@@ -183,12 +183,21 @@ pub async fn create_definition(
     // node we just resolved above (`source_node`) already carries exactly
     // this signal: `is_target` is true iff some earlier `create_definition`
     // call registered `def.source` as a target.
-    let source_schema = if source_node.is_target {
-        crate::config::DEFAULT_TARGET_SCHEMA
+    let source_schema: String = if source_node.is_target {
+        crate::config::DEFAULT_TARGET_SCHEMA.to_string()
     } else {
-        crate::config::DEFAULT_SCHEMA
+        let row = txn
+            .query_one(
+                "select n.nspname::text \
+                 from pg_class c \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 where c.oid = pg_catalog.to_regclass($1)",
+                &[&def.source],
+            )
+            .await?;
+        row.get(0)
     };
-    let qualified_source = crate::intake::publication::qualify(source_schema, &def.source)?;
+    let qualified_source = crate::intake::publication::qualify(&source_schema, &def.source)?;
     crate::intake::publication::enumerate_and_append(&txn, &qualified_source).await?;
 
     let version: i64 = txn
