@@ -40,14 +40,22 @@ async fn create_definition_backfills_the_source_exactly_once_regardless_of_field
     let client = db.pool.get().await.expect("get connection");
     let staged: Vec<String> = client
         .query(
-            "select key from seg_0 where op = 'recompute' and src_table = 'trellis.s' \
+            "select key, source_relation_oid from seg_0 \
+             where op = 'recompute' and src_table = 'trellis.s' \
              order by key",
             &[],
         )
         .await
         .expect("query seg_0")
         .into_iter()
-        .map(|r| r.get(0))
+        .map(|r| {
+            let source_relation_oid: Option<u32> = r.get(1);
+            assert!(
+                source_relation_oid.is_some(),
+                "backfill must stage the source OID"
+            );
+            r.get(0)
+        })
         .collect();
     assert_eq!(
         staged.len(),

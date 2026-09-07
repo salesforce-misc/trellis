@@ -44,6 +44,12 @@ via backfill, but **not** granularity changes (1-1 / aggregate / cross-join is
 fixed at creation). The versioning scheme for the Postgres-stored schema and the
 migration path for an in-place column edit are not yet designed.
 
+[ADR-0007](decisions/0007-source-object-identity.md) settles the identity rule:
+a definition remains bound to the table and columns resolved when it was accepted;
+a drop-and-recreate at the same name never transfers that binding. The concrete API
+for repairing, rebinding, or replacing an invalidated definition remains part of
+this redefinition work.
+
 One target is settled independent of the API surface: a definition's calculated
 fields (and the relationships they reference) are chosen and applied **together,
 as one atomic unit that backfills in a single pass** — defining a table with an

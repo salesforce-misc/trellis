@@ -689,7 +689,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 failed = reconcile_source_tables(
                     c,
                     &pool,
-                    &schema,
                     &publication,
                     &base_source_tables,
                     &wake_channel,
@@ -750,8 +749,8 @@ impl From<IntakeError> for ReconcileError {
 /// `base_source_tables` (whatever [`ClientOptions::source_tables`] was at
 /// [`Client::start`] time — kept so an embedder that only ever passes an
 /// explicit list, with no `transform_definitions` row for a table, still
-/// gets exactly the old, static behavior) and every source table
-/// [`defs::all_source_tables`] finds registered in the catalog right now,
+/// gets exactly the old, static behavior) and every currently resolvable
+/// physical relation [`defs::all_source_relations`] finds in the catalog,
 /// then reconciles the publication and discharges any resulting backfill
 /// against that set — the same two calls [`setup_staging`] makes once at
 /// startup, just re-run periodically so a transform registered against a
@@ -765,15 +764,32 @@ impl From<IntakeError> for ReconcileError {
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
-    schema: &str,
     publication: &str,
     base_source_tables: &[String],
     wake_channel: &str,
 ) -> Result<(), ReconcileError> {
-    let mut desired: std::collections::BTreeSet<String> =
-        base_source_tables.iter().cloned().collect();
-    for table in defs::all_source_tables(pool).await? {
-        desired.insert(intake::publication::qualify(schema, &table)?);
+    let catalog_sources = defs::all_source_relations(pool).await?;
+    let mut renamed_explicit = std::collections::HashMap::new();
+    for source in &catalog_sources {
+        let current = intake::publication::qualify(&source.schema, &source.name)?;
+        for original in defs::catalog::source_table_names_for_oid(pool, source.oid).await? {
+            // Catalog bindings are authoritative only for the spelling each
+            // definition stored; unrelated explicit publication entries stay
+            // untouched.
+            renamed_explicit.insert(original, current.clone());
+        }
+    }
+    let mut desired: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for base in base_source_tables {
+        desired.insert(
+            renamed_explicit
+                .get(base)
+                .cloned()
+                .unwrap_or_else(|| base.clone()),
+        );
+    }
+    for source in catalog_sources {
+        desired.insert(intake::publication::qualify(&source.schema, &source.name)?);
     }
     let desired: Vec<String> = desired.into_iter().collect();
 

@@ -30,12 +30,13 @@
 //! quarantining it individually cannot help — the fix is schema-shaped, not
 //! key-shaped.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
+use crate::defs::catalog::CatalogError;
 use crate::defs::ddl::DdlError;
 use crate::pool::Pool;
 
@@ -106,6 +107,13 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // individually caused.
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
         | ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. }) => FailureClass::Halting,
+        ApplyError::Catalog(
+            CatalogError::BoundSourceRelationMissing { .. }
+            | CatalogError::BoundSourceColumnMissing { .. }
+            | CatalogError::BoundSourceColumnIncompatible { .. }
+            | CatalogError::TargetRelationNotFound { .. }
+            | CatalogError::TargetRelationMismatch { .. },
+        ) => FailureClass::Halting,
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }
@@ -173,28 +181,46 @@ pub(super) async fn source_table_missing(
 /// just from this one failing batch.
 pub(super) async fn poisoned_keys_among(
     pool: &Pool,
-    candidates: &[(&str, &str)],
-) -> Result<HashSet<(String, String)>, ApplyError> {
+    candidates: &[&FoldedChange],
+) -> Result<HashSet<(String, Option<u32>, String)>, ApplyError> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
     let client = pool.get().await?;
-    let src_tables: Vec<&str> = candidates.iter().map(|(t, _)| *t).collect();
-    let keys: Vec<&str> = candidates.iter().map(|(_, k)| *k).collect();
+    let src_tables: Vec<&str> = candidates
+        .iter()
+        .map(|change| change.src_table.as_str())
+        .collect();
+    let source_oids: Vec<Option<u32>> = candidates
+        .iter()
+        .map(|change| change.source_relation_oid)
+        .collect();
+    let keys: Vec<&str> = candidates
+        .iter()
+        .map(|change| change.key.as_str())
+        .collect();
     let rows = client
         .query(
-            "select p.src_table, p.key from poison p \
-             join unnest($1::text[], $2::text[]) as u(src_table, key) \
-               on p.src_table = u.src_table and p.key = u.key",
-            &[&src_tables, &keys],
+            "select u.src_table, u.source_relation_oid, u.key from \
+             unnest($1::text[], $2::oid[], $3::text[]) as u(src_table, source_relation_oid, key) \
+             join poison p on p.key = u.key and ( \
+                 p.source_relation_oid = u.source_relation_oid \
+                 or (u.source_relation_oid is null and p.source_relation_oid is null \
+                     and p.src_table = u.src_table) \
+             )",
+            &[&src_tables, &source_oids, &keys],
         )
         .await?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
 }
 
 /// Parks `changes` — a batch's own folded contribution for keys already in
-/// the `poison` marker — into `poison_held`, keyed `(src_table, key,
-/// seg_seq)` and idempotent on that triple. Must run **inside the same
+/// the `poison` marker — into `poison_held`, keyed by `(source_relation_oid,
+/// key, seg_seq)` when available and by `(src_table, key, seg_seq)` for
+/// legacy rows. Must run **inside the same
 /// Phase-3 transaction** as the rest of the batch's apply, before the
 /// drained mark — see the module doc comment's "Parked work... is the
 /// source of truth" and doc 06's matching section: this is what stops a
@@ -209,13 +235,14 @@ pub(super) async fn park_batch_contribution(
         let op = folded_change_op(change);
         txn.execute(
             "insert into poison_held \
-                 (src_table, key, seg_seq, op, lsn, old_image, new_image, \
-                  origin_lsn, src_changed, hop_gen, group_key) \
-             values ($1, $2, $3, $4, $5, $6::text::jsonb, $7::text::jsonb, \
-                      $8, $9, $10, $11) \
-             on conflict (src_table, key, seg_seq) do nothing",
+                 (src_table, source_relation_oid, key, seg_seq, op, lsn, old_image, new_image, \
+                   origin_lsn, src_changed, hop_gen, group_key) \
+              values ($1, $2::oid, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb, \
+                      $9, $10, $11, $12) \
+              on conflict do nothing",
             &[
                 &change.src_table,
+                &change.source_relation_oid,
                 &change.key,
                 &seg_seq,
                 &op,
@@ -254,18 +281,23 @@ fn folded_change_op(change: &FoldedChange) -> &'static str {
 /// death does not accumulate toward a false eviction."
 pub(super) async fn clear_key_deaths(
     txn: &Transaction<'_>,
-    keys: &[(String, String)],
+    keys: &[(String, Option<u32>, String)],
 ) -> Result<(), ApplyError> {
     if keys.is_empty() {
         return Ok(());
     }
-    let src_tables: Vec<&str> = keys.iter().map(|(t, _)| t.as_str()).collect();
-    let ks: Vec<&str> = keys.iter().map(|(_, k)| k.as_str()).collect();
+    let src_tables: Vec<&str> = keys.iter().map(|(t, _, _)| t.as_str()).collect();
+    let source_oids: Vec<Option<u32>> = keys.iter().map(|(_, oid, _)| *oid).collect();
+    let ks: Vec<&str> = keys.iter().map(|(_, _, k)| k.as_str()).collect();
     txn.execute(
         "delete from key_deaths \
-         using unnest($1::text[], $2::text[]) as u(src_table, key) \
-         where key_deaths.src_table = u.src_table and key_deaths.key = u.key",
-        &[&src_tables, &ks],
+         using unnest($1::text[], $2::oid[], $3::text[]) as u(src_table, source_relation_oid, key) \
+          where key_deaths.key = u.key and ( \
+              key_deaths.source_relation_oid = u.source_relation_oid \
+              or (u.source_relation_oid is null and key_deaths.source_relation_oid is null \
+                  and key_deaths.src_table = u.src_table) \
+          )",
+        &[&src_tables, &source_oids, &ks],
     )
     .await?;
     Ok(())
@@ -281,21 +313,35 @@ pub(super) async fn clear_key_deaths(
 async fn record_key_death(
     client: &impl GenericClient,
     src_table: &str,
+    source_relation_oid: Option<u32>,
     key: &str,
     last_error: &str,
 ) -> Result<i32, ApplyError> {
-    let row = client
-        .query_one(
-            "insert into key_deaths (src_table, key, deaths, last_error, last_death_at) \
-             values ($1, $2, 1, $3, now()) \
-             on conflict (src_table, key) do update set \
-                 deaths = key_deaths.deaths + 1, \
-                 last_error = excluded.last_error, \
-                 last_death_at = now() \
-             returning deaths",
-            &[&src_table, &key, &last_error],
-        )
-        .await?;
+    let (sql, params): (&str, Vec<&(dyn tokio_postgres::types::ToSql + Sync)>) =
+        if source_relation_oid.is_some() {
+            (
+                "insert into key_deaths (src_table, source_relation_oid, key, deaths, last_error, last_death_at) \
+                 values ($1, $2::oid, $3, 1, $4, now()) \
+                 on conflict (source_relation_oid, key) where source_relation_oid is not null do update set \
+                    deaths = key_deaths.deaths + 1, \
+                    last_error = excluded.last_error, \
+                    last_death_at = now() \
+                 returning deaths",
+                vec![&src_table, &source_relation_oid, &key, &last_error],
+            )
+        } else {
+            (
+                "insert into key_deaths (src_table, source_relation_oid, key, deaths, last_error, last_death_at) \
+                 values ($1, $2::oid, $3, 1, $4, now()) \
+                 on conflict (src_table, key) where source_relation_oid is null do update set \
+                    deaths = key_deaths.deaths + 1, \
+                    last_error = excluded.last_error, \
+                    last_death_at = now() \
+                 returning deaths",
+                vec![&src_table, &source_relation_oid, &key, &last_error],
+            )
+        };
+    let row = client.query_one(sql, &params).await?;
     Ok(row.get(0))
 }
 
@@ -312,18 +358,30 @@ async fn evict_key(
     txn: &Transaction<'_>,
     seg_seq: i64,
     src_table: &str,
+    source_relation_oid: Option<u32>,
     key: &str,
     last_error: &str,
     contribution: Option<&FoldedChange>,
 ) -> Result<(), ApplyError> {
-    txn.execute(
-        "insert into poison (src_table, key, last_error) \
-         values ($1, $2, $3) \
-         on conflict (src_table, key) do update set \
-             last_error = excluded.last_error, poisoned_at = now()",
-        &[&src_table, &key, &last_error],
-    )
-    .await?;
+    let (sql, params): (&str, Vec<&(dyn tokio_postgres::types::ToSql + Sync)>) =
+        if source_relation_oid.is_some() {
+            (
+                "insert into poison (src_table, source_relation_oid, key, last_error) \
+                 values ($1, $2::oid, $3, $4) \
+                 on conflict (source_relation_oid, key) where source_relation_oid is not null do update set \
+                    last_error = excluded.last_error, poisoned_at = now()",
+                vec![&src_table, &source_relation_oid, &key, &last_error],
+            )
+        } else {
+            (
+                "insert into poison (src_table, source_relation_oid, key, last_error) \
+                 values ($1, $2::oid, $3, $4) \
+                 on conflict (src_table, key) where source_relation_oid is null do update set \
+                    last_error = excluded.last_error, poisoned_at = now()",
+                vec![&src_table, &source_relation_oid, &key, &last_error],
+            )
+        };
+    txn.execute(sql, &params).await?;
     if let Some(change) = contribution {
         park_batch_contribution(txn, seg_seq, std::slice::from_ref(change)).await?;
     }
@@ -374,7 +432,7 @@ pub async fn isolate_and_evict(
         return Ok(None);
     }
 
-    let mut poisoned: Vec<(String, String, String)> = Vec::new();
+    let mut poisoned: Vec<(String, Option<u32>, String, String)> = Vec::new();
     for change in folded {
         if change.is_truncate {
             continue;
@@ -391,6 +449,7 @@ pub async fn isolate_and_evict(
                 if class == FailureClass::Isolate {
                     poisoned.push((
                         change.src_table.clone(),
+                        change.source_relation_oid,
                         change.key.clone(),
                         err.to_string(),
                     ));
@@ -413,6 +472,7 @@ pub async fn isolate_and_evict(
             if class == FailureClass::Isolate {
                 poisoned.push((
                     change.src_table.clone(),
+                    change.source_relation_oid,
                     change.key.clone(),
                     err.to_string(),
                 ));
@@ -424,13 +484,20 @@ pub async fn isolate_and_evict(
         return Ok(None);
     }
 
-    let mut evict_now: Vec<(String, String, String)> = Vec::new();
+    let mut evict_now: Vec<(String, Option<u32>, String, String)> = Vec::new();
     {
         let client = pool.get().await?;
-        for (src_table, key, last_error) in &poisoned {
-            let deaths = record_key_death(&**client, src_table, key, last_error).await?;
+        for (src_table, source_relation_oid, key, last_error) in &poisoned {
+            let deaths =
+                record_key_death(&**client, src_table, *source_relation_oid, key, last_error)
+                    .await?;
             if deaths >= threshold {
-                evict_now.push((src_table.clone(), key.clone(), last_error.clone()));
+                evict_now.push((
+                    src_table.clone(),
+                    *source_relation_oid,
+                    key.clone(),
+                    last_error.clone(),
+                ));
             }
         }
     }
@@ -441,21 +508,49 @@ pub async fn isolate_and_evict(
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    for (src_table, key, last_error) in &evict_now {
-        let contribution = folded
-            .iter()
-            .find(|c| !c.is_truncate && &c.src_table == src_table && &c.key == key);
-        evict_key(&txn, seg_seq, src_table, key, last_error, contribution).await?;
+    for (src_table, source_relation_oid, key, last_error) in &evict_now {
+        let contribution = folded.iter().find(|change| {
+            !change.is_truncate
+                && &change.key == key
+                && match source_relation_oid {
+                    Some(oid) => change.source_relation_oid == Some(*oid),
+                    None => change.source_relation_oid.is_none() && &change.src_table == src_table,
+                }
+        });
+        evict_key(
+            &txn,
+            seg_seq,
+            src_table,
+            *source_relation_oid,
+            key,
+            last_error,
+            contribution,
+        )
+        .await?;
     }
     txn.commit().await?;
 
-    let evicted: HashSet<(&str, &str)> = evict_now
+    let evicted: HashSet<(&str, Option<u32>, &str)> = evict_now
         .iter()
-        .map(|(t, k, _)| (t.as_str(), k.as_str()))
+        .map(|(table, source_relation_oid, key, _)| {
+            (table.as_str(), *source_relation_oid, key.as_str())
+        })
         .collect();
     let retry_folded: Vec<FoldedChange> = folded
         .iter()
-        .filter(|c| c.is_truncate || !evicted.contains(&(c.src_table.as_str(), c.key.as_str())))
+        .filter(|change| {
+            change.is_truncate
+                || !evicted.iter().any(|(table, source_relation_oid, key)| {
+                    key == &change.key.as_str()
+                        && match source_relation_oid {
+                            Some(oid) => change.source_relation_oid == Some(*oid),
+                            None => {
+                                change.source_relation_oid.is_none()
+                                    && table == &change.src_table.as_str()
+                            }
+                        }
+                })
+        })
         .cloned()
         .collect();
     Ok(Some(retry_folded))
@@ -466,9 +561,9 @@ pub async fn isolate_and_evict(
 // ---------------------------------------------------------------------
 
 /// Operator-driven release, one transaction: replays every `poison_held` row
-/// for `(src_table, key)`, in batch order (`seg_seq` ascending) then
-/// position order (`held_seq` ascending — a tie-breaker only, since this
-/// table holds at most one row per `(src_table, key, seg_seq)`), into the
+/// for the current OID resolved from `(src_table, key)` (or legacy rows when
+/// no OID is present), in batch order (`seg_seq` ascending) then position
+/// order (`held_seq` ascending), into the
 /// active batch; then deletes the held rows, the marker, and the death
 /// counter. Doc 06: "Each replayed row keeps its **original** origin
 /// position" — [`StagedChange::Cdc`]'s `lsn`/`origin_lsn` fields are set
@@ -480,32 +575,46 @@ pub async fn isolate_and_evict(
 pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    let source_relation_oid: Option<u32> = txn
+        .query_one("select pg_catalog.to_regclass($1)::oid", &[&src_table])
+        .await?
+        .get(0);
 
     let held = txn
         .query(
-            "select seg_seq, op, lsn, old_image::text, new_image::text, origin_lsn, \
-                    src_changed, hop_gen, group_key \
-             from poison_held \
-             where src_table = $1 and key = $2 \
-             order by seg_seq asc, held_seq asc",
-            &[&src_table, &key],
+            "select id, seg_seq, source_relation_oid, op, lsn, old_image::text, new_image::text, origin_lsn, \
+                     src_changed, hop_gen, group_key \
+              from poison_held \
+              where key = $2 \
+                and (source_relation_oid = $3::oid \
+                     or (source_relation_oid is null and src_table = $1)) \
+              order by seg_seq asc, held_seq asc",
+            &[&src_table, &key, &source_relation_oid],
         )
         .await?;
 
+    let mut held_ids_by_oid: HashMap<Option<u32>, Vec<i64>> = HashMap::new();
     let changes: Vec<StagedChange> = held
         .iter()
         .map(|row| {
-            let op: String = row.get(1);
-            let lsn: Option<PgLsn> = row.get(2);
-            let old_image: Option<String> = row.get(3);
-            let new_image: Option<String> = row.get(4);
-            let origin_lsn: Option<PgLsn> = row.get(5);
-            let src_changed: Option<SystemTime> = row.get(6);
-            let hop_gen: i32 = row.get(7);
-            let group_key: Option<String> = row.get(8);
+            let held_id: i64 = row.get(0);
+            let source_relation_oid: Option<u32> = row.get(2);
+            held_ids_by_oid
+                .entry(source_relation_oid)
+                .or_default()
+                .push(held_id);
+            let op: String = row.get(3);
+            let lsn: Option<PgLsn> = row.get(4);
+            let old_image: Option<String> = row.get(5);
+            let new_image: Option<String> = row.get(6);
+            let origin_lsn: Option<PgLsn> = row.get(7);
+            let src_changed: Option<SystemTime> = row.get(8);
+            let hop_gen: i32 = row.get(9);
+            let group_key: Option<String> = row.get(10);
             if op == "recompute" {
                 StagedChange::Recompute {
                     src_table: src_table.to_string(),
+                    source_relation_oid,
                     key: key.to_string(),
                     hop_gen,
                     group_key,
@@ -518,6 +627,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
                 };
                 StagedChange::Cdc {
                     src_table: src_table.to_string(),
+                    source_relation_oid,
                     key: key.to_string(),
                     op: cdc_op,
                     lsn,
@@ -534,19 +644,44 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
 
     append::append(&txn, &changes).await?;
 
+    for (source_relation_oid, held_ids) in held_ids_by_oid {
+        match source_relation_oid {
+            Some(source_relation_oid) => {
+                txn.execute(
+                    "delete from poison_held \
+                     where id = any($1::bigint[]) \
+                       and source_relation_oid = $2::oid \
+                       and key = $3",
+                    &[&held_ids, &source_relation_oid, &key],
+                )
+                .await?;
+            }
+            None => {
+                txn.execute(
+                    "delete from poison_held \
+                     where id = any($1::bigint[]) \
+                       and source_relation_oid is null \
+                       and src_table = $2 and key = $3",
+                    &[&held_ids, &src_table, &key],
+                )
+                .await?;
+            }
+        }
+    }
     txn.execute(
-        "delete from poison_held where src_table = $1 and key = $2",
-        &[&src_table, &key],
+        "delete from poison where key = $2 and ( \
+             source_relation_oid = $3::oid \
+             or (source_relation_oid is null and src_table = $1) \
+         )",
+        &[&src_table, &key, &source_relation_oid],
     )
     .await?;
     txn.execute(
-        "delete from poison where src_table = $1 and key = $2",
-        &[&src_table, &key],
-    )
-    .await?;
-    txn.execute(
-        "delete from key_deaths where src_table = $1 and key = $2",
-        &[&src_table, &key],
+        "delete from key_deaths where key = $2 and ( \
+             source_relation_oid = $3::oid \
+             or (source_relation_oid is null and src_table = $1) \
+         )",
+        &[&src_table, &key, &source_relation_oid],
     )
     .await?;
 
@@ -569,27 +704,85 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
 /// a *live* `42P01` from a query against `src_table` itself — not a cached
 /// or stale signal, so there is no separate "reload and check again" step
 /// here: the error that triggers this call already reflects current
-/// database state.
-pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), ApplyError> {
+/// database state. OID-bearing rows are removed by OID so a recreated
+/// relation with the same presentation name remains intact; the legacy
+/// marker/counter tables remain name-keyed until their own schema migration.
+pub async fn purge_dropped_table(
+    pool: &Pool,
+    src_table: &str,
+    source_relation_oid: Option<u32>,
+) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     for slot in 0..RING_SIZE {
         let table = ring_table_name(slot)?;
-        txn.execute(
-            &format!("delete from {table} where src_table = $1"),
-            &[&src_table],
-        )
-        .await?;
+        match source_relation_oid {
+            Some(source_relation_oid) => {
+                txn.execute(
+                    &format!("delete from {table} where source_relation_oid = $1::oid"),
+                    &[&source_relation_oid],
+                )
+                .await?;
+            }
+            None => {
+                txn.execute(
+                    &format!(
+                        "delete from {table} where source_relation_oid is null and src_table = $1"
+                    ),
+                    &[&src_table],
+                )
+                .await?;
+            }
+        }
     }
-    txn.execute("delete from poison where src_table = $1", &[&src_table])
-        .await?;
-    txn.execute(
-        "delete from poison_held where src_table = $1",
-        &[&src_table],
-    )
-    .await?;
-    txn.execute("delete from key_deaths where src_table = $1", &[&src_table])
-        .await?;
+    match source_relation_oid {
+        Some(source_relation_oid) => {
+            txn.execute(
+                "delete from poison where source_relation_oid = $1::oid",
+                &[&source_relation_oid],
+            )
+            .await?;
+        }
+        None => {
+            txn.execute(
+                "delete from poison where source_relation_oid is null and src_table = $1",
+                &[&src_table],
+            )
+            .await?;
+        }
+    }
+    match source_relation_oid {
+        Some(source_relation_oid) => {
+            txn.execute(
+                "delete from poison_held where source_relation_oid = $1::oid",
+                &[&source_relation_oid],
+            )
+            .await?;
+        }
+        None => {
+            txn.execute(
+                "delete from poison_held where source_relation_oid is null and src_table = $1",
+                &[&src_table],
+            )
+            .await?;
+        }
+    }
+    match source_relation_oid {
+        Some(source_relation_oid) => {
+            txn.execute(
+                "delete from key_deaths where source_relation_oid = $1::oid",
+                &[&source_relation_oid],
+            )
+            .await?;
+        }
+        None => {
+            txn.execute(
+                "delete from key_deaths where source_relation_oid is null and src_table = $1",
+                &[&src_table],
+            )
+            .await?;
+        }
+    }
     txn.commit().await?;
     Ok(())
 }

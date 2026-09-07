@@ -15,7 +15,8 @@ use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{create_definition, create_target_table, recompute, source_primary_key};
 use engine::staging::apply::{self, ApplyError};
-use engine::staging::{SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
+use engine::staging::{FoldedChange, SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
+use engine::{Config, Pool};
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
@@ -247,6 +248,193 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
             "total mismatch for id {id}"
         );
     }
+}
+
+#[tokio::test]
+async fn oid_cdc_uses_its_bound_public_source_after_a_rename() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema other;
+             create table public.widgets (id integer primary key, value numeric);
+             create table other.widgets (id integer primary key, value numeric)",
+        )
+        .await
+        .expect("create same-named sources");
+
+    let source_columns = numeric_columns(&["id", "value"]);
+    let public_def = create_definition(
+        &db.pool,
+        "TRANSFORM public_widget_totals FROM widgets SELECT value AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create public definition");
+    let pk = source_primary_key(&db.pool, "widgets")
+        .await
+        .expect("introspect public source primary key");
+    let public_transform = TransformDef {
+        target: "public_widget_totals".to_string(),
+        source: "widgets".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::Column("value".to_string()),
+        }],
+        predicate: Predicate::True,
+    };
+    create_target_table(&db.pool, &public_transform, "public", &pk, &source_columns)
+        .await
+        .expect("create public target");
+
+    let other_source = engine::defs::resolve_source_relation(&db.pool, "other.widgets")
+        .await
+        .expect("resolve same-named other source");
+    assert_ne!(public_def.source.oid, other_source.oid);
+    client
+        .batch_execute("alter table public.widgets rename to renamed_widgets")
+        .await
+        .expect("rename bound public source");
+
+    let folded = [
+        FoldedChange {
+            src_table: "public.widgets".to_string(),
+            source_relation_oid: Some(public_def.source.oid),
+            key: "1".to_string(),
+            new_image: Some(r#"{"id": 1, "value": 42}"#.to_string()),
+            old_image: None,
+            src_changed: None,
+            origin_lsn: None,
+            lsn: Some(PgLsn::from(1u64)),
+            hop_gen: 0,
+            first_seen: std::time::SystemTime::now(),
+            group_key: None,
+            is_truncate: false,
+        },
+        // The presentation name deliberately matches the public CDC row,
+        // but this OID identifies another source with no definitions.
+        FoldedChange {
+            src_table: "public.widgets".to_string(),
+            source_relation_oid: Some(other_source.oid),
+            key: "1".to_string(),
+            new_image: Some(r#"{"id": 1, "value": 99}"#.to_string()),
+            old_image: None,
+            src_changed: None,
+            origin_lsn: None,
+            lsn: Some(PgLsn::from(1u64)),
+            hop_gen: 0,
+            first_seen: std::time::SystemTime::now(),
+            group_key: None,
+            is_truncate: false,
+        },
+    ];
+    let seg_seq = seal_active_segment(&mut client).await;
+    let plan = apply::compute(&db.pool, &folded)
+        .await
+        .expect("compute OID CDC change");
+    let txn = client.transaction().await.expect("begin claim transaction");
+    claim::claim(&txn, seg_seq, "oid-source-test", 1)
+        .await
+        .expect("claim sealed segment");
+    txn.commit().await.expect("commit claim");
+    let txn = client.transaction().await.expect("begin apply transaction");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        "oid-source-test",
+        &plan,
+        "trellis_apply_test",
+    )
+    .await
+    .expect("apply OID CDC change");
+    txn.commit().await.expect("commit OID apply");
+
+    let total: String = client
+        .query_one(
+            "select total::text from public_widget_totals where id = 1",
+            &[],
+        )
+        .await
+        .expect("read public target")
+        .get(0);
+    assert_eq!(total, "42");
+}
+
+#[tokio::test]
+async fn oid_cdc_uses_a_renamed_source_column_binding() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.rename_columns (id integer primary key, old_amount numeric)",
+        )
+        .await
+        .expect("create source table");
+    let source_columns = numeric_columns(&["id", "old_amount"]);
+    let definition = create_definition(
+        &db.pool,
+        "TRANSFORM renamed_column_totals FROM rename_columns SELECT old_amount AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition against old column name");
+    let transform = TransformDef {
+        target: "renamed_column_totals".to_string(),
+        source: "rename_columns".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "total".to_string(),
+            expr: Expr::Column("old_amount".to_string()),
+        }],
+        predicate: Predicate::True,
+    };
+    let pk = source_primary_key(&db.pool, &transform.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &transform, "public", &pk, &source_columns)
+        .await
+        .expect("create target table");
+
+    client
+        .batch_execute(
+            "alter table public.rename_columns rename column old_amount to current_amount;
+             insert into public.rename_columns (id, current_amount) values (1, 42)",
+        )
+        .await
+        .expect("rename source column and seed current row");
+    client
+        .execute(
+            "insert into seg_0
+                 (src_table, source_relation_oid, key, op, lsn, old_image, new_image, hop_gen)
+             values ($1, $2::oid, $3, 'insert', $4, null, $5::text::jsonb, 0)",
+            &[
+                &"public.rename_columns",
+                &definition.source.oid,
+                &"1",
+                &PgLsn::from(1u64),
+                &r#"{"id":1,"current_amount":42}"#,
+            ],
+        )
+        .await
+        .expect("stage OID-bearing CDC image with current column name");
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 1);
+    let total: String = client
+        .query_one(
+            "select total::text from renamed_column_totals where id = 1",
+            &[],
+        )
+        .await
+        .expect("read updated target")
+        .get(0);
+    assert_eq!(total, "42");
 }
 
 #[tokio::test]
@@ -484,7 +672,9 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
         .await
         .expect_err("orders' version moved since compute; the fence must trip");
     match &err {
-        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "orders"),
+        ApplyError::VersionFenceMiss { src_table } => {
+            assert!(src_table.ends_with(".orders") || src_table == "orders")
+        }
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
     txn.rollback().await.expect("rollback phase 3");
@@ -1033,6 +1223,103 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     );
 }
 
+#[tokio::test]
+async fn an_analytics_target_stages_its_bound_oid_for_a_downstream_transform() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric);
+             create schema analytics",
+        )
+        .await
+        .expect("seed source and analytics schema");
+    let analytics_pool = Pool::new(
+        &Config::from_dsn(db.dsn())
+            .expect("analytics config")
+            .with_target_schema("analytics")
+            .expect("valid analytics schema"),
+    )
+    .expect("analytics pool");
+
+    let source_columns = numeric_columns(&["id", "price"]);
+    let first = create_definition(
+        &analytics_pool,
+        "TRANSFORM order_totals FROM orders SELECT price AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create first definition");
+    let pk = source_primary_key(&db.pool, "orders")
+        .await
+        .expect("orders primary key");
+    create_target_table(
+        &analytics_pool,
+        &first.def,
+        "analytics",
+        &pk,
+        &source_columns,
+    )
+    .await
+    .expect("create analytics target");
+    let target_oid: u32 = client
+        .query_one("select 'analytics.order_totals'::regclass::oid", &[])
+        .await
+        .expect("read bound target oid")
+        .get(0);
+
+    let totals_columns = numeric_columns(&["id", "total"]);
+    let second = create_definition(
+        &analytics_pool,
+        "TRANSFORM order_summary FROM order_totals SELECT total + total AS grand_total",
+        &totals_columns,
+    )
+    .await
+    .expect("create downstream definition");
+    create_target_table(
+        &analytics_pool,
+        &second.def,
+        "analytics",
+        &pk,
+        &totals_columns,
+    )
+    .await
+    .expect("create downstream target");
+
+    client
+        .execute("insert into orders (id, price) values (1, 10)", &[])
+        .await
+        .expect("seed source row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"price":"10"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    drain(&analytics_pool, seg_seq, "worker").await;
+
+    let staged_oid: Option<u32> = client
+        .query_one(
+            "select source_relation_oid from (
+                 select src_table, source_relation_oid, key from seg_0
+                 union all select src_table, source_relation_oid, key from seg_1
+                 union all select src_table, source_relation_oid, key from seg_2
+                 union all select src_table, source_relation_oid, key from seg_3
+             ) rows where src_table = 'order_totals' and key = '1'",
+            &[],
+        )
+        .await
+        .expect("read downstream staged identity")
+        .get(0);
+    assert_eq!(staged_oid, Some(target_oid));
+}
+
 /// Issue #63's write-path gap: a text-column passthrough must round-trip
 /// through `compute()`/apply with the persisted `source_columns` type map
 /// (`catalog::create_definition`), not default every column to Numeric and
@@ -1396,7 +1683,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
 
     let def = order_totals_def();
     let source_columns = numeric_columns(&["id", "price", "tax"]);
-    create_definition(
+    let definition = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
         &source_columns,
@@ -1415,9 +1702,9 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     for i in 1..=N {
         client
             .execute(
-                "insert into seg_0 (src_table, key, op, hop_gen) \
-                 values ('orders', $1, 'recompute', 0)",
-                &[&i.to_string()],
+                "insert into seg_0 (src_table, source_relation_oid, key, op, hop_gen) \
+                 values ('orders', $1::oid, $2, 'recompute', 0)",
+                &[&definition.source.oid, &i.to_string()],
             )
             .await
             .unwrap_or_else(|e| panic!("insert recompute row {i} failed: {e}"));
@@ -1451,7 +1738,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("from \"orders\" t") && line.contains("\"id\" ="))
+        .filter(|line| line.contains("orders\" t") && line.contains("\"id\" ="))
         .collect();
     assert_eq!(
         refetch_queries.len(),

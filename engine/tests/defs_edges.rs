@@ -6,9 +6,10 @@ use std::collections::HashMap;
 
 use engine::defs::{
     CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition,
-    create_target_table, dependents_of, parse, persist_edge, resolve_node, source_primary_key,
-    transforms_for_source,
+    create_target_table, dependents_of, node_for_source_oid, parse, persist_edge, resolve_node,
+    source_primary_key, transforms_for_source,
 };
+use engine::{Config, Pool};
 use testkit::TestCluster;
 
 /// Creates a minimal backing relation for a definition's source table
@@ -21,7 +22,9 @@ use testkit::TestCluster;
 async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .batch_execute(&format!(
+            "create table {name} (id serial primary key, price numeric)"
+        ))
         .await
         .expect("create bare source table");
 }
@@ -113,7 +116,6 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "a").await;
-    create_bare_source_table(&db.pool, "b").await;
 
     let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
@@ -156,6 +158,84 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
         .await
         .expect("query a's dependents again");
     assert!(a_to_c.iter().all(|def| def.def.target != "c"));
+}
+
+/// A configured target schema must bind its physical target node before a
+/// chained definition resolves that table as a source. A same-named Trellis
+/// relation would be an incorrect node and must not affect the analytics one.
+#[tokio::test]
+async fn an_analytics_target_promotes_to_its_chained_source_node_by_oid() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric);
+             create schema analytics;
+             create table trellis.order_totals (id integer primary key, total numeric)",
+        )
+        .await
+        .expect("seed sources and colliding public table");
+    let analytics_pool = Pool::new(
+        &Config::from_dsn(db.dsn())
+            .expect("analytics config")
+            .with_target_schema("analytics")
+            .expect("valid analytics schema"),
+    )
+    .expect("analytics pool");
+
+    let source_columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("price".to_string(), ValueType::Numeric),
+    ]);
+    let first = create_definition(
+        &analytics_pool,
+        "TRANSFORM order_totals FROM orders SELECT price AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create first definition");
+    let pk = source_primary_key(&db.pool, "orders")
+        .await
+        .expect("source primary key");
+    create_target_table(
+        &analytics_pool,
+        &first.def,
+        "analytics",
+        &pk,
+        &source_columns,
+    )
+    .await
+    .expect("create and bind analytics target");
+
+    let analytics_oid: u32 = client
+        .query_one("select 'analytics.order_totals'::regclass::oid", &[])
+        .await
+        .expect("read analytics target oid")
+        .get(0);
+    let totals_columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("total".to_string(), ValueType::Numeric),
+    ]);
+    create_definition(
+        &analytics_pool,
+        "TRANSFORM order_summary FROM order_totals SELECT total AS grand_total",
+        &totals_columns,
+    )
+    .await
+    .expect("chain from analytics target through target schema search path");
+
+    let node = node_for_source_oid(&db.pool, analytics_oid)
+        .await
+        .expect("query bound analytics node")
+        .expect("analytics target has one node");
+    assert!(node.is_source && node.is_target);
+    assert_eq!(node.schema_name.as_deref(), Some("analytics"));
+    let dependents = transforms_for_source(&analytics_pool, "order_totals")
+        .await
+        .expect("find chain by bound target relation");
+    assert_eq!(dependents.len(), 1);
+    assert_eq!(dependents[0].def.target, "order_summary");
 }
 
 /// `transforms_for_source` is a thin wrapper over `dependents_of` filtered
@@ -273,6 +353,12 @@ async fn a_direct_table_cycle_is_rejected() {
     )
     .await
     .expect("a -> b definition should be stored");
+    materialize_chained_target(
+        &db.pool,
+        "TRANSFORM b FROM a SELECT price AS total",
+        &HashMap::from([("price".to_string(), ValueType::Numeric)]),
+    )
+    .await;
 
     let err = create_definition(
         &db.pool,
@@ -307,7 +393,6 @@ async fn a_transitive_table_cycle_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "a").await;
-    create_bare_source_table(&db.pool, "b").await;
 
     let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
@@ -331,6 +416,12 @@ async fn a_transitive_table_cycle_is_rejected() {
     )
     .await
     .expect("b -> c definition should be stored");
+    materialize_chained_target(
+        &db.pool,
+        "TRANSFORM c FROM b SELECT total AS total_again",
+        &HashMap::from([("total".to_string(), ValueType::Numeric)]),
+    )
+    .await;
 
     let err = create_definition(
         &db.pool,

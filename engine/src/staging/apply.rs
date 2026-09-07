@@ -113,7 +113,10 @@ pub enum ApplyError {
     /// resolve this, since the table itself is gone, not any one row.
     /// [`drain_once`] routes this to [`quarantine::purge_dropped_table`]
     /// rather than the ordinary isolate/evict path.
-    SourceTableDropped { source_table: String },
+    SourceTableDropped {
+        source_table: String,
+        source_relation_oid: Option<u32>,
+    },
 }
 
 impl fmt::Display for ApplyError {
@@ -146,7 +149,7 @@ impl fmt::Display for ApplyError {
                 "downstream propagation exceeded the hop bound (hop_gen {hop_gen} > \
                  {MAX_HOP_GEN}) through: {tables:?}"
             ),
-            ApplyError::SourceTableDropped { source_table } => write!(
+            ApplyError::SourceTableDropped { source_table, .. } => write!(
                 f,
                 "source table '{source_table}' no longer exists; purging its staged rows"
             ),
@@ -215,10 +218,10 @@ impl From<crate::error::Error> for ApplyError {
 }
 
 // ---------------------------------------------------------------------
-// src_table qualification
+// Source identity and qualification
 // ---------------------------------------------------------------------
 
-/// The catalog's lookup key for a folded record's `src_table`: everything
+/// The legacy catalog lookup key for a folded record's `src_table`: everything
 /// after the last `.`, if any.
 ///
 /// Definitions are stored — and their versions keyed — by the *unqualified*
@@ -228,8 +231,8 @@ impl From<crate::error::Error> for ApplyError {
 /// intake's own producer, though, always stages changes under the
 /// qualified `"schema.table"` shape `intake::publication::qualify` builds,
 /// which [`FoldedChange::src_table`] inherits directly from the ring. This
-/// is the one seam that reconciles the two conventions: strip a schema
-/// prefix before ever asking the catalog about a folded record's source. A
+/// is the one seam that reconciles the two conventions for legacy rows. OID
+/// bearing records instead use [`SourceKey::Oid`] throughout. A
 /// target table's own downstream `src_table` (the `Recompute` rows this
 /// module stages) is already unqualified —
 /// [`crate::defs::ddl::neighbor_table_name`] never adds a schema — so this
@@ -239,6 +242,32 @@ fn catalog_source_key(src_table: &str) -> &str {
         Some((_, table)) => table,
         None => src_table,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SourceKey {
+    Oid(u32),
+    Legacy(String),
+}
+
+fn source_oid(key: &SourceKey) -> Option<u32> {
+    match key {
+        SourceKey::Oid(oid) => Some(*oid),
+        SourceKey::Legacy(_) => None,
+    }
+}
+
+fn source_key(change: &FoldedChange) -> SourceKey {
+    match change.source_relation_oid {
+        Some(oid) => SourceKey::Oid(oid),
+        None => SourceKey::Legacy(catalog_source_key(&change.src_table).to_string()),
+    }
+}
+
+fn qualified_source_ident(schema: &str, name: &str) -> String {
+    // Quote components independently: quoting `schema.name` as one
+    // identifier would target a literal relation name containing a dot.
+    format!("{}.{}", quote_ident(schema), quote_ident(name))
 }
 
 /// Decodes a staged jsonb image (bound as text — this crate has no
@@ -267,6 +296,20 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
     Ok(row)
 }
 
+/// Projects the physical names in a current source image back onto the
+/// immutable logical names in one definition's DSL. This must be per
+/// definition: different definitions may have been created on opposite sides
+/// of a column rename while sharing the same staged source image.
+fn remap_bound_row(row: &Row, current_names: &HashMap<String, String>) -> Row {
+    let mut remapped = row.clone();
+    for (logical_name, current_name) in current_names {
+        if let Some(value) = row.get(current_name) {
+            remapped.insert(logical_name.clone(), value.clone());
+        }
+    }
+    remapped
+}
+
 /// Re-reads every one of `keys`' current rows from `source_table` live, in
 /// one round trip, for folded changes that carried no image at all (see
 /// [`compute`]'s doc comment on the three shapes) — the batched replacement
@@ -284,7 +327,7 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 /// treats as a delete, matching `read_live_row`'s old `None` case exactly.
 async fn read_live_rows_batch(
     pool: &Pool,
-    source_table: &str,
+    source_ident: &str,
     pk: &PrimaryKeyColumn,
     keys: &[&str],
 ) -> Result<HashMap<String, Row>, ApplyError> {
@@ -298,8 +341,7 @@ async fn read_live_rows_batch(
          from (select {pk_ident}::text as k, to_jsonb(t.*) as doc from {} t \
                where {pk_ident} = any($1::text[]::{}[])) m \
          cross join lateral jsonb_each_text(m.doc) e",
-        quote_ident(source_table),
-        pk.data_type,
+        source_ident, pk.data_type,
     );
     let db_rows = client.query(&sql, &[&keys]).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
@@ -350,6 +392,7 @@ struct TargetDelete {
 /// for it.
 #[derive(Debug, Clone)]
 struct TargetPlan {
+    target_ident: String,
     pk: PrimaryKeyColumn,
     field_names: Vec<String>,
     field_types: Vec<ValueType>,
@@ -369,8 +412,24 @@ struct TargetPlan {
 /// physically-changed key.
 #[derive(Debug, Clone)]
 struct ClearPlan {
+    target_ident: String,
     pk: PrimaryKeyColumn,
     hop_gen: i32,
+}
+
+async fn target_ident_for_definition(
+    pool: &Pool,
+    def: &crate::defs::Definition,
+) -> Result<String, ApplyError> {
+    let Some(oid) = def.target_relation_oid else {
+        return Ok(quote_ident(&def.def.target));
+    };
+    let relation = catalog::source_relation_by_oid(pool, oid)
+        .await?
+        .ok_or_else(|| CatalogError::TargetRelationNotFound {
+            target: def.def.target.clone(),
+        })?;
+    Ok(qualified_source_ident(&relation.schema, &relation.name))
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -389,7 +448,7 @@ struct ClearPlan {
 /// staleness this implies and why it's an accepted tradeoff.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyPlan {
-    versions: HashMap<String, Option<i64>>,
+    versions: HashMap<SourceKey, VersionFence>,
     targets: HashMap<String, TargetPlan>,
     /// [`KeySpace::Aggregate`] targets' per-group deltas (issue #11's
     /// aggregate extension) — the same role [`ApplyPlan::targets`] plays for
@@ -398,7 +457,9 @@ pub struct ApplyPlan {
     /// vs. `apply_aggregate::apply_aggregate_target`'s sequential per-group
     /// upserts) are different enough not to share one plan type.
     aggregate_targets: HashMap<String, AggregateTargetPlan>,
+    target_idents: HashMap<String, String>,
     downstream_readers: HashMap<String, bool>,
+    downstream_source_oids: HashMap<String, Option<u32>>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -446,12 +507,21 @@ pub struct ApplyPlan {
     /// batch computed against — cleared from `key_deaths` by
     /// [`apply_and_mark_drained`] on a successful commit, per doc 06's "a
     /// clean drain clears the counters for the keys it just applied."
-    applied_keys: Vec<(String, String)>,
+    applied_keys: Vec<(String, Option<u32>, String)>,
+}
+
+/// The version Phase 2 observed plus a current, user-facing source name. The
+/// catalog key may be an OID, but a fence miss should still identify a table.
+#[derive(Debug, Clone)]
+struct VersionFence {
+    version: Option<i64>,
+    source_table: String,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
 /// folded change's `f()` against the transform currently reading its
-/// source table, grouped by (unqualified) `src_table` so each source's
+/// source table, grouped by OID when present (and unqualified `src_table`
+/// only for legacy rows) so each source's
 /// catalog version is loaded — and fenced against — exactly once.
 ///
 /// Reloads the catalog fresh on every call, including retries: this is
@@ -463,44 +533,76 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // one batch's evaluation. Truncate sentinels are never candidates: a
     // truncate is whole-keyspace, not a key quarantine can attribute
     // anything to.
-    let candidates: Vec<(&str, &str)> = folded
-        .iter()
-        .filter(|c| !c.is_truncate)
-        .map(|c| (c.src_table.as_str(), c.key.as_str()))
-        .collect();
+    let candidates: Vec<&FoldedChange> = folded.iter().filter(|c| !c.is_truncate).collect();
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
 
-    let mut by_source: HashMap<&str, Vec<&FoldedChange>> = HashMap::new();
+    let mut by_source: HashMap<SourceKey, Vec<&FoldedChange>> = HashMap::new();
     // Truncate sentinels (issue #60) never enter the keyed by-source
     // evaluation loop below — they carry no key of their own (see
     // `append::TRUNCATE_SENTINEL_KEY`) and produce no write/delete;
     // they're handled separately, right after that loop.
     let mut truncated: Vec<&FoldedChange> = Vec::new();
     let mut poisoned_park: Vec<FoldedChange> = Vec::new();
-    let mut applied_keys: Vec<(String, String)> = Vec::new();
+    let mut applied_keys: Vec<(String, Option<u32>, String)> = Vec::new();
     for change in folded {
         if change.is_truncate {
             truncated.push(change);
             continue;
         }
-        if poisoned.contains(&(change.src_table.clone(), change.key.clone())) {
+        if poisoned.contains(&(
+            change.src_table.clone(),
+            change.source_relation_oid,
+            change.key.clone(),
+        )) {
             poisoned_park.push(change.clone());
             continue;
         }
-        applied_keys.push((change.src_table.clone(), change.key.clone()));
+        applied_keys.push((
+            change.src_table.clone(),
+            change.source_relation_oid,
+            change.key.clone(),
+        ));
         by_source
-            .entry(catalog_source_key(&change.src_table))
+            .entry(source_key(change))
             .or_default()
             .push(change);
     }
 
-    let mut versions: HashMap<String, Option<i64>> = HashMap::new();
+    let mut versions: HashMap<SourceKey, VersionFence> = HashMap::new();
     let mut targets: HashMap<String, TargetPlan> = HashMap::new();
     let mut aggregate_targets: HashMap<String, AggregateTargetPlan> = HashMap::new();
+    let mut target_idents: HashMap<String, String> = HashMap::new();
 
     for (source_key, changes) in by_source {
-        let version = catalog::source_table_version(pool, source_key).await?;
-        versions.insert(source_key.to_string(), version);
+        let (version, source_table, source_ident, defs) = match &source_key {
+            SourceKey::Oid(oid) => {
+                let source = catalog::source_relation_by_oid(pool, *oid)
+                    .await?
+                    .ok_or_else(|| ApplyError::SourceTableDropped {
+                        source_table: changes[0].src_table.clone(),
+                        source_relation_oid: Some(*oid),
+                    })?;
+                (
+                    catalog::source_table_version_by_oid(pool, *oid).await?,
+                    source.qualified(),
+                    qualified_source_ident(&source.schema, &source.name),
+                    catalog::transforms_for_source_oid(pool, *oid).await?,
+                )
+            }
+            SourceKey::Legacy(name) => (
+                catalog::source_table_version(pool, name).await?,
+                changes[0].src_table.clone(),
+                quote_ident(name),
+                catalog::transforms_for_source(pool, name).await?,
+            ),
+        };
+        versions.insert(
+            source_key.clone(),
+            VersionFence {
+                version,
+                source_table,
+            },
+        );
 
         // `source_key` alone determines the source table's primary key, not
         // the individual definition (issue #69) — introspected once per
@@ -509,17 +611,21 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // definition it's evaluated against). A live `42P01` here means
         // `source_key` no longer exists (issue #16's dropped-table purge,
         // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, &source_ident).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
-                    source_table: source_key.to_string(),
+                    source_table: changes[0].src_table.clone(),
+                    source_relation_oid: source_oid(&source_key),
                 });
             }
             Err(DdlError::NoPrimaryKey { source_table })
                 if quarantine::source_table_missing(pool, &source_table).await? =>
             {
-                return Err(ApplyError::SourceTableDropped { source_table });
+                return Err(ApplyError::SourceTableDropped {
+                    source_table: changes[0].src_table.clone(),
+                    source_relation_oid: source_oid(&source_key),
+                });
             }
             Err(err) => return Err(err.into()),
         };
@@ -552,13 +658,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 .iter()
                 .map(|&i| changes[i].key.as_str())
                 .collect();
-            let mut live_rows = read_live_rows_batch(pool, source_key, &pk, &live_keys).await?;
+            let mut live_rows = read_live_rows_batch(pool, &source_ident, &pk, &live_keys).await?;
             for &i in &live_refetch_indices {
                 rows[i] = live_rows.remove(changes[i].key.as_str());
             }
         }
-
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
 
         // Aggregate definitions need each change's *old*-side row too (to
         // derive a grain-migrating change's old group key and its old
@@ -584,6 +688,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
 
         for def in &defs {
+            let current_names = catalog::source_column_current_names(pool, def).await?;
+            let target_ident = target_ident_for_definition(pool, def).await?;
+            target_idents.insert(def.def.target.clone(), target_ident.clone());
             let KeySpace::Aggregate { group_by } = &def.def.key_space else {
                 let field_names: Vec<String> =
                     def.def.fields.iter().map(|f| f.name.clone()).collect();
@@ -600,6 +707,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
+                        target_ident: target_ident.clone(),
                         pk: pk.clone(),
                         field_names: field_names.clone(),
                         field_types: field_types.clone(),
@@ -636,9 +744,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             // (#63's write-path gap: persisted alongside the
                             // definition — see `catalog::create_definition` —
                             // rather than defaulting every column to Numeric).
+                            let row = remap_bound_row(row, &current_names);
                             let mut evaluated = eval::evaluate(
                                 &def.def,
-                                row,
+                                &row,
                                 &def.source_columns,
                                 &mut regex_cache,
                             )?;
@@ -694,18 +803,26 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         group_by.clone(),
                         group_by_types,
                         field_plans,
-                        source_key.to_string(),
+                        source_ident.clone(),
                         field_exprs,
                     )
                 });
 
             let mut regex_cache = eval::RegexCache::new();
+            let remapped_rows: Vec<Option<Row>> = rows
+                .iter()
+                .map(|row| row.as_ref().map(|row| remap_bound_row(row, &current_names)))
+                .collect();
+            let remapped_old_rows: Vec<Option<Row>> = old_rows
+                .iter()
+                .map(|row| row.as_ref().map(|row| remap_bound_row(row, &current_names)))
+                .collect();
             apply_aggregate::accumulate_changes(
                 target_plan,
                 &def.def,
                 &changes,
-                &rows,
-                &old_rows,
+                &remapped_rows,
+                &remapped_old_rows,
                 &def.source_columns,
                 &mut regex_cache,
             )?;
@@ -719,30 +836,59 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut clears: HashMap<String, ClearPlan> = HashMap::new();
     let mut aggregate_clears: HashMap<String, i32> = HashMap::new();
     for change in &truncated {
-        let source_key = catalog_source_key(&change.src_table);
+        let source_key = source_key(change);
         // Fence this source too, even though nothing evaluated against it —
         // a definition change against a truncated source, landing mid-drain,
         // must trip Phase 3's version fence exactly like it would for a
         // source this batch actually evaluated `f()` against.
-        let version = catalog::source_table_version(pool, source_key).await?;
-        versions.entry(source_key.to_string()).or_insert(version);
+        let (version, source_table, source_ident, defs) = match &source_key {
+            SourceKey::Oid(oid) => {
+                let source = catalog::source_relation_by_oid(pool, *oid)
+                    .await?
+                    .ok_or_else(|| ApplyError::SourceTableDropped {
+                        source_table: change.src_table.clone(),
+                        source_relation_oid: Some(*oid),
+                    })?;
+                (
+                    catalog::source_table_version_by_oid(pool, *oid).await?,
+                    source.qualified(),
+                    qualified_source_ident(&source.schema, &source.name),
+                    catalog::transforms_for_source_oid(pool, *oid).await?,
+                )
+            }
+            SourceKey::Legacy(name) => (
+                catalog::source_table_version(pool, name).await?,
+                change.src_table.clone(),
+                quote_ident(name),
+                catalog::transforms_for_source(pool, name).await?,
+            ),
+        };
+        versions.entry(source_key.clone()).or_insert(VersionFence {
+            version,
+            source_table,
+        });
 
-        let pk = match ddl::source_primary_key(pool, source_key).await {
+        let pk = match ddl::source_primary_key(pool, &source_ident).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
-                    source_table: source_key.to_string(),
+                    source_table: change.src_table.clone(),
+                    source_relation_oid: source_oid(&source_key),
                 });
             }
             Err(DdlError::NoPrimaryKey { source_table })
                 if quarantine::source_table_missing(pool, &source_table).await? =>
             {
-                return Err(ApplyError::SourceTableDropped { source_table });
+                return Err(ApplyError::SourceTableDropped {
+                    source_table: change.src_table.clone(),
+                    source_relation_oid: source_oid(&source_key),
+                });
             }
             Err(err) => return Err(err.into()),
         };
-        let defs = catalog::transforms_for_source(pool, source_key).await?;
         for def in &defs {
+            let target_ident = target_ident_for_definition(pool, def).await?;
+            target_idents.insert(def.def.target.clone(), target_ident.clone());
             match &def.def.key_space {
                 KeySpace::Aggregate { .. } => {
                     aggregate_clears
@@ -757,6 +903,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             existing.hop_gen = existing.hop_gen.max(change.hop_gen)
                         })
                         .or_insert(ClearPlan {
+                            target_ident,
                             pk: pk.clone(),
                             hop_gen: change.hop_gen,
                         });
@@ -766,22 +913,32 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     }
 
     let mut downstream_readers = HashMap::new();
+    let mut downstream_source_oids = HashMap::new();
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     for target in all_targets {
-        let has_downstream = !catalog::transforms_for_source(pool, target)
-            .await?
-            .is_empty();
+        let source_oid = catalog::target_relation_oid(pool, target).await?;
+        let has_downstream = match source_oid {
+            Some(oid) => !catalog::transforms_for_source_oid(pool, oid)
+                .await?
+                .is_empty(),
+            None => !catalog::transforms_for_source(pool, target)
+                .await?
+                .is_empty(),
+        };
         downstream_readers.insert(target.clone(), has_downstream);
+        downstream_source_oids.insert(target.clone(), source_oid);
     }
 
     Ok(ApplyPlan {
         versions,
         targets,
         aggregate_targets,
+        target_idents,
         downstream_readers,
+        downstream_source_oids,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -818,7 +975,7 @@ async fn apply_target(
 
     let pk_ident = quote_ident(&plan.pk.name);
     let pk_cast = plan.pk.data_type.as_str();
-    let target_ident = quote_ident(target);
+    let target_ident = target;
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
     let mut lock_keys: Vec<&str> = plan
@@ -1000,17 +1157,23 @@ pub async fn apply_and_mark_drained(
     wake_channel: &str,
 ) -> Result<ApplyOutcome, ApplyError> {
     // 1. Version fence.
-    for (source_key, loaded_version) in &plan.versions {
-        let row = txn
-            .query_opt(
+    for (source_key, loaded) in &plan.versions {
+        let (sql, param): (&str, &(dyn ToSql + Sync)) = match source_key {
+            SourceKey::Oid(oid) => (
+                "select version from source_table_versions \
+                 where source_relation_oid = $1::oid for share",
+                oid,
+            ),
+            SourceKey::Legacy(name) => (
                 "select version from source_table_versions where source_table = $1 for share",
-                &[source_key],
-            )
-            .await?;
+                name,
+            ),
+        };
+        let row = txn.query_opt(sql, &[param]).await?;
         let current: Option<i64> = row.map(|r| r.get(0));
-        if current != *loaded_version {
+        if current != loaded.version {
             return Err(ApplyError::VersionFenceMiss {
-                src_table: source_key.clone(),
+                src_table: loaded.source_table.clone(),
             });
         }
     }
@@ -1038,7 +1201,7 @@ pub async fn apply_and_mark_drained(
     // here specifically (single-bucket batch, barrier-drained).
     for (target, clear) in &plan.clears {
         let pk_ident = quote_ident(&clear.pk.name);
-        let target_ident = quote_ident(target);
+        let target_ident = &clear.target_ident;
         let cleared: Vec<String> = txn
             .query(
                 &format!("delete from {target_ident} returning {pk_ident}::text as pk"),
@@ -1061,7 +1224,11 @@ pub async fn apply_and_mark_drained(
     // downstream propagation, unlike every other clear/write/delete this
     // function tracks via `changed`.
     for target in plan.aggregate_clears.keys() {
-        let target_ident = quote_ident(target);
+        let target_ident = plan
+            .target_idents
+            .get(target)
+            .map(String::as_str)
+            .unwrap_or(target);
         let cleared = txn
             .execute(&format!("delete from {target_ident}"), &[])
             .await?;
@@ -1070,7 +1237,7 @@ pub async fn apply_and_mark_drained(
 
     // 3. Ordered pre-lock + upsert/delete, per target table.
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target, target_plan).await?;
+        let (written, deleted) = apply_target(txn, &target_plan.target_ident, target_plan).await?;
         keys_written += written.len();
         keys_deleted += deleted.len();
 
@@ -1107,7 +1274,12 @@ pub async fn apply_and_mark_drained(
     // for why that is not a live misuse risk today: no definition reading
     // from an aggregate target can actually survive its first drain attempt.
     for (target, agg_plan) in &plan.aggregate_targets {
-        let result = apply_aggregate::apply_aggregate_target(txn, target, agg_plan).await?;
+        let target_ident = plan
+            .target_idents
+            .get(target)
+            .map(String::as_str)
+            .unwrap_or(target);
+        let result = apply_aggregate::apply_aggregate_target(txn, target_ident, agg_plan).await?;
         keys_written += result.written.len();
         keys_deleted += result.deleted.len();
 
@@ -1143,6 +1315,7 @@ pub async fn apply_and_mark_drained(
             }
             recompute_changes.push(StagedChange::Recompute {
                 src_table: target.to_string(),
+                source_relation_oid: plan.downstream_source_oids.get(*target).copied().flatten(),
                 key: key.clone(),
                 hop_gen: next_hop,
                 group_key: None,
@@ -1281,7 +1454,10 @@ pub async fn drain_once(
         attempt += 1;
         let plan = match compute(pool, &folded).await {
             Ok(plan) => plan,
-            Err(ApplyError::SourceTableDropped { source_table }) => {
+            Err(ApplyError::SourceTableDropped {
+                source_table,
+                source_relation_oid,
+            }) => {
                 // Issue #16's one sanctioned exception to immutability: the
                 // table this batch's folded rows name is gone, not any one
                 // row's fault, so no retry or per-key quarantine resolves
@@ -1289,8 +1465,11 @@ pub async fn drain_once(
                 // with it excluded. Not counted against
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.
-                quarantine::purge_dropped_table(pool, &source_table).await?;
-                folded.retain(|c| c.src_table != source_table);
+                quarantine::purge_dropped_table(pool, &source_table, source_relation_oid).await?;
+                folded.retain(|change| match source_relation_oid {
+                    Some(oid) => change.source_relation_oid != Some(oid),
+                    None => change.src_table != source_table,
+                });
                 attempt -= 1;
                 continue;
             }

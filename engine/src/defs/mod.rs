@@ -41,9 +41,12 @@ pub use ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, RelationshipDef, TransformDef, ValueType,
 };
 pub use catalog::{
-    CatalogError, all_source_tables, create_definition, create_relationship, dependents_of,
-    edges_from, node_for_table, persist_edge, relationship_by_name, resolve_node,
-    source_table_version, transforms_for_source,
+    CatalogError, all_source_relations, all_source_tables, bind_target_relation, create_definition,
+    create_relationship, dependents_of, edges_from, node_for_source_oid, node_for_table,
+    persist_edge, relationship_by_name, resolve_node, resolve_source_relation,
+    source_column_current_names, source_relation_by_oid, source_table_version,
+    source_table_version_by_oid, target_relation_oid, transforms_for_source,
+    transforms_for_source_oid,
 };
 pub use ddl::{
     DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
@@ -54,7 +57,7 @@ pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
 pub use model::{
     Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode,
+    SchemaNode, SourceColumnBinding, SourceRelation,
 };
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate, render_aggregate_select_sql,

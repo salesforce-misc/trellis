@@ -128,6 +128,16 @@ outside the row (current time, timezone, collation, session settings, random
 values) is disallowed: incremental maintenance requires that re-evaluating a
 formula on unchanged inputs always yields the same result.
 
+### Source-object binding
+
+When Trellis accepts a definition, it resolves table and column names once,
+using PostgreSQL's normal `search_path` rules for unqualified table names, and
+binds the definition to those physical database objects. Renaming a bound table
+or column does not move the definition; dropping it and creating another object
+with the same name does not silently replace it. See
+[ADR-0007](decisions/0007-source-object-identity.md) for the identity,
+rename, and recovery rules.
+
 ### Chaining and cycle detection
 
 Calculated columns may reference each other, letting users build derivations

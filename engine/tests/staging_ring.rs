@@ -15,6 +15,8 @@ use tokio_postgres::{Client, NoTls};
 fn recompute(src_table: &str, key: &str) -> StagedChange {
     StagedChange::Recompute {
         src_table: src_table.to_string(),
+        // Manual fixture: no live source relation is resolved in this test.
+        source_relation_oid: None,
         key: key.to_string(),
         hop_gen: 0,
         group_key: None,
@@ -91,16 +93,23 @@ async fn route_is_identical_for_client_side_and_server_side_appends() {
 
     // Client-rendered VALUES tuple (the shape CDC intake, reverse
     // propagation, and definition re-derive use).
-    append_on_new_connection(db.dsn(), &[recompute("orders", "same-key")]).await;
+    let client_change = StagedChange::Recompute {
+        src_table: "orders".to_string(),
+        source_relation_oid: Some(4242),
+        key: "same-key".to_string(),
+        hop_gen: 0,
+        group_key: None,
+    };
+    append_on_new_connection(db.dsn(), &[client_change]).await;
 
     let client = db.pool.get().await.expect("acquire connection");
 
-    // Server-side INSERT ... SELECT (backfill's shape): same src_table/key,
+    // Server-side INSERT ... SELECT (backfill's shape): same source OID/key,
     // computed by Postgres itself rather than rendered by a client.
     client
         .execute(
-            "insert into seg_0 (src_table, key, op, hop_gen)
-             select 'orders', 'same-key', 'recompute', 0",
+            "insert into seg_0 (src_table, source_relation_oid, key, op, hop_gen)
+             select 'orders', 4242::oid, 'same-key', 'recompute', 0",
             &[],
         )
         .await
@@ -120,7 +129,7 @@ async fn route_is_identical_for_client_side_and_server_side_appends() {
     assert_eq!(routes.len(), 2);
     assert_eq!(
         routes[0], routes[1],
-        "the same (src_table, key) must route identically regardless of which producer wrote it"
+        "the same source identity/key must route identically regardless of which producer wrote it"
     );
 }
 
@@ -217,6 +226,7 @@ async fn change_id_records_intra_transaction_append_order() {
 
     let insert = StagedChange::Cdc {
         src_table: "orders".to_string(),
+        source_relation_oid: None,
         key: "same-key".to_string(),
         op: CdcOp::Insert,
         lsn: None,
@@ -229,6 +239,7 @@ async fn change_id_records_intra_transaction_append_order() {
     };
     let update = StagedChange::Cdc {
         src_table: "orders".to_string(),
+        source_relation_oid: None,
         key: "same-key".to_string(),
         op: CdcOp::Update,
         lsn: None,
@@ -293,9 +304,9 @@ async fn change_id_records_intra_transaction_append_order() {
 
 #[tokio::test]
 async fn append_chunks_batches_past_the_bind_parameter_limit() {
-    // 10 columns/row * 6553 rows = 65530 params — one row past 6553 already
+    // 11 columns/row * 5958 rows = 65538 params — one row past 5957 already
     // exceeds Postgres's 65535 Bind-parameter cap if sent as a single
-    // unchunked INSERT. Use a batch that spans three chunks (6000 rows
+    // unchunked INSERT. Use a batch that spans three chunks (5900 rows
     // each) to prove the chunking loop, not just a single boundary crossing.
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

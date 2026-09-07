@@ -17,9 +17,50 @@ use super::ast::{RelationshipDef, TransformDef, ValueType};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Definition {
     pub id: i64,
+    /// The physical source relation selected at definition time. Its OID is
+    /// authoritative; schema/name are refreshable presentation metadata.
+    pub source: SourceRelation,
+    /// The physical target relation once target DDL has materialized and bound
+    /// it. It is absent between definition creation and target creation.
+    pub target_relation_oid: Option<u32>,
     pub source_version: i64,
     pub def: TransformDef,
     pub source_columns: HashMap<String, ValueType>,
+    /// Physical bindings for source columns this definition actually reads.
+    /// Empty for definitions written before ADR-0007's column binding
+    /// migration, which retain legacy name-based evaluation.
+    pub source_column_bindings: Vec<SourceColumnBinding>,
+}
+
+/// A transform source column's immutable PostgreSQL attribute identity and
+/// its original logical DSL spelling. `attnum` survives a column rename;
+/// `type_oid` and `type_modifier` fence incompatible type changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceColumnBinding {
+    pub logical_name: String,
+    pub source_relation_oid: u32,
+    pub attnum: i16,
+    pub type_oid: u32,
+    pub type_modifier: i32,
+    pub value_type: ValueType,
+}
+
+/// The PostgreSQL relation a transform source is bound to. `oid` is database
+/// local and stable across relation renames and schema moves; `schema` and
+/// `name` describe its current catalog metadata when it was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRelation {
+    /// PostgreSQL's unsigned `pg_class.oid`.
+    pub oid: u32,
+    pub schema: String,
+    pub name: String,
+}
+
+impl SourceRelation {
+    /// Current schema-qualified presentation name.
+    pub fn qualified(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
 }
 
 /// A relationship declaration as stored in the catalog (issue #26): the
@@ -105,15 +146,19 @@ pub enum NodeKind {
 /// A first-class identity for a table Trellis knows about — as a source, a
 /// target, or (via chained transforms) both — that transforms (and, later,
 /// relationships) resolve their endpoints against instead of a bare
-/// table-name string. One row per physical table: `is_source`/`is_target`
-/// each start `false` and are only ever set to `true` by
-/// [`super::catalog::resolve_node`], never back to `false`. Only identity is
-/// persisted ([`super::catalog`]'s `schema_nodes` table); a node's columns
-/// and types are introspected live from `pg_catalog`/`information_schema`
-/// rather than cached here, per ADR-0005.
+/// table-name string. Nodes gain a physical relation OID when their relation
+/// is materialized. `is_source`/`is_target` each start
+/// `false` and are only ever set to `true` by [`super::catalog::resolve_node`],
+/// never back to `false`. A bound node's schema/name metadata is refreshed
+/// from `pg_catalog`; source columns/types remain live metadata per ADR-0005.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaNode {
     pub id: i64,
+    /// The bound physical relation, if it has been materialized as a source or
+    /// target.
+    pub relation_oid: Option<u32>,
+    /// Current namespace metadata for [`Self::relation_oid`].
+    pub schema_name: Option<String>,
     pub table_name: String,
     pub is_source: bool,
     pub is_target: bool,

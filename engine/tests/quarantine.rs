@@ -15,8 +15,8 @@ use std::time::SystemTime;
 use engine::config::DEFAULT_SCHEMA;
 use engine::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use engine::defs::{
-    DdlError, create_aggregate_target_table, create_definition, create_target_table, parse,
-    recompute, source_primary_key,
+    CatalogError, DdlError, create_aggregate_target_table, create_definition, create_target_table,
+    parse, recompute, source_primary_key,
 };
 use engine::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use engine::staging::converge;
@@ -664,6 +664,44 @@ async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_insta
     assert!(after.last_reason.is_some());
 }
 
+/// OID-binding failures describe a broken schema contract, never malformed
+/// per-key data. They must stop processing before isolation can charge or
+/// evict unrelated source keys.
+#[test]
+fn catalog_binding_failures_are_halting() {
+    for error in [
+        ApplyError::Catalog(CatalogError::BoundSourceRelationMissing { oid: 1 }),
+        ApplyError::Catalog(CatalogError::BoundSourceColumnMissing {
+            relation_oid: 1,
+            attnum: 2,
+            logical_name: "amount".to_string(),
+        }),
+        ApplyError::Catalog(CatalogError::BoundSourceColumnIncompatible {
+            relation_oid: 1,
+            attnum: 2,
+            logical_name: "amount".to_string(),
+            expected_type_oid: 1700,
+            expected_type_modifier: -1,
+            actual_type_oid: 25,
+            actual_type_modifier: -1,
+        }),
+        ApplyError::Catalog(CatalogError::TargetRelationNotFound {
+            target: "totals".to_string(),
+        }),
+        ApplyError::Catalog(CatalogError::TargetRelationMismatch {
+            target: "totals".to_string(),
+            expected_oid: 1,
+            actual_oid: 2,
+        }),
+    ] {
+        assert_eq!(
+            engine::staging::classify(&error),
+            engine::staging::FailureClass::Halting,
+            "{error:?} must halt rather than isolate"
+        );
+    }
+}
+
 /// Scenario: `poison_held` is idempotent on `(src_table, key, seg_seq)` — a
 /// retried park for the exact same batch and key must not duplicate or
 /// overwrite the row already parked for it.
@@ -674,9 +712,9 @@ async fn poison_held_is_idempotent_on_table_key_batch() {
     let client = connect_raw(db.dsn()).await;
 
     let insert = "insert into poison_held \
-                      (src_table, key, seg_seq, op, old_image, new_image, hop_gen) \
-                  values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0) \
-                  on conflict (src_table, key, seg_seq) do nothing";
+                   (src_table, key, seg_seq, op, old_image, new_image, hop_gen) \
+               values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0) \
+                   on conflict do nothing";
 
     client
         .execute(
@@ -781,6 +819,78 @@ async fn dropped_table_purge_lets_a_wedged_batch_drain() {
         remaining, 0,
         "the purge must have removed the dropped table's rows from every ring table"
     );
+}
+
+/// An OID-specific dropped-table purge must not clear poison state belonging
+/// to a replacement relation that reused the dropped table's presentation
+/// name.
+#[tokio::test]
+async fn purge_of_an_old_oid_preserves_a_same_named_replacement_quarantine_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table orders (id integer primary key)")
+        .await
+        .expect("create original orders");
+    let old_oid: u32 = client
+        .query_one("select 'orders'::regclass::oid", &[])
+        .await
+        .expect("read original OID")
+        .get(0);
+    client
+        .batch_execute("drop table orders; create table orders (id integer primary key)")
+        .await
+        .expect("replace orders relation");
+    let replacement_oid: u32 = client
+        .query_one("select 'orders'::regclass::oid", &[])
+        .await
+        .expect("read replacement OID")
+        .get(0);
+    assert_ne!(old_oid, replacement_oid);
+
+    for oid in [old_oid, replacement_oid] {
+        client
+            .execute(
+                "insert into poison (src_table, source_relation_oid, key, last_error) \
+                 values ('orders', $1::oid, '1', 'test')",
+                &[&oid],
+            )
+            .await
+            .expect("seed OID poison marker");
+        client
+            .execute(
+                "insert into key_deaths (src_table, source_relation_oid, key, deaths, last_error) \
+                 values ('orders', $1::oid, '1', 1, 'test')",
+                &[&oid],
+            )
+            .await
+            .expect("seed OID death counter");
+    }
+
+    engine::staging::purge_dropped_table(&db.pool, "orders", Some(old_oid))
+        .await
+        .expect("purge original OID only");
+
+    let remaining_poison: i64 = client
+        .query_one(
+            "select count(*) from poison where source_relation_oid = $1::oid and key = '1'",
+            &[&replacement_oid],
+        )
+        .await
+        .expect("read replacement poison")
+        .get(0);
+    let remaining_deaths: i64 = client
+        .query_one(
+            "select count(*) from key_deaths where source_relation_oid = $1::oid and key = '1'",
+            &[&replacement_oid],
+        )
+        .await
+        .expect("read replacement death count")
+        .get(0);
+    assert_eq!(remaining_poison, 1);
+    assert_eq!(remaining_deaths, 1);
 }
 
 /// Scenario: release replays `poison_held` rows in batch order (`seg_seq`)
@@ -1115,6 +1225,7 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
 
     let folded = vec![FoldedChange {
         src_table: "orders".to_string(),
+        source_relation_oid: None,
         key: "1".to_string(),
         new_image: Some(r#"{"price":"not-a-number","tax":"1.50"}"#.to_string()),
         old_image: None,

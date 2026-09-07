@@ -572,26 +572,20 @@ async fn probe_group_exists(
     values: &[Option<String>],
 ) -> Result<bool, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select exists(select 1 from {} where {where_sql})",
-        quote_ident(source)
-    );
+    let sql = format!("select exists(select 1 from {source} where {where_sql})");
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
 }
 
 async fn delete_group_row(
     txn: &Transaction<'_>,
-    target: &str,
+    target_ident: &str,
     group_by: &[String],
     group_by_types: &[ValueType],
     values: &[Option<String>],
 ) -> Result<bool, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "delete from {} where {where_sql} returning 1",
-        quote_ident(target)
-    );
+    let sql = format!("delete from {target_ident} where {where_sql} returning 1");
     let rows = txn.query(&sql, &group_where_params(values)).await?;
     Ok(!rows.is_empty())
 }
@@ -614,10 +608,7 @@ async fn probe_field_value(
 ) -> Result<Option<String>, ApplyError> {
     let expr_sql = oracle::render_expr_sql(expr);
     let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select ({expr_sql})::text from {} where {where_sql}",
-        quote_ident(source)
-    );
+    let sql = format!("select ({expr_sql})::text from {source} where {where_sql}");
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
 }
@@ -647,10 +638,8 @@ async fn probe_sum_and_count(
     };
     let arg_sql = oracle::render_expr_sql(&args[0]);
     let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select sum({arg_sql})::text, count({arg_sql}) from {} where {where_sql}",
-        quote_ident(source)
-    );
+    let sql =
+        format!("select sum({arg_sql})::text, count({arg_sql}) from {source} where {where_sql}");
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok((row.get(0), row.get(1)))
 }
@@ -670,10 +659,7 @@ async fn probe_count_star(
     values: &[Option<String>],
 ) -> Result<i64, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
-    let sql = format!(
-        "select count(*) from {} where {where_sql}",
-        quote_ident(source)
-    );
+    let sql = format!("select count(*) from {source} where {where_sql}");
     let row = txn.query_one(&sql, &group_where_params(values)).await?;
     Ok(row.get(0))
 }
@@ -725,12 +711,11 @@ enum ColumnPlan {
 
 async fn upsert_group(
     txn: &Transaction<'_>,
-    target: &str,
+    target_ident: &str,
     plan: &AggregateTargetPlan,
     group: &GroupPlan,
 ) -> Result<bool, ApplyError> {
     let pk_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
-    let target_ident = quote_ident(target);
 
     // Pass 1: decide each field's strategy, running every probe this group's
     // write needs and collecting their results — no SQL text or `params`
@@ -1086,7 +1071,7 @@ async fn upsert_group(
 /// row (extinct) or upserts its delta/probed values (still alive).
 pub(super) async fn apply_aggregate_target(
     txn: &Transaction<'_>,
-    target: &str,
+    target_ident: &str,
     plan: &AggregateTargetPlan,
 ) -> Result<AggregateApplyResult, ApplyError> {
     let mut group_keys: Vec<&String> = plan.groups.keys().collect();
@@ -1109,7 +1094,7 @@ pub(super) async fn apply_aggregate_target(
         if !exists {
             let did_delete = delete_group_row(
                 txn,
-                target,
+                target_ident,
                 &plan.group_by,
                 &plan.group_by_types,
                 &group.group_values,
@@ -1121,7 +1106,7 @@ pub(super) async fn apply_aggregate_target(
             continue;
         }
 
-        if upsert_group(txn, target, plan, group).await? {
+        if upsert_group(txn, target_ident, plan, group).await? {
             written.push((key.clone(), group.hop_gen));
         }
     }

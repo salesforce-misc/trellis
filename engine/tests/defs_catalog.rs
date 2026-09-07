@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use engine::defs::{
-    CatalogError, ValidationError, ValueType, create_definition, transforms_for_source,
+    CatalogError, ValidationError, ValueType, all_source_relations, create_definition,
+    resolve_source_relation, source_relation_by_oid, source_table_version_by_oid,
+    transforms_for_source, transforms_for_source_oid,
 };
 use testkit::TestCluster;
 
@@ -19,14 +21,25 @@ fn columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// Creates a minimal backing relation for a definition's source table
 /// (issue #23's backfill enumerates it for real, via a live `regclass`/
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
-/// column references against the passed-in `source_columns` map, not the
+/// column references against both the passed-in `source_columns` map and the
 /// live schema. Left unqualified so it lands via the pool's ambient
 /// `search_path` (Trellis schema first), matching the schema
 /// `create_definition` assumes for `def.source` today.
 async fn create_bare_source_table(pool: &engine::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} (id serial primary key)"))
+        .batch_execute(&format!(
+            "create table {name} (
+                id serial primary key,
+                price numeric,
+                tax numeric,
+                label text,
+                active boolean,
+                author uuid,
+                name numeric,
+                a numeric
+            )"
+        ))
         .await
         .expect("create bare source table");
 }
@@ -254,6 +267,31 @@ async fn a_text_column_passthrough_is_stored_and_retrievable() {
     assert_eq!(def.def.target, "labels");
 }
 
+#[tokio::test]
+async fn a_provided_source_column_map_cannot_invent_a_live_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute("create table source_column_missing (id integer primary key)")
+        .await
+        .expect("create source table");
+    drop(client);
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM source_column_missing_target FROM source_column_missing SELECT imaginary AS total",
+        &columns(&["imaginary"]),
+    )
+    .await
+    .expect_err("a caller-provided map cannot claim a missing PostgreSQL column");
+
+    assert!(matches!(
+        err,
+        CatalogError::SourceColumnNotFound { column, .. } if column == "imaginary"
+    ));
+}
+
 /// Issue #63's type-mismatch bar: `text_col + 1` must be rejected at
 /// validation time with a clear [`ValidationError::TypeMismatch`], not a
 /// panic.
@@ -474,5 +512,195 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     assert!(
         message.contains("transform_definitions_target_table_key"),
         "expected the violated constraint's name in the error message, got: {message}"
+    );
+}
+
+/// ADR-0007: an unqualified source follows the definition connection's
+/// search path, while same-named relations in two schemas remain distinct
+/// OID-backed sources with independent catalog versions.
+#[tokio::test]
+async fn source_bindings_distinguish_same_named_relations_across_schemas() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema catalog_oid_other;
+             create table public.catalog_oid_foo (id serial primary key, price numeric);
+             create table catalog_oid_other.catalog_oid_foo (id serial primary key, price numeric)",
+        )
+        .await
+        .expect("create fully-qualified source tables");
+    drop(client);
+
+    let public = create_definition(
+        &db.pool,
+        "TRANSFORM catalog_oid_public_target FROM catalog_oid_foo SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("configured search_path resolves public source");
+    assert_eq!(public.source.schema, "public");
+    assert_eq!(public.source.name, "catalog_oid_foo");
+    assert_eq!(public.source.qualified(), "public.catalog_oid_foo");
+
+    // This test uses one pool connection. Changing the connection setting
+    // exercises PostgreSQL's ordinary unqualified-name resolution again.
+    let client = db.pool.get().await.expect("reuse pool connection");
+    client
+        .batch_execute("set search_path to catalog_oid_other, trellis, public")
+        .await
+        .expect("switch definition search path");
+    drop(client);
+
+    let other = create_definition(
+        &db.pool,
+        "TRANSFORM catalog_oid_other_target FROM catalog_oid_foo SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("alternate search_path resolves other source");
+    assert_eq!(other.source.schema, "catalog_oid_other");
+    assert_ne!(public.source.oid, other.source.oid);
+
+    let public_binding = resolve_source_relation(&db.pool, "public.catalog_oid_foo")
+        .await
+        .expect("resolve public source by qualified name");
+    let other_binding = resolve_source_relation(&db.pool, "catalog_oid_other.catalog_oid_foo")
+        .await
+        .expect("resolve other source by qualified name");
+    assert_eq!(public_binding.oid, public.source.oid);
+    assert_eq!(other_binding.oid, other.source.oid);
+    assert_ne!(public_binding.oid, other_binding.oid);
+
+    assert_eq!(
+        source_table_version_by_oid(&db.pool, public_binding.oid)
+            .await
+            .expect("public source version"),
+        Some(1)
+    );
+    assert_eq!(
+        source_table_version_by_oid(&db.pool, other_binding.oid)
+            .await
+            .expect("other source version"),
+        Some(1)
+    );
+    assert_eq!(
+        transforms_for_source_oid(&db.pool, public_binding.oid)
+            .await
+            .expect("public OID lookup")
+            .len(),
+        1
+    );
+    assert_eq!(
+        transforms_for_source_oid(&db.pool, other_binding.oid)
+            .await
+            .expect("other OID lookup")
+            .len(),
+        1
+    );
+}
+
+/// A source OID continues to name the same object after its presentation name
+/// changes. Both direct OID resolution and catalog enumeration refresh the
+/// schema/name metadata from PostgreSQL rather than re-resolving DSL text.
+#[tokio::test]
+async fn source_relation_metadata_refreshes_after_rename_and_schema_move() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema catalog_oid_moved;
+             create table public.catalog_oid_original (id serial primary key, price numeric)",
+        )
+        .await
+        .expect("create source relation");
+    drop(client);
+
+    let created = create_definition(
+        &db.pool,
+        "TRANSFORM catalog_oid_move_target FROM catalog_oid_original SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("create definition");
+
+    let client = db.pool.get().await.expect("reuse pool connection");
+    client
+        .batch_execute(
+            "alter table public.catalog_oid_original rename to catalog_oid_renamed;
+             alter table public.catalog_oid_renamed set schema catalog_oid_moved",
+        )
+        .await
+        .expect("rename and move bound source");
+    drop(client);
+
+    let resolved = source_relation_by_oid(&db.pool, created.source.oid)
+        .await
+        .expect("resolve bound OID")
+        .expect("bound source still exists");
+    assert_eq!(resolved.oid, created.source.oid);
+    assert_eq!(resolved.schema, "catalog_oid_moved");
+    assert_eq!(resolved.name, "catalog_oid_renamed");
+    assert_eq!(
+        resolved.qualified(),
+        "catalog_oid_moved.catalog_oid_renamed"
+    );
+
+    assert_eq!(
+        all_source_relations(&db.pool)
+            .await
+            .expect("enumerate current source bindings"),
+        vec![resolved.clone()]
+    );
+
+    let loaded = transforms_for_source_oid(&db.pool, created.source.oid)
+        .await
+        .expect("load definition by stable OID");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].source, resolved);
+}
+
+/// A dropped OID-bound source remains a catalog error, not an absent
+/// subscriber that could be mistaken for a valid empty mapping.
+#[tokio::test]
+async fn dropped_bound_source_is_loud_on_oid_definition_lookup() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table public.catalog_oid_dropped (id serial primary key, price numeric)",
+        )
+        .await
+        .expect("create source relation");
+    drop(client);
+
+    let created = create_definition(
+        &db.pool,
+        "TRANSFORM catalog_oid_dropped_target FROM catalog_oid_dropped SELECT price AS total",
+        &columns(&["price"]),
+    )
+    .await
+    .expect("create definition");
+
+    let client = db.pool.get().await.expect("reuse pool connection");
+    client
+        .batch_execute("drop table public.catalog_oid_dropped")
+        .await
+        .expect("drop bound source relation");
+    drop(client);
+
+    assert!(matches!(
+        transforms_for_source_oid(&db.pool, created.source.oid).await,
+        Err(CatalogError::BoundSourceRelationMissing { oid }) if oid == created.source.oid
+    ));
+    assert!(
+        all_source_relations(&db.pool)
+            .await
+            .expect("list current source relations")
+            .is_empty(),
+        "dropped OID bindings are omitted rather than rebound by source text"
     );
 }

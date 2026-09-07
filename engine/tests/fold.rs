@@ -35,7 +35,9 @@ async fn connect_raw(dsn: &str) -> Client {
 /// exposed (unlike `StagedChange`, which enforces the image-bearing/
 /// image-less split at the type level — these tests need to construct rows
 /// the type wouldn't let a producer build, e.g. an image-less `update`, to
-/// exercise the fold's own discriminator rather than the type's).
+/// exercise the fold's own discriminator rather than the type's). Its SQL
+/// helper intentionally writes a null relation OID to cover legacy rows; the
+/// dedicated physical-identity test below supplies non-null OIDs directly.
 #[derive(Clone)]
 struct RawRow<'a> {
     key: &'a str,
@@ -73,9 +75,9 @@ async fn insert_row(client: &Client, table: &str, row: &RawRow<'_>) {
         .execute(
             &format!(
                 "insert into {table} \
-                 (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
-                  hop_gen, group_key) \
-                 values ('orders', $1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6, $7, $8, $9)"
+                  (src_table, source_relation_oid, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \
+                   hop_gen, group_key) \
+                  values ('orders', null, $1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6, $7, $8, $9)"
             ),
             &[
                 &row.key,
@@ -741,4 +743,43 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
     );
     let post = find(&folded, "post");
     assert_eq!(post.new_image, Some(r#"{"v": "post"}"#.to_string()));
+}
+
+/// A renamed/recreated table can reuse its diagnostic name while acquiring a
+/// new OID. Fold groups the two physical sources separately, so a same-key
+/// change from one relation cannot collapse into the other.
+#[tokio::test]
+async fn fold_groups_same_named_sources_by_relation_oid() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    for (oid, value) in [(101u32, "first"), (202u32, "second")] {
+        client
+            .execute(
+                "insert into seg_0 (src_table, source_relation_oid, key, op, lsn, new_image, src_changed, hop_gen)
+                 values ('orders', $1, 'same-key', 'insert', $2, $3::text::jsonb, now(), 0)",
+                &[&oid, &PgLsn::from(oid as u64), &format!(r#"{{"v":"{value}"}}"#)],
+            )
+            .await
+            .expect("insert physical-source fixture");
+    }
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    assert_eq!(folded.len(), 2);
+    assert_eq!(folded[0].key, "same-key");
+    assert_eq!(folded[1].key, "same-key");
+    let oids: std::collections::HashSet<Option<u32>> = folded
+        .iter()
+        .map(|change| change.source_relation_oid)
+        .collect();
+    assert_eq!(
+        oids,
+        std::collections::HashSet::from([Some(101), Some(202)])
+    );
 }

@@ -268,6 +268,7 @@ fn cdc_change(
     let src_table = publication::qualify(&relation.namespace, &relation.name)?;
     Ok(StagedChange::Cdc {
         src_table,
+        source_relation_oid: Some(relation.relation_id),
         key,
         op,
         lsn: None,
@@ -385,7 +386,7 @@ pub struct Intake {
     /// `relation_id` — [`extract_key`]'s override for issue #56. Populated
     /// on each `Relation` message and never consulted for any other
     /// replica identity (see `handle_xlog_data`).
-    primary_keys: std::collections::HashMap<i32, Vec<String>>,
+    primary_keys: std::collections::HashMap<u32, Vec<String>>,
     buffer: spill::TxnBuffer,
     spill_threshold: usize,
     hard_cap: usize,
@@ -576,6 +577,7 @@ impl Intake {
                     self.buffer.push(
                         StagedChange::Truncate {
                             src_table,
+                            source_relation_oid: Some(relation.relation_id),
                             lsn: None,
                             origin_lsn: None,
                             src_changed: None,
@@ -775,6 +777,7 @@ mod tests {
         match change {
             StagedChange::Cdc {
                 src_table,
+                source_relation_oid,
                 key,
                 op,
                 old_image,
@@ -782,6 +785,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(src_table, "public.widgets");
+                assert_eq!(source_relation_oid, Some(1));
                 assert_eq!(key, "1");
                 assert_eq!(op, CdcOp::Insert);
                 assert!(old_image.is_none());

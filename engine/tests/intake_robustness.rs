@@ -52,8 +52,11 @@ async fn confirmed_lsn(client: &Client, slot: &str) -> Option<u64> {
 }
 
 fn cdc_change(table: &str, key: &str) -> StagedChange {
+    // This spill fixture has no catalog-backed source relation. Live intake
+    // supplies `Some(relation_id)` from pgoutput instead.
     StagedChange::Cdc {
         src_table: table.to_string(),
+        source_relation_oid: None,
         key: key.to_string(),
         op: CdcOp::Insert,
         lsn: None,

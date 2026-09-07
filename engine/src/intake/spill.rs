@@ -225,9 +225,13 @@ fn read_chunk(r: &mut impl Read, max: usize) -> io::Result<Vec<StagedChange>> {
 // this format is never read by anything but the same process, in the same
 // run, that wrote it.
 
-const TAG_CDC: u8 = 0;
-const TAG_RECOMPUTE: u8 = 1;
-const TAG_TRUNCATE: u8 = 2;
+// V2 adds source_relation_oid after src_table. New tags make an old spill
+// artifact fail loudly instead of being decoded with shifted field offsets.
+// Spill files are process-local temporary state, so no cross-version reader
+// is required.
+const TAG_CDC: u8 = 3;
+const TAG_RECOMPUTE: u8 = 4;
+const TAG_TRUNCATE: u8 = 5;
 
 fn write_str(w: &mut impl Write, s: &str) -> io::Result<()> {
     w.write_all(&(s.len() as u32).to_le_bytes())?;
@@ -283,10 +287,32 @@ fn read_opt_u64(r: &mut impl Read) -> io::Result<Option<u64>> {
     Ok(Some(u64::from_le_bytes(buf)))
 }
 
+fn write_opt_u32(w: &mut impl Write, v: Option<u32>) -> io::Result<()> {
+    match v {
+        None => w.write_all(&[0]),
+        Some(n) => {
+            w.write_all(&[1])?;
+            w.write_all(&n.to_le_bytes())
+        }
+    }
+}
+
+fn read_opt_u32(r: &mut impl Read) -> io::Result<Option<u32>> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    if tag[0] == 0 {
+        return Ok(None);
+    }
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(Some(u32::from_le_bytes(buf)))
+}
+
 fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
     match change {
         StagedChange::Cdc {
             src_table,
+            source_relation_oid,
             key,
             op,
             lsn,
@@ -299,6 +325,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
         } => {
             w.write_all(&[TAG_CDC])?;
             write_str(w, src_table)?;
+            write_opt_u32(w, *source_relation_oid)?;
             write_str(w, key)?;
             let op_byte = match op {
                 CdcOp::Insert => 0u8,
@@ -323,24 +350,28 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
         }
         StagedChange::Recompute {
             src_table,
+            source_relation_oid,
             key,
             hop_gen,
             group_key,
         } => {
             w.write_all(&[TAG_RECOMPUTE])?;
             write_str(w, src_table)?;
+            write_opt_u32(w, *source_relation_oid)?;
             write_str(w, key)?;
             w.write_all(&hop_gen.to_le_bytes())?;
             write_opt_str(w, group_key.as_deref())
         }
         StagedChange::Truncate {
             src_table,
+            source_relation_oid,
             lsn,
             origin_lsn,
             src_changed,
         } => {
             w.write_all(&[TAG_TRUNCATE])?;
             write_str(w, src_table)?;
+            write_opt_u32(w, *source_relation_oid)?;
             write_opt_u64(w, lsn.map(u64::from))?;
             write_opt_u64(w, origin_lsn.map(u64::from))?;
             write_opt_u64(
@@ -376,6 +407,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
     let change = match tag[0] {
         TAG_CDC => {
             let src_table = read_str(r)?;
+            let source_relation_oid = read_opt_u32(r)?;
             let key = read_str(r)?;
             let mut op_byte = [0u8; 1];
             r.read_exact(&mut op_byte)?;
@@ -402,6 +434,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let group_key = read_opt_str(r)?;
             StagedChange::Cdc {
                 src_table,
+                source_relation_oid,
                 key,
                 op,
                 lsn,
@@ -415,6 +448,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
         }
         TAG_RECOMPUTE => {
             let src_table = read_str(r)?;
+            let source_relation_oid = read_opt_u32(r)?;
             let key = read_str(r)?;
             let mut hop_gen_buf = [0u8; 4];
             r.read_exact(&mut hop_gen_buf)?;
@@ -422,6 +456,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let group_key = read_opt_str(r)?;
             StagedChange::Recompute {
                 src_table,
+                source_relation_oid,
                 key,
                 hop_gen,
                 group_key,
@@ -429,12 +464,14 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
         }
         TAG_TRUNCATE => {
             let src_table = read_str(r)?;
+            let source_relation_oid = read_opt_u32(r)?;
             let lsn = read_opt_u64(r)?.map(PgLsn::from);
             let origin_lsn = read_opt_u64(r)?.map(PgLsn::from);
             let src_changed = read_opt_u64(r)?
                 .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
             StagedChange::Truncate {
                 src_table,
+                source_relation_oid,
                 lsn,
                 origin_lsn,
                 src_changed,
@@ -457,6 +494,7 @@ mod tests {
     fn sample_cdc(key: &str) -> StagedChange {
         StagedChange::Cdc {
             src_table: "public.widgets".into(),
+            source_relation_oid: Some(0xf000_0000),
             key: key.into(),
             op: CdcOp::Update,
             lsn: None,
@@ -477,6 +515,7 @@ mod tests {
         match decoded {
             StagedChange::Cdc {
                 key,
+                source_relation_oid,
                 old_image,
                 new_image,
                 origin_lsn,
@@ -485,6 +524,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(key, "k1");
+                assert_eq!(source_relation_oid, Some(0xf000_0000));
                 assert_eq!(old_image.unwrap(), r#"{"id":"1"}"#);
                 assert_eq!(new_image.unwrap(), r#"{"id":"1","note":"hi"}"#);
                 assert_eq!(origin_lsn, Some(PgLsn::from(42)));
@@ -499,6 +539,7 @@ mod tests {
     fn round_trips_a_recompute_change() {
         let change = StagedChange::Recompute {
             src_table: "public.widgets".into(),
+            source_relation_oid: Some(43),
             key: "k2".into(),
             hop_gen: 1,
             group_key: None,
@@ -509,15 +550,42 @@ mod tests {
         match decoded {
             StagedChange::Recompute {
                 key,
+                source_relation_oid,
                 hop_gen,
                 group_key,
                 ..
             } => {
                 assert_eq!(key, "k2");
+                assert_eq!(source_relation_oid, Some(43));
                 assert_eq!(hop_gen, 1);
                 assert!(group_key.is_none());
             }
             other => panic!("expected Recompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trips_a_truncate_change() {
+        let change = StagedChange::Truncate {
+            src_table: "public.widgets".into(),
+            source_relation_oid: Some(44),
+            lsn: Some(PgLsn::from(45)),
+            origin_lsn: None,
+            src_changed: None,
+        };
+        let mut buf = Vec::new();
+        write_change(&mut buf, &change).unwrap();
+        let decoded = read_change(&mut &buf[..]).unwrap().expect("one record");
+        match decoded {
+            StagedChange::Truncate {
+                source_relation_oid,
+                lsn,
+                ..
+            } => {
+                assert_eq!(source_relation_oid, Some(44));
+                assert_eq!(lsn, Some(PgLsn::from(45)));
+            }
+            other => panic!("expected Truncate, got {other:?}"),
         }
     }
 

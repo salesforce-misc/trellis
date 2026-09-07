@@ -38,7 +38,7 @@ pub enum DecodeError {
     UnknownTupleMarker { message: &'static str, marker: u8 },
     /// An `Insert`/`Update`/`Delete` named a `relation_id` with no prior
     /// `Relation` message describing it.
-    UnknownRelation(i32),
+    UnknownRelation(u32),
     /// Text bytes weren't valid UTF-8. Text mode (the only mode this decoder
     /// supports) guarantees this in practice, but the conversion is fallible,
     /// so it's surfaced rather than `unwrap`ped.
@@ -101,11 +101,14 @@ pub struct ColumnInfo {
 }
 
 /// A decoded `Relation` message: the tuple shape for one source table,
-/// cached by `relation_id` so later `Insert`/`Update`/`Delete` messages
-/// (which carry only the id, not the shape) can be resolved against it.
+/// cached by its PostgreSQL `pg_class.oid` (`relation_id`) so later
+/// `Insert`/`Update`/`Delete` messages (which carry only that OID, not the
+/// shape) can be resolved against it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relation {
-    pub relation_id: i32,
+    /// PostgreSQL's physical relation OID (`pg_class.oid`), not a local cache
+    /// identifier or relation-name surrogate.
+    pub relation_id: u32,
     pub namespace: String,
     pub name: String,
     /// The table's replica identity as reported by the `Relation` message:
@@ -148,11 +151,11 @@ pub enum Message {
         name: String,
     },
     Insert {
-        relation_id: i32,
+        relation_id: u32,
         new: Vec<ColumnValue>,
     },
     Update {
-        relation_id: i32,
+        relation_id: u32,
         /// Present iff the server sent an old-row image: a 'K' (key-only) or
         /// 'O' (full, `REPLICA IDENTITY FULL`) section preceded the new
         /// tuple. The `bool` is `true` for key-only. Either way the tuple is
@@ -163,22 +166,21 @@ pub enum Message {
         new: Vec<ColumnValue>,
     },
     Delete {
-        relation_id: i32,
+        relation_id: u32,
         /// See [`Message::Update::old`]'s second field.
         key_only: bool,
         old: Vec<ColumnValue>,
     },
-    /// A `TRUNCATE` of one or more replicated tables. Decoded so the stream
-    /// doesn't wedge, but intake does not yet *act* on it: propagating a
-    /// truncate into the ring is a later stage. The fields are carried so
-    /// that stage needs no re-decode.
+    /// A `TRUNCATE` of one or more replicated tables. Intake stages one
+    /// sentinel per PostgreSQL relation OID after resolving it in the
+    /// relation cache.
     Truncate {
         /// `TRUNCATE` option bits (bit 0 = `CASCADE`, bit 1 = `RESTART
         /// IDENTITY`), kept raw.
         options: u8,
-        /// The `relation_id`s named by this `TRUNCATE`, each resolvable
+        /// The PostgreSQL relation OIDs named by this `TRUNCATE`, each resolvable
         /// against the [`RelationCache`] the same way DML `relation_id`s are.
-        relation_ids: Vec<i32>,
+        relation_ids: Vec<u32>,
     },
 }
 
@@ -224,7 +226,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn u32(&mut self, message: &'static str, field: &'static str) -> Result<u32, DecodeError> {
-        Ok(self.i32(message, field)? as u32)
+        let b = self.take(4, message, field)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn i64(&mut self, message: &'static str, field: &'static str) -> Result<i64, DecodeError> {
@@ -336,7 +339,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             Ok(Message::Origin { origin_lsn, name })
         }
         b'R' => {
-            let relation_id = cur.i32("Relation", "relation_id")?;
+            let relation_id = cur.u32("Relation", "relation_id")?;
             let namespace = cur.cstring("Relation", "namespace")?;
             let name = cur.cstring("Relation", "relation_name")?;
             let replica_identity = cur.u8("Relation", "replica_identity")?;
@@ -373,7 +376,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             })
         }
         b'I' => {
-            let relation_id = cur.i32("Insert", "relation_id")?;
+            let relation_id = cur.u32("Insert", "relation_id")?;
             let marker = cur.u8("Insert", "new tuple marker")?;
             if marker != b'N' {
                 return Err(DecodeError::UnknownTupleMarker {
@@ -385,7 +388,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             Ok(Message::Insert { relation_id, new })
         }
         b'U' => {
-            let relation_id = cur.i32("Update", "relation_id")?;
+            let relation_id = cur.u32("Update", "relation_id")?;
             let mut marker = cur.u8("Update", "tuple marker")?;
             let old = if marker == b'K' || marker == b'O' {
                 let key_only = marker == b'K';
@@ -409,7 +412,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             })
         }
         b'D' => {
-            let relation_id = cur.i32("Delete", "relation_id")?;
+            let relation_id = cur.u32("Delete", "relation_id")?;
             let marker = cur.u8("Delete", "tuple marker")?;
             let key_only = match marker {
                 b'K' => true,
@@ -435,7 +438,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             let options = cur.u8("Truncate", "options")?;
             let mut relation_ids = Vec::with_capacity(num_relations.max(0) as usize);
             for _ in 0..num_relations {
-                relation_ids.push(cur.i32("Truncate", "relation_id")?);
+                relation_ids.push(cur.u32("Truncate", "relation_id")?);
             }
             Ok(Message::Truncate {
                 options,
@@ -449,10 +452,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
 /// The relation cache a stream of `Insert`/`Update`/`Delete` messages must
 /// be resolved against: `pgoutput` sends a `Relation` message once (then
 /// again only if the shape changes) and every subsequent DML message for
-/// that table names only its `relation_id`.
+/// that table names only its PostgreSQL relation OID (`relation_id`).
 #[derive(Debug, Default)]
 pub struct RelationCache {
-    by_id: HashMap<i32, Relation>,
+    by_id: HashMap<u32, Relation>,
 }
 
 impl RelationCache {
@@ -464,7 +467,7 @@ impl RelationCache {
         self.by_id.insert(relation.relation_id, relation.clone());
     }
 
-    pub fn get(&self, relation_id: i32) -> Result<&Relation, DecodeError> {
+    pub fn get(&self, relation_id: u32) -> Result<&Relation, DecodeError> {
         self.by_id
             .get(&relation_id)
             .ok_or(DecodeError::UnknownRelation(relation_id))
@@ -494,7 +497,7 @@ mod tests {
     /// fixture most of the DML tests below decode against.
     fn widgets_relation_bytes() -> Vec<u8> {
         let mut b = vec![b'R'];
-        b.extend_from_slice(&7i32.to_be_bytes()); // relation_id
+        b.extend_from_slice(&7u32.to_be_bytes()); // relation_id (pg_class.oid)
         b.extend_from_slice(b"public\0");
         b.extend_from_slice(b"widgets\0");
         b.push(b'd'); // replica identity: default
@@ -531,6 +534,16 @@ mod tests {
         assert!(r.columns[0].is_key);
         assert_eq!(r.columns[1].name, "name");
         assert!(!r.columns[1].is_key);
+    }
+
+    #[test]
+    fn decodes_a_relation_oid_above_i32_max() {
+        let mut bytes = widgets_relation_bytes();
+        bytes[1..5].copy_from_slice(&0xf000_0000u32.to_be_bytes());
+        match decode(&bytes).unwrap() {
+            Message::Relation(relation) => assert_eq!(relation.relation_id, 0xf000_0000),
+            other => panic!("expected Relation, got {other:?}"),
+        }
     }
 
     #[test]

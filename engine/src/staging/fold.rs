@@ -1,5 +1,5 @@
 //! The claim-time fold (issue #10, stage 04): collapsing a sealed batch's
-//! fenced window into one record per `(src_table, key)`, entirely in SQL —
+//! fenced window into one record per `(source_relation_oid, key)`, entirely in SQL —
 //! ordered aggregates run in Postgres, not Rust-side aggregation. See
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, "The claim-time
 //! fold" and "The two kinds of missing image".
@@ -73,7 +73,7 @@ impl BucketFilter {
     }
 }
 
-/// One key's folded record: the fenced window's `(src_table, key)` group
+/// One key's folded record: the fenced window's `(source_relation_oid, key)` group
 /// collapsed to the seven fold outputs the doc's four-rule table (plus
 /// `lsn`/`hop_gen`/`first_seen`) specifies. Images cross the wire as text —
 /// see `append.rs`'s doc comment on why this crate binds jsonb via
@@ -81,6 +81,9 @@ impl BucketFilter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldedChange {
     pub src_table: String,
+    /// The authoritative PostgreSQL source relation OID. `None` represents a
+    /// legacy/manual staged row that predates relation-identity propagation.
+    pub source_relation_oid: Option<u32>,
     pub key: String,
     /// LAST image-bearing row's post-image, by `(lsn, change_id)` — highest.
     pub new_image: Option<String>,
@@ -139,12 +142,12 @@ pub struct FoldedChange {
 /// `op` rides along too — issue #60's truncate-void filter and `is_truncate`
 /// both need it, even though the fold otherwise deliberately never filters
 /// on `op` (see the discriminator comment below).
-const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
+const FOLD_COLUMNS: &str = "src_table, source_relation_oid, key, old_image::text as old_image, \
      new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, \
      group_key, appended_at, change_id, route, op";
 
 /// Runs the claim-time fold over `seg_seq`'s fenced window, restricted to
-/// `bucket`. One [`FoldedChange`] per `(src_table, key)` present in that
+/// `bucket`. One [`FoldedChange`] per `(source_relation_oid, key)` present in that
 /// window. See the module doc and docs/.../04-claiming-and-the-fold.md for
 /// the rules this SQL encodes.
 ///
@@ -211,12 +214,20 @@ pub async fn fold(
              where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) \
                and not exists ( \
                    select 1 from fenced t \
-                   where t.op = 'truncate' and t.src_table = f.src_table \
+                    where t.op = 'truncate'
+                      and ( \
+                          (t.source_relation_oid is not null \
+                           and t.source_relation_oid = f.source_relation_oid) \
+                          or (t.source_relation_oid is null \
+                              and f.source_relation_oid is null \
+                              and t.src_table = f.src_table) \
+                      ) \
                      and (t.lsn, t.change_id) > (f.lsn, f.change_id) \
                ) \
          ) \
          select \
-             src_table, \
+              (array_agg(src_table order by lsn desc nulls last, change_id desc))[1] as src_table, \
+              source_relation_oid, \
              key, \
              (array_agg(new_image order by lsn desc, change_id desc) \
                  filter (where old_image is not null or new_image is not null))[1] as new_image, \
@@ -231,7 +242,9 @@ pub async fn fold(
                  filter (where group_key is not null))[1] as group_key, \
              bool_or(op = 'truncate') as is_truncate \
          from filtered \
-         group by src_table, key"
+          group by source_relation_oid, \
+                   case when source_relation_oid is null then src_table end, \
+                   key"
     );
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
@@ -246,16 +259,17 @@ pub async fn fold(
         .into_iter()
         .map(|row| FoldedChange {
             src_table: row.get(0),
-            key: row.get(1),
-            new_image: row.get(2),
-            old_image: row.get(3),
-            src_changed: row.get(4),
-            origin_lsn: row.get(5),
-            lsn: row.get(6),
-            hop_gen: row.get(7),
-            first_seen: row.get(8),
-            group_key: row.get(9),
-            is_truncate: row.get(10),
+            source_relation_oid: row.get(1),
+            key: row.get(2),
+            new_image: row.get(3),
+            old_image: row.get(4),
+            src_changed: row.get(5),
+            origin_lsn: row.get(6),
+            lsn: row.get(7),
+            hop_gen: row.get(8),
+            first_seen: row.get(9),
+            group_key: row.get(10),
+            is_truncate: row.get(11),
         })
         .collect())
 }

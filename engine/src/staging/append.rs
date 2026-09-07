@@ -79,6 +79,9 @@ pub enum StagedChange {
     /// CDC intake's shape: an image-bearing decoded change.
     Cdc {
         src_table: String,
+        /// The PostgreSQL source relation OID. `None` is reserved for legacy
+        /// staged rows and manual producers that have no resolved relation.
+        source_relation_oid: Option<u32>,
         key: String,
         op: CdcOp,
         lsn: Option<PgLsn>,
@@ -95,6 +98,9 @@ pub enum StagedChange {
     /// this key."
     Recompute {
         src_table: String,
+        /// See [`StagedChange::Cdc::source_relation_oid`]. Resolved backfills
+        /// supply this; legacy/manual recomputes may intentionally omit it.
+        source_relation_oid: Option<u32>,
         key: String,
         hop_gen: i32,
         group_key: Option<String>,
@@ -109,6 +115,8 @@ pub enum StagedChange {
     /// from the source, it is never a re-propagated downstream change.
     Truncate {
         src_table: String,
+        /// PostgreSQL's OID for the truncated source relation.
+        source_relation_oid: Option<u32>,
         lsn: Option<PgLsn>,
         origin_lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
@@ -133,6 +141,7 @@ impl StagedChange {
 /// references into it rather than cloning every field.
 struct ChangeRow<'a> {
     src_table: &'a str,
+    source_relation_oid: Option<u32>,
     key: &'a str,
     op: &'static str,
     lsn: Option<PgLsn>,
@@ -149,6 +158,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
         match change {
             StagedChange::Cdc {
                 src_table,
+                source_relation_oid,
                 key,
                 op,
                 lsn,
@@ -160,6 +170,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 group_key,
             } => ChangeRow {
                 src_table,
+                source_relation_oid: *source_relation_oid,
                 key,
                 op: op.as_sql(),
                 lsn: *lsn,
@@ -172,11 +183,13 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
             },
             StagedChange::Recompute {
                 src_table,
+                source_relation_oid,
                 key,
                 hop_gen,
                 group_key,
             } => ChangeRow {
                 src_table,
+                source_relation_oid: *source_relation_oid,
                 key,
                 op: "recompute",
                 lsn: None,
@@ -189,11 +202,13 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
             },
             StagedChange::Truncate {
                 src_table,
+                source_relation_oid,
                 lsn,
                 origin_lsn,
                 src_changed,
             } => ChangeRow {
                 src_table,
+                source_relation_oid: *source_relation_oid,
                 key: TRUNCATE_SENTINEL_KEY,
                 op: "truncate",
                 lsn: *lsn,
@@ -247,12 +262,12 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
         .get(0);
     let table = ring_table_name(ring_slot)?;
 
-    const COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, hop_gen, group_key";
-    const COLS_PER_ROW: usize = 10;
+    const COLUMNS: &str = "src_table, source_relation_oid, key, op, lsn, old_image, new_image, origin_lsn, src_changed, hop_gen, group_key";
+    const COLS_PER_ROW: usize = 11;
     // Postgres's wire protocol caps a Bind message's parameter count at
-    // i16::MAX (65535); 6000 rows keeps every chunk's param count
-    // (60000) safely under that regardless of column count.
-    const MAX_ROWS_PER_STATEMENT: usize = 6000;
+    // i16::MAX (65535); 5900 rows keeps every chunk's parameter count
+    // (64900) safely under that regardless of column count.
+    const MAX_ROWS_PER_STATEMENT: usize = 5900;
 
     let rows: Vec<ChangeRow<'_>> = changes.iter().map(ChangeRow::from).collect();
 
@@ -265,7 +280,7 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
             }
             let base = i * COLS_PER_ROW;
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}::text::jsonb, ${}::text::jsonb, ${}, ${}, ${}, ${})",
                 base + 1,
                 base + 2,
                 base + 3,
@@ -276,8 +291,10 @@ pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(
                 base + 8,
                 base + 9,
                 base + 10,
+                base + 11,
             ));
             params.push(&row.src_table);
+            params.push(&row.source_relation_oid);
             params.push(&row.key);
             params.push(&row.op);
             params.push(&row.lsn);

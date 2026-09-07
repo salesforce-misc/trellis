@@ -79,8 +79,11 @@ async fn seg_0_count(client: &Client) -> i64 {
 }
 
 fn insert_change(table: &str, key: &str) -> StagedChange {
+    // This linchpin fixture models an already-legacy/direct staged change;
+    // live pgoutput intake always supplies the PostgreSQL relation OID.
     StagedChange::Cdc {
         src_table: table.to_string(),
+        source_relation_oid: None,
         key: key.to_string(),
         op: CdcOp::Insert,
         lsn: None,
@@ -392,15 +395,23 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
     }
 
     let staged = observer
-        .query_one("select src_table, key, op from seg_0", &[])
+        .query_one(
+            "select src_table, source_relation_oid, key, op from seg_0",
+            &[],
+        )
         .await
         .expect("query staged row");
     let src_table: String = staged.get(0);
-    let key: String = staged.get(1);
-    let op: String = staged.get(2);
+    let source_relation_oid: Option<u32> = staged.get(1);
+    let key: String = staged.get(2);
+    let op: String = staged.get(3);
     // Unqualified DDL lands in the first schema on `search_path`, so the
     // namespace is `trellis`, not `public`.
     assert_eq!(src_table, format!("{DEFAULT_SCHEMA}.widgets"));
+    assert!(
+        source_relation_oid.is_some(),
+        "CDC must retain the source OID"
+    );
     assert_eq!(key, "1");
     assert_eq!(op, "insert");
 
@@ -492,13 +503,21 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
     }
 
     let staged = observer
-        .query_one("select src_table, key, op from seg_0", &[])
+        .query_one(
+            "select src_table, source_relation_oid, key, op from seg_0",
+            &[],
+        )
         .await
         .expect("query staged row");
     let src_table: String = staged.get(0);
-    let key: String = staged.get(1);
-    let op: String = staged.get(2);
+    let source_relation_oid: Option<u32> = staged.get(1);
+    let key: String = staged.get(2);
+    let op: String = staged.get(3);
     assert_eq!(src_table, format!("{DEFAULT_SCHEMA}.priced_widgets"));
+    assert!(
+        source_relation_oid.is_some(),
+        "CDC must retain the source OID"
+    );
     assert_eq!(
         key, "1",
         "the extracted key must be just the primary key, not the whole \
@@ -593,17 +612,22 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
 
     let staged = observer
         .query_one(
-            "select src_table, key, old_image::text, new_image::text \
+            "select src_table, source_relation_oid, key, old_image::text, new_image::text \
              from seg_0 where op = 'truncate'",
             &[],
         )
         .await
         .expect("query staged truncate row");
     let src_table: String = staged.get(0);
-    let key: String = staged.get(1);
-    let old_image: Option<String> = staged.get(2);
-    let new_image: Option<String> = staged.get(3);
+    let source_relation_oid: Option<u32> = staged.get(1);
+    let key: String = staged.get(2);
+    let old_image: Option<String> = staged.get(3);
+    let new_image: Option<String> = staged.get(4);
     assert_eq!(src_table, format!("{DEFAULT_SCHEMA}.widgets"));
+    assert!(
+        source_relation_oid.is_some(),
+        "truncate must retain the source OID"
+    );
     assert_eq!(key, TRUNCATE_SENTINEL_KEY);
     assert_eq!(old_image, None, "a truncate sentinel must be image-less");
     assert_eq!(new_image, None, "a truncate sentinel must be image-less");

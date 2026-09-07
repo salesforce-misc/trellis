@@ -21,6 +21,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::IntakeError;
+use crate::defs::SourceRelation;
 use crate::pool::quote_ident;
 use crate::staging::append::{self, StagedChange};
 use crate::staging::session::ProducerSession;
@@ -227,18 +228,17 @@ async fn fetch_pending_backfills(
 
 async fn primary_key_columns(
     txn: &Transaction<'_>,
-    schema: &str,
-    table: &str,
+    source_relation_oid: u32,
 ) -> Result<Vec<String>, IntakeError> {
     let rows = txn
         .query(
             "select a.attname \
              from pg_index i \
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) \
-             where i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
-               and i.indisprimary \
-             order by array_position(i.indkey, a.attnum)",
-            &[&schema, &table],
+              where i.indrelid = $1 \
+                and i.indisprimary \
+              order by array_position(i.indkey, a.attnum)",
+            &[&source_relation_oid],
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
@@ -257,7 +257,7 @@ const BACKFILL_PAGE_ROWS: i64 = 10_000;
 /// schema/table it selects from does.
 const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 
-/// Enumerates `src_table`'s current rows as image-less
+/// Enumerates `source`'s current rows as image-less
 /// [`StagedChange::Recompute`] triggers — the shape that asserts nothing
 /// about a row's state, which is all a backfill actually knows ("this key
 /// exists as of now," not any particular before/after image) — and appends
@@ -277,13 +277,34 @@ const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 /// property as the definition model becomes first-class.
 pub(crate) async fn enumerate_and_append(
     txn: &Transaction<'_>,
-    src_table: &str,
+    source: &SourceRelation,
 ) -> Result<(), IntakeError> {
-    let (schema, table) = split_qualified(src_table)?;
-    let pk_cols = primary_key_columns(txn, schema, table).await?;
+    // Bind the OID directly, so an already-resolved source never rebinds by
+    // name if it is concurrently dropped and recreated. The row lock keeps
+    // the bound relation alive while its cursor is enumerated.
+    let metadata = txn
+        .query_opt(
+            "select n.nspname, c.relname \
+             from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             where c.oid = $1 for share",
+            &[&source.oid],
+        )
+        .await?
+        .ok_or_else(|| IntakeError::InvalidTableName(format!("relation OID {}", source.oid)))?;
+    let schema: String = metadata.get(0);
+    let table: String = metadata.get(1);
+    let src_table = qualify(&schema, &table)?;
+    txn.batch_execute(&format!(
+        "lock table {}.{} in share mode",
+        quote_ident(&schema),
+        quote_ident(&table)
+    ))
+    .await?;
+    let pk_cols = primary_key_columns(txn, source.oid).await?;
     if pk_cols.is_empty() {
         return Err(IntakeError::MissingKeyValue {
-            table: src_table.to_string(),
+            table: src_table.clone(),
         });
     }
     let select_list = pk_cols
@@ -293,8 +314,8 @@ pub(crate) async fn enumerate_and_append(
         .join(", ");
     txn.batch_execute(&format!(
         "declare {BACKFILL_CURSOR} cursor for select {select_list} from {}.{}",
-        quote_ident(schema),
-        quote_ident(table)
+        quote_ident(&schema),
+        quote_ident(&table)
     ))
     .await?;
     loop {
@@ -314,7 +335,8 @@ pub(crate) async fn enumerate_and_append(
                 .collect::<Vec<_>>()
                 .join("\u{1f}");
             page.push(StagedChange::Recompute {
-                src_table: src_table.to_string(),
+                src_table: src_table.clone(),
+                source_relation_oid: Some(source.oid),
                 key,
                 hop_gen: 0,
                 group_key: None,
@@ -347,7 +369,8 @@ pub async fn run_pending_backfills(
             continue;
         }
         let txn = client.transaction().await?;
-        enumerate_and_append(&txn, &marker.table).await?;
+        let source = resolve_source_relation(&txn, &marker.table).await?;
+        enumerate_and_append(&txn, &source).await?;
         txn.execute(
             "delete from pending_backfill where table_name = $1",
             &[&marker.table],
@@ -420,7 +443,8 @@ pub async fn initial_snapshot_handshake(
     // once (see its own doc comment: it just reads the ring pointer and
     // inserts).
     for table in tables {
-        enumerate_and_append(&txn, table).await?;
+        let source = resolve_source_relation(&txn, table).await?;
+        enumerate_and_append(&txn, &source).await?;
     }
     txn.execute(
         "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
@@ -429,6 +453,30 @@ pub async fn initial_snapshot_handshake(
     .await?;
     txn.commit().await?;
     Ok(())
+}
+
+/// Resolves a configured table spelling once at a backfill boundary. All
+/// generated recompute rows thereafter carry this physical OID; no staging or
+/// fold path resolves `src_table` presentation text.
+async fn resolve_source_relation(
+    txn: &Transaction<'_>,
+    src_table: &str,
+) -> Result<SourceRelation, IntakeError> {
+    let row = txn
+        .query_opt(
+            "select c.oid, n.nspname, c.relname \
+             from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             where c.oid = pg_catalog.to_regclass($1)",
+            &[&src_table],
+        )
+        .await?
+        .ok_or_else(|| IntakeError::InvalidTableName(src_table.to_string()))?;
+    Ok(SourceRelation {
+        oid: row.get(0),
+        schema: row.get(1),
+        name: row.get(2),
+    })
 }
 
 /// Whether `slot` exists in `pg_replication_slots` but has no

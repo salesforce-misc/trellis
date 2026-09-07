@@ -39,6 +39,7 @@ use std::fmt;
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType};
+use super::catalog::CatalogError;
 use super::validate::ValidationError;
 
 /// The Postgres column type for a calculated field or grouping column of a
@@ -80,6 +81,8 @@ pub enum DdlError {
     InvalidDefinition(ValidationError),
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
+    /// Binding the materialized table into the transform catalog failed.
+    Catalog(CatalogError),
     /// Acquiring a connection from the pool failed.
     Pool(crate::error::Error),
 }
@@ -102,6 +105,7 @@ impl fmt::Display for DdlError {
                 write!(f, "target-table DDL database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
+            DdlError::Catalog(err) => write!(f, "target-table catalog binding error: {err}"),
             DdlError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
         }
     }
@@ -113,6 +117,7 @@ impl std::error::Error for DdlError {
             DdlError::NoPrimaryKey { .. } | DdlError::CompositePrimaryKeyUnsupported { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
             DdlError::Db(err) => Some(err),
+            DdlError::Catalog(err) => Some(err),
             DdlError::Pool(err) => Some(err),
         }
     }
@@ -121,6 +126,12 @@ impl std::error::Error for DdlError {
 impl From<tokio_postgres::Error> for DdlError {
     fn from(err: tokio_postgres::Error) -> Self {
         DdlError::Db(err)
+    }
+}
+
+impl From<CatalogError> for DdlError {
+    fn from(err: CatalogError) -> Self {
+        DdlError::Catalog(err)
     }
 }
 
@@ -229,6 +240,7 @@ pub async fn create_target_table(
 
     let client = pool.get().await?;
     client.batch_execute(&sql).await?;
+    super::catalog::bind_target_relation(pool, &def.target, target_schema).await?;
     Ok(())
 }
 
@@ -366,6 +378,7 @@ pub async fn create_aggregate_target_table(
 
     let client = pool.get().await?;
     client.batch_execute(&sql).await?;
+    super::catalog::bind_target_relation(pool, &def.target, target_schema).await?;
     Ok(())
 }
 

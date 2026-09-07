@@ -548,6 +548,18 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
         Some(r#"{"order_id":"10","amount":"5.00"}"#),
     )
     .await;
+    let source_oid: u32 = client
+        .query_one("select 'order_items'::regclass::oid", &[])
+        .await
+        .expect("read source OID")
+        .get(0);
+    client
+        .execute(
+            "update seg_0 set source_relation_oid = $1::oid where src_table = 'order_items'",
+            &[&source_oid],
+        )
+        .await
+        .expect("bind staged aggregate change to its source OID");
     let seg_seq = seal_active_segment(&mut client).await;
 
     let mut phase1_client = db.pool.get().await.expect("connection");
@@ -584,7 +596,9 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
     .await
     .expect_err("order_items' version moved since compute; the fence must trip");
     match &err {
-        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "order_items"),
+        ApplyError::VersionFenceMiss { src_table } => {
+            assert_eq!(src_table.as_str(), format!("{DEFAULT_SCHEMA}.order_items"))
+        }
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
     txn.rollback().await.expect("rollback phase 3");
@@ -668,6 +682,58 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
     .expect("an unrelated source's version change must not trip this batch's fence");
     txn.commit().await.expect("commit phase 3");
     assert_eq!(outcome.keys_written, 1);
+}
+
+/// A bound aggregate target must continue to receive writes after its physical
+/// relation is renamed and moved. The logical target name is intentionally no
+/// longer resolvable when Phase 3 executes.
+#[tokio::test]
+async fn aggregate_writes_follow_the_bound_target_after_rename_and_schema_move() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema moved_target;
+             create table order_items (id integer primary key, order_id integer, amount numeric)",
+        )
+        .await
+        .expect("create source");
+
+    let def = setup(&db).await;
+    client
+        .batch_execute(
+            "alter table order_summary rename to moved_order_summary;
+             alter table moved_order_summary set schema moved_target;
+             insert into order_items (id, order_id, amount) values (1, 10, 5.00)",
+        )
+        .await
+        .expect("move target and seed source");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "order_items",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"order_id":"10","amount":"5.00"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 1);
+
+    let total: String = client
+        .query_one(
+            "select total::text from moved_target.moved_order_summary where order_id = 10",
+            &[],
+        )
+        .await
+        .expect("read moved aggregate target")
+        .get(0);
+    assert_eq!(total, "5.00");
+    assert_eq!(read_oracle(&client, &def).await.len(), 1);
 }
 
 /// Two batches, drained concurrently (two separate transactions), that
