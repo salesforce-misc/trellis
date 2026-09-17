@@ -27,7 +27,7 @@ use regex::Regex;
 
 use crate::numeric::{Numeric, NumericParseError};
 
-use super::ast::{Expr, FieldDef, KeySpace, Operator, TransformDef, ValueType};
+use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Operator, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
 use crate::error_code::ErrorCode;
 
@@ -457,19 +457,31 @@ pub fn evaluate_with_relationships_excluding(
     Ok(cache)
 }
 
-/// Every `<rel>.<column>` relationship reference in `def`'s field expressions,
-/// as `(relationship_name, column)` pairs — both bare to-one paths
-/// ([`Expr::RelationshipPath`]) and aggregate-wrapped to-many paths
-/// (`SUM(<rel>.<column>)`, which parse to a [`Expr::FunctionCall`] whose sole
-/// argument is a path). The staging reverse-recompute path (issue #30) uses
-/// this to learn which relationships a target reads — and which of their
-/// to-side columns — so it can build a [`RelationshipContext`] for the
-/// from-side recompute without re-walking the AST itself. Pairs may repeat if
-/// the same reference appears in more than one field; the caller dedups.
+/// Every `<rel>.<column>` relationship reference in `def`'s field expressions
+/// *and* (issue #137) its `GROUP BY` keys, as `(relationship_name, column)`
+/// pairs — bare to-one paths ([`Expr::RelationshipPath`]), aggregate-wrapped
+/// to-many paths (`SUM(<rel>.<column>)`, which parse to a
+/// [`Expr::FunctionCall`] whose sole argument is a path), and a to-one
+/// relationship path used as a [`super::ast::KeySpace::Aggregate`] `GROUP BY`
+/// key. The staging reverse-recompute path (issue #30) uses this to learn
+/// which relationships a target reads — and which of their to-side columns —
+/// so it can build a [`RelationshipContext`] for the from-side recompute
+/// without re-walking the AST itself; [`super::catalog::resolve_relationships`]
+/// uses it the same way to resolve every relationship the validator needs to
+/// check, regardless of whether a definition reads it via a field or a
+/// `GROUP BY` key. Pairs may repeat if the same reference appears more than
+/// once; the caller dedups.
 pub fn relationship_references(def: &TransformDef) -> Vec<(String, String)> {
     let mut refs = Vec::new();
     for field in &def.fields {
         collect_relationship_refs(&field.expr, &mut refs);
+    }
+    if let KeySpace::Aggregate { group_by } = &def.key_space {
+        for key in group_by {
+            if let GroupByKey::RelationshipPath { rel, column } = key {
+                refs.push((rel.clone(), column.clone()));
+            }
+        }
     }
     refs
 }
@@ -844,7 +856,16 @@ pub fn evaluate_aggregate(
         panic!("evaluate_aggregate called on a non-aggregate definition");
     };
     assert!(!rows.is_empty(), "a group must have at least one row");
-    let group_by: HashSet<&str> = group_by.iter().map(String::as_str).collect();
+    // A `GroupByKey::RelationshipPath` group key is never representable here
+    // (this pure evaluator carries no relationship data — see this
+    // function's module doc comment on `fold_aggregate`'s own
+    // relationship-free `RelationshipContext::default()`); a caller with one
+    // must first substitute it (and any field referencing it bare) for a
+    // synthetic `Column`, mirroring `staging::apply_aggregate`'s forward
+    // relationship shape for fields. Keying this set by each entry's target
+    // column name keeps a plain-column `GROUP BY` (the overwhelmingly common
+    // case) byte-identical to before issue #137.
+    let group_by: HashSet<&str> = group_by.iter().map(|k| k.target_column_name()).collect();
 
     let fields_by_name: HashMap<&str, &FieldDef> =
         def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -1863,7 +1884,10 @@ mod tests {
             target: "t".to_string(),
             source: "s".to_string(),
             key_space: KeySpace::Aggregate {
-                group_by: group_by.iter().map(|s| s.to_string()).collect(),
+                group_by: group_by
+                    .iter()
+                    .map(|s| GroupByKey::Column(s.to_string()))
+                    .collect(),
             },
             fields,
             predicate: Predicate::True,

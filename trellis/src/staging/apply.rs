@@ -31,7 +31,7 @@ use std::sync::Arc;
 use tokio_postgres::types::{PgLsn, ToSql};
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType};
+use crate::defs::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::eval::{
@@ -1081,6 +1081,19 @@ struct ReverseAggregateShape {
     /// parent's old/new image into a live from-side row before evaluating
     /// it (see [`augment_row_with_relationship_value`]).
     synthetic_columns: Vec<(String, String)>,
+    /// The row-column name [`apply_aggregate::derive_group_key`] should read
+    /// for each of `template`'s `GROUP BY` keys, in order — a plain key's
+    /// own column name (present on the from-side row as-is), or (issue #137)
+    /// a relationship-path key's synthetic column name from
+    /// `synthetic_columns` (present only on an *augmented* row — see
+    /// [`augment_row_with_relationship_value`]). `template.group_by` itself
+    /// cannot be reused for this: it holds each key's **target** column name
+    /// (`author`, say), never the synthetic name
+    /// (`__trellis_rev_author`-shaped) an augmented row actually carries —
+    /// reading `template.group_by` directly against an augmented row would
+    /// silently find nothing for a relationship-path key and always resolve
+    /// it to `NULL`.
+    group_by_row_columns: Vec<String>,
 }
 
 /// One to-one relationship's parent-keyed reverse record (issue #131),
@@ -1380,32 +1393,62 @@ async fn build_reverse_relationship_shape(
             continue;
         }
 
+        // Design fork 4 above already excludes any `def` whose `GROUP BY`
+        // reads `rel.def.name` — and design fork 3 excludes more than one
+        // distinct relationship reference — so every key reaching here is a
+        // plain column; `relationships` (this relationship only) is passed
+        // anyway for a defensive, generically-correct lookup rather than
+        // assuming that invariant holds forever.
         let group_by_types: Vec<ValueType> = group_by
             .iter()
-            .map(|c| {
-                def.source_columns
+            .map(|key| match key {
+                GroupByKey::Column(c) => def
+                    .source_columns
                     .get(c)
                     .copied()
-                    .unwrap_or(ValueType::Numeric)
+                    .unwrap_or(ValueType::Numeric),
+                GroupByKey::RelationshipPath { rel: r, column } => relationships
+                    .get(r)
+                    .and_then(|res| res.column_types.get(column))
+                    .copied()
+                    .unwrap_or(ValueType::Numeric),
             })
             .collect();
         let field_exprs: HashMap<String, Expr> = substituted_exprs
             .into_iter()
-            .filter(|(name, _)| !group_by.contains(name))
+            .filter(|(name, _)| !group_by_contains(group_by, name))
             .collect();
         let template = AggregateTargetPlan::new(
-            group_by.clone(),
+            group_by,
             group_by_types,
             field_plans,
             qualified_from_table.clone(),
             def.target_table.clone(),
             field_exprs,
-            // No live JOIN needed: the triggering relationship's value comes
-            // from the parent's old/new image via a synthetic column below,
-            // not a SQL join back to the to-side table — and design fork 3
-            // already ruled out any *other* relationship reference reaching
-            // here.
-            Vec::new(),
+            // Every per-row contribution below resolves the relationship's
+            // value from the parent's old/new image via a synthetic column,
+            // never a live join — but `apply_aggregate::probe_group_exists`
+            // (called generically by `apply_aggregate_target` for every
+            // non-forced delta group, reverse-fast-path groups included)
+            // still needs this join wired whenever a `GROUP BY` key itself
+            // reads the relationship (issue #137): "does the source still
+            // have any row for this (tag, author) tuple" is a question about
+            // *all* of `post_tags`, not just the rows this one change
+            // touched, so it has no synthetic-column shortcut and must join
+            // back to the live to-side table — exactly the same live-join
+            // existence check the forward path's `probe_group_exists` has
+            // always used for a relationship-reading target, #136 never
+            // touched that (it only replaced live-join *value* reads with
+            // the settled projection, not the boolean existence probe).
+            // Design fork 3 already ensures `rel` is the only relationship
+            // this shape could possibly need, so this is always exactly one
+            // join, never a second lookup.
+            vec![apply_aggregate::RelJoin {
+                name: rel.def.name.clone(),
+                to_table: rel.def.to_table.clone(),
+                to_col: rel.def.to_col.clone(),
+                from_col: rel.def.from_col.clone(),
+            }],
         );
 
         let mut synthetic_columns = Vec::new();
@@ -1430,6 +1473,18 @@ async fn build_reverse_relationship_shape(
             substitute_relationship_path(&mut field.expr, &rel.def.name, &synthetic_map);
         }
         let contribution_def = apply_aggregate::contribution_def(&rewritten);
+        // Issue #137: see `ReverseAggregateShape::group_by_row_columns`'s
+        // own doc comment — `synthetic_map` already carries an entry for
+        // every relationship-path `GROUP BY` key's column (via `rel_refs`,
+        // which `eval::relationship_references` now includes group-by
+        // references in), whether or not any field also reads it.
+        let group_by_row_columns: Vec<String> = group_by
+            .iter()
+            .map(|key| match key {
+                GroupByKey::Column(name) => name.clone(),
+                GroupByKey::RelationshipPath { column, .. } => synthetic_map[column].clone(),
+            })
+            .collect();
 
         aggregate_shapes.push(ReverseAggregateShape {
             target: def.target_table.clone(),
@@ -1437,6 +1492,7 @@ async fn build_reverse_relationship_shape(
             contribution_def,
             source_columns,
             synthetic_columns,
+            group_by_row_columns,
         });
     }
 
@@ -3980,15 +4036,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // Aggregate dispatch (issue #11): fold this source's changes
             // into per-group deltas on `def.def.target`'s aggregate plan,
             // via `apply_aggregate` rather than duplicating its logic here.
-            let group_by_types: Vec<ValueType> = group_by
-                .iter()
-                .map(|c| {
-                    def.source_columns
-                        .get(c)
-                        .copied()
-                        .unwrap_or(ValueType::Numeric)
-                })
-                .collect();
+            //
             // Substitute cross-field-alias references (e.g. `double_total =
             // total + total` where `total` is itself a field) once up front,
             // so classification and the plan's rendered `field_exprs` share
@@ -3999,10 +4047,27 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // Issue #94: a to-one relationship path an aggregate field folds
             // (`SUM(post.word_count)`) needs its relationship's endpoints (to
             // build the recompute's LEFT JOIN) and its to-side column's type
-            // (to type the target column). Both come from the same catalog
-            // resolution `defs::catalog` validates against; a relationship-free
-            // aggregate resolves to an empty map and costs one cheap no-op.
+            // (to type the target column). Issue #137: a `GROUP BY` key can
+            // read a relationship too, typed the same way. Both come from the
+            // same catalog resolution `defs::catalog` validates against; a
+            // relationship-free aggregate resolves to an empty map and costs
+            // one cheap no-op.
             let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+            let group_by_types: Vec<ValueType> = group_by
+                .iter()
+                .map(|key| match key {
+                    GroupByKey::Column(c) => def
+                        .source_columns
+                        .get(c)
+                        .copied()
+                        .unwrap_or(ValueType::Numeric),
+                    GroupByKey::RelationshipPath { rel, column } => relationships
+                        .get(rel)
+                        .and_then(|r| r.column_types.get(column))
+                        .copied()
+                        .unwrap_or(ValueType::Numeric),
+                })
+                .collect();
             let field_plans = apply_aggregate::classify_fields(
                 &def.def,
                 group_by,
@@ -4041,13 +4106,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             rel_joins.sort_by(|a, b| a.name.cmp(&b.name));
             let field_exprs: HashMap<String, crate::defs::ast::Expr> = substituted_exprs
                 .into_iter()
-                .filter(|(name, _)| !group_by.contains(name))
+                .filter(|(name, _)| !group_by_contains(group_by, name))
                 .collect();
             let target_plan = aggregate_targets
                 .entry(def.def.target.clone())
                 .or_insert_with(|| {
                     AggregateTargetPlan::new(
-                        group_by.clone(),
+                        group_by,
                         group_by_types,
                         field_plans,
                         qualified_source.to_string(),
@@ -5266,6 +5331,24 @@ pub async fn apply_and_mark_drained_many(
             let mut target_plan = agg_shape.template.clone();
             let mut regex_cache = eval::RegexCache::new();
 
+            // Issue #137: a `GROUP BY` key can itself read this relationship
+            // (`GROUP BY tag, post.author`), in which case a from-side row's
+            // *group* — not just its contribution — can move as a pure side
+            // effect of the to-side row's own change, even though the
+            // from-side row itself never changed. `old_augmented`/
+            // `new_augmented` resolve the relationship's value from the old
+            // and new parent images respectively (never a live read), so the
+            // old and new group keys can differ here exactly the way an
+            // ordinary same-row CDC `UPDATE` can move a row between groups
+            // in `accumulate_changes`'s own grain-migration branch — this
+            // mirrors that branch's split (`sub_contributions` from the old
+            // group, `add_contributions` to the new one) rather than
+            // `diff_contributions`'s single-group assumption, whenever the
+            // two keys disagree. For a plain-column-only `GROUP BY` (the
+            // overwhelmingly common case), `old_group_key` and
+            // `new_group_key` are always equal (neither depends on the
+            // augmented/synthetic columns at all), so this takes the
+            // `diff_contributions` branch exactly as before issue #137.
             let diff_pass = async |txn: &Transaction<'_>,
                                    target_plan: &mut AggregateTargetPlan,
                                    regex_cache: &mut eval::RegexCache,
@@ -5292,8 +5375,14 @@ pub async fn apply_and_mark_drained_many(
                         &agg_shape.synthetic_columns,
                         new_parent,
                     );
-                    let (values, group_key) =
-                        apply_aggregate::derive_group_key(&new_augmented, &target_plan.group_by);
+                    let (old_values, old_group_key) = apply_aggregate::derive_group_key(
+                        &old_augmented,
+                        &agg_shape.group_by_row_columns,
+                    );
+                    let (new_values, new_group_key) = apply_aggregate::derive_group_key(
+                        &new_augmented,
+                        &agg_shape.group_by_row_columns,
+                    );
                     let old_contrib = apply_aggregate::row_contribution(
                         &agg_shape.contribution_def,
                         &old_augmented,
@@ -5306,17 +5395,41 @@ pub async fn apply_and_mark_drained_many(
                         &agg_shape.source_columns,
                         regex_cache,
                     )?;
-                    let group = target_plan
-                        .groups
-                        .entry(group_key)
-                        .or_insert_with(|| apply_aggregate::GroupPlan::new(values));
-                    group.hop_gen = group.hop_gen.max(record.hop_gen);
-                    apply_aggregate::diff_contributions(
-                        &target_plan.fields,
-                        group,
-                        &old_contrib,
-                        &new_contrib,
-                    );
+                    if old_group_key == new_group_key {
+                        let group = target_plan
+                            .groups
+                            .entry(new_group_key)
+                            .or_insert_with(|| apply_aggregate::GroupPlan::new(new_values));
+                        group.hop_gen = group.hop_gen.max(record.hop_gen);
+                        apply_aggregate::diff_contributions(
+                            &target_plan.fields,
+                            group,
+                            &old_contrib,
+                            &new_contrib,
+                        );
+                    } else {
+                        let old_group = target_plan
+                            .groups
+                            .entry(old_group_key)
+                            .or_insert_with(|| apply_aggregate::GroupPlan::new(old_values));
+                        old_group.hop_gen = old_group.hop_gen.max(record.hop_gen);
+                        apply_aggregate::sub_contributions(
+                            &target_plan.fields,
+                            old_group,
+                            &old_contrib,
+                        );
+
+                        let new_group = target_plan
+                            .groups
+                            .entry(new_group_key)
+                            .or_insert_with(|| apply_aggregate::GroupPlan::new(new_values));
+                        new_group.hop_gen = new_group.hop_gen.max(record.hop_gen);
+                        apply_aggregate::add_contributions(
+                            &target_plan.fields,
+                            new_group,
+                            &new_contrib,
+                        );
+                    }
                 }
                 Ok(())
             };

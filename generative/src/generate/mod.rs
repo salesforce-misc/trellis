@@ -218,7 +218,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 
 use crate::model::{
     Cardinality, Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op,
@@ -1028,7 +1030,7 @@ pub fn build_program_multi_with_shapes(
                     );
                     (
                         KeySpace::Aggregate {
-                            group_by: vec![grain_col],
+                            group_by: vec![GroupByKey::Column(grain_col)],
                         },
                         fields,
                     )
@@ -2099,7 +2101,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
         target: pool.next_table_name(),
         source: table.name.clone(),
         key_space: KeySpace::Aggregate {
-            group_by: vec![grain.clone()],
+            group_by: vec![GroupByKey::Column(grain.clone())],
         },
         fields: vec![
             FieldDef {
@@ -2211,7 +2213,8 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
         KeySpace::Aggregate { group_by } => match op {
             Op::Insert { row, .. } => {
                 let mut parts = Vec::with_capacity(group_by.len());
-                for column in group_by {
+                for key in group_by {
+                    let column = key.target_column_name();
                     let value = row.iter().find(|(name, _)| name == column)?.1.clone();
                     // A `NULL` grouping value is itself a value Postgres's
                     // `GROUP BY` treats as one group (nulls compare equal for

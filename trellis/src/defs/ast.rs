@@ -83,12 +83,75 @@ pub struct RelationshipDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySpace {
     OneToOne,
-    /// `group_by` holds the source column names named after `GROUP BY`, in
-    /// the order they were written — that order becomes the target table's
-    /// composite primary key column order.
+    /// `group_by` holds the keys named after `GROUP BY`, in the order they
+    /// were written — that order becomes the target table's composite
+    /// primary key column order. Issue #137 widened each key from a bare
+    /// source column name to [`GroupByKey`], which also admits a to-one
+    /// relationship path (`rel.column`).
     Aggregate {
-        group_by: Vec<String>,
+        group_by: Vec<GroupByKey>,
     },
+}
+
+/// One `GROUP BY` key (issue #137): either a plain source column, or a
+/// to-one relationship path (`rel.column`) — grouping by a linked row's
+/// column without that column ever appearing on the source table itself
+/// (e.g. `GROUP BY tag, post.author` on `post_tags`, where `author` lives on
+/// `posts` via the `post` relationship). A **to-many** relationship path is
+/// rejected by the validator, not represented here — grouping by "the many
+/// child rows on the other end of a to-many relationship" has no defined
+/// semantics.
+///
+/// There is no separate aliasing syntax for a `GROUP BY` key (unlike a
+/// `SELECT <expr> AS <name>` field): a plain column's target column name is
+/// its own name, and a relationship path's target column name is its tail
+/// `column` — see [`Self::target_column_name`]. Every call site that used to
+/// treat a `group_by` entry as a bare `String` (target column name,
+/// dedup/lookup key, DDL column name, …) should use that method instead of
+/// assuming the entry itself is the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupByKey {
+    Column(String),
+    RelationshipPath { rel: String, column: String },
+}
+
+impl GroupByKey {
+    /// The target table's column name this key becomes — the plain column's
+    /// own name, or a relationship path's tail `column` (there is no
+    /// separate aliasing syntax for a `GROUP BY` key, so `post.author`
+    /// becomes target column `author`, exactly like `tag` becomes target
+    /// column `tag`).
+    pub fn target_column_name(&self) -> &str {
+        match self {
+            GroupByKey::Column(name) => name,
+            GroupByKey::RelationshipPath { column, .. } => column,
+        }
+    }
+
+    /// This key, as the [`Expr`] it's semantically equivalent to — a plain
+    /// [`Expr::Column`] or [`Expr::RelationshipPath`] — so a renderer that
+    /// already knows how to qualify/join an arbitrary expression (e.g.
+    /// [`super::oracle::render_to_one_rel_expr_sql`]) can render a `GROUP BY`
+    /// key without a second, key-specific rendering path.
+    pub fn as_expr(&self) -> Expr {
+        match self {
+            GroupByKey::Column(name) => Expr::Column(name.clone()),
+            GroupByKey::RelationshipPath { rel, column } => Expr::RelationshipPath {
+                rel: rel.clone(),
+                column: column.clone(),
+            },
+        }
+    }
+}
+
+/// Whether `name` is one of `group_by`'s keys' target column names — the
+/// common "is this field a `GROUP BY` passthrough" check every layer that
+/// touches an [`super::ast::KeySpace::Aggregate`] definition's fields needs
+/// (DDL's column dedup, `staging::apply_aggregate`'s field-plan skip, the
+/// reverse-relationship shape's field-expr filter, …), pulled out once here
+/// rather than re-implemented at each call site.
+pub fn group_by_contains(group_by: &[GroupByKey], name: &str) -> bool {
+    group_by.iter().any(|key| key.target_column_name() == name)
 }
 
 /// One `<expr> AS <name>` calculated-field entry.

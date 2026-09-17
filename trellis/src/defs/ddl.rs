@@ -55,7 +55,9 @@ use std::fmt;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
-use super::ast::{Expr, FieldDef, KeySpace, TransformDef, ValueType};
+use super::ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains,
+};
 use super::validate::ValidationError;
 
 /// The Postgres column type for a calculated field or grouping column of a
@@ -1067,7 +1069,10 @@ pub(crate) fn count_column_names_from<'a>(
 /// Each grouping column's type comes from `source_columns` (the same
 /// [`ValueType`]-only map every other column type in this grammar is
 /// derived from — there's no separate exact-Postgres-type introspection for
-/// grouping columns, unlike the 1-1 primary key's [`source_primary_key`]).
+/// grouping columns, unlike the 1-1 primary key's [`source_primary_key`]) —
+/// except a [`GroupByKey::RelationshipPath`] key (issue #137), whose type
+/// comes from the to-side column `relationships` (resolved the same way
+/// issue #94's relationship-field typing already is) reports instead.
 ///
 /// A calculated field whose name matches a grouping column (the
 /// `SELECT order_id AS order_id, SUM(amount) AS total` passthrough idiom)
@@ -1114,17 +1119,31 @@ pub async fn create_aggregate_target_table(
         "create table if not exists {} (",
         qualified_target_table(target_schema, def)
     );
-    for (i, column) in group_by.iter().enumerate() {
+    for (i, key) in group_by.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        let pg_type = pg_type_name(
-            source_columns
+        // Issue #137: a `GroupByKey::RelationshipPath` key's type is its
+        // to-side column's, resolved via the same `relationships` map issue
+        // #94's field typing already reuses above — a plain column keeps
+        // reading straight from `source_columns`, unchanged.
+        let value_type = match key {
+            GroupByKey::Column(column) => source_columns
                 .get(column)
                 .copied()
                 .unwrap_or(ValueType::Numeric),
-        );
-        sql.push_str(&format!("{} {}", quote_ident(column), pg_type));
+            GroupByKey::RelationshipPath { rel, column } => relationships
+                .get(rel)
+                .and_then(|r| r.column_types.get(column))
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+        };
+        let pg_type = pg_type_name(value_type);
+        sql.push_str(&format!(
+            "{} {}",
+            quote_ident(key.target_column_name()),
+            pg_type
+        ));
     }
     // Issue #48: fields aggregating the exact same argument (e.g. `SUM(amount)
     // AS total, AVG(amount) AS average`) share one hidden running-count
@@ -1136,7 +1155,7 @@ pub async fn create_aggregate_target_table(
     let count_cols = count_column_names(&def.fields, &substituted);
     let mut emitted_count_cols: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for field in &def.fields {
-        if group_by.contains(&field.name) {
+        if group_by_contains(group_by, &field.name) {
             continue;
         }
         let pg_type = pg_type_name(
@@ -1170,7 +1189,10 @@ pub async fn create_aggregate_target_table(
             }
         }
     }
-    let pk_columns: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
+    let pk_columns: Vec<String> = group_by
+        .iter()
+        .map(|k| quote_ident(k.target_column_name()))
+        .collect();
     sql.push_str(&format!(
         ", unique nulls not distinct ({})",
         pk_columns.join(", ")

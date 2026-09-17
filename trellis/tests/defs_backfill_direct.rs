@@ -453,13 +453,13 @@ async fn assert_aggregate_matches_oracle(
 
     let key_expr = group_by
         .iter()
-        .map(|c| format!("coalesce({c}::text, '')"))
+        .map(|k| format!("coalesce({}::text, '')", k.target_column_name()))
         .collect::<Vec<_>>()
         .join(" || '|' || ");
     let val_expr = def
         .fields
         .iter()
-        .filter(|f| !group_by.contains(&f.name))
+        .filter(|f| !trellis::defs::ast::group_by_contains(group_by, &f.name))
         .map(|f| format!("coalesce({}::text, 'NULL')", f.name))
         .collect::<Vec<_>>()
         .join(" || '|' || ");

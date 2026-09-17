@@ -164,7 +164,14 @@ fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
     debug_assert_eq!(def.predicate, Predicate::True);
     let key_space_clause = match &def.key_space {
         KeySpace::OneToOne => String::new(),
-        KeySpace::Aggregate { group_by } => format!(" GROUP BY {}", group_by.join(", ")),
+        KeySpace::Aggregate { group_by } => format!(
+            " GROUP BY {}",
+            group_by
+                .iter()
+                .map(|k| k.target_column_name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     };
     Ok(format!(
         "TRANSFORM {} FROM {}{key_space_clause} SELECT {}",
@@ -1101,7 +1108,17 @@ impl super::Backend for ManualBackend {
                     read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
-                    read_aggregate_table(&self.raw, &qualified, group_by, &def.fields).await?
+                    // The generative suite never constructs a relationship-path
+                    // `GROUP BY` key (issue #137 scopes that support out of this
+                    // crate) — every key's target column name is read straight
+                    // off the target table either way, so mapping to that name
+                    // here needs no relationship awareness.
+                    let group_by_names: Vec<String> = group_by
+                        .iter()
+                        .map(|k| k.target_column_name().to_string())
+                        .collect();
+                    read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
+                        .await?
                 }
             };
             snapshot.insert(def.target.clone(), rows);

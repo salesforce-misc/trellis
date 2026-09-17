@@ -14,7 +14,7 @@ use std::fmt;
 
 use crate::pool::{Pool, quote_ident};
 
-use super::ast::{Expr, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
+use super::ast::{Expr, GroupByKey, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use super::registry::lookup_aggregate_function;
 
@@ -175,9 +175,18 @@ pub async fn recompute_aggregate(
         panic!("recompute_aggregate called on a non-aggregate definition");
     };
 
+    // Issue #137: a `GroupByKey::RelationshipPath` key has no source column
+    // to select at all — this pure-Rust, evaluator-driven cross-check is
+    // documented as not wiring relationships (see `eval::evaluate_aggregate`'s
+    // own doc comment), so a definition with one is expected to skip this
+    // function entirely and compare only against the real Postgres oracle
+    // (`render_aggregate_relationship_select_sql`), exactly as issue #94's
+    // relationship-*field* tests already do. Keying by `target_column_name`
+    // keeps a plain-column `GROUP BY` (the overwhelmingly common case)
+    // byte-identical to before this issue.
     let mut columns = referenced_source_columns(def);
-    for column in group_by {
-        columns.insert(column.clone());
+    for key in group_by {
+        columns.insert(key.target_column_name().to_string());
     }
     let columns: Vec<String> = columns.into_iter().collect();
 
@@ -221,7 +230,7 @@ pub async fn recompute_aggregate(
 /// image gives the same key. A grouping column is assumed non-`NULL` (the
 /// typical case for a real foreign/primary key); this doesn't attempt to
 /// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
-fn group_key(image: &Row, group_by: &[String]) -> String {
+fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
     // Length-prefix each component (`"{len}:{value}"`) rather than joining
     // on a bare separator: a Text grouping column's value can itself
     // contain any separator character (including a comma), which would
@@ -232,7 +241,13 @@ fn group_key(image: &Row, group_by: &[String]) -> String {
     // number, not searched for as a delimiter.
     group_by
         .iter()
-        .map(|c| image.get(c).cloned().flatten().unwrap_or_default())
+        .map(|k| {
+            image
+                .get(k.target_column_name())
+                .cloned()
+                .flatten()
+                .unwrap_or_default()
+        })
         .map(|v| format!("{}:{v}", v.len()))
         .collect::<String>()
 }
@@ -278,7 +293,16 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
             )
         })
         .collect();
-    let group_cols: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
+    // A `GroupByKey::RelationshipPath` key has no plain-column rendering
+    // this relationship-unaware oracle can produce — `render_expr_sql`'s own
+    // `RelationshipPath` arm panics with a clear message, matching how this
+    // whole function is documented as relationship-free; a definition with
+    // one must use `render_aggregate_relationship_select_sql` instead
+    // (issue #94's own split, unchanged by issue #137).
+    let group_cols: Vec<String> = group_by
+        .iter()
+        .map(|k| render_expr_sql(&k.as_expr()))
+        .collect();
 
     format!(
         "select {} from {} group by {}",
@@ -520,16 +544,29 @@ pub fn render_aggregate_relationship_select_sql(
             )
         })
         .collect();
+    // Issue #137: a `GROUP BY` key may itself be a to-one relationship path
+    // (`post.author`), rendered exactly like a field's own relationship-path
+    // reference — qualified against `source_sql` for a plain column, or
+    // against its own join alias for a relationship path.
     let group_cols: Vec<String> = group_by
         .iter()
-        .map(|c| format!("{source_sql}.{}", quote_ident(c)))
+        .map(|k| render_to_one_rel_expr_sql(&k.as_expr(), &source_sql))
         .collect();
 
-    // Deterministic JOIN order, deduped: a relationship read by several fields
-    // is joined once.
+    // Deterministic JOIN order, deduped: a relationship read by several
+    // fields (or a field and a `GROUP BY` key alike) is joined once. Issue
+    // #137: a `GROUP BY`-only relationship reference (no field reads it at
+    // all — e.g. `GROUP BY tag, post.author SELECT COUNT(*) AS post_count`)
+    // still needs its join, or `group_cols`' own alias reference above
+    // resolves to nothing.
     let mut rel_names: BTreeSet<&str> = BTreeSet::new();
     for expr in substituted.values() {
         collect_rel_names(expr, &mut rel_names);
+    }
+    for key in group_by {
+        if let GroupByKey::RelationshipPath { rel, .. } = key {
+            rel_names.insert(rel.as_str());
+        }
     }
     let joins = to_one_join_clauses(
         rel_names.iter().map(|rel| {

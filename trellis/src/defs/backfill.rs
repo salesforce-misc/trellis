@@ -70,7 +70,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Client, Pool, quote_ident};
 
-use super::ast::{Expr, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
+use super::ast::{
+    Expr, GroupByKey, KeySpace, Operator, RelationshipDef, TransformDef, ValueType,
+    group_by_contains,
+};
 use super::ddl::{
     self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, require_single_column_pk,
     source_primary_key,
@@ -874,7 +877,7 @@ async fn backfill_aggregate(
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
-    group_by: &[String],
+    group_by: &[GroupByKey],
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), BackfillError> {
     // Substitute any cross-field-alias reference (e.g. `double_total = total +
@@ -919,19 +922,45 @@ async fn backfill_aggregate(
             super::oracle::render_to_one_rel_expr_sql(expr, &source)
         }
     };
-    let qualify = |ident: &str| -> String {
-        if rel_joins.is_empty() {
-            ident.to_string()
-        } else {
-            format!("{source}.{ident}")
+
+    // Issue #137: a `GROUP BY` key's type comes from the to-side column
+    // `relationships` reports for a relationship path, or `source_columns`
+    // for a plain column — the same split `ddl::create_aggregate_target_table`
+    // uses for the same reason (a relationship-free aggregate never resolves
+    // any relationships, so this is a cheap no-op call for the overwhelmingly
+    // common case).
+    let relationships = super::catalog::resolve_relationships(pool, def)
+        .await
+        .map_err(map_rel_lookup_err)?;
+    let group_by_value_type = |key: &GroupByKey| -> ValueType {
+        match key {
+            GroupByKey::Column(column) => source_columns
+                .get(column)
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+            GroupByKey::RelationshipPath { rel, column } => relationships
+                .get(rel)
+                .and_then(|r| r.column_types.get(column))
+                .copied()
+                .unwrap_or(ValueType::Numeric),
         }
     };
 
-    let group_idents: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
-    let group_refs: Vec<String> = group_idents.iter().map(|c| qualify(c)).collect();
+    let group_idents: Vec<String> = group_by
+        .iter()
+        .map(|k| quote_ident(k.target_column_name()))
+        .collect();
+    // `render_field` already qualifies a plain column against `source` (or
+    // leaves it bare when there's no join) and resolves a relationship path
+    // against its own join alias — reused here rather than re-deriving the
+    // same qualification rules for `GROUP BY` keys.
+    let group_refs: Vec<String> = group_by
+        .iter()
+        .map(|k| render_field(&k.as_expr()))
+        .collect();
     let group_casts: Vec<&'static str> = group_by
         .iter()
-        .map(|c| ddl::pg_type_name(source_columns.get(c).copied().unwrap_or(ValueType::Numeric)))
+        .map(|k| ddl::pg_type_name(group_by_value_type(k)))
         .collect();
 
     // Build the INSERT column list and, for each, the aggregate SELECT
@@ -950,7 +979,7 @@ async fn backfill_aggregate(
     // its own substituted `field_exprs`, rather than re-deriving names from a
     // raw-shape-only pass that a purely-aliased field would never match.
     let count_cols = ddl::count_column_names_from(def.fields.iter().filter_map(|f| {
-        if group_by.contains(&f.name) {
+        if group_by_contains(group_by, &f.name) {
             return None;
         }
         let expr = &substituted[&f.name];
@@ -972,7 +1001,7 @@ async fn backfill_aggregate(
     let mut emitted_count_cols: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for field in &def.fields {
-        if group_by.contains(&field.name) {
+        if group_by_contains(group_by, &field.name) {
             continue;
         }
         let col = quote_ident(&field.name);

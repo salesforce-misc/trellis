@@ -17,7 +17,7 @@ use std::fmt;
 
 use regex::Regex;
 
-use super::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
+use super::ast::{Expr, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
 use crate::error_code::ErrorCode;
 
@@ -101,6 +101,21 @@ pub enum ValidationError {
     /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
     /// column that isn't a real source column.
     UnresolvedGroupByColumn { column: String },
+    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
+    /// `<rel>.<column>` path whose `<rel>` is not a relationship declared on
+    /// this definition's source table (ADR-0006: relationship names are
+    /// scoped per from-table) — the `GROUP BY` twin of
+    /// [`ValidationError::UnknownRelationship`], which blames a specific
+    /// field; a `GROUP BY` key has no field to blame, so this variant names
+    /// the relationship alone (issue #137).
+    UnknownGroupByRelationship { rel: String },
+    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
+    /// **to-many** `<rel>.<column>` relationship path (issue #137).
+    /// Grouping by "the many child rows on the other end of a to-many
+    /// relationship" has no defined semantics — a `GROUP BY` key must
+    /// resolve to exactly one value per source row, which only a to-one
+    /// relationship path guarantees.
+    GroupByRelationshipMustBeToOne { rel: String, column: String },
     /// An [`super::ast::KeySpace::Aggregate`] definition's field references a
     /// source column that is neither a grouping key nor wrapped in exactly
     /// one of `SUM`/`MIN`/`MAX`/`AVG` — every row in a group must be folded
@@ -348,6 +363,18 @@ impl fmt::Display for ValidationError {
                 f,
                 "GROUP BY references '{column}', which is not a source column"
             ),
+            ValidationError::UnknownGroupByRelationship { rel } => write!(
+                f,
+                "GROUP BY references relationship '{rel}', which is not declared on this \
+                 definition's source table (relationship names are scoped per from-table, \
+                 ADR-0006)"
+            ),
+            ValidationError::GroupByRelationshipMustBeToOne { rel, column } => write!(
+                f,
+                "GROUP BY references to-many relationship path '{rel}.{column}'; grouping by \
+                 the many related rows on the other end of a to-many relationship has no \
+                 defined semantics, so a GROUP BY relationship path must be to-one"
+            ),
             ValidationError::UngroupedColumnReference { field, column } => write!(
                 f,
                 "calculated field '{field}' references source column '{column}' outside of \
@@ -546,23 +573,56 @@ pub fn validate(
             }
         }
         KeySpace::Aggregate { group_by } => {
-            for column in group_by {
-                if !source_columns.contains_key(column) {
-                    return Err(ValidationError::UnresolvedGroupByColumn {
-                        column: column.clone(),
-                    });
+            // Issue #137: a `GROUP BY` key is either a plain source column
+            // (checked exactly as before) or a to-one relationship path,
+            // resolved against the same catalog-supplied `relationships` map
+            // a field's own `<rel>.<column>` reference uses. An unknown
+            // relationship name or a to-many cardinality is rejected here,
+            // ahead of the per-field checks below, so a bad `GROUP BY`
+            // clause is never masked by a field error instead.
+            for key in group_by {
+                match key {
+                    GroupByKey::Column(column) => {
+                        if !source_columns.contains_key(column) {
+                            return Err(ValidationError::UnresolvedGroupByColumn {
+                                column: column.clone(),
+                            });
+                        }
+                    }
+                    GroupByKey::RelationshipPath { rel, column } => {
+                        let resolved = relationships.get(rel).ok_or_else(|| {
+                            ValidationError::UnknownGroupByRelationship { rel: rel.clone() }
+                        })?;
+                        if resolved.cardinality != RelationshipCardinality::ToOne {
+                            return Err(ValidationError::GroupByRelationshipMustBeToOne {
+                                rel: rel.clone(),
+                                column: column.clone(),
+                            });
+                        }
+                        if !resolved.column_types.contains_key(column) {
+                            return Err(ValidationError::UnknownRelationshipColumn {
+                                table: resolved.to_table.clone(),
+                                column: column.clone(),
+                            });
+                        }
+                    }
                 }
             }
-            let group_by: HashSet<&str> = group_by.iter().map(|s| s.as_str()).collect();
             for field in &def.fields {
                 // DDL generation (`ddl::create_aggregate_target_table`)
-                // treats a field named after a grouping column as that
-                // column's passthrough and gives it no target column of its
-                // own. Any other expression under that name would compute a
-                // value with nowhere to go — enforce the passthrough shape
-                // here rather than let DDL silently drop it.
-                if group_by.contains(field.name.as_str())
-                    && !matches!(&field.expr, Expr::Column(name) if name == &field.name)
+                // treats a field named after a grouping column's target
+                // column name as that key's passthrough and gives it no
+                // target column of its own. Any other expression under that
+                // name would compute a value with nowhere to go — enforce
+                // the passthrough shape here rather than let DDL silently
+                // drop it. For a relationship-path key the passthrough shape
+                // is the same bare path, not the column's own name (there is
+                // no source column named e.g. `author` on this definition's
+                // source at all).
+                if let Some(key) = group_by
+                    .iter()
+                    .find(|k| k.target_column_name() == field.name)
+                    && !expr_is_group_by_key_passthrough(&field.expr, key)
                 {
                     return Err(ValidationError::GroupingColumnFieldMustBePassthrough {
                         field: field.name.clone(),
@@ -571,7 +631,7 @@ pub fn validate(
                 validate_aggregate_field_expr(
                     &field.expr,
                     &field.name,
-                    &group_by,
+                    group_by,
                     source_columns,
                     relationships,
                     false,
@@ -740,7 +800,12 @@ fn validate_relationship_refs(
 /// for the same reason: a **to-one** path resolves to exactly one related
 /// value per *source* row (a `LEFT JOIN`, evaluated before the group folds),
 /// so it is accepted when — and only when — it is wrapped in an aggregate
-/// call, and otherwise rejected as
+/// call, *or* (issue #137) it names exactly the same relationship path as one
+/// of this definition's own `GROUP BY` keys (the relationship-path twin of a
+/// bare grouping-column reference, e.g. `GROUP BY tag, post.author SELECT
+/// post.author AS author_alias, COUNT(*) AS c` — `post.author` resolves once
+/// per group, exactly like a bare `tag` reference does, so it needs no
+/// aggregate wrapper either) — and otherwise rejected as
 /// [`ValidationError::UngroupedRelationshipReference`]. A **to-many** path is
 /// rejected outright ([`ValidationError::RelationshipPathInAggregate`]):
 /// aggregating it inside a GROUP BY aggregate is a nested aggregation with no
@@ -750,17 +815,17 @@ fn validate_relationship_refs(
 fn validate_aggregate_field_expr(
     expr: &Expr,
     field_name: &str,
-    group_by: &HashSet<&str>,
+    group_by: &[GroupByKey],
     source_columns: &HashMap<String, ValueType>,
     relationships: &HashMap<String, ResolvedRelationship>,
     in_aggregate_call: bool,
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::Column(name) => {
-            if source_columns.contains_key(name)
-                && !group_by.contains(name.as_str())
-                && !in_aggregate_call
-            {
+            let is_group_key = group_by
+                .iter()
+                .any(|k| matches!(k, GroupByKey::Column(c) if c == name));
+            if source_columns.contains_key(name) && !is_group_key && !in_aggregate_call {
                 return Err(ValidationError::UngroupedColumnReference {
                     field: field_name.to_string(),
                     column: name.clone(),
@@ -774,6 +839,9 @@ fn validate_aggregate_field_expr(
                 // Unknown name: `validate_relationship_refs` reports it.
                 return Ok(());
             };
+            let is_group_key = group_by.iter().any(|k| {
+                matches!(k, GroupByKey::RelationshipPath { rel: r, column: c } if r == rel && c == column)
+            });
             match resolved.cardinality {
                 RelationshipCardinality::ToMany => {
                     Err(ValidationError::RelationshipPathInAggregate {
@@ -782,7 +850,7 @@ fn validate_aggregate_field_expr(
                         column: column.clone(),
                     })
                 }
-                RelationshipCardinality::ToOne if !in_aggregate_call => {
+                RelationshipCardinality::ToOne if !in_aggregate_call && !is_group_key => {
                     Err(ValidationError::UngroupedRelationshipReference {
                         field: field_name.to_string(),
                         rel: rel.clone(),
@@ -823,6 +891,23 @@ fn validate_aggregate_field_expr(
                 )?;
             }
             Ok(())
+        }
+    }
+}
+
+/// Whether `expr` is exactly the passthrough shape [`GroupByKey`] `key`
+/// requires of a field named after its target column name (see
+/// [`ValidationError::GroupingColumnFieldMustBePassthrough`]): a bare
+/// [`Expr::Column`] of the same name for a plain grouping column, or a bare
+/// [`Expr::RelationshipPath`] naming the exact same relationship and column
+/// for a relationship-path grouping key — there is no other expression shape
+/// DDL generation gives a target column of its own for that name, so
+/// anything else is rejected rather than silently dropped.
+fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
+    match key {
+        GroupByKey::Column(name) => matches!(expr, Expr::Column(n) if n == name),
+        GroupByKey::RelationshipPath { rel, column } => {
+            matches!(expr, Expr::RelationshipPath { rel: r, column: c } if r == rel && c == column)
         }
     }
 }
@@ -1691,12 +1776,20 @@ mod tests {
     }
 
     fn aggregate_def(group_by: &[&str], fields: Vec<FieldDef>) -> TransformDef {
+        aggregate_def_with_keys(
+            group_by
+                .iter()
+                .map(|s| GroupByKey::Column(s.to_string()))
+                .collect(),
+            fields,
+        )
+    }
+
+    fn aggregate_def_with_keys(group_by: Vec<GroupByKey>, fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
             target: "t".to_string(),
             source: "s".to_string(),
-            key_space: KeySpace::Aggregate {
-                group_by: group_by.iter().map(|s| s.to_string()).collect(),
-            },
+            key_space: KeySpace::Aggregate { group_by },
             fields,
             predicate: Predicate::True,
             explicit_source_schema: None,
@@ -1951,6 +2044,190 @@ mod tests {
         );
         let source_columns = numeric_columns(&["order_id"]);
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn a_to_one_relationship_path_group_by_key_is_accepted() {
+        // Issue #137's headline shape: `GROUP BY tag, post.author` groups
+        // `post_tags` rows partly by their linked post's `author` — no field
+        // needs to mention `post.author` at all, exactly like a plain
+        // grouping column needs no corresponding field.
+        let d = aggregate_def_with_keys(
+            vec![
+                GroupByKey::Column("tag".to_string()),
+                GroupByKey::RelationshipPath {
+                    rel: "post".to_string(),
+                    column: "author".to_string(),
+                },
+            ],
+            vec![FieldDef {
+                name: "post_count".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["tag", "post"]);
+        let mut relationships = to_one_rel("post", "posts", "author");
+        relationships
+            .get_mut("post")
+            .unwrap()
+            .column_types
+            .insert("author".to_string(), ValueType::Text);
+        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
+    }
+
+    #[test]
+    fn a_group_by_relationship_path_bare_passthrough_field_is_allowed() {
+        // Mirrors `a_field_named_after_the_grouping_column_as_a_bare_passthrough_is_allowed`
+        // for a relationship-path grouping key: a field explicitly named
+        // after the key's target column, whose expression is the exact same
+        // bare path, is a legal passthrough — DDL gives it no separate
+        // target column of its own.
+        let d = aggregate_def_with_keys(
+            vec![GroupByKey::RelationshipPath {
+                rel: "post".to_string(),
+                column: "author".to_string(),
+            }],
+            vec![FieldDef {
+                name: "author".to_string(),
+                expr: Expr::RelationshipPath {
+                    rel: "post".to_string(),
+                    column: "author".to_string(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["post"]);
+        let mut relationships = to_one_rel("post", "posts", "author");
+        relationships
+            .get_mut("post")
+            .unwrap()
+            .column_types
+            .insert("author".to_string(), ValueType::Text);
+        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
+    }
+
+    #[test]
+    fn a_group_by_relationship_path_field_must_be_a_bare_passthrough() {
+        let d = aggregate_def_with_keys(
+            vec![GroupByKey::RelationshipPath {
+                rel: "post".to_string(),
+                column: "author".to_string(),
+            }],
+            vec![FieldDef {
+                name: "author".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["post"]);
+        let mut relationships = to_one_rel("post", "posts", "author");
+        relationships
+            .get_mut("post")
+            .unwrap()
+            .column_types
+            .insert("author".to_string(), ValueType::Text);
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupingColumnFieldMustBePassthrough {
+                field: "author".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_relationship_in_group_by_is_rejected() {
+        let d = aggregate_def_with_keys(
+            vec![GroupByKey::RelationshipPath {
+                rel: "nope".to_string(),
+                column: "author".to_string(),
+            }],
+            vec![FieldDef {
+                name: "c".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["post"]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnknownGroupByRelationship {
+                rel: "nope".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_to_many_relationship_path_in_group_by_is_rejected() {
+        // Grouping by "the many child rows on the other end of a to-many
+        // relationship" has no defined semantics (issue #137's own scoping)
+        // — rejected with a clear, GROUP-BY-specific error rather than the
+        // field-position `RelationshipPathInAggregate`.
+        let d = aggregate_def_with_keys(
+            vec![GroupByKey::RelationshipPath {
+                rel: "comments".to_string(),
+                column: "author".to_string(),
+            }],
+            vec![FieldDef {
+                name: "c".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["id"]);
+        let relationships = HashMap::from([(
+            "comments".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToMany,
+                to_table: "comments".to_string(),
+                to_col: "post_id".to_string(),
+                column_types: HashMap::from([("author".to_string(), ValueType::Text)]),
+            },
+        )]);
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupByRelationshipMustBeToOne {
+                rel: "comments".to_string(),
+                column: "author".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_group_by_relationship_path_referencing_an_unknown_to_side_column_is_rejected() {
+        let d = aggregate_def_with_keys(
+            vec![GroupByKey::RelationshipPath {
+                rel: "post".to_string(),
+                column: "missing".to_string(),
+            }],
+            vec![FieldDef {
+                name: "c".to_string(),
+                expr: Expr::FunctionCall {
+                    name: "COUNT".to_string(),
+                    args: Vec::new(),
+                },
+            }],
+        );
+        let source_columns = numeric_columns(&["post"]);
+        let relationships = to_one_rel("post", "posts", "word_count");
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::UnknownRelationshipColumn {
+                table: "posts".to_string(),
+                column: "missing".to_string(),
+            }
+        );
     }
 
     #[test]

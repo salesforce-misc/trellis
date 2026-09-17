@@ -601,9 +601,12 @@ fn render_rel_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -
                     )
                 })
                 .collect();
+            // The generative suite never constructs a relationship-path
+            // `GROUP BY` key (issue #137 scopes that support out of this
+            // crate), so every key is a plain column here.
             let group_cols: Vec<String> = group_by
                 .iter()
-                .map(|c| format!("{source}.{}", quote_ident(c)))
+                .map(|k| format!("{source}.{}", quote_ident(k.target_column_name())))
                 .collect();
             format!(
                 "select {} from {source}{joins} group by {}",
@@ -672,7 +675,10 @@ fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> St
                     )
                 })
                 .collect();
-            let group_cols: Vec<String> = group_by.iter().map(|c| quote_ident(c)).collect();
+            let group_cols: Vec<String> = group_by
+                .iter()
+                .map(|k| quote_ident(k.target_column_name()))
+                .collect();
             format!(
                 "select {} from {} group by {}",
                 select_list.join(", "),
@@ -728,11 +734,12 @@ pub async fn sql_oracle(
                     .collect();
                 let group_values: Vec<Option<String>> = group_by
                     .iter()
-                    .map(|column| {
+                    .map(|key| {
+                        let column = key.target_column_name();
                         let index = def
                             .fields
                             .iter()
-                            .position(|f| &f.name == column)
+                            .position(|f| f.name == column)
                             .unwrap_or_else(|| {
                                 panic!(
                                     "oracle: GROUP BY column {column:?} has no matching \
@@ -747,7 +754,10 @@ pub async fn sql_oracle(
                 let key = group_key(&group_values);
                 let mut by_column = BTreeMap::new();
                 for (field, value) in def.fields.iter().zip(values) {
-                    if group_by.contains(&field.name) {
+                    if group_by
+                        .iter()
+                        .any(|k| k.target_column_name() == field.name)
+                    {
                         continue;
                     }
                     by_column.insert(field.name.clone(), value);
@@ -801,7 +811,9 @@ pub async fn evaluator_oracle(
             for (key, fields) in recomputed {
                 let by_column = fields
                     .into_iter()
-                    .filter(|(column, _)| !group_by.contains(column))
+                    .filter(|(column, _)| {
+                        !group_by.iter().any(|k| k.target_column_name() == column)
+                    })
                     .map(|(column, value)| (column, value.map(|v| v.to_string())))
                     .collect();
                 rows.insert(key, by_column);
@@ -1230,7 +1242,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::Aggregate {
-                group_by: vec!["grain".into()],
+                group_by: vec![trellis::defs::ast::GroupByKey::Column("grain".into())],
             },
             fields: vec![
                 trellis::defs::ast::FieldDef {
@@ -1478,7 +1490,7 @@ mod tests {
             target: "d0".into(),
             source: "t0".into(),
             key_space: KeySpace::Aggregate {
-                group_by: vec!["k".into()],
+                group_by: vec![trellis::defs::ast::GroupByKey::Column("k".into())],
             },
             fields: vec![
                 trellis::defs::ast::FieldDef {

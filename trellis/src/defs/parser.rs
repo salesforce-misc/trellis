@@ -43,7 +43,7 @@
 //! relationship from a calculated field, cardinality validation, and catalog
 //! storage are all separate, later issues.
 
-use super::ast::{Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef};
+use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Predicate, RelationshipDef, TransformDef};
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
@@ -299,7 +299,7 @@ impl Parser {
 
     /// Parses the key-space clause in its ADR-0004-reserved slot, between
     /// `FROM <source>` and `SELECT`: absent -> [`KeySpace::OneToOne`],
-    /// `GROUP BY <col>[, <col>...]` -> [`KeySpace::Aggregate`]. `JOIN` is
+    /// `GROUP BY <key>[, <key>...]` -> [`KeySpace::Aggregate`]. `JOIN` is
     /// rejected outright — cross-join key-spaces aren't supported by any
     /// part of this grammar yet.
     fn parse_key_space_clause(&mut self) -> Result<KeySpace, ParseError> {
@@ -314,15 +314,35 @@ impl Parser {
         if self.peek_is_keyword("GROUP") {
             self.advance();
             self.expect_keyword("BY")?;
-            let mut group_by = vec![self.expect_ident()?];
+            let mut group_by = vec![self.parse_group_by_key()?];
             while self.peek_is_symbol(',') {
                 self.advance();
-                group_by.push(self.expect_ident()?);
+                group_by.push(self.parse_group_by_key()?);
             }
             self.is_aggregate = true;
             return Ok(KeySpace::Aggregate { group_by });
         }
         Ok(KeySpace::OneToOne)
+    }
+
+    /// Parses one `GROUP BY` key (issue #137): a plain `<column>`, or a
+    /// to-one relationship path `<rel>.<column>` — the same `ident '.'
+    /// ident` shape [`Self::parse_primary`]'s `Expr::RelationshipPath`
+    /// handling recognizes, reused here rather than duplicated since a
+    /// `GROUP BY` key sits in its own reserved grammar slot (ahead of
+    /// `SELECT`) and can never compete with an expression's own tokens.
+    /// Whether the head names an actually-declared relationship, and its
+    /// cardinality (a to-many path is rejected — grouping by "the many child
+    /// rows on the other end of a to-many relationship" has no defined
+    /// semantics), is resolved later by the validator, not this parser.
+    fn parse_group_by_key(&mut self) -> Result<GroupByKey, ParseError> {
+        let first = self.expect_ident()?;
+        if self.peek_is_symbol('.') {
+            self.advance();
+            let column = self.expect_ident()?;
+            return Ok(GroupByKey::RelationshipPath { rel: first, column });
+        }
+        Ok(GroupByKey::Column(first))
     }
 
     /// Rejects a `JOIN`/`GROUP BY` key-space clause with a construct-specific

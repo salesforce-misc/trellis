@@ -25,7 +25,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{
-    Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
+    Expr, FieldDef, GroupByKey, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
 };
 use trellis::defs::{
     CatalogError, ValidationError, create_relationship, install_definition,
@@ -189,7 +189,7 @@ fn oracle_def() -> TransformDef {
         target: "tag_totals".to_string(),
         source: "post_tags".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["tag".to_string()],
+            group_by: vec![GroupByKey::Column("tag".to_string())],
         },
         fields: vec![
             FieldDef {
@@ -617,7 +617,7 @@ async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forw
             target: "tag_avg".to_string(),
             source: "post_tags".to_string(),
             key_space: KeySpace::Aggregate {
-                group_by: vec!["tag".to_string()],
+                group_by: vec![GroupByKey::Column("tag".to_string())],
             },
             fields: vec![
                 FieldDef {
@@ -899,7 +899,7 @@ fn mixed_oracle_def() -> TransformDef {
         target: "tag_mixed".to_string(),
         source: "post_tags".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["tag".to_string()],
+            group_by: vec![GroupByKey::Column("tag".to_string())],
         },
         fields: vec![
             FieldDef {

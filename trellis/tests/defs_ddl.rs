@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 use trellis::defs::{
     DdlError, create_aggregate_target_table, create_target_table, require_single_column_pk,
     source_primary_key,
@@ -587,7 +589,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         target: "comments_by_author".to_string(),
         source: "comments".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["author".to_string()],
+            group_by: vec![GroupByKey::Column("author".to_string())],
         },
         fields: vec![
             FieldDef {
@@ -673,7 +675,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
         target: "order_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["order_id".to_string()],
+            group_by: vec![GroupByKey::Column("order_id".to_string())],
         },
         fields: vec![
             FieldDef {
@@ -811,7 +813,7 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
         target: "order_totals".to_string(),
         source: "order_line_items".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["order_id".to_string()],
+            group_by: vec![GroupByKey::Column("order_id".to_string())],
         },
         fields: vec![
             FieldDef {
@@ -901,7 +903,7 @@ async fn aggregate_columns_over_different_arguments_keep_separate_count_columns(
         target: "posts_totals".to_string(),
         source: "posts_calc".to_string(),
         key_space: KeySpace::Aggregate {
-            group_by: vec!["author".to_string()],
+            group_by: vec![GroupByKey::Column("author".to_string())],
         },
         fields: vec![
             FieldDef {

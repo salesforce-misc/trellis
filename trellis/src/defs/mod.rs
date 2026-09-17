@@ -40,7 +40,8 @@ pub mod registry;
 pub mod validate;
 
 pub use ast::{
-    Expr, FieldDef, KeySpace, Operator, Predicate, RelationshipDef, TransformDef, ValueType,
+    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, RelationshipDef, TransformDef,
+    ValueType,
 };
 pub use backfill::{BackfillError, backfill_definition};
 pub use catalog::{
@@ -150,7 +151,7 @@ mod tests {
         assert_eq!(
             def.key_space,
             KeySpace::Aggregate {
-                group_by: vec!["order_id".to_string()]
+                group_by: vec![GroupByKey::Column("order_id".to_string())]
             }
         );
         assert_eq!(
@@ -169,7 +170,10 @@ mod tests {
         assert_eq!(
             def.key_space,
             KeySpace::Aggregate {
-                group_by: vec!["a".to_string(), "b".to_string()]
+                group_by: vec![
+                    GroupByKey::Column("a".to_string()),
+                    GroupByKey::Column("b".to_string())
+                ]
             }
         );
     }
