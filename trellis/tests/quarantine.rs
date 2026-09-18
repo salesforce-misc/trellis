@@ -643,18 +643,31 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
 }
 
 /// Scenario: a composite source primary key (`DdlError::CompositePrimaryKeyUnsupported`)
-/// is exactly as structural as the hop bound — "this definition can never
-/// work against this source's real schema," not "this row's data is bad" —
-/// so it must halt too, not get isolated and eventually evicted key by key.
-/// Two keys touch the unsupported source; both would reproduce the failure
-/// alone (it's schema-shaped, not row-shaped), which is precisely why
-/// isolating it would be wrong: neither gets charged a death, and the
-/// original error surfaces unmodified.
+/// against a `OneToOne` target used to be exactly as structural as the hop
+/// bound below — "this definition can never work against this source's real
+/// schema," not "this row's data is bad" — so it used to halt the instance
+/// rather than get isolated and evicted key by key, because
+/// `create_definition` (the ring-path entry point this test uses, unlike
+/// `install_definition`) never ran the composite-PK arity check at all: it
+/// only ran deep inside `staging::apply`'s own `require_single_column_pk`
+/// call, well after CDC rows had already been staged.
+///
+/// Issue #177 closed that gap: `create_definition_inner` now runs the same
+/// arity check itself, first thing, before any side effect — so
+/// `create_definition` below now rejects this source synchronously, with a
+/// clean, typed `CatalogError`, and the scenario can no longer reach the
+/// ring/CDC/apply machinery this test used to have to drive at all. See
+/// `defs_catalog.rs`'s
+/// `a_one_to_one_transform_against_a_composite_primary_key_source_is_rejected`
+/// for the test that now pins that rejection directly. This test instead
+/// pins the *absence* of the old halt: no row is persisted, so nothing is
+/// left for a later `drain_once` to ever halt on, and
+/// `halting_stop_stats`/quarantine bookkeeping are both untouched.
 #[tokio::test]
-async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_instance() {
+async fn a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -664,153 +677,110 @@ async fn a_composite_primary_key_source_is_never_quarantined_and_stops_the_insta
         .await
         .expect("create source table with a composite primary key");
 
+    let before = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats before");
+
     let source_columns = numeric_columns(&["order_id", "line_no", "price"]);
-    create_definition(
+    let err = create_definition(
         &db.pool,
         "TRANSFORM line_totals FROM order_lines SELECT price AS total",
         &source_columns,
     )
     .await
-    .expect("create definition over the composite-pk source");
+    .unwrap_err();
 
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "order_lines",
-        "1",
-        "insert",
-        None,
-        Some(r#"{"order_id":"1","line_no":"1","price":"10.00"}"#),
-    )
-    .await;
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "order_lines",
-        "2",
-        "insert",
-        None,
-        Some(r#"{"order_id":"1","line_no":"2","price":"20.00"}"#),
-    )
-    .await;
-
-    let before = trellis::staging::halting_stop_stats(&db.pool)
-        .await
-        .expect("halting_stop_stats before");
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
-    match result {
-        Err(ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. })) => {}
-        other => panic!("expected CompositePrimaryKeyUnsupported to propagate, got {other:?}"),
+    match &err {
+        trellis::defs::CatalogError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. }) => {}
+        other => panic!(
+            "expected create_definition to reject this up front with \
+             CompositePrimaryKeyUnsupported, got {other:?}"
+        ),
     }
 
     assert_eq!(
         key_deaths_count(&client, "order_lines", "1").await,
         None,
-        "a structural schema failure must not charge any key that merely touched it"
+        "a create-time rejection must never charge any key a death"
     );
-    assert_eq!(key_deaths_count(&client, "order_lines", "2").await, None);
     assert!(!poison_marker_exists(&client, "order_lines", "1").await);
-    assert!(!poison_marker_exists(&client, "order_lines", "2").await);
 
     let after = trellis::staging::halting_stop_stats(&db.pool)
         .await
         .expect("halting_stop_stats after");
-    assert_eq!(after.stop_count, before.stop_count + 1);
-    assert!(after.last_reason.is_some());
+    assert_eq!(
+        after.stop_count, before.stop_count,
+        "a clean create-time rejection must not register as an instance halt"
+    );
 }
 
 /// Scenario: a single-column primary key of an unsafe, non-text-stable type
-/// (`DdlError::UnsupportedPrimaryKeyType`, issue #107) is exactly as
+/// (`DdlError::UnsupportedPrimaryKeyType`, issue #107) used to be exactly as
 /// structural as the composite-key case above — "this definition can never
-/// work against this source's real schema" — so it must halt too, not get
-/// isolated and eventually evicted key by key. Two keys touch the unsafe
-/// source; both would reproduce the failure alone (it's schema-shaped, not
-/// row-shaped), which is precisely why isolating it would be wrong: neither
-/// gets charged a death, and the original error surfaces unmodified.
+/// work against this source's real schema" — so it used to halt the
+/// instance rather than get isolated and evicted key by key, for the exact
+/// same reason the composite-key case did: `create_definition` never ran
+/// `ddl::source_primary_key`/`require_single_column_pk` at all, so the
+/// rejection only ever surfaced later, deep inside `staging::apply`.
+///
+/// Issue #177's fix closes this gap too, not just the composite-arity one:
+/// `create_definition_inner`'s new `KeySpace::OneToOne` check calls
+/// `ddl::source_primary_key` itself (the same call `install_definition`
+/// already made), and that function's own type check
+/// (`is_text_stable_join_key_type`) runs unconditionally as part of fetching
+/// the primary key — there's no way to ask it for "just the columns, skip
+/// the type check," so this scenario is rejected up front now too, by the
+/// very same call that fixes the composite case. This test now pins the
+/// *absence* of the old halt, mirroring
+/// `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`
+/// immediately above.
 #[tokio::test]
-async fn an_unsupported_primary_key_type_source_is_never_quarantined_and_stops_the_instance() {
+async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_quarantined_or_halted()
+ {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute("create table events (occurred_at timestamptz primary key, payload text)")
         .await
         .expect("create source table with a timestamptz primary key");
 
+    let before = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats before");
+
     let source_columns = numeric_columns(&["occurred_at", "payload"]);
-    create_definition(
+    let err = create_definition(
         &db.pool,
         "TRANSFORM event_echo FROM events SELECT payload AS payload",
         &source_columns,
     )
     .await
-    .expect("create definition over the unsafe-pk source");
+    .unwrap_err();
 
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "events",
-        "1",
-        "insert",
-        None,
-        Some(r#"{"occurred_at":"2024-01-01T00:00:00Z","payload":"a"}"#),
-    )
-    .await;
-    insert_cdc_row(
-        &client,
-        "seg_0",
-        "events",
-        "2",
-        "insert",
-        None,
-        Some(r#"{"occurred_at":"2024-01-02T00:00:00Z","payload":"b"}"#),
-    )
-    .await;
-
-    let before = trellis::staging::halting_stop_stats(&db.pool)
-        .await
-        .expect("halting_stop_stats before");
-
-    let seg_seq = seal_active_segment(&mut client).await;
-    let result = apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_quarantine_test",
-        &StagedWatermark::saturated(),
-    )
-    .await;
-    match result {
-        Err(ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. })) => {}
-        other => panic!("expected UnsupportedPrimaryKeyType to propagate, got {other:?}"),
+    match &err {
+        trellis::defs::CatalogError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => {}
+        other => panic!(
+            "expected create_definition to reject this up front with \
+             UnsupportedPrimaryKeyType, got {other:?}"
+        ),
     }
 
     assert_eq!(
         key_deaths_count(&client, "events", "1").await,
         None,
-        "a structural schema failure must not charge any key that merely touched it"
+        "a create-time rejection must never charge any key a death"
     );
-    assert_eq!(key_deaths_count(&client, "events", "2").await, None);
     assert!(!poison_marker_exists(&client, "events", "1").await);
-    assert!(!poison_marker_exists(&client, "events", "2").await);
 
     let after = trellis::staging::halting_stop_stats(&db.pool)
         .await
         .expect("halting_stop_stats after");
-    assert_eq!(after.stop_count, before.stop_count + 1);
-    assert!(after.last_reason.is_some());
+    assert_eq!(
+        after.stop_count, before.stop_count,
+        "a clean create-time rejection must not register as an instance halt"
+    );
 }
 
 /// Scenario: `poison_held` is idempotent on `(src_table, key, seg_seq)` — a

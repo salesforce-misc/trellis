@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
-    CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
+    CatalogError, DdlError, ValidationError, ValueType, all_source_tables, create_definition,
     create_relationship, install_definition, transforms_for_source,
 };
 
@@ -1742,5 +1742,72 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     assert_eq!(
         count, 0,
         "the wrongly-would-be-accepted aggregate definition must not persist"
+    );
+}
+
+/// Issue #177: a `OneToOne` target's primary key is always narrowed down to
+/// a single column, mirroring the source's own (see
+/// `ddl::require_single_column_pk`'s doc comment, issue #126) — so a source
+/// with a genuinely composite primary key can never be represented and must
+/// be rejected outright.
+///
+/// [`create_definition`] is the ring-path entry point this test calls
+/// directly, deliberately bypassing [`install_definition`] entirely: before
+/// this issue's fix, only `install_definition`'s own `KeySpace::OneToOne` arm
+/// ran this arity check, so a composite-PK source reaching Postgres only via
+/// `create_definition`/`create_definition_without_backfill` skipped it
+/// entirely and only surfaced the failure much later, deep in
+/// `staging::apply`'s own machinery, manifesting as a whole-instance halt
+/// (see `quarantine.rs`'s
+/// `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`,
+/// which pins that this scenario can no longer even reach that machinery).
+/// This test pins the fix itself: `create_definition_inner` now runs the
+/// exact same check up front, so the rejection is a clean, typed
+/// `CatalogError` returned synchronously from `create_definition`, before any
+/// row is persisted, any DDL runs, or any CDC/apply machinery is ever
+/// touched.
+#[tokio::test]
+async fn a_one_to_one_transform_against_a_composite_primary_key_source_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table order_lines (order_id integer, line_no integer, price numeric, \
+             primary key (order_id, line_no))",
+        )
+        .await
+        .expect("create source table with a composite primary key");
+
+    let err = create_definition(
+        &db.pool,
+        "TRANSFORM line_totals FROM order_lines SELECT price AS total",
+        &columns(&["order_id", "line_no", "price"]),
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Ddl(DdlError::CompositePrimaryKeyUnsupported { source_table }) => {
+            assert!(
+                source_table.ends_with("order_lines"),
+                "expected the composite source to be named in the error, got {source_table}"
+            );
+        }
+        other => panic!("expected a clean CompositePrimaryKeyUnsupported rejection, got {other:?}"),
+    }
+
+    let count: i64 = client
+        .query_one(
+            "select count(*) from transform_definitions \
+             where split_part(target_table, '.', 2) = 'line_totals'",
+            &[],
+        )
+        .await
+        .expect("count definitions")
+        .get(0);
+    assert_eq!(
+        count, 0,
+        "the rejected definition must not have been persisted"
     );
 }
