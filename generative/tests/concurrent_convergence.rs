@@ -214,7 +214,7 @@ proptest! {
     #![proptest_config(proptest_config())]
 
     #[test]
-    fn convergence_holds_under_the_concurrent_backend(
+    fn property_convergence_holds_under_the_concurrent_backend(
         program in trivial_program(),
         burst_size in burst_size(),
     ) {

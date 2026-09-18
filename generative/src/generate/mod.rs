@@ -3264,7 +3264,7 @@ mod strategy {
     /// adversarial hand-built pin using this same restart primitive
     /// reproduced the identical shape in roughly 1 of every 3-4 isolated
     /// runs — see `generative/tests/client_lifecycle.rs`'s
-    /// `convergence_holds_across_a_mid_stream_client_restart`/
+    /// `property_convergence_holds_across_a_mid_stream_client_restart`/
     /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge` doc
     /// comments for the confirmed root cause: a seal/append race in
     /// `trellis::staging::seal::seal_if_active_nonempty`, latent regardless
@@ -3288,7 +3288,7 @@ mod strategy {
     /// generator draws stays far below `claim::MIN_ROWS_TO_SPLIT`, so every
     /// batch seals to one bucket, and `ceil(1 / live_workers)` is `1`
     /// regardless of the count). See
-    /// `convergence_holds_across_a_mid_stream_scale_out`'s doc comment for
+    /// `property_convergence_holds_across_a_mid_stream_scale_out`'s doc comment for
     /// the confirmed mechanism. Both properties are re-enabled in
     /// `client_lifecycle.rs`.
     pub fn program_with_client_restart(awkward_values: bool) -> impl Strategy<Value = Program> {

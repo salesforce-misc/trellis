@@ -38,7 +38,7 @@
 //! [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`] below
 //! reproduced a genuine lost write (a brand-new row's target `MissingRow`,
 //! not a stale value) in roughly 1 of every 4 runs, and
-//! `convergence_holds_across_a_mid_stream_scale_out` reproduced the same
+//! `property_convergence_holds_across_a_mid_stream_scale_out` reproduced the same
 //! *lost-group* shape on an `Aggregate` target with no restart involved at
 //! all, on the very first randomly-generated case in one run. **Root
 //! cause, confirmed by direct tracing of a failing run:** nothing to do with
@@ -176,7 +176,7 @@ proptest! {
     /// false-positive gap in `trellis::staging::converge::converged_through`)
     /// and the fix, now landed in both places. Re-enabled.
     #[test]
-    fn convergence_holds_across_a_mid_stream_client_restart(
+    fn property_convergence_holds_across_a_mid_stream_client_restart(
         program in program_with_client_restart(true)
     ) {
         run_one(&program)?;
@@ -189,7 +189,7 @@ proptest! {
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
     /// fixed.** This property reproduced the same lost-write bug as
-    /// [`convergence_holds_across_a_mid_stream_client_restart`] above, but
+    /// [`property_convergence_holds_across_a_mid_stream_client_restart`] above, but
     /// with no restart involved at all — a brand-new `Aggregate` group
     /// (source row `c6 = 2`) inserted shortly after `schedule_scale_out`
     /// never appeared in its target. That ruled out `Intake::connect`'s
@@ -205,12 +205,12 @@ proptest! {
     /// restart or scale-out specifically — both simply perturb timing enough
     /// to make it common). Re-enabled. The seeds saved in
     /// `client_lifecycle.proptest-regressions` (this property's and
-    /// [`convergence_holds_across_a_mid_stream_client_restart`]'s) are kept,
+    /// [`property_convergence_holds_across_a_mid_stream_client_restart`]'s) are kept,
     /// not stale: proptest replays them on every run precisely so a
     /// regression in this fix would be caught immediately, before any
     /// randomly-generated case even runs.
     #[test]
-    fn convergence_holds_across_a_mid_stream_scale_out(
+    fn property_convergence_holds_across_a_mid_stream_scale_out(
         program in program_with_scale_out(true)
     ) {
         run_one(&program)?;
@@ -225,7 +225,7 @@ proptest! {
 /// proven to compose with each other, not just individually.
 ///
 /// **Formerly `#[ignore]`d for the same known-open engine bug
-/// `convergence_holds_across_a_mid_stream_client_restart` above was ignored
+/// `property_convergence_holds_across_a_mid_stream_client_restart` above was ignored
 /// for — root-caused and fixed.** This small, fixed, non-adversarial
 /// sequence was in fact the fastest, cheapest repro of the whole
 /// investigation: reliably reproducing `MissingRow { table: "t1", pk: "3" }`

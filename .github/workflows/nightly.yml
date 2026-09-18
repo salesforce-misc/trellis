@@ -12,9 +12,12 @@ name: Nightly
 #   was measured at several minutes for the full campaign -- too slow to pay
 #   on every push, but this deep lane can afford it.
 # - the generative crate's own expensive property
-#   (`convergence_holds_for_trivial_programs`), at a much higher case count
+#   (`property_convergence_holds_for_trivial_programs`), at a much higher case count
 #   than its 16-case PR-time default -- generative/README.md documented this
 #   split but it had never actually been wired into any workflow before now.
+#   Only this one of the crate's 9 properties gets an in-repo deep run; a
+#   separate, out-of-repo nightly (not part of this repo's CI config)
+#   calibrates case counts across all 9 -- see generative/README.md.
 #
 # Both lanes' `FileFailurePersistence`/regression-persistence behavior
 # (proptest's `tests/proptest-regressions/*.txt`) means a failure found here
@@ -62,8 +65,8 @@ jobs:
         env:
           SPIKE_102_CAMPAIGN_RUNS: "3000"
 
-      - name: Generative deep property -- convergence_holds_for_trivial_programs at PROPTEST_CASES=200
+      - name: Generative deep property -- property_convergence_holds_for_trivial_programs at PROPTEST_CASES=200
         # generative/README.md's own recommended deep-lane invocation.
-        run: cargo test -p generative --test convergence convergence_holds_for_trivial_programs
+        run: cargo test -p generative --test convergence property_convergence_holds_for_trivial_programs
         env:
           PROPTEST_CASES: "200"

@@ -97,7 +97,7 @@ proptest! {
     /// definition, i.e. must correctly backfill those preexisting rows and
     /// then keep up with whatever ops follow.
     #[test]
-    fn convergence_holds_with_a_mid_stream_definition_install(
+    fn property_convergence_holds_with_a_mid_stream_definition_install(
         program in program_with_mid_stream_def_install(true)
     ) {
         run_one(&program)?;

@@ -14,7 +14,7 @@
 //! `Op::Truncate` is also drawn by the *default* strategy now (`trivial_program`'s
 //! shared `mutate()` strategy, weighted rare — see `generate::strategy::mutate`'s
 //! doc comment), so `tests/convergence.rs`'s existing
-//! `convergence_holds_for_trivial_programs` property already exercises it
+//! `property_convergence_holds_for_trivial_programs` property already exercises it
 //! probabilistically end-to-end; this file adds the pins that pin down the
 //! specific scenarios the task calls out directly, plus a dedicated property
 //! for the bulk-insert row-count dimension.
@@ -98,7 +98,7 @@ proptest! {
     /// `1..=MAX_BULK_INSERT_ROWS` via `prop_flat_map`, the same idiom
     /// `MAX_SEED_ROWS`/`MAX_MUTATES` already use).
     #[test]
-    fn convergence_holds_for_bulk_insert_programs(program in bulk_insert_program()) {
+    fn property_convergence_holds_for_bulk_insert_programs(program in bulk_insert_program()) {
         run_one(&program)?;
     }
 }

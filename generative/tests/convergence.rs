@@ -157,7 +157,7 @@ proptest! {
     #![proptest_config(proptest_config())]
 
     #[test]
-    fn convergence_holds_for_trivial_programs(program in trivial_program()) {
+    fn property_convergence_holds_for_trivial_programs(program in trivial_program()) {
         run_one(&program)?;
     }
 }

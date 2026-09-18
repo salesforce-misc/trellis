@@ -120,7 +120,7 @@ proptest! {
     /// D2's property: reordering ops across distinct target keys must not
     /// change the converged state.
     #[test]
-    fn commuting_reorderings_converge_identically(program in trivial_program()) {
+    fn property_commuting_reorderings_converge_identically(program in trivial_program()) {
         run_one(&program)?;
     }
 }
@@ -150,7 +150,7 @@ fn trivial_program_sometimes_has_ops_with_genuinely_distinct_target_keys() {
         saw_genuine_reorder,
         "expected at least one sample across 500 where reordering by commute group actually \
          changes the op order (i.e. the generator drew 2+ ops with genuinely distinct target \
-         keys) — otherwise `commuting_reorderings_converge_identically` never exercises anything"
+         keys) — otherwise `property_commuting_reorderings_converge_identically` never exercises anything"
     );
 }
 

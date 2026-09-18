@@ -19,7 +19,7 @@ wall-clock heuristic is backed by `run::Coverage`'s floor assertions
 (`tests/coverage.rs`) for the fast, DB-free half of "did it actually run" —
 this note stays as a smell to notice, not the only check.
 
-## Current cost profile, and the CI split this still needs (plan workstream C)
+## Current cost profile, and the CI split that exists today
 
 At the design doc's default case count (16), a full `cargo test -p generative
 --test convergence` run takes **~130–290s**, and that variance is understood,
@@ -37,31 +37,41 @@ not a suite problem, and is out of scope for this crate to fix; see the git
 history for `generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for
 the full measurement writeup.
 
-One consequence: `cargo test --workspace` in CI currently pays this full
-cost on **every** push and every PR (`.github/workflows/ci.yml`'s `Test`
-step has no fast/deep split). The plan's recommended split — not yet
-applied, because it requires editing a `.github/workflows/*.yml` file, which
-needs a token with the `workflow` OAuth scope to push — is:
+Because paying that cost 9 times over on every push/PR would be expensive,
+the crate's 9 proptest properties are all named with a `property_` prefix
+(enforced by a self-check in `tests/meta.rs` that scans every `proptest! {
+... }` block in `tests/*.rs` and fails the build if any `#[test] fn` inside
+one lacks the prefix — a future property added without it breaks CI rather
+than silently skipping the split below). That prefix is the actual fast/deep
+split, wired into two workflows:
 
-- **PR/push job (fast):** skip the expensive property (`cargo test -p
-  generative --test convergence -- --skip
-  convergence_holds_for_trivial_programs`) — measured at ~22s, since the
-  file's 5 remaining hand-built pin tests still each round-trip through a
-  real cluster and can themselves hit the stall, just far less often than a
-  16-case property's ~80 ops. The other DB-backed targets are each a handful
-  of ops and measure well under a minute individually (`meta` ~0.7s,
-  `oracle` ~1.3s, `backend_seam` ~1.6s, `backfill` ~11.3s — `backfill`'s
-  single test reliably hits the stall once); `coverage` and `--lib` are
-  sub-second (no cluster at all).
-- **A new scheduled (nightly or on-demand) workflow (deep):** run the full
-  property at a much higher case count (e.g. `PROPTEST_CASES=200`). The
-  property's `FileFailurePersistence::SourceParallel` config (see
-  `tests/convergence.rs`'s `proptest_config`) already writes any failing
-  case to `generative/tests/proptest-regressions/convergence.txt` and
-  replays it first on the next run — commit that file if a deep run ever
-  produces one, so the failure becomes a real, replayable regression the
-  fast path picks up too.
+- **`.github/workflows/ci.yml`'s "Test generative (fast lane)" step (every
+  push/PR):** `cargo test -p generative -- --skip property_` — skips all 9
+  properties at once, by prefix, and runs everything else in the crate (the
+  lib, `coverage`, `meta`, `oracle`, `backend_seam`, `backfill`, and every
+  hand-built pin/regression test) at each target's own default case count.
+  This is the ~22s-and-under path described above; the DB-backed pins can
+  still individually hit the quiesce stall, just far less often than a
+  16-case property's ~80 ops.
+- **`.github/workflows/nightly.yml` (scheduled, 06:00 UTC daily, plus
+  `workflow_dispatch`):** deep-runs exactly one property,
+  `property_convergence_holds_for_trivial_programs`, at `PROPTEST_CASES=200`
+  — `cargo test -p generative --test convergence
+  property_convergence_holds_for_trivial_programs`. This is the crate's most
+  exercised property (see the design doc's property list) and the only one
+  given an in-repo deep run today; the other 8 are not deep-run anywhere in
+  this repo's CI config. The property's
+  `FileFailurePersistence::SourceParallel` config (see
+  `tests/convergence.rs`'s `proptest_config`) already writes any failing case
+  to `generative/tests/convergence.proptest-regressions` and replays it first
+  on the next run — commit that file if a deep run ever produces one, so the
+  failure becomes a real, replayable regression the fast lane picks up too.
 
-Once someone with `workflow`-scope push access applies that split, the
-"minutes, not seconds" heuristic above should be re-read as describing the
-*deep* job, not the PR-path one.
+**Case-count calibration across all 9 properties is not this repo's job.** A
+separate, out-of-repo nightly (run by the maintainer, not part of any
+workflow file here) covers that; don't go looking for it in
+`.github/workflows/` — it isn't there.
+
+The "minutes, not seconds" heuristic above describes the *deep* lane (and a
+manual `cargo test -p generative` with no `--skip`), not the PR-path fast
+lane, which is designed to be fast.
