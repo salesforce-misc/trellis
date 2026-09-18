@@ -3421,6 +3421,14 @@ pub struct ApplyPlan {
     /// [`apply_and_mark_drained_many`]'s "3d" step, after the ordinary
     /// aggregate-target writes (step 3b) and the forward gen-bump (step 3c).
     relationship_reverses: Vec<RelationshipReverseRecord>,
+    /// Issue #168: every to-one relationship's settled parent projection
+    /// (qualified table name) a `TRUNCATE` on that relationship's to-side
+    /// emptied this batch — cleared in full by
+    /// [`apply_and_mark_drained_many`], alongside [`ApplyPlan::clears`]/
+    /// [`ApplyPlan::aggregate_clears`]. See the `compute` truncate loop's
+    /// own comment on why this can't reuse [`ApplyPlan::relationship_reverses`]
+    /// (a `TRUNCATE`'s sentinel carries no image to upsert or delete with).
+    relationship_projection_clears: std::collections::HashSet<String>,
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -3560,6 +3568,17 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // this batch's fold produced, applied by `apply_and_mark_drained_many`'s
     // "3d" step.
     let mut relationship_reverses: Vec<RelationshipReverseRecord> = Vec::new();
+    // Issue #168: settled parent projections to clear in full at Phase 3 —
+    // a `TRUNCATE` on a to-one relationship's to-side table. Unlike the
+    // row-driven path (`relationship_reverses`, just above), a `TRUNCATE`
+    // stages one key-less sentinel row, never a per-row image, so it can
+    // never build a `RelationshipReverseRecord` (that needs an old/new row
+    // to upsert or delete into the projection). Without this, the
+    // projection silently keeps serving every to-side row's last-known
+    // value forever after the physical table is emptied — see the
+    // `truncated` loop below, where this is populated, for the full story.
+    let mut relationship_projection_clears: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -4416,6 +4435,39 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // pipeline below — no separate emission path needed.
         let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
         for rel in &inbound_rels {
+            // Issue #168: for a to-one relationship, the staged recompute
+            // above only re-derives the from-side row's enrichment — it
+            // says nothing about *what value* that recompute will read. For
+            // an ordinary row-driven change, that value comes from
+            // `catalog::relationship_projection`'s settled parent
+            // projection (`build_relationship_context`'s doc comment),
+            // which the row-driven `by_source` loop keeps in sync via
+            // `RelationshipReverseRecord`/`apply_projection_advance` (a
+            // delete-then-upsert keyed off each change's own old/new
+            // image). A `TRUNCATE` never reaches that loop at all (its one
+            // key-less sentinel carries no image to upsert or delete with),
+            // so without this, the projection would keep serving every
+            // to-side row's pre-truncate value forever — the from-side
+            // recompute would re-derive against stale data, not against
+            // the now-empty table. Cleared in full at Phase 3
+            // (`ApplyPlan::relationship_projection_clears`), same "whole
+            // table, not a key list" shape as the truncate-clear on a
+            // direct target above, since every row this projection held
+            // for this relationship just vanished with the truncate.
+            // To-many relationships have no projection at all (`ToMany`
+            // still resolves via a live `LEFT JOIN` every time —
+            // `build_relationship_context`'s own doc comment), so nothing
+            // to clear there.
+            if rel.cardinality == RelationshipCardinality::ToOne
+                && let Some(projection) = catalog::relationship_projection(pool, rel.id).await?
+            {
+                relationship_projection_clears.insert(
+                    ddl::qualified_relationship_projection_table(
+                        pool.target_schema(),
+                        &projection.projection_table,
+                    ),
+                );
+            }
             let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
             let from_keys = from_side_keys_with_non_null_join(
                 pool,
@@ -4498,6 +4550,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         end_to_end_origins: terminal_end_to_end_origins,
         relationship_gen_bumps,
         relationship_reverses,
+        relationship_projection_clears,
     })
 }
 
@@ -5018,6 +5071,22 @@ pub async fn apply_and_mark_drained_many(
             .execute(&format!("delete from {target_ident}"), &[])
             .await?;
         keys_deleted += cleared as usize;
+    }
+
+    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
+    // to-one relationship's to-side table empties that relationship's
+    // projection too, same "whole table" shape as 2b just above (and for
+    // the same reason: nothing here can enumerate which specific keys the
+    // truncate removed, and every row this projection held for this
+    // relationship just vanished along with it). No downstream propagation
+    // of its own, same as 2b — the from-side recompute this same truncate
+    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
+    // definition; the projection is only ever read by
+    // `build_relationship_context`/the reverse-guard machinery, never a
+    // definition's own downstream consumer.
+    for qualified_projection in &plan.relationship_projection_clears {
+        txn.execute(&format!("delete from {qualified_projection}"), &[])
+            .await?;
     }
 
     // 3. Ordered pre-lock + upsert/delete, per target table.

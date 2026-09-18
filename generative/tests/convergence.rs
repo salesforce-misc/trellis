@@ -1178,12 +1178,16 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrich
 /// row-driven path (issue #30) already feeds. Kept as a permanent regression
 /// pin (design doc §6) rather than deleted now that it passes.
 ///
-/// **Currently failing again** — epic #127's settled-parent-projection
-/// reverse mechanism for to-one relationships does not yet handle
-/// TRUNCATE's key-less sentinel the way this fix originally did. Tracked as
-/// upstream issue #165; re-enable once that lands.
+/// **Was failing again** (issue #168): epic #127's settled-parent-projection
+/// reverse mechanism for to-one relationships did not handle TRUNCATE's
+/// key-less sentinel — the projection was never cleared on a to-side
+/// truncate, so the from-side recompute this path stages kept re-deriving
+/// against the stale pre-truncate projection row. Fixed by also clearing the
+/// relationship's settled parent projection in full
+/// (`ApplyPlan::relationship_projection_clears`) whenever a `TRUNCATE`
+/// empties a to-one relationship's to-side table. Re-enabled as a permanent
+/// regression pin.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "regressed by epic #127's to-one reverse mechanism, see #165"]
 async fn truncating_a_relationship_to_side_table_leaves_a_stale_enrichment() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
