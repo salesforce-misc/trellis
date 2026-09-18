@@ -591,7 +591,10 @@ pub async fn isolate_and_evict(
 // incrementally-maintained counters: `poison` is already keyed one row per
 // `(src_table, key)`, so `count(*) where src_table = $1` is already exactly
 // "how many distinct keys for this source are currently evicted," with no
-// write-amplification tradeoff to make.
+// write-amplification tradeoff to make. Issue #160 narrowed *which* of those
+// rows a given definition is charged for (only those evicted since its last
+// resume re-armed the fuse — see `trip_transform_fuse_if_crossed`), but the
+// table is still the whole counter.
 
 /// Checks whether `src_table`'s whole-transform fuse has crossed
 /// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] and, if so, quarantines every
@@ -631,6 +634,13 @@ pub async fn isolate_and_evict(
 /// read against `txn`, deliberately unchanged here (issue #159 tracks that
 /// count's separate concurrent-undercount race).
 ///
+/// The old unwindowed `count(*)` survives as a cheap guard in front of the
+/// loop: a window can only ever *remove* `poison` rows from the count, so a
+/// source below threshold in total is below it for every definition, and the
+/// per-definition work (plus the `catalog` lookup's second pool connection,
+/// taken while `txn` is open) is skipped entirely — the same fast path every
+/// eviction below threshold took before #160.
+///
 /// Idempotent: a definition already [`TransformStatus::Quarantined`] is left
 /// alone (no redundant write, no repeated log line) on every later eviction
 /// that keeps `src_table` above threshold.
@@ -639,6 +649,25 @@ async fn trip_transform_fuse_if_crossed(
     pool: &Pool,
     src_table: &str,
 ) -> Result<(), ApplyError> {
+    // Unwindowed guard, kept from the pre-#160 shape: every definition's
+    // windowed count is a *subset* of this one (the window only ever removes
+    // `poison` rows, never adds them), so a source table below threshold in
+    // total cannot have any single definition at or above it, and the whole
+    // per-definition loop below — including the `catalog` call's second pool
+    // connection, acquired while this eviction's own `txn` is still open —
+    // can be skipped outright. Every eviction pays this one indexed
+    // `count(*)`; only a genuinely threshold-deep source pays for the rest.
+    let poisoned_total: i64 = txn
+        .query_one(
+            "select count(*) from poison where src_table = $1",
+            &[&src_table],
+        )
+        .await?
+        .get(0);
+    if poisoned_total < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
+        return Ok(());
+    }
+
     let definitions = catalog::transforms_for_source(pool, src_table).await?;
     for def in definitions {
         if def.status == TransformStatus::Quarantined {
