@@ -25,8 +25,8 @@
 //! many physical connections the pool opens, and
 //! `TRELLIS_POOL_WAIT_TIMEOUT_SECS` (default [`DEFAULT_POOL_WAIT_TIMEOUT`])
 //! bounds how long [`crate::Pool::get`] waits for one to free up before
-//! failing with a typed error, instead of deadpool's own defaults (an
-//! unbounded, box-size-dependent `max_size` and no wait timeout at all).
+//! failing with a typed error, instead of deadpool's own defaults (a
+//! box-size-dependent `max_size` and no wait timeout at all).
 
 use crate::error::Error;
 use std::fmt;
@@ -54,9 +54,10 @@ pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 /// The default cap on how many physical connections [`crate::Pool`] will
 /// ever open at once (issue #182).
 ///
-/// `deadpool_postgres`'s own default (`4 * num_cpus`) scales with the box
-/// this happens to run on, not with this engine's actual concurrency
-/// pattern, and — paired with no wait timeout — is how a handful of
+/// `deadpool_postgres`'s own default (`2 * num_cpus`, per `deadpool`'s
+/// `get_default_pool_max_size`) scales with the box this happens to run on,
+/// not with this engine's actual concurrency pattern, and — paired with no
+/// wait timeout — is how a handful of
 /// concurrent evictions each needing a *second* pool connection while their
 /// own transaction holds a first (`trip_transform_fuse_if_crossed`,
 /// `crate::staging::quarantine`) could exhaust a small box's pool and hang

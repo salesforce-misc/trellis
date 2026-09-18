@@ -57,7 +57,7 @@ impl Pool {
     ///
     /// Sized and timed out per `config.pool_max_size()`/
     /// `config.pool_wait_timeout()` (issue #182) rather than deadpool's own
-    /// defaults (`4 * num_cpus` connections, no wait timeout at all): with
+    /// defaults (`2 * num_cpus` connections, no wait timeout at all): with
     /// no cap and no timeout, a handful of concurrent callers each needing
     /// a *second* connection while their own transaction holds a first
     /// (`crate::staging::quarantine::trip_transform_fuse_if_crossed`'s
