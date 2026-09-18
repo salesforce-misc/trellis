@@ -921,10 +921,20 @@ enum SlotHealth {
     Invalidated,
 }
 
+/// Scoped to `database = current_database()` for the same reason
+/// [`slot_is_orphaned`] is (issue #188): `pg_replication_slots` is a
+/// cluster-wide view, but a logical slot only ever belongs to the database it
+/// was created against. Here the unscoped version fails in the *unsafe*
+/// direction — a same-named slot owned by a different database on the same
+/// cluster would make this database's own missing-or-invalidated slot look
+/// `Healthy`, defeating [`require_slot_healthy`]'s whole purpose (refusing to
+/// resume into an unrecoverable WAL gap) on the strength of a slot that isn't
+/// ours and that intake could never actually stream from.
 async fn slot_health(client: &impl GenericClient, slot: &str) -> Result<SlotHealth, IntakeError> {
     let row = client
         .query_opt(
-            "select wal_status from pg_replication_slots where slot_name = $1",
+            "select wal_status from pg_replication_slots where slot_name = $1 and \
+             database = current_database()",
             &[&slot],
         )
         .await?;

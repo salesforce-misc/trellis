@@ -157,10 +157,24 @@ impl TestCluster {
             .arg(port.to_string())
             .arg("-c")
             .arg("wal_level=logical")
+            // Headroom, not a tuning knob: a `TestDatabase`'s `dropdb
+            // --force` fails silently while that database still has an
+            // *active* logical slot (see `TestDatabase::drop`), so a case
+            // whose `trellis::Client` hasn't finished its best-effort
+            // shutdown leaves both behind. Issue #188 gives every
+            // shared-cluster generative case its own slot *name*, which
+            // removes the cross-case collision but means such leaks
+            // accumulate rather than reusing one name — and a deep nightly
+            // run puts hundreds of cases on one cluster. 10 left only a
+            // handful of leaks' worth of room before
+            // `pg_create_logical_replication_slot` would start failing with
+            // "all replication slots are in use"; 50 is still trivial
+            // shared memory (a slot is a small fixed struct) and takes that
+            // off the table.
             .arg("-c")
-            .arg("max_replication_slots=10")
+            .arg("max_replication_slots=50")
             .arg("-c")
-            .arg("max_wal_senders=10")
+            .arg("max_wal_senders=50")
             // Tests that assert on what the server logged (`log_statement =
             // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
             // file the two `Stdio::from` handles below point at. That only

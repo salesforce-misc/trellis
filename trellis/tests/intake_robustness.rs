@@ -682,13 +682,71 @@ async fn initial_snapshot_handshake_does_not_mistake_another_databases_slot_for_
             // rejects — the name is taken cluster-wide, just not by db_b.
         }
         Err(other) => panic!("expected IntakeError::Db (slot name collision), got {other:?}"),
-        Ok(()) => panic!(
-            "db_b's handshake must not succeed while db_a still holds the same slot name"
-        ),
+        Ok(()) => {
+            panic!("db_b's handshake must not succeed while db_a still holds the same slot name")
+        }
     }
 
     setup_a
         .execute("select pg_drop_replication_slot('shared_name_slot')", &[])
+        .await
+        .expect("clean up db_a's slot so it doesn't leak");
+}
+
+/// The other half of issue #188's cluster-wide-view finding, and the more
+/// dangerous half: `require_slot_healthy`'s own `pg_replication_slots` lookup
+/// (`slot_health`) must be scoped by `database = current_database()` too.
+/// Unscoped, it fails *open* rather than loud — a same-named slot owned by a
+/// different database on the same cluster makes this database's missing (or
+/// invalidated) slot read back as `Healthy`, so intake would resume across the
+/// very WAL gap this check exists to refuse, on the strength of a slot it can
+/// never actually stream from.
+///
+/// Same two-database setup as the orphan case above, inverted: `db_a` owns a
+/// real, healthy slot, and `db_b` has confirmed progress against a slot of the
+/// same name that does not exist in `db_b` at all. `db_b` must still be told
+/// [`IntakeError::SlotLost`].
+#[tokio::test]
+async fn another_databases_healthy_slot_does_not_make_a_lost_slot_look_healthy() {
+    let cluster = TestCluster::start();
+    let db_a = cluster.create_isolated_database().await;
+    let db_b = cluster.create_isolated_database().await;
+
+    let setup_a = connect_raw(db_a.dsn()).await;
+    setup_a
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('shared_health_slot', \
+             'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create a real, healthy replication slot on db_a");
+
+    // db_b has confirmed work against this slot name before, but the slot
+    // itself is gone from db_b (it never existed there) — the `SlotLost`
+    // condition, with a decoy of the same name one database over.
+    let setup_b = connect_raw(db_b.dsn()).await;
+    seed_progress(&setup_b, "shared_health_slot", 500).await;
+
+    match publication::require_slot_healthy(&setup_b, "shared_health_slot", PgLsn::from(500)).await
+    {
+        Err(IntakeError::SlotLost {
+            slot,
+            last_confirmed_lsn,
+        }) => {
+            assert_eq!(slot, "shared_health_slot");
+            assert_eq!(last_confirmed_lsn, 500);
+        }
+        Err(other) => panic!("expected SlotLost, got {other:?}"),
+        Ok(()) => panic!(
+            "db_b's own slot is gone; db_a's same-named slot must not make it look healthy — \
+             slot_health must scope its pg_replication_slots check by database = \
+             current_database()"
+        ),
+    }
+
+    setup_a
+        .execute("select pg_drop_replication_slot('shared_health_slot')", &[])
         .await
         .expect("clean up db_a's slot so it doesn't leak");
 }
