@@ -26,11 +26,14 @@ deltas after the build fence. Implemented in [`trellis::defs::backfill`]:
   ON CONFLICT (<pk>) DO UPDATE`. Bounds come from `max()`-over-`LIMIT`, so every
   row falls in exactly one range regardless of key gaps.
 - **Aggregates** scan the source **once** into a temp staging table (`CREATE TEMP
-  TABLE … AS SELECT <group_cols>, <aggs> FROM source WHERE <keys> IS NOT NULL
-  GROUP BY <group_cols>`), then chunk the **writes** from staging into the target
-  by group-key range (`INSERT INTO target SELECT … FROM staging WHERE
-  (<group_cols>) > lo AND (<group_cols>) <= hi ON CONFLICT DO UPDATE`). A group is
-  a point in group-key space, so it lands wholly in one chunk.
+  TABLE … AS SELECT <group_cols>, <aggs> FROM source GROUP BY <group_cols>` —
+  NULL-keyed groups included, issue #128/#110), then chunk the **writes** from
+  staging into the target by group-key range (`INSERT INTO target SELECT …
+  FROM staging WHERE (<group_cols>) > lo AND (<group_cols>) <= hi ON CONFLICT
+  DO UPDATE`) for the non-NULL-keyed groups, plus one final unchunked write for
+  every NULL-keyed group (see [below](#null-group-keys-are-built-in-one-unchunked-pass)).
+  A non-NULL group is a point in group-key space, so it lands wholly in one
+  chunk.
 
 Each chunk write is one bounded transaction. Chunks are not run in an in-call
 loop — they are enumerated as a durable, claimable work queue executed by drain
@@ -71,11 +74,38 @@ by group key:
   bind parameters, so there is no bind-parameter ceiling (unlike #58's
   VALUES-list writes).
 
-## NULL group keys are not built
+## NULL group keys are built, in one unchunked pass
 
-An aggregate's GROUP BY columns are its primary key, so Postgres forbids a NULL
-there — a NULL-key group has no representable target row and the ring can't store
-one either. The staging build excludes them (`WHERE <keys> IS NOT NULL`).
+Postgres `GROUP BY` folds every `NULL` in a column into one ordinary group
+(three-valued-logic's usual exception: `GROUP BY` treats `NULL = NULL` as true
+for grouping purposes even though `NULL = NULL` is `NULL` everywhere else), so
+a NULL-keyed group is real and must be built like any other. It used to be
+true that Postgres forbids a NULL in a `PRIMARY KEY`, and the target's
+`GROUP BY` columns were keyed that way — issue #128 replaced that with a
+`UNIQUE NULLS NOT DISTINCT` constraint instead (`ddl.rs`'s
+`create_aggregate_target_table`), specifically so a NULL-keyed group's target
+row is representable, and the direct backfill build was fixed to match:
+the single-pass staging aggregation includes NULL-keyed groups (no `WHERE
+<keys> IS NOT NULL` filter), but they're excluded from the range-chunked
+write loop above and written afterward in one final unchunked
+`INSERT … WHERE not (<keys> is not null)` instead. That's for a narrower
+reason than "can't exist": a `NULL` component makes Postgres's row-value
+comparison operators (`<`, `<=`, `>`) return `NULL` rather than
+`true`/`false` (three-valued logic again, the *other* direction from
+`GROUP BY`'s), which would silently exclude that row from every chunk's range
+`WHERE` clause — so NULL-keyed groups are written through the target's
+`NULLS NOT DISTINCT` conflict arbiter instead, which needs no row-value
+comparison at all. NULL keys are expected to be a small minority of groups,
+so skipping the chunking optimization for them costs little.
+
+Issue #110 closed the sibling gap this decision's initial version didn't
+cover: a NULL-keyed group being built here is a from-scratch backfill of one
+target in isolation, not the live-CDC *downstream propagation* of a NULL-keyed
+group's creation/update/extinction into a *chained* definition reading that
+target as its own source — see that issue for the shared key-encoding fix
+(`staging::apply_aggregate::derive_group_key`,
+`staging::apply::read_live_rows_batch`) this backfill path didn't need,
+since it writes directly to the target rather than through the ring.
 
 ## Wiring
 

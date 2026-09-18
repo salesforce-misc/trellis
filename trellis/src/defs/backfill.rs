@@ -868,10 +868,18 @@ async fn resolve_to_one_joins(
 ///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
 /// ordered distinct group tuples in staging, which cover every non-`NULL` group
-/// exactly once. A group whose key has a `NULL` component is deliberately never
-/// built: the target's GROUP BY columns are its primary key, so no such row can
-/// exist (the ring can't store one either). Such groups are filtered out when
-/// staging is built, so they never reach the target.
+/// exactly once. A group whose key has a `NULL` component **is** built — issue
+/// #128 keys the target's `GROUP BY` columns with `UNIQUE NULLS NOT DISTINCT`
+/// rather than a bare `PRIMARY KEY`, precisely so such a row can exist — but a
+/// `NULL` component makes Postgres's row-value comparison operators
+/// (`<`/`<=`/`>`) return `NULL` rather than `true`/`false` (three-valued
+/// logic), which would silently drop that row from every range-chunked
+/// write's `WHERE` clause. So NULL-keyed groups are excluded only from this
+/// range-chunking scheme, not from the single-pass staging aggregation
+/// itself, and are written afterward in one unchunked pass instead (see the
+/// `group_key_not_null`/final `insert_for` call below) — matched through the
+/// target's `NULLS NOT DISTINCT` constraint, which needs no row-value
+/// comparison at all.
 async fn backfill_aggregate(
     pool: &Pool,
     def: &TransformDef,

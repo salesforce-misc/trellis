@@ -172,13 +172,18 @@ unblocks it.
   await it, assert the visible derived state includes every effect of ops 1..k.
 - **Non-idempotent delta convergence** *(aggregate slice)*. The hardest guarantee —
   byte-identical convergence to a from-scratch `GROUP BY` oracle under aggregate
-  delta maintenance. Grain domains stay *tiny* (`0`, `1`, `2` — see
-  `generative::generate::strategy::grain_value`'s doc comment) so many rows share a
-  group and deletes really kill groups. **Not** `NULL`: a legal SQL `NULL` grouping
-  value hits a real, still-open engine defect (a NULL-keyed group is silently and
-  permanently dropped, no operator-driven recovery — mechanism and out-of-scope
-  reasoning in `grain_value`'s doc comment), so the generator never draws one until
-  that lands.
+  delta maintenance. Grain domains stay *tiny* (`0`, `1`, `2`, plus occasional
+  `NULL` — see `generative::generate::strategy::grain_value`'s doc comment) so many
+  rows share a group and deletes really kill groups. A legal SQL `NULL` grouping
+  value used to hit a real engine defect (a NULL-keyed group's write was silently
+  and permanently dropped with a not-null-constraint quarantine and no
+  operator-driven recovery), which the generator worked around by never drawing
+  one; issue #128 fixed the root cause (the target no longer rejects a NULL-keyed
+  group's write at all) and `grain_value` has drawn `NULL` unconditionally since.
+  This suite doesn't currently generate a *chained* definition (one `TRANSFORM`
+  reading another's target), so it never exercised issue #110's sibling
+  downstream-propagation gap either way; #110's own front-door coverage lives in
+  `trellis/tests/defs_aggregate_chained_single_column_group_key.rs`.
 - **A second, structural oracle** *(needs an engine consistency auditor, if one
   exists)*. Run the engine's internal consistency check at end of run, require zero
   findings, prove the wiring with a negative test.
