@@ -22,7 +22,7 @@
 use crate::config::Config;
 use crate::error::Error;
 use deadpool_postgres::{
-    Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod,
+    Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
 use std::str::FromStr;
 use tokio_postgres::NoTls;
@@ -54,6 +54,18 @@ impl Pool {
     /// parsed as a Postgres connection string or deadpool's builder rejects
     /// the resulting configuration; no network I/O happens here — the pool
     /// connects lazily on first `get()`.
+    ///
+    /// Sized and timed out per `config.pool_max_size()`/
+    /// `config.pool_wait_timeout()` (issue #182) rather than deadpool's own
+    /// defaults (`4 * num_cpus` connections, no wait timeout at all): with
+    /// no cap and no timeout, a handful of concurrent callers each needing
+    /// a *second* connection while their own transaction holds a first
+    /// (`crate::staging::quarantine::trip_transform_fuse_if_crossed`'s
+    /// `catalog::transforms_for_source` call) could exhaust a small box's
+    /// pool and then [`Pool::get`] would wait forever — no error, no log,
+    /// just every drain thread stuck. See [`crate::config::DEFAULT_POOL_MAX_SIZE`]/
+    /// [`crate::config::DEFAULT_POOL_WAIT_TIMEOUT`] for the sizing/timeout
+    /// reasoning.
     pub fn new(config: &Config) -> Result<Self, Error> {
         let pg_config = tokio_postgres::Config::from_str(config.dsn())
             .map_err(|err| Error::Config(format!("invalid database connection string: {err}")))?;
@@ -75,6 +87,16 @@ impl Pool {
                         .map_err(HookError::Backend)
                 })
             }))
+            .max_size(config.pool_max_size())
+            // A `Runtime` is required for `wait_timeout` to take effect at
+            // all — without one, `deadpool`'s `PoolBuilder::build` rejects
+            // the config outright (`BuildError::NoRuntimeSpecified`) rather
+            // than silently ignoring the timeout. `Runtime::Tokio1` matches
+            // deadpool-postgres's own default feature (`rt_tokio_1`) and
+            // every other async runtime this crate already assumes
+            // (tokio_postgres::Client, the post_create hook above).
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(config.pool_wait_timeout()))
             .build()?;
 
         Ok(Self {
@@ -83,8 +105,12 @@ impl Pool {
         })
     }
 
-    /// Acquires a connection, waiting for one to become available if the
-    /// pool is at capacity.
+    /// Acquires a connection, waiting up to `config.pool_wait_timeout()`
+    /// (see [`Pool::new`]) for one to become available if the pool is at
+    /// capacity. Once that timeout elapses, returns
+    /// `Err(Error::Pool(deadpool_postgres::PoolError::Timeout(_)))` — a
+    /// clear, typed, loggable failure (categorized [`crate::ErrorCode::Connectivity`]
+    /// via [`Error::code`]) instead of hanging indefinitely (issue #182).
     pub async fn get(&self) -> Result<Client, Error> {
         Ok(self.inner.get().await?)
     }

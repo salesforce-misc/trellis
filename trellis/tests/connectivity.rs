@@ -117,6 +117,59 @@ async fn unreachable_dsn_surfaces_a_typed_error_without_panicking() {
     }
 }
 
+/// Issue #182: a pool with no `max_size`/`wait_timeout` configured lets a
+/// caller that shows up once every slot is already checked out wait
+/// forever — silently, with no error and no log line, ever. Configures a
+/// deliberately tiny `max_size` (2, via [`Config::with_pool_max_size`]) and
+/// a short `wait_timeout` (via [`Config::with_pool_wait_timeout`]) so
+/// exhaustion is trivial to trigger without spinning up dozens of real
+/// connections, then proves a third caller gets back a typed, bounded
+/// failure — never a hang — once every slot is held.
+#[tokio::test]
+async fn pool_exhaustion_times_out_with_a_typed_error_instead_of_hanging() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+
+    let config = Config::from_dsn(db.dsn().to_string())
+        .expect("valid schema")
+        .with_pool_max_size(2)
+        .expect("2 is a valid pool size")
+        .with_pool_wait_timeout(std::time::Duration::from_millis(300));
+    let pool = trellis::Pool::new(&config).expect("pool builds lazily; DSN is well-formed");
+
+    // Check out every slot the pool has and hold onto the guards — dropping
+    // either would return its connection to the pool and defeat the point
+    // of this test.
+    let first = pool.get().await.expect("acquire slot 1 of 2");
+    let second = pool.get().await.expect("acquire slot 2 of 2");
+
+    // A third caller now has nowhere to go. Wrap the call in a generous
+    // outer `tokio::time::timeout` (well beyond the pool's own 300ms
+    // `wait_timeout`) so a regression that reintroduces an unbounded wait
+    // fails this test loudly and quickly instead of hanging the whole test
+    // binary.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), pool.get())
+        .await
+        .expect("pool.get() must return well within 5s once wait_timeout elapses, not hang");
+
+    match outcome {
+        Err(Error::Pool(err)) => {
+            let message = err.to_string();
+            assert!(
+                message.to_lowercase().contains("timeout"),
+                "expected a wait-timeout pool error, got: {message}"
+            );
+        }
+        other => panic!(
+            "expected a typed, bounded pool-timeout error once the pool was exhausted, got \
+             {other:?}"
+        ),
+    }
+
+    drop(first);
+    drop(second);
+}
+
 #[tokio::test]
 async fn failing_migration_rolls_back_without_partial_ledger_entry() {
     let cluster = TestCluster::start();
