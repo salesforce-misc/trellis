@@ -2818,6 +2818,42 @@ mod tests {
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
 
+    /// Issue #180's step-4 guard: a key this batch both deleted (with a
+    /// captured pre-delete image) and wrote — reachable when the forward
+    /// aggregate apply and a per-record reverse-relationship apply touch one
+    /// group inside a single batch — must be reported as written, so the
+    /// captured image never rides downstream and annihilates the write's own
+    /// image-less `Recompute` in the fold.
+    #[test]
+    fn a_key_both_deleted_and_written_in_one_batch_counts_as_written() {
+        let touched: Vec<ChangedKey> = vec![
+            (
+                "gone".to_string(),
+                0,
+                None,
+                Some(r#"{"g":"gone"}"#.to_string()),
+            ),
+            (
+                "moved".to_string(),
+                0,
+                None,
+                Some(r#"{"g":"moved"}"#.to_string()),
+            ),
+            ("moved".to_string(), 0, None, None),
+            ("fresh".to_string(), 0, None, None),
+        ];
+        let written = keys_written_without_image(&touched);
+        assert!(
+            written.contains("moved"),
+            "a key deleted and then rewritten in the same batch must count as written"
+        );
+        assert!(written.contains("fresh"), "a plain write counts as written");
+        assert!(
+            !written.contains("gone"),
+            "a key only ever deleted must keep its image-bearing propagation"
+        );
+    }
+
     #[test]
     fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
         let earlier = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -4678,6 +4714,20 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// dropping the change (issue #180).
 type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
 
+/// Every key in one target's [`ChangedKey`] accumulator that this batch
+/// *wrote* (no captured pre-delete image), as a lookup set — the guard
+/// [`apply_and_mark_drained_many`]'s step 4 checks before it lets a
+/// captured image ride downstream as a real delete. See that call site's own
+/// comment for why a key that is both deleted and written inside one batch
+/// must propagate image-less.
+fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashSet<&str> {
+    touched
+        .iter()
+        .filter(|(_, _, _, old_image)| old_image.is_none())
+        .map(|(key, _, _, _)| key.as_str())
+        .collect()
+}
+
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
 /// deleted (as opposed to every key this batch merely *proposed* — the
@@ -5709,6 +5759,25 @@ pub async fn apply_and_mark_drained_many(
         {
             continue;
         }
+        // Issue #180 hardening: one batch can physically touch the same
+        // target key more than once. The forward aggregate step (3b) and
+        // *each* per-record reverse-relationship fast-path apply (3d) extend
+        // this very same vector, so a group whose last from-side row moves
+        // away under one reverse record and whose first from-side row
+        // arrives under another is deleted by one apply and rewritten by
+        // the next, inside this one batch. Staging both an image-bearing
+        // delete and an image-less `Recompute` for such a key would be
+        // strictly worse than staging neither: [`fold::fold`]'s
+        // arg-extremes only ever consider image-bearing rows, so the
+        // delete's `old_image` (and its absent `new_image`) wins *both*
+        // halves and the recompute is annihilated — a chained downstream
+        // aggregate would then subtract a still-live group's contribution
+        // and never learn its new value. A key this batch also wrote
+        // therefore gives up its image and stays an ordinary `Recompute`,
+        // whose downstream live refetch finds the surviving row and
+        // re-derives the group correctly — exactly the pre-#180 behaviour,
+        // which was only ever wrong for a key that really is gone.
+        let rewritten = keys_written_without_image(touched);
         for (key, hop_gen, src_changed, deleted_old_image) in touched {
             let next_hop = hop_gen + 1;
             if next_hop > MAX_HOP_GEN {
@@ -5726,9 +5795,25 @@ pub async fn apply_and_mark_drained_many(
             // and silently drop the change (the module doc comment's "A
             // known gap: image-less changes"). An ordinary write still stays
             // image-less — a downstream live refetch always finds the
-            // *right* current row for those, so there is no gap to close.
+            // *right* current row for those, except for a `NULL`-keyed
+            // group, which cannot be resolved by key text at all and never
+            // reaches a chained reader in the first place (issue #195, a
+            // gap upstream of this one).
+            //
+            // `lsn: None`, like every other row this step stages: a
+            // propagated hop has no source LSN of its own. Two fold-side
+            // predicates read `lsn` and were written when "no `lsn`" implied
+            // "no images" — both stay sound for this row, but only by
+            // argument, so re-check them if either changes: [`fold::fold`]'s
+            // truncate-void filter (`(t.lsn, t.change_id) > (f.lsn,
+            // f.change_id)` is `NULL`, so a truncate on the target never
+            // voids this delete — harmless, since subtracting a group that a
+            // truncate also erased reaches the same answer), and
+            // [`from_side_change_in_flight`]'s `r.lsn <= $2` (this row is
+            // invisible to that in-flight probe, exactly as its pre-#180
+            // `Recompute` was).
             match deleted_old_image {
-                Some(old_image) => {
+                Some(old_image) if !rewritten.contains(key.as_str()) => {
                     recompute_changes.push(StagedChange::Cdc {
                         src_table: target.to_string(),
                         key: key.clone(),
@@ -5742,7 +5827,7 @@ pub async fn apply_and_mark_drained_many(
                         group_key: None,
                     });
                 }
-                None => {
+                _ => {
                     recompute_changes.push(StagedChange::Recompute {
                         src_table: target.to_string(),
                         key: key.clone(),

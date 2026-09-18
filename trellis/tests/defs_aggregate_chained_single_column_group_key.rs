@@ -318,3 +318,101 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
          update and the brand-new group still propagate normally"
     );
 }
+
+/// The `NULL`-keyed group, which issue #180's own writeup calls out by name
+/// ("a `NULL` grouping component ... same underlying gap, same failure
+/// family") — and which issue #180's fix deliberately does **not** close,
+/// because the gap is upstream of it. A `NULL`-keyed upstream group never
+/// reaches a chained downstream aggregate *at all*: not on creation, not on
+/// update, and so there is never any downstream contribution for an
+/// extinction to subtract. `derive_group_key` encodes a `NULL` component as
+/// an empty part (indistinguishable from `''`), and the chained definition's
+/// own live re-read (`read_live_rows_batch`'s keyset join, a plain `t.col =
+/// u.c0`) can never match a `NULL` column anyway — see issue #195, which
+/// tracks the encoding/resolution design call this needs.
+///
+/// This test pins that gap rather than asserting the behaviour we want, in
+/// the same spirit the composite-key file's own test pinned issue #180
+/// before it was fixed: it fails loudly the day #195 is fixed, which is
+/// exactly when it should be rewritten into the assertion below its
+/// `GAP:` comments.
+#[tokio::test]
+async fn a_null_keyed_group_never_reaches_the_chained_downstream_aggregate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    install_the_chain(&db, &mut client).await;
+
+    client
+        .batch_execute("insert into sales (id, sku, amount) values (7, null, 6)")
+        .await
+        .expect("insert the NULL-keyed group's only row");
+    stage_cdc(
+        &client,
+        "sales",
+        "7",
+        "insert",
+        None,
+        Some(r#"{"id":"7","sku":null,"amount":"6"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        null_group_total(&client, "sku_totals", "total").await,
+        Some("6".to_string()),
+        "the NULL-keyed group is maintained correctly at its own level"
+    );
+    // GAP (issue #195): should be `Some("6")`.
+    assert_eq!(
+        null_group_total(&client, "sku_totals_v2", "total2").await,
+        None,
+        "issue #195: the NULL-keyed group's creation never propagates into \
+         the chained aggregate, because its downstream Recompute's key text \
+         cannot express (or resolve) a NULL group key"
+    );
+
+    client
+        .batch_execute("delete from sales where id = 7")
+        .await
+        .expect("delete the NULL-keyed group's only row");
+    stage_cdc(
+        &client,
+        "sales",
+        "7",
+        "delete",
+        Some(r#"{"id":"7","sku":null,"amount":"6"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        null_group_total(&client, "sku_totals", "total").await,
+        None,
+        "the NULL-keyed group goes extinct upstream, as it should"
+    );
+    // Consistent, at least: nothing downstream to subtract, because nothing
+    // downstream was ever created. Issue #180's fix stages the extinct
+    // group's real pre-delete image here, and the chained aggregate simply
+    // has no matching group to reduce.
+    assert_eq!(
+        null_group_total(&client, "sku_totals_v2", "total2").await,
+        None,
+        "and its (never-created) downstream counterpart stays absent"
+    );
+}
+
+/// The `sku IS NULL` group's aggregate value in `table`, or `None` when that
+/// group has no row at all — `sku_totals`/`sku_totals_v2`'s own helpers read
+/// `sku` into a `String`, which a `NULL` key cannot be.
+async fn null_group_total(client: &Client, table: &str, column: &str) -> Option<String> {
+    client
+        .query_opt(
+            &format!("select {column}::text from {table} where sku is null"),
+            &[],
+        )
+        .await
+        .expect("read the NULL-keyed group")
+        .and_then(|row| row.get(0))
+}

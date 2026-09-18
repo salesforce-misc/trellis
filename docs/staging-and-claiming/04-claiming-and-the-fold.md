@@ -158,6 +158,15 @@ NULL on the other side, while a bare trigger is excluded from both. A key whose
 rows are all image-less folds to both images NULL, which is correct: recompute
 from live source and take a zero delta.
 
+The corollary binds *producers*, not just the fold: within one window, for one
+`(src_table, key)`, an image-bearing row always beats an image-less one — **even
+when the image-less one is newer**. A producer that can stage both shapes for the
+same key must therefore pick one. See issue #180's downstream propagation of an
+extinct aggregate group: it stages a real image-bearing delete carrying the
+group's captured pre-delete image, but drops back to an image-less `Recompute`
+for any key the same batch also *wrote*, precisely so the delete cannot
+annihilate the write and leave a live group subtracted downstream.
+
 One field is deliberately **not** filtered: `op`, because the only load-bearing op
 is the `truncate` sentinel, and that sentinel is itself image-less. Filtering `op`
 would fold it to NULL and lose the truncate.
