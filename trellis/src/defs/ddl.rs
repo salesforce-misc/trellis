@@ -505,6 +505,66 @@ pub fn require_single_column_pk(
 /// notably): both producers, and every consumer, agree on one shape.
 pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 
+/// The per-part text substituted for a `NULL` key/group component wherever
+/// this crate's shared key contract renders one — the fix for issue #110's
+/// NULL-lossiness axis: before this, a `NULL` component rendered as an empty
+/// string (`unwrap_or_default()`/a bare `col::text`, which is SQL `NULL` and
+/// gets dropped by `array_to_string`), indistinguishable from a genuine `''`
+/// value, so a `NULL`-keyed group's identity couldn't round-trip through a
+/// chained definition's live re-fetch (`staging::apply::read_live_rows_batch`)
+/// — it looked exactly like "no row," which is mistaken for a delete.
+///
+/// U+0001 (SOH) is used, on the same "no real column value contains this
+/// control character" assumption `staging::append::TRUNCATE_SENTINEL_KEY`
+/// already documents and relies on (and, transitively,
+/// [`COMPOSITE_KEY_SEPARATOR`]'s own U+001F) — deliberately *not* U+0000
+/// (NUL), which would otherwise be the more obviously-unambiguous choice
+/// (`TRUNCATE_SENTINEL_KEY`'s doc comment: Postgres `text` is effectively
+/// cstring-based internally and can never store an embedded NUL at all,
+/// unlike an ordinary control character, which it merely happens not to see
+/// in practice). Postgres's own `chr()` builtin unconditionally refuses to
+/// *construct* `chr(0)` in the first place (`ERROR: null character not
+/// permitted`, raised from `oracle_compat.c`) — confirmed the hard way, as a
+/// live-database `SQLSTATE 54000` failure every drain-touching integration
+/// test hit the first time this constant used U+0000 — which would make it
+/// impossible to express identically on the SQL side
+/// ([`pk_key_sql_expr`]'s `coalesce(<col>::text, chr(1))` twin) even though
+/// the underlying storage guarantee is stronger. U+0001 has no such
+/// restriction and is otherwise unused anywhere else in this crate's key
+/// contract.
+///
+/// Every producer of this crate's composite/single key text must route a
+/// possibly-`NULL` component through [`encode_key_part`] (Rust side) or the
+/// equivalent `coalesce(<col>::text, chr(1))` (SQL side, baked into
+/// [`pk_key_sql_expr`]) before joining it in, and every consumer must decode
+/// it back through [`decode_key_part`] (used by [`split_pk_key`]) — so a
+/// `NULL` component agrees byte-for-byte on both sides of the wire, the same
+/// "one shape, every producer and consumer" property
+/// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment describes for the separator.
+pub(crate) const NULL_KEY_SENTINEL: &str = "\u{1}";
+
+/// The Rust-side counterpart of [`pk_key_sql_expr`]'s `coalesce(<col>::text,
+/// chr(1))`: renders one possibly-`NULL` key/group component as the text a
+/// producer should feed into [`join_pk_key`] — `value` unchanged when
+/// `Some`, or [`NULL_KEY_SENTINEL`] when `None`. See that constant's doc
+/// comment for why the two sides are guaranteed to agree.
+pub(crate) fn encode_key_part(value: Option<&str>) -> &str {
+    value.unwrap_or(NULL_KEY_SENTINEL)
+}
+
+/// [`encode_key_part`]'s exact inverse — the read-side counterpart
+/// [`split_pk_key`] applies to each of a decoded key's parts: `None` when the
+/// part is exactly [`NULL_KEY_SENTINEL`] (which, per that constant's doc
+/// comment, no ordinary column value is expected to equal), `Some(part)`
+/// otherwise.
+pub(crate) fn decode_key_part(part: &str) -> Option<&str> {
+    if part == NULL_KEY_SENTINEL {
+        None
+    } else {
+        Some(part)
+    }
+}
+
 /// The SQL expression computing one row's composite primary-key identity
 /// text, from `pk`'s columns (in the key's own declared order) — the
 /// multi-column generalization of a bare `{pk}::text`. A single-column key
@@ -549,10 +609,24 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
         .iter()
         .map(|c| {
             let ident = quote_ident(&c.name);
-            match alias {
+            let col_text = match alias {
                 Some(a) => format!("{a}.{ident}::text"),
                 None => format!("{ident}::text"),
-            }
+            };
+            // Issue #110: a NULL component is coalesced to `chr(1)`
+            // (`NULL_KEY_SENTINEL`; deliberately not `chr(0)` — Postgres's
+            // `chr()` itself refuses to construct a NUL byte, see that
+            // constant's doc comment) rather than left as SQL `NULL`, so it
+            // survives `array_to_string` (which otherwise drops a NULL
+            // array element outright, collapsing a composite key's arity)
+            // and stays distinguishable from a genuine empty string, both
+            // at every arity — see `NULL_KEY_SENTINEL`'s doc comment for why
+            // the substitution is unambiguous, and `encode_key_part` for
+            // this expression's exact Rust-side counterpart, which every
+            // producer of this crate's *other* half of this same key
+            // (`join_pk_key`'s callers) must use so the two sides render
+            // byte-identical text for the same NULL-ness.
+            format!("coalesce({col_text}, chr(1))")
         })
         .collect();
     match parts.len() {
@@ -602,11 +676,18 @@ pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> 
 /// declared order" here is [`pk_key_sql_expr`]'s documented declared-order
 /// convention (issue #163), not the table's physical column order; see that
 /// variant's doc comment for when this can genuinely happen.
+///
+/// Each returned part is run through [`decode_key_part`] (issue #110): a
+/// part that is exactly [`NULL_KEY_SENTINEL`] decodes to `None` (a real
+/// `NULL` component), not the literal sentinel text, so a caller binding
+/// these back against the live columns (`staging::apply::read_live_rows_batch`)
+/// can bind a genuine SQL `NULL` — and, critically, tell that column apart
+/// from one that merely holds an empty string.
 pub(crate) fn split_pk_key<'a>(
     pk: &[PrimaryKeyColumn],
     source_table: &str,
     key: &'a str,
-) -> Result<Vec<&'a str>, DdlError> {
+) -> Result<Vec<Option<&'a str>>, DdlError> {
     let parts: Vec<&str> = key.split(COMPOSITE_KEY_SEPARATOR).collect();
     if parts.len() != pk.len() {
         return Err(DdlError::MalformedCompositeKey {
@@ -616,7 +697,7 @@ pub(crate) fn split_pk_key<'a>(
             actual_arity: parts.len(),
         });
     }
-    Ok(parts)
+    Ok(parts.into_iter().map(decode_key_part).collect())
 }
 
 /// [`split_pk_key`], applied to a whole batch of keys and transposed so
@@ -624,13 +705,15 @@ pub(crate) fn split_pk_key<'a>(
 /// parameterized `unnest(...)` match needs (one bind array per `pk` column,
 /// regardless of how many keys the batch carries), mirroring
 /// `staging::apply_aggregate`'s `keyset_unnest`/`transpose_group_values`
-/// pair for the identical reason.
+/// pair for the identical reason. A `None` part (issue #110: a `NULL` key
+/// component, decoded by [`split_pk_key`]) binds as a genuine SQL `NULL` in
+/// its column's array, not [`NULL_KEY_SENTINEL`]'s literal text.
 pub(crate) fn transpose_pk_keys<'a>(
     pk: &[PrimaryKeyColumn],
     source_table: &str,
     keys: &[&'a str],
-) -> Result<Vec<Vec<&'a str>>, DdlError> {
-    let mut columns: Vec<Vec<&str>> = (0..pk.len())
+) -> Result<Vec<Vec<Option<&'a str>>>, DdlError> {
+    let mut columns: Vec<Vec<Option<&str>>> = (0..pk.len())
         .map(|_| Vec::with_capacity(keys.len()))
         .collect();
     for &key in keys {
@@ -1321,6 +1404,30 @@ mod tests {
             .collect()
     }
 
+    /// Issue #110: every column reference `pk_key_sql_expr` renders is
+    /// `coalesce(<col>::text, chr(1))`, not a bare `<col>::text` — the
+    /// SQL-side half of the NULL-safe encoding, matching
+    /// [`encode_key_part`]'s Rust-side `unwrap_or(NULL_KEY_SENTINEL)`
+    /// byte-for-byte so a NULL group's key text agrees on both sides of the
+    /// wire regardless of arity. `chr(1)`, not `chr(0)`: Postgres's `chr()`
+    /// itself refuses to construct a NUL byte (`NULL_KEY_SENTINEL`'s doc
+    /// comment) — a live-database regression this exact test would not have
+    /// caught (`pk_key_sql_expr` is pure string rendering), which is why
+    /// every `defs_aggregate_chained_*_group_key.rs` front-door test drives
+    /// this expression against a real Postgres end to end.
+    #[test]
+    fn pk_key_sql_expr_coalesces_a_null_component_to_the_sentinel() {
+        assert_eq!(
+            pk_key_sql_expr(&pk(&["warehouse"]), Some("t")),
+            "coalesce(t.\"warehouse\"::text, chr(1))"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&pk(&["warehouse", "sku"]), Some("t")),
+            "array_to_string(array[coalesce(t.\"warehouse\"::text, chr(1)), \
+             coalesce(t.\"sku\"::text, chr(1))], chr(31))"
+        );
+    }
+
     /// [`join_pk_key`] and [`split_pk_key`] are exact inverses, and an
     /// arity-1 key carries no separator at all — the property issue #103's
     /// and issue #171's fixes both lean on (a group key of either arity is
@@ -1333,15 +1440,45 @@ mod tests {
         assert_eq!(join_pk_key(["w1", "a"]), "w1\u{1f}a");
         assert_eq!(
             split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["w1", "a"])).unwrap(),
-            vec!["w1", "a"]
+            vec![Some("w1"), Some("a")]
         );
-        // An empty component (a NULL grouping value, per
-        // `apply_aggregate::derive_group_key`) still occupies its own part,
-        // so the arity check can't be fooled by it.
+        // A genuine empty-string component still occupies its own part, so
+        // the arity check can't be fooled by it — and, issue #110, it must
+        // decode as `Some("")`, distinct from a real `NULL` component below.
         assert_eq!(
             split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["", "a"])).unwrap(),
-            vec!["", "a"]
+            vec![Some(""), Some("a")]
         );
+    }
+
+    /// Issue #110: a `NULL` key/group component, encoded via
+    /// [`encode_key_part`] the way every real producer
+    /// (`staging::apply_aggregate::derive_group_key`, [`pk_key_sql_expr`]'s
+    /// SQL-side twin) must, round-trips back to `None` — distinguishable
+    /// from the genuine empty string [`join_pk_key_round_trips_through_split_pk_key`]
+    /// pins above, which is exactly the ambiguity the old
+    /// `unwrap_or_default()`/bare-`col::text` encoding could not resolve.
+    #[test]
+    fn a_null_component_round_trips_distinct_from_an_empty_string() {
+        let key = join_pk_key([encode_key_part(None), encode_key_part(Some("a"))]);
+        assert_eq!(key, "\u{1}\u{1f}a");
+        assert_eq!(
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &key).unwrap(),
+            vec![None, Some("a")]
+        );
+
+        // The single-column case (no separator at all) round-trips the same
+        // way: the bare sentinel text decodes back to `None`.
+        let single = join_pk_key([encode_key_part(None)]);
+        assert_eq!(single, "\u{1}");
+        assert_eq!(
+            split_pk_key(&pk(&["warehouse"]), "t", &single).unwrap(),
+            vec![None]
+        );
+
+        // A NULL component and an empty-string component encode to
+        // different text and therefore never collide.
+        assert_ne!(encode_key_part(None), encode_key_part(Some("")));
     }
 
     /// The length-prefixed encoding `apply_aggregate::derive_group_key` used

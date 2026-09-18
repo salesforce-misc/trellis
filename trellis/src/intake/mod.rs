@@ -178,6 +178,18 @@ async fn fetch_confirmed_lsn(
 /// catalog can no longer resolve — a table dropped since the change was
 /// written to the WAL, say — where the flags remain the only surviving
 /// description of its key; see `handle_xlog_data`'s `Relation` arm.
+///
+/// Issue #110's NULL-safe key encoding (`ddl::encode_key_part`/
+/// `ddl::NULL_KEY_SENTINEL`) doesn't need to touch this function's own
+/// logic: `key_value` below already rejects anything but
+/// [`ColumnValue::Text`] with [`IntakeError::MissingKeyValue`], and a real
+/// table's `PRIMARY KEY`/`REPLICA IDENTITY FULL` column can never itself be
+/// SQL `NULL` — so `parts` here can never actually contain a `NULL`
+/// component to encode ambiguously in the first place. It still shares
+/// [`crate::defs::ddl::join_pk_key`] with every other producer
+/// (`staging::apply_aggregate::derive_group_key`, which *does* need the
+/// sentinel, since a `GROUP BY` column can be `NULL`), so the two agree on
+/// one shape regardless.
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],

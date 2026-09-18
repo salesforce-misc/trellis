@@ -536,15 +536,22 @@ impl AggregateTargetPlan {
 /// strictly more than being independently self-describing, and a value
 /// containing U+001F already corrupts `intake::extract_key` today.
 ///
-/// A `NULL` grouping component renders as the empty string (same as the
-/// length-prefixed form's own `"0:"`), so it is indistinguishable from a
-/// genuine empty-string value, and `array_to_string` drops a `NULL`
-/// component outright on the read side — so a `NULL`-keyed group still does
-/// not round-trip through a *downstream* refetch (it resolves to no row, and
-/// is treated as a delete). That is the pre-existing single-column gap
-/// (`""` never `=` `NULL` either), unchanged and not widened here; issue
-/// #128's NULL-representable target keying fixed the target's own storage,
-/// not this text encoding.
+/// A `NULL` grouping component (issue #110) is rendered through
+/// [`ddl::encode_key_part`] as [`ddl::NULL_KEY_SENTINEL`] — a lone U+0001,
+/// assumed absent from ordinary column text — rather than
+/// `unwrap_or_default()`'s empty string. Before this fix, a `NULL` component
+/// rendered as `""`, indistinguishable from a genuine empty-string value, and
+/// `array_to_string` drops a bare SQL `NULL` array element outright on the
+/// read side (a bare `col::text` of a `NULL` column *is* SQL `NULL`), so a
+/// `NULL`-keyed group could never round-trip through a *downstream* refetch:
+/// its encoded key looked exactly like "no row," which
+/// `staging::apply::read_live_rows_batch`'s `=`-based keyset join (also
+/// fixed by #110, to `is not distinct from` wherever a batch's key carries a
+/// `NULL` component) mistook for a delete. Both the encoding
+/// (`ddl::pk_key_sql_expr`'s SQL-side `coalesce(<col>::text, chr(1))`) and
+/// this Rust-side producer route every component through the same
+/// `NULL_KEY_SENTINEL` substitution, so a `NULL` group's key text agrees
+/// byte-for-byte on both sides of the wire regardless of arity.
 ///
 /// For a **single-column** `GROUP BY`, the key is that one column's own
 /// text value, completely unencoded — no length prefix, and no separator to
@@ -567,11 +574,10 @@ impl AggregateTargetPlan {
 /// the target table's real single-column PK shape exactly (see
 /// [`ddl::create_aggregate_target_table`]) closes that gap.
 ///
-/// A NULL grouping value and a genuine empty-string value are
-/// indistinguishable either way (both fold to `""` here, same as the
-/// composite encoding's own empty component for the same two cases) — a
-/// pre-existing quirk this function doesn't introduce or worsen for the
-/// single-column case, just carries over unchanged.
+/// A `NULL` grouping value and a genuine empty-string value are now
+/// distinguishable at every arity (issue #110): the single-column case's
+/// bare value is `NULL_KEY_SENTINEL` for `NULL` vs. `""` for a real empty
+/// string, exactly as the composite case's own per-part encoding is.
 ///
 /// `pub(super)`: issue #131's reverse-delta apply path derives a live
 /// from-side row's group key the same way this batch-driven caller does.
@@ -585,10 +591,12 @@ pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<St
     // bare value for a single column (issue #103), the U+001F join for a
     // composite one (issue #171) — so a chained definition's live refetch
     // decodes the staged downstream key as that target's real primary key
-    // either way. See this function's doc comment. `unwrap_or_default` (not a
-    // skip) keeps a composite key's arity equal to `group_by`'s, which is
-    // what `ddl::split_pk_key` checks on the other end.
-    let text = ddl::join_pk_key(values.iter().map(|v| v.as_deref().unwrap_or_default()));
+    // either way. See this function's doc comment. `ddl::encode_key_part`
+    // (issue #110, not `unwrap_or_default`) keeps a composite key's arity
+    // equal to `group_by`'s, which is what `ddl::split_pk_key` checks on the
+    // other end, while keeping a `NULL` component distinguishable from a
+    // real empty string.
+    let text = ddl::join_pk_key(values.iter().map(|v| ddl::encode_key_part(v.as_deref())));
     (values, text)
 }
 
@@ -3037,7 +3045,7 @@ mod tests {
         ];
         assert_eq!(
             ddl::split_pk_key(&pk, "stock_totals", &key).expect("decodes as a composite PK"),
-            vec!["w1", "a"],
+            vec![Some("w1"), Some("a")],
             "the downstream consumer must decode exactly the grouping values back"
         );
     }
@@ -3052,19 +3060,86 @@ mod tests {
         assert_eq!(key, "10");
     }
 
-    /// A `NULL`/absent grouping component renders as an empty part rather
-    /// than being dropped, so the encoded key's arity always equals the
-    /// `GROUP BY`'s — which is what [`ddl::split_pk_key`] checks, and what
-    /// keeps two different groups from colliding on one key.
+    /// Issue #110: a `NULL`/absent grouping component renders as
+    /// [`ddl::NULL_KEY_SENTINEL`], not an empty part, so the encoded key's
+    /// arity always equals the `GROUP BY`'s (keeping two different groups
+    /// from colliding on one key, as before) *and* the `NULL` component is
+    /// unambiguously distinguishable from a genuine empty string — the
+    /// pre-#110 encoding folded both to `""`.
     #[test]
     fn derive_group_key_keeps_a_null_components_place_in_a_composite_key() {
         let group_by = vec!["warehouse".to_string(), "sku".to_string()];
         let (values, key) =
             derive_group_key(&row(&[("warehouse", None), ("sku", Some("a"))]), &group_by);
         assert_eq!(values, vec![None, Some("a".to_string())]);
-        assert_eq!(key, "\u{1f}a");
+        assert_eq!(key, "\u{1}\u{1f}a");
         let (_, other) = derive_group_key(&row(&[("sku", Some("a"))]), &group_by);
-        assert_eq!(other, key, "an absent column folds to the same empty part");
+        assert_eq!(
+            other, key,
+            "an absent column folds to the same NULL-sentinel part"
+        );
+
+        // Distinct from a group whose `warehouse` is a genuine empty string,
+        // not NULL — the exact ambiguity issue #110 closes.
+        let (_, empty_string_key) =
+            derive_group_key(&row(&[("warehouse", Some("")), ("sku", Some("a"))]), &group_by);
+        assert_eq!(empty_string_key, "\u{1f}a");
+        assert_ne!(
+            empty_string_key, key,
+            "a NULL warehouse and an empty-string warehouse must encode differently"
+        );
+
+        let pk = vec![
+            ddl::PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+            },
+            ddl::PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+            },
+        ];
+        assert_eq!(
+            ddl::split_pk_key(&pk, "stock_totals", &key).expect("decodes as a composite PK"),
+            vec![None, Some("a")],
+            "the downstream consumer must decode the NULL component back as None"
+        );
+        assert_eq!(
+            ddl::split_pk_key(&pk, "stock_totals", &empty_string_key)
+                .expect("decodes as a composite PK"),
+            vec![Some(""), Some("a")],
+            "and the empty-string component back as Some(\"\")"
+        );
+    }
+
+    /// Issue #110's single-column twin of the composite test above: a
+    /// `NULL` single-column group key must decode back to `None`, distinct
+    /// from a genuine empty string, and must be the bare `NULL_KEY_SENTINEL`
+    /// text (no separator), matching `ddl::pk_key_sql_expr`'s single-column
+    /// rendering (`coalesce(<col>::text, chr(1))`, no `array_to_string`).
+    #[test]
+    fn derive_group_key_encodes_a_null_single_column_group_distinctly_from_empty_string() {
+        let group_by = vec!["sku".to_string()];
+        let (values, null_key) = derive_group_key(&row(&[("sku", None)]), &group_by);
+        assert_eq!(values, vec![None]);
+        assert_eq!(null_key, "\u{1}");
+
+        let (_, empty_key) = derive_group_key(&row(&[("sku", Some(""))]), &group_by);
+        assert_eq!(empty_key, "");
+        assert_ne!(null_key, empty_key);
+
+        let pk = vec![ddl::PrimaryKeyColumn {
+            name: "sku".to_string(),
+            data_type: "text".to_string(),
+        }];
+        assert_eq!(
+            ddl::split_pk_key(&pk, "sku_totals", &null_key).expect("decodes"),
+            vec![None]
+        );
+        assert_eq!(
+            ddl::split_pk_key(&pk, "sku_totals", &empty_key).expect("decodes"),
+            vec![Some("")]
+        );
     }
 
     /// The bulk-recompute path's extinct-group `DELETE` (step 3 of
