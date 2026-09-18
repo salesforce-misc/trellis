@@ -1393,12 +1393,15 @@ async fn build_reverse_relationship_shape(
             continue;
         }
 
-        // Design fork 4 above already excludes any `def` whose `GROUP BY`
-        // reads `rel.def.name` — and design fork 3 excludes more than one
-        // distinct relationship reference — so every key reaching here is a
-        // plain column; `relationships` (this relationship only) is passed
-        // anyway for a defensive, generically-correct lookup rather than
-        // assuming that invariant holds forever.
+        // Issue #137: a `GROUP BY` key reaching here may itself be a
+        // `GroupByKey::RelationshipPath` — design fork 3 above only excludes
+        // more than one *distinct* relationship reference across fields and
+        // `GROUP BY` together, so a relationship-path key that survived that
+        // check is guaranteed to name `rel.def.name` itself (the sole
+        // relationship this shape was built for), never some other
+        // relationship. `relationships` (resolved for this relationship
+        // only, just above) is therefore always the right map to look up a
+        // relationship-path key's to-side column type in below.
         let group_by_types: Vec<ValueType> = group_by
             .iter()
             .map(|key| match key {
@@ -1471,6 +1474,33 @@ async fn build_reverse_relationship_shape(
         let mut rewritten = def.def.clone();
         for field in &mut rewritten.fields {
             substitute_relationship_path(&mut field.expr, &rel.def.name, &synthetic_map);
+        }
+        // Issue #137 fix: a `GROUP BY` key that is itself this relationship's
+        // path (e.g. `GROUP BY tag, post.author`) must be rewritten to the
+        // same synthetic `Column` its field-level references above already
+        // are, mirroring `apply_aggregate::build_forward_relationship_shape`'s
+        // own `rewritten.key_space` rewrite. Without this,
+        // `eval::evaluate_aggregate`'s `group_by` set (keyed by each key's
+        // *target* column name, e.g. `author`) never matches a field whose
+        // expression was just substituted to `Column("__trellis_rev_author")`
+        // — any field bare-passthrough-referencing the relationship path
+        // (e.g. `SELECT post.author AS author`, the exact shape
+        // `validate::a_group_by_relationship_path_bare_passthrough_field_is_allowed`
+        // proves is legal) would then fail with `EvalError::MissingColumn`
+        // the moment the reverse fast path tried to compute its
+        // contribution, aborting the whole apply.
+        if let KeySpace::Aggregate { group_by } = &mut rewritten.key_space {
+            for key in group_by.iter_mut() {
+                if let GroupByKey::RelationshipPath {
+                    rel: key_rel,
+                    column,
+                } = key
+                    && key_rel == &rel.def.name
+                    && let Some(synthetic_name) = synthetic_map.get(column)
+                {
+                    *key = GroupByKey::Column(synthetic_name.clone());
+                }
+            }
         }
         let contribution_def = apply_aggregate::contribution_def(&rewritten);
         // Issue #137: see `ReverseAggregateShape::group_by_row_columns`'s

@@ -727,3 +727,100 @@ async fn a_group_by_key_naming_an_unknown_relationship_is_rejected() {
         "a rejected definition must leave no target table behind"
     );
 }
+
+/// A definition that, unlike [`AUTHOR_TAG_TOTALS`], adds an *explicit*
+/// bare-passthrough field for the relationship `GROUP BY` key
+/// (`SELECT post.author AS author, ...`) — legal per
+/// `validate::a_group_by_relationship_path_bare_passthrough_field_is_allowed`,
+/// and the only shape that puts a `RelationshipPath` expression on a *field*
+/// that also happens to be a `GROUP BY`-passthrough (every other field in
+/// this file's fixtures either wraps the path in an aggregate call or leaves
+/// it unmentioned entirely — DDL derives the `author` column from the
+/// `GROUP BY` key alone either way, so this field is legal but redundant).
+const AUTHOR_TAG_TOTALS_WITH_PASSTHROUGH: &str = "TRANSFORM author_tag_totals_pt FROM post_tags GROUP BY tag, post.author \
+     SELECT post.author AS author, count(*) AS post_count, sum(post.word_count) AS total_words";
+
+/// Regression pin (found in review): [`build_reverse_relationship_shape`]'s
+/// per-field `substitute_relationship_path` rewrite left
+/// `rewritten.key_space`'s own `GroupByKey::RelationshipPath` entry
+/// unrewritten, unlike `apply_aggregate::build_forward_relationship_shape`'s
+/// matching rewrite on the forward path. `eval::evaluate_aggregate` keys its
+/// `group_by` set off each key's *target* column name (`author`), so a field
+/// substituted to `Column("__trellis_rev_author")` never matched it, and
+/// `eval_aggregate_expr` fell through to its "must be another calculated
+/// field" branch and returned `EvalError::MissingColumn` — aborting the
+/// entire reverse-fanout apply for *any* definition with an explicit
+/// bare-passthrough field for a relationship `GROUP BY` key, the moment the
+/// related row actually changed. [`AUTHOR_TAG_TOTALS`]'s own reverse-fanout
+/// test never caught this because it has no such field at all (DDL derives
+/// the `author` column from the `GROUP BY` key regardless) — this test adds
+/// the one field shape that did trigger it.
+#[tokio::test]
+async fn updating_a_to_sides_row_with_a_passthrough_field_for_the_group_by_key_still_migrates_groups()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    create_post_relationship(&db.pool).await;
+
+    install_definition(
+        &db.pool,
+        AUTHOR_TAG_TOTALS_WITH_PASSTHROUGH,
+        &post_tags_columns(),
+        "public",
+    )
+    .await
+    .expect("install the passthrough-field definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update posts set author = 'carol' where id = 1", &[])
+        .await
+        .expect("rename post 1's author");
+    stage_cdc(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"author\":\"alice\",\"word_count\":100}"),
+        Some("{\"id\":1,\"author\":\"carol\",\"word_count\":100}"),
+    )
+    .await;
+    // Before the fix, this call panics: `drain_once` propagates
+    // `ApplyError::Eval(EvalError::MissingColumn { field: "author", column:
+    // "__trellis_rev_author" })` the moment it tries to compute row 10's (or
+    // row 12's) contribution under the renamed author.
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals: Totals = client
+        .query(
+            "select tag, author, post_count::text, total_words::text from author_tag_totals_pt",
+            &[],
+        )
+        .await
+        .expect("read author_tag_totals_pt")
+        .into_iter()
+        .map(|r| ((r.get(0), r.get(1)), (r.get(2), r.get(3))))
+        .collect();
+
+    // Same grain migration as `updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_group`:
+    // `rust`'s old `alice` group (row 10 only) is deleted outright, and a new
+    // `rust`/`carol` group takes its place.
+    assert_eq!(totals.get(&(some("rust"), some("alice"))), None);
+    assert_eq!(
+        totals.get(&(some("rust"), some("carol"))),
+        Some(&(some("1"), some("100")))
+    );
+    // `db`'s old `alice` group survives via row 14 (a different post), with
+    // row 12 subtracted out: count drops 2 -> 1, sum drops to NULL (only
+    // row 14, itself NULL, remains).
+    assert_eq!(
+        totals.get(&(some("db"), some("alice"))),
+        Some(&(some("1"), None))
+    );
+    assert_eq!(
+        totals.get(&(some("db"), some("carol"))),
+        Some(&(some("1"), some("100")))
+    );
+}
