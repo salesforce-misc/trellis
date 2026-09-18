@@ -321,29 +321,33 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
 
 /// The `NULL`-keyed group, which issue #180's own writeup calls out by name
 /// ("a `NULL` grouping component ... same underlying gap, same failure
-/// family") — and which issue #180's fix deliberately does **not** close,
-/// because the gap is upstream of it. A `NULL`-keyed upstream group never
-/// reaches a chained downstream aggregate *at all*: not on creation, not on
-/// update, and so there is never any downstream contribution for an
-/// extinction to subtract. `derive_group_key` encodes a `NULL` component as
-/// an empty part (indistinguishable from `''`), and the chained definition's
-/// own live re-read (`read_live_rows_batch`'s keyset join, a plain `t.col =
-/// u.c0`) can never match a `NULL` column anyway — see issue #195, which
-/// tracks the encoding/resolution design call this needs.
+/// family") — and which issue #180's fix deliberately did **not** close,
+/// because the gap was upstream of it, in the shared key contract itself:
+/// `derive_group_key` used to encode a `NULL` component as an empty part
+/// (indistinguishable from `''`), and the chained definition's own live
+/// re-read (`read_live_rows_batch`'s keyset join, a plain `t.col = u.c0`)
+/// could never match a `NULL` column anyway. Issue #110 closes it: a `NULL`
+/// component now encodes as `ddl::NULL_KEY_SENTINEL` (a control character
+/// assumed absent from ordinary column text, the same convention
+/// `ddl::COMPOSITE_KEY_SEPARATOR`/`staging::append::TRUNCATE_SENTINEL_KEY`
+/// already rely on), and `read_live_rows_batch` uses `is not distinct from`
+/// for any key component a batch's keys carry a `NULL` for.
 ///
-/// This test pins that gap rather than asserting the behaviour we want, in
-/// the same spirit the composite-key file's own test pinned issue #180
-/// before it was fixed: it fails loudly the day #195 is fixed, which is
-/// exactly when it should be rewritten into the assertion below its
-/// `GAP:` comments.
+/// This test (formerly `a_null_keyed_group_never_reaches_the_chained_downstream_aggregate`,
+/// issue #195's pin of the gap) now asserts the behaviour we actually want,
+/// end to end: a `NULL`-keyed upstream group's **creation**, a later
+/// **update** that keeps it `NULL`-keyed, and its eventual **extinction**
+/// must all reach the chained downstream aggregate, exactly like any other
+/// group.
 #[tokio::test]
-async fn a_null_keyed_group_never_reaches_the_chained_downstream_aggregate() {
+async fn a_null_keyed_group_reaches_the_chained_downstream_aggregate() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_schema(&client).await;
     install_the_chain(&db, &mut client).await;
 
+    // Creation: the NULL-keyed group's only row arrives.
     client
         .batch_execute("insert into sales (id, sku, amount) values (7, null, 6)")
         .await
@@ -363,19 +367,46 @@ async fn a_null_keyed_group_never_reaches_the_chained_downstream_aggregate() {
         Some("6".to_string()),
         "the NULL-keyed group is maintained correctly at its own level"
     );
-    // GAP (issue #195): should be `Some("6")`.
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
-        None,
-        "issue #195: the NULL-keyed group's creation never propagates into \
-         the chained aggregate, because its downstream Recompute's key text \
-         cannot express (or resolve) a NULL group key"
+        Some("6".to_string()),
+        "issue #110: the NULL-keyed group's creation now propagates into \
+         the chained aggregate"
     );
 
+    // Update: a second NULL-keyed row arrives, growing the (still-NULL-keyed)
+    // group — exercises the delta path, not just from-scratch creation.
+    client
+        .batch_execute("insert into sales (id, sku, amount) values (8, null, 4)")
+        .await
+        .expect("insert a second NULL-keyed row");
+    stage_cdc(
+        &client,
+        "sales",
+        "8",
+        "insert",
+        None,
+        Some(r#"{"id":"8","sku":null,"amount":"4"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        null_group_total(&client, "sku_totals", "total").await,
+        Some("10".to_string()),
+        "the NULL-keyed group grows upstream"
+    );
+    assert_eq!(
+        null_group_total(&client, "sku_totals_v2", "total2").await,
+        Some("10".to_string()),
+        "issue #110: the NULL-keyed group's update also propagates downstream"
+    );
+
+    // Partial reduction: deleting one of the two rows leaves the group alive
+    // (not yet extinct), still NULL-keyed.
     client
         .batch_execute("delete from sales where id = 7")
         .await
-        .expect("delete the NULL-keyed group's only row");
+        .expect("delete the first NULL-keyed row, leaving the group alive");
     stage_cdc(
         &client,
         "sales",
@@ -386,20 +417,45 @@ async fn a_null_keyed_group_never_reaches_the_chained_downstream_aggregate() {
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        null_group_total(&client, "sku_totals", "total").await,
+        Some("4".to_string()),
+        "the NULL-keyed group survives, reduced"
+    );
+    assert_eq!(
+        null_group_total(&client, "sku_totals_v2", "total2").await,
+        Some("4".to_string()),
+        "issue #110: the reduction (not yet an extinction) propagates too"
+    );
+
+    // Extinction: deleting the group's last row must remove it both upstream
+    // and (issue #180's image-threading, exercised here for a NULL key
+    // specifically) downstream.
+    client
+        .batch_execute("delete from sales where id = 8")
+        .await
+        .expect("delete the NULL-keyed group's last remaining row");
+    stage_cdc(
+        &client,
+        "sales",
+        "8",
+        "delete",
+        Some(r#"{"id":"8","sku":null,"amount":"4"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
         null_group_total(&client, "sku_totals", "total").await,
         None,
         "the NULL-keyed group goes extinct upstream, as it should"
     );
-    // Consistent, at least: nothing downstream to subtract, because nothing
-    // downstream was ever created. Issue #180's fix stages the extinct
-    // group's real pre-delete image here, and the chained aggregate simply
-    // has no matching group to reduce.
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
         None,
-        "and its (never-created) downstream counterpart stays absent"
+        "issue #110 + #180: the NULL-keyed group's extinction propagates \
+         downstream too, instead of leaving a stale total2 = 4 forever"
     );
 }
 

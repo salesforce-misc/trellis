@@ -533,6 +533,19 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 /// degenerates to exactly that single-array-parameter shape, so the
 /// single-column case (still the overwhelmingly common one) pays no extra
 /// cost.
+///
+/// # NULL-keyed groups (issue #110)
+///
+/// A `NULL` component decodes off `keys` (via [`ddl::transpose_pk_keys`]) as
+/// a real `Option::None`, bound as SQL `NULL` in its column's array — so a
+/// plain `t.<col> = u.<c>` join condition would never match it (`NULL` is
+/// never `=` anything, including another `NULL`), which is exactly how a
+/// `NULL`-keyed aggregate group's live row used to be mistaken for "already
+/// deleted" by every downstream consumer of this function. [`live_rows_join_cond`]
+/// therefore uses `is not distinct from` — the same per-column, only-when-
+/// needed choice `apply_aggregate::keyset_match` already makes — for any `pk`
+/// column that carries at least one `NULL` in this batch, so that group
+/// resolves to its real live row instead.
 async fn read_live_rows_batch(
     pool: &Pool,
     source_table: &str,
@@ -551,12 +564,8 @@ async fn read_live_rows_batch(
         .map(|(i, c)| format!("${}::text[]::{}[]", i + 1, c.data_type))
         .collect();
     let u_cols: Vec<String> = (0..pk.len()).map(|i| format!("c{i}")).collect();
-    let join_cond = pk_idents
-        .iter()
-        .zip(&u_cols)
-        .map(|(ident, u_col)| format!("t.{ident} = u.{u_col}"))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    let null_safe: Vec<bool> = columns.iter().map(|c| c.iter().any(Option::is_none)).collect();
+    let join_cond = live_rows_join_cond(&pk_idents, &u_cols, &null_safe);
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
     let sql = format!(
         "select m.k, e.key, e.value \
@@ -578,6 +587,37 @@ async fn read_live_rows_batch(
         rows.entry(key).or_default().insert(field, value);
     }
     Ok(rows)
+}
+
+/// A `t.<col> <op> u.<c>` conjunction matching a refetched row's primary-key
+/// columns against the keyset relation — [`read_live_rows_batch`]'s join
+/// condition, factored out as its own pure, directly testable function (the
+/// same convention [`key_array_filter`] and
+/// `apply_aggregate::keyset_match`/`keyset_match_source` use for their own
+/// per-column operator choice). `null_safe[i]` selects `is not distinct
+/// from` over plain `=` for column `i`: `=` is preferred whenever no key in
+/// this batch binds a `NULL` for that column (hashable/indexable, so
+/// Postgres can pick a plan that uses a btree index on `t.<col>` — the same
+/// tradeoff `apply_aggregate::keyset_match`'s own doc comment explains), but
+/// a batch that does needs `is not distinct from` for it (issue #110):
+/// plain `=` never matches a `NULL` operand, so a `NULL`-keyed group's live
+/// row would otherwise be indistinguishable from "row doesn't exist" and
+/// mistaken for a delete.
+fn live_rows_join_cond(pk_idents: &[String], u_cols: &[String], null_safe: &[bool]) -> String {
+    pk_idents
+        .iter()
+        .zip(u_cols)
+        .enumerate()
+        .map(|(i, (ident, u_col))| {
+            let op = if null_safe[i] {
+                "is not distinct from"
+            } else {
+                "="
+            };
+            format!("t.{ident} {op} u.{u_col}")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// The exact Postgres type of `column` on `table`, as rendered by
@@ -3170,6 +3210,32 @@ mod tests {
             Some(1),
             "exactly one end-to-end latency observation must land (target is terminal): \
              {after_flush}"
+        );
+    }
+
+    /// Issue #110 regression pin: [`live_rows_join_cond`] uses plain `=` for
+    /// a column no key in the batch binds `NULL` for (preserving the
+    /// pre-#110, index-friendly shape), but `is not distinct from` for a
+    /// column that does — so a `NULL`-keyed group's live row is found
+    /// instead of being mistaken for "already deleted."
+    #[test]
+    fn live_rows_join_cond_uses_is_not_distinct_from_only_for_a_null_carrying_column() {
+        let idents = vec![r#""warehouse""#.to_string(), r#""sku""#.to_string()];
+        let u_cols = vec!["c0".to_string(), "c1".to_string()];
+
+        assert_eq!(
+            live_rows_join_cond(&idents, &u_cols, &[false, false]),
+            r#"t."warehouse" = u.c0 and t."sku" = u.c1"#,
+            "no NULL anywhere in the batch: both columns keep the indexable `=`"
+        );
+        assert_eq!(
+            live_rows_join_cond(&idents, &u_cols, &[true, false]),
+            r#"t."warehouse" is not distinct from u.c0 and t."sku" = u.c1"#,
+            "only the column that actually carries a NULL switches operator"
+        );
+        assert_eq!(
+            live_rows_join_cond(&idents, &u_cols, &[true, true]),
+            r#"t."warehouse" is not distinct from u.c0 and t."sku" is not distinct from u.c1"#
         );
     }
 
@@ -5795,10 +5861,10 @@ pub async fn apply_and_mark_drained_many(
             // and silently drop the change (the module doc comment's "A
             // known gap: image-less changes"). An ordinary write still stays
             // image-less — a downstream live refetch always finds the
-            // *right* current row for those, except for a `NULL`-keyed
-            // group, which cannot be resolved by key text at all and never
-            // reaches a chained reader in the first place (issue #195, a
-            // gap upstream of this one).
+            // *right* current row for those, `NULL`-keyed groups included
+            // (issue #110 closed #195's gap: `derive_group_key`/
+            // `read_live_rows_batch` now resolve a `NULL` group key by its
+            // own real identity instead of mistaking it for "no row").
             //
             // `lsn: None`, like every other row this step stages: a
             // propagated hop has no source LSN of its own. Two fold-side

@@ -440,3 +440,99 @@ async fn a_live_grain_migration_of_the_composite_key_propagates_both_keys_downst
          only if both migrated composite keys decoded correctly"
     );
 }
+
+/// `total_qty` for the `(warehouse, sku IS NULL)` group, or `None` when that
+/// group has no row — `stock_totals`' own helper reads `sku` into a
+/// `String`, which a `NULL` `sku` cannot be.
+async fn null_sku_total(client: &Client, warehouse: &str) -> Option<String> {
+    client
+        .query_opt(
+            "select total_qty::text from stock_totals where warehouse = $1 and sku is null",
+            &[&warehouse],
+        )
+        .await
+        .expect("read the NULL-sku group")
+        .and_then(|row| row.get(0))
+}
+
+/// Issue #110's composite-key case: one component of a composite `GROUP BY`
+/// key (`sku`) is `NULL` while the other (`warehouse`) is not — exercising
+/// the `array_to_string`/`coalesce(..., chr(1))` composite encoding path
+/// (`ddl::pk_key_sql_expr`/`derive_group_key`), as opposed to
+/// `defs_aggregate_chained_single_column_group_key.rs`'s bare single-column
+/// sentinel. `stock_totals_v2` groups only by `warehouse`, so the `(w1,
+/// NULL)` group's contribution must fold into `w1`'s downstream total
+/// exactly like any other `w1` row would — both on creation and on the
+/// group's later extinction.
+#[tokio::test]
+async fn a_composite_group_with_a_null_component_propagates_downstream() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    install_the_chain(&db, &mut client).await;
+
+    // Creation: a NULL-sku row lands in warehouse w1.
+    client
+        .batch_execute("insert into inventory (id, warehouse, sku, qty) values (6, 'w1', null, 3)")
+        .await
+        .expect("insert the (w1, NULL) group's only row");
+    stage_cdc(
+        &client,
+        "inventory",
+        "6",
+        "insert",
+        None,
+        Some(r#"{"id":"6","warehouse":"w1","sku":null,"qty":"3"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        null_sku_total(&client, "w1").await,
+        Some("3".to_string()),
+        "the (w1, NULL) group is maintained correctly at its own level"
+    );
+    assert_eq!(
+        stock_totals_v2(&client).await,
+        HashMap::from([
+            // 12 (w1,a) + 2 (w1,b) + 3 (w1,NULL) = 17.
+            ("w1".to_string(), Some("17".to_string())),
+            ("w2".to_string(), Some("11".to_string())),
+        ]),
+        "issue #110: a composite group with a NULL component propagates its \
+         creation into the chained aggregate"
+    );
+
+    // Extinction: deleting the (w1, NULL) group's only row must remove its
+    // contribution downstream too (issue #110 + #180's image threading).
+    client
+        .batch_execute("delete from inventory where id = 6")
+        .await
+        .expect("delete the (w1, NULL) group's only row");
+    stage_cdc(
+        &client,
+        "inventory",
+        "6",
+        "delete",
+        Some(r#"{"id":"6","warehouse":"w1","sku":null,"qty":"3"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        null_sku_total(&client, "w1").await,
+        None,
+        "the (w1, NULL) group goes extinct upstream"
+    );
+    assert_eq!(
+        stock_totals_v2(&client).await,
+        HashMap::from([
+            ("w1".to_string(), Some("14".to_string())),
+            ("w2".to_string(), Some("11".to_string())),
+        ]),
+        "issue #110 + #180: the (w1, NULL) group's extinction propagates \
+         downstream too, back to w1's original 14"
+    );
+}

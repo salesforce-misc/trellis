@@ -59,9 +59,21 @@ pub type RegexCache = HashMap<String, Regex>;
 /// use as a to-side `PRIMARY KEY`/`UNIQUE` column — integers, UUIDs, text —
 /// whose canonical text encoding is stable; it is *not* scale-insensitive for
 /// a fractional-numeric key (Postgres treats `1` and `1.0` as equal in a
-/// join, this index would not). A to-side row whose `to_col` is `NULL` must
+/// join, this index would not — issue #110's *type*-lossiness axis, still
+/// open, blocked on #108). A to-side row whose `to_col` is `NULL` must
 /// be omitted from the index by the builder: SQL `NULL` never joins, so it
 /// has no key.
+///
+/// This `NULL`-exclusion is deliberately **not** issue #110's NULL-lossiness
+/// bug: this is a real SQL join (a relationship's `from_col = to_col`), where
+/// ANSI `NULL <> NULL` is the *correct* semantics (a from-row with a `NULL`
+/// join value has no related row, same as `LEFT JOIN ON from_col = to_col`
+/// would compute) — unlike an aggregate group's downstream propagation
+/// identity (`staging::apply_aggregate::derive_group_key`/
+/// `staging::apply::read_live_rows_batch`), which is a *primary-key*
+/// round-trip ("is this the same group as before"), not a join, and where a
+/// `NULL` component legitimately needs to resolve to itself. Confirmed by
+/// reading this module during #110's investigation: no change needed here.
 pub struct ToOneRelationship {
     /// The from-row column whose value is the join key (the relationship's
     /// `from_col`).
