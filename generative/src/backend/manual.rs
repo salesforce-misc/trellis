@@ -345,6 +345,17 @@ pub struct ManualBackend {
     /// fresh client against the exact same target rather than needing the
     /// caller to hand the options back in.
     client_options: Option<ClientOptions>,
+    /// Overrides `ClientOptions::default()`'s shared `"trellis_slot"`/
+    /// `"trellis_pub"` literals for the primary `install`-started
+    /// `EngineClient`, when set via [`ManualBackend::set_slot_and_publication`]
+    /// before the first [`ManualBackend::install`] call. `None` (every
+    /// existing caller) keeps today's shared-literal behavior. See issue
+    /// #188: a logical replication slot name is unique cluster-wide, not
+    /// scoped per database, so two `ManualBackend`s against different
+    /// isolated databases on the *same* shared Postgres cluster (e.g.
+    /// `generative/tests/convergence.rs`'s thread-local `TestCluster`) must
+    /// not both install against the literal default name.
+    slot_and_publication: Option<(String, String)>,
     /// Additional application-worker-only clients started by
     /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
     /// the backend's own lifetime (dropped, and so best-effort-signalled to
@@ -447,6 +458,7 @@ impl ManualBackend {
             raw,
             engine_client: None,
             client_options: None,
+            slot_and_publication: None,
             scale_out_clients: Vec::new(),
             tables: HashMap::new(),
             defs: Vec::new(),
@@ -454,6 +466,34 @@ impl ManualBackend {
             maintenance_interval: maintenance_interval
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
         })
+    }
+
+    /// Overrides the slot/publication names [`ManualBackend::install`] uses
+    /// to start the primary `EngineClient`, instead of
+    /// `ClientOptions::default()`'s shared `"trellis_slot"`/`"trellis_pub"`
+    /// literals. Must be called before the first `install` (which is the
+    /// only call that starts the primary client — see
+    /// [`super::Backend::install`]'s impl below); a client already started
+    /// ignores a later call.
+    ///
+    /// Issue #188: a logical replication slot name is unique cluster-wide,
+    /// not scoped per database, even though the slot itself is tied to one
+    /// database. A caller driving multiple `ManualBackend`s against
+    /// separate isolated databases on the *same* shared Postgres cluster
+    /// (e.g. `generative/tests/convergence.rs`'s thread-local `TestCluster`,
+    /// one per proptest case) must give each a distinct slot/publication
+    /// name, or a later case can collide with an earlier case's slot that
+    /// hasn't actually been torn down yet (`trellis::Client::drop` is a
+    /// best-effort shutdown signal, not a synchronous join — see its own
+    /// doc comment) and get misdiagnosed by
+    /// `trellis::intake::publication::initial_snapshot_handshake` as an
+    /// orphaned slot.
+    pub fn set_slot_and_publication(
+        &mut self,
+        slot: impl Into<String>,
+        publication: impl Into<String>,
+    ) {
+        self.slot_and_publication = Some((slot.into(), publication.into()));
     }
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
@@ -845,13 +885,22 @@ impl super::Backend for ManualBackend {
             .map(|t| format!("{DEFAULT_SCHEMA}.{}", t.name))
             .collect();
         if !source_tables.is_empty() && self.engine_client.is_none() {
-            let options = ClientOptions {
+            let mut options = ClientOptions {
                 staging_worker: true,
                 application_threads: self.application_threads,
                 source_tables,
                 maintenance_interval: self.maintenance_interval,
                 ..Default::default()
             };
+            // Issue #188: a caller that needs to coexist with other
+            // `ManualBackend`s on the same shared Postgres cluster (see
+            // `set_slot_and_publication`'s doc comment) overrides the
+            // otherwise-shared default slot/publication names here, at the
+            // one place the primary client actually starts.
+            if let Some((slot, publication)) = &self.slot_and_publication {
+                options.slot = slot.clone();
+                options.publication = publication.clone();
+            }
             let client = EngineClient::start(self.dsn.clone(), options.clone())?;
             self.engine_client = Some(client);
             // Remembered so `restart` (improvement-plan task E3) can start an

@@ -70,6 +70,14 @@ async fn run_ops_to_snapshot(cluster: &TestCluster, program: &Program, ops: &[Op
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
+    // Issue #188: unique per-case slot/publication names, not the shared
+    // `ClientOptions::default()` literals — see `tests/convergence.rs`'s
+    // module doc comment for the shared-cluster slot-collision this avoids.
+    // This function is called twice per proptest case (original and
+    // reordered), so it needs this even more directly than a
+    // one-database-per-case harness does.
+    let unique = db.name().replace('-', "_");
+    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
 
     backend.install(program).await.expect("install program");
 

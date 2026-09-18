@@ -864,17 +864,39 @@ pub async fn initial_snapshot_handshake(
     Ok(())
 }
 
-/// Whether `slot` exists in `pg_replication_slots` but has no
-/// `replication_progress` row — the orphaned state a crash between
-/// `pg_create_logical_replication_slot` (which persists immediately, see
-/// [`initial_snapshot_handshake`]'s doc comment) and that same handshake's
-/// commit leaves behind. A slot that exists *with* a progress row is a
-/// different situation (re-running setup against an already-initialized
-/// slot) and is left to the existing "slot already exists" error path.
+/// Whether `slot` exists in `pg_replication_slots` **and belongs to the
+/// current database** but has no `replication_progress` row — the orphaned
+/// state a crash between `pg_create_logical_replication_slot` (which
+/// persists immediately, see [`initial_snapshot_handshake`]'s doc comment)
+/// and that same handshake's commit leaves behind. A slot that exists *with*
+/// a progress row is a different situation (re-running setup against an
+/// already-initialized slot) and is left to the existing "slot already
+/// exists" error path.
+///
+/// `pg_replication_slots` is a cluster-wide system view, not scoped to the
+/// connected database, but a logical slot only ever belongs to the database
+/// it was created against — so this must filter on `database =
+/// current_database()` (issue #188). Without that filter, a slot-name
+/// collision with a *different* database on the same Postgres cluster (e.g.
+/// another Trellis install sharing the cluster, or — as
+/// `generative/tests/convergence.rs`'s shared-cluster harness discovered — a
+/// still-live prior test case's database) is indistinguishable from this
+/// database's own orphan: `slot_exists` comes back true (the name exists
+/// somewhere) and `has_progress_row` comes back false (this database never
+/// wrote that row, since the slot was never really this database's own), so
+/// an unfiltered check calls it "orphaned" — a misdiagnosis that hides the
+/// real condition (a slot name that isn't actually free) behind a
+/// plausible-looking crash-recovery story. Scoping the check surfaces that
+/// case correctly instead: `slot_is_orphaned` returns `false` (this
+/// database has no slot by that name), and the
+/// `pg_create_logical_replication_slot` call just below fails loudly with
+/// Postgres's own "replication slot already exists" error, naming the
+/// actual condition.
 async fn slot_is_orphaned(client: &impl GenericClient, slot: &str) -> Result<bool, IntakeError> {
     let slot_exists: bool = client
         .query_one(
-            "select exists(select 1 from pg_replication_slots where slot_name = $1)",
+            "select exists(select 1 from pg_replication_slots where slot_name = $1 and \
+             database = current_database())",
             &[&slot],
         )
         .await?

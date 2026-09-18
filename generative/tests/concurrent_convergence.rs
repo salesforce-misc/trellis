@@ -185,6 +185,12 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
             let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
                 .await
                 .expect("connect concurrent backend");
+            // Issue #188: unique per-case slot/publication names, not the
+            // shared `ClientOptions::default()` literals — see
+            // `tests/convergence.rs`'s module doc comment for the
+            // shared-cluster slot-collision this avoids.
+            let unique = db.name().replace('-', "_");
+            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 

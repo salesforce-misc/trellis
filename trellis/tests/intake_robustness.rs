@@ -616,6 +616,83 @@ async fn initial_snapshot_handshake_reports_an_orphaned_slot_instead_of_retrying
         .expect("clean up the orphaned slot so it doesn't leak");
 }
 
+/// Issue #188's production-hardening finding: `pg_replication_slots` is a
+/// cluster-wide system view, not scoped to the connected database, but a
+/// logical slot only ever belongs to the database it was created against.
+/// Before this fix, `slot_is_orphaned`'s existence check didn't filter on
+/// `database = current_database()`, so a same-named slot that genuinely
+/// belongs to a *different* database on the same cluster was
+/// indistinguishable from this database's own orphan (the name "exists"
+/// somewhere, and this database's `replication_progress` naturally has no
+/// row for a slot it never created) — exactly the false diagnosis
+/// `generative/tests/convergence.rs`'s shared-cluster harness hit when two
+/// proptest cases' isolated databases collided on the same hardcoded slot
+/// name.
+///
+/// Reproduced directly with two isolated databases sharing one
+/// `TestCluster`: `db_a` creates a real slot; `db_b`'s handshake for a slot
+/// of the *same name* must not call it *its own* orphan. Post-fix, the
+/// scoped existence check correctly reports "no such slot in this
+/// database", so the handshake proceeds to actually create one — and
+/// Postgres's own cluster-wide slot-name uniqueness constraint rejects that,
+/// surfacing as a plain [`IntakeError::Db`] rather than a misleading
+/// [`IntakeError::OrphanedSlot`].
+#[tokio::test]
+async fn initial_snapshot_handshake_does_not_mistake_another_databases_slot_for_its_own_orphan() {
+    let cluster = TestCluster::start();
+    let db_a = cluster.create_isolated_database().await;
+    let db_b = cluster.create_isolated_database().await;
+
+    // A slot that genuinely belongs to db_a — not orphaned from db_a's own
+    // point of view, just irrelevant to the assertion below (db_b never
+    // looks at db_a's `replication_progress` row either way).
+    let setup_a = connect_raw(db_a.dsn()).await;
+    setup_a
+        .batch_execute(
+            "create table widgets (id bigint primary key, payload text not null);
+             create publication shared_name_pub for table widgets;",
+        )
+        .await
+        .expect("create source table and publication on db_a");
+    setup_a
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('shared_name_slot', \
+             'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create a real replication slot on db_a");
+
+    // db_b never created a slot by this name at all — its own handshake for
+    // the same name must not be told it's *its own* crash-orphaned slot.
+    let mut session_b = ProducerSession::connect(db_b.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("connect producer session for db_b");
+
+    match publication::initial_snapshot_handshake(&mut session_b, "shared_name_slot", &[]).await {
+        Err(IntakeError::OrphanedSlot { slot }) => panic!(
+            "db_b misdiagnosed db_a's slot {slot:?} as its own orphan — \
+             slot_is_orphaned must scope its pg_replication_slots check by \
+             database = current_database()"
+        ),
+        Err(IntakeError::Db(_)) => {
+            // Expected: the scoped check correctly says "not this
+            // database's slot", so the handshake goes on to actually try
+            // `pg_create_logical_replication_slot`, which Postgres itself
+            // rejects — the name is taken cluster-wide, just not by db_b.
+        }
+        Err(other) => panic!("expected IntakeError::Db (slot name collision), got {other:?}"),
+        Ok(()) => panic!(
+            "db_b's handshake must not succeed while db_a still holds the same slot name"
+        ),
+    }
+
+    setup_a
+        .execute("select pg_drop_replication_slot('shared_name_slot')", &[])
+        .await
+        .expect("clean up db_a's slot so it doesn't leak");
+}
+
 /// Item 6 (issue #32): the `wal_status = 'lost'` branch of
 /// `require_slot_healthy` — a slot the server actively invalidated because
 /// its retained WAL blew past `max_slot_wal_keep_size`, as distinct from

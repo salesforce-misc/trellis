@@ -11,11 +11,48 @@
 //! on the calling thread, so the harness is built once (first case) and its
 //! `Drop` — the clean `pg_ctl stop` — runs when the test thread exits. Each
 //! case still provisions a fresh *isolated database* (its own schema, slot,
-//! and publication) inside that shared cluster, which is the accepted
-//! per-case fallback the issue calls out: the `ManualBackend` seam (issue #3)
-//! starts a client with a fixed slot per `install`, so reusing one slot while
-//! resetting only the schema between cases would mean reworking that seam.
-//! Reusing the slot/publication across cases is left as a follow-up.
+//! and publication) inside that shared cluster.
+//!
+//! **Issue #188: each case's slot/publication names must be unique, not just
+//! its database.** A Postgres logical replication slot name is unique
+//! *cluster-wide*, not scoped per database, even though the slot itself is
+//! tied to the database it was created against. Every case used to install
+//! through `ClientOptions::default()`'s literal `"trellis_slot"`/
+//! `"trellis_pub"` (the `ManualBackend` seam, issue #3, starts a client with
+//! a fixed slot per `install`), which was survivable only because each
+//! case's prior database was normally fully dropped before the next case's
+//! install ran. But `trellis::Client::drop` is a documented best-effort
+//! shutdown signal, not a synchronous join, so occasionally a case's
+//! `EngineClient` (and the replication connection actually holding its
+//! slot) hadn't finished disconnecting by the time that case's
+//! `TestDatabase::drop` ran `dropdb --force` — and Postgres refuses to drop
+//! a database with an *active* logical slot outright, an error
+//! `TestDatabase::drop` swallows silently. The next case's fresh database
+//! then tried to install against the same slot name, found it already
+//! existed (owned by the still-live prior database) with no
+//! `replication_progress` row in *its own* fresh schema, and
+//! `initial_snapshot_handshake` correctly-by-its-own-lights but
+//! incorrectly-overall called that an orphaned slot
+//! (`Client(Intake(OrphanedSlot { .. }))`) — the failure this issue's nightly
+//! `deep` run hit after 43 clean cases. See
+//! `trellis/src/intake/publication.rs`'s `slot_is_orphaned` for a related
+//! production hardening fix: that check now also scopes its
+//! `pg_replication_slots` lookup to `database = current_database()`, so a
+//! same-named slot genuinely owned by a *different* database is no longer
+//! misreported as this database's own orphan.
+//!
+//! The fix here is simpler than synchronizing the shutdown race: every case
+//! gets its own slot/publication name, derived from its already-unique
+//! isolated database name via [`ManualBackend::set_slot_and_publication`].
+//! Two cases can then never collide on a slot no matter how their
+//! `EngineClient` teardowns overlap in time — the same "give every case its
+//! own everything" isolation `create_isolated_database` already gives
+//! schema/tables, extended to the two names that used to be the one
+//! shared-per-run exception. (A used-but-not-yet-dropped slot from a slow
+//! prior case can still make a **later** attempt to reuse *that exact same*
+//! name collide in principle, but with process-id-plus-monotonic-counter
+//! uniqueness per `testkit::TestCluster::create_empty_database`, that's not
+//! a real risk within one run.)
 //!
 //! Case count defaults to 16 (design doc §9's 12–24 band) and is overridable
 //! for deep sweeps with `PROPTEST_CASES` (e.g. `PROPTEST_CASES=500 cargo test
@@ -128,6 +165,14 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
+            // Issue #188: give this case its own slot/publication names,
+            // not the shared `ClientOptions::default()` literals — see the
+            // module doc comment. `db.name()` is already unique per case
+            // (`testkit::TestCluster::create_empty_database`'s
+            // process-id-plus-counter suffix); replication slot names only
+            // allow `[a-z0-9_]`, so hyphens are sanitized to underscores.
+            let unique = db.name().replace('-', "_");
+            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
