@@ -508,6 +508,136 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
     assert_eq!(op, "insert");
 }
 
+/// Regression test for issue #163: a table whose `PRIMARY KEY (...)` clause
+/// lists its columns in a *different* order than they are physically
+/// declared —
+///
+/// ```sql
+/// create table t (tag text, post bigint, primary key (post, tag));
+/// ```
+///
+/// — must still stage its composite key in the primary key's own **declared**
+/// order (`post` then `tag`), because that is the order every consumer of an
+/// encoded composite key decodes with: `ddl::split_pk_key`, whose `pk` slice
+/// comes from `ddl::source_primary_key`'s `array_position(i.indkey, a.attnum)`
+/// sort, and `ddl::pk_key_sql_expr`, which re-renders the same identity in
+/// SQL for `apply::read_live_rows_batch`'s live re-fetch.
+///
+/// `pgoutput` hands `extract_key` the columns in *physical* order (`tag`,
+/// `post`) with per-column `is_key` flags, and `extract_key` used to simply
+/// filter that order to the flagged columns — silently producing
+/// `"rust\x1f7"` here, which the read side would then bind as `post =
+/// 'rust'`/`tag = '7'`. Latent (no fixture had a PK declared out of physical
+/// order) until something reached it; normalized now, and pinned here.
+///
+/// This table keeps the default replica identity deliberately: `DEFAULT` is
+/// the case where `pgoutput`'s flags are *right* and only their order is
+/// wrong, so it exercises the ordering normalization on its own rather than
+/// through `REPLICA IDENTITY FULL`'s separate "every column is flagged"
+/// problem (issue #56, the test above).
+#[tokio::test]
+async fn a_composite_key_declared_out_of_physical_column_order_stages_in_declared_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table ordered_pk_widgets ( \
+                 tag text, \
+                 post bigint, \
+                 payload text, \
+                 primary key (post, tag) \
+             ); \
+             create publication intake_pub for table ordered_pk_widgets;",
+        )
+        .await
+        .expect("create source table and publication");
+    let slot_row = setup
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create replication slot");
+    let _: String = slot_row.get(0);
+    seed_progress(&setup, "intake_slot", 0).await;
+
+    setup
+        .execute(
+            "insert into ordered_pk_widgets (tag, post, payload) values ('rust', 7, 'hi')",
+            &[],
+        )
+        .await
+        .expect("insert source row");
+
+    let config = intake::IntakeConfig {
+        dsn: db.dsn().to_string(),
+        schema: DEFAULT_SCHEMA.to_string(),
+        host: db.socket_dir().display().to_string(),
+        port: db.port(),
+        user: "postgres".to_string(),
+        password: String::new(),
+        database: db.name().to_string(),
+        slot: "intake_slot".to_string(),
+        publication: "intake_pub".to_string(),
+        wake_channel: "wake".to_string(),
+        spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
+        hard_cap: intake::spill::DEFAULT_HARD_CAP,
+    };
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+        .await
+        .expect("connect intake");
+
+    tokio::spawn(async move {
+        let _ = consumer.run().await;
+    });
+
+    let observer = connect_raw(db.dsn()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while seg_0_count(&observer).await < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the change to be staged"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let staged = observer
+        .query_one("select key from seg_0", &[])
+        .await
+        .expect("query staged row");
+    let key: String = staged.get(0);
+    assert_eq!(
+        key, "7\u{1f}rust",
+        "the composite key must be joined in the primary key's declared \
+         order (post, tag), not the physical order (tag, post)"
+    );
+
+    // ...and the same claim expressed as the actual producer/consumer
+    // agreement it stands for: the parts, in the order `ddl::source_primary_key`
+    // reports the key's columns (the order `ddl::split_pk_key` decodes into),
+    // are this row's `(post, tag)` values.
+    let pk = trellis::defs::source_primary_key(
+        &db.pool,
+        &format!("{DEFAULT_SCHEMA}.ordered_pk_widgets"),
+    )
+    .await
+    .expect("introspect the declared primary key");
+    let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        pk_names,
+        vec!["post", "tag"],
+        "sanity: source_primary_key reports the declared order"
+    );
+    assert_eq!(
+        key.split('\u{1f}').collect::<Vec<&str>>(),
+        vec!["7", "rust"],
+        "the staged key's parts must line up positionally with the primary \
+         key's declared columns"
+    );
+}
+
 /// A real `TRUNCATE` on a published source table must decode to a staged
 /// `op = 'truncate'` sentinel row (issue #60) — not silently dropped, which
 /// is what `handle_xlog_data`'s previous `Message::Truncate { .. } => {}`

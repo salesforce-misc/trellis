@@ -3315,9 +3315,7 @@ pub struct ApplyPlan {
     /// truncate on an aggregate definition's source clears every group, but
     /// (unlike a 1-1 target's single-column primary key) there is no single
     /// column shape to `RETURNING`-project a physically-changed group key
-    /// out of generically, and no downstream reader can consume an
-    /// aggregate target's composite key as a 1-1 source today regardless —
-    /// so this is applied as a plain `DELETE FROM <target>` (every group
+    /// out of generically — so this is applied as a plain `DELETE FROM <target>` (every group
     /// atomically gone), counted toward [`ApplyOutcome::keys_deleted`], but
     /// *not* staged for downstream propagation. A documented gap, not an
     /// oversight: closing it needs composite-key downstream propagation,
@@ -3330,34 +3328,41 @@ pub struct ApplyPlan {
     /// moot one? Yes, and the originally-assumed safety net does **not**
     /// reliably prevent it: `defs::validate`/`create_definition` impose no
     /// primary-key-shape check at definition-creation time, and
-    /// `ddl::source_primary_key` only rejects a source with *more than one*
-    /// PK column — a single-column `GROUP BY` (the common case) produces a
-    /// genuinely single-column aggregate-target PK, so
-    /// `DdlError::CompositePrimaryKeyUnsupported` never fires for it.
-    /// Previously (**[#103](https://github.com/salesforce-misc/trellis/issues/103)**),
-    /// the encoded composite group-key text (`derive_group_key`'s
+    /// `ddl::source_primary_key` never rejects a composite source at all
+    /// since issue #126 lifted that blanket rejection (the narrowing lives
+    /// in `ddl::require_single_column_pk` now, which only the
+    /// genuinely-single-column callers invoke), so
+    /// `DdlError::CompositePrimaryKeyUnsupported` fires for neither arity.
+    /// Previously (**[#103](https://github.com/salesforce-misc/trellis/issues/103)**
+    /// for one grouping column,
+    /// **[#171](https://github.com/salesforce-misc/trellis/issues/171)** for
+    /// several),
+    /// the encoded group-key text (`derive_group_key`'s locally-invented
     /// `"{len}:{value}"` shape, `apply_aggregate.rs`) reached a real
     /// evaluator via [`ApplyPlan::aggregate_targets`]' `written`/`deleted`
     /// downstream-propagation path (step 3b in
     /// `apply_and_mark_drained_many`) and got misread as a raw PK value —
-    /// confirmed to crash for a numeric-typed group column, and plausibly
-    /// silently corrupted downstream rows for a text-typed one. Fixed:
-    /// `derive_group_key` now only uses the length-prefixed encoding for a
-    /// genuinely composite `GROUP BY`; a single-column one yields the
-    /// plain, unencoded value, matching the aggregate target's real PK
-    /// shape exactly, so a chained definition's live refetch reads the
-    /// correct key. This paragraph's own "moot" claim was itself already
-    /// corrected once, during #51/#52 review — left in place (rather than
-    /// deleted) as the historical record of both corrections.
+    /// confirmed to crash for a numeric-typed single group column, plausibly
+    /// silently corrupting downstream rows for a text-typed one, and failing
+    /// the whole batch with `DdlError::MalformedCompositeKey` for a
+    /// multi-column `GROUP BY`. Fixed: `derive_group_key` emits exactly
+    /// `ddl::pk_key_sql_expr`'s own row-identity encoding at either arity
+    /// (the bare value for one grouping column, the U+001F join for
+    /// several), matching the aggregate target's real PK shape exactly, so a
+    /// chained definition's live refetch reads the correct key. This
+    /// paragraph's own "moot" claim was itself already corrected once,
+    /// during #51/#52 review — left in place (rather than deleted) as the
+    /// historical record of all three corrections.
     ///
     /// The *other* half of this field's gap — a truncate clear on an
     /// aggregate source not propagating downstream at all (this field's own
-    /// doc comment, above) — is a separate, still-open item: #103's fix
-    /// only corrects the key a chained definition's live refetch resolves
-    /// against once a write/delete *does* propagate; it does not add
-    /// propagation to the truncate-clear path, which still needs
-    /// composite-key downstream propagation to close (out of scope here, as
-    /// noted above).
+    /// doc comment, above) — is a separate, still-open item: #103's/#171's
+    /// fixes only correct the key a chained definition's live refetch
+    /// resolves against once a write/delete *does* propagate; they do not
+    /// add propagation to the truncate-clear path. That path now has no
+    /// encoding obstacle left (a group key at any arity is a valid composite
+    /// row identity), only the missing `RETURNING`-projection of the cleared
+    /// group keys noted above — still out of scope here.
     aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
@@ -5130,16 +5135,19 @@ pub async fn apply_and_mark_drained_many(
     // stages Recompute rows keyed by `apply_aggregate::derive_group_key`'s
     // key, same as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s
     // doc comment, corrected during #51/#52's review: chaining a definition
-    // onto a single-group-by-column aggregate target *is* live and
-    // reachable. That key used to always be the length-prefixed composite
-    // encoding regardless of arity, which a chained definition's live
-    // refetch (`read_live_rows_batch`, above) would then bind as the
-    // literal (unencoded) single-column primary key — corrupting or
-    // crashing that refetch
-    // ([#103](https://github.com/salesforce-misc/trellis/issues/103), now
-    // fixed: `derive_group_key` only uses the length-prefixed form for a
-    // genuinely composite `GROUP BY`; a single-column one now yields the
-    // plain, unencoded value, matching the target's real PK shape exactly).
+    // onto an aggregate target *is* live and reachable, at any `GROUP BY`
+    // arity. That key used to be a locally-invented, length-prefixed
+    // encoding, which a chained definition's live refetch
+    // (`read_live_rows_batch`, above) would then try to bind as the target's
+    // real primary key — corrupting or crashing that refetch for a
+    // single-column `GROUP BY`
+    // ([#103](https://github.com/salesforce-misc/trellis/issues/103)) and
+    // failing it outright with `DdlError::MalformedCompositeKey` for a
+    // multi-column one
+    // ([#171](https://github.com/salesforce-misc/trellis/issues/171)). Both
+    // now fixed: `derive_group_key` emits exactly `ddl::pk_key_sql_expr`'s
+    // own identity encoding at either arity (the bare value for one column,
+    // the U+001F join for several), matching the target's real PK shape.
     // `src_changed` is always `None` here (`apply_aggregate::AggregateTargetPlan`'s
     // written/deleted shape carries no origin today) — deliberately left
     // unthreaded rather than plumbed in this commit; tracked as

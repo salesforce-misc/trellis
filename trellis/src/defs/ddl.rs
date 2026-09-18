@@ -498,6 +498,31 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 /// alias literal like `"t"`, never user input) — needed once the surrounding
 /// query joins in a second relation, so an
 /// unqualified column name can't become ambiguous.
+///
+/// # The declared-order convention (issue #163)
+///
+/// "In the key's own declared order" above is the whole codebase's single
+/// convention for *which* order a composite key's parts appear in, and it is
+/// load-bearing: a key encoded in one order and decoded in another silently
+/// looks up the wrong row (or, if the parts' types differ, fails the batch).
+/// It means the order the `PRIMARY KEY (...)`/`UNIQUE (...)` constraint
+/// itself lists its columns in — `pg_index.indkey`'s own order, which is what
+/// [`source_primary_key`] sorts by (`array_position(i.indkey, a.attnum)`) and
+/// therefore the order of the `pk` slice every function here receives. It is
+/// deliberately *not* the table's physical column-declaration order
+/// (`attnum`), which Postgres allows to differ:
+///
+/// ```sql
+/// create table t (tag text, post int, primary key (post, tag));
+/// -- declared key order: (post, tag); physical order: (tag, post)
+/// ```
+///
+/// Every producer and consumer must agree on this one order:
+/// [`pk_key_sql_expr`] and [`join_pk_key`] (producers),
+/// [`split_pk_key`]/[`transpose_pk_keys`] (consumers), and
+/// [`crate::intake::extract_key`] (a producer that reaches the key through
+/// `pgoutput`'s physical column order and so has to normalize back onto this
+/// one — see its own doc comment).
 pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> String {
     let parts: Vec<String> = pk
         .iter()
@@ -515,14 +540,44 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
     }
 }
 
+/// The Rust-side counterpart of [`pk_key_sql_expr`]: joins already-rendered
+/// per-column text values into one composite primary-key identity string, in
+/// the key's own declared column order (the caller's responsibility — see
+/// [`split_pk_key`]'s doc comment for that convention), and the exact inverse
+/// of [`split_pk_key`]. A single part renders as itself, byte-identical to
+/// the bare `{pk}::text` form, so an arity-1 key never carries a separator.
+///
+/// Every producer of an encoded key this crate has goes through either this
+/// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
+/// [`crate::intake::extract_key`] for a row arriving over real CDC,
+/// `staging::apply_aggregate::derive_group_key` for an aggregate group's
+/// downstream-propagated identity (issue #171), and the SQL form for
+/// everything computed in the database. Keeping them one function each —
+/// rather than a hand-rolled `join` per site — is what makes the
+/// "producers and consumers agree on one shape" claim in
+/// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.
+pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            out.push(COMPOSITE_KEY_SEPARATOR);
+        }
+        out.push_str(part.as_ref());
+    }
+    out
+}
+
 /// Splits a composite primary-key identity string (built by
-/// [`pk_key_sql_expr`], or by [`crate::intake::extract_key`] for a row that
+/// [`pk_key_sql_expr`]/[`join_pk_key`], or by [`crate::intake::extract_key`]
+/// for a row that
 /// arrived via real CDC) back into its per-column parts, in the same
 /// declared order — the read-side counterpart used once a set of already-
 /// identified rows' keys need to be matched back against `pk`'s live
 /// columns (`staging::apply::read_live_rows_batch`). Returns
 /// [`DdlError::MalformedCompositeKey`] if `key` doesn't split into exactly
-/// `pk.len()` parts, rather than silently truncating/padding — see that
+/// `pk.len()` parts, rather than silently truncating/padding — "the same
+/// declared order" here is [`pk_key_sql_expr`]'s documented declared-order
+/// convention (issue #163), not the table's physical column order; see that
 /// variant's doc comment for when this can genuinely happen.
 pub(crate) fn split_pk_key<'a>(
     pk: &[PrimaryKeyColumn],
@@ -1231,6 +1286,60 @@ mod tests {
     #[test]
     fn neighbor_table_name_is_the_definitions_target() {
         assert_eq!(neighbor_table_name(&def()), "order_totals");
+    }
+
+    fn pk(columns: &[&str]) -> Vec<PrimaryKeyColumn> {
+        columns
+            .iter()
+            .map(|name| PrimaryKeyColumn {
+                name: (*name).to_string(),
+                data_type: "text".to_string(),
+            })
+            .collect()
+    }
+
+    /// [`join_pk_key`] and [`split_pk_key`] are exact inverses, and an
+    /// arity-1 key carries no separator at all — the property issue #103's
+    /// and issue #171's fixes both lean on (a group key of either arity is
+    /// byte-identical to what [`pk_key_sql_expr`] renders for the aggregate
+    /// target's own grouping-column identity, so a chained definition's live
+    /// re-fetch decodes it as an ordinary source primary key).
+    #[test]
+    fn join_pk_key_round_trips_through_split_pk_key() {
+        assert_eq!(join_pk_key(["w1"]), "w1");
+        assert_eq!(join_pk_key(["w1", "a"]), "w1\u{1f}a");
+        assert_eq!(
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["w1", "a"])).unwrap(),
+            vec!["w1", "a"]
+        );
+        // An empty component (a NULL grouping value, per
+        // `apply_aggregate::derive_group_key`) still occupies its own part,
+        // so the arity check can't be fooled by it.
+        assert_eq!(
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["", "a"])).unwrap(),
+            vec!["", "a"]
+        );
+    }
+
+    /// The length-prefixed encoding `apply_aggregate::derive_group_key` used
+    /// to emit for a composite `GROUP BY` is exactly what issue #171's crash
+    /// was: one part where two were expected.
+    #[test]
+    fn split_pk_key_rejects_the_pre_171_length_prefixed_encoding() {
+        match split_pk_key(&pk(&["warehouse", "sku"]), "stock_totals", "2:w11:a") {
+            Err(DdlError::MalformedCompositeKey {
+                source_table,
+                key,
+                expected_arity,
+                actual_arity,
+            }) => {
+                assert_eq!(source_table, "stock_totals");
+                assert_eq!(key, "2:w11:a");
+                assert_eq!(expected_arity, 2);
+                assert_eq!(actual_arity, 1);
+            }
+            other => panic!("expected MalformedCompositeKey, got {other:?}"),
+        }
     }
 
     #[test]

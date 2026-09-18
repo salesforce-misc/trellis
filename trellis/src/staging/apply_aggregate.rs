@@ -469,26 +469,68 @@ impl AggregateTargetPlan {
 /// "absent column" convention in this crate), plus a key suitable as a
 /// `HashMap` key naming that group.
 ///
-/// For a **composite** (multi-column) `GROUP BY`, the key is the same
-/// length-prefixed encoding (`"{len}:{value}"` per column, concatenated)
-/// `defs::oracle::group_key` uses for exactly the same reason (a bare
-/// separator could itself appear inside a `Text` grouping column's value),
-/// duplicated locally since that one is private to the oracle module and
-/// this is the one other place a group needs to be named as a single
-/// string. Every consumer of this encoded form *within this crate*
-/// (`plan.groups`, `written`/`deleted` diffing, the grain-migration
-/// old-key/new-key comparison above) only ever treats it as an opaque,
-/// injective token — never decodes it — so the encoding's exact shape is
-/// free to differ from the single-column case below. It matters for a
-/// different reason: [`ddl::source_primary_key`] rejects a composite
-/// grouping key's aggregate target as an unsupported
-/// (`CompositePrimaryKeyUnsupported`) 1-1 source, so this encoded string
-/// never has to double as a real Postgres primary key value downstream —
-/// it never survives long enough to reach a chained definition's live
-/// refetch.
+/// For a **composite** (multi-column) `GROUP BY`, the key is every column's
+/// text value joined on [`ddl::COMPOSITE_KEY_SEPARATOR`] (U+001F) — exactly
+/// [`ddl::pk_key_sql_expr`]'s/[`crate::intake::extract_key`]'s own composite
+/// primary-key identity encoding, in the same `GROUP BY` order
+/// [`ddl::create_aggregate_target_table`] declares the target's `UNIQUE
+/// NULLS NOT DISTINCT` grouping-column constraint in (and therefore the
+/// order [`ddl::source_primary_key`] reports those columns back in, since it
+/// orders by the chosen index's own `indkey` position).
+///
+/// This encoding used to be a local, length-prefixed one (`"{len}:{value}"`
+/// per column, concatenated — still what the private
+/// `defs::oracle::group_key` uses for the oracle's own `Recomputed` map),
+/// justified by the claim that a composite grouping key's target could never
+/// be chained onto as another definition's source, because
+/// `ddl::source_primary_key` rejected a composite source outright. Issue
+/// #126 lifted that rejection (the rejection now lives in
+/// [`ddl::require_single_column_pk`], which only the genuinely
+/// single-column-only callers invoke), which made the claim false and turned
+/// the encoding into a live crash: `written`/`deleted` (via
+/// `apply::apply_and_mark_drained_many`'s downstream-propagation step) stage
+/// a `Recompute` keyed by this string against the aggregate target, and the
+/// chained definition's live refetch (`apply::read_live_rows_batch` →
+/// [`ddl::split_pk_key`]) split it on U+001F, found one part where the
+/// target's two-column identity wanted two, and failed the whole batch with
+/// [`ddl::DdlError::MalformedCompositeKey`] (issue #171 — the multi-column
+/// twin of the single-column bug issue #103 fixed below). Emitting the real
+/// composite-PK encoding instead makes a chained definition decode an
+/// aggregate group key exactly like any other multi-column source primary
+/// key.
+///
+/// Nothing *within* this crate decodes the key (`plan.groups`,
+/// `written`/`deleted` diffing, the grain-migration old-key/new-key
+/// comparison above all treat it as an opaque, injective token, and every
+/// statement this module emits binds `GroupPlan::group_values` — the typed
+/// per-column values — never the encoded text), so switching encodings is
+/// invisible to the aggregate target's own bookkeeping; it is also not
+/// persisted anywhere across versions (the ring's staged `key` text is the
+/// only place it lands, and only for the duration of one hop).
+///
+/// The U+001F join is injective under exactly the assumption the rest of
+/// this codebase already makes for a real composite primary key and for
+/// `staging::append::TRUNCATE_SENTINEL_KEY`: no ordinary column value
+/// contains U+001F. The old length-prefixed form was injective without that
+/// assumption, which is the one property given up here — deliberately, since
+/// agreeing with the crate's single composite-key convention is worth
+/// strictly more than being independently self-describing, and a value
+/// containing U+001F already corrupts `intake::extract_key` today.
+///
+/// A `NULL` grouping component renders as the empty string (same as the
+/// length-prefixed form's own `"0:"`), so it is indistinguishable from a
+/// genuine empty-string value, and `array_to_string` drops a `NULL`
+/// component outright on the read side — so a `NULL`-keyed group still does
+/// not round-trip through a *downstream* refetch (it resolves to no row, and
+/// is treated as a delete). That is the pre-existing single-column gap
+/// (`""` never `=` `NULL` either), unchanged and not widened here; issue
+/// #128's NULL-representable target keying fixed the target's own storage,
+/// not this text encoding.
 ///
 /// For a **single-column** `GROUP BY`, the key is that one column's own
-/// text value, completely unencoded — no length prefix. This case *does*
+/// text value, completely unencoded — no length prefix, and no separator to
+/// join on, byte-identical to what [`ddl::pk_key_sql_expr`] renders for a
+/// single-column key. This case *does*
 /// need to double as a real primary key value: the aggregate target's
 /// actual Postgres identity (its `UNIQUE NULLS NOT DISTINCT` grouping-column
 /// constraint, the same one [`ddl::source_primary_key`] falls back to for a
@@ -508,7 +550,7 @@ impl AggregateTargetPlan {
 ///
 /// A NULL grouping value and a genuine empty-string value are
 /// indistinguishable either way (both fold to `""` here, same as the
-/// composite encoding's own `"0:"` collision for the same two cases) — a
+/// composite encoding's own empty component for the same two cases) — a
 /// pre-existing quirk this function doesn't introduce or worsen for the
 /// single-column case, just carries over unchanged.
 ///
@@ -519,21 +561,15 @@ pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<St
         .iter()
         .map(|c| row.get(c).cloned().flatten())
         .collect();
-    let text = if values.len() == 1 {
-        // Single-column GROUP BY: the key must match the aggregate target's
-        // real (unencoded) single-column primary key shape exactly, since a
-        // chained definition's live refetch binds it as that literal PK
-        // value (issue #103) — see this function's doc comment.
-        values[0].clone().unwrap_or_default()
-    } else {
-        values
-            .iter()
-            .map(|v| {
-                let s = v.clone().unwrap_or_default();
-                format!("{}:{s}", s.len())
-            })
-            .collect::<String>()
-    };
+    // One encoding at every arity, exactly what `ddl::pk_key_sql_expr`
+    // renders for the aggregate target's own grouping-column identity: the
+    // bare value for a single column (issue #103), the U+001F join for a
+    // composite one (issue #171) — so a chained definition's live refetch
+    // decodes the staged downstream key as that target's real primary key
+    // either way. See this function's doc comment. `unwrap_or_default` (not a
+    // skip) keeps a composite key's arity equal to `group_by`'s, which is
+    // what `ddl::split_pk_key` checks on the other end.
+    let text = ddl::join_pk_key(values.iter().map(|v| v.as_deref().unwrap_or_default()));
     (values, text)
 }
 
@@ -2905,6 +2941,77 @@ pub(super) async fn apply_aggregate_target(
 mod tests {
     use super::*;
     use tokio_postgres::NoTls;
+
+    fn row(pairs: &[(&str, Option<&str>)]) -> Row {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    /// Issue #171: a composite `GROUP BY`'s key must be the crate's single
+    /// composite primary-key encoding ([`ddl::pk_key_sql_expr`]'s
+    /// U+001F join, in `GROUP BY` order — the same order
+    /// `ddl::create_aggregate_target_table` declares the target's unique
+    /// constraint in, and therefore the order `ddl::source_primary_key`
+    /// reports it back in), not the length-prefixed form this used to emit
+    /// (`"2:w1" + "1:a"`), so a chained definition's live re-fetch
+    /// ([`ddl::split_pk_key`]) decodes it as an ordinary composite source PK.
+    #[test]
+    fn derive_group_key_encodes_a_composite_group_as_a_composite_primary_key() {
+        let group_by = vec!["warehouse".to_string(), "sku".to_string()];
+        let (values, key) = derive_group_key(
+            &row(&[("warehouse", Some("w1")), ("sku", Some("a"))]),
+            &group_by,
+        );
+        assert_eq!(
+            values,
+            vec![Some("w1".to_string()), Some("a".to_string())],
+            "the typed per-column values every SQL statement binds are unchanged"
+        );
+        assert_eq!(key, "w1\u{1f}a");
+
+        let pk = vec![
+            ddl::PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+            },
+            ddl::PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+            },
+        ];
+        assert_eq!(
+            ddl::split_pk_key(&pk, "stock_totals", &key).expect("decodes as a composite PK"),
+            vec!["w1", "a"],
+            "the downstream consumer must decode exactly the grouping values back"
+        );
+    }
+
+    /// Issue #103's single-column case, unchanged by #171: one grouping
+    /// column yields its bare value, byte-identical to the aggregate
+    /// target's real single-column identity (no separator, no prefix).
+    #[test]
+    fn derive_group_key_leaves_a_single_column_group_unencoded() {
+        let group_by = vec!["order_id".to_string()];
+        let (_, key) = derive_group_key(&row(&[("order_id", Some("10"))]), &group_by);
+        assert_eq!(key, "10");
+    }
+
+    /// A `NULL`/absent grouping component renders as an empty part rather
+    /// than being dropped, so the encoded key's arity always equals the
+    /// `GROUP BY`'s — which is what [`ddl::split_pk_key`] checks, and what
+    /// keeps two different groups from colliding on one key.
+    #[test]
+    fn derive_group_key_keeps_a_null_components_place_in_a_composite_key() {
+        let group_by = vec!["warehouse".to_string(), "sku".to_string()];
+        let (values, key) =
+            derive_group_key(&row(&[("warehouse", None), ("sku", Some("a"))]), &group_by);
+        assert_eq!(values, vec![None, Some("a".to_string())]);
+        assert_eq!(key, "\u{1f}a");
+        let (_, other) = derive_group_key(&row(&[("sku", Some("a"))]), &group_by);
+        assert_eq!(other, key, "an absent column folds to the same empty part");
+    }
 
     /// The bulk-recompute path's extinct-group `DELETE` (step 3 of
     /// [`apply_forced_groups_bulk`]) removes a forced group's target row when

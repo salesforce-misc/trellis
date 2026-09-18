@@ -2870,7 +2870,10 @@ async fn drain_computes_an_aggregate_cross_field_alias_through_insert_and_update
 /// `ddl::source_primary_key` falls back to when nothing is `indisprimary`)
 /// is genuinely a *single*, unencoded column (`order_id`) — so
 /// `ddl::source_primary_key` does not reject `order_summary_alert`
-/// chaining onto it (only a *composite* grouping key is rejected), and
+/// chaining onto it (at the time of #103 a *composite* grouping key still
+/// was rejected; issue #126 lifted even that, and issue #171 then gave the
+/// composite case this same encoding fix — see
+/// `defs_aggregate_chained_composite_group_key.rs`), and
 /// `defs::validate`/`create_definition` impose no primary-key-shape check
 /// of their own. Before the fix, `derive_group_key` always
 /// length-prefix-encoded the group key regardless of arity, and that

@@ -500,35 +500,29 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
 ///
 /// Every interesting #137 mechanic (forward relationship resolution, the
 /// reverse-fanout grain migration) is driven directly against
-/// `author_tag_totals` *before* `tag_totals2` is installed — deliberately,
-/// not just for simplicity: code-reading plus a minimal (relationship-free,
-/// two-plain-column `GROUP BY`) repro during this issue's own work confirmed
-/// that propagating a *live incremental* change on a **multi-column**
-/// `GROUP BY` aggregate target *downstream* to a further chained
-/// definition is already broken on `main`, independent of issue #137 —
-/// `apply_aggregate::derive_group_key`'s length-prefixed composite-key
-/// encoding (correct and necessary for `author_tag_totals`'s own internal
-/// bookkeeping) leaks into the downstream `Recompute` marker's `key` field,
+/// `author_tag_totals` *before* `tag_totals2` is installed — which, when
+/// this test was written, was load-bearing rather than merely simpler:
+/// propagating a *live incremental* change on a **multi-column** `GROUP BY`
+/// aggregate target *downstream* to a further chained definition was broken
+/// on `main`, independently of #137, because
+/// `apply_aggregate::derive_group_key`'s then length-prefixed composite-key
+/// encoding leaked into the downstream `Recompute` marker's `key` field,
 /// which the live re-fetch path (`intake::extract_key`'s U+001F-joined
-/// convention) then fails to parse (`DdlError::MalformedCompositeKey`).
-/// Issue #103 only ever fixed this encoding's *single*-column case (so a
-/// single-column `GROUP BY` chains correctly, as
+/// convention) then failed to parse (`DdlError::MalformedCompositeKey`).
+/// Issue #103 had only ever fixed that encoding's *single*-column case (see
 /// `chaining_onto_a_single_group_by_column_aggregate_target_does_not_misread_the_group_key`
-/// in `apply_aggregate.rs` proves); the multi-column case was never
-/// actually exercised by a *further-chained* downstream consumer before —
-/// issue #126 legalized chaining a non-1-1 (i.e. another aggregate)
-/// definition onto a composite-keyed source, but no test ever combined that
-/// with a *live* change to such a source until this one. This is a
-/// pre-existing gap, not something #137 introduces or need fix (the brief
-/// for this issue says this chaining case "should not need further
-/// changes, just must not regress" — it doesn't, once kept off the already-
-/// broken live-propagation path); see this test's author's final report for
-/// the suggested follow-up issue. So: `tag_totals2` is installed (and does
-/// its own from-scratch backfill, a plain table scan with no per-row key
-/// string involved at all) only *after* `author_tag_totals` has already
+/// in `apply_aggregate.rs`). **Issue #171 has since closed the multi-column
+/// case** the same way — a composite group key is now emitted as an ordinary
+/// U+001F-joined composite primary key — and pins it with live updates,
+/// inserts and grain migrations across a two-column chain in
+/// `defs_aggregate_chained_composite_group_key.rs`.
+///
+/// This test is deliberately left as it was: `tag_totals2` is installed (and
+/// does its own from-scratch backfill, a plain table scan with no per-row
+/// key string involved at all) only *after* `author_tag_totals` has already
 /// reached its final, fully-migrated state — proving the chain converges
-/// correctly over a relationship-derived composite key, without touching
-/// the unrelated broken path.
+/// correctly over a *relationship-derived* composite key, which is #137's
+/// own concern and is orthogonal to #171's encoding fix.
 #[tokio::test]
 async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_converges() {
     let cluster = TestCluster::start();

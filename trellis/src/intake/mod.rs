@@ -132,54 +132,103 @@ async fn fetch_confirmed_lsn(
 }
 
 /// Builds the [`StagedChange::Cdc::key`] string from `relation`'s key
-/// columns, in definition order, joined with the ASCII unit separator — the
+/// columns, joined with the ASCII unit separator — the
 /// same collision-free delimiter the ring's `route` column uses (see
 /// `V3__staging_ring.sql`), so a key containing a comma can't collide with
-/// another row's.
+/// another row's. Joined through [`crate::defs::ddl::join_pk_key`] rather
+/// than a local `join`, so this producer and the SQL-side producer
+/// (`ddl::pk_key_sql_expr`) provably share one separator.
 ///
-/// `primary_key` is the source table's actual primary-key column names,
-/// looked up from `pg_catalog` (see [`primary_key_columns`]), and is only
-/// ever `Some` for a `REPLICA IDENTITY FULL` relation. Under FULL,
-/// `pgoutput` sets the `is_key` flag on *every* column (issue #56), so
-/// `col.is_key` can't be trusted to mean "part of the key" there — `Some`
-/// overrides it with the real primary key instead. `None` (every other
-/// replica identity) keeps the original `is_key`-flag behavior unchanged.
+/// `primary_key` is the source table's actual primary-key column names, **in
+/// the primary key's own declared order**, looked up from `pg_catalog` (see
+/// [`primary_key_columns`]), and is `Some` for any relation whose replica
+/// identity makes its primary key the authoritative row identity — `REPLICA
+/// IDENTITY FULL` (issue #56: `pgoutput` sets the `is_key` flag on *every*
+/// column there, so `col.is_key` can't be trusted to mean "part of the key")
+/// and `REPLICA IDENTITY DEFAULT` (where the replica identity simply *is* the
+/// primary key, so the flags agree with it but carry no ordering
+/// information). When `Some`, the parts are emitted in `primary_key`'s order,
+/// making this agree with [`crate::defs::ddl::pk_key_sql_expr`]'s
+/// declared-order convention — see that function's "declared-order
+/// convention" section, and issue #163: this used to walk `relation.columns`
+/// (`pgoutput`'s *physical* column order) filtered to key membership, which
+/// silently produced a differently-ordered key than the one the consuming
+/// side (`ddl::split_pk_key`, via `staging::apply::read_live_rows_batch`)
+/// decodes with for any table whose `PRIMARY KEY (...)` clause happens to
+/// list its columns in a different order than they're physically declared
+/// (`create table t (tag text, post int, primary key (post, tag))`).
+///
+/// `None` — `REPLICA IDENTITY USING INDEX` or `NOTHING` — keeps the original
+/// `is_key`-flag, physical-order behavior, deliberately: under `USING INDEX`
+/// the flagged columns are that *index's*, not necessarily the primary key's,
+/// so the primary key is not the right ordering to normalize onto, and
+/// `pgoutput` exposes no ordering for the identity index itself. So the
+/// physical-vs-declared divergence issue #163 describes survives, in
+/// principle, for a multi-column `USING INDEX` identity listed out of
+/// physical order (`NOTHING` stages no key at all — it fails the "at least
+/// one key column" check below). A strictly narrower residue than what #163
+/// found, since the two replica identities this crate's front door actually
+/// *requires* for the tables whose composite keys get decoded again
+/// downstream (an aggregate source, a relationship's projected endpoints)
+/// are both FULL — but not nothing. Closing it means introspecting
+/// `pg_index.indisreplident`'s own `indkey` order here rather than the
+/// primary key's, which no reachable path needs today.
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],
     primary_key: Option<&[String]>,
 ) -> Result<String, IntakeError> {
+    let missing_key = || IntakeError::MissingKeyValue {
+        table: relation.name.clone(),
+    };
+    let key_value = |i: usize| match tuple.get(i) {
+        Some(ColumnValue::Text(t)) => Ok(t.as_str()),
+        _ => Err(missing_key()),
+    };
+
     let mut parts = Vec::new();
-    for (i, col) in relation.columns.iter().enumerate() {
-        let is_key = match primary_key {
-            Some(pk) => pk.iter().any(|name| name == &col.name),
-            None => col.is_key,
-        };
-        if !is_key {
-            continue;
+    match primary_key {
+        // Issue #163: `primary_key`'s order, not `relation.columns`' —
+        // a column the publication doesn't carry at all is treated exactly
+        // like a missing value below (there's no identity to build without
+        // it), the same outcome the old membership filter reached by simply
+        // never finding it.
+        Some(pk) => {
+            for name in pk {
+                let i = relation
+                    .columns
+                    .iter()
+                    .position(|col| &col.name == name)
+                    .ok_or_else(missing_key)?;
+                parts.push(key_value(i)?);
+            }
         }
-        match tuple.get(i) {
-            Some(ColumnValue::Text(t)) => parts.push(t.as_str()),
-            _ => {
-                return Err(IntakeError::MissingKeyValue {
-                    table: relation.name.clone(),
-                });
+        None => {
+            for (i, col) in relation.columns.iter().enumerate() {
+                if !col.is_key {
+                    continue;
+                }
+                parts.push(key_value(i)?);
             }
         }
     }
     if parts.is_empty() {
-        return Err(IntakeError::MissingKeyValue {
-            table: relation.name.clone(),
-        });
+        return Err(missing_key());
     }
-    Ok(parts.join("\u{1f}"))
+    Ok(crate::defs::ddl::join_pk_key(parts))
 }
 
 /// Looks up `namespace.name`'s actual primary-key column names from
-/// `pg_catalog`, in the primary key's own column order — the source of
+/// `pg_catalog`, in the primary key's own **declared** column order
+/// (`array_position(i.indkey, a.attnum)`, matching
+/// `defs::ddl::source_primary_key` exactly — see
+/// `defs::ddl::pk_key_sql_expr`'s "declared-order convention" section) — the
+/// source of
 /// truth [`extract_key`] falls back to under `REPLICA IDENTITY FULL`, where
 /// `pgoutput`'s per-column `is_key` flag is set on every column and so can't
-/// tell the key columns apart from the rest (issue #56). Unlike
+/// tell the key columns apart from the rest (issue #56), and under `REPLICA
+/// IDENTITY DEFAULT`, where it supplies the ordering `pgoutput`'s
+/// physical-order columns don't (issue #163). Unlike
 /// `defs::ddl::source_primary_key`, this supports a composite primary key —
 /// intake's key derivation only ever needs the column *names*, never a
 /// single column's type — and returns an empty `Vec` rather than an error
@@ -503,11 +552,15 @@ pub struct Intake {
     slot: String,
     wake_channel: String,
     relations: RelationCache,
-    /// The actual source-table primary-key column names for every
-    /// `REPLICA IDENTITY FULL` relation seen so far, keyed by
-    /// `relation_id` — [`extract_key`]'s override for issue #56. Populated
-    /// on each `Relation` message and never consulted for any other
-    /// replica identity (see `handle_xlog_data`).
+    /// The actual source-table primary-key column names, in the key's own
+    /// declared order, for every `REPLICA IDENTITY FULL` or `DEFAULT`
+    /// relation seen so far, keyed by `relation_id` — [`extract_key`]'s
+    /// override for issue #56 (FULL: the `is_key` flags are useless there)
+    /// and its declared-order normalization for issue #163 (DEFAULT: the
+    /// flags are right but carry no ordering). Populated on each `Relation`
+    /// message; still never consulted for `USING INDEX`/`NOTHING`, where the
+    /// primary key is not the row identity at all (see `handle_xlog_data`
+    /// and [`extract_key`]'s own doc comment).
     primary_keys: std::collections::HashMap<i32, Vec<String>>,
     /// Issue #133: `src_table -> from_col` column names, refreshed
     /// lazily/on-miss — see [`GroupKeyColumns`]'s own doc comment.
@@ -716,7 +769,21 @@ impl Intake {
                 // column for this relation, so `extract_key` can't trust it
                 // — look up the source table's actual primary key once per
                 // relation and cache it alongside the relation itself.
-                if relation.replica_identity == b'f' {
+                //
+                // REPLICA IDENTITY DEFAULT (issue #163): the flags *are*
+                // trustworthy (the identity is exactly the primary key), but
+                // they arrive in `pgoutput`'s physical column order, which
+                // Postgres allows to differ from the order the `PRIMARY KEY
+                // (...)` clause declares — and every consumer of an encoded
+                // composite key decodes in *declared* order (see
+                // `defs::ddl::pk_key_sql_expr`'s "declared-order convention"
+                // section). Caching the real key here lets `extract_key`
+                // normalize onto that one order instead of silently emitting a
+                // differently-ordered key for such a table. One extra catalog
+                // round trip per `Relation` message (not per change), and
+                // byte-identical keys for the overwhelmingly common table
+                // whose two orders already coincide.
+                if matches!(relation.replica_identity, b'f' | b'd') {
                     let pk = primary_key_columns(
                         self.session.client(),
                         &relation.namespace,
@@ -1023,6 +1090,66 @@ mod tests {
         ];
         let pk = vec!["id".to_string()];
         assert_eq!(extract_key(&r, &tuple, Some(&pk)).unwrap(), "1");
+    }
+
+    /// Issue #163: `create table t (tag text, post int, primary key (post,
+    /// tag))` — the primary key's *declared* order `(post, tag)` is the
+    /// reverse of the table's physical column order `(tag, post)`, and
+    /// `pgoutput` hands us the physical one. The staged key must follow the
+    /// declared order, because that is the order every consumer decodes with
+    /// (`ddl::split_pk_key`, whose `pk` slice comes from
+    /// `ddl::source_primary_key`'s `array_position(i.indkey, a.attnum)`
+    /// sort) and the order the SQL-side producer `ddl::pk_key_sql_expr`
+    /// re-renders it in. Before this fix the two silently disagreed for
+    /// exactly this table shape: a live re-fetch would have looked up
+    /// `post = 'rust'`/`tag = '7'`.
+    #[test]
+    fn extract_key_orders_composite_parts_by_the_primary_keys_declared_order() {
+        let r = relation(vec![("tag", true), ("post", true), ("payload", false)]);
+        let tuple = vec![
+            ColumnValue::Text("rust".into()),
+            ColumnValue::Text("7".into()),
+            ColumnValue::Text("hello".into()),
+        ];
+        let pk = vec!["post".to_string(), "tag".to_string()];
+        assert_eq!(extract_key(&r, &tuple, Some(&pk)).unwrap(), "7\u{1f}rust");
+    }
+
+    /// The same declared-order normalization under `REPLICA IDENTITY FULL`,
+    /// where `pgoutput` additionally marks *every* column `is_key` (issue
+    /// #56) — so neither the flags nor the column order carry usable
+    /// information and both have to come from the catalog lookup.
+    #[test]
+    fn extract_key_orders_composite_parts_by_declared_order_under_full_replica_identity() {
+        let mut r = relation(vec![("tag", true), ("post", true), ("payload", true)]);
+        r.replica_identity = b'f';
+        let tuple = vec![
+            ColumnValue::Text("rust".into()),
+            ColumnValue::Text("7".into()),
+            ColumnValue::Text("hello".into()),
+        ];
+        let pk = vec!["post".to_string(), "tag".to_string()];
+        assert_eq!(extract_key(&r, &tuple, Some(&pk)).unwrap(), "7\u{1f}rust");
+    }
+
+    /// A primary-key column the publication doesn't carry at all leaves no
+    /// derivable row identity, so this fails loudly with the same
+    /// `MissingKeyValue` a missing *value* raises — rather than silently
+    /// staging a short, lower-arity key that `ddl::split_pk_key` would later
+    /// reject as `MalformedCompositeKey` (or, worse, that would collide with
+    /// a different row's).
+    #[test]
+    fn extract_key_rejects_a_primary_key_column_absent_from_the_relation() {
+        let r = relation(vec![("tag", true), ("payload", false)]);
+        let tuple = vec![
+            ColumnValue::Text("rust".into()),
+            ColumnValue::Text("hello".into()),
+        ];
+        let pk = vec!["post".to_string(), "tag".to_string()];
+        match extract_key(&r, &tuple, Some(&pk)) {
+            Err(IntakeError::MissingKeyValue { table }) => assert_eq!(table, "widgets"),
+            other => panic!("expected MissingKeyValue, got {other:?}"),
+        }
     }
 
     #[test]
