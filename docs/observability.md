@@ -192,7 +192,12 @@ so backfill and quarantine are two arcs of one lifecycle:
   only. This is the steady state.
 * **`quarantined`** — the fuse has tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)); resuming drops the
-  transform back to `waiting_to_backfill` and re-runs the backfill.
+  transform back to `waiting_to_backfill` and re-runs the backfill. Resuming
+  also **re-arms** the fuse: the already-evicted keys stay evicted (and stay
+  releasable, one at a time, with their parked changes intact), but they no
+  longer count against the resumed transform, so it gets a full fresh budget
+  of new evictions before the fuse can trip again rather than re-tripping on
+  the very next one.
 
 ### Backfill status and the `xmin` caveat
 

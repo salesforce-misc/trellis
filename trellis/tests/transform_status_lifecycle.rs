@@ -35,6 +35,12 @@
 //! `staging::quarantine`'s whole-transform fuse quarantines the definition,
 //! then the same resume/re-backfill lifecycle as the scenario above carries
 //! it back to `live`.
+//!
+//! A fourth scenario (issue #160) carries that one further: once resumed and
+//! live again, the transform must have a *fresh* whole-transform fuse budget
+//! — one new eviction must not immediately re-quarantine it just because the
+//! pre-resume `poison` rows are (deliberately) still there, while a full
+//! fresh threshold's worth of new evictions must.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -248,6 +254,118 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
         .expect("query status")
         .get(0);
     TransformStatus::from_persisted(&text).unwrap_or_else(|| panic!("unrecognized status {text}"))
+}
+
+/// One seal/drain/retire round, with no exit condition of its own — the
+/// "flush whatever is still staged" step [`drain_to_quiescence`] can't be
+/// used for once a scenario has parked a permanently-unreleasable
+/// `poison_held` row (see [`drain_until_live`]'s own comment on why
+/// `has_pending` never clears then).
+async fn drain_one_round(pool: &trellis::Pool, client: &mut Client) {
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let seg = seal_active_segment(client).await;
+    while apply::drain_once(
+        pool,
+        seg,
+        "status_lifecycle_test",
+        1,
+        "trellis_status_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+    retire_drained_segments(client)
+        .await
+        .expect("retire drained segments");
+}
+
+/// Drives real evictions for `keys` on `src_table`: stages one malformed-key
+/// CDC insert per key (see
+/// `quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live`'s
+/// own long comment for why a bad *key* rather than a bad *value* is what
+/// charges only the row-level fuse), seals, then drains until the segment
+/// finally drains — which, by construction, is once every one of `keys` has
+/// crossed `DEFAULT_DEATH_THRESHOLD` real failures and been evicted to
+/// `poison`. Asserts exactly that before returning.
+async fn evict_keys_for_real(
+    pool: &trellis::Pool,
+    raw: &mut Client,
+    src_table: &str,
+    keys: &[&str],
+) {
+    let ring_table = active_ring_table(raw).await;
+    for key in keys {
+        insert_cdc_row(
+            raw,
+            &ring_table,
+            src_table,
+            key,
+            "insert",
+            None,
+            Some(r#"{"a":"1"}"#),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(raw).await;
+
+    // Each external `drain_once` call charges every still-failing key's
+    // death counter once (`isolate_and_evict`'s probe loop) and, unless that
+    // charge crosses the threshold for at least one key, surfaces the
+    // failure immediately rather than looping internally — see
+    // `staging::apply::classify_and_retry`'s `Isolate` arm. So reaching
+    // `DEFAULT_DEATH_THRESHOLD` (5) takes five external failures, the fifth
+    // of which evicts every one of `keys` together (they all fail every
+    // attempt alike) and lets the retry drain succeed within that same call.
+    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
+    // is running here either, so a throwaway, always-caught-up watermark is
+    // correct.
+    let watermark = trellis::staging::StagedWatermark::saturated();
+    let mut real_failures = 0;
+    loop {
+        match apply::drain_once(
+            pool,
+            seg_seq,
+            "status_lifecycle_test",
+            1,
+            "trellis_status_test",
+            &watermark,
+        )
+        .await
+        {
+            Ok(Some(_)) => break,
+            Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
+            Err(_) => {
+                real_failures += 1;
+                assert!(
+                    real_failures <= 20,
+                    "did not cross the eviction threshold within a reasonable number of real \
+                     attempts"
+                );
+            }
+        }
+    }
+    assert!(
+        real_failures >= 1,
+        "the eviction must be driven by real, observed failures, not conjured"
+    );
+
+    for key in keys {
+        let poisoned = raw
+            .query_opt(
+                "select 1 from poison where src_table = $1 and key = $2",
+                &[&src_table, key],
+            )
+            .await
+            .expect("query poison")
+            .is_some();
+        assert!(poisoned, "key {key} must have actually been evicted");
+    }
+
+    retire_drained_segments(raw)
+        .await
+        .expect("retire drained segments");
 }
 
 /// A fresh transform whose source table's publication-join fence is pinned
@@ -551,80 +669,19 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     // `"seg_0"` — the backfill/catch-up activity above has already sealed
     // and advanced the ring pointer past its initial slot.
     let s4 = qualify_fixture_table("s4");
-    let ring_table = active_ring_table(&raw).await;
-    let bad_keys = [
-        "bad-key-1",
-        "bad-key-2",
-        "bad-key-3",
-        "bad-key-4",
-        "bad-key-5",
-    ];
-    for key in bad_keys {
-        insert_cdc_row(
-            &raw,
-            &ring_table,
-            &s4,
-            key,
-            "insert",
-            None,
-            Some(r#"{"a":"1"}"#),
-        )
-        .await;
-    }
-    let seg_seq = seal_active_segment(&mut raw).await;
-
-    // Each external `drain_once` call charges every still-failing key's
-    // death counter once (`isolate_and_evict`'s probe loop) and, unless that
-    // charge crosses the threshold for at least one key, surfaces the
-    // failure immediately rather than looping internally — see
-    // `staging::apply::classify_and_retry`'s `Isolate` arm. So reaching
-    // `DEFAULT_TRANSFORM_DEATH_THRESHOLD` (5) takes five external failures,
-    // the fifth of which evicts all five keys together and lets the
-    // (now-empty) retry drain succeed within that same call.
-    // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
-    // is running here either, so a throwaway, always-caught-up watermark is
-    // correct.
-    let watermark = trellis::staging::StagedWatermark::saturated();
-    let mut real_failures = 0;
-    loop {
-        match apply::drain_once(
-            &db.pool,
-            seg_seq,
-            "status_lifecycle_test",
-            1,
-            "trellis_status_test",
-            &watermark,
-        )
-        .await
-        {
-            Ok(Some(_)) => break,
-            Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
-            Err(_) => {
-                real_failures += 1;
-                assert!(
-                    real_failures <= 20,
-                    "did not cross the eviction threshold within a reasonable number of real \
-                     attempts"
-                );
-            }
-        }
-    }
-    assert!(
-        real_failures >= 1,
-        "the trip must be driven by real, observed failures, not conjured"
-    );
-
-    for key in bad_keys {
-        let poisoned = raw
-            .query_opt(
-                "select 1 from poison where src_table = $1 and key = $2",
-                &[&s4, &key],
-            )
-            .await
-            .expect("query poison")
-            .is_some();
-        assert!(poisoned, "key {key} must have actually been evicted");
-    }
+    evict_keys_for_real(
+        &db.pool,
+        &mut raw,
+        &s4,
+        &[
+            "bad-key-1",
+            "bad-key-2",
+            "bad-key-3",
+            "bad-key-4",
+            "bad-key-5",
+        ],
+    )
+    .await;
 
     assert_eq!(
         status_of(&raw, "t4").await,
@@ -678,6 +735,139 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
         mismatches, 0,
         "the re-backfill must re-derive every real row from current source state, including the \
          mutated one"
+    );
+}
+
+/// Regression coverage for issue #160: a resumed transform gets a **fresh**
+/// whole-transform fuse budget, rather than re-tripping on the very next
+/// eviction forever.
+///
+/// Before the fix, `resume_transform` moved the status out of `quarantined`
+/// but left the `poison` rows that tripped the fuse in place, and
+/// `trip_transform_fuse_if_crossed` counted *every* `poison` row for the
+/// source table — so the count was already at 5 (the threshold) before any
+/// new eviction even landed, and eviction number six re-quarantined the
+/// transform immediately. The decided semantics (`V29__transform_fuse_rearm.sql`,
+/// issue #160's option (b)) are that a resume *re-arms* the fuse by stamping
+/// `transform_definitions.fuse_rearmed_at`, so only evictions after that
+/// instant count: history and parked work are preserved, the budget is not.
+///
+/// This test pins both halves of that: exactly one new eviction after a
+/// resume must **not** re-trip, and a full further threshold's worth of new
+/// evictions must.
+#[tokio::test]
+async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table s6 (id bigint primary key, a numeric); \
+         insert into s6 (id, a) select g, g from generate_series(1, 5) g;",
+    )
+    .await
+    .expect("seed source table");
+
+    let cols = numeric(&["a"]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM t6 FROM s6 SELECT a + a AS x",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition");
+    drain_backfill_chunks(&db.pool, "public").await;
+    publication::run_pending_backfills(&mut raw, "wake")
+        .await
+        .expect("discharge the post-build catch-up marker");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status_of(&raw, "t6").await, TransformStatus::Live);
+
+    let s6 = qualify_fixture_table("s6");
+
+    // Phase 1: trip the fuse for real, exactly like
+    // `quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live`.
+    evict_keys_for_real(
+        &db.pool,
+        &mut raw,
+        &s6,
+        &["bad-1", "bad-2", "bad-3", "bad-4", "bad-5"],
+    )
+    .await;
+    assert_eq!(
+        status_of(&raw, "t6").await,
+        TransformStatus::Quarantined,
+        "five distinct evicted keys must trip the whole-transform fuse"
+    );
+
+    // Resume, and carry the re-backfill through to live so the fuse is even
+    // eligible to trip again (`transforms_for_source` only ever returns
+    // `live` definitions).
+    quarantine::resume_transform(&db.pool, "t6")
+        .await
+        .expect("resume_transform");
+    publication::run_pending_backfills(&mut raw, "wake")
+        .await
+        .expect("run_pending_backfills discharges the resume's own marker");
+    drain_until_live(&db.pool, &mut raw, "t6").await;
+    // Flush whatever the re-backfill's own catch-up left staged, so the
+    // eviction rounds below start from a segment holding only their own
+    // bad-key rows.
+    drain_one_round(&db.pool, &mut raw).await;
+
+    let rearmed: Option<std::time::SystemTime> = raw
+        .query_one(
+            &format!(
+                "select fuse_rearmed_at from transform_definitions \
+                 where target_table = '{DEFAULT_TARGET_SCHEMA}.t6'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read fuse_rearmed_at")
+        .get(0);
+    assert!(
+        rearmed.is_some(),
+        "resume_transform must stamp the fuse's re-arm point"
+    );
+
+    // Phase 2: exactly one new eviction. The five pre-resume `poison` rows
+    // are deliberately still there (they are the fold's global exclusion
+    // marker and own parked `poison_held` work) — they just must not count
+    // toward the re-armed budget any more.
+    evict_keys_for_real(&db.pool, &mut raw, &s6, &["bad-6"]).await;
+
+    let poisoned_total: i64 = raw
+        .query_one("select count(*) from poison where src_table = $1", &[&s6])
+        .await
+        .expect("count poison")
+        .get(0);
+    assert_eq!(
+        poisoned_total, 6,
+        "the resume must preserve the pre-resume poison rows (audit trail + parked work), not \
+         delete them"
+    );
+    assert_eq!(
+        status_of(&raw, "t6").await,
+        TransformStatus::Live,
+        "one single new eviction after a resume must not re-trip the whole-transform fuse — the \
+         resumed transform gets a fresh full threshold's budget (issue #160)"
+    );
+
+    // Phase 3: four more new evictions — five fresh ones in total — must
+    // re-trip it, so the re-arm rearms the fuse rather than disabling it.
+    evict_keys_for_real(
+        &db.pool,
+        &mut raw,
+        &s6,
+        &["bad-7", "bad-8", "bad-9", "bad-10"],
+    )
+    .await;
+    assert_eq!(
+        status_of(&raw, "t6").await,
+        TransformStatus::Quarantined,
+        "a full fresh threshold's worth of post-resume evictions must re-trip the fuse"
     );
 }
 

@@ -218,3 +218,41 @@ a transform's broader **lifecycle status**
   accumulation has no per-column pause concept — see
   `staging::apply_aggregate`), which is a known, deliberate gap rather than an
   oversight.
+
+**Amendment (2026-09-18): resuming a transform re-arms its fuse (issue
+#160).** The transform-wide fuse counts the distinct evicted keys for a
+source table — rows in `poison` — and `staging::quarantine::resume_transform`
+originally left that table completely untouched, so a source that had ever
+reached the threshold stayed at/above it forever and the *next single* new
+eviction, for any key and any reason, re-quarantined the transform
+immediately. "Five fresh failures re-trips" silently became "one failure
+re-trips, forever, after the first trip."
+
+Decided: a resume **re-arms** the fuse rather than erasing quarantine
+history. `resume_transform` stamps `transform_definitions.fuse_rearmed_at`
+(`V29__transform_fuse_rearm.sql`) in the same transaction as the status drop,
+and `trip_transform_fuse_if_crossed` counts only `poison` rows evicted after
+that instant — a full, fresh threshold's budget of *new* evictions. `null`
+(never resumed) reads as `-infinity`, i.e. exactly the pre-#160 count.
+
+The rejected alternative was deleting the source table's `poison`/`key_deaths`
+rows on resume:
+
+* `poison` is not just a counter, it is the **marker** the fold consults
+  (`poisoned_keys_among`) to exclude a key globally, and each of its keys may
+  own real parked work in `poison_held`. Only `release_key` knows how to
+  replay that work (per key, with original origin positions preserved);
+  deleting the marker without it would silently strand the parked changes.
+* The fuse is keyed per source table, but a resume is per *transform*, and one
+  source can back several transforms. Clearing the shared rows while resuming
+  one of them would un-evict those keys out from under the siblings, which are
+  not being re-backfilled and would lose their parked deltas for good.
+* Keeping the rows keeps the operator-visible audit trail of what was ever
+  evicted and why (`poisoned_at`/`last_error`) — the same reasoning
+  `trip_column_fuse` already documents for not clearing `column_failures` when
+  the column fuse trips.
+
+The per-key (`key_deaths`) and per-column (`column_deaths`) tiers are
+deliberately unaffected: they are cleared by a clean drain of the key itself
+and by `resume_column` respectively, and a whole-transform resume makes no
+claim about any individual key's or column's health.

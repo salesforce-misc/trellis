@@ -607,6 +607,30 @@ pub async fn isolate_and_evict(
 /// rows; a separate connection would undercount until commit and could miss
 /// the exact eviction that crosses the threshold.
 ///
+/// **The count is windowed by the resuming operator's re-arm point** (issue
+/// #160): only `poison` rows whose `poisoned_at` is *after* the definition's
+/// `transform_definitions.fuse_rearmed_at` count toward the threshold. Before
+/// this, [`resume_transform`] left `poison` untouched, so a `src_table` that
+/// had ever reached five evicted keys kept that count forever and the next
+/// single new eviction — for any key, for any reason — re-tripped the fuse
+/// immediately; the intended "five fresh failures re-trips" degraded into
+/// "one failure re-trips, forever." See `V29__transform_fuse_rearm.sql` for
+/// why re-arming (this option) beats deleting the `src_table`'s `poison` rows
+/// on resume: those rows are the fold's global exclusion *marker* and may own
+/// parked `poison_held` work, and they are shared by every transform on the
+/// same source (only one of which is being resumed). `fuse_rearmed_at` is
+/// `null` for a never-resumed definition, read here as `-infinity` — i.e.
+/// identical to the pre-#160 unwindowed count.
+///
+/// The count is therefore per *definition* rather than one shared count for
+/// `src_table`: sibling transforms on the same source are resumed
+/// independently, so each one carries its own budget. That is a strictly
+/// finer-grained version of the previous behaviour (with no resume anywhere,
+/// every sibling sees the same number the single old query returned), and it
+/// leaves the query's concurrency semantics untouched — still a `count(*)`
+/// read against `txn`, deliberately unchanged here (issue #159 tracks that
+/// count's separate concurrent-undercount race).
+///
 /// Idempotent: a definition already [`TransformStatus::Quarantined`] is left
 /// alone (no redundant write, no repeated log line) on every later eviction
 /// that keeps `src_table` above threshold.
@@ -615,20 +639,28 @@ async fn trip_transform_fuse_if_crossed(
     pool: &Pool,
     src_table: &str,
 ) -> Result<(), ApplyError> {
-    let poisoned_count: i64 = txn
-        .query_one(
-            "select count(*) from poison where src_table = $1",
-            &[&src_table],
-        )
-        .await?
-        .get(0);
-    if poisoned_count < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
-        return Ok(());
-    }
-
     let definitions = catalog::transforms_for_source(pool, src_table).await?;
     for def in definitions {
         if def.status == TransformStatus::Quarantined {
+            continue;
+        }
+        // `fuse_rearmed_at` is read inside `txn` (from the definition's own
+        // committed row, by id) rather than carried on `Definition`: it is
+        // pure fuse bookkeeping with no other reader, so widening the
+        // catalog's public model — and every construction site of it — for
+        // one call site isn't worth it.
+        let poisoned_count: i64 = txn
+            .query_one(
+                "select count(*) from poison \
+                 where src_table = $1 \
+                   and poisoned_at > coalesce( \
+                         (select fuse_rearmed_at from transform_definitions where id = $2), \
+                         '-infinity'::timestamptz)",
+                &[&src_table, &def.id],
+            )
+            .await?
+            .get(0);
+        if poisoned_count < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
             continue;
         }
         tracing::warn!(
@@ -1135,6 +1167,18 @@ pub async fn resume_column(
 /// subscribed to that source is quarantined (issue #105 — this used to have
 /// no writer at all; `resume_transform` predates it and was written first so
 /// the trip mechanism would have somewhere correct to land).
+///
+/// **Re-arms that fuse** (issue #160) by stamping
+/// `transform_definitions.fuse_rearmed_at`, so the resumed transform gets a
+/// fresh [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] budget of *new* evictions
+/// rather than re-tripping on the very next one (the `poison` rows that
+/// tripped it are still there — see
+/// [`trip_transform_fuse_if_crossed`]'s doc comment and
+/// `V29__transform_fuse_rearm.sql` for why they're windowed out rather than
+/// deleted). This deliberately does **not** touch `key_deaths`: that's the
+/// independent per-key fuse tier, cleared by a clean drain of the key itself
+/// (`clear_key_deaths`), and a resume makes no claim about any individual
+/// key's health — only about the transform's.
 #[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
@@ -1170,8 +1214,20 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         });
     }
 
+    // `fuse_rearmed_at = now()` in the same statement, not a separate one:
+    // re-arming the whole-transform fuse is part of the same atomic
+    // "this transform starts over" transition as the status drop (issue
+    // #160). `now()` is the transaction timestamp, and every later eviction
+    // stamps `poison.poisoned_at` from its own, strictly later transaction,
+    // so `trip_transform_fuse_if_crossed`'s strict `>` comparison gives this
+    // transform a full, fresh `DEFAULT_TRANSFORM_DEATH_THRESHOLD` budget of
+    // post-resume evictions. Keys still sitting in `poison` from before the
+    // resume are deliberately left there — they remain globally excluded
+    // from folding (and their parked `poison_held` work remains releasable
+    // via `release_key`), they just no longer count toward this transform's
+    // fuse.
     txn.execute(
-        "update transform_definitions set status = $1 where id = $2",
+        "update transform_definitions set status = $1, fuse_rearmed_at = now() where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;

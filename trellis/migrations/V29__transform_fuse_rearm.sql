@@ -1,0 +1,37 @@
+-- Re-arming the whole-transform fuse on resume (issue #160).
+--
+-- The whole-transform fuse (`staging::quarantine::trip_transform_fuse_if_crossed`,
+-- issue #105) trips when a `src_table`'s distinct-evicted-key count — rows in
+-- `poison` — crosses `DEFAULT_TRANSFORM_DEATH_THRESHOLD`. `resume_transform`
+-- moved the definition's status back out of `quarantined` but left `poison`
+-- alone, so the count stayed at/above threshold forever and the very next
+-- single new eviction (any key, any reason) re-tripped the fuse immediately:
+-- "5 fresh failures re-trips" silently became "1 failure re-trips, forever."
+--
+-- Decided semantics (issue #160's option (b)): a resume **re-arms** the fuse
+-- rather than erasing quarantine history. `fuse_rearmed_at` records when, and
+-- the fuse counts only `poison` rows evicted *after* that instant. Why not
+-- option (a), "delete the `src_table`'s `poison`/`key_deaths` rows on resume":
+--
+--   * `poison` is not only a counter, it is the *marker* the fold consults
+--     (`poisoned_keys_among`) to exclude a key globally, and each of its keys
+--     may have real parked work in `poison_held`. Deleting the marker without
+--     replaying that work (which only `release_key` knows how to do, per key,
+--     with the original origin positions preserved) would silently strand it.
+--   * The fuse is keyed per `src_table`, but resume is per *transform*, and a
+--     source table can back several transforms. Clearing the shared `poison`
+--     rows while resuming one of them would un-evict those keys out from under
+--     the sibling transforms too — which are not being re-backfilled and would
+--     therefore lose the parked deltas for good.
+--   * It keeps `poison` as the operator-visible audit trail of what was ever
+--     evicted and why (`poisoned_at`/`last_error`), the same reasoning
+--     `trip_column_fuse` already documents for not clearing `column_failures`
+--     when the column fuse trips.
+--
+-- Nullable with no default, and deliberately not backfilled: `null` means
+-- "never resumed", which the fuse reads as `-infinity` — exactly the
+-- pre-#160 behaviour for every transform that has never been resumed, so
+-- this migration changes nothing for an existing installation until the
+-- first resume happens.
+alter table transform_definitions
+    add column if not exists fuse_rearmed_at timestamptz;
