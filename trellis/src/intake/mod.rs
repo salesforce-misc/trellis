@@ -173,6 +173,11 @@ async fn fetch_confirmed_lsn(
 /// are both FULL — but not nothing. Closing it means introspecting
 /// `pg_index.indisreplident`'s own `indkey` order here rather than the
 /// primary key's, which no reachable path needs today.
+///
+/// `None` also covers a DEFAULT-identity relation whose primary key the
+/// catalog can no longer resolve — a table dropped since the change was
+/// written to the WAL, say — where the flags remain the only surviving
+/// description of its key; see `handle_xlog_data`'s `Relation` arm.
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],
@@ -559,8 +564,9 @@ pub struct Intake {
     /// and its declared-order normalization for issue #163 (DEFAULT: the
     /// flags are right but carry no ordering). Populated on each `Relation`
     /// message; still never consulted for `USING INDEX`/`NOTHING`, where the
-    /// primary key is not the row identity at all (see `handle_xlog_data`
-    /// and [`extract_key`]'s own doc comment).
+    /// primary key is not the row identity at all, nor for a DEFAULT-identity
+    /// relation whose primary key the current catalog can't resolve at all
+    /// (see `handle_xlog_data` and [`extract_key`]'s own doc comment).
     primary_keys: std::collections::HashMap<i32, Vec<String>>,
     /// Issue #133: `src_table -> from_col` column names, refreshed
     /// lazily/on-miss — see [`GroupKeyColumns`]'s own doc comment.
@@ -783,6 +789,29 @@ impl Intake {
                 // round trip per `Relation` message (not per change), and
                 // byte-identical keys for the overwhelmingly common table
                 // whose two orders already coincide.
+                //
+                // The lookup reads the *current* catalog on intake's own
+                // session, while this `Relation` message comes out of the WAL
+                // at a possibly much older position — logical decoding
+                // resolves a relation against a historic snapshot, so a table
+                // that has since been dropped (or had its primary key
+                // replaced) still gets decoded while the lookup finds
+                // nothing. An empty result therefore means "can't normalize",
+                // not "this relation has no key":
+                //
+                // - under DEFAULT, fall back to `pgoutput`'s flags (they
+                //   *are* the primary key's columns as of the change's own
+                //   LSN, merely unordered), which is exactly the pre-#163
+                //   behavior and the only ordering information that still
+                //   exists for such a relation. Overriding with an empty key
+                //   instead would fail `extract_key`'s "at least one key
+                //   column" check and so take the whole intake loop down
+                //   (`IntakeError::MissingKeyValue` propagates out of `run`)
+                //   for a change that staged fine before.
+                // - under FULL, keep overriding unconditionally: the flags
+                //   are set on *every* column there, so falling back would
+                //   key the row by its entire contents — issue #56's bug —
+                //   and failing loudly is the right outcome instead.
                 if matches!(relation.replica_identity, b'f' | b'd') {
                     let pk = primary_key_columns(
                         self.session.client(),
@@ -790,7 +819,11 @@ impl Intake {
                         &relation.name,
                     )
                     .await?;
-                    self.primary_keys.insert(relation.relation_id, pk);
+                    if pk.is_empty() && relation.replica_identity == b'd' {
+                        self.primary_keys.remove(&relation.relation_id);
+                    } else {
+                        self.primary_keys.insert(relation.relation_id, pk);
+                    }
                 } else {
                     self.primary_keys.remove(&relation.relation_id);
                 }

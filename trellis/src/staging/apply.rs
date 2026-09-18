@@ -3315,8 +3315,9 @@ pub struct ApplyPlan {
     /// truncate on an aggregate definition's source clears every group, but
     /// (unlike a 1-1 target's single-column primary key) there is no single
     /// column shape to `RETURNING`-project a physically-changed group key
-    /// out of generically — so this is applied as a plain `DELETE FROM <target>` (every group
-    /// atomically gone), counted toward [`ApplyOutcome::keys_deleted`], but
+    /// out of generically — so this is applied as a plain `DELETE FROM
+    /// <target>` (every group atomically gone), counted toward
+    /// [`ApplyOutcome::keys_deleted`], but
     /// *not* staged for downstream propagation. A documented gap, not an
     /// oversight: closing it needs composite-key downstream propagation,
     /// out of scope for this issue (see `staging::apply_aggregate`'s module

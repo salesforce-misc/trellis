@@ -551,7 +551,9 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
 /// [`crate::intake::extract_key`] for a row arriving over real CDC,
 /// `staging::apply_aggregate::derive_group_key` for an aggregate group's
-/// downstream-propagated identity (issue #171), and the SQL form for
+/// downstream-propagated identity (issue #171),
+/// `intake::publication::enumerate_and_append` for a backfill enumeration's
+/// image-less `Recompute` triggers, and the SQL form for
 /// everything computed in the database. Keeping them one function each —
 /// rather than a hand-rolled `join` per site — is what makes the
 /// "producers and consumers agree on one shape" claim in

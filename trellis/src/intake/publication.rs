@@ -388,10 +388,15 @@ pub(crate) async fn enumerate_and_append(
         }
         let mut page = Vec::with_capacity(rows.len());
         for row in &rows {
-            let key = (0..pk_cols.len())
-                .map(|i| row.get::<_, String>(i))
-                .collect::<Vec<_>>()
-                .join("\u{1f}");
+            // Through `ddl::join_pk_key`, not a local `join`, so this third
+            // producer of an encoded composite key provably shares the one
+            // separator and the one declared-order convention the SQL-side
+            // producer (`ddl::pk_key_sql_expr`) and `intake::extract_key`
+            // use — `primary_key_columns` above already reports the key's
+            // columns in `array_position(i.indkey, a.attnum)` order for
+            // exactly that reason (issue #163).
+            let key =
+                crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| row.get::<_, String>(i)));
             page.push(StagedChange::Recompute {
                 src_table: src_table.to_string(),
                 key,

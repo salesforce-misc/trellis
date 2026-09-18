@@ -638,6 +638,112 @@ async fn a_composite_key_declared_out_of_physical_column_order_stages_in_declare
     );
 }
 
+/// Issue #163 review follow-up: the declared-order normalization now runs a
+/// `pg_catalog` lookup for a `REPLICA IDENTITY DEFAULT` relation too — i.e.
+/// for essentially *every* published table, not just the rare opt-in FULL
+/// ones (#56). That lookup reads the **current** catalog on intake's own
+/// session, while the `Relation` message it answers comes out of the WAL at
+/// a possibly much older position, so the two can legitimately disagree: a
+/// table inserted into and then dropped is still decoded (logical decoding
+/// resolves the relation against a historic snapshot), but
+/// `primary_key_columns`' `to_regclass` finds nothing and returns an empty
+/// `Vec`.
+///
+/// An empty lookup must fall back to `pgoutput`'s own `is_key` flags — which
+/// under DEFAULT *are* the primary key's columns, only unordered — rather
+/// than override them with "no key columns", which would fail
+/// `extract_key`'s "at least one key column" check and take down the whole
+/// intake loop (`IntakeError::MissingKeyValue` propagates out of `run`) for
+/// a change that staged fine before the normalization existed. FULL keeps
+/// overriding unconditionally: there an empty lookup must *not* fall back,
+/// because every column is flagged there and the flags would yield a key
+/// made of the entire row (exactly issue #56's bug).
+#[tokio::test]
+async fn a_dropped_default_identity_table_still_stages_its_pending_change() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table doomed_widgets (id bigint primary key, payload text); \
+             create publication intake_pub for table doomed_widgets;",
+        )
+        .await
+        .expect("create source table and publication");
+    let slot_row = setup
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create replication slot");
+    let _: String = slot_row.get(0);
+    seed_progress(&setup, "intake_slot", 0).await;
+
+    setup
+        .execute(
+            "insert into doomed_widgets (id, payload) values (1, 'hi')",
+            &[],
+        )
+        .await
+        .expect("insert source row");
+    // The change is in the WAL and the slot hasn't consumed it yet; the
+    // table itself is gone by the time intake decodes it.
+    setup
+        .batch_execute("drop table doomed_widgets")
+        .await
+        .expect("drop the source table out from under the slot");
+
+    let config = intake::IntakeConfig {
+        dsn: db.dsn().to_string(),
+        schema: DEFAULT_SCHEMA.to_string(),
+        host: db.socket_dir().display().to_string(),
+        port: db.port(),
+        user: "postgres".to_string(),
+        password: String::new(),
+        database: db.name().to_string(),
+        slot: "intake_slot".to_string(),
+        publication: "intake_pub".to_string(),
+        wake_channel: "wake".to_string(),
+        spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
+        hard_cap: intake::spill::DEFAULT_HARD_CAP,
+    };
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+        .await
+        .expect("connect intake");
+    let outcome = tokio::sync::Mutex::new(None);
+    let outcome = std::sync::Arc::new(outcome);
+    let recorded = outcome.clone();
+    tokio::spawn(async move {
+        let result = consumer.run().await;
+        *recorded.lock().await = Some(result.map_err(|e| e.to_string()));
+    });
+
+    let observer = connect_raw(db.dsn()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while seg_0_count(&observer).await < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the change to be staged; intake reported \
+             {:?}",
+            outcome.try_lock().ok().and_then(|o| o.clone())
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let staged = observer
+        .query_one("select key from seg_0", &[])
+        .await
+        .expect("query staged row");
+    let key: String = staged.get(0);
+    assert_eq!(
+        key, "1",
+        "the key must still come from pgoutput's own key flags when the \
+         catalog no longer has the table to normalize the order against"
+    );
+}
+
 /// A real `TRUNCATE` on a published source table must decode to a staged
 /// `op = 'truncate'` sentinel row (issue #60) — not silently dropped, which
 /// is what `handle_xlog_data`'s previous `Message::Truncate { .. } => {}`
