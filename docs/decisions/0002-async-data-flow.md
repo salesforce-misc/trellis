@@ -1,21 +1,23 @@
 ---
-status: draft
+status: accepted
 date: 2026-08-15
 deciders: Michael Ries
 consulted: 
 informed:
 ---
 
-This project could attempt to apply data transformations
-synchronously or asynchronously, and the two patterns have
-very different effects on the user's experience.
+# Asynchronous Data Flow
 
-## Proposal
+This project could apply data transformations synchronously or asynchronously,
+and the two patterns have very different effects on the user's experience.
 
-After reviewing the tradeoffs below, I am leaning towards
-an asynchronous pattern using logical replication to detect
-source data changes and apply data transformations in
-batches.
+## Decision
+
+Trellis applies transformations **asynchronously**, using Postgres logical
+replication to detect source-data changes and applying derivations in batches
+outside the application's write path.
+
+The tradeoffs that drive this choice follow.
 
 ## Synchronous
 

@@ -82,6 +82,10 @@ Each numbered step has its own document:
 | — | Proving it (read-your-writes) | [07-convergence-and-await.md](07-convergence-and-await.md) | A caller can block until its own write is reflected, and the predicate never lies. |
 | — | Implementation checklist | [08-implementation-checklist.md](08-implementation-checklist.md) | What is essential to correctness, what is a Postgres-specific choice, what to test. |
 
+A source `TRUNCATE` cuts across several of these stages (sealing, the fold, and
+apply); its whole-keyspace-clear semantics and drain-ordering barrier are
+written up separately in [truncate-propagation-spec.md](truncate-propagation-spec.md).
+
 Four of these guarantees are correctness (intake durability, one batch per row,
 claimed batches immutable, exactly-once deltas); each is enforced in exactly one
 stage, and duplicating any of them is how the design rots.

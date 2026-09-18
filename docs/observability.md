@@ -5,10 +5,8 @@ changes are propagating, where they're stuck, and what work is pending or
 blocked. This is the counterpart to [data-flow](data-flow.md) — that document
 describes the flow; this one describes how we *measure* it.
 
-This is a first design pass; settled decisions are stated as such. The
-questions originally collected under [Open questions](#open-questions) are
-now all settled — see [ADR-0009](decisions/0009-observability-decisions.md)
-for the decisions and their rationale.
+The decisions behind this design, and the alternatives weighed, live in
+[ADR-0009](decisions/0009-observability-decisions.md).
 
 ## Goals and non-goals
 
@@ -32,8 +30,7 @@ for the decisions and their rationale.
 
 * Being a metrics *backend*. Trellis only exposes an in-process registry for
   scraping; it does not retain history of its own or replace Prometheus/
-  Grafana/etc. (Metric rollup/retention was tried and reversed — see
-  [ADR-0009 decision 7](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54).)
+  Grafana/etc. (see [Retention](#retention-left-to-prometheus-not-trellis)).
 * Distributed tracing across the *application's* code. We instrument Trellis's
   own pipeline, not the caller's write path.
 
@@ -70,10 +67,9 @@ Recommended supporting counters/gauges so the histograms are interpretable:
 
 * `changes_applied_total{transform}` — throughput denominator.
 * `staging_segments{state}` — a cheap, system-level gauge counting segments
-  by state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)).
-  This replaces the per-transform `staging_ring_depth{transform}` gauge
-  originally proposed here, which [ADR-0009](decisions/0009-observability-decisions.md#5-staging-ring-metrics-drop-the-per-transform-depth-gauge-add-a-cheap-segment-state-gauge)
-  drops in favor of this lower-cost alternative.
+  by state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
+  chosen over a per-transform depth gauge for its lower cost
+  ([ADR-0009 decision 5](decisions/0009-observability-decisions.md#5-staging-ring-metrics-drop-the-per-transform-depth-gauge-add-a-cheap-segment-state-gauge)).
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#backfill-status-and-the-xmin-caveat), a small enumerable
@@ -139,15 +135,13 @@ from inside whatever process is actually running
 
 ### Retention: left to Prometheus, not Trellis
 
-Trellis does **not** retain metric history of its own. An earlier design
-([ADR-0009 decision 7](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54))
-called for a pruned Postgres rollup table (`metric_rollup`) written by a
-periodic job — that was implemented (issue #54) and then reversed: retention,
-rollup, and cross-instance aggregation are exactly what a real Prometheus/
-VictoriaMetrics/Thanos deployment already does well, and duplicating that
-inside Trellis added write load and a schema object for no capability an
-operator's existing scrape/TSDB stack doesn't already provide. Operators who
-want history configure their scraper's own retention against the
+Trellis does **not** retain metric history of its own. Retention, rollup, and
+cross-instance aggregation are exactly what a real Prometheus/VictoriaMetrics/
+Thanos deployment already does well; duplicating that inside Trellis would add
+write load and a schema object for no capability an operator's existing scrape/
+TSDB stack doesn't already provide
+([ADR-0009 decision 7](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54)).
+Operators who want history configure their scraper's own retention against the
 `render_prometheus()` endpoint (or `trellis run --prometheus-bind`) like any
 other Prometheus target.
 
@@ -236,37 +230,6 @@ depending on the `prometheus` crate directly:
   `opentelemetry-otlp` for OTLP export, both behind the `otlp` Cargo feature
   (off by default, and genuinely absent from the dependency tree when
   unused — not merely unused at runtime).
-
-## Open questions
-
-All settled by [ADR-0009](decisions/0009-observability-decisions.md):
-
-* **End-to-end keying for DAGs** — is end-to-end latency keyed by terminal
-  transform, by source→sink pair, or both? Affects cardinality. **Settled:**
-  [terminal transform only](decisions/0009-observability-decisions.md#2-end-to-end-latency-keying-terminal-transform-only).
-* **Histogram buckets** — the initial boundary set, and whether they're
-  configurable per transform. **Settled:**
-  [a single global exponential set, ~10ms-60s, not configurable per transform](decisions/0009-observability-decisions.md#6-histogram-bucket-boundaries).
-* **Traces vs. flat logs** — do we adopt spans/traces as a first-class signal
-  (and derive latency from them), or keep logs flat and instrument metrics
-  separately? **Settled:**
-  [spans are first-class; per-transform latency derives from span durations](decisions/0009-observability-decisions.md#3-traces-vs-flat-logs-spans-are-first-class).
-* **Rollup interval and retention window defaults**, and whether the rollup is
-  raw histogram buckets or pre-computed quantiles. **Settled, then reversed:**
-  [originally 5-minute interval/7-day retention/raw buckets](decisions/0009-observability-decisions.md#7-rollup-interval-and-retention-issue-54);
-  the rollup table was later removed in favor of leaving retention/aggregation
-  to an external Prometheus/TSDB stack (see [Retention](#retention-left-to-prometheus-not-trellis)
-  above).
-* **Where transform status is stored and read** — does the lifecycle status live
-  alongside the [ADR-0003](decisions/0003-quarantine-storage-and-api.md)
-  quarantine model or in its own transform-registry row, and is it exposed via
-  the same client read that lists quarantined transforms? **Settled:**
-  [the existing `transform_definitions.status` field — no new schema](decisions/0009-observability-decisions.md#4-transform-status-storage-no-new-field).
-
-Additionally, the staging-ring supporting-gauge design (originally
-`staging_ring_depth{transform}`, above) is
-[settled](decisions/0009-observability-decisions.md#5-staging-ring-metrics-drop-the-per-transform-depth-gauge-add-a-cheap-segment-state-gauge)
-in favor of a cheap `staging_segments{state}` gauge.
 
 ## Related
 

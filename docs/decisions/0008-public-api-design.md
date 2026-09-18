@@ -6,16 +6,11 @@ deciders: Michael Ries
 
 # Public API Design
 
-Issue #82 ("Design Public API") asked for this design; this document is now
-its permanent record, promoted from a temporary working doc (originally
-`docs/public-api-design.md`, outside `docs/decisions/`) once a personal
-access token with write access to `salesforce-misc/trellis` turned out not to
-be available and the 5 decisions below were settled and implemented directly
-in this session instead of being split into separate GitHub issues. All 5
-decisions are implemented; see each section for what shipped. The "Open
-questions not yet worked through" section at the end lists items that remain
-genuinely open — future scope for adjacent issues (#87, #49, #12), not this
-document's own decisions.
+Issue #82 ("Design Public API") asked for this design. This ADR records it:
+five decisions about the public API's shape, all now implemented (each section
+points to what shipped). The "Open questions not yet worked through" section at
+the end lists items that remain genuinely open — future scope for adjacent
+issues (#87, #49, #12), not this document's own decisions.
 
 ## Why now
 
@@ -43,11 +38,11 @@ implements most of the "planned interactions" #82 lists:
 * `shutdown()`.
 
 So the "deep interface" isn't a green-field design — it's mostly already
-built. What's unsettled is (a) how it crosses an FFI boundary for #87, (b)
-whether the grammar-vs-typed-method split above is the intended long-term
-shape or an artifact of what's been built so far, and (c) how quarantine/status
-observability (a named use case in #82, and its own epic in #49) plugs into
-this facade. Below records the decisions and open questions on each.
+built. This ADR settles what wasn't: (a) how it crosses an FFI boundary for
+#87, (b) whether the grammar-vs-typed-method split above is the intended
+long-term shape, and (c) how quarantine/status observability (a named use case
+in #82, and its own epic in #49) plugs into this facade. The decisions below
+cover each.
 
 ## Decisions
 
@@ -70,24 +65,18 @@ enough to create the target table, capture the coverage fence, and persist the
 definition/enumerate its backfill work; it returns before a single row of the
 target is actually built.
 
-**Correction from this doc's first draft:** that draft justified the sync
-decision by pointing out `install_definition`
-(`trellis/src/defs/catalog.rs:207`) already blocks synchronously through a full
-backfill on the fast direct-build path today, and treated "sync call, separate
-poll for completion" as merely formalizing the existing ring-fallback path's
-behavior. That reasoning doesn't survive contact with scale: even the fast,
-chunked direct-build path (ADR-0007) takes real wall-clock time on a
+The reasoning is scale: even the fast, chunked direct-build path
+([ADR-0007](0007-direct-set-based-backfill.md)) takes real wall-clock time on a
 billion-row table, and blocking a call — or an in-call loop — for however long
 that takes means an interrupted process (the FFI caller's, or the one doing
-the building) loses all progress. [ADR-0007's amendment](0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment)
-now makes backfill *always* background and resumable for both build paths: the
-chunked writes ADR-0007 already breaks the direct build into become a durable,
-claimable work queue that running drain (application) threads execute — the
-same claim/heartbeat/reclaim-stale machinery they already use for sealed ring
-segments — rather than an in-call loop on whatever connection happened to call
-`define()`. `staging_worker` is unrelated to this (it only owns keeping up
-with the logical replication slot); it's `application_threads` that finishes
-transform work, backfill included.
+the building) loses all progress. Backfill is therefore *always* background and
+resumable for both build paths: the chunked writes ADR-0007 breaks the direct
+build into are a durable, claimable work queue that running drain (application)
+threads execute — the same claim/heartbeat/reclaim-stale machinery they already
+use for sealed ring segments — rather than an in-call loop on whatever
+connection happened to call `define()`. `staging_worker` is unrelated to this
+(it only owns keeping up with the logical replication slot); it's
+`application_threads` that finishes transform work, backfill included.
 
 **Follow-on:** this is exactly what issue #55's transform status lifecycle
 (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`) is for. A
@@ -102,8 +91,7 @@ in whatever documentation eventually covers this for embedders.
 
 **Settled:** the synchronous wrapper (`BlockingTrellis`, `trellis/src/blocking.rs`)
 lives directly in the `trellis` crate alongside `Trellis`, not in a separate
-shim crate — despite this doc's earlier leaning toward a separate crate.
-`trellis` remains async-native (`Trellis`'s own methods are untouched);
+shim crate. `trellis` remains async-native (`Trellis`'s own methods are untouched);
 `BlockingTrellis` is an additive wrapper that owns a dedicated thread running
 its own Tokio runtime (the same pattern `Client::start` already uses
 internally) and guards against being called from a thread that already has a
@@ -132,8 +120,7 @@ and expressing that as text means growing the grammar into an actual
 `WHERE`-clause sublanguage — a much bigger parsing/validation surface than any
 DDL-style statement needed, paid on every call of the hottest, most
 latency-sensitive path in the API. `poisoned_since()` already draws this line
-correctly today; the amendment to ADR-0003 (see below) extends it rather than
-replacing it.
+correctly today; ADR-0003 (see below) extends it rather than replacing it.
 
 This is a deliberate exception to "everything through one grammar," not an
 oversight — worth flagging in case #82's eventual writeup wants to call it out
@@ -188,9 +175,8 @@ planned interaction patterns. Working through it surfaced that table-level
 calculated columns, and one broken formula shouldn't force every other healthy
 column into quarantine.
 
-**Decision:** see the amendments to
-[ADR-0003](0003-quarantine-storage-and-api.md) for the full storage and fuse
-design. Summary of what it settles (all now implemented, `V21__column_quarantine.sql`):
+**Decision:** see [ADR-0003](0003-quarantine-storage-and-api.md) for the full
+storage and fuse design. Summary of what it settles (all now implemented, `V21__column_quarantine.sql`):
 
 * Exception detail for the existing whole-key fuse stays one record per
   poisoned **source row** (`poison`, unchanged). Column-grain failure detail
@@ -212,9 +198,8 @@ design. Summary of what it settles (all now implemented, `V21__column_quarantine
   Implemented on `Trellis`/`BlockingTrellis` as `quarantined()`,
   `quarantine_status()`, `sample_quarantined()`, `resume_column()`.
 * Threshold, counter mechanism, escalation, paused-value semantics, and
-  propagation to dependents were all open when this document was first
-  written; all are now settled — see ADR-0003's "Amendment (2026-09-13): open
-  questions resolved."
+  propagation to dependents are settled in
+  [ADR-0003](0003-quarantine-storage-and-api.md).
 
 ## Open questions not yet worked through
 
@@ -224,7 +209,7 @@ design. Summary of what it settles (all now implemented, `V21__column_quarantine
   directly on #87's embedding mechanism choice.
 * How `PAUSE`/`RESUME` (mentioned above as plausible grammar statements) would
   actually be phrased, and whether they need their own ADR given they mutate
-  the column-status table from ADR-0003's amendment.
+  the column-status table from ADR-0003.
 * Whether the observability epic (#49: metrics registry, Prometheus exposition
   via #53, structured logs via #56) exposes through this same `Trellis` facade
   or a separate handle — #82's "pulling instrumentation data for prometheus"

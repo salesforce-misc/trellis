@@ -6,35 +6,21 @@ be removed from here.
 
 ## Quarantine policy details
 
-[ADR-0003](decisions/0003-quarantine-storage-and-api.md) fixed quarantine
-storage and the read APIs but left the policy knobs open:
+[ADR-0003](decisions/0003-quarantine-storage-and-api.md) settles quarantine
+storage, the read APIs, the per-column and transform-wide fuse tiers, the fixed
+(non-configurable) fuse threshold, and fuse re-arm on resume. One policy knob
+remains open:
 
-* The fuse threshold (fixed count vs. percentage) and whether it's
-  configurable per transform.
-* Whether tripping the fuse should pause transforms chained onto the fused
-  one, or let them keep reading its last-written data.
-* Retry-with-backoff vs. immediate quarantine, and whether a dead-letter area
-  is needed.
-
-Issue #16 (per-key isolate/evict/park/release, `trellis/src/staging/quarantine.rs`)
-resolved two of these knobs for its own poison/poison_held/key_deaths track —
-a distinct mechanism from ADR-0003's transform-wide fuse, but facing the same
-open questions:
-
-* **Fuse threshold**: fixed count, not a percentage — `DEFAULT_DEATH_THRESHOLD
-  = 5` (a key evicts once its `key_deaths.deaths` count reaches 5; `0`
-  disables eviction, deferring to the halting-schema-error instance-stop path
-  instead). Not yet configurable per source table or transform — this crate
-  has no per-instance config surface today, so every call site uses the
-  constant directly.
-* **Retry-with-backoff vs. immediate quarantine**: neither, exactly —
-  transient failures always retry (no quarantine); a version fence miss
-  retries with `FenceMissBackoff`'s existing consecutive-miss backoff; only a
-  non-transient, non-halting failure goes through per-key isolation, and even
-  then a key isn't quarantined until it *repeatedly* isolates past the fuse
-  threshold above. There is no separate dead-letter area: `poison_held` (keyed
-  `(src_table, key, seg_seq)`) is itself the parked/dead-letter storage,
-  replayed back onto the active batch by an operator-driven release.
+* **Retry-with-backoff vs. immediate quarantine, and whether a dead-letter area
+  is needed.** Today (issue #16's per-key track, `trellis/src/staging/quarantine.rs`)
+  neither, exactly: transient failures always retry (a version-fence miss backs
+  off via `FenceMissBackoff`), and only a non-transient, non-halting failure
+  goes through per-key isolation — and even then a key isn't quarantined until
+  it *repeatedly* isolates past the fuse threshold. There is no separate
+  dead-letter area: `poison_held` (keyed `(src_table, key, seg_seq)`) is itself
+  the parked storage, replayed onto the active batch by an operator-driven
+  release. Whether an explicit backoff/dead-letter policy should replace this is
+  the open question.
 
 ## Transform redefinition (post-v1)
 

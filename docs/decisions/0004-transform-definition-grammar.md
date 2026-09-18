@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-08-20
 deciders: Michael Ries
 consulted: 
@@ -21,10 +21,10 @@ and later `GROUP BY` / `JOIN`) is ours; the *expression semantics* are Postgres'
 This constraint allows us to use Postgres as the primary correctness oracle, while
 the internal evaluator serves as a secondary cross-check (see `docs/generative-test-suite.md`).
 
-## Proposal
+## Decision
 
-Define a small grammar of our own, parsed at definition time into an AST the
-validator and execution layer consume. It looks like SQL — same operator and
+Trellis defines a small grammar of its own, parsed at definition time into an
+AST the validator and execution layer consume. It looks like SQL — same operator and
 function spelling, same shape for a `GROUP BY` list or join condition — so it's
 familiar on sight, but the accepted language is exactly what we specify. We
 start from the stable operations common to **PostgreSQL 15+**.
@@ -117,27 +117,23 @@ parity — the accepted-language-is-the-spec goal makes the gaps worth naming:
 These are tracked toward full compatibility; each is pinned by a divergence
 test in `trellis/src/defs`.
 
-`FROM <source>` is deliberately where a future key-space clause slots in —
-`GROUP BY <cols>` for the aggregate case, `JOIN <other> ON <cond>
-[INNER|LEFT|RIGHT]` for cross-join — without changing the statement's outer
-shape. `JOIN` is still only recognized and rejected by name (cross-join
-remains out of scope). Relationship paths (`a.b`) are likewise still
-rejected by name, ahead of the relationship feature landing.
+`FROM <source>` is deliberately where a key-space clause slots in — `GROUP BY
+<cols>` for the aggregate case, `JOIN <other> ON <cond> [INNER|LEFT|RIGHT]` for
+cross-join — without changing the statement's outer shape. `JOIN` is recognized
+and rejected by name; cross-join remains out of scope. Relationship reference
+syntax is defined with the relationship feature — see
+[0006-relationships](0006-relationships.md).
 
-`GROUP BY <col1>[, <col2>...]` itself has landed (issue #11's groundwork):
-it's parsed in this same reserved slot, producing a `KeySpace::Aggregate`
-whose calculated fields may reference a grouping column directly or wrap any
-other numeric column in exactly one of `SUM`, `MIN`, `MAX`, or `AVG` — the
-same paired grammar-plus-evaluator bar every other addition here meets.
-**Aggregate function-call spelling is now settled**: it's the same
-`func(args)` call syntax general function calls already use, just resolved
-against a separate aggregate-function registry only reachable inside a
-`GROUP BY` definition. `COUNT(*)` (arity-0 row counting) has since landed
-(issue #75); `COUNT(<column>)` inside a `GROUP BY` is still recognized by name
-only to give a specific "not yet implemented" error, the same
-reservation-by-name pattern `JOIN` uses.
-Side-qualification for cross-joins (`a.column` vs. some other qualifier)
-remains genuinely open, since no join syntax is parsed at all yet.
+`GROUP BY <col1>[, <col2>...]` is parsed in this same reserved slot, producing
+a `KeySpace::Aggregate` whose calculated fields may reference a grouping column
+directly or wrap any other numeric column in exactly one of `SUM`, `MIN`,
+`MAX`, or `AVG` — the same paired grammar-plus-evaluator bar every other
+addition here meets. Aggregate function calls use the same `func(args)` syntax
+general function calls use, resolved against a separate aggregate-function
+registry reachable only inside a `GROUP BY` definition. `COUNT(*)` (arity-0 row
+counting, issue #75) is supported; `COUNT(<column>)` inside a `GROUP BY` is
+recognized by name only, to give a specific "not yet implemented" error — the
+same reservation-by-name pattern `JOIN` uses.
 
 ## Growth policy
 
@@ -150,11 +146,8 @@ stays out.
 
 Undecided:
 
-* Cross-join side-qualification syntax (`JOIN` is still only recognized and
-  rejected by name, not parsed). Aggregate function-call spelling and general
-  non-aggregate function-call syntax are both settled — see above. `COUNT(*)`
-  row counting has landed (issue #75); `COUNT(<column>)` in a `GROUP BY`
-  remains rejected by name with the "not yet implemented" spelling.
+* Cross-join side-qualification syntax — `JOIN` is recognized and rejected by
+  name, not yet parsed.
 * Whether the grammar and its stored schema are versioned independently of the
   transform-redefinition scheme (see [open-questions](../open-questions.md)).
 * Operator precedence: the parser is currently flat left-associative with no

@@ -15,11 +15,9 @@ settles those questions so the follow-on implementation issues (#51-#56) have
 a fixed design to build against, and amends `docs/observability.md` in place
 to mark them settled and point back here.
 
-## Proposal
+## Summary
 
-Settle six questions from `docs/observability.md`'s "Open questions" section,
-plus the dependency choice its "Proposed dependencies" section left as a
-proposal:
+The decisions settled here, each discussed below with its rationale:
 
 1. Dependencies: `metrics` + `metrics-exporter-prometheus`, and `tracing` +
    `tracing-opentelemetry` + `opentelemetry-otlp`.
@@ -28,15 +26,15 @@ proposal:
    latency derive from span durations rather than a separate measurement.
 4. Transform status reuses the existing `transform_definitions.status` field;
    no new schema.
-5. The staging ring gets a cheap `staging_segments{state}` gauge instead of
-   the originally-proposed per-transform `staging_ring_depth{transform}`
-   gauge, which is dropped.
+5. The staging ring gets a cheap `staging_segments{state}` gauge rather than a
+   per-transform `staging_ring_depth{transform}` gauge.
 6. Histogram buckets are exponential, ~10ms-60s, one global default for every
    histogram.
-7. The rollup job (#54) uses a 5-minute interval and 7-day retention, both
-   configurable, storing raw buckets rather than pre-computed quantiles.
+7. Trellis retains no metric history of its own; retention, rollup, and
+   cross-instance aggregation are left to the operator's external Prometheus/
+   TSDB stack.
 
-Each is discussed below with its rationale. None of this changes
+None of this changes
 `docs/observability.md`'s goals/non-goals or its two-subsystem split
 (metrics vs. logs/traces) — it fills in the specifics that section left
 undecided.
@@ -57,15 +55,14 @@ bound port" design (`render_prometheus()` stays a plain function the operator
 serves from their own HTTP stack — see `cli/src/commands/run.rs`'s
 `--prometheus-bind` flag for a worked example).
 
-The facade was chosen over depending on the `prometheus` crate directly
-because issue #54's rollup job (later removed — see decision 7's superseding
-note) needed to read the *same* registry that `render_prometheus()` (issue
-#53) renders from, to compute periodic aggregates without a second, parallel
-recording path. `metrics` separates "recording an observation" (via its
-`Recorder` trait, implemented once by `metrics-exporter-prometheus`) from
-"reading the registry back out" — a decoupling that outlived the rollup job
-itself and still avoids hardwiring Prometheus's own concrete `Registry`/
-`HistogramVec` types into this crate's recording call sites.
+The facade was chosen over depending on the `prometheus` crate directly for
+the decoupling it provides: `metrics` separates "recording an observation"
+(via its `Recorder` trait, implemented once by `metrics-exporter-prometheus`)
+from "reading the registry back out." That keeps any registry consumer — the
+`render_prometheus()` exposition path (issue #53), or any future reader — off a
+second, parallel recording path, and avoids hardwiring Prometheus's own
+concrete `Registry`/`HistogramVec` types into this crate's recording call
+sites.
 
 ### 2. End-to-end latency keying: terminal transform only
 
@@ -126,31 +123,22 @@ mechanism that does not touch this field — a `live` transform can carry
 individually paused columns without its overall `status` moving, so there is
 no conflict between the two tiers sharing this column's semantics.
 
-**Correction (issue #55 review):** at the time of this decision, no code
-path actually *wrote* `Quarantined` to this field — only the per-key
-(`poison`) and per-column (`column_status`) tiers had real writers; a
-whole-transform fuse-trip condition was designed for but never implemented.
-Issue #55 wired the `waiting_to_backfill`/`backfilling`/`live` transitions
-(the `xmin`-fence wait, `trellis/src/intake/publication.rs`'s
-`Snapshot::settled_since`, and both backfill-enumeration paths) plus a
+Issue #55 wires the `waiting_to_backfill`/`backfilling`/`live` transitions on
+this field — the `xmin`-fence wait (`trellis/src/intake/publication.rs`'s
+`Snapshot::settled_since`) and both backfill-enumeration paths — plus a
 `quarantined → waiting_to_backfill` resume function
-(`staging::quarantine::resume_transform`), but a whole-transform trip
-condition is still unwritten — tracked as a follow-up (see epic #49).
-`resume_transform` is correct but currently unreachable in production until
-that trip condition exists.
-
-`WaitingToBackfill` and `Backfilling` exist in the enum today but, before
-issue #55, no writer set them. Issue #55 wires the actual transitions: the
-`xmin`-fence wait (`trellis/src/intake/publication.rs`,
-`Snapshot::settled_since`) and backfill-enumeration path both become
-transitions on this same field, rather than introducing a parallel status
-source.
+(`staging::quarantine::resume_transform`), rather than introducing a parallel
+status source. The whole-transform fuse-trip condition that would *write*
+`Quarantined` to this field is still unwritten — designed for but not yet
+implemented, tracked as a follow-up (see epic #49) — so `resume_transform` is
+correct but not yet reachable in production. The per-key (`poison`) and
+per-column (`column_status`) tiers have their own writers today.
 
 ### 5. Staging-ring metrics: drop the per-transform depth gauge, add a cheap segment-state gauge
 
-**Decision:** the originally-proposed `staging_ring_depth{transform}` gauge
-from `docs/observability.md`'s supporting-series list is **dropped as
-literally specified**. It's replaced by two independent pieces:
+**Decision:** the staging ring is not measured by a per-transform
+`staging_ring_depth{transform}` gauge. Two independent pieces cover the need
+instead:
 
 * **Per-transform latency histogram** (#51/#52), computed at **apply
   completion**, not on a separate live-counter path. The origin timestamp
@@ -199,45 +187,21 @@ different boundaries (much faster or slower than this range), that's a
 targeted follow-up once real data justifies it, not a speculative knob added
 up front.
 
-### 7. Rollup interval and retention (issue #54)
+### 7. Metric retention: left to Prometheus, not Trellis
 
-**Decision:**
+**Decision:** Trellis retains no metric history of its own. Retention, rollup,
+and cross-instance aggregation are exactly what an operator's existing
+Prometheus/VictoriaMetrics/Thanos stack already does well; duplicating a pruned
+history table inside Trellis would add write load, a schema object, and a prune
+job for a capability mature external tooling already covers, rather than a gap
+Trellis itself needs to fill. Operators who want history configure their
+scraper's own retention against the `render_prometheus()` endpoint like any
+other Prometheus target.
 
-* **Interval:** 5 minutes.
-* **Retention:** 7 days.
-* **Storage shape:** raw histogram buckets, not pre-computed quantiles.
-* Both interval and retention are **configurable** (env var or config), with
-  the above as defaults.
-
-`docs/observability.md`'s "Retention: Postgres rollup tables" section already
-settled *where* this lives (`trellis.metric_rollup`, a pruned Postgres table
-Trellis owns) and *why* (survives restarts, SQL-queryable, shared across
-engine instances) but left the interval/retention numbers and the
-bucket-vs-quantile storage question as "TBD." Storing raw buckets rather than
-pre-computed quantiles is the more important half of this decision:
-pre-computed quantiles (e.g. a stored p50/p99) can't be re-aggregated across
-rollup periods or across engine instances after the fact — you can't average
-two p99s into a valid p99. Raw buckets can be summed and re-queried with
-`histogram_quantile`-style math at any later time and at any slice, which
-directly serves `docs/observability.md`'s stated "self-retained history ...
-to later analyze usage patterns and suggest optimizations" goal. The 5-minute/
-7-day defaults are a reasonable starting point for an operator dashboard's
-resolution vs. storage tradeoff; making both configurable means they can be
-tuned without a schema change once real usage patterns are observed.
-
-This decision doesn't itself create the migration — the rollup table lands
-in the next available migration number when #54 is implemented (latest as of
-this writing is `V21__column_quarantine.sql`, so the rollup table would be
-`V22__...`).
-
-**Superseded (2026-09-16).** Issue #54 was implemented (`V25__metric_rollup.sql`,
-`trellis::rollup`) and then removed. On reflection, retention and
-cross-instance aggregation are exactly what an operator's existing Prometheus/
-VictoriaMetrics/Thanos stack already does well; duplicating a pruned history
-table inside Trellis added write load, a schema object, and a prune job for a
-capability that mature external tooling already covers, rather than a gap
-Trellis itself needed to fill. `docs/observability.md`'s goals no longer list
-self-retained history — see its ["Retention"](../observability.md#retention-left-to-prometheus-not-trellis)
+A pruned Postgres rollup table (`trellis.metric_rollup`, issue #54) was built
+(`V25__metric_rollup.sql`, `trellis::rollup`) and then removed in favor of this
+approach — see `docs/observability.md`'s
+["Retention"](../observability.md#retention-left-to-prometheus-not-trellis)
 section.
 
 ## Options considered
@@ -247,23 +211,20 @@ weighed against it:
 
 * **`prometheus` crate directly.** The obvious default for Prometheus text
   exposition, and what `docs/observability.md`'s "Proposed dependencies"
-  section listed as an explicit alternative. Rejected because it would force
-  issue #54's rollup job to either depend on `prometheus`'s own concrete
-  registry/collector types to read back what #53 renders, or maintain a
-  second, independently-recorded set of aggregates alongside the exposition
-  registry — either way coupling two issues' implementations to one crate's
-  internal type shapes more tightly than necessary.
+  section listed as an explicit alternative. Rejected because it hardwires
+  Prometheus's own concrete registry/collector types into the recording call
+  sites, so any consumer that wants to read the registry back (the exposition
+  path, or a future reader) is coupled to those internal type shapes.
 * **`metrics` + `metrics-exporter-prometheus` (chosen).** A thin recording
   facade in front of a Prometheus-flavored exporter. Costs one extra crate in
-  the dependency graph relative to using `prometheus` directly, in exchange
-  for #53 (exposition) and #54 (rollup) both reading the same registry
-  through the facade's `Recorder`/inspection traits instead of one hardcoding
-  the other's concrete types.
+  the dependency graph relative to using `prometheus` directly, in exchange for
+  a `Recorder`/inspection-trait seam that separates recording an observation
+  from reading the registry back out.
 
 The other six decisions were framing/design questions
 `docs/observability.md` posed explicitly as open (end-to-end keying, traces
 vs. flat logs, status storage location, staging-ring metrics shape, bucket
-boundaries, rollup interval/retention/storage shape); each is a single
+boundaries, metric retention); each is a single
 settled choice rather than a field of alternatives, so they're recorded above
 under "Decisions" with their rationale rather than re-listed here.
 

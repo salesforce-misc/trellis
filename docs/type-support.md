@@ -25,7 +25,9 @@ ladder, and most types climb it left-to-right:
    `to_rows_by_key`, `eval.rs:65-106`).
 4. **Primary key** — identify a target row. A stricter join key: it must come
    from the source's replica identity and be present in the old-image for
-   updates/deletes. *(Not type-gated today — see the safety note below.)*
+   updates/deletes. Gated to the same text-stable allowlist as join keys
+   (`is_text_stable_join_key_type`) — an unsafe single-column PK type is
+   rejected at define time with `DdlError::UnsupportedPrimaryKeyType` (#107).
 5. **Computed 1-1 target** — a scalar calculated field *produces* a value of
    this type (distinct from passthrough). Needs an immutable evaluator arm **and**
    grammar to spell a literal/cast of the type.
@@ -34,11 +36,13 @@ ladder, and most types climb it left-to-right:
    `MIN`/`MAX` orderable-but-not-invertible; `array_agg`/`string_agg`/`jsonb_agg`
    order-sensitive.
 
-> **Safety note (tracked as an urgent bug).** Primary-key *types* are unchecked
-> today — `source_primary_key` (`ddl.rs:263`) validates only arity. So a
-> single-column `numeric`/`timestamptz`/`bytea` PK is silently accepted and
-> `::text`-matched, a live mismatch risk. The matrix shows the *intended* state;
-> the fix gates PK types to the join-key-safe set.
+> **Primary-key types are gated to the join-key-safe set** (#107).
+> `source_primary_key` reuses `is_text_stable_join_key_type` (the shared source
+> of truth with the join-key allowlist), so a single-column `numeric`/
+> `timestamptz`/`bytea` PK — which `::text`-matching would silently mismatch — is
+> rejected at define time (`DdlError::UnsupportedPrimaryKeyType`) rather than
+> accepted. The typed key index (below) is what later *unlocks* those types as
+> safe keys by comparing decoded values instead of text.
 
 ## Legend
 
@@ -60,7 +64,7 @@ cells below.
 |---|---|---|---|---|---|---|---|
 | `smallint` `integer` `bigint` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ SUM/AVG/MIN/MAX | 🎯 split into a typed integer (exact key round-trip) |
 | `oid` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | — | behaves like `int`; low priority |
-| `numeric` `decimal` | ✅ | 🎯 | 🎯 typed index | 🎯 (unsafe today) | ✅ | ✅ | `1.0`≠`1.00` under text match |
+| `numeric` `decimal` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ | ✅ | rejected as PK today; `1.0`≠`1.00` under text match |
 | `real` `double precision` | ✅ | 🎯 | 🎯 typed index | ⚠️ NaN/±0 | 🎯 (distinguish from `numeric`) | 🎯 | IEEE edge cases need a decision |
 | `boolean` | ✅ | 🎯 | 🎯 | ⚠️ (rare) | ✅ | 🎯 `bool_and`/`bool_or` | value type exists |
 | `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ⚠️ MIN/MAX | landed in #79 |

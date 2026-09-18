@@ -9,27 +9,13 @@ informed:
 # Direct, Set-Based Backfill Bypasses the Staging Ring
 
 When a definition is created (or explicitly backfilled), Trellis must build its
-target table from the entire, already-populated source. Historically this went
-through the same machinery as live CDC: enumerate every source row, append it to
-the staging ring, then claim/fold/compute/apply it back out. That path is
-correct but pathologically slow for a from-scratch build — issue #63 measured a
-1M-row / 100k-group aggregate at ~55s on the dev box (~1m50s on the poc
-cluster), dominated by ring bookkeeping over data that is entirely present up
-front and has no concurrent deltas to reconcile.
-
-**Amendment (2026-09-12):** "The build is synchronous and complete on return"
-(below) doesn't scale to the sizes the public API design
-([ADR-0008](0008-public-api-design.md)) needs to support — a
-1B-row table's direct build still takes real wall-clock time, and a
-synchronous in-call loop means an interrupted process (the caller's, or the
-one running the loop) loses everything and starts over. This amendment keeps
-every algorithmic decision below (range/group-key chunking, overwrite
-semantics, single-pass aggregation into a staging table) — those are exactly
-what makes the rest of this workable — but changes *who runs the chunks and
-when*: chunk execution moves from an in-call loop to a durable, claimable work
-queue that running drain (application) threads pick up, the same way they
-already claim sealed ring segments. See "Backgrounding and resumability"
-below.
+target table from the entire, already-populated source. Routing that through the
+same machinery as live CDC — enumerate every source row, append it to the
+staging ring, then claim/fold/compute/apply it back out — is correct but
+pathologically slow for a from-scratch build: issue #63 measured a 1M-row /
+100k-group aggregate at ~55s on the dev box (~1m50s on the poc cluster),
+dominated by ring bookkeeping over data that is entirely present up front and
+has no concurrent deltas to reconcile.
 
 ## Decision
 
@@ -53,8 +39,11 @@ Implemented in [`trellis::defs::backfill`]:
   group is a single point in group-key space, it lands wholly in exactly one
   chunk.
 
-Each chunk write is one bounded transaction. The build is synchronous and
-complete on return.
+Each chunk write is one bounded transaction. Chunks are not run in an in-call
+loop: they are enumerated as a durable, claimable work queue and executed by
+drain (application) threads, so `install_definition` returns after registering
+the definition and enumerating its chunk work items, not after the whole build
+completes (see [Backgrounding and resumability](#backgrounding-and-resumability)).
 
 ## Single-pass aggregation, then chunked writes — not chunked aggregation
 
@@ -117,21 +106,14 @@ rather than attempting to insert them.
 
 ## Wiring
 
-`create_definition` (bare ring enumeration) is unchanged and still exists, but it
-is no longer the primary entry point a real caller should reach for. That role
-belongs to `trellis::defs::install_definition`: it creates the target table, tries
-`backfill_definition` (the direct path), persists via
-`create_definition_without_backfill` on success, and falls back to
-`create_definition` (ring enumeration) on `BackfillError::Unsupported`. This
-supersedes an earlier version of this ADR's wiring account, which described the
-direct path as reachable only through the generative harness's `ManualBackend`
-(`generative/src/backend/manual.rs`) — at that point true, but not what a real,
-non-test/non-benchmark caller of the definition-creation API would hit, since
-`ManualBackend` is a correctness/oracle fuzz harness, not a production consumer.
-`install_definition` closes that gap: it is the shared implementation both
-`ManualBackend` and any real caller of `create_definition` should use, and
-`ManualBackend` has been rewired onto it rather than hand-rolling the same
-create-table → backfill → fallback sequence itself.
+`trellis::defs::install_definition` is the entry point a real caller reaches
+for: it creates the target table, tries `backfill_definition` (the direct path),
+persists via `create_definition_without_backfill` on success, and falls back to
+`create_definition` (ring enumeration) on `BackfillError::Unsupported`.
+`create_definition` (bare ring enumeration) still exists as that fallback but is
+no longer a primary entry point. `install_definition` is the shared
+implementation both real callers and the generative harness's `ManualBackend`
+(`generative/src/backend/manual.rs`) use.
 
 1-1 relationship-enriched definitions were entirely unsupported by the direct
 path at first (any `uses_relationships(def)` definition returned
@@ -171,22 +153,26 @@ to-many-aggregate shape is direct-built.
   shape not listed above remain on the ring until the direct path learns to
   render them.
 
-## Backgrounding and resumability (amendment)
+## Backgrounding and resumability
 
-`install_definition` today creates the target table, then runs
-`backfill_definition` (every chunk, back to back, in one call) before ever
-persisting the definition to the catalog — the caller's connection blocks for
-however long the whole build takes. That's the piece this amendment changes.
+A synchronous, complete-on-return build doesn't scale to the sizes the public
+API design ([ADR-0008](0008-public-api-design.md)) must support: a 1B-row
+table's direct build still takes real wall-clock time, and a synchronous in-call
+loop means an interrupted process (the caller's, or the one running the loop)
+loses everything and starts over. So chunk execution is a durable, claimable
+work queue that running drain (application) threads pick up, the same way they
+already claim sealed ring segments — this keeps every algorithmic decision above
+(range/group-key chunking, overwrite semantics, single-pass aggregation into a
+staging table) and changes only *who runs the chunks and when*.
 
-**Chunks become a durable, claimable work queue**, not an in-call loop. Once
-the target table exists and the coverage fence is captured (both already fast,
-metadata-only operations — this ordering is unchanged from today, see issue
-#79 bug B's fence-before-build requirement), `install_definition` enumerates
-the same chunk boundaries `backfill_definition` computes today (PK ranges for
-1-1, group-key ranges for aggregates) but persists them as pending work items
-instead of executing them, then returns immediately — the definition is
-recorded and visible (`definitions()` lists it, status `waiting_to_backfill`)
-well before a single row of the target is built.
+**Chunks are a durable, claimable work queue**, not an in-call loop. Once the
+target table exists and the coverage fence is captured (both fast, metadata-only
+operations — see issue #79 bug B's fence-before-build requirement),
+`install_definition` enumerates the chunk boundaries (PK ranges for 1-1,
+group-key ranges for aggregates) and persists them as pending work items rather
+than executing them, then returns immediately — the definition is recorded and
+visible (`definitions()` lists it, status `waiting_to_backfill`) well before a
+single row of the target is built.
 
 **Drain (application) threads execute the queue.** Per-fleet clarification:
 `staging_worker` is only about keeping up with the logical replication slot
@@ -218,9 +204,9 @@ per-chunk released as each range finishes (that would require re-deriving the
 fence/ordering guarantee per chunk instead of once per definition, real added
 complexity with no immediate need). Once every chunk work item for a
 definition is committed, the definition flips to `live` in one step and parked
-deltas discharge in one shot, the same `run_pending_backfills`-shaped event
-that already exists — just now the trigger for it is "every chunk claimed and
-done" instead of "the ring path's one-shot enumeration finished." The
+deltas discharge in one shot, via the same `run_pending_backfills`-shaped event
+the ring-fallback path uses, its trigger being "every chunk claimed and done"
+rather than "the ring path's one-shot enumeration finished." The
 tradeoff this accepts: a very long build means a correspondingly long queue of
 parked deltas to fold through on discharge; acceptable for now, revisit if it
 becomes the actual bottleneck.
@@ -239,14 +225,11 @@ general multi-writer access to an in-progress aggregation. Not settled.
 
 Undecided:
 
-* Exact shape of the chunk work-item table (columns/claim semantics) — almost
-  certainly parallel to the existing `drainers`/segment-claim tables rather
-  than novel, but not drafted.
 * How the aggregate path's durable staging table gets cleaned up if a
   definition is dropped/redefined mid-backfill (orphaned staging table).
 * Whether a stalled backfill (every chunk claimed, none completing — e.g. a
   chunk that deterministically errors) needs its own fuse, distinct from the
   per-column quarantine fuse in
-  [ADR-0003](0003-quarantine-storage-and-api.md)'s amendment, since a failure
+  [ADR-0003](0003-quarantine-storage-and-api.md), since a failure
   here happens before a target row ever exists to attribute a quarantine
   entry to.
