@@ -309,23 +309,28 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
 /// `apply_aggregate_target`'s `written`/`deleted` result, and so the other
 /// half of what the downstream-propagation step encodes).
 ///
-/// The new group propagates. The extinct one deliberately does **not**, and
-/// this test pins that: `staging::apply_aggregate`'s module doc comment ("A
-/// known gap: image-less changes") already documents it — a downstream
-/// `Recompute` carries no image, so `stock_totals_v2` re-reads the key live,
-/// finds the row already gone, and has no way to know which of *its* groups
-/// that vanished row used to contribute to, so the change is dropped. That
-/// gap is entirely independent of issue #171's key *encoding* (it is
-/// identical for a single-column `GROUP BY` chain, whose encoding #103
-/// already fixed, and for a 1-1 target row's deletion propagating into a
-/// chained aggregate) and closing it needs the deleted group's old values
-/// threaded through the propagation step, not a different key format. What
-/// #171 fixes here is narrower and still worth pinning: the extinct group's
-/// key now *decodes* rather than failing the whole batch with
-/// `MalformedCompositeKey` — which is why the sibling `(w2, c)` insert in
-/// this same batch lands at all.
+/// Both now propagate. Before issue #180, the extinct one did **not**: a
+/// downstream `Recompute` carried no image, so `stock_totals_v2` re-read the
+/// key live, found the row already gone, and had no way to know which of
+/// *its* groups that vanished row used to contribute to, so the change was
+/// dropped — `staging::apply_aggregate`'s module doc comment ("Image-less
+/// changes, and issue #180's fix for one producer of them") has the full
+/// story. That gap was entirely independent of issue #171's key *encoding*
+/// (it reproduced identically for a single-column `GROUP BY` chain, whose
+/// encoding #103 already fixed — see
+/// `defs_aggregate_chained_single_column_group_key.rs`) and closing it
+/// needed the deleted group's old values threaded through the propagation
+/// step, not a different key format: `apply_aggregate_target`'s
+/// `delete_group_row`/`apply_forced_groups_bulk` now capture the extinct
+/// group's pre-delete row (`RETURNING to_jsonb(t.*)`), and downstream
+/// propagation stages it as a real image-bearing delete instead of an
+/// image-less `Recompute`. #171's own narrower fix is still exercised here
+/// too: the extinct group's key still needs to *decode* correctly (rather
+/// than failing the whole batch with `MalformedCompositeKey`) for either the
+/// old gap or this fix to be reachable at all — which is why the sibling
+/// `(w2, c)` insert in this same batch lands regardless.
 #[tokio::test]
-async fn a_live_insert_propagates_while_an_extinct_composite_group_hits_the_image_less_gap() {
+async fn a_live_insert_and_an_extinct_composite_group_both_propagate_downstream() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -373,15 +378,15 @@ async fn a_live_insert_propagates_while_an_extinct_composite_group_hits_the_imag
     assert_eq!(
         stock_totals_v2(&client).await,
         HashMap::from([
-            // The documented image-less gap: `w1` still carries extinct
-            // `(w1, b)`'s 2 (12 + 2), rather than dropping to 12. See this
-            // test's doc comment — not an issue #171 regression.
-            ("w1".to_string(), Some("14".to_string())),
+            // Issue #180: extinct (w1, b)'s 2 is now subtracted from `w1`
+            // (14 - 2 = 12) instead of surviving forever.
+            ("w1".to_string(), Some("12".to_string())),
             // The new `(w2, c)` group did propagate: 11 + 4.
             ("w2".to_string(), Some("15".to_string())),
         ]),
         "a brand-new composite-key group must propagate downstream (issue \
-         #171); an extinct one hits the documented image-less gap instead"
+         #171) and an extinct one must now reduce the downstream aggregate \
+         too (issue #180)"
     );
 }
 

@@ -1059,7 +1059,8 @@ async fn two_overlapping_group_writers_serialize_via_ascending_lock_order_not_de
 
 /// Issue #11 review, finding #1 (HIGH): a group forced onto the full-recompute
 /// path by an image-less change (a bare recompute trigger — see the module
-/// doc comment's "A known gap: image-less changes" section) must still probe
+/// doc comment's "Image-less changes, and issue #180's fix for one producer
+/// of them" section) must still probe
 /// its `SUM` fields, not skip them for lack of a `field_accum` entry. Before
 /// this fix, `AggFieldKind::Sum`'s Pass-1 check skipped whenever
 /// `field_accum` had no entry for the field — checked *before* consulting

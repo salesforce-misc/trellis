@@ -84,7 +84,7 @@
 //! change (a bare recompute trigger — reverse propagation's own fallback
 //! path for anything the issue #131 fast path doesn't cover, definition
 //! re-derive, backfill) still forces its group onto it below, for the exact
-//! reason the "A known gap: image-less changes" section explains — no prior
+//! reason the "Image-less changes" section below explains — no prior
 //! state to diff against, so a full-recompute re-derivation (a live `JOIN`
 //! is simply the correct way to compute a *fresh* group value, not an
 //! incremental adjustment, so it carries none of the double-counting risk a
@@ -103,7 +103,7 @@
 //! subtracts the row's old contribution from the old group and adds its new
 //! contribution to the new group as two independent deltas.
 //!
-//! # A known gap: image-less changes
+//! # Image-less changes, and issue #180's fix for one producer of them
 //!
 //! A folded change with neither an old nor a new image (a bare recompute
 //! trigger — reverse propagation, definition re-derive, backfill) carries no
@@ -114,11 +114,30 @@
 //! group's *every* field (not just the [`AggFieldKind::RecomputeOnly`] ones)
 //! is re-derived by probe in Phase 3, sidestepping the ambiguity at the cost
 //! of losing the delta's O(1)-per-touch cost for that one group, that one
-//! batch. If the image-less change's live re-read finds the key already
-//! gone, there is no group to locate at all (its prior group, if any, is
-//! unknowable) and the change is dropped — a gap shared with any producer
-//! that stages a recompute trigger for a key already deleted by the time
-//! this batch drains, which is not exercised by today's producers.
+//! batch. **If the image-less change's live re-read finds the key already
+//! gone, there is no group to locate at all** (its prior group, if any, is
+//! unknowable) **and the change is dropped** — this module's own logic here
+//! is unchanged, and the gap is still real for a genuinely bare recompute
+//! trigger reaching an already-vanished key (reverse propagation, definition
+//! re-derive, or backfill racing a delete — not exercised by today's
+//! producers).
+//!
+//! Issue #180 closes this gap for the one producer that *can* know the prior
+//! state and previously threw it away: a chained aggregate's own upstream
+//! source is itself an aggregate target, and when **that** target's group
+//! goes extinct, [`super::apply::apply_and_mark_drained_many`]'s Phase 3
+//! (`delete_group_row`/`apply_forced_groups_bulk`'s own `DELETE ...
+//! RETURNING to_jsonb(t.*)`) captures the deleted row's exact pre-delete
+//! image before it's gone, and downstream propagation (step 4) stages that
+//! as a real image-bearing delete (`StagedChange::Cdc`, `old_image: Some(..)`,
+//! `new_image: None`) instead of an image-less `Recompute`. Once staged that
+//! way, this module never even sees an image-less change for that key: the
+//! decoded `old_image` reaches [`accumulate_changes`] as an ordinary
+//! `(Some(old_row), None)` change — the "a row leaves its group" case
+//! [`sub_contributions`] already handles, subtracting the extinct group's
+//! last-known contribution exactly like any other row-leaves-group delta.
+//! No change to this module's own delta logic was needed; the fix is
+//! entirely in what `super::apply` chooses to stage.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1200,13 +1219,30 @@ pub(super) fn diff_contributions(
 // ---------------------------------------------------------------------
 
 /// What one [`apply_aggregate_target`] call did: every group it physically
-/// wrote or deleted, as `(group_key_text, hop_gen)` pairs — the same shape
-/// [`super::apply::apply_and_mark_drained`]'s downstream-propagation step
-/// already consumes for the 1-1 case, so that step needs no branching of
-/// its own to handle aggregate targets.
+/// wrote or deleted. `written` stays `(group_key_text, hop_gen)`, the same
+/// shape [`super::apply::apply_and_mark_drained`]'s downstream-propagation
+/// step already consumed for the 1-1 case pre-issue #180 — a written group's
+/// new state is always recoverable by a downstream chain's own live refetch,
+/// so no image needs to ride along.
+///
+/// `deleted` additionally carries the group's target row exactly as it stood
+/// the instant before this call deleted it (`to_jsonb(t.*)::text`, the same
+/// server-side encoding a real CDC delete's pre-image would carry) — issue
+/// #180's fix: an extinct group's *key* alone is not enough for a chained
+/// downstream aggregate to know what to subtract, because by the time that
+/// downstream chain's own live refetch runs, the row is genuinely gone (see
+/// the module doc comment's "Image-less changes, and issue #180's fix for
+/// one producer of them" section, and
+/// `super::apply`'s downstream-propagation step, which now stages a real
+/// image-bearing delete for a `Some` entry here instead of an image-less
+/// `Recompute`). `None` only when [`delete_group_row`]/
+/// [`apply_forced_groups_bulk`]'s delete genuinely touched zero rows
+/// (already gone), which never accumulates a key into `deleted` at all in
+/// practice — kept as `Option` rather than `String` purely so both callers
+/// can build this tuple the same way they build a plain existence check.
 pub(super) struct AggregateApplyResult {
     pub written: Vec<(String, i32)>,
-    pub deleted: Vec<(String, i32)>,
+    pub deleted: Vec<(String, i32, Option<String>)>,
 }
 
 /// A `col IS NOT DISTINCT FROM $n::text::<cast>` clause per `group_by`
@@ -1324,24 +1360,35 @@ async fn probe_group_exists(
     Ok(row.get(0))
 }
 
+/// Deletes this group's target row, if it still has one, returning its
+/// pre-delete image (`to_jsonb(t.*)::text`, `None` iff there was no row to
+/// delete) — issue #180: the caller (`apply_aggregate_target`) threads this
+/// through as the extinct group's `AggregateApplyResult::deleted` entry, so
+/// a chained downstream aggregate's `Recompute` can carry a real old image
+/// instead of asking a live refetch to find a row that, by construction
+/// (`probe_group_exists` already found no surviving source row for this
+/// group), is genuinely gone.
 async fn delete_group_row(
     txn: &Transaction<'_>,
     target: &str,
     group_by: &[String],
     group_by_types: &[ValueType],
     values: &[Option<String>],
-) -> Result<bool, ApplyError> {
+) -> Result<Option<String>, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     // `target` is always [`AggregateTargetPlan::target`]'s qualified
     // identity by the time this is called (reviewer follow-up to issue #74)
     // — quoted component-independently via
-    // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`.
+    // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`. `t`
+    // aliases the target for `to_jsonb(t.*)` below; `where_sql`'s own column
+    // references stay unqualified, which still resolves correctly since `t`
+    // is the sole table in scope.
     let sql = format!(
-        "delete from {} where {where_sql} returning 1",
+        "delete from {} as t where {where_sql} returning to_jsonb(t.*)::text as old_image",
         ddl::qualified_target_table_ident(target)
     );
     let rows = txn.query(&sql, &group_where_params(values)).await?;
-    Ok(!rows.is_empty())
+    Ok(rows.into_iter().next().map(|row| row.get(0)))
 }
 
 /// Probes one [`AggFieldKind::RecomputeOnly`] (or, on the full-recompute
@@ -1970,7 +2017,7 @@ async fn apply_forced_groups_bulk(
     target: &str,
     plan: &AggregateTargetPlan,
     forced: &[(&String, &GroupPlan)],
-) -> Result<(Vec<(String, i32)>, Vec<(String, i32)>), ApplyError> {
+) -> Result<(Vec<(String, i32)>, Vec<(String, i32, Option<String>)>), ApplyError> {
     let arity = plan.group_by.len();
     let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
     let arrays = transpose_group_values(arity, &forced_groups);
@@ -2110,14 +2157,19 @@ async fn apply_forced_groups_bulk(
     }
 
     // 3. Extinct groups: touched, but no surviving source row — delete their
-    // target rows in one statement, `ord` telling us which we removed.
+    // target rows in one statement, `ord` telling us which we removed. Issue
+    // #180: also returns each deleted row's pre-delete image
+    // (`to_jsonb(t.*)`), the bulk-path counterpart to
+    // [`delete_group_row`]'s own per-group `RETURNING` — see
+    // [`AggregateApplyResult::deleted`]'s doc comment for why a downstream
+    // chain needs this rather than a bare key.
     let mut deleted = Vec::new();
     if !extinct_ords.is_empty() {
         let ord_param = arity + 1;
         let delete_sql = format!(
             "delete from {target_ident} t using {} \
              where {} and k.ord = any(${ord_param}::bigint[]) \
-             returning k.ord::bigint",
+             returning k.ord::bigint, to_jsonb(t.*)::text as old_image",
             keyset_unnest(&plan.group_by_types, 1, true),
             keyset_match(&plan.group_by, "t", &null_safe),
         );
@@ -2125,12 +2177,14 @@ async fn apply_forced_groups_bulk(
             arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         delete_params.push(&extinct_ords);
         let rows = txn.query(&delete_sql, &delete_params).await?;
-        let deleted_ords: std::collections::HashSet<i64> =
-            rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+        let deleted_images: HashMap<i64, String> = rows
+            .iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+            .collect();
         for (i, (key, group)) in forced.iter().enumerate() {
             let ord = (i + 1) as i64;
-            if deleted_ords.contains(&ord) {
-                deleted.push(((*key).clone(), group.hop_gen));
+            if let Some(old_image) = deleted_images.get(&ord) {
+                deleted.push(((*key).clone(), group.hop_gen, Some(old_image.clone())));
             }
         }
     }
@@ -2894,7 +2948,7 @@ pub(super) async fn apply_aggregate_target(
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
 
         if !exists {
-            let did_delete = delete_group_row(
+            let old_image = delete_group_row(
                 txn,
                 target,
                 &plan.group_by,
@@ -2902,8 +2956,8 @@ pub(super) async fn apply_aggregate_target(
                 &group.group_values,
             )
             .await?;
-            if did_delete {
-                deleted.push((key.clone(), group.hop_gen));
+            if let Some(old_image) = old_image {
+                deleted.push((key.clone(), group.hop_gen, Some(old_image)));
             }
             continue;
         }
@@ -3082,9 +3136,27 @@ mod tests {
 
         assert!(written.is_empty(), "an extinct group writes nothing");
         assert_eq!(
-            deleted,
-            vec![(key.clone(), 3)],
-            "the extinct forced group's target row must be reported deleted"
+            deleted.len(),
+            1,
+            "the extinct forced group must be reported deleted"
+        );
+        let (del_key, del_hop_gen, del_old_image) = &deleted[0];
+        assert_eq!(del_key, &key);
+        assert_eq!(*del_hop_gen, 3);
+        // Issue #180: the deleted group's pre-delete row must ride along, so
+        // a chained downstream aggregate can subtract its last-known
+        // contribution instead of hitting the image-less gap.
+        let old_image = del_old_image
+            .as_deref()
+            .expect("a deleted group must carry its pre-delete image");
+        let old_total: String = client
+            .query_one("select $1::text::jsonb ->> 'total'", &[&old_image])
+            .await
+            .expect("read the pre-delete image's total")
+            .get(0);
+        assert_eq!(
+            old_total, "99.00",
+            "the pre-delete image must carry the extinct group's last total"
         );
 
         let remaining: i64 = client
