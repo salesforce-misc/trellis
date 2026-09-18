@@ -4698,21 +4698,28 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// text, the `hop_gen` it carries forward, (issues #51/#52's multi-hop gap)
 /// the `src_changed` origin it carries forward — `None` for an aggregate
 /// target's group key (see the 3b step's doc comment) or any other touched
-/// key with no traceable origin — and (issue #180) the key's pre-delete
-/// image, `Some` only when this entry is a genuine deletion whose prior row
-/// state was captured at delete time (an extinct aggregate group's
-/// `AggregateApplyResult::deleted` entry today), `None` for every written
-/// key and for a deletion no producer captures an image for yet (the 1-1
-/// target delete and truncate-clear cases — see step 4's own doc comment on
-/// why only the aggregate-deleted case is threaded through so far). Step 4
-/// reads this to decide whether a downstream `Recompute` can stay
-/// image-less (safe whenever a live refetch would find the *right* row —
-/// true for every write, and true for a delete only once a downstream
-/// chain's own live refetch is known to correctly see "gone") or must
-/// become an image-bearing delete instead, so a chained aggregate can
-/// subtract the extinct row's last-known contribution rather than silently
-/// dropping the change (issue #180).
+/// key with no traceable origin — and (issues #180/#196) the key's
+/// pre-delete image, `Some` only when this entry is a genuine deletion whose
+/// prior row state was captured at delete time (an extinct aggregate
+/// group's `AggregateApplyResult::deleted` entry, or a deleted 1-1 target
+/// row's own `apply_target`-captured entry — 3b's and step 3's doc comments
+/// respectively), `None` for every written key and for a deletion no
+/// producer captures an image for yet (the truncate-clear case — see step
+/// 4's own doc comment on why that one stays image-less). Step 4 reads this
+/// to decide whether a downstream `Recompute` can stay image-less (safe
+/// whenever a live refetch would find the *right* row — true for every
+/// write, and true for a delete only once a downstream chain's own live
+/// refetch is known to correctly see "gone") or must become an
+/// image-bearing delete instead, so a chained aggregate can subtract the
+/// extinct row's last-known contribution rather than silently dropping the
+/// change (issue #180, widened to the 1-1 target case by issue #196).
 type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
+
+/// One row [`apply_target`]'s delete statement actually removed: its key,
+/// paired with the pre-delete image captured by that statement's own
+/// `RETURNING ... to_jsonb(t.*)::text` (issue #196) — the 1-1-target
+/// counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s tuple.
+type TargetDeletedKey = (String, String);
 
 /// Every key in one target's [`ChangedKey`] accumulator that this batch
 /// *wrote* (no captured pre-delete image), as a lookup set — the guard
@@ -4732,7 +4739,12 @@ fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashS
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
 /// deleted (as opposed to every key this batch merely *proposed* — the
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
-/// proposed write physically changes nothing).
+/// proposed write physically changes nothing). Issue #196: each deleted key
+/// is paired with its pre-delete image (`RETURNING ... to_jsonb(t.*)::text`,
+/// the same encoding `apply_aggregate::delete_group_row`'s issue #180 fix
+/// captures for an extinct aggregate group), so `apply_and_mark_drained_many`
+/// can stage a real image-bearing delete for a deleted 1-1 target row
+/// instead of an image-less `Recompute` — see [`ChangedKey`]'s doc comment.
 ///
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
@@ -4771,7 +4783,7 @@ async fn apply_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &TargetPlan,
-) -> Result<(Vec<String>, Vec<String>), ApplyError> {
+) -> Result<(Vec<String>, Vec<TargetDeletedKey>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -4911,17 +4923,27 @@ async fn apply_target(
         .filter(|k| !write_keys.contains(k))
         .collect();
     if !delete_keys.is_empty() {
+        // Issue #196: `as t` + `to_jsonb(t.*)::text` captures each deleted
+        // row's exact pre-delete state, the same `apply_aggregate`'s
+        // `delete_group_row` does for an extinct aggregate group (issue
+        // #180) — see this function's own doc comment and `ChangedKey`'s for
+        // why a 1-1 target's delete needed this same treatment. `pk_ident`
+        // stays unqualified (no `t.` prefix) since `t` is the sole table in
+        // scope, exactly like `delete_group_row`'s own `where_sql`.
         let rows = txn
             .query(
                 &format!(
-                    "delete from {target_ident} \
+                    "delete from {target_ident} as t \
                      where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {pk_ident}::text as pk"
+                     returning {pk_ident}::text as pk, to_jsonb(t.*)::text as old_image"
                 ),
                 &[&delete_keys],
             )
             .await?;
-        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+        deleted.extend(
+            rows.into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1))),
+        );
     }
 
     let span = tracing::Span::current();
@@ -5194,20 +5216,33 @@ pub async fn apply_and_mark_drained_many(
             src_changed_of.insert(d.pk_text.as_str(), d.src_changed);
         }
 
-        // A 1-1 target delete's downstream propagation also stays image-less
-        // today (`None`) — the same "same failure family, different
-        // producer" gap issue #180's own writeup calls out, but its fix here
-        // is scoped to the aggregate-group-extinction case below; widening
-        // this one is a follow-up, not this fix.
-        let touched: Vec<ChangedKey> = written
-            .into_iter()
-            .chain(deleted)
-            .map(|key| {
-                let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
-                let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
-                (key, hop_gen, src_changed, None)
-            })
-            .collect();
+        // Issue #196: a deleted 1-1 target row's downstream propagation used
+        // to stay image-less (`None`) here — the same "same failure family,
+        // different producer" gap issue #180 fixed for extinct aggregate
+        // groups, left unthreaded for this producer at the time. `deleted`
+        // now carries each row's pre-delete image straight from
+        // `apply_target`'s own `RETURNING to_jsonb(t.*)::text`, so it stages
+        // the same way 3b's extinct-group `deleted` entries do below —
+        // `Some(old_image)`, letting a chained downstream aggregate subtract
+        // this row's last-known contribution (`accumulate_changes`'s
+        // `(Some(old_row), None)` branch) instead of a live refetch finding
+        // nothing and silently dropping the change. Step 4's same-batch
+        // write-vs-delete guard (issue #180 hardening, `e28a89c`) already
+        // applies here for free: it reads generically off `changed`'s
+        // per-target `touched` vector, regardless of which step populated
+        // it, so this needs no guard logic of its own — see that guard's own
+        // comment at the step 4 call site.
+        let written_touched = written.into_iter().map(|key| {
+            let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
+            let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
+            (key, hop_gen, src_changed, None)
+        });
+        let deleted_touched = deleted.into_iter().map(|(key, old_image)| {
+            let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
+            let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
+            (key, hop_gen, src_changed, Some(old_image))
+        });
+        let touched: Vec<ChangedKey> = written_touched.chain(deleted_touched).collect();
         changed.entry(target.as_str()).or_default().extend(touched);
     }
 
@@ -5777,6 +5812,20 @@ pub async fn apply_and_mark_drained_many(
         // whose downstream live refetch finds the surviving row and
         // re-derives the group correctly — exactly the pre-#180 behaviour,
         // which was only ever wrong for a key that really is gone.
+        //
+        // Issue #196 reuses this exact guard for a deleted 1-1 target row's
+        // own image-bearing entry (step 3), with no changes needed here: the
+        // guard reads generically off `touched`, whichever step(s)
+        // contributed to it. Unlike the aggregate case above, step 3 cannot
+        // actually produce a key with *both* a written and a deleted entry
+        // in the first place — `apply_target` resolves that conflict itself
+        // before it ever reaches the database (see its own "never delete a
+        // key this same call just wrote" comment), and it is the only
+        // producer of a 1-1 target's `touched` entries besides the
+        // truncate-clear step (2, always image-less already) — but the
+        // guard still applies uniformly rather than needing a carve-out, so
+        // a future second producer of 1-1 target deletes/writes (there is
+        // none today) inherits the same safety automatically.
         let rewritten = keys_written_without_image(touched);
         for (key, hop_gen, src_changed, deleted_old_image) in touched {
             let next_hop = hop_gen + 1;
@@ -5785,10 +5834,11 @@ pub async fn apply_and_mark_drained_many(
                 worst_hop_gen = worst_hop_gen.max(next_hop);
                 continue;
             }
-            // Issue #180: a deletion whose pre-delete image was captured
-            // (today, only an extinct aggregate group's `deleted` entry —
-            // see [`ChangedKey`]'s doc comment) stages as a real
-            // image-bearing delete instead of an image-less `Recompute`, so
+            // Issues #180/#196: a deletion whose pre-delete image was
+            // captured (an extinct aggregate group's `deleted` entry, or a
+            // deleted 1-1 target row's own captured entry — see
+            // [`ChangedKey`]'s doc comment) stages as a real image-bearing
+            // delete instead of an image-less `Recompute`, so
             // a chained downstream aggregate can subtract the extinct row's
             // last-known contribution (`accumulate_changes`'s `(Some(old_row),
             // None)` branch) rather than have its live refetch find nothing

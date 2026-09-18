@@ -138,6 +138,18 @@
 //! last-known contribution exactly like any other row-leaves-group delta.
 //! No change to this module's own delta logic was needed; the fix is
 //! entirely in what `super::apply` chooses to stage.
+//!
+//! Issue #196 widens this to the sibling producer #180 deliberately scoped
+//! out: a chained aggregate's upstream source can just as well be a plain
+//! [`KeySpace::OneToOne`] target, and deleting *that* target's row is the
+//! same shape of "the prior state is knowable at delete time, but was being
+//! thrown away." `super::apply::apply_target`'s own delete statement now
+//! carries the identical `RETURNING to_jsonb(t.*)::text` capture, threaded
+//! through the same [`super::apply::ChangedKey`] slot, so step 4 stages the
+//! same image-bearing `StagedChange::Cdc` for a deleted 1-1 row — reaching
+//! this module's `(Some(old_row), None)` branch exactly as issue #180's
+//! aggregate-group case does. Again, no change to this module's own delta
+//! logic was needed.
 
 use std::borrow::Cow;
 use std::collections::HashMap;

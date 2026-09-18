@@ -165,7 +165,9 @@ same key must therefore pick one. See issue #180's downstream propagation of an
 extinct aggregate group: it stages a real image-bearing delete carrying the
 group's captured pre-delete image, but drops back to an image-less `Recompute`
 for any key the same batch also *wrote*, precisely so the delete cannot
-annihilate the write and leave a live group subtracted downstream.
+annihilate the write and leave a live group subtracted downstream. Issue #196
+threads the same capture through a deleted 1-1 target row's own downstream
+propagation, reusing this same guard rather than a second copy of it.
 
 One field is deliberately **not** filtered: `op`, because the only load-bearing op
 is the `truncate` sentinel, and that sentinel is itself image-less. Filtering `op`
