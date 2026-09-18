@@ -1040,7 +1040,7 @@ async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
 /// groups within the same drain batch, so `apply_aggregate_target` routes it
 /// through `apply_delta_groups_bulk` — `probe_recompute_fields_bulk`'s corner
 /// of this regression, and the one the generative fuzz suite's
-/// `convergence_holds_across_a_mid_stream_scale_out` caught.
+/// `property_convergence_holds_across_a_mid_stream_scale_out` caught.
 #[tokio::test]
 async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
     let cluster = TestCluster::start();
