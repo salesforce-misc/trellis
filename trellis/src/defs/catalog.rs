@@ -563,11 +563,11 @@ pub async fn install_definition(
             // call site, rather than inside `source_primary_key` itself.
             //
             // Issue #177: this same arity check now also runs inside
-            // `create_definition_inner` itself, right after that function
-            // resolves its own `qualified_source` and before any of its
-            // side effects (node/edge/backfill work) — see that check's own
-            // doc comment for why it's placed there rather than at the very
-            // top, unlike the aggregate replica-identity check beside it.
+            // `create_definition_inner` itself, after that function resolves
+            // its own `qualified_source` and runs its cycle/collision checks,
+            // but before its initial backfill enumeration — see that check's
+            // own doc comment for why it's placed there rather than at the
+            // very top, unlike the aggregate replica-identity check beside it.
             // This function eventually calls `create_definition_inner` too
             // (below), so a composite source is rejected either way. This
             // copy stays regardless: it isn't just a redundant fail-fast
@@ -1302,8 +1302,13 @@ async fn create_definition_inner(
     // call deep in the backfill/apply pipeline instead. By that point it's
     // deep enough in the pipeline that it surfaces as a whole-instance halt
     // rather than a clean, typed rejection of just this one definition.
+    // Run against `txn`, not a second pooled connection (`ddl::source_primary_key`'s
+    // own `pool`-taking form): this function is mid-transaction here, so taking
+    // another connection would risk a pool-exhaustion deadlock and would read the
+    // source relation's shape on a different snapshot than every other check
+    // around it — see [`ddl::source_primary_key_in_txn`]'s own doc comment.
     if let KeySpace::OneToOne = &def.key_space {
-        let pk = ddl::source_primary_key(pool, &qualified_source)
+        let pk = ddl::source_primary_key_in_txn(&*txn, &qualified_source)
             .await
             .map_err(CatalogError::Ddl)?;
         ddl::require_single_column_pk(pk, &qualified_source).map_err(CatalogError::Ddl)?;

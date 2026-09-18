@@ -3327,17 +3327,23 @@ pub struct ApplyPlan {
     /// could a definition actually be *created* reading from an aggregate
     /// target today, making this skip a live correctness gap rather than a
     /// moot one? Yes, and the originally-assumed safety net does **not**
-    /// reliably prevent it: `defs::validate`/`create_definition` impose no
-    /// primary-key-shape check at definition-creation time, and
-    /// `ddl::source_primary_key` never rejects a composite source at all
-    /// since issue #126 lifted that blanket rejection (the narrowing lives
-    /// in `ddl::require_single_column_pk` now, which only the
-    /// genuinely-single-column callers invoke), so
-    /// `DdlError::CompositePrimaryKeyUnsupported` fires for neither arity.
+    /// reliably prevent it: `create_definition`'s own primary-key-shape gate
+    /// (issue #177, in `catalog::create_definition_inner`) closes this for a
+    /// `OneToOne` downstream definition — it rejects any source with more
+    /// than one PK column, so a `OneToOne` read of a multi-column-`GROUP BY`
+    /// aggregate target is rejected at create time; a single-column
+    /// `GROUP BY` still produces a genuinely single-column aggregate-target
+    /// PK, so `DdlError::CompositePrimaryKeyUnsupported` never fires for
+    /// that case either. The gate is `OneToOne`-only, though: a downstream
+    /// **`Aggregate`** definition (this field's own real shape, and issue
+    /// #171's actual repro) needs no PK narrowing at all and is untouched by
+    /// it, so a multi-column `GROUP BY` chained into another aggregate
+    /// remains fully creatable and live.
     /// Previously (**[#103](https://github.com/salesforce-misc/trellis/issues/103)**
     /// for one grouping column,
     /// **[#171](https://github.com/salesforce-misc/trellis/issues/171)** for
-    /// several),
+    /// several — both before #177's gate existed, and #171's case remains
+    /// live today for the `Aggregate` shape the gate doesn't cover),
     /// the encoded group-key text (`derive_group_key`'s locally-invented
     /// `"{len}:{value}"` shape, `apply_aggregate.rs`) reached a real
     /// evaluator via [`ApplyPlan::aggregate_targets`]' `written`/`deleted`
@@ -3947,14 +3953,19 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // Issue #126: `pk` is this source's full (possibly
                 // composite) primary key, shared with the `KeySpace::Aggregate`
                 // branch above (which needs no single-column narrowing at
-                // all). A `KeySpace::OneToOne` definition installed through
-                // `catalog::install_definition` can only have a single-column
-                // source primary key (its own `ddl::require_single_column_pk`
-                // gate), so this narrowing fails here only for a definition
-                // that reached the ring via a path that skips that gate (see
-                // `quarantine.rs`'s
-                // `a_composite_primary_key_source_is_never_quarantined_and_stops_the_instance`)
-                // — a real, typed halting error, not an invariant violation.
+                // all). A `KeySpace::OneToOne` definition can only be created
+                // against a single-column source primary key — issue #177 put
+                // that same `ddl::require_single_column_pk` gate in
+                // `catalog::create_definition_inner`, so it now holds for the
+                // ring-path entry points (`create_definition`/
+                // `create_definition_without_backfill`) too, not just
+                // `install_definition` (see `quarantine.rs`'s
+                // `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`,
+                // which pins that the create-time rejection is what fires
+                // now). What's left for this narrowing to catch is a source
+                // whose primary key *changed* to composite after its
+                // definition was accepted — still a real, typed halting
+                // error, not an invariant violation.
                 let target_pk = ddl::require_single_column_pk(pk.clone(), qualified_source)?;
                 let plan = targets
                     .entry(def.def.target.clone())

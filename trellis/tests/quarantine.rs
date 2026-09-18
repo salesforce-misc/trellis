@@ -653,7 +653,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
 /// call, well after CDC rows had already been staged.
 ///
 /// Issue #177 closed that gap: `create_definition_inner` now runs the same
-/// arity check itself, first thing, before any side effect — so
+/// arity check itself, before it enumerates a single source row — so
 /// `create_definition` below now rejects this source synchronously, with a
 /// clean, typed `CatalogError`, and the scenario can no longer reach the
 /// ring/CDC/apply machinery this test used to have to drive at all. See

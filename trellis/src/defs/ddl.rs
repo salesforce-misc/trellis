@@ -52,6 +52,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use tokio_postgres::GenericClient;
+
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
@@ -387,6 +389,25 @@ pub async fn source_primary_key(
     source_table: &str,
 ) -> Result<Vec<PrimaryKeyColumn>, DdlError> {
     let client = pool.get().await?;
+    source_primary_key_in_txn(&**client, source_table).await
+}
+
+/// [`source_primary_key`] against a caller-supplied client instead of a fresh
+/// pooled one — for callers already holding an open transaction
+/// (`catalog::create_definition_inner`'s issue #177 `KeySpace::OneToOne`
+/// gate). Two reasons that matters there rather than just calling
+/// [`source_primary_key`]: taking a *second* pooled connection while the
+/// first one is mid-transaction is the classic pool-exhaustion deadlock (N
+/// concurrent definition creations against a pool of N connections would each
+/// wait forever for a connection the others are holding), and reading the
+/// source relation's shape on the transaction's own connection keeps this
+/// check reading the same session/transaction state (`search_path`, locks,
+/// anything that transaction has itself written) as every check around it,
+/// instead of an unrelated session's independent view.
+pub(crate) async fn source_primary_key_in_txn(
+    client: &impl GenericClient,
+    source_table: &str,
+) -> Result<Vec<PrimaryKeyColumn>, DdlError> {
     let rows = client
         .query(
             "with chosen_index as (
