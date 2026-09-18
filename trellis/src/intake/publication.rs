@@ -395,8 +395,15 @@ pub(crate) async fn enumerate_and_append(
             // use — `primary_key_columns` above already reports the key's
             // columns in `array_position(i.indkey, a.attnum)` order for
             // exactly that reason (issue #163).
-            let key =
-                crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| row.get::<_, String>(i)));
+            // `encode_key_part` (issue #110), not the raw text: it is not a
+            // no-op for a non-NULL value either — a real U+0001 is escaped so
+            // it can never be read back as the NULL sentinel — so skipping it
+            // would make this producer disagree with `ddl::pk_key_sql_expr`
+            // for exactly those values. A primary-key column itself is never
+            // NULL, hence the unconditional `Some`.
+            let key = crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| {
+                crate::defs::ddl::encode_key_part(Some(row.get::<_, &str>(i))).into_owned()
+            }));
             page.push(StagedChange::Recompute {
                 src_table: src_table.to_string(),
                 key,

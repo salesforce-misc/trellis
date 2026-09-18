@@ -179,17 +179,18 @@ async fn fetch_confirmed_lsn(
 /// written to the WAL, say — where the flags remain the only surviving
 /// description of its key; see `handle_xlog_data`'s `Relation` arm.
 ///
-/// Issue #110's NULL-safe key encoding (`ddl::encode_key_part`/
-/// `ddl::NULL_KEY_SENTINEL`) doesn't need to touch this function's own
-/// logic: `key_value` below already rejects anything but
+/// Issue #110's NULL-safe key encoding: this function can never produce a
+/// `NULL` component itself — `key_value` below already rejects anything but
 /// [`ColumnValue::Text`] with [`IntakeError::MissingKeyValue`], and a real
 /// table's `PRIMARY KEY`/`REPLICA IDENTITY FULL` column can never itself be
-/// SQL `NULL` — so `parts` here can never actually contain a `NULL`
-/// component to encode ambiguously in the first place. It still shares
-/// [`crate::defs::ddl::join_pk_key`] with every other producer
-/// (`staging::apply_aggregate::derive_group_key`, which *does* need the
-/// sentinel, since a `GROUP BY` column can be `NULL`), so the two agree on
-/// one shape regardless.
+/// SQL `NULL`. It must nevertheless route every part through
+/// [`crate::defs::ddl::encode_key_part`], exactly like the SQL-side producer
+/// (`ddl::pk_key_sql_expr`) and `staging::apply_aggregate::derive_group_key`
+/// do, because that encoding is not a no-op for a *non*-`NULL` value either:
+/// a real U+0001 inside a key column's text is escaped (doubled) so it can
+/// never be read back as the `NULL` sentinel. Skipping it here would make
+/// this producer disagree byte-for-byte with `pk_key_sql_expr` for exactly
+/// those values, and a live refetch would then miss the row.
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],
@@ -217,7 +218,7 @@ fn extract_key(
                     .iter()
                     .position(|col| &col.name == name)
                     .ok_or_else(missing_key)?;
-                parts.push(key_value(i)?);
+                parts.push(crate::defs::ddl::encode_key_part(Some(key_value(i)?)));
             }
         }
         None => {
@@ -225,7 +226,7 @@ fn extract_key(
                 if !col.is_key {
                     continue;
                 }
-                parts.push(key_value(i)?);
+                parts.push(crate::defs::ddl::encode_key_part(Some(key_value(i)?)));
             }
         }
     }

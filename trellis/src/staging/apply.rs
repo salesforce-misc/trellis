@@ -564,7 +564,10 @@ async fn read_live_rows_batch(
         .map(|(i, c)| format!("${}::text[]::{}[]", i + 1, c.data_type))
         .collect();
     let u_cols: Vec<String> = (0..pk.len()).map(|i| format!("c{i}")).collect();
-    let null_safe: Vec<bool> = columns.iter().map(|c| c.iter().any(Option::is_none)).collect();
+    let null_safe: Vec<bool> = columns
+        .iter()
+        .map(|c| c.iter().any(Option::is_none))
+        .collect();
     let join_cond = live_rows_join_cond(&pk_idents, &u_cols, &null_safe);
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
     let sql = format!(

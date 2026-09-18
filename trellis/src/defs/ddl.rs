@@ -49,6 +49,7 @@
 //! [`super::validate::infer_field_types`] rather than a second type-inference
 //! implementation).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -514,10 +515,20 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 /// chained definition's live re-fetch (`staging::apply::read_live_rows_batch`)
 /// — it looked exactly like "no row," which is mistaken for a delete.
 ///
-/// U+0001 (SOH) is used, on the same "no real column value contains this
-/// control character" assumption `staging::append::TRUNCATE_SENTINEL_KEY`
-/// already documents and relies on (and, transitively,
-/// [`COMPOSITE_KEY_SEPARATOR`]'s own U+001F) — deliberately *not* U+0000
+/// U+0001 (SOH) is used — but, unlike
+/// `staging::append::TRUNCATE_SENTINEL_KEY`/[`COMPOSITE_KEY_SEPARATOR`],
+/// **not** on a bare "no real column value contains this control character"
+/// assumption. A `text`/`varchar` column can perfectly well hold a U+0001,
+/// and a key component that *was* exactly this sentinel would otherwise be
+/// read back as a `NULL` component — folding two genuinely distinct groups
+/// onto one encoded key, which is a strictly worse (silent, data-dependent)
+/// failure than the loud `DdlError::MalformedCompositeKey` an embedded
+/// U+001F produces. [`encode_key_part`] therefore *escapes* a real U+0001 by
+/// doubling it, so an encoded non-`NULL` part only ever contains U+0001 in
+/// even-length runs and can never equal this odd-length-1 sentinel. See that
+/// function for the round-trip argument.
+///
+/// Deliberately *not* U+0000
 /// (NUL), which would otherwise be the more obviously-unambiguous choice
 /// (`TRUNCATE_SENTINEL_KEY`'s doc comment: Postgres `text` is effectively
 /// cstring-based internally and can never store an embedded NUL at all,
@@ -528,40 +539,83 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 /// live-database `SQLSTATE 54000` failure every drain-touching integration
 /// test hit the first time this constant used U+0000 — which would make it
 /// impossible to express identically on the SQL side
-/// ([`pk_key_sql_expr`]'s `coalesce(<col>::text, chr(1))` twin) even though
+/// ([`pk_key_sql_expr`]'s [`null_key_escape_sql`] twin) even though
 /// the underlying storage guarantee is stronger. U+0001 has no such
 /// restriction and is otherwise unused anywhere else in this crate's key
 /// contract.
 ///
-/// Every producer of this crate's composite/single key text must route a
-/// possibly-`NULL` component through [`encode_key_part`] (Rust side) or the
-/// equivalent `coalesce(<col>::text, chr(1))` (SQL side, baked into
+/// Every producer of this crate's composite/single key text must route
+/// *every* component — `NULL` or not — through [`encode_key_part`] (Rust
+/// side) or the equivalent [`null_key_escape_sql`] (SQL side, baked into
 /// [`pk_key_sql_expr`]) before joining it in, and every consumer must decode
 /// it back through [`decode_key_part`] (used by [`split_pk_key`]) — so a
 /// `NULL` component agrees byte-for-byte on both sides of the wire, the same
 /// "one shape, every producer and consumer" property
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment describes for the separator.
+/// "Every component, not just the `NULL` ones" is what makes the escape
+/// above actually hold: a producer that skipped the encode for its non-`NULL`
+/// parts would emit a *different* text than one that did, for any value
+/// containing a U+0001.
 pub(crate) const NULL_KEY_SENTINEL: &str = "\u{1}";
 
-/// The Rust-side counterpart of [`pk_key_sql_expr`]'s `coalesce(<col>::text,
-/// chr(1))`: renders one possibly-`NULL` key/group component as the text a
-/// producer should feed into [`join_pk_key`] — `value` unchanged when
-/// `Some`, or [`NULL_KEY_SENTINEL`] when `None`. See that constant's doc
-/// comment for why the two sides are guaranteed to agree.
-pub(crate) fn encode_key_part(value: Option<&str>) -> &str {
-    value.unwrap_or(NULL_KEY_SENTINEL)
+/// What [`encode_key_part`] rewrites a genuine, in-value U+0001 to: the
+/// sentinel doubled. See [`NULL_KEY_SENTINEL`] and [`encode_key_part`].
+const NULL_KEY_SENTINEL_ESCAPED: &str = "\u{1}\u{1}";
+
+/// [`encode_key_part`]'s exact SQL twin, wrapping one column-text expression
+/// (`<col>::text`) — [`pk_key_sql_expr`] renders one per key column.
+/// `replace(...)` performs the same doubling escape and the outer `coalesce`
+/// the same `NULL` -> sentinel substitution, in that order: `replace(NULL,
+/// ...)` is itself `NULL`, so the `coalesce` still sees a `NULL` input as
+/// `NULL`, and a real value's escape happens before it could ever be confused
+/// with the substituted one.
+pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
+    format!("coalesce(replace({col_text}, chr(1), chr(1) || chr(1)), chr(1))")
+}
+
+/// The Rust-side counterpart of [`null_key_escape_sql`]: renders one
+/// possibly-`NULL` key/group component as the text a producer should feed
+/// into [`join_pk_key`].
+///
+/// - `None` (a SQL `NULL` component) renders as [`NULL_KEY_SENTINEL`] — a
+///   *single* U+0001.
+/// - `Some(v)` renders `v` with every U+0001 doubled
+///   ([`NULL_KEY_SENTINEL_ESCAPED`]), and is otherwise `v` unchanged (the
+///   borrowed, zero-allocation case every real value takes).
+///
+/// That makes the two cases provably disjoint rather than merely
+/// improbably-disjoint, which is the whole point: doubling maps a run of `n`
+/// U+0001s to a run of `2n`, so every U+0001 run in an encoded `Some` part
+/// has *even* length, while the encoded `None` part is a run of length one.
+/// No `Some(v)` can therefore ever encode to the sentinel, and
+/// [`decode_key_part`] recovers `v` exactly. Without this escape a group
+/// whose key column genuinely held a lone U+0001 would silently share one
+/// encoded key with the `NULL` group — two distinct groups folded into one,
+/// a silent-corruption bug strictly worse than issue #110's own.
+pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
+    match value {
+        None => Cow::Borrowed(NULL_KEY_SENTINEL),
+        Some(v) if v.contains(NULL_KEY_SENTINEL) => {
+            Cow::Owned(v.replace(NULL_KEY_SENTINEL, NULL_KEY_SENTINEL_ESCAPED))
+        }
+        Some(v) => Cow::Borrowed(v),
+    }
 }
 
 /// [`encode_key_part`]'s exact inverse — the read-side counterpart
 /// [`split_pk_key`] applies to each of a decoded key's parts: `None` when the
-/// part is exactly [`NULL_KEY_SENTINEL`] (which, per that constant's doc
-/// comment, no ordinary column value is expected to equal), `Some(part)`
-/// otherwise.
-pub(crate) fn decode_key_part(part: &str) -> Option<&str> {
+/// part is exactly [`NULL_KEY_SENTINEL`] (which, per that function's doc
+/// comment, no encoded non-`NULL` value can be), and otherwise the part with
+/// each doubled U+0001 collapsed back to one.
+pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
     if part == NULL_KEY_SENTINEL {
         None
+    } else if part.contains(NULL_KEY_SENTINEL) {
+        Some(Cow::Owned(
+            part.replace(NULL_KEY_SENTINEL_ESCAPED, NULL_KEY_SENTINEL),
+        ))
     } else {
-        Some(part)
+        Some(Cow::Borrowed(part))
     }
 }
 
@@ -620,13 +674,13 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
             // survives `array_to_string` (which otherwise drops a NULL
             // array element outright, collapsing a composite key's arity)
             // and stays distinguishable from a genuine empty string, both
-            // at every arity — see `NULL_KEY_SENTINEL`'s doc comment for why
-            // the substitution is unambiguous, and `encode_key_part` for
-            // this expression's exact Rust-side counterpart, which every
-            // producer of this crate's *other* half of this same key
-            // (`join_pk_key`'s callers) must use so the two sides render
-            // byte-identical text for the same NULL-ness.
-            format!("coalesce({col_text}, chr(1))")
+            // at every arity — and a *real* chr(1) inside the value is
+            // doubled so it can never be read back as that substitution.
+            // `encode_key_part` is this expression's exact Rust-side
+            // counterpart, which every producer of this crate's *other* half
+            // of this same key (`join_pk_key`'s callers) must use so the two
+            // sides render byte-identical text for the same value.
+            null_key_escape_sql(&col_text)
         })
         .collect();
     match parts.len() {
@@ -687,7 +741,7 @@ pub(crate) fn split_pk_key<'a>(
     pk: &[PrimaryKeyColumn],
     source_table: &str,
     key: &'a str,
-) -> Result<Vec<Option<&'a str>>, DdlError> {
+) -> Result<Vec<Option<Cow<'a, str>>>, DdlError> {
     let parts: Vec<&str> = key.split(COMPOSITE_KEY_SEPARATOR).collect();
     if parts.len() != pk.len() {
         return Err(DdlError::MalformedCompositeKey {
@@ -712,8 +766,8 @@ pub(crate) fn transpose_pk_keys<'a>(
     pk: &[PrimaryKeyColumn],
     source_table: &str,
     keys: &[&'a str],
-) -> Result<Vec<Vec<Option<&'a str>>>, DdlError> {
-    let mut columns: Vec<Vec<Option<&str>>> = (0..pk.len())
+) -> Result<Vec<Vec<Option<Cow<'a, str>>>>, DdlError> {
+    let mut columns: Vec<Vec<Option<Cow<'a, str>>>> = (0..pk.len())
         .map(|_| Vec::with_capacity(keys.len()))
         .collect();
     for &key in keys {
@@ -1405,10 +1459,10 @@ mod tests {
     }
 
     /// Issue #110: every column reference `pk_key_sql_expr` renders is
-    /// `coalesce(<col>::text, chr(1))`, not a bare `<col>::text` — the
+    /// [`null_key_escape_sql`]'s wrapper, not a bare `<col>::text` — the
     /// SQL-side half of the NULL-safe encoding, matching
-    /// [`encode_key_part`]'s Rust-side `unwrap_or(NULL_KEY_SENTINEL)`
-    /// byte-for-byte so a NULL group's key text agrees on both sides of the
+    /// [`encode_key_part`]'s Rust-side substitution *and* its doubling
+    /// escape byte-for-byte, so a key's text agrees on both sides of the
     /// wire regardless of arity. `chr(1)`, not `chr(0)`: Postgres's `chr()`
     /// itself refuses to construct a NUL byte (`NULL_KEY_SENTINEL`'s doc
     /// comment) — a live-database regression this exact test would not have
@@ -1419,12 +1473,13 @@ mod tests {
     fn pk_key_sql_expr_coalesces_a_null_component_to_the_sentinel() {
         assert_eq!(
             pk_key_sql_expr(&pk(&["warehouse"]), Some("t")),
-            "coalesce(t.\"warehouse\"::text, chr(1))"
+            "coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1))"
         );
         assert_eq!(
             pk_key_sql_expr(&pk(&["warehouse", "sku"]), Some("t")),
-            "array_to_string(array[coalesce(t.\"warehouse\"::text, chr(1)), \
-             coalesce(t.\"sku\"::text, chr(1))], chr(31))"
+            "array_to_string(array[\
+             coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1)), \
+             coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))], chr(31))"
         );
     }
 
@@ -1439,14 +1494,22 @@ mod tests {
         assert_eq!(join_pk_key(["w1"]), "w1");
         assert_eq!(join_pk_key(["w1", "a"]), "w1\u{1f}a");
         assert_eq!(
-            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["w1", "a"])).unwrap(),
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["w1", "a"]))
+                .unwrap()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![Some("w1"), Some("a")]
         );
         // A genuine empty-string component still occupies its own part, so
         // the arity check can't be fooled by it — and, issue #110, it must
         // decode as `Some("")`, distinct from a real `NULL` component below.
         assert_eq!(
-            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["", "a"])).unwrap(),
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["", "a"]))
+                .unwrap()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![Some(""), Some("a")]
         );
     }
@@ -1463,7 +1526,11 @@ mod tests {
         let key = join_pk_key([encode_key_part(None), encode_key_part(Some("a"))]);
         assert_eq!(key, "\u{1}\u{1f}a");
         assert_eq!(
-            split_pk_key(&pk(&["warehouse", "sku"]), "t", &key).unwrap(),
+            split_pk_key(&pk(&["warehouse", "sku"]), "t", &key)
+                .unwrap()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![None, Some("a")]
         );
 
@@ -1472,13 +1539,81 @@ mod tests {
         let single = join_pk_key([encode_key_part(None)]);
         assert_eq!(single, "\u{1}");
         assert_eq!(
-            split_pk_key(&pk(&["warehouse"]), "t", &single).unwrap(),
+            split_pk_key(&pk(&["warehouse"]), "t", &single)
+                .unwrap()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![None]
         );
 
         // A NULL component and an empty-string component encode to
         // different text and therefore never collide.
         assert_ne!(encode_key_part(None), encode_key_part(Some("")));
+    }
+
+    /// Review follow-up to issue #110: [`NULL_KEY_SENTINEL`] is an ordinary
+    /// control character a `text` column can genuinely hold, so a value that
+    /// *was* a lone U+0001 must not be readable back as a `NULL` component —
+    /// that would fold two distinct groups onto one encoded key (silently,
+    /// and data-dependently, which is worse than the bug #110 fixes). The
+    /// doubling escape makes the two cases provably disjoint: an encoded
+    /// non-`NULL` part's U+0001 runs are always even-length, and the `NULL`
+    /// part is a run of one.
+    #[test]
+    fn a_real_sentinel_valued_component_never_decodes_as_null() {
+        let one_col = pk(&["sku"]);
+        let round_trip = |v: Option<&str>| {
+            let key = join_pk_key([encode_key_part(v)]);
+            let parts = split_pk_key(&one_col, "t", &key).unwrap();
+            let back = parts[0].as_deref().map(str::to_string);
+            (key, back)
+        };
+
+        let (null_key, null_back) = round_trip(None);
+        assert_eq!(null_key, NULL_KEY_SENTINEL);
+        assert_eq!(null_back, None);
+
+        for value in ["\u{1}", "\u{1}\u{1}", "a\u{1}b", "\u{1}\u{1}\u{1}", ""] {
+            let (key, back) = round_trip(Some(value));
+            assert_ne!(
+                key, null_key,
+                "a genuine {value:?} must not encode to the NULL sentinel"
+            );
+            assert_eq!(
+                back.as_deref(),
+                Some(value),
+                "and must round-trip back to itself"
+            );
+        }
+
+        // The same holds inside a composite key, where the escape has to
+        // survive the separator join/split too.
+        let two_col = pk(&["warehouse", "sku"]);
+        let key = join_pk_key([encode_key_part(Some("\u{1}")), encode_key_part(None)]);
+        assert_eq!(
+            split_pk_key(&two_col, "t", &key)
+                .unwrap()
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("\u{1}"), None]
+        );
+    }
+
+    /// The SQL-side twin of the test above: [`pk_key_sql_expr`] must render
+    /// the *escape* as well as the `NULL` substitution, or the two producers
+    /// disagree for any value holding a real U+0001.
+    #[test]
+    fn pk_key_sql_expr_escapes_a_real_sentinel_in_the_value() {
+        assert_eq!(
+            null_key_escape_sql("t.\"sku\"::text"),
+            "coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&pk(&["sku"]), Some("t")),
+            null_key_escape_sql("t.\"sku\"::text")
+        );
     }
 
     /// The length-prefixed encoding `apply_aggregate::derive_group_key` used

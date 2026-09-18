@@ -328,9 +328,10 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
 /// re-read (`read_live_rows_batch`'s keyset join, a plain `t.col = u.c0`)
 /// could never match a `NULL` column anyway. Issue #110 closes it: a `NULL`
 /// component now encodes as `ddl::NULL_KEY_SENTINEL` (a control character
-/// assumed absent from ordinary column text, the same convention
-/// `ddl::COMPOSITE_KEY_SEPARATOR`/`staging::append::TRUNCATE_SENTINEL_KEY`
-/// already rely on), and `read_live_rows_batch` uses `is not distinct from`
+/// that no genuine value can encode to, since `ddl::encode_key_part` escapes
+/// a real one by doubling it — see
+/// `a_real_sentinel_valued_group_key_stays_its_own_group` below), and
+/// `read_live_rows_batch` uses `is not distinct from`
 /// for any key component a batch's keys carry a `NULL` for.
 ///
 /// This test (formerly `a_null_keyed_group_never_reaches_the_chained_downstream_aggregate`,
@@ -471,4 +472,83 @@ async fn null_group_total(client: &Client, table: &str, column: &str) -> Option<
         .await
         .expect("read the NULL-keyed group")
         .and_then(|row| row.get(0))
+}
+
+/// Review follow-up to issue #110: `ddl::NULL_KEY_SENTINEL` is U+0001, an
+/// ordinary control character a `text` column can genuinely hold — so the
+/// encoding has to *escape* a real one rather than merely assume it never
+/// occurs. Without the escape, a group whose `sku` is a lone U+0001 encodes
+/// to exactly the same key text as the `sku IS NULL` group, and the two are
+/// folded into one: the upstream aggregate loses the U+0001 group entirely
+/// and mis-attributes its `amount` to the NULL group, at both levels of the
+/// chain. That is a silent, data-dependent corruption of data that worked
+/// correctly *before* #110, which makes it strictly worse than the bug #110
+/// fixes — hence this pin, alongside `ddl`'s own unit-level round-trip test.
+#[tokio::test]
+async fn a_real_sentinel_valued_group_key_stays_its_own_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    install_the_chain(&db, &mut client).await;
+
+    client
+        .batch_execute("insert into sales (id, sku, amount) values (7, null, 6)")
+        .await
+        .expect("insert the NULL-keyed row");
+    stage_cdc(
+        &client,
+        "sales",
+        "7",
+        "insert",
+        None,
+        Some(r#"{"id":"7","sku":null,"amount":"6"}"#),
+    )
+    .await;
+    client
+        .batch_execute(r"insert into sales (id, sku, amount) values (9, E'\x01', 5)")
+        .await
+        .expect("insert the U+0001-sku row");
+    stage_cdc(
+        &client,
+        "sales",
+        "9",
+        "insert",
+        None,
+        Some(r#"{"id":"9","sku":"\u0001","amount":"5"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    async fn sentinel_total(client: &Client, table: &str, column: &str) -> Option<String> {
+        client
+            .query_opt(
+                &format!(r"select {column}::text from {table} where sku = E'\x01'"),
+                &[],
+            )
+            .await
+            .expect("read the U+0001-keyed group")
+            .and_then(|row| row.get(0))
+    }
+
+    assert_eq!(
+        null_group_total(&client, "sku_totals", "total").await,
+        Some("6".to_string()),
+        "the NULL group keeps only its own row's amount"
+    );
+    assert_eq!(
+        sentinel_total(&client, "sku_totals", "total").await,
+        Some("5".to_string()),
+        "and the U+0001 group is a separate group, not folded into the NULL one"
+    );
+    assert_eq!(
+        null_group_total(&client, "sku_totals_v2", "total2").await,
+        Some("6".to_string()),
+        "both distinctions survive the chained hop's key round-trip"
+    );
+    assert_eq!(
+        sentinel_total(&client, "sku_totals_v2", "total2").await,
+        Some("5".to_string()),
+        "the U+0001 group propagates downstream as its own group too"
+    );
 }

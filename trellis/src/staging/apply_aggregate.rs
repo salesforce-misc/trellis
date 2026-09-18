@@ -538,7 +538,8 @@ impl AggregateTargetPlan {
 ///
 /// A `NULL` grouping component (issue #110) is rendered through
 /// [`ddl::encode_key_part`] as [`ddl::NULL_KEY_SENTINEL`] — a lone U+0001,
-/// assumed absent from ordinary column text — rather than
+/// which a genuine value can never encode to, since `encode_key_part`
+/// escapes a real U+0001 by doubling it — rather than
 /// `unwrap_or_default()`'s empty string. Before this fix, a `NULL` component
 /// rendered as `""`, indistinguishable from a genuine empty-string value, and
 /// `array_to_string` drops a bare SQL `NULL` array element outright on the
@@ -548,7 +549,7 @@ impl AggregateTargetPlan {
 /// `staging::apply::read_live_rows_batch`'s `=`-based keyset join (also
 /// fixed by #110, to `is not distinct from` wherever a batch's key carries a
 /// `NULL` component) mistook for a delete. Both the encoding
-/// (`ddl::pk_key_sql_expr`'s SQL-side `coalesce(<col>::text, chr(1))`) and
+/// (`ddl::pk_key_sql_expr`'s SQL-side `ddl::null_key_escape_sql`) and
 /// this Rust-side producer route every component through the same
 /// `NULL_KEY_SENTINEL` substitution, so a `NULL` group's key text agrees
 /// byte-for-byte on both sides of the wire regardless of arity.
@@ -3044,7 +3045,11 @@ mod tests {
             },
         ];
         assert_eq!(
-            ddl::split_pk_key(&pk, "stock_totals", &key).expect("decodes as a composite PK"),
+            ddl::split_pk_key(&pk, "stock_totals", &key)
+                .expect("decodes as a composite PK")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![Some("w1"), Some("a")],
             "the downstream consumer must decode exactly the grouping values back"
         );
@@ -3081,8 +3086,10 @@ mod tests {
 
         // Distinct from a group whose `warehouse` is a genuine empty string,
         // not NULL — the exact ambiguity issue #110 closes.
-        let (_, empty_string_key) =
-            derive_group_key(&row(&[("warehouse", Some("")), ("sku", Some("a"))]), &group_by);
+        let (_, empty_string_key) = derive_group_key(
+            &row(&[("warehouse", Some("")), ("sku", Some("a"))]),
+            &group_by,
+        );
         assert_eq!(empty_string_key, "\u{1f}a");
         assert_ne!(
             empty_string_key, key,
@@ -3100,13 +3107,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            ddl::split_pk_key(&pk, "stock_totals", &key).expect("decodes as a composite PK"),
+            ddl::split_pk_key(&pk, "stock_totals", &key)
+                .expect("decodes as a composite PK")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![None, Some("a")],
             "the downstream consumer must decode the NULL component back as None"
         );
         assert_eq!(
             ddl::split_pk_key(&pk, "stock_totals", &empty_string_key)
-                .expect("decodes as a composite PK"),
+                .expect("decodes as a composite PK")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![Some(""), Some("a")],
             "and the empty-string component back as Some(\"\")"
         );
@@ -3133,11 +3147,19 @@ mod tests {
             data_type: "text".to_string(),
         }];
         assert_eq!(
-            ddl::split_pk_key(&pk, "sku_totals", &null_key).expect("decodes"),
+            ddl::split_pk_key(&pk, "sku_totals", &null_key)
+                .expect("decodes")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![None]
         );
         assert_eq!(
-            ddl::split_pk_key(&pk, "sku_totals", &empty_key).expect("decodes"),
+            ddl::split_pk_key(&pk, "sku_totals", &empty_key)
+                .expect("decodes")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
             vec![Some("")]
         );
     }
