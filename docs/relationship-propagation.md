@@ -125,12 +125,11 @@ point of the exercise, not a completeness failure of the audit:
    (`catalog.rs:1026`) and so covers both entry points — this gate could be
    moved the same way.
 
-   **This is not currently filed anywhere.** Issue #163 is adjacent but
-   different: it is about composite-key *column ordering*
-   (`intake::extract_key`'s physical-column order vs. `ddl::pk_key_sql_expr`'s
-   PK-declared order agreeing only by fixture coincidence), not about which
-   entry points enforce the single-column-PK precondition. Treat this bullet
-   as an unfiled finding of this audit.
+   Filed as #177. Issue #163 is adjacent but different: it is about
+   composite-key *column ordering* (`intake::extract_key`'s physical-column
+   order vs. `ddl::pk_key_sql_expr`'s PK-declared order agreeing only by
+   fixture coincidence), not about which entry points enforce the
+   single-column-PK precondition.
 
 No cell in the table above is a *silent* correctness gap — every "N/A" is
 backed by a structural reason (a declare-time gate, or an input shape that
