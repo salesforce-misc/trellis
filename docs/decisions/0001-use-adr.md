@@ -8,14 +8,10 @@ informed:
 
 # Use ADR System
 
-Data-intensive tooling is always a mix of many tradeoffs.
-One data-pattern is more CPU-bound while another is bottlenecked
-by disk IOPS.
-It is important for us to be clear about which tradeoffs we are
-making and what use-cases we are optimizing for.
-To this end, this project will use the Architecture Decision
-Record pattern, to record key decisions and provide details on
-the motivations and intentions behind those decisions.
+Data-intensive tooling is a web of tradeoffs: one pattern is CPU-bound,
+the next is limited by disk IOPS. We use Architecture Decision Records to
+capture the key decisions, the tradeoffs they make, and the use-cases they
+optimize for.
 
 ## More Information
 

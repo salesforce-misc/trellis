@@ -2,7 +2,7 @@
 
 ← [Convergence and await](07-convergence-and-await.md) · [Overview](README.md)
 
-A condensed checklist for building this. Each item links to the document that argues for it.
+A condensed checklist. Each item links to the document that argues for it.
 
 ## What is essential vs. what is Postgres-specific
 
@@ -36,8 +36,7 @@ A condensed checklist for building this. Each item links to the document that ar
       recompute path. Never approximate an inverse.
       → [05](05-apply-and-exactly-once-deltas.md)
 - [ ] **An undrainable item stops the whole instance, on purpose** — write the
-      metric for it at the same time, so "stopped" and "slow" stay
-      distinguishable.
+      metric at the same time, so "stopped" and "slow" stay distinguishable.
       → [06](06-cleanup-and-reclaim.md)
 
 ## Build order
@@ -87,7 +86,7 @@ These fail only if you write them deliberately; ordinary end-to-end tests pass a
 
 ## Anti-patterns to name in review
 
-Each of these is a regression to something this design deliberately avoids:
+Each is a regression to something this design deliberately avoids:
 
 - Merging staged rows at write time "to save the fold" — reintroduces mutable
   claimed batches, hence compare-and-delete and survivor rewriting.

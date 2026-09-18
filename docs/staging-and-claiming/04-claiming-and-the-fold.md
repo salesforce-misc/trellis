@@ -16,8 +16,8 @@ same derived state. Correctness comes from the fence
 Nothing is removed, moved, or marked when a batch is claimed. A claim is a
 *positional, re-issuable cursor*: if the claimant dies, another worker re-claims
 and re-drains from scratch, and the result is identical because the batch is
-immutable and the recompute is deterministic. That is what lets the reclaim
-window be short and the claim mechanism be cheap.
+immutable and the recompute deterministic. That is what lets the reclaim window be
+short and the claim mechanism cheap.
 
 Contrast `UPDATE … SET claimed_by = me` on each row: the claim becomes a write,
 the rows become hot-update targets, and losing a claim means reconciling partial
@@ -29,20 +29,17 @@ A batch is a unit of *batching*, not necessarily one unit of *work*. A large
 batch is split into buckets at seal time, and workers claim buckets.
 
 **How many buckets** is decided **once, by the seal, from configuration and batch
-size only**: a batch of at least `MIN_ROWS_TO_SPLIT` (256) rows is sealed into
-`SEG_BUCKETS` (default 8); anything smaller gets 1, the unsplit behaviour exactly.
-
-It deliberately **does not** consult the live-worker registry (e.g.
-`min(cap, live workers)`). Workers register lazily, so a bulk batch seals before
-the pool's threads arrive, and the live count sampled at seal time swings run to
-run. The partition is immutable and safety-critical, so it must not be sampled
-from a registry that moves under it.
+size only**: at least `MIN_ROWS_TO_SPLIT` (256) rows seals into `SEG_BUCKETS`
+(default 8); anything smaller gets 1. It deliberately **does not** consult the
+live-worker registry — workers register lazily and the count swings run to run, so
+an immutable, safety-critical partition must not be sampled from a registry that
+moves under it.
 
 **How large a share** one claim takes *is* where adapting to the live fleet
-belongs, because being wrong there costs a pass of under-parallelism rather than a
-double apply. The share is `ceil(free_buckets / live_workers)`. Both extremes are wrong: *every*
-free bucket is the single-worker bulk path again; *one* bucket per claim makes a
-lone worker pay `bucket_count` claims, folds and applies for one batch.
+belongs — being wrong there costs a pass of under-parallelism, not a double apply.
+The share is `ceil(free_buckets / live_workers)`. Both extremes are wrong: *every*
+free bucket is the single-worker bulk path again; *one* bucket makes a lone worker
+pay `bucket_count` claims, folds and applies for one batch.
 
 **Exclusivity is the primary key**, not a lock:
 
@@ -68,17 +65,15 @@ the 30 s reclaim TTL.
 > query; an unreferenced `FOR UPDATE` pre-lock CTE gets pruned and locks nothing.
 
 **A row's bucket is a total function of the row and its batch.** Every row is in
-exactly one of its batch's buckets: none in two (a double apply on the delta
-path), none in zero (silently lost work). That is why the routing key is *stored*,
-not recomputed, and why `bucket_count` is fixed at the seal — either changing
-mid-drain moves rows between buckets, and a row moving out of a completed bucket
-into an incomplete one is applied twice.
+exactly one of its batch's buckets: none in two (a double apply), none in zero
+(silently lost work). That is why the routing key is *stored*, not recomputed, and
+`bucket_count` fixed at the seal — changing either mid-drain moves a row out of a
+completed bucket into an incomplete one, and it applies twice.
 
-There is **one bucket definition, in SQL**, with exactly one caller (the fold's
-filter). Which buckets a worker holds is read from the claims table, never
-recomputed. Any host-language `bucket_of_route` should be a **test oracle** written
-against the SQL, so "the two agree" is a property the tests check rather than a
-two-sided risk the engine runs.
+There is **one bucket definition, in SQL**, with one caller (the fold's filter);
+which buckets a worker holds is read from the claims table, never recomputed. Any
+host-language `bucket_of_route` should be a **test oracle** against that SQL, so
+"the two agree" is a property the tests check, not a risk the engine runs.
 
 ### What key-routing buys and what it does not
 
@@ -87,11 +82,11 @@ Two obstacles are real:
 
 - **Three of the four producers have no image to derive a group key from.** They
   append bare recompute triggers, so a group key would need a per-row catalog
-  lookup and a live source read on the hot append path — the exact cost the
-  generated column exists to avoid.
-- **A per-batch bucket is not stable across batches.** `bucket_count` is chosen
-  per batch and buckets are re-assigned at every claim, so group G in batch *k* and
-  *k+1* need not meet the same worker — which is what co-location would require.
+  lookup and live source read on the hot append path — the exact cost the generated
+  column exists to avoid.
+- **A per-batch bucket is not stable across batches.** `bucket_count` is per-batch
+  and buckets re-assign at every claim, so group G in batch *k* and *k+1* need not
+  meet the same worker, which co-location would require.
 
 So key-routing buys **disjoint bulk parallelism** and keeps every row of a key in
 one bucket, but it does **not** co-locate an aggregate group: two workers on two
@@ -107,11 +102,10 @@ one anyway ([02](02-the-staging-ring.md)).
 
 ## The claim-time fold
 
-The merge the write-time upsert used to do now happens at **read** time: group the
-claimed batch's fenced window by `(table, key)` into exactly one record each.
+The merge the write-time upsert once did now happens at **read** time: group the
+claimed batch's fenced window by `(table, key)` into one record each.
 
-Four rules are load-bearing, and they are the same four the write-time merge
-established:
+Four rules are load-bearing — the same four the write-time merge established:
 
 | Field | Rule | Why |
 |---|---|---|
@@ -124,19 +118,17 @@ Plus `lsn` GREATEST (over *every* row, image-less included, so the watermark
 still covers them) and a hop-generation counter that resets to 0 on any source
 change.
 
-`change_id` (issue #31) is store-assigned from a shared sequence (`nextval`),
-monotonic across the whole ring, recording the append order within one source
-transaction — the one thing commit `lsn` can't: every row of a transaction
-shares its commit `lsn`, so ordering an INSERT before a later UPDATE of the
-same key in that transaction needs a second, intra-commit order. `lsn` stays
-the primary order; `change_id` only breaks ties within a single commit.
+`change_id` (issue #31) is store-assigned from a shared `nextval` sequence,
+monotonic across the ring. It records the one order commit `lsn` can't: every row
+of a transaction shares its commit `lsn`, so ordering an INSERT before a later
+UPDATE of the same key needs an intra-commit order. `lsn` stays primary;
+`change_id` only breaks ties within a single commit.
 
 ### The two kinds of missing image
 
-This is the fold's sharpest subtlety, because some producers emit changes and
-others emit bare triggers. Both arg-extremes must distinguish **"there is
-genuinely no image here"** from **"this producer does not carry images"** — two
-different facts needing different answers:
+The fold's sharpest subtlety: some producers emit changes, others bare triggers,
+so both arg-extremes must distinguish **"there is genuinely no image here"** from
+**"this producer does not carry images"** — two facts needing different answers:
 
 - A key **born inside the batch** (insert-then-update) folds to `old_image =
   NULL`, because its lowest-`lsn` change is the insert, which has no pre-image (a
@@ -144,14 +136,13 @@ different facts needing different answers:
   and it suppresses a spurious `−f(old)`. It is more correct than the old
   write-time `COALESCE(old_image, EXCLUDED.old_image)` merge, and it must survive
   the fold. **Do not reintroduce a blanket `COALESCE` here.**
-- An **image-less row** — both images NULL — is not a change at all. Aggregate
-  functions like `array_agg` do not skip NULLs, so before the discriminator such a
-  row silently won whichever ordering its `lsn` topped and handed the drain a NULL
-  image, which the delta path reads as "no side to apply". The failure was
-  directional and both directions were live: a re-derive restaged at
-  `pg_current_wal_lsn()` killed the `+f(new)` and **under**-counted, up to deleting
-  a live group; reverse propagation and backfill restaged below and killed the
-  `−f(old)`, **over**-counting with a phantom member.
+- An **image-less row** — both images NULL — is not a change at all. Aggregates
+  like `array_agg` don't skip NULLs, so before the discriminator such a row won
+  whichever ordering its `lsn` topped and handed the drain a NULL image, which the
+  delta path reads as "no side to apply". The failure ran both ways: a re-derive
+  restaged at `pg_current_wal_lsn()` killed the `+f(new)` and **under**-counted, up
+  to deleting a live group; reverse propagation and backfill restaged below and
+  killed the `−f(old)`, **over**-counting with a phantom member.
 
 The discriminator is therefore *"does this row carry any image at all"*, **not**
 *"is this image column null"*:
@@ -179,12 +170,10 @@ would fold it to NULL and lose the truncate.
   does not own.
 - Raise the session sort memory before the fold (Trellis uses 64 MB) so the
   ordered aggregates sort in memory rather than spilling on a large batch.
-- Carry `first_seen = min(appended_at)` per key — the end-to-end latency origin.
-  It must be per-row, **not** the batch's creation timestamp: an active batch is
-  created empty by the seal that opens it and only sealed once a worker finds rows,
-  so its age is unbounded during idle. Latency derived from creation time then
-  over-reports wildly — a change drained in milliseconds appears to take seconds,
-  purely from the idle gap before it was staged.
+- Carry `first_seen = min(appended_at)` per key — the latency origin. It must be
+  per-row, **not** the batch's creation timestamp: an active batch is created empty
+  and its age is unbounded during idle, so creation-time latency over-reports wildly
+  — a change drained in milliseconds appears to take seconds.
 
 ## Keeping a claim alive
 
@@ -198,12 +187,11 @@ the whole of each step.
 - **Out-of-band**: a process-wide daemon on its own connection refreshes every
   registered claim in one statement every 5 s, against a 30 s reclaim window.
 
-The out-of-band half makes the cadence a function of **wall time**, not of how
-many source tables the batch touches. Without it, the bulk shape — one large
-transaction becoming one batch touching one source table — runs a drain long
-enough to outlive the reclaim window on its single in-line heartbeat: the sweeper
-reclaims it, the worker re-claims it immediately, and two workers trade the batch
-forever.
+The out-of-band half makes the cadence a function of **wall time**, not how many
+source tables the batch touches. Without it, the bulk shape — one large transaction
+touching one source table — runs a drain that outlives the reclaim window on its
+single in-line heartbeat: the sweeper reclaims, the worker re-claims, and the two
+trade the batch forever.
 
 Two details make it cheap and safe: the daemon opens **no connection** until a
 claim has been registered for a full interval (a fast drain costs nothing) and
@@ -223,17 +211,16 @@ consumed, either way the re-claim is a clean re-drain from scratch.
 **Released**, immediately, by the worker itself, on **any** error. Nothing was
 applied — a fold error precedes every write and an apply error rolls back — so the
 claim covers work that did not happen. This is load-bearing for *latency*: without
-it the only route back is the TTL, so a routine, immediately-retryable failure
-parks the work for 30 seconds. And that failure is not exotic: **every definition
-change trips the version fence** on any worker whose loaded schema predates it,
-which is exactly what "change a formula, then wait for it" does.
+it the only route back is the TTL, parking a routine, retryable failure for 30
+seconds. And it isn't exotic: **every definition change trips the version fence**
+on a worker whose loaded schema predates it — exactly what "change a formula, then
+wait for it" does.
 
-Because release makes a fence miss instantly re-claimable, it also removes the
-TTL's accidental role as a **rate limiter** — so the loop must back off on
-*consecutive* fence misses itself (zero wait for the first, so read-your-writes
-stays fast, then doubling from 10 ms to a 1 s ceiling, reset by any clean drain).
-A definition the reload never resolves is then re-claimed at a bounded rate instead
-of hot-looping.
+Because release makes a fence miss instantly re-claimable, it removes the TTL's
+accidental role as a **rate limiter** — so the loop must back off on *consecutive*
+fence misses itself (zero wait for the first, so read-your-writes stays fast, then
+doubling from 10 ms to a 1 s ceiling, reset by any clean drain). A definition the
+reload never resolves is then re-claimed at a bounded rate, not hot-looping.
 
 Every release is scoped `claimed_by = me`, so a claim already reclaimed or taken
 over is untouched. A caller that took the claim *itself* keeps it and retries in
@@ -249,9 +236,9 @@ behind one.
 
 Suspending *claiming* fleet-wide is occasionally necessary — a self-check auditor
 needs a quiescent read. It is a heartbeated **lease** with an `expires_at`, not a
-latch, so a dead pauser can never wedge the fleet. It gates the claim and the
-seal-on-demand at the top of a drain call; a batch already claimed on a prior call
-finishes normally.
+latch, so a dead pauser can never wedge the fleet. It gates the claim and
+seal-on-demand at the top of a drain call; a batch already claimed finishes
+normally.
 
 If you build one, make the heartbeat `WHERE expires_at > now()` so a heartbeat
 arriving *after* expiry cannot silently resurrect a lapsed lease and mask the very
@@ -259,13 +246,11 @@ window that made the paused read unsound.
 
 ## What is load-bearing here
 
-- **Claim exclusivity is an `INSERT … ON CONFLICT DO NOTHING`** on a
-  `(batch, bucket)` primary key — a unique constraint, not a lock manager. The
-  `SELECT … FOR UPDATE SKIP LOCKED` only serves the sweep.
+- **Claim exclusivity is `INSERT … ON CONFLICT DO NOTHING`** on a `(batch, bucket)`
+  primary key — a unique constraint, not a lock manager. `FOR UPDATE SKIP LOCKED`
+  only serves the sweep.
 - **The fold rules are the core of this stage.** The four-rule table and the
   image-bearing discriminator are where the silent bugs live.
-- **No write-time merge.** Merging to "save" the fold makes staged rows mutable,
-  and mutable staged rows force the survivor-rewrite machinery back into existence
-  ([05](05-apply-and-exactly-once-deltas.md)).
-- **The routing key does not co-locate the contended thing, and says so.** Two
-  workers on two buckets of one batch still contend on a hot aggregate group.
+- **No write-time merge.** It makes staged rows mutable, which forces the
+  survivor-rewrite machinery back into existence ([05](05-apply-and-exactly-once-deltas.md)).
+- **The routing key does not co-locate the contended thing, and says so.**

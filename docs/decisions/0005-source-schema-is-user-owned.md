@@ -9,59 +9,49 @@ informed:
 # Source Schema Is User-Owned
 
 Trellis reads source tables over logical replication and derives target tables
-from them. A recurring temptation, as features grow, is for Trellis to *improve*
-the source schema on the user's behalf — add an index to make a lookup fast, add
-a `UNIQUE` constraint to guarantee an invariant a transform relies on, set
-`REPLICA IDENTITY FULL` so deletes carry an old image. This ADR rejects that
-class of behavior.
+from them. As features grow, it's tempting to *improve* the source schema on the
+user's behalf — add an index, add a `UNIQUE` constraint a transform relies on,
+set `REPLICA IDENTITY FULL` so deletes carry an old image. This ADR rejects that.
 
 ## Decision
 
-**Trellis never modifies the source schema.** It does not create indexes, add or
-alter constraints, change replica identity, or issue any other DDL against a
-source table. The user owns those tables; Trellis is a reader.
+**Trellis never modifies the source schema.** No indexes, no constraint changes,
+no replica-identity changes, no DDL against a source table. The user owns those
+tables; Trellis is a reader. Instead:
 
-Instead, Trellis:
+1. **Validate strongly at definition time.** Every definition is checked against
+   the introspected source schema (`pg_catalog` / `information_schema`) before
+   acceptance. If the schema can't support it, the definition is **rejected** —
+   Trellis never silently produces wrong answers, and never reshapes the source
+   to make a definition work.
+2. **Guide the user to a fix.** Every rejection or warning names the exact change
+   to make — e.g. "`products.id` must be a primary key or `UNIQUE` to be a to-one
+   target; add one, or go through an aggregate," or "no index on
+   `order_line_items.product_id`; related-row updates will be slow — consider
+   `CREATE INDEX ... ON order_line_items (product_id)`."
 
-1. **Validates strongly at definition time.** Every definition is checked against
-   the introspected source schema (`pg_catalog` / `information_schema`) before it
-   is accepted. If the source schema cannot support the definition, the
-   definition is **rejected** — Trellis does not silently produce wrong answers
-   and does not quietly reshape the source to make it work.
-2. **Guides the user toward a working solution.** A rejection (or a performance
-   warning) carries the most helpful, specific message we can produce, including
-   the exact change the user should make to their own schema — e.g. "`products.id`
-   must be a primary key or have a `UNIQUE` constraint to be the target of a
-   to-one relationship; add one, or reference this relationship through an
-   aggregate," or "no index on `order_line_items.product_id`; related-row updates
-   will be slow — consider `CREATE INDEX ... ON order_line_items (product_id)`."
-
-The distinction between the two is **correctness vs. performance**:
+Correctness vs. performance sets the severity:
 
 * A missing correctness prerequisite (a required type, a uniqueness guarantee a
-  bare to-one relationship depends on) is a **hard rejection** at definition time.
-* A missing performance prerequisite (an index that would make reverse
-  propagation cheap) is a **warning**: the definition still succeeds and is
-  correct without it; we tell the user what to add if they want it fast.
+  bare to-one relationship needs) is a **hard rejection**.
+* A missing performance prerequisite (an index for cheap reverse propagation) is
+  a **warning**: the definition succeeds and is correct without it.
 
 ## Consequences
 
-* Definitions are only as capable as the source schema the user has actually
-  built. This is deliberate: a Trellis instance never leaves the user's schema in
-  a state they didn't author.
-* Validation logic must introspect real constraints (primary keys, unique
-  indexes, column types, replica identity) rather than assume them. Requirements
-  that today are stated as "checked user requirements" (e.g. `REPLICA IDENTITY
-  FULL` for deletes/re-parents from one-to-many aggregates, see
-  `staging-and-claiming/01-intake-and-lsn-confirmation.md`) are enforced this
-  way: checked and surfaced, never applied by Trellis.
-* Error and warning messages are a first-class part of the product surface, not
-  an afterthought — the guidance *is* how a user learns to shape a schema Trellis
-  can serve well.
+* Definitions are only as capable as the schema the user actually built — by
+  design. Trellis never leaves a schema in a state the user didn't author.
+* Validation must introspect real constraints (keys, unique indexes, types,
+  replica identity), never assume them. Requirements like `REPLICA IDENTITY FULL`
+  for deletes/re-parents from one-to-many aggregates (see
+  `staging-and-claiming/01-intake-and-lsn-confirmation.md`) are checked and
+  surfaced, never applied.
+* Error and warning messages are first-class product surface: the guidance *is*
+  how a user learns to shape a schema Trellis can serve well.
 
 ## Scope
 
-This is a project-wide stance, not specific to any one feature. It governs how
-every current and future definition type validates against source tables —
-transforms, relationships (see [0006-relationships](0006-relationships.md)), and
-the transform-redefinition work still being designed.
+Project-wide, not feature-specific. Governs how every definition type validates
+against source tables — transforms, relationships (see
+[0006-relationships](0006-relationships.md)), and the transform-redefinition work
+still being designed.

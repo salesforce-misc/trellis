@@ -8,9 +8,9 @@ informed:
 
 # Named Relationships
 
-This ADR settles the design for named relationships: how one is declared and
-referenced, how cardinality constrains that reference, and how a change to a
-*related* row propagates back to the rows that depend on it.
+This ADR settles how a named relationship is declared and referenced, how
+cardinality constrains that reference, and how a change to a *related* row
+propagates back to the rows that depend on it.
 
 ## Declaration
 
@@ -19,90 +19,77 @@ transform's `FROM`, so one relationship is reusable across many transforms:
 
 ```text
 RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+
+RELATIONSHIP product FROM order_line_items.product_id TO products.id
+RELATIONSHIP author  FROM posts.author_id            TO users.id
+RELATIONSHIP editor  FROM posts.editor_id            TO users.id
 ```
 
-```text
-RELATIONSHIP product  FROM order_line_items.product_id TO products.id
-RELATIONSHIP author   FROM posts.author_id             TO users.id
-RELATIONSHIP editor   FROM posts.editor_id             TO users.id
-```
-
-The statement grammar follows ADR-0004's approach: our own minimal grammar,
-parsed at definition time into an AST, sharing the same lexer and expression
-language used everywhere else.
+The grammar follows [ADR-0004](0004-transform-definition-grammar.md): our own minimal
+grammar, parsed at definition time into an AST over the shared lexer and
+expression language.
 
 ### Naming and scope
 
 * A relationship name is **unique per from-table**, not global. `posts` may
-  declare both `author` and `editor` pointing at `users` as independent
-  relationships.
-* Relationships may be declared in any order relative to the transforms and
-  tables they reference, as long as every endpoint resolves and the resulting
-  dependency graph stays acyclic.
+  declare both `author` and `editor` at `users` as independent relationships.
+* Relationships may be declared in any order, as long as every endpoint
+  resolves and the dependency graph stays acyclic.
 
 ### Endpoints
 
 * Either endpoint may be a **source table or a transform target**, in any
   combination.
 * **No FK auto-discovery.** Every relationship names its join key explicitly.
-  Inferring relationships from foreign-key metadata is a possible future
-  convenience, not part of this design.
 
 ## Referencing a relationship
 
 A calculated field references a relationship through a qualified path whose
-**head is the relationship name** — not the target table name and not a
-per-query alias:
+**head is the relationship name** — not the target table and not a per-query
+alias:
 
 ```text
 product.category_name
 ```
 
-`category_name` is a column on the to-side table; per-from-table name uniqueness
-guarantees `product` names exactly one relationship on the referencing table.
+`category_name` is a column on the to-side table; per-from-table uniqueness
+guarantees `product` names exactly one relationship. How it may be referenced
+depends on **cardinality**, paralleling how granularity constrains formula
+shape in [transforms](../transforms.md#calculated-fields).
 
-How a relationship may be referenced depends on its **cardinality**, which
-parallels how granularity constrains formula shape in
-[transforms](../transforms.md#calculated-fields):
+### To-one (at most one related row)
 
-### To-one relationships (at most one related row)
+If the to-side column is a **primary key or `UNIQUE`**, the join resolves to at
+most one row and enrichment columns are usable as **bare paths**
+(`product.category_name`). A transform target always qualifies, its PK coming
+from its key-space.
 
-If the to-side column is a **primary key or has a `UNIQUE` constraint**, the join
-resolves to at most one related row and enrichment columns are usable as **bare
-paths** (`product.category_name`). A transform target always qualifies, since its
-primary key comes from its key-space.
+This invariant is enforced **at definition time** from the to-side constraint,
+per [ADR-0005](0005-source-schema-is-user-owned.md): a bare to-one relationship
+whose to-side is not provably unique is rejected with guidance (add `UNIQUE`, or
+use the aggregate form). A runtime uniqueness violation quarantines the affected
+key (existing per-key isolation), never resolving to an arbitrary row.
 
-This "at most one related row" invariant is enforced **at definition time** from
-the to-side constraint, per
-[ADR-0005](0005-source-schema-is-user-owned.md): a bare to-one relationship whose
-to-side is not provably unique is rejected with guidance (add a `UNIQUE`
-constraint, or use the aggregate form). If data violates uniqueness at runtime,
-the affected key is quarantined (per the existing per-key isolation mechanism),
-never silently resolved to an arbitrary row.
-
-### To-many relationships (many related rows)
+### To-many (many related rows)
 
 If the to-side column is not unique, the relationship is **to-many** and its
-columns may be referenced **only** wrapped in exactly one aggregate function
-(`SUM`, `MIN`, `MAX`, `AVG`, `COUNT`) over the related rows:
+columns may be referenced **only** wrapped in exactly one aggregate (`SUM`,
+`MIN`, `MAX`, `AVG`, `COUNT`):
 
 ```text
 sum(comments.word_count)
 ```
 
-This uses the same aggregate semantics and incremental-delta machinery as a
-`GROUP BY` transform, keyed by the relationship's join value instead of a
-grouping tuple. A **bare** reference to a to-many relationship is a definition-time
-error.
+This reuses `GROUP BY` aggregate semantics and incremental-delta machinery,
+keyed by the join value instead of a grouping tuple. A **bare** to-many
+reference is a definition-time error.
 
 ### Relationship vs. cross-join
 
-A relationship of either cardinality **keeps the referencing table's own
+A relationship of either cardinality **keeps the referencing table's
 granularity**, folding related data into scalar enrichment columns. A
-**cross-join changes granularity**, producing a new table at the pairing grain
-(`{a.pk, b.pk}`). Same data shape, different output grain: a to-many relationship
-decorates existing rows with an aggregate of related rows; a cross-join produces
-one row per matching pair.
+**cross-join changes granularity**, producing one row per matching pair at the
+pairing grain (`{a.pk, b.pk}`).
 
 ## Chaining
 
@@ -113,30 +100,24 @@ on the table the previous segment resolved to:
 post.author.name
 ```
 
-Here `post` is a relationship on `comments`, `author` is a relationship on
-`posts`, and `name` is a column on `authors`. Each hop resolves under its own
-cardinality rule; the chain's cardinality is to-one only if **every** hop is
-to-one, in which case the whole path stays a bare reference. A to-many hop
-anywhere in the chain makes the whole path to-many, referenceable only wrapped
-in exactly one aggregate at the outermost reference — a chain does not let a
-later to-one hop "undo" an earlier to-many one:
+Each hop resolves under its own cardinality rule. The chain is to-one only if
+**every** hop is to-one, staying a bare reference; a single to-many hop makes
+the whole path to-many — referenceable only wrapped in one outermost aggregate,
+with no later to-one hop "undoing" it:
 
 ```text
 sum(comments.post.author.post_count)
 ```
 
-Chained relationships add no new cycle-detection or storage machinery: each hop
-is already an edge in the dependency graph from
-[Dependency graph and cycles](#dependency-graph-and-cycles), so a chain is just
-several edges traversed in sequence.
+Chaining adds no new machinery: each hop is already an edge in the
+[dependency graph](#dependency-graph-and-cycles).
 
 ## Nullability
 
-* A to-one relationship with **no matching related row** yields `NULL` for its
-  enrichment columns (left-join semantics). It does not affect whether the
-  referencing row exists.
-* A to-many relationship with no related rows yields the aggregate's empty result
-  (`COUNT` → `0`, `SUM` → `NULL`, etc.), matching PostgreSQL.
+* A to-one relationship with no matching row yields `NULL` enrichment columns
+  (left-join semantics); it does not affect whether the referencing row exists.
+* A to-many relationship with no related rows yields the aggregate's empty
+  result (`COUNT` → `0`, `SUM` → `NULL`), matching PostgreSQL.
 
 ## Dependency graph and cycles
 
@@ -144,72 +125,61 @@ Relationship links are **edges in the same cross-table dependency graph** as
 sources, joins, and chained transforms
 ([transforms](../transforms.md#chaining-and-cycle-detection)). Cycles — both
 column-to-column and table-to-table — are rejected at definition time across the
-whole graph, so evaluation order is well-defined and runtime propagation
-terminates.
+whole graph, so evaluation order is well-defined and propagation terminates.
 
 ## Storage
 
-Relationship definitions are persisted in Trellis's own catalog as source text,
-re-parsed on read, immutable once created, mirroring transform definitions. No
-storage change is made to source tables (see
-[ADR-0005](0005-source-schema-is-user-owned.md)).
+Relationship definitions are persisted in Trellis's catalog as source text,
+re-parsed on read, immutable once created — mirroring transforms. Source tables
+are unchanged (see [ADR-0005](0005-source-schema-is-user-owned.md)).
 
 ## Incremental maintenance
 
-Trellis maintains enriched columns incrementally, like any other calculated
-field, over the asynchronous staging/apply pipeline
+Trellis maintains enriched columns incrementally, like any calculated field,
+over the asynchronous staging/apply pipeline
 ([ADR-0002](0002-async-data-flow.md), [data-flow](../data-flow.md)). Two
 directions:
 
 * **Forward (a referencing row changes).** Its enrichment columns are re-derived
-  in dependency order: a to-one relationship looks up the single related row by
-  join key; a to-many relationship aggregates the related rows.
-* **Reverse (a *related* row changes).** Trellis resolves, from the dependency
-  graph, which relationships target the changed table, then re-derives the
-  referencing rows whose join key matches the changed row's key. That key comes
-  from the changed row's replica image, so both cardinalities constrain the
-  replica identity of the tables involved — enforced at define time, when the
-  relationship is declared, rather than deferred to first use:
+  in dependency order: to-one looks up the single related row by join key;
+  to-many aggregates the related rows.
+* **Reverse (a *related* row changes).** From the dependency graph, Trellis
+  finds which relationships target the changed table and re-derives the
+  referencing rows whose join key matches the changed row's key — read from the
+  changed row's replica image. Both cardinalities therefore constrain replica
+  identity, enforced at define time:
 
-  * A **to-many** relationship's join key is a *non-PK* column on the to-side,
-    which the default (PK) replica identity omits from delete/re-parent
-    pre-images. It requires `REPLICA IDENTITY FULL`, or a replica-identity index
-    covering the join column.
-  * A **to-one** relationship's join key is the to-side's own primary key, which
-    the default replica identity does carry — but the key alone is not enough.
-    Every to-one relationship gets a settled parent projection unconditionally,
-    and that projection's reverse-applied advance needs the to-side row's
-    *entire* old image to detect a parent update, delete, or re-key. A narrower
-    replica identity covering only the join column cannot supply an old image of
-    unpredictably-many columns, so a to-one relationship requires
-    `REPLICA IDENTITY FULL` on the to-side.
-  * A **to-one** relationship additionally requires `REPLICA IDENTITY FULL` on
-    its **from-side** (child) table. The from-side's join column is an ordinary
-    non-key column — the foreign key — so under that table's default (PK)
-    replica identity, an `UPDATE` that re-points the foreign key without
-    touching the primary key ships *no* pre-image at all, rather than one that
-    merely omits the changed column. Anything recovering a row's prior parent
-    from the replication message is then reading nothing. The to-side gate above
-    cannot catch this: a from-side re-point never touches the to-side row.
+  * **To-many**'s join key is a *non-PK* to-side column, omitted from the
+    default (PK) replica identity's delete/re-parent pre-images. Requires
+    `REPLICA IDENTITY FULL`, or a replica-identity index covering the join
+    column.
+  * **To-one**'s join key is the to-side PK, which the default identity carries
+    — but the key alone is not enough. Every to-one relationship gets an
+    unconditional settled parent projection, whose reverse-applied advance needs
+    the to-side row's *entire* old image to detect an update, delete, or re-key.
+    So the to-side requires `REPLICA IDENTITY FULL`.
+  * **To-one** additionally requires `REPLICA IDENTITY FULL` on its **from-side**
+    (child) table. The from-side join column is an ordinary non-key column (the
+    FK), so under the default identity an `UPDATE` that re-points the FK without
+    touching the PK ships *no* pre-image — nothing to recover the prior parent
+    from. The to-side gate cannot catch this: a from-side re-point never touches
+    the to-side row.
 
-  This reuses the existing "recompute" staging path rather than a bespoke
-  persisted reverse index.
+  This reuses the existing "recompute" staging path, not a bespoke persisted
+  reverse index. Finding the affected referencing rows is a lookup on the
+  from-side join column — **correct without an index**; an index only makes it
+  fast. Per [ADR-0005](0005-source-schema-is-user-owned.md), Trellis does not
+  create it; it detects a usable one and, if absent, emits a performance warning
+  naming the exact `CREATE INDEX`.
 
-  Finding the affected referencing rows is a lookup on the from-side join column.
-  That lookup is **correct without an index**; an index only makes it fast. Per
-  [ADR-0005](0005-source-schema-is-user-owned.md), Trellis does not create the
-  index — it detects whether a usable one exists and, if not, emits a performance
-  warning naming the exact `CREATE INDEX` the user may run.
-
-This is the case [ADR-0002](0002-async-data-flow.md) flagged: formulas that
-reference across relationships are unsound under naive synchronous triggers. The
-asynchronous staging/apply/fence design makes them sound; reverse propagation is
-one more producer feeding that same machinery, not a new ordering regime.
+This is the case [ADR-0002](0002-async-data-flow.md) flagged: cross-relationship
+formulas are unsound under naive synchronous triggers. The async
+staging/apply/fence design makes them sound; reverse propagation is one more
+producer feeding that machinery, not a new ordering regime.
 
 ## Redefinition
 
 Relationships are **immutable once declared**, like transforms: to change a join
-key you declare a new relationship and cut over. Editing the *calculated columns
-that consume* a relationship is part of the separate transform-redefinition work
-(see [open-questions](../open-questions.md)); its rules govern those columns, not
-the relationship link itself.
+key, declare a new relationship and cut over. Editing the calculated columns
+that *consume* a relationship is separate transform-redefinition work (see
+[open-questions](../open-questions.md)).

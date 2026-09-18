@@ -82,15 +82,15 @@ Each numbered step has its own document:
 | — | Proving it (read-your-writes) | [07-convergence-and-await.md](07-convergence-and-await.md) | A caller can block until its own write is reflected, and the predicate never lies. |
 | — | Implementation checklist | [08-implementation-checklist.md](08-implementation-checklist.md) | What is essential to correctness, what is a Postgres-specific choice, what to test. |
 
-A source `TRUNCATE` cuts across several of these stages (sealing, the fold, and
-apply); its whole-keyspace-clear semantics and drain-ordering barrier are
-written up separately in [truncate-propagation-spec.md](truncate-propagation-spec.md).
+A source `TRUNCATE` cuts across sealing, the fold, and apply; its
+whole-keyspace-clear semantics and drain-ordering barrier are written up in
+[truncate-propagation-spec.md](truncate-propagation-spec.md).
 
-Four of these guarantees are correctness (intake durability, one batch per row,
-claimed batches immutable, exactly-once deltas); each is enforced in exactly one
-stage, and duplicating any of them is how the design rots.
-Everything else — buckets, heartbeats, poison quarantine, truncate eligibility —
-is liveness, throughput, or observability, never load-bearing for correctness.
+Four guarantees are correctness (intake durability, one batch per row, claimed
+batches immutable, exactly-once deltas); each is enforced in exactly one stage,
+and duplicating any of them is how the design rots. Everything else — buckets,
+heartbeats, poison quarantine, truncate eligibility — is liveness, throughput,
+or observability.
 
 ## The state you have to keep
 
@@ -110,11 +110,10 @@ high-volume ones be append-only and vacuum-free.
 
 ## Reading order
 
-Read [01](01-intake-and-lsn-confirmation.md) → [02](02-the-staging-ring.md) →
-[03](03-sealing-and-the-fence.md) in order; the fence in 03 does not make sense
-without the append discipline in 02. [04](04-claiming-and-the-fold.md) and
-[05](05-apply-and-exactly-once-deltas.md) are the worker half, best read as a
-pair. [06](06-cleanup-and-reclaim.md) and [07](07-convergence-and-await.md) are
-the operational half; [07](07-convergence-and-await.md) covers the
-read-your-writes predicate, the easiest part of the design to get silently
-wrong, so read it before designing the equivalent predicate.
+[01](01-intake-and-lsn-confirmation.md) → [02](02-the-staging-ring.md) →
+[03](03-sealing-and-the-fence.md) in order — the fence in 03 needs the append
+discipline in 02. [04](04-claiming-and-the-fold.md) and
+[05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair.
+[06](06-cleanup-and-reclaim.md) and [07](07-convergence-and-await.md) are the
+operational half; read 07 before designing any read-your-writes predicate — it
+is the easiest part of the design to get silently wrong.

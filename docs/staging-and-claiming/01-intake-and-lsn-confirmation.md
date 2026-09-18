@@ -48,9 +48,9 @@ The exception is the old image, which *cannot* be re-read once the row is gone:
   only the old image names the old one.
 
 Postgres logs only the old tuple's primary key by default, so those tables need
-`REPLICA IDENTITY FULL`. Trellis treats that as a **checked user requirement**: a
-definition that needs it is rejected with the exact `ALTER TABLE` in the error
-text. Issuing DDL against tables Trellis does not own would turn a library into an
+`REPLICA IDENTITY FULL`. Trellis treats that as a **checked user requirement**:
+a definition that needs it is rejected with the exact `ALTER TABLE` in the error
+text — issuing DDL against tables it does not own would turn a library into an
 operator.
 
 ## The linchpin: stage and watermark in one transaction
@@ -78,11 +78,11 @@ Update reporting `end_lsn` as flushed. Four details are each load-bearing:
   `confirmed` is untouched, the slot stays put, and Postgres replays the whole
   transaction.
 - **Replay is safe because the failed attempt left nothing** — not because a
-  re-stage would deduplicate. The ring is append-only; there is no upsert on this
-  path, and re-staging duplicate rows *would* duplicate them. The stage
-  transaction is all-or-nothing, so replay restarts from exactly the state the
-  first attempt started from. A partial-commit path would force deduplication at
-  write time — the thing this design deliberately does not have (see
+  re-stage would deduplicate. The ring is append-only with no upsert on this path,
+  and re-staging duplicate rows *would* duplicate them. Because the stage
+  transaction is all-or-nothing, replay restarts from the first attempt's starting
+  state. A partial-commit path would instead force deduplication at write time —
+  the thing this design deliberately lacks (see
   [04](04-claiming-and-the-fold.md)).
 - **`NOTIFY` is inside the transaction** so listeners wake only once staged rows
   are visible. It is a latency optimization only; the poll interval is the
@@ -186,18 +186,15 @@ knife-edged guards:
 
 ## The load-bearing invariants
 
-Only two properties of the source are essential, and Postgres logical replication
-supplies both: **committed changes in commit order**, and **a monotonic cursor
-Trellis acknowledges explicitly**. Given that, four things must hold:
+Postgres logical replication supplies the only two source properties Trellis
+needs: **committed changes in commit order**, and **a monotonic cursor Trellis
+acknowledges explicitly**. The rest is the design above: acknowledgment strictly
+after the durable stage commit, stage and watermark as one atomic unit (which is
+why the watermark lives in the staging database), and a spill/stream path because
+a source transaction can exceed memory.
 
-1. Acknowledgment happens strictly after the durable stage commit, and the
-   in-memory position reported to the slot advances only after that commit returns.
-2. The stage and the persisted watermark are one atomic unit — which is why the
-   watermark lives in the same database as the staging tables.
-3. The producer half is a **singleton**, because the cursor is. Trellis enforces
-   this with a session-scoped advisory lock rather than a leader election, so the
-   lock releases instantly on disconnect — a TTL-based lease would add failover
-   latency for nothing, and every second without a consumer is a second the log
-   grows.
-4. A source transaction can exceed memory, so the spill/stream story above is part
-   of the design, not an afterthought.
+One invariant is not stated elsewhere: the producer half is a **singleton**,
+because the cursor is. Trellis enforces this with a session-scoped advisory lock
+rather than a leader election, so the lock releases instantly on disconnect — a
+TTL-based lease would add failover latency for nothing, and every second without a
+consumer is a second the log grows.

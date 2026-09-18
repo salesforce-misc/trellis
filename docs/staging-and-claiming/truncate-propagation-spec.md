@@ -1,20 +1,19 @@
 # TRUNCATE propagation
 
 How a source `TRUNCATE` propagates through the staging ring to the derived
-tables it feeds. This is the design; the machinery lives in `staging::apply`,
-`staging::fold`, and `staging::seal`.
+tables it feeds. The machinery lives in `staging::apply`, `staging::fold`, and
+`staging::seal`.
 
 ## Semantics
 
 - A source `TRUNCATE` clears **all derived/target rows produced from each named
-  source relation**, then post-truncate inserts re-populate normally.
-- Postgres pre-expands `CASCADE` server-side: the single pgoutput TRUNCATE
-  message's `relation_ids` list already enumerates every truncated table **that
-  is in the publication**. We iterate that list; we do **not** implement cascade
-  traversal. A cascaded child not in the publication is simply absent (and was
-  never replicated).
+  source relation**; post-truncate inserts then re-populate normally.
+- Postgres pre-expands `CASCADE` server-side: the pgoutput TRUNCATE message's
+  `relation_ids` already lists every truncated table **in the publication**. We
+  iterate that list; we do **not** traverse cascade ourselves. A cascaded child
+  outside the publication was never replicated, so nothing to clear.
 - The `options` bits (bit0 CASCADE, bit1 RESTART IDENTITY) are informational; we
-  do not act on them beyond clearing the listed relations.
+  act only on the listed relations.
 
 ## The ordering hazard
 
@@ -22,31 +21,30 @@ A TRUNCATE is **whole-keyspace**, but drains are **per-bucket, parallel, and out
 of `seg_seq` order** (`next_claimable_segment` does not enforce order). So a
 truncate is a **two-directional drain barrier**:
 
-- **Predecessors must drain first.** Otherwise an earlier batch's insert applies
-  *after* the truncate clears the target and wrongly survives.
-- **Successors must not drain first.** Otherwise a later batch's post-truncate
-  insert is wiped when the truncate batch clears the whole target.
+- **Predecessors must drain first** — else an earlier insert applies *after* the
+  truncate clears the target and wrongly survives.
+- **Successors must not drain first** — else a later post-truncate insert is
+  wiped when the truncate clears the whole target.
 
-Enforcement (a single-bucket truncate batch, extended to a barrier):
+Enforcement:
 
-1. **Single bucket.** A batch containing any `op='truncate'` row seals with
-   `bucket_count = 1` — one worker drains the whole batch, so the whole-keyspace
-   `DELETE` + any same-batch post-truncate writes are one atomic Phase-3 txn.
+1. **Single bucket.** A batch with any `op='truncate'` row seals with
+   `bucket_count = 1`, so one worker drains the whole-keyspace `DELETE` + any
+   same-batch post-truncate writes as one atomic Phase-3 txn.
 2. **Barrier in `next_claimable_segment`.** `has_truncate` is recorded on the
-   `segments` registry at seal time. Let `B` = min `seg_seq` among undrained
-   truncate-bearing segments. A worker may be handed segment `s` only when
-   `s <= B` (never a segment past an undrained truncate). Because the query
-   returns the lowest undrained `s`, `B` itself is handed out only once every
-   `s < B` has drained. This gives both directions with one clause.
+   `segments` registry at seal. Let `B` = min `seg_seq` among undrained
+   truncate-bearing segments; a worker may be handed segment `s` only when
+   `s <= B`. Since the query returns the lowest undrained `s`, `B` is handed out
+   only after every `s < B` drains — both directions from one clause.
 
-Truncates are rare; fully serializing the drain around one is the correct
+Truncates are rare; fully serializing the drain around one is the right
 correctness/throughput trade.
 
 ## Per-key fold correctness
 
 The fold telescopes per `(src_table, key)` ordered by `(lsn, change_id)`. A
-truncate landing between two changes to a key voids the earlier one. So the fold
-**voids image-bearing keyed changes at a position ≤ the src_table's max truncate
+truncate between two changes to a key voids the earlier one, so the fold **voids
+image-bearing keyed changes at a position ≤ the src_table's max truncate
 position** in the fenced window:
 
 ```sql
@@ -58,16 +56,15 @@ and not exists (
 )
 ```
 
-Key subtlety — **recompute rows (NULL `lsn`) are never filtered**: the
-row-comparison against a NULL lsn is NULL (not true), so recompute rows survive
-regardless of truncate position. That is correct: a recompute re-reads *live*
-current source state, which already reflects the truncate, so its position is
-irrelevant. Only image-bearing rows (real `lsn`) carry stale state and must be
+**Recompute rows (NULL `lsn`) are never filtered** — the comparison against a
+NULL lsn is NULL, not true, so they survive regardless of truncate position.
+That is correct: a recompute re-reads *live* source state, which already
+reflects the truncate. Only image-bearing rows carry stale state and must be
 voided below the truncate.
 
 A truncate and inserts **in the same source transaction** share the commit
 `lsn`; `change_id` (intake append order = execution order) breaks the tie, so
-truncate-then-insert within one txn orders correctly.
+truncate-then-insert orders correctly.
 
 ## Invariants to preserve
 
@@ -75,7 +72,4 @@ truncate-then-insert within one txn orders correctly.
   [05](05-apply-and-exactly-once-deltas.md)).
 - A row's bucket is a total function of row+batch — the single-bucket truncate
   rule must not put a row in zero or two buckets.
-- The fold must not start filtering `op` — the truncate sentinel must survive
-  the fold.
-</content>
-</invoke>
+- The fold must not filter `op` — the truncate sentinel must survive the fold.

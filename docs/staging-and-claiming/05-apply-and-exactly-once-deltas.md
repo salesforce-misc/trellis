@@ -43,11 +43,10 @@ sequenceDiagram
     end
 ```
 
-**Phase 2 holds no locks and no transaction.** Deliberate: it lets compute be
-arbitrarily expensive — a long recompute never blocks intake, never blocks another
-worker, and never holds a snapshot open (which would block the seal gate and the
-cleanup pass). The price is that the world can move under you during Phase 2, which
-is what the version fence and the immutable batch exist to handle.
+**Phase 2 holds no locks and no transaction.** Deliberate: compute can be
+arbitrarily expensive without blocking intake, another worker, or — by holding a
+snapshot open — the seal gate and cleanup pass. The price is that the world can
+move under you, which the version fence and the immutable batch exist to handle.
 
 ## The exactly-once argument
 
@@ -107,18 +106,17 @@ converges to the same total.
 
 ## What this replaced
 
-The old, mutable-worklist design needed two extra mechanisms, and both are gone:
+The old, mutable-worklist design needed two extra mechanisms, both now gone:
 
 - An **`lsn` compare-and-delete**: clear a claimed key only if its `lsn` is
-  unchanged since the claim, so anything re-staged concurrently survives.
+  unchanged since the claim, so concurrent re-stages survive.
 - A **survivor rewrite**: when a re-stage *did* land on a claimed row mid-compute,
   advance that survivor's `old_image` to the image just applied, or the re-drain
   double-subtracts.
 
-Both existed *only* because the worklist was mutable. Property 1 removes the race
-they addressed. **A patch that reintroduces a mutable claimed batch must
-reintroduce them both** — that is the tell for whether a proposed change is
-actually equivalent.
+Both existed *only* because the worklist was mutable; Property 1 removes the race.
+**A patch that reintroduces a mutable claimed batch must reintroduce them both** —
+that is the tell for whether a proposed change is actually equivalent.
 
 ## The delta model
 
@@ -145,19 +143,18 @@ never added.
 Composite measures fold their hidden partials, never themselves: `avg` maintains
 `{m}__sum` and `{m}__count` and recomputes the visible ratio from them.
 
-**Not every measure is delta-able**, and the gate is explicit: only exact,
-invertible folds qualify. `count(*)`, `count(col)`, and `sum`/`avg` over
+**Not every measure is delta-able**; the gate is explicit: only exact, invertible
+folds qualify. `count(*)`, `count(col)`, and `sum`/`avg` over
 int/numeric are in. `min`/`max` are not invertible (removing the current maximum
 tells you nothing about the next one) and take a probe-assisted recompute path
-instead. Floats need care: naïve float deltas drift unboundedly because IEEE-754
+instead. Floats need care: naïve deltas drift unboundedly because IEEE-754
 addition is non-associative, so the accumulator is kept in exact decimal and only
-rendered to float — and `Inf`/`NaN` are tracked as counts because they are not
-delta-invertible at all (`Inf − Inf = NaN`).
+rendered to float — and `Inf`/`NaN` are tracked as counts, not delta-invertible at
+all (`Inf − Inf = NaN`).
 
 **The north star for the exact types is byte-identical convergence to a
 from-scratch `GROUP BY` oracle after every op and every drain interleaving** — far
-stronger than "eventually approximately right", and what makes the path auditable:
-you can always recompute and compare.
+stronger than "eventually approximately right", and what makes the path auditable.
 
 ## The version fence: the one failure idempotency cannot fix
 
@@ -202,10 +199,9 @@ WITH locked AS (
 -- ... the actual merge, guarded so `locked` is genuinely referenced
 ```
 
-A consistent total lock order has no cycle, so overlapping workers merely
-serialize on a shared hot group instead of deadlocking. That plus a bounded,
-idempotent retry on the residual serialization failures (`40001`/`40P01`) is the
-whole deadlock story.
+A consistent total lock order has no cycle, so overlapping workers serialize on a
+shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
+residual serialization failures (`40001`/`40P01`) is the whole deadlock story.
 
 > **The same Postgres gotcha as the claim statement:** an unreferenced `FOR
 > UPDATE` pre-lock CTE gets pruned and locks nothing. Force it with a `count(*)`
@@ -247,9 +243,9 @@ ON CONFLICT (pk) DO UPDATE SET ...
  WHERE (target.a, target.b) IS DISTINCT FROM (EXCLUDED.a, EXCLUDED.b)
 ```
 
-so a target a change did not actually affect sees no tuple churn at all. It is
-the relief valve for hot tables, and what makes per-source (not per-target)
-version fencing free: a sibling target's idempotent recompute writes nothing.
+so a target a change did not affect sees no tuple churn. It is the relief valve
+for hot tables, and what makes per-source (not per-target) version fencing free: a
+sibling target's idempotent recompute writes nothing.
 
 The set of keys **physically written** is then the "this recompute changed
 something" signal that filters downstream propagation. Deleted keys count as
@@ -258,7 +254,7 @@ changed.
 ## Failure classification
 
 Treating every Phase-3 failure uniformly turns a transient blip into a quarantined
-key, or a genuine schema error into a silently parked one. The classification:
+key, or a schema error into a silently parked one. The classification:
 
 | Class | Examples | Treatment |
 |---|---|---|
@@ -269,13 +265,12 @@ key, or a genuine schema error into a silently parked one. The classification:
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 
 The halting class deserves emphasis: **failing that way stops the whole instance,
-deliberately.** The batch holding the offending change can never drain, cleanup
-requires every older batch to be drained, so the ring fills and seals start
-failing. That is the correct semantic for a genuine schema cycle — nothing may be
-silently skipped — but it is instance-wide rather than scoped to the tables
-named, and the error message should say so. It also needs a real metric (a
-counter plus the last reason), because "stopped" and "slow" look identical from
-the outside otherwise.
+deliberately.** The offending batch can never drain, cleanup requires every older
+batch drained, so the ring fills and seals start failing. That is correct for a
+genuine schema cycle — nothing may be silently skipped — but it is instance-wide
+rather than scoped to the named tables, and the error message should say so. It
+also needs a metric (counter plus last reason), because "stopped" and "slow" look
+identical from outside otherwise.
 
 ## Invariants
 

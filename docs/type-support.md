@@ -1,48 +1,39 @@
 # Data-type support matrix
 
-Which PostgreSQL data types Trellis supports, in **which role**. This is a
-living reference — updated as each type/role lands. The epic that drives it is
-[Epic: Data-type support (#123)](https://github.com/salesforce-misc/trellis/issues/123);
-the constraint that decides which
-types can even be candidates is
+Which PostgreSQL data types Trellis supports, in **which role**. A living
+reference, updated as each type/role lands. Driven by
+[Epic #123](https://github.com/salesforce-misc/trellis/issues/123); the
+candidacy constraint is
 [ADR-0004](decisions/0004-transform-definition-grammar.md).
 
-A type is never simply "supported." It earns its way into six capabilities,
-ordered here **floor → ceiling** — each row of the matrix doubles as a maturity
-ladder, and most types climb it left-to-right:
+A type is never simply "supported." It earns its way into six roles, ordered
+**floor → ceiling** — the matrix doubles as a maturity ladder, and most types
+climb it left-to-right:
 
-1. **Ingest / passthrough** — faithfully decode the value from logical
-   replication and copy it into a derived table unchanged. The floor under every
-   other role. Today nearly everything clears it: unmapped types fall through to
-   `Text` and the target keeps the source's concrete PG type
-   (`trellis/src/defs/ddl.rs:293-324`).
-2. **Filter (predicate)** — appear in a `WHERE` / partial-data predicate
-   (`created_at > '2020-01-01'`). Needs immutable comparison operators and the
-   predicate grammar (stubbed to `TRUE` today, `ast.rs:185`).
-3. **Join / relationship / `GROUP BY` key** — be matched across rows by
-   equality. Today matched by raw `::text` rendering
-   (`TEXT_STABLE_JOIN_KEY_TYPES`, `trellis/src/defs/catalog.rs:2156`;
-   `to_rows_by_key`, `eval.rs:65-106`).
+1. **Ingest / passthrough** — decode from logical replication and copy into a
+   derived table unchanged. The floor under every other role, and nearly
+   everything clears it: unmapped types fall through to `Text`, keeping the
+   source's concrete PG type (`trellis/src/defs/ddl.rs:293-324`).
+2. **Filter (predicate)** — appear in a `WHERE` predicate. Needs immutable
+   comparison operators and the predicate grammar (stubbed to `TRUE` today,
+   `ast.rs:185`).
+3. **Join / relationship / `GROUP BY` key** — be matched by equality. Today via
+   raw `::text` rendering (`TEXT_STABLE_JOIN_KEY_TYPES`,
+   `trellis/src/defs/catalog.rs:2156`; `to_rows_by_key`, `eval.rs:65-106`).
 4. **Primary key** — identify a target row. A stricter join key: it must come
-   from the source's replica identity and be present in the old-image for
-   updates/deletes. Gated to the same text-stable allowlist as join keys
-   (`is_text_stable_join_key_type`) — an unsafe single-column PK type is
-   rejected at define time with `DdlError::UnsupportedPrimaryKeyType` (#107).
-5. **Computed 1-1 target** — a scalar calculated field *produces* a value of
-   this type (distinct from passthrough). Needs an immutable evaluator arm **and**
-   grammar to spell a literal/cast of the type.
+   from the source's replica identity and present in the old-image for
+   updates/deletes. Gated to the join-key-safe allowlist
+   (`is_text_stable_join_key_type`) — an unsafe single-column PK
+   (`numeric`/`timestamptz`/`bytea`, which `::text`-matching would silently
+   mismatch) is rejected at define time with `DdlError::UnsupportedPrimaryKeyType`
+   (#107). The typed key index (below) later unlocks those types as safe keys.
+5. **Computed 1-1 target** — a scalar calculated field *produces* this type
+   (distinct from passthrough). Needs an immutable evaluator arm **and** grammar
+   to spell a literal/cast of the type.
 6. **Aggregate target** — an aggregate calculated field folds to this type.
    Gated by fold economics: `SUM`/`COUNT`/`AVG` invertible (cheap deltas);
    `MIN`/`MAX` orderable-but-not-invertible; `array_agg`/`string_agg`/`jsonb_agg`
    order-sensitive.
-
-> **Primary-key types are gated to the join-key-safe set** (#107).
-> `source_primary_key` reuses `is_text_stable_join_key_type` (the shared source
-> of truth with the join-key allowlist), so a single-column `numeric`/
-> `timestamptz`/`bytea` PK — which `::text`-matching would silently mismatch — is
-> rejected at define time (`DdlError::UnsupportedPrimaryKeyType`) rather than
-> accepted. The typed key index (below) is what later *unlocks* those types as
-> safe keys by comparing decoded values instead of text.
 
 ## Legend
 
@@ -54,9 +45,8 @@ ladder, and most types climb it left-to-right:
 | ❌ | excluded (immutability or no equality) |
 | — | not applicable |
 
-`COUNT(*)` is type-agnostic row-counting (`registry.rs:160`, #75) — it works for
-any group and is *not* a per-type capability, so it's omitted from the aggregate
-cells below.
+`COUNT(*)` is type-agnostic row-counting (`registry.rs:160`, #75) — not a
+per-type capability, so it's omitted from the aggregate cells.
 
 ## Matrix
 
@@ -91,9 +81,9 @@ cells below.
 ADR-0004 admits only operators/functions whose output depends solely on their
 inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wrong:
 
-* **`money`** — comparison (`cash_eq`/`cash_cmp`) *is* immutable; the **text I/O**
-  (`cash_out`) is `STABLE` (`lc_monetary`). Since CDC decodes values as text, the
-  decoded representation is locale-dependent. Excluded; use `numeric`.
+* **`money`** — comparison (`cash_eq`/`cash_cmp`) *is* immutable, but text I/O
+  (`cash_out`) is `STABLE` (`lc_monetary`), so the CDC-decoded text is
+  locale-dependent. Excluded; use `numeric`.
 * **`json`** — has *no* `=` operator; can never be a key. `jsonb` can.
 * **`text`/`varchar`/`char`** — Postgres marks these comparisons IMMUTABLE
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
@@ -107,12 +97,13 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 
 ## Cross-cutting concerns
 
-* **Casts / coercion lattice** — computing a value of a new type needs literal
-  and `CAST` grammar (numeric + quoted-text literals only today); tracked as its
-  own epic child.
+* **Casts / coercion lattice** — computing a new type needs literal and `CAST`
+  grammar (numeric + quoted-text literals only today); own epic child.
 * **Typed key index** — replacing the raw-`::text` match unlocks
-  `timestamp`/`bytea`/`date`/`numeric`/… as safe keys; the single highest-leverage
-  child for the key roles.
+  `timestamp`/`bytea`/`date`/`numeric`/… as safe keys; the single
+  highest-leverage child for the key roles.
 * **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
   `string_agg`, `jsonb_agg`) need an incremental-delta design or a
   group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.
+</content>
+</invoke>
