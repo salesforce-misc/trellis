@@ -103,7 +103,7 @@
 //! subtracts the row's old contribution from the old group and adds its new
 //! contribution to the new group as two independent deltas.
 //!
-//! # Image-less changes, and issue #180's fix for one producer of them
+//! # Image-less changes, and issues #180/#196's fixes for two producers of them
 //!
 //! A folded change with neither an old nor a new image (a bare recompute
 //! trigger — reverse propagation, definition re-derive, backfill) carries no
@@ -145,7 +145,8 @@
 //! same shape of "the prior state is knowable at delete time, but was being
 //! thrown away." `super::apply::apply_target`'s own delete statement now
 //! carries the identical `RETURNING to_jsonb(t.*)::text` capture, threaded
-//! through the same [`super::apply::ChangedKey`] slot, so step 4 stages the
+//! through the same `super::apply::ChangedKey` slot (a module-private type
+//! alias, so deliberately not an intra-doc link), so step 4 stages the
 //! same image-bearing `StagedChange::Cdc` for a deleted 1-1 row — reaching
 //! this module's `(Some(old_row), None)` branch exactly as issue #180's
 //! aggregate-group case does. Again, no change to this module's own delta
