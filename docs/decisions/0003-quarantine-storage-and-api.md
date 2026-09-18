@@ -256,3 +256,42 @@ The per-key (`key_deaths`) and per-column (`column_deaths`) tiers are
 deliberately unaffected: they are cleared by a clean drain of the key itself
 and by `resume_column` respectively, and a whole-transform resume makes no
 claim about any individual key's or column's health.
+
+**Amendment (2026-09-18): the transform-wide fuse counts behind a gate (issue
+#159).** `trip_transform_fuse_if_crossed` counts `poison` rows inside the same
+transaction as the eviction that triggered the check — read-your-own-writes
+correct for one caller, blind to a sibling. Two `isolate_and_evict` calls for
+the same source (different segments, different workers) each counted their own
+new row plus whatever had already committed, never the other's concurrent,
+uncommitted insert: two workers landing a source's 4th and 5th eviction at
+once both saw 4, neither tripped, and the transform stayed live past its fuse
+point until some later, unrelated eviction happened to re-run the check. It
+could undercount, never overcount, so no false trip was ever possible — only a
+missed one.
+
+Decided: a per-source-table **gate row** (`transform_fuse_gate`,
+`V30__transform_fuse_gate.sql`), taken by an atomic
+`INSERT ... ON CONFLICT DO UPDATE` as the first statement of the fuse check.
+That is the same row-lock serialization the per-key and per-column fuses have
+always had via `key_deaths`/`column_deaths`, which is why neither of them ever
+had this bug. Concurrent evictions for one source queue on that row; the
+second one through starts counting only after the first has committed, and its
+counts — a fresh statement snapshot under READ COMMITTED — include the
+sibling's rows. `ON CONFLICT DO UPDATE` rather than `SELECT ... FOR UPDATE`
+because the gate row may not exist yet (a source's first-ever eviction) and
+`FOR UPDATE` over zero rows locks nothing, so two concurrent first evictions
+would each sail through.
+
+The gate holds no count. The threshold decision stays a `count(*)` over
+`poison`, because `poison` is the only table that can also answer the
+*windowed*, per-definition form of the same question the amendment above
+introduced (`poisoned_at > fuse_rearmed_at`), so a maintained total would have
+had to coexist with the `count(*)` anyway — two representations of one fact,
+one of which can drift, and one needing matching rewinds in `release_key` and
+`purge_dropped_table`. The two mechanisms compose cleanly and orthogonally:
+**the gate decides when a transaction may count, the re-arm window decides
+which rows that count includes.** Cost is one indexed upsert per eviction, on
+the transaction's existing connection — notably not a second pool connection
+taken while that transaction is open, and in front of (not instead of) the
+pre-threshold fast path that keeps a below-threshold eviction from paying for
+the per-definition loop at all.

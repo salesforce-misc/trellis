@@ -554,6 +554,14 @@ pub async fn isolate_and_evict(
             .find(|c| !c.is_truncate && &c.src_table == src_table && &c.key == key);
         evict_key(&txn, seg_seq, src_table, key, last_error, contribution).await?;
     }
+    // Sorted (and deduped) — the dedup is what this is for, but the sort now
+    // also fixes the order in which this transaction takes the per-source
+    // fuse gates (issue #159, `take_fuse_gate`), so two concurrent evictions
+    // spanning the same two sources cannot grab them in opposite orders. No
+    // new cycle against the `poison` row locks either: the `evict_key` loop
+    // above has already taken every one of them before the first gate is
+    // touched, so a transaction waiting on a gate is never itself holding one
+    // while a gate-holder waits on it.
     let mut evicted_src_tables: Vec<&str> = evict_now.iter().map(|(t, _, _)| t.as_str()).collect();
     evicted_src_tables.sort_unstable();
     evicted_src_tables.dedup();
@@ -595,6 +603,51 @@ pub async fn isolate_and_evict(
 // rows a given definition is charged for (only those evicted since its last
 // resume re-armed the fuse — see `trip_transform_fuse_if_crossed`), but the
 // table is still the whole counter.
+//
+// What `poison` cannot supply on its own is *serialization* between two
+// concurrent evictions for the same source (issue #159): each counts inside
+// its own transaction and cannot see the other's uncommitted insert, so two
+// workers landing the 4th and 5th eviction at once both counted 4 and
+// neither tripped. That is what `transform_fuse_gate`/[`take_fuse_gate`]
+// adds — one per-`src_table` row lock, in exactly the shape
+// [`record_key_death`] already uses for `key_deaths`, taken before any
+// counting happens. It still introduces no duplicated count anywhere; see
+// `V30__transform_fuse_gate.sql` for why the counts themselves stayed on
+// `poison`.
+
+/// Takes `src_table`'s whole-transform-fuse gate on `txn` and holds it until
+/// that transaction ends: the serialization point issue #159 was missing.
+/// Every eviction transaction that is about to ask "has this source crossed
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]?" passes through this one row first,
+/// so two of them for the same source can never both answer from a snapshot
+/// taken before the other's `poison` insert landed.
+///
+/// An `INSERT ... ON CONFLICT DO UPDATE`, not a `SELECT ... FOR UPDATE`, for
+/// the same reason [`record_key_death`]/`charge_column_failure` use that
+/// shape for `key_deaths`/`column_deaths`: the gate row may not exist yet
+/// (first-ever eviction for this source), and `FOR UPDATE` over zero rows
+/// locks nothing at all — two concurrent first evictions would each sail
+/// straight through. `ON CONFLICT` covers both halves: Postgres's speculative
+/// insertion makes the losing *inserter* wait on the winner's transaction,
+/// and `DO UPDATE` (not `DO NOTHING`, which takes no row lock once the row
+/// exists) makes every later caller wait on the row lock.
+///
+/// Deliberately no `RETURNING` and no maintained count: the threshold
+/// decision stays a `count(*)` over `poison`, which is the only table that
+/// can also answer #160's windowed, per-definition form of the same
+/// question. `V30__transform_fuse_gate.sql` has the full rationale.
+async fn take_fuse_gate(txn: &Transaction<'_>, src_table: &str) -> Result<(), ApplyError> {
+    txn.execute(
+        "insert into transform_fuse_gate (src_table, checks, last_checked_at) \
+         values ($1, 1, now()) \
+         on conflict (src_table) do update set \
+             checks = transform_fuse_gate.checks + 1, \
+             last_checked_at = now()",
+        &[&src_table],
+    )
+    .await?;
+    Ok(())
+}
 
 /// Checks whether `src_table`'s whole-transform fuse has crossed
 /// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] and, if so, quarantines every
@@ -609,6 +662,22 @@ pub async fn isolate_and_evict(
 /// connection) specifically so it observes those just-inserted, not-yet-committed
 /// rows; a separate connection would undercount until commit and could miss
 /// the exact eviction that crosses the threshold.
+///
+/// **Concurrent evictions for one source are serialized first** (issue
+/// #159), by [`take_fuse_gate`], before either count below runs. Reading
+/// `poison` from `txn` is what makes this call see *its own* new rows, but it
+/// is also exactly what made it blind to a *sibling* transaction's
+/// concurrent, not-yet-committed ones: two workers each poisoning a key for
+/// the same source (say the source's 4th and 5th) each counted 4, neither
+/// crossed the threshold-of-5, and the transform stayed live past its fuse
+/// point until some later, unrelated eviction happened to re-run the check.
+/// The gate's per-`src_table` row lock forces those two into an order; the
+/// second one through does not begin counting until the first has committed,
+/// and — READ COMMITTED, one fresh snapshot per statement — both counts below
+/// then include the sibling's rows. This never changes *whether* a genuine
+/// threshold crossing trips, only how promptly: the fuse could always
+/// undercount, never overcount, so no previously-correct non-trip becomes a
+/// false trip.
 ///
 /// **The count is windowed by the resuming operator's re-arm point** (issue
 /// #160): only `poison` rows whose `poisoned_at` is *after* the definition's
@@ -629,10 +698,14 @@ pub async fn isolate_and_evict(
 /// `src_table`: sibling transforms on the same source are resumed
 /// independently, so each one carries its own budget. That is a strictly
 /// finer-grained version of the previous behaviour (with no resume anywhere,
-/// every sibling sees the same number the single old query returned), and it
-/// leaves the query's concurrency semantics untouched — still a `count(*)`
-/// read against `txn`, deliberately unchanged here (issue #159 tracks that
-/// count's separate concurrent-undercount race).
+/// every sibling sees the same number the single old query returned).
+///
+/// The two mechanisms compose without either knowing about the other: the
+/// gate decides *when* a transaction is allowed to count, the re-arm window
+/// decides *which* `poison` rows that count includes. Both windowed and
+/// unwindowed counts still read `poison` directly, so a per-definition window
+/// needs no gate of its own — once the gate has been passed, every committed
+/// sibling row is visible to both, whatever their `poisoned_at`.
 ///
 /// The old unwindowed `count(*)` survives as a cheap guard in front of the
 /// loop: a window can only ever *remove* `poison` rows from the count, so a
@@ -644,11 +717,23 @@ pub async fn isolate_and_evict(
 /// Idempotent: a definition already [`TransformStatus::Quarantined`] is left
 /// alone (no redundant write, no repeated log line) on every later eviction
 /// that keeps `src_table` above threshold.
-async fn trip_transform_fuse_if_crossed(
+///
+/// `pub` rather than module-private only so the issue-#159 regression test
+/// (`tests/quarantine.rs`) can drive two genuinely overlapping eviction
+/// transactions through it directly: the race lives in the window between one
+/// transaction's `poison` insert and its commit, which two full
+/// `drain_once`/`isolate_and_evict` pipelines cannot be made to interleave
+/// deterministically from the outside.
+pub async fn trip_transform_fuse_if_crossed(
     txn: &Transaction<'_>,
     pool: &Pool,
     src_table: &str,
 ) -> Result<(), ApplyError> {
+    // Issue #159's serialization point, before either count below. Must come
+    // first: a count taken ahead of the gate could be stale by the time the
+    // gate is granted, which is the whole bug.
+    take_fuse_gate(txn, src_table).await?;
+
     // Unwindowed guard, kept from the pre-#160 shape: every definition's
     // windowed count is a *subset* of this one (the window only ever removes
     // `poison` rows, never adds them), so a source table below threshold in

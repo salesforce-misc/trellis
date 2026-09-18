@@ -102,6 +102,7 @@ high-volume ones be append-only and vacuum-free.
 | `drainers` | one row per live worker | share denominator for fair fan-out |
 | `replication_progress` | one row per slot | the durable acknowledgment watermark |
 | `poison` / `poison_held` / `key_deaths` | per quarantined key | keeps a killer change from wedging the system |
+| `transform_fuse_gate` | one row per poisoned source table | serializes concurrent evictions' fuse checks (issue #159) |
 
 ## Reading order
 

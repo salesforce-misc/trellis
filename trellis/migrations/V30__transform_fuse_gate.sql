@@ -1,0 +1,69 @@
+-- The whole-transform fuse's serialization point (issue #159).
+--
+-- `staging::quarantine::trip_transform_fuse_if_crossed` decides "has this
+-- `src_table` crossed `DEFAULT_TRANSFORM_DEATH_THRESHOLD` distinct evicted
+-- keys?" by counting `poison` rows *inside the same transaction* as the
+-- eviction(s) that triggered the check. That is read-your-own-writes correct
+-- for one caller in isolation, but two `isolate_and_evict` calls for the same
+-- source (different segments, different workers) run in two different
+-- transactions: under READ COMMITTED each one's count sees its own new
+-- `poison` row plus whatever had already *committed* — never the sibling's
+-- concurrent, not-yet-committed insert. Two workers poisoning the 4th and 5th
+-- key of a source therefore both counted 4, neither tripped, and the fuse
+-- stayed live past its intended trip point until some later, unrelated
+-- eviction happened to re-run the check.
+--
+-- The per-key and per-column fuses never had this problem: `key_deaths` and
+-- `column_deaths` are incremented by an atomic
+-- `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, whose row lock forces
+-- concurrent chargers of the same counter into a real order and hands the
+-- second one a post-commit-accurate value. This table gives the
+-- whole-transform fuse the same kind of serialization point, one row per
+-- source table:
+--
+--   insert into transform_fuse_gate (src_table, checks, last_checked_at)
+--   values ($1, 1, now())
+--   on conflict (src_table) do update set
+--       checks = transform_fuse_gate.checks + 1, last_checked_at = now();
+--
+-- run as the *first* statement of the fuse check. Concurrent evictions for
+-- one source queue on that row's lock; the second one through only proceeds
+-- once the first has committed, and its subsequent `count(*)` over `poison`
+-- — a fresh statement snapshot, READ COMMITTED — therefore includes the
+-- sibling's now-committed row. The count is still taken against `poison`
+-- itself rather than a maintained total in this table, deliberately:
+--
+--   * `poison` stays the single source of truth for both the unwindowed
+--     guard and issue #160's per-*definition* windowed counts. A windowed
+--     count ("only rows poisoned after this definition's `fuse_rearmed_at`")
+--     is a question no scalar counter can answer at all, so a counter would
+--     have had to coexist with the `count(*)` anyway — two representations of
+--     the same fact, one of which can silently drift.
+--   * Nothing here has to be rewound. A maintained total would need matching
+--     decrements in `release_key` (un-poisons one key) and
+--     `purge_dropped_table` (drops a whole source's rows), and would be
+--     quietly wrong forever after any direct manipulation of `poison`.
+--   * There is nothing to backfill: the gate row carries no fact that has to
+--     be true at migration time, so an existing installation needs no
+--     seeding pass and cannot start out with a wrong count.
+--
+-- `checks`/`last_checked_at` are bookkeeping for an operator reading this
+-- table (how often, and how recently, a source's fuse was evaluated) and
+-- give the `DO UPDATE` something to write — the lock, not the value, is the
+-- point. Cost per eviction is one indexed upsert against a table with at
+-- most one row per source table ever poisoned, taken on the eviction's
+-- *existing* transaction/connection: it deliberately does not acquire a
+-- second pool connection while that transaction is open, which is the hazard
+-- the pre-threshold fast path in `trip_transform_fuse_if_crossed` (a #160
+-- review follow-up) exists to avoid. That fast path is unchanged and still
+-- short-circuits everything expensive; this gate runs in front of it.
+--
+-- Rows are never deleted, not even by `purge_dropped_table`: this is not
+-- per-key quarantine state, it is a per-source lock row of two scalars, and
+-- deleting it concurrently with a sibling eviction blocked on its lock would
+-- add a needless edge case for no space saved.
+create table if not exists transform_fuse_gate (
+    src_table text primary key,
+    checks bigint not null default 0,
+    last_checked_at timestamptz not null default now()
+);

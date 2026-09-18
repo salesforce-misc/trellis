@@ -1400,3 +1400,175 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
          src_table — release_key has no way to safely re-append it later"
     );
 }
+
+/// `target`'s persisted `transform_definitions.status`, matched on the bare
+/// target-table suffix the same way `quarantine::resume_transform` does
+/// (issue #73: the column itself is fully qualified).
+async fn transform_status(client: &Client, target: &str) -> String {
+    client
+        .query_one(
+            "select status from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read transform status")
+        .get(0)
+}
+
+/// Marks `(src_table, key)` poisoned from inside `txn` — the marker half of
+/// what `quarantine::evict_key` writes, staged directly (this file's
+/// "reach past the mechanism, insert directly" convention) so the test below
+/// controls exactly when each eviction commits.
+async fn poison_in_txn(txn: &tokio_postgres::Transaction<'_>, src_table: &str, key: &str) {
+    txn.execute(
+        "insert into poison (src_table, key, last_error) values ($1, $2, 'test')",
+        &[&src_table, &key],
+    )
+    .await
+    .expect("insert poison marker inside a transaction");
+}
+
+/// How many backends on this cluster are currently parked waiting for a lock
+/// — the signal the issue-#159 test below uses to observe worker B's fuse
+/// check actually blocking on the fuse gate, rather than guessing with a
+/// sleep. Read from a third, uninvolved connection.
+async fn backends_waiting_on_a_lock(client: &Client) -> i64 {
+    client
+        .query_one(
+            "select count(*) from pg_stat_activity where wait_event_type = 'Lock'",
+            &[],
+        )
+        .await
+        .expect("read pg_stat_activity")
+        .get(0)
+}
+
+/// Regression pin for issue #159: two **concurrent** eviction transactions
+/// for the same source table, neither of which crosses
+/// `DEFAULT_TRANSFORM_DEATH_THRESHOLD` on the evidence it can see alone, must
+/// still trip the whole-transform fuse once their evictions combine to cross
+/// it.
+///
+/// The fuse counts `poison` rows inside the evicting transaction itself, so
+/// it sees that transaction's own not-yet-committed insert — but, under READ
+/// COMMITTED, *not* a sibling transaction's concurrent, still-uncommitted
+/// one. With `threshold - 2` keys already evicted and two workers each
+/// poisoning one more key (the source's 4th and 5th) before either commits,
+/// both counts came back `threshold - 1`, neither tripped, and the transform
+/// stayed live past its fuse point — indefinitely, unless some later,
+/// unrelated eviction happened to re-run the check. `take_fuse_gate`'s
+/// per-`src_table` row lock (`V30__transform_fuse_gate.sql`) is the fix: B
+/// cannot begin counting until A's transaction has ended, so it counts all
+/// five and trips.
+///
+/// **The interleaving is forced, not raced.** Both orderings this test cares
+/// about are established by construction rather than by timing:
+///
+/// 1. A poisons its key and runs its fuse check to completion (four visible
+///    keys — correctly declines to trip). Post-fix it now holds the gate.
+/// 2. B's whole eviction transaction is started as a *concurrent* future and
+///    driven under the same `tokio::join!` as step 3, so it is guaranteed to
+///    have poisoned its own key and issued its count **before** A commits.
+///    Post-fix that count parks on the gate; pre-fix it returns
+///    `threshold - 1` immediately and B declines to trip, exactly the bug.
+/// 3. A only commits once B is observably parked on a lock
+///    (`backends_waiting_on_a_lock`) — or, pre-fix, once a bounded wait for
+///    that has expired because B never blocked at all. Either way B's count
+///    has already happened, so a pre-fix run cannot accidentally pass by
+///    having B count after A's commit.
+///
+/// With the fix, step 3's commit releases the gate, B's count resumes and
+/// sees all five, and the fuse trips. Without it, this test fails on the
+/// final assertion every time.
+///
+/// Drives `trip_transform_fuse_if_crossed` directly with two hand-built
+/// transactions rather than two `isolate_and_evict` calls: the race lives in
+/// the window between one transaction's `poison` insert and its commit, which
+/// two full `drain_once` pipelines cannot be made to overlap inside from the
+/// outside.
+#[tokio::test]
+async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse() {
+    use std::time::Duration;
+
+    use trellis::staging::quarantine::{
+        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
+    };
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let orders = qualify_fixture_table("orders");
+
+    // Already committed: two short of the threshold, so neither transaction
+    // below can cross it on the strength of its own single new eviction.
+    for i in 0..(DEFAULT_TRANSFORM_DEATH_THRESHOLD - 2) {
+        insert_poison_marker(&client, &orders, &format!("settled-{i}")).await;
+    }
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "the fixture must start live — a quarantined definition is skipped by the fuse check, \
+         and a non-live one is invisible to `transforms_for_source` in the first place"
+    );
+
+    let mut client_a = db.pool.get().await.expect("pool connection for worker a");
+    let mut client_b = db.pool.get().await.expect("pool connection for worker b");
+
+    // Worker A: poison one more key, check the fuse (sees `threshold - 1`,
+    // correctly declines), and — post-fix — hold the gate until step 3.
+    let txn_a = client_a.transaction().await.expect("begin worker a");
+    poison_in_txn(&txn_a, &orders, "concurrent-a").await;
+    trip_transform_fuse_if_crossed(&txn_a, &db.pool, &orders)
+        .await
+        .expect("worker a's fuse check");
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "worker a alone only reaches `threshold - 1` visible keys, so it must not trip the fuse"
+    );
+
+    let worker_b = async {
+        let txn_b = client_b.transaction().await.expect("begin worker b");
+        poison_in_txn(&txn_b, &orders, "concurrent-b").await;
+        trip_transform_fuse_if_crossed(&txn_b, &db.pool, &orders)
+            .await
+            .expect("worker b's fuse check");
+        txn_b.commit().await.expect("commit worker b");
+    };
+    let release_worker_a = async {
+        // Bounded: with the fix, worker b parks on the gate within a round
+        // trip or two and this exits at once; without it, worker b never
+        // blocks and this simply expires, having already let b's (buggy,
+        // `threshold - 1`) count happen first — which is the point.
+        for _ in 0..200 {
+            if backends_waiting_on_a_lock(&client).await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        txn_a.commit().await.expect("commit worker a");
+    };
+    tokio::join!(worker_b, release_worker_a);
+
+    let poisoned_keys: i64 = client
+        .query_one(
+            "select count(*) from poison where src_table = $1",
+            &[&orders],
+        )
+        .await
+        .expect("count poison")
+        .get(0);
+    assert_eq!(
+        poisoned_keys, DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64,
+        "the two concurrent transactions must have committed a combined threshold's worth of \
+         distinct evicted keys"
+    );
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "quarantined",
+        "a threshold's worth of poisoned keys reached by two concurrent evictions must trip the \
+         whole-transform fuse just as promptly as one worker reaching it alone (issue #159)"
+    );
+}
