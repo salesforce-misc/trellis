@@ -325,13 +325,21 @@ struct FieldAccum {
 /// One group's pending Phase-3 write: its `GROUP BY` column values (text,
 /// aligned with [`AggregateTargetPlan::group_by`]), the invertible fields'
 /// accumulated deltas, the deepest `hop_gen` among the changes that touched
-/// it, and whether an image-less change forced it onto the full-recompute
-/// path (see the module doc comment).
+/// it, whether an image-less change forced it onto the full-recompute path
+/// (see the module doc comment), and (issue #104, follow-up to #51/#52 once
+/// #103 made aggregate-target chaining live rather than moot) the earliest
+/// `src_changed` origin among those same changes — [`accumulate_changes`]
+/// folds each touched change's [`FoldedChange::src_changed`] into this field
+/// via [`super::apply::earliest_src_changed`], the identical fan-in
+/// tie-break (earliest wins) the 1-1 path already uses, so this group's own
+/// `hop_gen`/`src_changed` merge the same way a 1-1 target's touched key
+/// does.
 #[derive(Debug, Clone)]
 pub(super) struct GroupPlan {
     pub group_values: Vec<Option<String>>,
     field_accum: HashMap<String, FieldAccum>,
     pub hop_gen: i32,
+    pub src_changed: Option<std::time::SystemTime>,
     pub force_full_recompute: bool,
 }
 
@@ -346,6 +354,7 @@ impl GroupPlan {
             group_values,
             field_accum: HashMap::new(),
             hop_gen: 0,
+            src_changed: None,
             force_full_recompute: false,
         }
     }
@@ -1061,6 +1070,8 @@ pub(super) fn accumulate_changes(
                     .or_insert_with(|| GroupPlan::new(values));
                 group.force_full_recompute = true;
                 group.hop_gen = group.hop_gen.max(change.hop_gen);
+                group.src_changed =
+                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
             }
             continue;
         }
@@ -1076,6 +1087,8 @@ pub(super) fn accumulate_changes(
                     .entry(key)
                     .or_insert_with(|| GroupPlan::new(values));
                 group.hop_gen = group.hop_gen.max(change.hop_gen);
+                group.src_changed =
+                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
                 add_contributions(&plan.fields, group, &contrib);
             }
             (Some(old_row), None) => {
@@ -1088,6 +1101,8 @@ pub(super) fn accumulate_changes(
                     .entry(key)
                     .or_insert_with(|| GroupPlan::new(values));
                 group.hop_gen = group.hop_gen.max(change.hop_gen);
+                group.src_changed =
+                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
                 sub_contributions(&plan.fields, group, &contrib);
             }
             (Some(old_row), Some(new_row)) => {
@@ -1106,6 +1121,8 @@ pub(super) fn accumulate_changes(
                         .entry(new_key)
                         .or_insert_with(|| GroupPlan::new(new_values));
                     group.hop_gen = group.hop_gen.max(change.hop_gen);
+                    group.src_changed =
+                        super::apply::earliest_src_changed(group.src_changed, change.src_changed);
                     diff_contributions(&plan.fields, group, &old_contrib, &new_contrib);
                 } else {
                     // Grain migration: subtract from the old group, add to
@@ -1116,6 +1133,10 @@ pub(super) fn accumulate_changes(
                             .entry(old_key)
                             .or_insert_with(|| GroupPlan::new(old_values));
                         old_group.hop_gen = old_group.hop_gen.max(change.hop_gen);
+                        old_group.src_changed = super::apply::earliest_src_changed(
+                            old_group.src_changed,
+                            change.src_changed,
+                        );
                         sub_contributions(&plan.fields, old_group, &old_contrib);
                     }
                     {
@@ -1124,6 +1145,10 @@ pub(super) fn accumulate_changes(
                             .entry(new_key)
                             .or_insert_with(|| GroupPlan::new(new_values));
                         new_group.hop_gen = new_group.hop_gen.max(change.hop_gen);
+                        new_group.src_changed = super::apply::earliest_src_changed(
+                            new_group.src_changed,
+                            change.src_changed,
+                        );
                         add_contributions(&plan.fields, new_group, &new_contrib);
                     }
                 }
@@ -1258,11 +1283,11 @@ pub(super) fn diff_contributions(
 // ---------------------------------------------------------------------
 
 /// What one [`apply_aggregate_target`] call did: every group it physically
-/// wrote or deleted. `written` stays `(group_key_text, hop_gen)`, the same
-/// shape [`super::apply::apply_and_mark_drained`]'s downstream-propagation
-/// step already consumed for the 1-1 case pre-issue #180 — a written group's
-/// new state is always recoverable by a downstream chain's own live refetch,
-/// so no image needs to ride along.
+/// wrote or deleted. `written` is `(group_key_text, hop_gen, src_changed)`,
+/// the same shape [`super::apply::apply_and_mark_drained`]'s downstream-
+/// propagation step already consumed for the 1-1 case pre-issue #180 — a
+/// written group's new state is always recoverable by a downstream chain's
+/// own live refetch, so no image needs to ride along.
 ///
 /// `deleted` additionally carries the group's target row exactly as it stood
 /// the instant before this call deleted it (`to_jsonb(t.*)::text`, the same
@@ -1279,9 +1304,18 @@ pub(super) fn diff_contributions(
 /// (already gone), which never accumulates a key into `deleted` at all in
 /// practice — kept as `Option` rather than `String` purely so both callers
 /// can build this tuple the same way they build a plain existence check.
+///
+/// Both tuples' `src_changed: Option<SystemTime>` (issue #104, follow-up to
+/// #51/#52 once #103 made aggregate-target chaining live rather than moot)
+/// is the written/deleted group's own [`GroupPlan::src_changed`] — the
+/// earliest origin among the changes that touched it, folded there by
+/// [`accumulate_changes`] via [`super::apply::earliest_src_changed`].
+/// `super::apply`'s 3b step threads this straight into the `Recompute` rows
+/// it stages for downstream propagation, closing the gap where a transform
+/// chained off an aggregate target always saw `src_changed: None`.
 pub(super) struct AggregateApplyResult {
-    pub written: Vec<(String, i32)>,
-    pub deleted: Vec<(String, i32, Option<String>)>,
+    pub written: Vec<(String, i32, Option<std::time::SystemTime>)>,
+    pub deleted: Vec<(String, i32, Option<std::time::SystemTime>, Option<String>)>,
 }
 
 /// A `col IS NOT DISTINCT FROM $n::text::<cast>` clause per `group_by`
@@ -2056,7 +2090,13 @@ async fn apply_forced_groups_bulk(
     target: &str,
     plan: &AggregateTargetPlan,
     forced: &[(&String, &GroupPlan)],
-) -> Result<(Vec<(String, i32)>, Vec<(String, i32, Option<String>)>), ApplyError> {
+) -> Result<
+    (
+        Vec<(String, i32, Option<std::time::SystemTime>)>,
+        Vec<(String, i32, Option<std::time::SystemTime>, Option<String>)>,
+    ),
+    ApplyError,
+> {
     let arity = plan.group_by.len();
     let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
     let arrays = transpose_group_values(arity, &forced_groups);
@@ -2102,7 +2142,7 @@ async fn apply_forced_groups_bulk(
     for (i, (key, group)) in forced.iter().enumerate() {
         let ord = (i + 1) as i64;
         if survivor_ords.contains(&ord) {
-            written.push(((*key).clone(), group.hop_gen));
+            written.push(((*key).clone(), group.hop_gen, group.src_changed));
         } else {
             extinct_ords.push(ord);
         }
@@ -2223,7 +2263,12 @@ async fn apply_forced_groups_bulk(
         for (i, (key, group)) in forced.iter().enumerate() {
             let ord = (i + 1) as i64;
             if let Some(old_image) = deleted_images.get(&ord) {
-                deleted.push(((*key).clone(), group.hop_gen, Some(old_image.clone())));
+                deleted.push((
+                    (*key).clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    Some(old_image.clone()),
+                ));
             }
         }
     }
@@ -2996,7 +3041,12 @@ pub(super) async fn apply_aggregate_target(
             )
             .await?;
             if let Some(old_image) = old_image {
-                deleted.push((key.clone(), group.hop_gen, Some(old_image)));
+                deleted.push((
+                    key.clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    Some(old_image),
+                ));
             }
             continue;
         }
@@ -3011,7 +3061,7 @@ pub(super) async fn apply_aggregate_target(
         1 => {
             let (key, group) = delta_groups[0];
             if upsert_group(txn, target, plan, group).await? {
-                written.push((key.clone(), group.hop_gen));
+                written.push((key.clone(), group.hop_gen, group.src_changed));
             }
         }
         _ => {
@@ -3019,7 +3069,7 @@ pub(super) async fn apply_aggregate_target(
             written.extend(
                 delta_groups
                     .iter()
-                    .map(|(key, group)| ((*key).clone(), group.hop_gen)),
+                    .map(|(key, group)| ((*key).clone(), group.hop_gen, group.src_changed)),
             );
         }
     }
@@ -3345,7 +3395,7 @@ mod tests {
             1,
             "the extinct forced group must be reported deleted"
         );
-        let (del_key, del_hop_gen, del_old_image) = &deleted[0];
+        let (del_key, del_hop_gen, _del_src_changed, del_old_image) = &deleted[0];
         assert_eq!(del_key, &key);
         assert_eq!(*del_hop_gen, 3);
         // Issue #180: the deleted group's pre-delete row must ride along, so
@@ -3442,7 +3492,7 @@ mod tests {
 
         assert_eq!(
             written,
-            vec![(key.clone(), 1)],
+            vec![(key.clone(), 1, None)],
             "the NULL-keyed group survives and is written"
         );
         assert!(deleted.is_empty(), "nothing is extinct");
@@ -3854,7 +3904,8 @@ mod tests {
             .expect("bulk apply");
         txn.commit().await.expect("commit bulk");
         assert!(result.deleted.is_empty(), "no group went extinct");
-        let mut written_keys: Vec<&str> = result.written.iter().map(|(k, _)| k.as_str()).collect();
+        let mut written_keys: Vec<&str> =
+            result.written.iter().map(|(k, _, _)| k.as_str()).collect();
         written_keys.sort();
         assert_eq!(
             written_keys,
@@ -3988,7 +4039,7 @@ mod tests {
 
         assert_eq!(
             result.written,
-            vec![("g9".to_string(), 5)],
+            vec![("g9".to_string(), 5, None)],
             "the lone group must be reported written"
         );
 
@@ -4258,7 +4309,8 @@ mod tests {
 
         let (_, result) = tokio::join!(release_a, run_b);
 
-        let mut written_keys: Vec<&str> = result.written.iter().map(|(k, _)| k.as_str()).collect();
+        let mut written_keys: Vec<&str> =
+            result.written.iter().map(|(k, _, _)| k.as_str()).collect();
         written_keys.sort();
         assert_eq!(
             written_keys,

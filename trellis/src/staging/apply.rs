@@ -2830,7 +2830,13 @@ struct AggregateClearPlan {
 /// source commit) doesn't get to blank out a known origin its fan-in sibling
 /// carried — it simply contributes nothing to the merge. Only when *every*
 /// contributor is origin-less does the result stay `None`.
-fn earliest_src_changed(
+///
+/// Widened to `pub(super)` for issue #104: `apply_aggregate`'s
+/// `accumulate_changes` reuses this exact merge to fold a `FoldedChange`'s
+/// `src_changed` into the touched [`apply_aggregate::GroupPlan`]'s own
+/// running origin, the aggregate-path counterpart to this module's own
+/// `hop_gen`-style fan-in above.
+pub(super) fn earliest_src_changed(
     a: Option<std::time::SystemTime>,
     b: Option<std::time::SystemTime>,
 ) -> Option<std::time::SystemTime> {
@@ -5429,12 +5435,14 @@ pub async fn apply_and_mark_drained_many(
     // now fixed: `derive_group_key` emits exactly `ddl::pk_key_sql_expr`'s
     // own identity encoding at either arity (the bare value for one column,
     // the U+001F join for several), matching the target's real PK shape.
-    // `src_changed` is always `None` here (`apply_aggregate::AggregateTargetPlan`'s
-    // written/deleted shape carries no origin today) — deliberately left
-    // unthreaded rather than plumbed in this commit; tracked as
-    // [#104](https://github.com/salesforce-misc/trellis/issues/104), a
-    // known, live gap in the latency histograms for any transform chained
-    // off an aggregate target, independent of #103's fix above.
+    // `src_changed` (issue #104, follow-up to #51/#52 once #103 made
+    // aggregate-target chaining live rather than moot) is threaded from
+    // each touched [`apply_aggregate::GroupPlan`]'s own `src_changed` —
+    // folded there by `accumulate_changes` via the same
+    // [`earliest_src_changed`] fan-in tie-break this module's 1-1 path
+    // uses, so a `Recompute` staged for a transform chained off an
+    // aggregate target now carries a real origin instead of always
+    // reading `None`.
     //
     // Issue #180: `result.deleted` additionally carries each extinct group's
     // pre-delete image (`AggregateApplyResult::deleted`'s own doc comment) —
@@ -5461,13 +5469,8 @@ pub async fn apply_and_mark_drained_many(
             result
                 .written
                 .into_iter()
-                .map(|(key, hop_gen)| (key, hop_gen, None, None))
-                .chain(
-                    result
-                        .deleted
-                        .into_iter()
-                        .map(|(key, hop_gen, old_image)| (key, hop_gen, None, old_image)),
-                ),
+                .map(|(key, hop_gen, src_changed)| (key, hop_gen, src_changed, None))
+                .chain(result.deleted),
         );
     }
 
@@ -5803,6 +5806,8 @@ pub async fn apply_and_mark_drained_many(
                             .entry(new_group_key)
                             .or_insert_with(|| apply_aggregate::GroupPlan::new(new_values));
                         group.hop_gen = group.hop_gen.max(record.hop_gen);
+                        group.src_changed =
+                            earliest_src_changed(group.src_changed, record.src_changed);
                         apply_aggregate::diff_contributions(
                             &target_plan.fields,
                             group,
@@ -5815,6 +5820,8 @@ pub async fn apply_and_mark_drained_many(
                             .entry(old_group_key)
                             .or_insert_with(|| apply_aggregate::GroupPlan::new(old_values));
                         old_group.hop_gen = old_group.hop_gen.max(record.hop_gen);
+                        old_group.src_changed =
+                            earliest_src_changed(old_group.src_changed, record.src_changed);
                         apply_aggregate::sub_contributions(
                             &target_plan.fields,
                             old_group,
@@ -5826,6 +5833,8 @@ pub async fn apply_and_mark_drained_many(
                             .entry(new_group_key)
                             .or_insert_with(|| apply_aggregate::GroupPlan::new(new_values));
                         new_group.hop_gen = new_group.hop_gen.max(record.hop_gen);
+                        new_group.src_changed =
+                            earliest_src_changed(new_group.src_changed, record.src_changed);
                         apply_aggregate::add_contributions(
                             &target_plan.fields,
                             new_group,
@@ -5886,6 +5895,13 @@ pub async fn apply_and_mark_drained_many(
                 // step above — `result.deleted`'s pre-delete image lets step
                 // 4 stage a real image-bearing delete for an extinct group
                 // reached through the reverse-relationship fast path too.
+                // Issue #104: `result`'s own `src_changed` (folded into each
+                // touched `GroupPlan` above from this single `record`'s own
+                // `src_changed` — the diff_pass merges above) carries the
+                // same origin `record.src_changed` would, so no separate
+                // substitution is needed here, unlike before this fix, when
+                // `AggregateApplyResult`'s written/deleted shape carried no
+                // origin at all.
                 changed
                     .entry(agg_shape.target.as_str())
                     .or_default()
@@ -5893,10 +5909,8 @@ pub async fn apply_and_mark_drained_many(
                         result
                             .written
                             .into_iter()
-                            .map(|(key, hop_gen)| (key, hop_gen, record.src_changed, None))
-                            .chain(result.deleted.into_iter().map(|(key, hop_gen, old_image)| {
-                                (key, hop_gen, record.src_changed, old_image)
-                            })),
+                            .map(|(key, hop_gen, src_changed)| (key, hop_gen, src_changed, None))
+                            .chain(result.deleted),
                     );
             }
         }
