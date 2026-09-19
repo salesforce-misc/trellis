@@ -4,14 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-# `test-util` (issue #166): compiles in `trellis::staging::apply`'s
-# test-only pre-commit pause hook (see that module for the mechanism) that
-# `backend::subprocess::SubprocessBackend` needs to land a `SIGKILL`
-# deterministically. `generative` is itself test-infrastructure-only (never
-# depended on by `trellis`/`cli`/`benchmark`), so enabling this here doesn't
-# leak it into anything production-facing — see `trellis/Cargo.toml`'s
-# `test-util` feature doc comment.
-trellis = { path = "../trellis", features = ["test-util"] }
+# Plain and featureless, deliberately. `trellis/test-util` (issue #166) is
+# turned on only through this crate's own `subprocess-backend` feature
+# below, never unconditionally here. Cargo unifies features across a whole
+# workspace build, and this is a *normal* (not dev-) dependency, so a
+# `features = ["test-util"]` written here compiles the engine's test-only
+# pre-commit pause hook straight into `cli`'s production `trellis` binary on
+# any plain `cargo build --workspace [--release]` — verified, not
+# hypothetical. Same "must never enter a normal `cargo build`" rule the
+# `proptest` dependency below already follows.
+trellis = { path = "../trellis" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
 # Issue #166: `backend::subprocess::SubprocessBackend` spawns/supervises the
@@ -30,6 +32,26 @@ proptest = { version = "1.11", optional = true }
 
 [features]
 proptest = ["dep:proptest"]
+# Issue #166. Turns on `trellis/test-util`, which compiles in
+# `trellis::staging::apply`'s test-only pre-commit pause hook (see that
+# module for the mechanism) — the thing `backend::subprocess::
+# SubprocessBackend` needs in order to land a `SIGKILL` deterministically
+# inside an open Phase 3 transaction. Off by default, and turned on for this
+# crate's own tests by the self dev-dependency below, exactly like
+# `proptest`: that is what keeps it out of `cargo build --workspace`'s
+# production `cli` binary. `backend::subprocess` itself compiles either way
+# (it drives the hook purely through env vars, and never names a gated
+# item); only the spawned `engine_subprocess` binary actually needs the
+# feature active, hence its `required-features` below.
+subprocess-backend = ["trellis/test-util"]
+
+# Not auto-discovered, because it must not be built by a plain
+# `cargo build --workspace`: building it would activate `subprocess-backend`
+# and, with it, `trellis/test-util` for every other crate in the same build.
+[[bin]]
+name = "engine_subprocess"
+path = "src/bin/engine_subprocess.rs"
+required-features = ["subprocess-backend"]
 
 [dev-dependencies]
-generative = { path = ".", features = ["proptest"] }
+generative = { path = ".", features = ["proptest", "subprocess-backend"] }
