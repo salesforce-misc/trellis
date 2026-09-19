@@ -20,9 +20,10 @@
 //! longer for those two shapes — consistent with, not a regression from,
 //! today's async behavior.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_postgres::types::PgLsn;
 
 use crate::app::{
     DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, RelationshipSummary, Trellis,
@@ -70,6 +71,8 @@ enum Job {
         oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
     ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
+    WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
+    AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
@@ -246,6 +249,18 @@ impl BlockingTrellis {
         self.submit(|reply| Job::ResumeTransform(target, reply))
     }
 
+    /// A read-your-writes watermark token. See [`Trellis::watermark_token`].
+    pub fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
+        self.submit(Job::WatermarkToken)
+    }
+
+    /// Blocks until every effect committed at or before `token` has been
+    /// reflected in its target(s), or `timeout` elapses. See
+    /// [`Trellis::await_converged`].
+    pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
+        self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
+    }
+
     /// Stops any background work this connection started and waits for the
     /// background thread to exit cleanly. See [`Trellis::shutdown`].
     pub fn shutdown(mut self) -> Result<(), TrellisError> {
@@ -382,6 +397,12 @@ async fn run(
             }
             Job::ResumeTransform(target, reply) => {
                 let _ = reply.send(trellis.resume_transform(&target).await);
+            }
+            Job::WatermarkToken(reply) => {
+                let _ = reply.send(trellis.watermark_token().await);
+            }
+            Job::AwaitConverged(token, timeout, reply) => {
+                let _ = reply.send(trellis.await_converged(token, timeout).await);
             }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);

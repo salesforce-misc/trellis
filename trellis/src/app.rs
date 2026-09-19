@@ -83,7 +83,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use tokio_postgres::types::PgLsn;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
@@ -94,6 +96,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::quarantine;
+use crate::staging::{StagingError, converge};
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
 ///
@@ -714,6 +717,63 @@ impl Trellis {
         Ok(())
     }
 
+    /// A read-your-writes watermark (issue #192): `pg_current_wal_lsn()`,
+    /// read on a freshly acquired pool connection — see
+    /// [`crate::staging::converge::watermark_token`] for the exact
+    /// semantics.
+    ///
+    /// **Call this after the write you want reflected has committed.**
+    /// Taken any earlier, the token bounds the write from *below* instead of
+    /// above, and [`Trellis::await_converged`] could then return before the
+    /// write is actually applied to its target(s)
+    /// (docs/staging-and-claiming/07-convergence-and-await.md, "Watermark
+    /// tokens"). The write itself doesn't need to go through this same
+    /// connection or even through [`Trellis`] at all — any connection works,
+    /// as long as this call happens after the write's commit returns:
+    /// `pg_current_wal_lsn()` reports the server's current WAL position, not
+    /// something scoped to one session, so it's guaranteed to be at or past
+    /// the write's own commit LSN by the time this query runs.
+    ///
+    /// Pairs with [`Trellis::await_converged`]:
+    ///
+    /// ```no_run
+    /// # async fn example(trellis: &trellis::Trellis) -> Result<(), trellis::TrellisError> {
+    /// // ... write to a source table (any connection), and let the commit
+    /// // return ...
+    /// let token = trellis.watermark_token().await?;
+    /// trellis
+    ///     .await_converged(token, std::time::Duration::from_secs(30))
+    ///     .await?;
+    /// // Every target fed by that write is now guaranteed to reflect it.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
+        let client = self.pool.get().await?;
+        Ok(converge::watermark_token(&**client).await?)
+    }
+
+    /// Blocks until every effect committed at or before `token` (see
+    /// [`Trellis::watermark_token`]) has been reflected in its target(s), or
+    /// `timeout` elapses — the read-your-writes primitive an embedder
+    /// reaches for after writing to a source table and needing to see that
+    /// write's effects in a transform's target table.
+    ///
+    /// A thin facade over [`crate::staging::converge::await_converged`] (see
+    /// its doc comment for the polling/backoff shape and exactly what
+    /// "reflected" means). Errors with
+    /// [`TrellisError::Staging`]`(`[`StagingError::ConvergenceTimeout`]`)`
+    /// on timeout — a named, matchable condition rather than a generic
+    /// failure.
+    pub async fn await_converged(
+        &self,
+        token: PgLsn,
+        timeout: Duration,
+    ) -> Result<(), TrellisError> {
+        let client = self.pool.get().await?;
+        Ok(converge::await_converged(&**client, token, timeout).await?)
+    }
+
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. When staging, derives the source-table set from the
     /// catalog (a staging worker needs it non-empty).
@@ -1066,6 +1126,12 @@ pub enum TrellisError {
     /// (no `.column`) — a `quarantined` transform's whole-transform remedy
     /// is [`Trellis::resume_transform`], not this call.
     ColumnAddressRequired,
+    /// [`Trellis::watermark_token`]/[`Trellis::await_converged`] hit a
+    /// failure inside the staging ring's convergence machinery
+    /// (`staging::converge`) — most commonly
+    /// [`StagingError::ConvergenceTimeout`], but also a lower-level DB
+    /// failure encountered while polling.
+    Staging(StagingError),
 }
 
 impl TrellisError {
@@ -1103,6 +1169,7 @@ impl TrellisError {
             TrellisError::Apply(err) => err.code(),
             TrellisError::TransformNotFound(_) => ErrorCode::NotFound,
             TrellisError::ColumnAddressRequired => ErrorCode::Validation,
+            TrellisError::Staging(err) => err.code(),
         }
     }
 }
@@ -1156,6 +1223,7 @@ impl std::fmt::Display for TrellisError {
                 "resume_column needs a \"transform.column\" address; to resume a whole \
                  quarantined transform, call resume_transform instead"
             ),
+            TrellisError::Staging(err) => write!(f, "{err}"),
         }
     }
 }
@@ -1177,6 +1245,7 @@ impl std::error::Error for TrellisError {
             TrellisError::BlockingSpawn(err) => Some(err),
             TrellisError::Apply(err) => Some(err),
             TrellisError::TransformNotFound(_) | TrellisError::ColumnAddressRequired => None,
+            TrellisError::Staging(err) => Some(err),
         }
     }
 }
@@ -1214,6 +1283,12 @@ impl From<crate::error::Error> for TrellisError {
 impl From<tokio_postgres::Error> for TrellisError {
     fn from(err: tokio_postgres::Error) -> Self {
         TrellisError::Db(err)
+    }
+}
+
+impl From<StagingError> for TrellisError {
+    fn from(err: StagingError) -> Self {
+        TrellisError::Staging(err)
     }
 }
 
