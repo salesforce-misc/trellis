@@ -2603,9 +2603,11 @@ async fn fetch_relationship_projection_rows(
 }
 
 /// The [`ValueType`] of each named column on `table`, introspected live from
-/// `pg_catalog` via `format_type` (matching `catalog::column_type_in_txn`), so
-/// a to-side relationship column's text is typed the same way the from-side
-/// source columns are. A column not found is simply absent — the evaluator
+/// `pg_catalog` via its raw `atttypid` OID and [`crate::defs::pg_type::value_type_for_oid`]
+/// (issue #108 — previously a second, independently-drifting copy of
+/// `catalog`'s own `format_type`-text matching lived here), so a to-side
+/// relationship column's text is typed the same way the from-side source
+/// columns are. A column not found is simply absent — the evaluator
 /// defaults an absent to-side column to `Numeric`.
 pub(crate) async fn to_column_types(
     pool: &Pool,
@@ -2618,7 +2620,7 @@ pub(crate) async fn to_column_types(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+            "select a.attname::text, a.atttypid \
              from pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attname = any($2::text[]) \
@@ -2630,26 +2632,10 @@ pub(crate) async fn to_column_types(
     let mut types = HashMap::with_capacity(rows.len());
     for row in rows {
         let name: String = row.get(0);
-        let pg_type: String = row.get(1);
-        types.insert(name, value_type_from_pg(&pg_type));
+        let type_oid: u32 = row.get(1);
+        types.insert(name, crate::defs::pg_type::value_type_for_oid(type_oid));
     }
     Ok(types)
-}
-
-/// Maps a Postgres `format_type` rendering to the evaluator's [`ValueType`],
-/// mirroring `catalog::type_family`'s buckets. Anything not clearly numeric,
-/// boolean, or uuid is treated as text — a verbatim passthrough that can't
-/// misparse, the safe default for a to-side enrichment column.
-fn value_type_from_pg(pg_type: &str) -> ValueType {
-    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-    match base {
-        "uuid" => ValueType::Uuid,
-        "boolean" => ValueType::Boolean,
-        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
-            ValueType::Numeric
-        }
-        _ => ValueType::Text,
-    }
 }
 
 // ---------------------------------------------------------------------

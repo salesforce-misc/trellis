@@ -1883,7 +1883,7 @@ pub(crate) async fn resolve_relationships(
         };
         let to_table = reldef.def.to_table.clone();
         // Reviewer follow-up to issue #74 (epic #78's own whole-branch
-        // review, 4th gap): `column_type` below queries `pg_attribute`
+        // review, 4th gap): `column_type_oid` below queries `pg_attribute`
         // straight off this bare `to_table` — a `to_regclass` `search_path`
         // walk with no fallback, same as `create_relationship`'s own
         // pg_catalog checks had before [`resolve_relationship_endpoint_in_txn`]
@@ -1897,12 +1897,12 @@ pub(crate) async fn resolve_relationships(
         // [`resolve_relationship_endpoint_in_txn`], same best-effort
         // fallback-to-bare-on-total-miss behavior — so a genuinely
         // nonexistent to-table still reports its own precise error out of
-        // `column_type` below, not this resolution's.
+        // `column_type_oid` below, not this resolution's.
         let query_to_table = resolve_relationship_endpoint(pool, &to_table).await?;
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
-            let pg_type = column_type(pool, &query_to_table, &to_table, &column).await?;
-            column_types.insert(column, value_type_from_pg(&pg_type));
+            let type_oid = column_type_oid(pool, &query_to_table, &to_table, &column).await?;
+            column_types.insert(column, super::pg_type::value_type_for_oid(type_oid));
         }
         resolved.insert(
             rel,
@@ -2313,16 +2313,26 @@ async fn defer_if_fence_unsettled(
 /// `reldef.def.to_table` as `display_table`, so a reported
 /// [`ValidationError::UnknownRelationshipColumn`] still names the table
 /// exactly as the relationship's own source text did.
-async fn column_type(
+///
+/// Renamed from `column_type` (issue #108): its one caller
+/// ([`resolve_relationships`]) only ever fed the result straight into
+/// `value_type_from_pg`'s `format_type`-text matching, which is exactly the
+/// `_ => Text` fallthrough this issue replaces. Selecting the raw
+/// `atttypid` OID instead — and classifying it via
+/// [`super::pg_type::value_type_for_oid`] — sidesteps that matching (and its
+/// `(...)` modifier-stripping) entirely, since a type's OID doesn't vary
+/// with `numeric(10,2)` vs. `numeric`'s modifier the way its `format_type`
+/// text does.
+async fn column_type_oid(
     pool: &Pool,
     query_table: &str,
     display_table: &str,
     column: &str,
-) -> Result<String, CatalogError> {
+) -> Result<u32, CatalogError> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod)
+            "select a.atttypid
              from pg_attribute a
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attname = $2
@@ -2338,24 +2348,6 @@ async fn column_type(
             column: column.to_string(),
         }
         .into()),
-    }
-}
-
-/// Maps a Postgres `format_type` rendering to the evaluator's [`ValueType`].
-/// A copy of `staging::apply`'s same-named helper (the `defs` layer is
-/// upstream of `staging`, so it can't reuse it without a backward
-/// dependency); keep the two in sync. Anything not clearly numeric, boolean,
-/// or uuid is treated as text, the safe verbatim-passthrough default for a
-/// to-side enrichment column.
-fn value_type_from_pg(pg_type: &str) -> ValueType {
-    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-    match base {
-        "uuid" => ValueType::Uuid,
-        "boolean" => ValueType::Boolean,
-        "smallint" | "integer" | "bigint" | "numeric" | "real" | "double precision" => {
-            ValueType::Numeric
-        }
-        _ => ValueType::Text,
     }
 }
 
