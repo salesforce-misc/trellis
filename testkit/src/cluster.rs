@@ -405,7 +405,9 @@ fn reap_orphans_once() {
 /// `postmaster.pid`) and removing the directory. A dir whose recorded
 /// postmaster is still alive belongs to a running test process and is left
 /// untouched; a dir with no `postmaster.pid` never got a server (or it already
-/// stopped), so there's no segment to free — just remove it.
+/// stopped), so there's no segment to free — just remove it, unless the
+/// *owning* process (see [`owning_pid`]) is still alive, in which case it's
+/// simply mid-`initdb`/mid-startup and must be left alone.
 ///
 /// Everything here is best-effort: this reclaims resources that already leaked,
 /// so any failure (a segment already gone, a dir we can't read) is not worth
@@ -416,7 +418,8 @@ fn reap_orphans_in(tmp: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("trellis-testkit-") {
+        let name = name.to_string_lossy();
+        if !name.starts_with("trellis-testkit-") {
             continue;
         }
         let dir = entry.path();
@@ -437,19 +440,45 @@ fn reap_orphans_in(tmp: &Path) {
                 reap_shmem_segment(&data_dir);
                 let _ = fs::remove_dir_all(&dir);
             }
-            // No `postmaster.pid`: either a run killed mid-`initdb` (no server,
-            // no segment — safe to drop) or a cluster in *another* process
-            // whose postgres hasn't written its pidfile yet. Can't tell those
-            // apart directly, so only sweep dirs old enough that no in-flight
-            // setup could still be using them; a fresh one is left for its
-            // owner and reaped on a later run.
-            Err(_) => {
-                if older_than(&dir, Duration::from_secs(60)) {
+            // No `postmaster.pid`: either a run was killed mid-`initdb` (no
+            // server, no segment — safe to drop) or a cluster in *another*,
+            // still-live process whose postgres hasn't written its pidfile
+            // yet (still mid-`initdb`, possibly for a while under load — see
+            // #198). The directory name itself encodes the answer: it's
+            // `trellis-testkit-<owning-pid>-<counter>` (see [`unique_suffix`]),
+            // so check that PID directly rather than guessing from age. A
+            // dir whose owning process is still alive is left alone no
+            // matter how long setup takes; one whose owner is confirmed dead
+            // is a genuine orphan and reaped immediately.
+            Err(_) => match owning_pid(&name) {
+                Some(pid) if process_alive(pid) => {}
+                Some(_) => {
                     let _ = fs::remove_dir_all(&dir);
                 }
-            }
+                // Name doesn't match the `<owning-pid>-<counter>` shape we
+                // generate (e.g. some future/foreign layout) — fall back to
+                // the conservative age guard rather than guessing wrong.
+                None => {
+                    if older_than(&dir, Duration::from_secs(60)) {
+                        let _ = fs::remove_dir_all(&dir);
+                    }
+                }
+            },
         }
     }
+}
+
+/// Extracts the owning process's PID from a `trellis-testkit-<pid>-<counter>`
+/// directory name, as produced by [`unique_suffix`]. Returns `None` if the
+/// name doesn't have that shape (e.g. it's not one this build of testkit
+/// created).
+fn owning_pid(dir_name: &str) -> Option<i32> {
+    dir_name
+        .strip_prefix("trellis-testkit-")?
+        .split('-')
+        .next()?
+        .parse::<i32>()
+        .ok()
 }
 
 /// Whether `path`'s last modification was more than `age` ago. Conservative on
@@ -569,6 +598,17 @@ mod tests {
         dir
     }
 
+    // Like `write_fake_cluster`, but names the directory the way
+    // `unique_suffix` actually does (`<owning-pid>-<counter>`), so
+    // `owning_pid` can parse a PID back out of it. Never writes a
+    // `postmaster.pid` — these are for exercising the no-pidfile branch's
+    // owning-process check specifically.
+    fn write_fake_cluster_owned_by(sandbox: &Path, owning_pid: i32, counter: u32) -> PathBuf {
+        let dir = sandbox.join(format!("trellis-testkit-{owning_pid}-{counter}"));
+        fs::create_dir_all(dir.join("data")).expect("create fake data dir");
+        dir
+    }
+
     // Std has no set-mtime API, so shell out to `touch -t` to push a dir's
     // modification time far enough back to clear `older_than`'s guard.
     fn backdate(path: &Path) {
@@ -621,7 +661,9 @@ mod tests {
     }
 
     #[test]
-    fn reaps_stale_dir_with_no_pidfile() {
+    fn reaps_stale_dir_with_no_pidfile_and_unparseable_name() {
+        // A name that doesn't match `<owning-pid>-<counter>` falls back to
+        // the age guard rather than the owning-pid check exercised below.
         let sandbox = fresh_sandbox("nopid-stale");
         let dir = write_fake_cluster(&sandbox, "nopid-stale", None);
         // Backdate it well past the age guard so it reads as a genuine
@@ -638,10 +680,9 @@ mod tests {
     }
 
     #[test]
-    fn keeps_fresh_dir_with_no_pidfile() {
+    fn keeps_fresh_dir_with_no_pidfile_and_unparseable_name() {
+        // Same fallback path as above, but fresh: must not be swept.
         let sandbox = fresh_sandbox("nopid-fresh");
-        // Freshly created: stands in for a cluster in another process whose
-        // postgres hasn't written its pidfile yet. Must not be swept.
         let dir = write_fake_cluster(&sandbox, "nopid-fresh", None);
 
         reap_orphans_in(&sandbox);
@@ -650,6 +691,98 @@ mod tests {
             dir.exists(),
             "a just-created pidfile-less dir may be mid-setup elsewhere and must be left alone"
         );
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn keeps_dir_with_no_pidfile_whose_owning_process_is_alive() {
+        // This is the #198 regression case: a cluster whose owning process
+        // is still alive and mid-`initdb` (no postmaster.pid yet) must never
+        // be reaped, no matter how long setup takes. Backdate it well past
+        // the old 60s age guard to prove it's the owning-pid check — not
+        // age — that's protecting it now.
+        let sandbox = fresh_sandbox("owner-alive");
+        let dir = write_fake_cluster_owned_by(&sandbox, std::process::id() as i32, 0);
+        backdate(&dir);
+
+        reap_orphans_in(&sandbox);
+
+        assert!(
+            dir.exists(),
+            "a pidfile-less dir whose owning process is still alive must never be reaped, \
+             regardless of age"
+        );
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn reaps_dir_with_no_pidfile_whose_owning_process_is_dead() {
+        // The flip side: once the owning process is confirmed dead, the
+        // orphan is real and gets reaped immediately — no need to wait out
+        // an age guard.
+        let sandbox = fresh_sandbox("owner-dead");
+        // i32::MAX is above macOS's PID ceiling, so it's reliably not a live
+        // process.
+        let dir = write_fake_cluster_owned_by(&sandbox, i32::MAX, 0);
+
+        reap_orphans_in(&sandbox);
+
+        assert!(
+            !dir.exists(),
+            "a pidfile-less dir whose owning process is confirmed dead is a genuine orphan \
+             and should be removed immediately"
+        );
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// Regression test for #198: two independent OS processes concurrently
+    /// running `reap_orphans_in` against the same shared temp root must
+    /// never reap a directory that belongs to the *other*, still-live
+    /// process — even though that directory has no `postmaster.pid` yet
+    /// (still mid-`initdb`) and even though its age alone would look old
+    /// enough to sweep under the old heuristic.
+    ///
+    /// A real child process stands in for "the other process": its PID is
+    /// embedded in the directory name exactly as `unique_suffix` would, so
+    /// this exercises the actual mechanism (`owning_pid` + `process_alive`)
+    /// rather than merely simulating it.
+    #[test]
+    fn does_not_reap_concurrent_processes_in_flight_cluster() {
+        let sandbox = fresh_sandbox("race");
+
+        // Stand-in for another live `TestCluster::start()` in a different
+        // process: something that reliably stays alive until we kill it.
+        let mut other_process = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in process");
+        let other_pid = other_process.id() as i32;
+
+        let dir = write_fake_cluster_owned_by(&sandbox, other_pid, 0);
+        // Backdate past the old 60s guard: under load, real setup
+        // (`initdb` retries, contention) can plausibly take this long, and
+        // the fix must not depend on it staying "fresh".
+        backdate(&dir);
+
+        // A concurrent process's reap pass must leave the other process's
+        // in-flight directory alone while it's still alive.
+        reap_orphans_in(&sandbox);
+        assert!(
+            dir.exists(),
+            "must not reap another live process's in-flight cluster directory"
+        );
+
+        // Once that process actually exits, its directory is a genuine
+        // orphan and the next reap pass must clean it up.
+        other_process.kill().expect("kill stand-in process");
+        other_process.wait().expect("reap stand-in process");
+
+        reap_orphans_in(&sandbox);
+        assert!(
+            !dir.exists(),
+            "must reap the directory once its owning process has actually exited"
+        );
+
         let _ = fs::remove_dir_all(&sandbox);
     }
 
