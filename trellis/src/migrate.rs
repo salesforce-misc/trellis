@@ -30,6 +30,12 @@ use crate::pool::Pool;
 /// Ensures `config.schema()` exists and is safe to attach to (see
 /// [`crate::identity`]), then applies any migrations not yet recorded as
 /// applied. A no-op if everything is already up to date.
+///
+/// Deliberately public — a tier-2 composable primitive under ADR-0012, not a
+/// leaked internal. [`crate::Trellis::migrate`] and
+/// [`crate::BlockingTrellis::migrate`] delegate to it, and an embedder (or a
+/// shared test bootstrap such as `testkit`'s) may call it directly to bring a
+/// schema up to date without standing up a facade.
 pub async fn migrate(pool: &Pool, config: &Config) -> Result<(), Error> {
     let mut client = pool.get().await?;
     let pg_client: &mut tokio_postgres::Client = &mut client;

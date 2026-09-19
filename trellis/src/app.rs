@@ -1017,10 +1017,11 @@ impl Trellis {
 /// time), which broke for a source living outside this connection's
 /// `search_path` (e.g. an issue #76 explicit-schema source).
 ///
-/// `pub` (rather than `pub(crate)`) only so `trellis/tests/app.rs` can exercise
-/// it directly as `trellis::app::qualified_source_tables`; not re-exported
-/// from the crate root, so it isn't part of [`Trellis`]'s public surface.
-pub async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
+/// `pub(crate)`: [`Trellis::connect`]'s `start_client` is its only caller, and
+/// ADR-0012 keeps the facade's public surface to tier 1 and tier 2. What it
+/// passes through to — the transitive source-table closure — is covered
+/// directly in `trellis/tests/app.rs` against `defs::all_source_tables`.
+pub(crate) async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
     Ok(defs::all_source_tables(pool).await?)
 }
 

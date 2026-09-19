@@ -5,8 +5,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use trellis::app::qualified_source_tables;
-use trellis::defs::{create_definition, create_relationship};
+use trellis::defs::{all_source_tables, create_definition, create_relationship};
 use trellis::{Config, Trellis, TrellisOptions};
 
 /// A bare table with an integer primary key named `id`.
@@ -30,10 +29,11 @@ async fn create_table_with_fk_column(pool: &trellis::pool::Pool, name: &str, fk_
         .expect("create table with fk column");
 }
 
-/// Issue #83 WI3: `qualified_source_tables` (the seed for
+/// Issue #83 WI3: `defs::all_source_tables` (which `app`'s crate-private
+/// `qualified_source_tables` passes straight through as the seed for
 /// [`trellis::ClientOptions::source_tables`] at staging startup) must seed the
-/// full transitive closure of source tables (`trellis::defs::all_source_tables`),
-/// not just each definition's direct anchor. A definition anchored on
+/// full transitive closure of source tables, not just each definition's
+/// direct anchor. A definition anchored on
 /// `authors` with a to-many relationship to `posts` (the shape a
 /// `count(posts.id)`-style calculated field on `authors` reads through) must
 /// seed both `authors` and `posts`, schema-qualified — otherwise a live write
@@ -70,7 +70,7 @@ async fn includes_relationship_to_tables_not_just_direct_anchors() {
     .await
     .expect("valid to-many relationship should be stored");
 
-    let mut tables = qualified_source_tables(&db.pool)
+    let mut tables = all_source_tables(&db.pool)
         .await
         .expect("seeding query should succeed");
     tables.sort();

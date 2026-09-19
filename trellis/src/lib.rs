@@ -10,7 +10,12 @@
 //! starts, still public for embedders that want to drive it directly.
 //! [`blocking::BlockingTrellis`] wraps the same facade for callers that
 //! can't assume a `tokio` runtime on their own thread (issue #87's future
-//! FFI embedding). Everything else in the crate is machinery these compose:
+//! FFI embedding). Those three are tier 1 in
+//! `docs/decisions/0012-curate-public-api-demote-engine-modules.md` — the
+//! only front doors.
+//!
+//! Tier 2 is the small set of composable primitives an embedder may reach
+//! for directly instead of going through the facade:
 //!
 //! - [`config`] resolves a [`Config`] from CLI args + environment.
 //! - [`pool`] manages a `deadpool-postgres` connection pool and exposes the
@@ -18,12 +23,6 @@
 //! - [`migrate`] applies Trellis's embedded SQL migrations.
 //! - [`identity`] decides, before migrations run, whether the configured
 //!   schema is safe to attach to — see `docs/instance-identity.md`.
-//! - [`intake`] streams committed source-table changes off a logical
-//!   replication slot into the durable staging ring.
-//! - [`staging`] owns the ring, sealing, claim-time fold, and the exactly-once
-//!   apply path — see `docs/staging-and-claiming/README.md`.
-//! - [`defs`] parses, validates, and catalogs transform definitions (today:
-//!   the 1-1, `+`-only grammar — see `docs/decisions/0004-transform-definition-grammar.md`).
 //! - [`error_code`] is a small, stable [`error_code::ErrorCode`] taxonomy
 //!   every error type in this crate can report via a `code()` method,
 //!   independent of its own (freely growing) internal variants — see
@@ -36,23 +35,35 @@
 //! - Logs/traces (issue #56, epic #49) flow through the plain `tracing`
 //!   facade — spans modeling the propagation path (source commit → hop →
 //!   hop → apply, ADR-0009 decision 3) and events at operationally
-//!   meaningful points, in [`intake`] and [`staging`] directly, not a
-//!   separate module of their own. [`otel`] (behind the optional `otlp`
+//!   meaningful points, in `intake` and `staging` directly, not a
+//!   separate module of their own. `otel` (behind the optional `otlp`
 //!   Cargo feature, off by default) is the OTLP export layer an embedder can
 //!   add to their own subscriber; with the feature off, or with no
 //!   subscriber installed at all, spans/events cost only `tracing`'s own
 //!   near-zero no-subscriber overhead.
 //!
+//! Tier 3 is the engine — `defs` (parses, validates, and catalogs transform
+//! definitions), `intake` (streams committed source-table changes off a
+//! logical replication slot into the durable staging ring), and `staging`
+//! (the ring, sealing, claim-time fold, and the exactly-once apply path) —
+//! together with everything beneath them. They are `pub(crate)`: machinery
+//! the facade composes, not names an embedder can write. See
+//! `docs/staging-and-claiming/README.md` and
+//! `docs/decisions/0004-transform-definition-grammar.md` for what they do,
+//! and ADR-0012 for why they aren't API. `dev` (behind the off-by-default
+//! `test-util` feature) is the one curated, uncommitted door onto them, for
+//! the generative suite's independent cross-check leg.
+//!
 //! **Current subset**: 1-1 scalar transforms only end to end (issue #11's
 //! 1-1 slice). Aggregate/invertible-delta maintenance is not yet wired up —
 //! the apply frame that will carry it (fence, lock order, atomic apply ∪
-//! mark-drained) is already in place in [`staging`].
+//! mark-drained) is already in place in `staging`.
 //!
-//! The ring has a fixed [`staging::RING_SIZE`] of 4 slots; a `drained`
+//! The ring has a fixed `staging::RING_SIZE` of 4 slots; a `drained`
 //! segment's slot is freed for reuse by retirement (stage 06,
 //! `docs/staging-and-claiming/06-cleanup-and-reclaim.md`,
-//! [`staging::retire_drained_segments`]), run both as
-//! [`staging::seal_if_active_nonempty`]'s one-retry-on-`RingFull` step and on
+//! `staging::retire_drained_segments`), run both as
+//! `staging::seal_if_active_nonempty`'s one-retry-on-`RingFull` step and on
 //! every maintenance tick ([`client::ClientOptions::maintenance_interval`]).
 //! Quarantine, stage 06's other half, is not yet implemented.
 
