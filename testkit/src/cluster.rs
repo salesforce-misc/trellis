@@ -643,29 +643,6 @@ mod tests {
         dir
     }
 
-    // Like `write_fake_cluster_owned_by`, but also writes a `postmaster.pid`
-    // naming `postmaster_pid` — standing in for a cluster whose postgres has
-    // (or hasn't) died while its owning process is a separate, independently
-    // tracked PID. Exercises the `Ok(contents)` branch's owning-process
-    // check, the #206 case, the same way `write_fake_cluster_owned_by`
-    // exercises it for the `Err(_)` (no-pidfile) branch.
-    fn write_fake_cluster_owned_by_with_pidfile(
-        sandbox: &Path,
-        owning_pid: i32,
-        counter: u32,
-        postmaster_pid: i32,
-    ) -> PathBuf {
-        let dir = sandbox.join(format!("trellis-testkit-{owning_pid}-{counter}"));
-        let data_dir = dir.join("data");
-        fs::create_dir_all(&data_dir).expect("create fake data dir");
-        let contents = format!(
-            "{postmaster_pid}\n{}\n0\n5432\n\n\n123 987654321\nready\n",
-            dir.display()
-        );
-        fs::write(data_dir.join("postmaster.pid"), contents).expect("write fake pidfile");
-        dir
-    }
-
     // Std has no set-mtime API, so shell out to `touch -t` to push a dir's
     // modification time far enough back to clear `older_than`'s guard.
     fn backdate(path: &Path) {
@@ -866,10 +843,12 @@ mod tests {
             .expect("spawn stand-in process");
         let other_pid = other_process.id() as i32;
 
-        // i32::MAX is above macOS's PID ceiling, so it's reliably not a live
-        // process: this postmaster.pid is stale, naming a dead postgres PID,
-        // even though the *owning* process is still alive.
-        let dir = write_fake_cluster_owned_by_with_pidfile(&sandbox, other_pid, 0, i32::MAX);
+        // Named the way `unique_suffix` does (`<owning-pid>-<counter>`), so
+        // `owning_pid` parses that live process back out of it. i32::MAX is
+        // above macOS's PID ceiling, so it's reliably not a live process:
+        // this postmaster.pid is stale, naming a dead postgres PID, even
+        // though the *owning* process is still alive.
+        let dir = write_fake_cluster(&sandbox, &format!("{other_pid}-0"), Some(i32::MAX));
 
         reap_orphans_in(&sandbox);
         assert!(
