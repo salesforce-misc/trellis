@@ -4,169 +4,131 @@ date: 2026-09-19
 deciders: Michael Ries
 ---
 
-# Pausing and Dropping a Transform
+# Pausing and Dropping a Definition
 
-`Trellis` has `define` and `define_relationship` and no inverse — nothing retires a
-definition or its target table. That is a plain API gap, and it *blocks* the
-embeddable-clients epic (#140): ADR-0010 puts transform definitions in Rails/Ecto
-migration files, and a migration needs a `down`. Without a drop path, a rolled-back
-deploy leaves a live transform running against a table the migration just removed.
+Defining derived state is only half a lifecycle. A definition — a transform or a
+relationship — can also need to stop: frozen while an operator investigates or stages
+a schema change, or removed entirely. This ADR settles that other half. Pause and drop
+apply to any definition uniformly; the act of defining is one concept, and so is its
+inverse.
 
-This ADR settles how a transform is retired. It answers every open question raised in
-#142, and defines the pause/resume primitive it builds on. It deliberately shares
-machinery with the redefinition design still open in #12 rather than inventing a
-parallel one.
+## The lifecycle
 
-## The lifecycle: DEFINE → PAUSE → DROP
+```mermaid
+stateDiagram-v2
+    [*] --> Backfilling: define
+    Backfilling --> Live: backfill completes
+    Live --> Paused: pause (intentional)
+    Live --> Paused: auto-pause (poison threshold)
+    Paused --> Live: resume — rebuild by backfill
+    Paused --> [*]: drop — data removed
+```
 
-A transform's terminal path is two operator-visible verbs, not one. **PAUSE** freezes
-a live transform reversibly; **DROP** reaps a paused one. There is no `undefine`.
+A live definition reaches `Paused` two ways that share one state: an operator pauses it
+deliberately, or the engine auto-pauses it when a target accumulates too many poisoned
+rows. Both stop the claim-time fold from writing to the target and hold its current,
+now-stale value. From `Paused`, an operator either resumes — which rebuilds the target
+by backfill — or drops it, which removes the definition and its data.
 
-`undefine` would be redundant. My earlier "soft-retire then reap" bundled these two
-steps into one opaque call; splitting them is strictly better:
-
-- **PAUSE is independently useful** — freeze a misbehaving transform during an
-  incident, or stage a source-schema change, without losing the target data. That
-  reuse is what earns it a verb; a bundled `undefine` has no use outside "remove it."
-- **It unifies with the pause family Trellis already has.** The involuntary
-  poison/halting pause (`halting_stops`, the `key_deaths` threshold) and column
-  quarantine ([ADR-0003](0003-quarantine-storage-and-api.md)) are both "stop folding
-  into this, hold the stale value." Voluntary whole-transform pause is the same idea
-  at a third scope, reachable through the same status gate the fold path already
-  applies (`transforms_for_source` filters `status = 'live'`).
-- **Clearer failure semantics.** DROP is not transactional with the host migration
-  (below); if a reap fails midway, the transform is still cleanly PAUSED — a
-  well-defined state — not a half-undefined one.
-- The `drop_target` flag (below) already covers the only other thing `undefine`
-  might have meant: retire the definition but keep the data. So a fourth verb buys
-  nothing, and cuts against [ADR-0012](0012-curate-public-api-demote-engine-modules.md)'s
-  curated surface.
+Drop acts only on a paused definition. There is no direct live-to-gone edge: quiescing
+first is a precondition, so the removal never has to reason about a fold still
+dispatching to the target.
 
 ## Decisions
 
-### PAUSE is reversible; RESUME recovers via a new backfill, not a catch-up
+### Pause is one state with two triggers
 
-Pausing flips the definition to a `paused` status the claim-time fold already
-excludes. It must **not** hold the ring from retiring — a paused transform that
-pinned its ring segments would wedge the ring for its siblings, the same
-lease-not-latch lesson that retired the pause-lease scaffolding (#191). So while a
-transform is paused, its delta stream is drained away for the other transforms on the
-same source and is *not recoverable by replay*.
+Intentional pause and automatic poison-driven pause are the same state, reached by the
+same status gate the fold already honors. There is no second freezing mechanism. An
+operator pause is durable until an explicit resume; a poison auto-pause is durable until
+the operator addresses the poisoned rows and resumes. Column-level quarantine is this
+same idea at column granularity — a paused column holds a deliberately stale value while
+the rest of the target stays live.
 
-Therefore **RESUME triggers a fresh backfill**, not a catch-up over buffered changes.
-There are no buffered changes to catch up on; the target is reconciled from source
-the same way `define` builds it. This is stated plainly because it is the surprising
-part: a long pause is not free, and a caller who expects a cheap resume gets a full
-rebuild. This is documented as the contract, not an implementation detail.
+### Resume rebuilds by backfill, not by catch-up
 
-### DROP requires the transform to be paused
+A paused definition must not pin the staging ring. Holding ring segments open for a
+paused target would wedge the ring for every other definition reading the same source.
+So while a definition is paused, its share of the change stream is drained for its
+siblings and is not recoverable by replay.
 
-DROP acts only on a `paused` transform. Requiring the pause first makes quiescence an
-explicit precondition, so the reap never has to reason about live fold dispatch, and
-each step is independently atomic and idempotent. There is no `force` variant in v1.
+Resume therefore reconciles the target with a fresh backfill from source — the same way
+defining it built it — not a catch-up over buffered changes, because there are none. A
+long pause is not free: the cost of resuming scales with the data, not with the length
+of the pause. This is the contract, stated so a caller does not expect a cheap resume.
 
-For framework integration this is composed, not exposed as a burden: the Ruby and
-Elixir migration helpers' `down` calls PAUSE then DROP (host-language convenience per
-[ADR-0010](0010-embeddable-clients.md) decision 2's corollary — compose the public
-calls, don't reach around them). A single-verb convenience on the crate that
-internally pauses, waits for quiescence, then drops is a possible later addition; it
-is not required for v1 and is left open below.
+### Drop always removes the associated data
 
-### DROP takes `drop_target`: retire the definition, optionally drop the data
+Dropping a definition drops its target table; dropping a single derived column drops
+that column's data. There is no option to retire the definition while keeping the data —
+a caller who wants the derived data to persist without being maintained leaves the
+definition paused. Keeping the derived rows after removing the definition that explains
+them has no use we can name, and the paused state already serves it.
 
-`drop(target, drop_target)` retires the catalog definition either way. When
-`drop_target` is true it also `DROP`s the physical target table; when false it leaves
-the table as inert data. A migration `down` passes true — it mirrors the `up` that
-created the table. A human retiring a transform defaults to false — keep the data,
-stop deriving it. The target table is Trellis-owned, so dropping it does not violate
-[ADR-0005](0005-source-schema-is-user-owned.md); that ADR governs *source* tables.
+Because the target table and its columns are Trellis-owned, dropping them is Trellis's
+to do. Source tables remain user-owned and untouched.
 
-### Drops must be made in reverse dependency order — no cascade
+### Drops go in reverse dependency order — no cascade
 
-If a live transform chains off the target being dropped (a `source` edge in
-`schema_edges` from the target's node, found via `dependents_of`), the drop is
-**refused** with an error naming the blocking dependents. Trellis does not cascade,
-and does not leave a dependent silently broken. The operator drops in reverse
-dependency order. This matches [ADR-0005](0005-source-schema-is-user-owned.md)'s
-principle that the engine guides rather than reshapes: the error names the exact
-transforms to retire first.
+If a live definition chains off the target being dropped, the drop is refused and names
+the definitions that depend on it. Trellis does not cascade the removal, and does not
+leave a dependent silently deriving from a table that is about to disappear. The operator
+retires dependents first. The refusal names them so the order to follow is explicit.
 
-### In-flight work is quiesced by the status gate, never by deleting shared rows
+### In-flight work is quiesced by the pause, never by deleting shared state
 
-Only `backfill_chunks` is keyed to a definition (`definition_id ... ON DELETE
-CASCADE`); dropping the catalog row cascades those away, and any chunk a drain worker
-holds is released on its heartbeat. Everything else touched by in-flight work — ring
-segments, `seg_claims`, `poison`/`poison_held`/`key_deaths` — is **source-keyed and
-co-owned by sibling transforms on the same source**, and is never deleted by a drop.
+Only per-definition backfill work is keyed to the definition and removed with it; a chunk
+a drain worker holds is released on its own heartbeat. Everything else that in-flight work
+touches — ring segments, claims, the poison band — is keyed to the *source* table and
+co-owned by every definition reading it. A drop never deletes that shared state out from
+under a running worker. The pause is what makes this safe: once paused, the fold no longer
+dispatches to the target, so a batch still draining for the source skips it while its
+siblings continue, and the drop then removes only what the target itself owns.
 
-The pause status is what makes this safe: once the transform is `paused`, the fold
-stops dispatching to it, so a sealed batch still draining for the source simply skips
-the paused target while its siblings continue. The reap then deletes only rows the
-dropped target owns and calls `reconcile_publication`, never touching shared staging
-state out from under a running worker.
+### Quarantine state follows its owner
 
-### Quarantine: delete the target's column rows, leave the shared poison band
-
-The column-quarantine tables (`column_status`, `column_deaths`, `column_failures`,
-`column_pause_cascades`) are keyed by the bare target-table name with no FK (V22
-dropped it), so a drop clears them explicitly — they are target-specific and their
-forensic value goes with the table. The whole-key `poison`/`poison_held`/`key_deaths`
-tables are **source-keyed and shared with sibling transforms**, so a drop leaves them
+Target-keyed quarantine bookkeeping — the per-column status a target accumulates — is
+dropped with the target; its forensic value goes with the data. The whole-key poison band
+is keyed to the source table and shared with sibling definitions, so a drop leaves it
 untouched.
 
-### The publication shrinks by reconcile, not by hand
+### The publication shrinks by reconciliation
 
-A drop does not hand-edit the Postgres publication. After removing the catalog rows it
-calls `reconcile_publication`, which recomputes the desired table set from
-`all_source_tables` (the transitive closure over remaining definitions) and issues the
-`ALTER PUBLICATION ... DROP TABLE` only if the source now backs zero definitions.
-Correct by construction, and it runs inline rather than waiting for the maintenance
-loop.
+A drop does not hand-edit the replication publication. After removing the definition it
+reconciles the publication against the definitions that remain, which removes a source
+table from replication only when nothing derives from it any longer. Correct by
+construction, and applied at drop time rather than deferred to a maintenance pass.
 
-### PAUSE and DROP are idempotent and not transactional with the host migration
+### Pause and drop are idempotent
 
-`define` runs on Trellis's own pool, not the host migration's transaction (#140's
-central hazard), and so does its inverse. A rolled-back or replayed migration must be
-safe in both directions, so **pausing an already-paused transform and dropping an
-absent one are no-op successes**. This is the same idempotency question #140 raises
-for `define` ("idempotent by text?"); the two are answered together — a replayed `up`
-is a no-op, a replayed `down` is a no-op.
+Defining runs on Trellis's own connections, not inside a host application's migration
+transaction, and so does its inverse. A migration that is replayed or rolled back must be
+safe in both directions, so pausing an already-paused definition and dropping an absent
+one are no-op successes. The two states a caller can be uncertain about — "did the pause
+land?", "is it already gone?" — resolve to success, not error.
 
-### Placement: Tier-1 facade, plain data across the boundary
+### Pause, resume, and drop are facade capabilities
 
-`pause`, `resume`, and `drop` are methods on `Trellis`/`Client`/`BlockingTrellis`
-(with the blocking mirror), returning plain data
-([ADR-0012](0012-curate-public-api-demote-engine-modules.md),
-[ADR-0010](0010-embeddable-clients.md) decision 4). Bindings call them; they never
-reach around into staging with their own SQL.
-
-### Shared mechanism with redefinition (#12)
-
-Drop and in-place redefinition share three primitives — the live-dependent refusal
-(`dependents_of`), the status-gated fold exclusion, and backfill-chunk cancellation.
-Drop is the strictly simpler operation (whole definition, no versioning scheme) and it
-is what unblocks #140 now, so it ships first and extracts those primitives so #12's
-redefinition reuses them rather than co-designing both. The redefinition-specific
-pieces — the stored-schema versioning scheme and per-column backfill — stay with #12.
+They are methods on the front-door facade, returning plain data, alongside a synchronous
+mirror. They are not staging internals a caller reaches around with its own SQL; the
+engine composes them behind the facade.
 
 ## Consequences
 
-- Operators gain a reversible PAUSE (a freeze that holds stale data) and a terminal
-  DROP, with the physical table's fate an explicit `drop_target` choice.
-- A long pause is not free: RESUME is a full backfill, because the delta stream is
-  drained away for siblings while paused. This is the documented contract.
-- Migration `down` in both bindings is PAUSE + DROP, idempotent in both directions,
-  and honest about the fact that it is not transactional with the host's migration.
-- The reap touches only definition-owned rows and reconciles the publication; shared
-  source-keyed staging and poison state is never deleted under a running worker.
-- #12's redefinition design inherits the dependency-refusal, fold-exclusion, and
-  chunk-cancellation primitives rather than reinventing them.
+- Every definition has a reversible freeze and a terminal removal. The freeze holds stale
+  data; the removal takes the data with it.
+- A long pause costs a full rebuild to resume, because the change stream is drained for
+  siblings while paused.
+- Removal is safe under load: it quiesces through the pause and touches only
+  definition-owned rows, never shared source-keyed staging or poison state.
+- A framework migration's rollback is honest: pause-then-drop, idempotent in both
+  directions, even though it does not share the host's migration transaction.
 
 ## Open questions
 
-- **A single-verb `retire` convenience** that internally pauses, waits for quiescence,
-  then drops — worth adding to the crate, or is composing PAUSE + DROP in the
-  migration helpers enough? Deferred until a binding needs it.
-- **RESUME's backfill scope.** A full rebuild is always correct; whether a bounded
-  resume (backfill only the key range that changed during the pause) is worth building
-  depends on how long real pauses last, and is left to the redefinition/backfill work.
+- **A single-verb convenience** that pauses, waits for quiescence, then drops — worth
+  offering, or is composing pause and drop enough? Deferred until a concrete caller needs
+  the one-call form.
+- **Resume's backfill scope.** A full rebuild is always correct; whether a bounded resume
+  that rebuilds only the range that changed during the pause is worth building depends on
+  how long real pauses last.
