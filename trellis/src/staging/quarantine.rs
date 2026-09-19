@@ -1730,8 +1730,7 @@ pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), App
 /// calls for on the halting class, so "stopped" and "slow" are
 /// distinguishable from the outside. A plain counter table, matching this
 /// crate's existing convention for small operational state (`drainers`)
-/// rather than a Prometheus-style dependency this crate has
-/// none of today.
+/// rather than a Prometheus-style dependency this crate has none of today.
 pub async fn record_halting_stop(pool: &Pool, reason: &str) -> Result<(), ApplyError> {
     let client = pool.get().await?;
     client
