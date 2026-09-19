@@ -30,7 +30,9 @@ use trellis::defs::{
     require_single_column_pk, source_primary_key,
 };
 use trellis::staging::apply;
-use trellis::staging::{StagedWatermark, has_pending, retire_drained_segments};
+use trellis::staging::{
+    StagedWatermark, TRUNCATE_SENTINEL_KEY, has_pending, retire_drained_segments,
+};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -804,6 +806,123 @@ async fn reverse_recompute_dedupes_across_relationships_sharing_from_table() {
         1,
         "article 1 must be staged exactly once even though two relationships \
          (comments, likes) both touched it in this batch"
+    );
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+}
+
+/// Issue #173 phase 4, closing a gap `docs/relationship-propagation.md`
+/// named but left open: "No test combines a `TRUNCATE` with two
+/// shared-from-table relationships; the dedupe is structural (the container
+/// types)." That doc entry classified the cell "Handled by reuse" on
+/// code-reading alone — the `truncated` loop pushes into the very same
+/// `reverse_recomputes` accumulator [`reverse_recompute_dedupes_across_relationships_sharing_from_table`]
+/// above pins for two ordinary row-driven changes — but nothing had actually
+/// driven a `TRUNCATE` through it. This test is that missing assertion, not
+/// a new mechanism: `comments` is `TRUNCATE`d (a key-less
+/// `ReverseTrigger::WholeKeyspace` sentinel, resolved via
+/// `catalog::relationships_to_table`) in the same batch as an ordinary
+/// `likes` insert (a row-keyed `ReverseTrigger::Keys` resolution) — both
+/// paths resolve to the same `(articles, "1")` from-side key, and the
+/// accumulator must still dedupe them to one `Recompute`, exactly as it does
+/// for two row-driven changes.
+#[tokio::test]
+async fn reverse_recompute_dedupes_a_truncate_against_a_relationship_sharing_the_same_from_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table articles (id integer primary key, title text); \
+             create table comments (id integer primary key, article_id integer, word_count integer); \
+             create table likes (id integer primary key, article_id integer); \
+             alter table comments replica identity full; \
+             alter table likes replica identity full; \
+             insert into articles (id, title) values (1, 'a1')",
+        )
+        .await
+        .expect("create tables and seed from-side rows");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM articles.id TO comments.article_id",
+    )
+    .await
+    .expect("create comments relationship");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP likes FROM articles.id TO likes.article_id",
+    )
+    .await
+    .expect("create likes relationship");
+
+    client
+        .execute(
+            "insert into comments (id, article_id, word_count) values (100, 1, 5)",
+            &[],
+        )
+        .await
+        .expect("insert comment");
+    client
+        .execute("insert into likes (id, article_id) values (200, 1)", &[])
+        .await
+        .expect("insert like");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // Both changes land in the same batch: `comments` gets a `TRUNCATE`
+    // sentinel (`ReverseTrigger::WholeKeyspace` resolves it to every
+    // non-NULL `article_id`, here just article 1 — see `insert_truncate_row`
+    // in `apply.rs` for the same staged-sentinel-without-an-actual-SQL-
+    // `TRUNCATE` convention) while a fresh `likes` row also points at
+    // article 1 through the *other* relationship (an ordinary
+    // `ReverseTrigger::Keys` resolution). If the two triggers' resolutions
+    // were staged through independent accumulators rather than the one
+    // shared `reverse_recomputes` map, article 1 would be staged twice.
+    stage_cdc(
+        &client,
+        "comments",
+        TRUNCATE_SENTINEL_KEY,
+        "truncate",
+        None,
+        None,
+    )
+    .await;
+    client
+        .execute("insert into likes (id, article_id) values (201, 1)", &[])
+        .await
+        .expect("insert second like");
+    stage_cdc(
+        &client,
+        "likes",
+        "201",
+        "insert",
+        None,
+        Some("{\"id\":201,\"article_id\":1}"),
+    )
+    .await;
+
+    let seg = seal_active_segment(&mut client).await;
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        &db.pool,
+        seg,
+        "reverse_test",
+        1,
+        "trellis_apply_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+
+    assert_eq!(
+        staged_recompute_count(&client, "articles", "1").await,
+        1,
+        "article 1 must be staged exactly once even though it was reached both by \
+         truncating comments (WholeKeyspace) and by a fresh likes row (Keys) in the \
+         same batch"
     );
 
     drain_to_quiescence(&db.pool, &mut client).await;

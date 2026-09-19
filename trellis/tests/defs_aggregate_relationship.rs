@@ -594,6 +594,87 @@ async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contrib
     );
 }
 
+/// Issue #173 phase 4, closing Known Gap 1 from
+/// `docs/relationship-propagation.md`'s obligation table: "no test drives an
+/// aggregate delta-path re-point across the *nonexistent*-parent boundary."
+/// The test above proves the delta path resolves a from-side re-point's old
+/// and new sides independently when *both* resolve to a real parent; this is
+/// its missing sibling — the new side resolves to nothing at all.
+///
+/// Byte-for-byte the same shape as
+/// [`a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contributions`],
+/// except row 10 is re-pointed from post 1 (a real parent, `word_count`
+/// 100) to post 999 — the fixture's own standing nonexistent-parent id
+/// (already used by row 13's `rust`-tagged, permanently-unmatched row). The
+/// old side must still subtract its real contribution; the new side must
+/// resolve to `NULL` and contribute nothing, exactly as `to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappears`
+/// (`defs_relationship_nullability.rs`) pins for the *forward-read* path —
+/// this is that same "resolves to nothing" outcome, but reached by
+/// `accumulate_changes`'s own old/new resolution rather than the reverse
+/// path re-deriving the group from scratch.
+#[tokio::test]
+async fn a_from_side_re_point_to_a_nonexistent_parent_subtracts_the_old_contribution() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals_before = target_totals(&client).await;
+    assert_eq!(
+        totals_before.get("rust"),
+        Some(&(Some("3".to_string()), Some("350".to_string()))),
+        "sanity: 'rust' starts at 100 (row 10, post 1) + 250 (row 11, post 2) \
+         + null (row 13, post 999)"
+    );
+
+    // Re-point row 10 from post 1 (word_count 100, a real parent) to post
+    // 999 (the fixture's standing nonexistent parent) — same group (`tag`
+    // stays 'rust'), one folded UPDATE carrying both a real old image and a
+    // new image whose FK resolves to nothing.
+    client
+        .execute("update post_tags set post = 999 where id = 10", &[])
+        .await
+        .expect("re-point row 10 to a nonexistent parent");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "10",
+        "update",
+        Some("{\"id\":10,\"post\":1,\"tag\":\"rust\"}"),
+        Some("{\"id\":10,\"post\":999,\"tag\":\"rust\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals,
+        oracle_totals(&client).await,
+        "after a from-side re-point to a nonexistent parent"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("250".to_string()))),
+        "row 10 must subtract its OLD contribution (100, via post 1) and add \
+         nothing for its NEW side (post 999 does not exist) — 250 (row 11, \
+         post 2) alone = 250, not 350 (no-op) or NULL (as if the whole group \
+         lost its match). post_count stays 3: row 10 still exists in \
+         post_tags, an unmatched relationship target only nulls the \
+         aggregated value, never the row's own group membership"
+    );
+}
+
 /// Issue #136 review follow-up: `AVG` over a relationship-read column
 /// (`AVG(post.word_count)`) — code-reading confirmed `contribution_def`'s
 /// `AVG`-as-`SUM` rewrite only touches a field's own top-level
