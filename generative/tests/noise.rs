@@ -12,7 +12,7 @@
 //! # E5 scope cut: `CHECKPOINT` only, not a full Postgres restart
 //!
 //! A full `TestCluster` restart was investigated and deliberately **not**
-//! built. `trellis::intake::Intake::run` (the staging worker's logical-
+//! built. `trellis::dev::intake::Intake::run` (the staging worker's logical-
 //! replication consumer) returns `Err` the instant its replication
 //! connection drops — confirmed by reading `trellis/src/intake/mod.rs`
 //! directly, not assumed — and `trellis::client::run` spawns it as
@@ -213,7 +213,7 @@ async fn noise_on_an_adversarially_shaped_untracked_table_never_perturbs_converg
                 before_op: 2,
                 kind: NoiseEventKind::Table(NoiseAction::AddColumn {
                     name: "extra1".to_string(),
-                    value_type: trellis::defs::ast::ValueType::Numeric,
+                    value_type: trellis::dev::defs::ast::ValueType::Numeric,
                 }),
             },
             NoiseEvent {

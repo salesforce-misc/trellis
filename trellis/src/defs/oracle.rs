@@ -9,17 +9,28 @@
 //! Comparing the evaluator-driven recompute against the Postgres-SQL oracle
 //! ensures the engine mirrors Postgres semantics exactly.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(any(test, feature = "test-util"))]
+use std::collections::BTreeSet;
+#[cfg(any(test, feature = "test-util"))]
+use std::collections::{HashMap, HashSet};
+#[cfg(any(test, feature = "test-util"))]
 use std::fmt;
 
-use crate::pool::{Pool, quote_ident};
+#[cfg(any(test, feature = "test-util"))]
+use crate::pool::Pool;
+use crate::pool::quote_ident;
 
-use super::ast::{Expr, GroupByKey, KeySpace, Operator, RelationshipDef, TransformDef, ValueType};
+use super::ast::{Expr, Operator};
+#[cfg(any(test, feature = "test-util"))]
+use super::ast::{GroupByKey, KeySpace, RelationshipDef, TransformDef, ValueType};
+#[cfg(any(test, feature = "test-util"))]
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
+#[cfg(any(test, feature = "test-util"))]
 use super::registry::lookup_aggregate_function;
 
 /// Why a from-scratch recompute failed.
 #[derive(Debug)]
+#[cfg(any(test, feature = "test-util"))]
 pub enum OracleError {
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
@@ -31,6 +42,7 @@ pub enum OracleError {
     Eval(EvalError),
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl fmt::Display for OracleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -44,6 +56,7 @@ impl fmt::Display for OracleError {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl std::error::Error for OracleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -54,18 +67,21 @@ impl std::error::Error for OracleError {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl From<tokio_postgres::Error> for OracleError {
     fn from(err: tokio_postgres::Error) -> Self {
         OracleError::Db(err)
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl From<crate::error::Error> for OracleError {
     fn from(err: crate::error::Error) -> Self {
         OracleError::Pool(err)
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl From<EvalError> for OracleError {
     fn from(err: EvalError) -> Self {
         OracleError::Eval(err)
@@ -74,6 +90,7 @@ impl From<EvalError> for OracleError {
 
 /// A from-scratch recompute of `def`'s target: every source row's primary
 /// key (as text) mapped to its calculated columns.
+#[cfg(any(test, feature = "test-util"))]
 pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
 /// The `FROM`-clause identifier this test/benchmark-only oracle module
@@ -92,6 +109,7 @@ pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 /// (`docs/decisions/0007`) — only the explicit-schema case needed a real fix
 /// here, and it needs no database round trip: the schema is already right on
 /// `def`.
+#[cfg(any(test, feature = "test-util"))]
 fn quoted_source_from(def: &TransformDef) -> String {
     match &def.explicit_source_schema {
         Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&def.source)),
@@ -109,6 +127,7 @@ fn quoted_source_from(def: &TransformDef) -> String {
 /// references, as text, then runs each row through [`evaluate`] — the exact
 /// function the incremental path evaluates deltas with. No SQL expression
 /// here computes a calculated field's value; only column selection is SQL.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn recompute(
     pool: &Pool,
     def: &TransformDef,
@@ -166,6 +185,7 @@ pub async fn recompute(
 /// # Panics
 ///
 /// If `def.key_space` is not [`KeySpace::Aggregate`].
+#[cfg(any(test, feature = "test-util"))]
 pub async fn recompute_aggregate(
     pool: &Pool,
     def: &TransformDef,
@@ -230,6 +250,7 @@ pub async fn recompute_aggregate(
 /// image gives the same key. A grouping column is assumed non-`NULL` (the
 /// typical case for a real foreign/primary key); this doesn't attempt to
 /// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
+#[cfg(any(test, feature = "test-util"))]
 fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
     // Length-prefix each component (`"{len}:{value}"`) rather than joining
     // on a bare separator: a Text grouping column's value can itself
@@ -275,6 +296,7 @@ fn group_key(image: &Row, group_by: &[GroupByKey]) -> String {
 /// `benchmark`'s test/comparison code, never a production path), so it stays
 /// infallible and simply panics on either misuse rather than growing a
 /// `Result` that would ripple into every call site for no real benefit here.
+#[cfg(any(test, feature = "test-util"))]
 pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
         panic!("render_aggregate_select_sql called on a non-aggregate definition");
@@ -345,6 +367,7 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 /// invokes `recompute`/`recompute_aggregate` against a `TransformDef` that
 /// hasn't been through `validate()`, thread `source_columns` through here
 /// too and add the same guard.
+#[cfg(any(test, feature = "test-util"))]
 fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
@@ -355,6 +378,7 @@ fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     columns
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn collect_columns(
     expr: &Expr,
     field_name: &str,
@@ -522,6 +546,7 @@ pub(crate) fn to_one_join_clauses<'a>(
 /// If `def.key_space` is not [`KeySpace::Aggregate`], if substitution fails
 /// (see [`render_aggregate_select_sql`]), or if a referenced relationship is
 /// missing from `relationships`.
+#[cfg(any(test, feature = "test-util"))]
 pub fn render_aggregate_relationship_select_sql(
     def: &TransformDef,
     relationships: &HashMap<String, RelationshipDef>,
@@ -595,6 +620,7 @@ pub fn render_aggregate_relationship_select_sql(
 /// stops at an aggregate-wrapped path because that shape means *to-many* in a
 /// 1-1 definition. In an aggregate definition every path is to-one (the
 /// validator rejects to-many there), so every one of them needs a `LEFT JOIN`.
+#[cfg(any(test, feature = "test-util"))]
 fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
     match expr {
         Expr::RelationshipPath { rel, .. } => {
@@ -651,6 +677,7 @@ fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
 ///
 /// If `def.key_space` is not [`KeySpace::OneToOne`], or a referenced
 /// relationship is missing from `relationships`.
+#[cfg(any(test, feature = "test-util"))]
 pub fn render_relationship_select_sql(
     def: &TransformDef,
     relationships: &HashMap<String, RelationshipDef>,
@@ -708,6 +735,7 @@ pub fn render_relationship_select_sql(
 /// evaluator's structural test in #29: a `<rel>.<column>` path that is the sole
 /// argument of an aggregate call is a to-many enrichment (a correlated
 /// subquery, no JOIN), so recursion stops there; every other path is to-one.
+#[cfg(any(test, feature = "test-util"))]
 fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
     match expr {
         Expr::RelationshipPath { rel, .. } => {
@@ -737,6 +765,7 @@ fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
 /// are qualified with the source table (so they don't collide with a JOINed
 /// to-side column of the same name), a bare to-one path reads off its JOIN
 /// alias, and an aggregate-wrapped to-many path becomes a correlated subquery.
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn render_rel_expr_sql(
     expr: &Expr,
     source: &str,

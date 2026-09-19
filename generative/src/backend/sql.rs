@@ -20,8 +20,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use trellis::defs::TransformStatus;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::dev::defs::TransformStatus;
+use trellis::dev::defs::ast::{
+    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 
 use crate::model::{Column, Op, PRIMARY_KEY_PG_TYPE, Relationship, Table};
 
@@ -40,7 +42,7 @@ pub(super) fn pg_type_name(value_type: ValueType) -> &'static str {
         ValueType::Uuid => "uuid",
         // Issue #108: the generator itself never emits an `Other`-typed
         // column (see `generate::Column`'s doc comment), but this mirrors
-        // `trellis::defs::ddl::pg_type_name` for exhaustiveness/parity.
+        // `trellis::dev::defs::ddl::pg_type_name` for exhaustiveness/parity.
         ValueType::Other(pg_type) => pg_type.sql_type_name(),
     }
 }
@@ -123,7 +125,7 @@ pub(super) fn render_operator(op: Operator) -> &'static str {
     }
 }
 
-/// `source_columns` for `table`, as `trellis::defs::install_definition` wants
+/// `source_columns` for `table`, as `trellis::dev::defs::install_definition` wants
 /// it.
 pub(super) fn source_columns(table: &Table) -> HashMap<String, ValueType> {
     table
@@ -569,7 +571,7 @@ pub(super) async fn await_definitions_settled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trellis::defs::parse;
+    use trellis::dev::defs::parse;
 
     /// The reviewer-flagged follow-up to issue #67 (real operator
     /// precedence): a nested, mixed-operator `Expr` must round-trip through

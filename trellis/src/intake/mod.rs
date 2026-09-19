@@ -31,8 +31,7 @@ pub mod spill;
 
 pub use error::IntakeError;
 pub use replica_identity::{
-    ResolvedPlan, SourceGuarantee, needs_old_image, require_replica_identity_full,
-    required_source_guarantees,
+    ResolvedPlan, SourceGuarantee, require_replica_identity_full, required_source_guarantees,
 };
 
 use std::time::{Duration, Instant, SystemTime};
@@ -44,6 +43,7 @@ use pgoutput::{ColumnValue, Message, Relation, RelationCache};
 
 use crate::defs::catalog;
 use crate::pool::Pool;
+#[cfg(any(test, feature = "internals"))]
 use crate::staging::append;
 use crate::staging::session::ProducerSession;
 use crate::staging::{CdcOp, StagedChange, StagedWatermark};
@@ -79,6 +79,7 @@ fn pg_commit_time_to_system_time(commit_time_micros: i64) -> SystemTime {
 /// Does **not** advance the in-memory position or send a Standby Status
 /// Update — that is the caller's job, and only after this function's effects
 /// are durably committed (see [`Intake::commit_transaction`]).
+#[cfg(any(test, feature = "internals"))]
 pub async fn stage_and_advance(
     txn: &Transaction<'_>,
     changes: &[StagedChange],

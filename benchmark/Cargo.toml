@@ -8,3 +8,27 @@ trellis = { path = "../trellis" }
 testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-postgres = "0.7.13"
+
+[features]
+# ADR-0012. Turns on `trellis/test-util`, which compiles in `trellis::dev` —
+# the curated, uncommitted re-export of the engine items this crate's scenario
+# oracle names now that `trellis::{defs,staging,intake}` are `pub(crate)`.
+#
+# Off by default, and the binary below carries `required-features` for it, so
+# a plain `cargo build --workspace` skips this crate entirely rather than
+# switching `trellis/test-util` on: Cargo unifies features workspace-wide, so
+# naming it on a normal dependency edge would compile the engine's test-only
+# hooks straight into `cli`'s production `trellis` binary. Same rule
+# `generative` follows, and the same reason `generative`'s `engine_subprocess`
+# binary is likewise not auto-discovered.
+#
+# Run the benchmark with:
+#   cargo run -p benchmark --features engine-access --release -- <args>
+# CI still type-checks it: `cargo clippy --all-targets --all-features` turns
+# this feature on.
+engine-access = ["trellis/test-util"]
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+required-features = ["engine-access"]

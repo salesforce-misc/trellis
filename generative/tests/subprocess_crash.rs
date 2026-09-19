@@ -16,7 +16,7 @@
 //! settled-parent projection gen bump/relationship reverse-delta machinery
 //! (epic #127) in the same batch — the "moves and the projection advance
 //! together" #138 called out. `SubprocessBackend::arm_pause_before_commit`
-//! (driving `trellis::staging::apply`'s test-only pre-commit pause hook)
+//! (driving `trellis::dev::staging::apply`'s test-only pre-commit pause hook)
 //! lands the `SIGKILL` deterministically inside that batch's still-open,
 //! uncommitted Phase 3 transaction, rather than hoping timing luck hits the
 //! window — see `SubprocessBackend`'s own module doc comment for the full
@@ -107,7 +107,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     assert!(
         paused,
         "the primary engine subprocess must reach the Phase 3 pre-commit pause within {PAUSE_TIMEOUT:?} \
-         — if this fires, the pause hook (trellis::staging::apply::pause_before_commit_for_tests) \
+         — if this fires, the pause hook (trellis::dev::staging::apply::pause_before_commit_for_tests) \
          never engaged, so nothing below would actually be testing a mid-transaction kill"
     );
 

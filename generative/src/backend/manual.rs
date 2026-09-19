@@ -44,12 +44,12 @@ use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{KeySpace, TransformDef, ValueType};
-use trellis::defs::{
+use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
+use trellis::dev::defs::{
     CatalogError, DdlError, create_relationship, install_definition, qualified_target_table,
     require_single_column_pk, source_primary_key,
 };
-use trellis::staging::{
+use trellis::dev::staging::{
     StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
     watermark_token,
 };
@@ -360,7 +360,7 @@ impl ManualBackend {
     /// hasn't actually been torn down yet (`trellis::Client::drop` is a
     /// best-effort shutdown signal, not a synchronous join — see its own
     /// doc comment) and get misdiagnosed by
-    /// `trellis::intake::publication::initial_snapshot_handshake` as an
+    /// `trellis::dev::intake::publication::initial_snapshot_handshake` as an
     /// orphaned slot.
     pub fn set_slot_and_publication(
         &mut self,
@@ -372,9 +372,9 @@ impl ManualBackend {
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
     /// across every segment sealed so far, straight from
-    /// `trellis::staging::claim`'s partition decision (`segments.bucket_count`,
+    /// `trellis::dev::staging::claim`'s partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
-    /// `trellis::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
+    /// `trellis::dev::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
     /// segment has sealed yet.
     ///
     /// This module is the one place the backend seam (its own doc comment)
@@ -395,7 +395,7 @@ impl ManualBackend {
 
     /// Whether anything committed so far is still sitting in the ring,
     /// un-drained (issue #138, epic #127 phase 2): a thin wrapper around
-    /// `trellis::staging::has_pending`, exposed so a caller stressing the
+    /// `trellis::dev::staging::has_pending`, exposed so a caller stressing the
     /// relationship-delta interleaving scenarios
     /// (`crate::generate::build_relationship_interleaving_scenario`) can
     /// poll for "the op I just committed has actually reached the ring"
@@ -415,7 +415,7 @@ impl ManualBackend {
     /// Forces whatever is currently active in the ring to seal immediately
     /// (issue #138, epic #127 phase 2), returning the sealed segment's
     /// `seg_seq`: a direct wrapper around
-    /// `trellis::staging::seal_phase1`/`seal_phase2`, the same two-phase
+    /// `trellis::dev::staging::seal_phase1`/`seal_phase2`, the same two-phase
     /// seal the engine's own maintenance loop performs on its normal
     /// cadence. Mirrors `trellis/tests/spike_102.rs`'s
     /// `spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work`
@@ -534,7 +534,7 @@ impl ManualBackend {
     /// delegates to the shared [`sql::await_definitions_settled`]. See that
     /// function's doc comment for why this closes a real gap in
     /// [`ManualBackend::quiesce`] (public-api-design review): a direct-build
-    /// 1-1 definition's backfill runs through `trellis::defs::chunk_queue`'s
+    /// 1-1 definition's backfill runs through `trellis::dev::defs::chunk_queue`'s
     /// durable claim/execute/finish queue entirely outside the ring
     /// (docs/decisions/0007's "Backgrounding and resumability" amendment) —
     /// `await_converged`'s CDC-ring convergence wait has no visibility into

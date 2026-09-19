@@ -96,6 +96,11 @@ pub enum PartialField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountArg {
     Star,
+    /// `COUNT(<column>)`. The grammar does not accept this yet (see the
+    /// module doc and ADR-0004), so nothing outside this module's own tests
+    /// constructs it — it is modelled here because `COUNT`'s invertibility
+    /// verdict genuinely differs between the two argument forms.
+    #[allow(dead_code)]
     Column,
 }
 

@@ -2,7 +2,7 @@
 //! #63, C3): a `KeySpace::OneToOne` `authors` transform that `SUM`/`COUNT`s
 //! over two to-many children (`posts`, `comments`), matching the real
 //! workload that motivated `backfill_relationship_one_to_one`
-//! (`trellis::defs::backfill`) — 100k authors, 1M posts, 4.5M comments,
+//! (`trellis::dev::defs::backfill`) — 100k authors, 1M posts, 4.5M comments,
 //! creating the target table took ~1 minute on the old ring path.
 //!
 //! Unlike [`crate::scenario`]'s plain `GROUP BY` pipeline, this measures the
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::defs::{ValueType, create_relationship, install_definition};
+use trellis::dev::defs::{ValueType, create_relationship, install_definition};
 
 use crate::generate;
 use crate::scenario::connect_raw;
@@ -145,7 +145,7 @@ pub async fn run(
 }
 
 /// Compares the backfilled `author_totals` against an independently written
-/// `GROUP BY`/`LEFT JOIN` oracle (not [`trellis::defs::render_relationship_select_sql`],
+/// `GROUP BY`/`LEFT JOIN` oracle (not [`trellis::dev::defs::render_relationship_select_sql`],
 /// whose per-row correlated-subquery shape is meant for the small fixtures in
 /// `trellis/tests` and doesn't scale to this benchmark's row counts) — an
 /// exact-value check over every author, not just a row count or a sample.

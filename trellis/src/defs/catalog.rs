@@ -99,9 +99,11 @@ use super::backfill::{self, BackfillError};
 use super::chunk_queue;
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
+#[cfg(any(test, feature = "internals"))]
+use super::model::SchemaEdge;
 use super::model::{
-    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode, TransformStatus,
+    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaNode,
+    TransformStatus,
 };
 use super::parser::{parse, parse_relationship};
 use super::pg_type::PgType;
@@ -401,6 +403,7 @@ pub async fn create_definition(
 /// the ring is then left to handle only live CDC deltas after the direct
 /// build's fence. Every other caller wants the ring-enumeration backfill and
 /// keeps using [`create_definition`].
+#[cfg(any(test, feature = "test-util"))]
 pub async fn create_definition_without_backfill(
     pool: &Pool,
     source_text: &str,
@@ -3260,6 +3263,7 @@ async fn has_usable_fk_index_in_txn(
 /// Runs in its own transaction; [`create_definition`] instead calls
 /// [`resolve_node_in_txn`] directly so both of a definition's node
 /// resolutions land in the same transaction as the definition write.
+#[cfg(any(test, feature = "internals"))]
 pub async fn resolve_node(
     pool: &Pool,
     table_name: &str,
@@ -3313,6 +3317,7 @@ async fn resolve_node_in_txn(
 /// coverage — [`create_definition`] can never hit it itself, since
 /// `transform_definitions.target_table` is unique and so no two definitions
 /// can ever resolve to the same `(from_node_id, to_node_id)` pair.
+#[cfg(any(test, feature = "internals"))]
 pub async fn persist_edge(
     pool: &Pool,
     from_node_id: i64,
@@ -3440,6 +3445,7 @@ fn find_table_path_from(
 /// The [`SchemaNode`] already resolved for `table_name`, or `None` if
 /// nothing has ever referenced it as a source or a target. `table_name`
 /// must already be fully-qualified (issue #74, ADR-0007).
+#[cfg(any(test, feature = "internals"))]
 pub async fn node_for_table(
     pool: &Pool,
     table_name: &str,
@@ -3470,6 +3476,7 @@ pub async fn node_for_table(
 /// definition table, so it works for any [`EdgeKind`] without needing a
 /// kind-specific query. `node_table` must already be fully-qualified (issue
 /// #74, ADR-0007) — matched exactly against `schema_nodes.table_name`.
+#[cfg(any(test, feature = "internals"))]
 pub async fn edges_from(
     pool: &Pool,
     node_table: &str,

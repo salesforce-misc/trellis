@@ -32,6 +32,17 @@ proptest = { version = "1.11", optional = true }
 
 [features]
 proptest = ["dep:proptest"]
+# ADR-0012. Turns on `trellis/test-util`, which compiles in `trellis::dev` —
+# the curated, uncommitted re-export of the engine items this crate's oracle
+# and backends name now that `trellis::{defs,staging,intake}` are `pub(crate)`.
+# Every module in `src/lib.rs` needs it, so all five are `cfg`-gated on it and
+# a plain `cargo build --workspace` compiles this crate down to an empty lib —
+# which is the point: that build must not switch `trellis/test-util` on, or
+# Cargo's workspace-wide feature unification compiles the engine's test-only
+# hooks straight into `cli`'s production `trellis` binary. Off by default and
+# turned on for this crate's own tests by the self dev-dependency below,
+# exactly like `proptest`.
+engine-access = ["trellis/test-util"]
 # Issue #166. Turns on `trellis/test-util`, which compiles in
 # `trellis::staging::apply`'s test-only pre-commit pause hook (see that
 # module for the mechanism) — the thing `backend::subprocess::
@@ -43,7 +54,7 @@ proptest = ["dep:proptest"]
 # (it drives the hook purely through env vars, and never names a gated
 # item); only the spawned `engine_subprocess` binary actually needs the
 # feature active, hence its `required-features` below.
-subprocess-backend = ["trellis/test-util"]
+subprocess-backend = ["engine-access", "trellis/test-util"]
 
 # Not auto-discovered, because it must not be built by a plain
 # `cargo build --workspace`: building it would activate `subprocess-backend`
@@ -54,4 +65,4 @@ path = "src/bin/engine_subprocess.rs"
 required-features = ["subprocess-backend"]
 
 [dev-dependencies]
-generative = { path = ".", features = ["proptest", "subprocess-backend"] }
+generative = { path = ".", features = ["engine-access", "proptest", "subprocess-backend"] }

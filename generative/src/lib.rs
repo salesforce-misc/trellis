@@ -16,8 +16,21 @@
 //! `generate`/`oracle`/`run` are skeletons today; [`model`] and [`backend`]
 //! are this issue's substance.
 
+// Every module below names `trellis::dev` — ADR-0012's curated, uncommitted
+// re-export of the engine items this suite's oracle and backends need — which
+// exists only when `trellis/test-util` is on. This crate turns that on through
+// its own `engine-access` feature, enabled by the self dev-dependency in
+// `Cargo.toml` and by nothing else, so a plain `cargo build --workspace`
+// compiles this crate down to an empty lib rather than leaking the engine's
+// test-only hooks into `cli`'s production binary. See `Cargo.toml` for the
+// feature-unification rule that protects against.
+#[cfg(feature = "engine-access")]
 pub mod backend;
+#[cfg(feature = "engine-access")]
 pub mod generate;
+#[cfg(feature = "engine-access")]
 pub mod model;
+#[cfg(feature = "engine-access")]
 pub mod oracle;
+#[cfg(feature = "engine-access")]
 pub mod run;

@@ -19,7 +19,6 @@
 
 use tokio_postgres::{Client, NoTls, Transaction};
 
-use super::append::{self, StagedChange};
 use super::error::StagingError;
 
 /// The advisory lock key the producer singleton is acquired under. Any
@@ -71,17 +70,6 @@ impl ProducerSession {
             client,
             _connection: handle,
         })
-    }
-
-    /// Opens a transaction, appends `changes` through [`append::append`], and
-    /// commits. For a producer that doesn't need to compose the append with
-    /// anything else; a producer that does (e.g. intake's watermark advance)
-    /// should call [`append::append`] against its own transaction instead.
-    pub async fn append(&mut self, changes: &[StagedChange]) -> Result<(), StagingError> {
-        let txn = self.client.transaction().await?;
-        append::append(&txn, changes).await?;
-        txn.commit().await?;
-        Ok(())
     }
 
     /// Starts a transaction on this session's connection, for callers that

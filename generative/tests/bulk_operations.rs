@@ -26,7 +26,7 @@ use generative::run::{RunError, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
-use trellis::defs::ast::ValueType;
+use trellis::dev::defs::ast::ValueType;
 use trellis::{Config, Pool};
 
 struct Harness {

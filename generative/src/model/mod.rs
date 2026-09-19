@@ -7,7 +7,7 @@
 //! this crate generates is byte-for-byte the same shape the parser produces
 //! from concrete syntax.
 
-use trellis::defs::ast::{TransformDef, ValueType};
+use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 /// One column on a [`Table`].
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +30,7 @@ pub struct Table {
     ///
     /// This exists for relationships: ADR-0006 derives a relationship's
     /// cardinality from whether its **to-side** column is provably unique
-    /// (primary key or `UNIQUE`), and `trellis::defs::catalog` introspects
+    /// (primary key or `UNIQUE`), and `trellis::dev::defs::catalog` introspects
     /// that live against `pg_catalog` at `create_relationship` time. A
     /// generated to-one relationship therefore needs a real `UNIQUE`
     /// constraint on the to-side column, which the backend can only emit if
@@ -48,7 +48,7 @@ pub struct Table {
 /// `crate::generate::build_program_multi_with_shapes`), but [`ValueType`]'s
 /// only numeric variant maps to Postgres `numeric` — and the engine rejects a
 /// `numeric` primary key outright with
-/// `trellis::defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
+/// `trellis::dev::defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
 /// `source_primary_key` gates the resolved PK type on
 /// `is_text_stable_join_key_type`'s allowlist (issue #107): every consumer
 /// compares that key via a `::text` cast, and `numeric` is not text-stable
@@ -69,7 +69,7 @@ impl Table {
     ///
     /// The PK column's Postgres type is [`PRIMARY_KEY_PG_TYPE`], *not* the
     /// [`ValueType`] stored on its [`Column`]. [`ValueType`] is
-    /// `trellis::defs::ast`'s expression-level type and has no integer
+    /// `trellis::dev::defs::ast`'s expression-level type and has no integer
     /// variant, so it simply cannot name the type a primary key needs; the
     /// `ValueType::Numeric` recorded below is an unavoidable placeholder.
     /// Nothing may render the PK column's type from it — see
@@ -115,7 +115,7 @@ impl Table {
 /// — not declared — from whether the **to-side** column is provably unique:
 /// the concrete-syntax declaration
 /// (`RELATIONSHIP <name> FROM <t>.<c> TO <t>.<c>`) carries no cardinality
-/// keyword at all, and `trellis::defs::catalog` introspects `pg_catalog` for a
+/// keyword at all, and `trellis::dev::defs::catalog` introspects `pg_catalog` for a
 /// primary-key/`UNIQUE` index on the to-side column to decide.
 ///
 /// This enum records the cardinality the *generator* built the relationship
@@ -139,7 +139,7 @@ pub enum Cardinality {
 /// `RELATIONSHIP <name> FROM <from_table>.<from_col> TO <to_table>.<to_col>`.
 ///
 /// Plain data, like every other part of a [`Program`] — the concrete syntax
-/// the backend hands `trellis::defs::create_relationship` is rendered from
+/// the backend hands `trellis::dev::defs::create_relationship` is rendered from
 /// these fields (see `crate::backend::ManualBackend`), and the oracle renders
 /// its own independent `SELECT` from them too.
 ///
@@ -291,7 +291,7 @@ pub struct Program {
     /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
     /// default). A nonzero value `N` means "install this definition only once
     /// `ops[0..N]` have already been applied" — real rows can already exist
-    /// in `defs[i].source` by then, exercising `trellis::defs::catalog::install_definition`'s
+    /// in `defs[i].source` by then, exercising `trellis::dev::defs::catalog::install_definition`'s
     /// direct-backfill-over-preexisting-rows path (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
     /// inside the harness's own op-stream loop). Must be index-aligned with
@@ -406,7 +406,7 @@ impl NoisePlan {
     }
 }
 
-/// The composite row-key convention for an [`trellis::defs::ast::KeySpace::Aggregate`]
+/// The composite row-key convention for an [`trellis::dev::defs::ast::KeySpace::Aggregate`]
 /// target (improvement-plan task B4): every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1
 /// target's primary key (never `NULL`, enforced by the source table's own
@@ -418,10 +418,10 @@ impl NoisePlan {
 /// scoped out of the generator for now); this function still handles a
 /// `NULL` component correctly regardless, since a hand-built pin can
 /// construct one directly (see [`crate::generate::TableSpec::grain_values`]'s
-/// doc comment), and [`trellis::defs::oracle::recompute_aggregate`]'s own
+/// doc comment), and [`trellis::dev::defs::oracle::recompute_aggregate`]'s own
 /// private `group_key` this mirrors has no such restriction either.
 /// [`crate::oracle`]'s SQL
-/// oracle, its evaluator oracle (via [`trellis::defs::oracle::recompute_aggregate`],
+/// oracle, its evaluator oracle (via [`trellis::dev::defs::oracle::recompute_aggregate`],
 /// whose own private `group_key` uses this exact same length-prefixing
 /// scheme independently), and [`crate::backend::ManualBackend`]'s persisted-
 /// target reader all key their rows through this one function, so a group's

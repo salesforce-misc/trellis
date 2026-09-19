@@ -8,7 +8,9 @@
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use testkit::TestCluster;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::dev::defs::ast::{
+    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 
 #[tokio::test]
 async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {

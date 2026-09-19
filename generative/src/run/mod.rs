@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use trellis::Pool;
-use trellis::defs::ast::{TransformDef, ValueType};
+use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 use crate::backend::{Backend, Snapshot};
 use crate::model::{Op, OpOutcome, Program};
@@ -366,7 +366,7 @@ async fn quiesce_snapshot_and_check<B: Backend>(
 /// naive N-worker backend driven that way mostly tests "N idle-ish workers
 /// don't duplicate/corrupt a single claim" rather than a real batch getting
 /// split and drained by several workers at once
-/// (`trellis::staging::claim`'s bucket-splitting only kicks in above
+/// (`trellis::dev::staging::claim`'s bucket-splitting only kicks in above
 /// `MIN_ROWS_TO_SPLIT` rows sealed in one batch). Letting several ops land
 /// before the harness ever asks the engine to catch up gives a real batch a
 /// chance to accumulate.

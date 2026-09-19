@@ -40,36 +40,63 @@ pub mod pg_type;
 pub mod registry;
 pub mod validate;
 
-pub use ast::{
-    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, RelationshipDef, TransformDef,
-    ValueType,
-};
-pub use backfill::{BackfillError, backfill_definition};
-pub use catalog::{
-    CatalogError, RelationshipProjection, all_source_tables, create_definition,
-    create_definition_without_backfill, create_relationship, dependents_of, edges_from,
-    install_definition, node_for_table, persist_edge, relationship_by_name,
-    relationship_projection, resolve_node, source_table_version, transforms_for_source,
-};
-pub use ddl::{
-    DdlError, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
-    neighbor_table_name, qualified_target_table, require_single_column_pk, source_primary_key,
-};
+// This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened
+// re-exports are a convenience for the engine itself and for the two gated
+// doors onto it. Names the engine does not use are split out below and
+// compiled only behind those gates, which is what keeps a plain
+// `cargo build` free of `unused_imports` rather than an `allow`.
+pub use ast::ValueType;
+pub use catalog::{CatalogError, all_source_tables, create_relationship, install_definition};
 pub use error::ParseError;
-pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
-pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
-pub use model::{
-    Definition, EdgeKind, NodeKind, RelationshipCardinality, RelationshipDefinition, SchemaEdge,
-    SchemaNode, TransformStatus,
+pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
+pub use parser::parse;
+pub use pg_type::PgType;
+pub use validate::validate;
+
+// Reached from `crate::dev` (ADR-0012's sanctioned exception) by `generative`
+// and `benchmark`.
+#[cfg(any(test, feature = "test-util"))]
+pub use backfill::backfill_definition;
+#[cfg(any(test, feature = "test-util"))]
+pub use catalog::create_definition_without_backfill;
+#[cfg(any(test, feature = "test-util"))]
+pub use ddl::{
+    DdlError, create_aggregate_target_table, create_target_table, qualified_target_table,
+    require_single_column_pk, source_primary_key,
 };
+#[cfg(any(test, feature = "internals"))]
 pub use oracle::{
     OracleError, Recomputed, recompute, recompute_aggregate,
     render_aggregate_relationship_select_sql, render_aggregate_select_sql, render_expr_sql,
     render_relationship_select_sql,
 };
-pub use parser::{parse, parse_relationship};
-pub use pg_type::PgType;
-pub use validate::{RelationshipTypeMismatch, RelationshipWarning, ValidationError, validate};
+
+// Reached only by this crate's own `tests/*.rs`, through the `internals`
+// feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
+#[cfg(any(test, feature = "internals"))]
+pub use ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, RelationshipDef, TransformDef,
+};
+#[cfg(any(test, feature = "internals"))]
+pub use backfill::BackfillError;
+#[cfg(any(test, feature = "internals"))]
+pub use catalog::{
+    RelationshipProjection, create_definition, dependents_of, edges_from, node_for_table,
+    persist_edge, relationship_by_name, relationship_projection, resolve_node,
+    source_table_version, transforms_for_source,
+};
+#[cfg(any(test, feature = "internals"))]
+pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
+#[cfg(any(test, feature = "internals"))]
+pub use eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
+#[cfg(any(test, feature = "internals"))]
+pub use invertibility::{AggregateArg, CountArg, Invertibility, PartialField, Verdict, classify};
+#[cfg(any(test, feature = "internals"))]
+pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
+#[cfg(any(test, feature = "internals"))]
+pub use parser::parse_relationship;
+#[cfg(any(test, feature = "internals"))]
+pub use validate::{RelationshipTypeMismatch, RelationshipWarning, ValidationError};
 
 #[cfg(test)]
 mod tests {

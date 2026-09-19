@@ -40,7 +40,7 @@
 //! one row's change is ever in flight — a naive N-worker backend driven that
 //! way mostly proves "N idle-ish workers don't duplicate/corrupt a single
 //! claim," not that a real batch gets split and drained by several workers at
-//! once (`trellis::staging::claim`'s bucket-splitting only kicks in above a
+//! once (`trellis::dev::staging::claim`'s bucket-splitting only kicks in above a
 //! sealed batch's own row-count threshold). [`run_convergence_bursty`]
 //! (`generative::run`) applies several already-generated ops back-to-back,
 //! with no `quiesce()` in between, before checking convergence once per
@@ -272,7 +272,7 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
 }
 
 /// The non-negotiable D4 pin: a batch that **genuinely exceeds** the engine's
-/// real split threshold (`trellis::staging::claim::MIN_ROWS_TO_SPLIT`, 256 as
+/// real split threshold (`trellis::dev::staging::claim::MIN_ROWS_TO_SPLIT`, 256 as
 /// of this writing — not imported here, per the backend seam's "nothing
 /// outside `generative::backend` may import `trellis::staging`" rule; see
 /// `ManualBackend::max_bucket_count`'s doc comment for the one sanctioned
@@ -346,8 +346,8 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
 }
 
 /// Cross-cutting holistic-review pin: the phase-gap-straggler fix
-/// (`trellis::staging::seal::seal_if_active_nonempty`'s straggler-catching
-/// case, `trellis::staging::converge::converged_through`'s condition 3 — see
+/// (`trellis::dev::staging::seal::seal_if_active_nonempty`'s straggler-catching
+/// case, `trellis::dev::staging::converge::converged_through`'s condition 3 — see
 /// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
 /// writeup) was found and fixed entirely under the *single*-worker,
 /// burst-batching runtime (`ManualBackend::connect`/`connect_with_options`

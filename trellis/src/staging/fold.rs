@@ -46,6 +46,7 @@ pub struct BucketFilter {
 impl BucketFilter {
     /// The whole (single-bucket) batch: `route % 1 = 0` is trivially true
     /// for every row.
+    #[cfg(any(test, feature = "internals"))]
     pub fn all() -> Self {
         Self {
             bucket_count: 1,

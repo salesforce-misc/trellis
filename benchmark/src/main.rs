@@ -31,7 +31,7 @@ use std::time::Duration;
 
 /// Post-M3 this shape's aggregate phase measures ~0.7-0.8s on this
 /// harness/box across repeated runs — the direct, single-pass-then-chunked
-/// build ([`trellis::defs::backfill_definition`], issue #63) replaced the ring
+/// build ([`trellis::dev::defs::backfill_definition`], issue #63) replaced the ring
 /// drain that took ~55-58s here (and ~1m50s on the issue's poc cluster). The
 /// M3-review fix (aggregate the source once into a staging table, then chunk
 /// the writes from that small table instead of re-scanning the source per

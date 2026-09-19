@@ -185,6 +185,7 @@ pub enum Value {
 }
 
 impl Value {
+    #[cfg(test)]
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::Numeric(_) => ValueType::Numeric,
@@ -363,6 +364,7 @@ impl std::error::Error for EvalError {
 /// column's as a decimal). A column absent from `source_columns` defaults to
 /// `Numeric`, preserving this evaluator's pre-#63 behavior for callers that
 /// don't yet declare column types.
+#[cfg(any(test, feature = "test-util"))]
 pub fn evaluate(
     def: &TransformDef,
     row: &Row,
@@ -408,6 +410,7 @@ pub fn evaluate_excluding(
 /// no entry in `relationships` errors ([`EvalError::UnknownRelationship`]);
 /// with the empty context [`evaluate`] passes, any path errors, matching the
 /// pure evaluator's pre-#28 behavior.
+#[cfg(any(test, feature = "test-util"))]
 pub fn evaluate_with_relationships(
     def: &TransformDef,
     row: &Row,

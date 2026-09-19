@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use trellis::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
 
 use crate::model::{Cardinality, Op, OpOutcome, Program, Relationship};
 
@@ -38,7 +38,7 @@ pub struct Coverage {
     /// while walking `expr_shapes`.
     pub operators: HashSet<&'static str>,
     /// Which function names (the [`Expr::FunctionCall`] `name` field, one of
-    /// `trellis::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
+    /// `trellis::dev::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
     /// canonical uppercased names) appear across every `FieldDef.expr` on
     /// every def, walked recursively alongside `expr_shapes` (improvement-plan
     /// task B2). An unrecognized function name is tallied as `"Other"` rather
@@ -323,7 +323,7 @@ fn operator_name(op: Operator) -> &'static str {
 
 /// Maps a [`Expr::FunctionCall`] name to a stable `&'static str` for
 /// [`Coverage::functions`], matching the canonical uppercased names
-/// `trellis::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS` already use
+/// `trellis::dev::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS` already use
 /// (and the generator only ever builds). A name outside that fixed set
 /// collapses to `"Other"` rather than leaking an arbitrary caller-owned
 /// `String` into a `HashSet<&'static str>`.

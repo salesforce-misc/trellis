@@ -6718,6 +6718,7 @@ const MAX_APPLY_ATTEMPTS: u32 = 5;
     skip(pool, wake_channel, watermark),
     fields(claimed_by = %claimed_by, attempt = tracing::field::Empty)
 )]
+#[cfg(any(test, feature = "internals"))]
 pub async fn drain_once(
     pool: &Pool,
     seg_seq: i64,
@@ -7155,6 +7156,7 @@ async fn classify_and_retry(
 /// returns the *lowest* eligible `seg_seq`, `B` itself is only ever handed
 /// out once every segment below it has drained — one clause gives both
 /// directions of the barrier.
+#[cfg(any(test, feature = "internals"))]
 pub async fn next_claimable_segment(
     client: &impl GenericClient,
 ) -> Result<Option<i64>, ApplyError> {

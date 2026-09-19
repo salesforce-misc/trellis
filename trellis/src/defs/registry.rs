@@ -39,7 +39,10 @@ pub mod precedence {
     pub const COMPARISON: u8 = 10;
     /// Binary `+`, `-`.
     pub const ADDITIVE: u8 = 20;
-    /// `*`, `/`, `%`.
+    /// `*`, `/`, `%`. Unused until those operators land — see this module's
+    /// doc comment: the gap exists precisely so they can be added without
+    /// renumbering the levels around them.
+    #[allow(dead_code)]
     pub const MULTIPLICATIVE: u8 = 30;
 }
 

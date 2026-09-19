@@ -16,8 +16,8 @@ use generative::generate::{
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
-use trellis::defs::ast::{Expr, KeySpace, Operator, ValueType};
-use trellis::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
+use trellis::dev::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
 
 /// `ValueType` has no `Hash` impl (it's an engine type, not owned by this
 /// crate), so scalar-type-surface comparisons here go through a sorted `Vec`
@@ -697,7 +697,7 @@ fn all_function_call_names(program: &Program) -> HashSet<String> {
 
 /// Improvement-plan task B4 (the widening unit's coverage meta-test): all
 /// five aggregate functions (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
-/// `trellis::defs::registry::AGGREGATE_FUNCTIONS`) must actually get drawn
+/// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`) must actually get drawn
 /// across enough sampled programs — this is the floor that would catch B4's
 /// aggregate-function widening silently regressing (design doc §3 "coverage
 /// that silently drops out"), the same principle every other floor test in
@@ -742,7 +742,7 @@ fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
 }
 
 /// The five `KeySpace::Aggregate` function names
-/// (`trellis::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
+/// (`trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
 /// `const` rather than imported: `generative` doesn't re-export the engine's
 /// `registry` module, and this list is short/stable enough (the same
 /// `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` five [`AggregateFn`] already hardcodes) that
@@ -765,7 +765,7 @@ fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
 const AGGREGATE_FUNCTION_NAMES: &[&str] = &["SUM", "COUNT", "AVG", "MIN", "MAX"];
 
 /// The other half of B4's coverage floor: both invertibility classes
-/// (`trellis::defs::invertibility::Invertibility`) must appear across a run —
+/// (`trellis::dev::defs::invertibility::Invertibility`) must appear across a run —
 /// at least one `Invertible` function (`SUM`/`COUNT`/`AVG`) and at least one
 /// `RecomputeOnly` function (`MIN`/`MAX`) — not just "all five names appear"
 /// in the abstract. This is what makes the generative suite a real exerciser

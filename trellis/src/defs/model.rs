@@ -229,6 +229,9 @@ pub struct SchemaNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Source,
+    // Nothing persists a join edge yet — see this enum's doc comment for why
+    // the variant exists ahead of the writer that will construct it.
+    #[allow(dead_code)]
     Join,
     Relationship,
 }
@@ -249,6 +252,7 @@ impl EdgeKind {
 /// `order_totals` means `order_totals` is a transform target reading from
 /// `orders`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "internals"))]
 pub struct SchemaEdge {
     pub id: i64,
     pub from_node_id: i64,

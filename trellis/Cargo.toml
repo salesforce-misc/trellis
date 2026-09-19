@@ -64,12 +64,24 @@ otlp = [
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
 ]
-# Issue #166: compiles in a small number of test-only pause hooks (today,
-# just `staging::apply`'s pre-commit Phase 3 pause — see that module for the
-# mechanism) that let an external harness land a `SIGKILL` at a
-# deterministic point in the engine's drain path instead of relying on
-# timing luck. No dependencies, unlike `otlp` — this only gates a few
-# `cfg`-attributed fn bodies and their call sites. Off by default
+# Issue #166 and ADR-0012. Compiles in this crate's dev-only, uncommitted
+# surface, which is two things:
+#
+#   1. A small number of test-only pause hooks (issue #166 — today, just
+#      `staging::apply`'s pre-commit Phase 3 pause; see that module for the
+#      mechanism) that let an external harness land a `SIGKILL` at a
+#      deterministic point in the engine's drain path instead of relying on
+#      timing luck.
+#   2. `src/dev.rs` — ADR-0012's one sanctioned exception: a curated
+#      re-export of the engine items the `generative` fuzz suite's
+#      independent, evaluator-driven cross-check leg and `benchmark`'s
+#      scenario oracle need. ADR-0012 makes `defs`/`staging`/`intake`
+#      `pub(crate)`; `dev` is the only way across that line from another
+#      crate, and nothing reached through it carries a public-API or semver
+#      commitment.
+#
+# No dependencies, unlike `otlp` — this only gates `cfg`-attributed items,
+# `src/dev.rs`, and their call sites. Off by default
 # (`cfg(any(test, feature = "test-util"))` also means every `trellis` unit
 # test build gets it for free, with no feature flag needed).
 #
@@ -84,11 +96,36 @@ otlp = [
 # feature, activated only by its self dev-dependency. Any future enabler
 # must do the same; check with
 # `cargo build --workspace && strings target/debug/trellis | grep TRELLIS_TEST_PAUSE`
-# (must print nothing).
+# (must print nothing). The same check applies to `dev`'s own contents:
+# `strings target/debug/trellis | grep render_aggregate_relationship_select_sql`
+# must print nothing too.
 test-util = []
+# ADR-0012, and *not* its sanctioned exception. `defs`/`staging`/`intake` are
+# tier 3 — `pub(crate)`, named by no external crate. But this crate's own
+# `tests/*.rs` are separate compilation units, so `pub(crate)` is as invisible
+# to them as it is to `generative`, and they exercise the engine directly by
+# design (that is what an engine integration test *is*). This feature flips
+# those three modules back to `pub` for exactly that audience.
+#
+# It is not API, it is not a re-export an embedder may reach for, and no other
+# crate in this workspace enables it: the only enabler is this crate's own
+# self dev-dependency below, which means it is on for `cargo test -p trellis`
+# and `cargo clippy --all-targets` and off for every other build — the same
+# discipline `test-util` documents above, and subject to the same `strings`
+# check. Sibling crates (`generative`, `benchmark`) go through `dev` instead;
+# see `src/dev.rs`. Implies `test-util` so that engine items gated for the
+# sibling crates are present here too, under one `cfg` predicate.
+internals = ["test-util"]
 
 [dev-dependencies]
 testkit = { path = "../testkit" }
+# Turns on `internals` (see above) for this crate's own test targets only —
+# `tests/*.rs` are separate compilation units and cannot otherwise see the
+# tier-3 engine modules ADR-0012 made `pub(crate)`. Exactly the self
+# dev-dependency pattern `generative/Cargo.toml` uses for `proptest`/
+# `subprocess-backend`, and for the same reason: it keeps the feature out of
+# `cargo build --workspace`'s production `cli` binary.
+trellis = { path = ".", features = ["internals"] }
 # Dev-only: this crate's own tests capture spans/events emitted through
 # `tracing` to assert they fire with the right fields (see
 # `tests/tracing_instrumentation.rs`) — the same `tracing-subscriber`

@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+#[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
@@ -48,7 +49,10 @@ impl Default for SealConfig {
 pub struct SealOutcome {
     pub sealed_seg_seq: i64,
     pub sealed_ring_slot: i16,
-    pub next_seg_seq: i64,
+    /// Which ring slot the newly-active segment took. Read only by
+    /// `tests/sealing.rs`/`tests/retire.rs`, so it rides the `internals`
+    /// feature (ADR-0012) rather than sitting in production builds unread.
+    #[cfg(any(test, feature = "internals"))]
     pub next_ring_slot: i16,
 }
 
@@ -214,7 +218,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
     Ok(SealOutcome {
         sealed_seg_seq: active_seq,
         sealed_ring_slot: ring_slot,
-        next_seg_seq,
+        #[cfg(any(test, feature = "internals"))]
         next_ring_slot,
     })
 }
@@ -499,6 +503,7 @@ pub(crate) async fn fenced_window(
 /// row identity (`tableoid:ctid`) per matching row — stable enough to check
 /// "exactly once" across batches in tests, without requiring test data to
 /// use globally-unique keys.
+#[cfg(any(test, feature = "internals"))]
 pub async fn fenced_rows(
     client: &impl GenericClient,
     seg_seq: i64,

@@ -31,8 +31,10 @@
 //! key-shaped.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(any(test, feature = "internals"))]
 use std::time::SystemTime;
 
+#[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
 
@@ -44,7 +46,9 @@ use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::validate;
 use crate::pool::{Pool, quote_ident};
 
-use super::append::{self, CdcOp, RING_SIZE, StagedChange, ring_table_name};
+#[cfg(any(test, feature = "internals"))]
+use super::append::{self, CdcOp, StagedChange};
+use super::append::{RING_SIZE, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
 use super::watermark::StagedWatermark;
@@ -1598,6 +1602,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
 /// silently un-gating the read-your-writes predicate.
 ///
 /// Returns how many held rows were replayed.
+#[cfg(any(test, feature = "internals"))]
 pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
@@ -1743,12 +1748,14 @@ pub async fn record_halting_stop(pool: &Pool, reason: &str) -> Result<(), ApplyE
 /// [`record_halting_stop`]'s counterpart read: the current stop count and
 /// last reason, for an operator dashboard or health check.
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "internals"))]
 pub struct HaltingStopStats {
     pub stop_count: i64,
     pub last_reason: Option<String>,
     pub last_stopped_at: Option<SystemTime>,
 }
 
+#[cfg(any(test, feature = "internals"))]
 pub async fn halting_stop_stats(pool: &Pool) -> Result<HaltingStopStats, ApplyError> {
     let client = pool.get().await?;
     let row = client

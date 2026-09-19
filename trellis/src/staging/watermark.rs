@@ -75,14 +75,6 @@ impl StagedWatermark {
         Self(Arc::new(AtomicU64::new(u64::MAX)))
     }
 
-    /// Starts at a specific, already-known position — e.g. a fresh
-    /// `Intake::connect`'s durably-persisted `confirmed_lsn`, a safe (if
-    /// possibly slightly stale) lower bound to resume advancing from after a
-    /// restart.
-    pub fn at(initial: PgLsn) -> Self {
-        Self(Arc::new(AtomicU64::new(u64::from(initial))))
-    }
-
     /// Advances the watermark to `lsn`, monotonically — a lower or equal
     /// value already published (by this or a concurrent advance) is a
     /// no-op, so an out-of-order call (there shouldn't be one; intake is

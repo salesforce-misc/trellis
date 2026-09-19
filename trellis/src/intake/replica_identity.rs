@@ -38,12 +38,14 @@
 //! needs it" vs. "the table already has it") is why this function takes a
 //! bare bool instead of doing its own `pg_catalog` lookup.
 use super::error::IntakeError;
-use crate::defs::ast::{KeySpace, TransformDef};
+use crate::defs::ast::KeySpace;
+#[cfg(test)]
+use crate::defs::ast::TransformDef;
 
 /// Whether `key_space` needs the old image of a row — `false` for
 /// [`KeySpace::OneToOne`], `true` for [`KeySpace::Aggregate`] (see the
-/// module doc). The shared rule behind both [`needs_old_image`] and
-/// [`required_source_guarantees`]'s `Transform` arm.
+/// module doc). The rule behind [`required_source_guarantees`]'s
+/// `Transform` arm.
 fn needs_old_image_for_key_space(key_space: &KeySpace) -> bool {
     match key_space {
         KeySpace::OneToOne => false,
@@ -53,12 +55,6 @@ fn needs_old_image_for_key_space(key_space: &KeySpace) -> bool {
         // leaving.
         KeySpace::Aggregate { .. } => true,
     }
-}
-
-/// Whether `def`'s derivation needs the old image of a row — `false` for
-/// every shape the current grammar can express (see the module doc).
-pub fn needs_old_image(def: &TransformDef) -> bool {
-    needs_old_image_for_key_space(&def.key_space)
 }
 
 /// A source-table guarantee some resolved plan's propagation paths depend
@@ -190,7 +186,9 @@ mod tests {
 
     #[test]
     fn one_to_one_transforms_never_need_the_old_image() {
-        assert!(!needs_old_image(&one_to_one_def("orders")));
+        assert!(!needs_old_image_for_key_space(
+            &one_to_one_def("orders").key_space
+        ));
     }
 
     #[test]

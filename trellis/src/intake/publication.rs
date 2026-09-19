@@ -518,6 +518,7 @@ pub async fn write_backfill_coverage(
 /// ([`crate::defs::catalog::install_definition`]) must instead
 /// [`capture_backfill_coverage_fence`] *before* the build and
 /// [`write_backfill_coverage`] after it (see the former's doc comment).
+#[cfg(any(test, feature = "internals"))]
 pub async fn record_backfill_coverage(
     client: &impl GenericClient,
     qualified_table: &str,

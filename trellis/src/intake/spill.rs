@@ -106,7 +106,9 @@ impl TxnBuffer {
         self.count
     }
 
-    /// Clippy's `len_without_is_empty` companion — not otherwise used today.
+    /// Clippy's `len_without_is_empty` companion — not otherwise used today,
+    /// and kept only because removing it would trip that lint on `len`.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }

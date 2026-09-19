@@ -77,6 +77,11 @@ impl ChunkQueueError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). Delegates to the wrapped error's own `code()` wherever one
     /// nests here.
+    // `ChunkQueueError` never escapes the crate (ADR-0012 tier 3), so nothing
+    // calls this today. Kept because ADR-0008 decision 3 makes `code()` a
+    // uniform obligation of *every* error type here: the moment this error
+    // nests into one that does surface, the method has to already exist.
+    #[allow(dead_code)]
     pub fn code(&self) -> ErrorCode {
         match self {
             ChunkQueueError::Db(err) => error_code::classify_pg_error(err),

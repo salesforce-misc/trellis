@@ -209,6 +209,7 @@ pub async fn converged_through(
 /// bound, so there's no inequality selectivity for the planner to guess at
 /// either way — a plain existence check is cheap on any slot regardless of
 /// `ANALYZE` cadence.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn has_pending(client: &impl GenericClient) -> Result<bool, StagingError> {
     let arms = per_ring_table(" union all ", |slot, table| {
         format!(
@@ -231,6 +232,7 @@ pub async fn has_pending(client: &impl GenericClient) -> Result<bool, StagingErr
 /// rows with no index to serve it (there is no inequality here to seek
 /// against — every row counts). Every polled consumer wants [`has_pending`]
 /// or [`converged_through`]'s sign, not this number.
+#[cfg(any(test, feature = "internals"))]
 pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingError> {
     let arms = per_ring_table(" union all ", |slot, table| {
         format!(
