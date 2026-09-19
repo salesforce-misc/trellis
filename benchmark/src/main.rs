@@ -7,12 +7,16 @@
 //!
 //! ## Running
 //!
+//! This binary carries `required-features = ["engine-access"]` (ADR-0012; see
+//! `Cargo.toml`), so every invocation must pass `--features engine-access` —
+//! without it Cargo skips the target and `cargo run` fails outright:
+//!
 //! ```text
-//! cargo run -p benchmark --release -- high-cardinality
-//! cargo run -p benchmark --release -- low-cardinality
-//! cargo run -p benchmark --release -- both
-//! cargo run -p benchmark --release -- custom --n 200000 --g 500 --ceiling-secs 60
-//! cargo run -p benchmark --release -- relationship-aggregate
+//! cargo run -p benchmark --features engine-access --release -- high-cardinality
+//! cargo run -p benchmark --features engine-access --release -- low-cardinality
+//! cargo run -p benchmark --features engine-access --release -- both
+//! cargo run -p benchmark --features engine-access --release -- custom --n 200000 --g 500 --ceiling-secs 60
+//! cargo run -p benchmark --features engine-access --release -- relationship-aggregate
 //! ```
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres

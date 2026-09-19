@@ -73,7 +73,8 @@ impl ProducerSession {
     }
 
     /// Starts a transaction on this session's connection, for callers that
-    /// need to compose [`append::append`] with other statements atomically.
+    /// need to compose [`super::append::append`] with other statements
+    /// atomically.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, StagingError> {
         Ok(self.client.transaction().await?)
     }

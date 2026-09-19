@@ -22,7 +22,7 @@
 //! `TRELLIS_READY_MARKER` (a path). Optional: `TRELLIS_SOURCE_TABLES`
 //! (comma-separated `schema.table` names; only consulted when
 //! `TRELLIS_STAGING_WORKER=true`, same as [`trellis::ClientOptions::source_tables`]
-//! itself). Two more env vars are read directly by `trellis::dev::staging::apply`'s
+//! itself). Two more env vars are read directly by `staging::apply`'s
 //! own test-only pause hook, never by this binary — see
 //! `SubprocessBackend::spawn_engine`'s doc comment for why they only need to
 //! be present in this process's environment, not parsed here:

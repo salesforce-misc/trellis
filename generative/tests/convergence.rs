@@ -396,7 +396,7 @@ async fn a_duplicate_pk_insert_error_still_converges() {
 
 /// A seeded row with `NULL` in a nullable column (design doc §3's awkward
 /// values) converges: `NULL + n = NULL` on both sides (Postgres's `numeric`
-/// arithmetic and `trellis::dev::defs::eval`'s `Operator::Add` arm agree), so the
+/// arithmetic and `defs::eval`'s `Operator::Add` arm agree), so the
 /// SQL oracle and the maintained target must agree too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_null_value_in_a_nullable_column_converges() {
@@ -494,7 +494,7 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
 /// Row 1 carries plain, unremarkable values for all three new columns. Row 2
 /// carries the U+001F ("unit separator") awkward text literal specifically
 /// (design doc §3 / the module doc comment's B1 scope-cut note): it's the
-/// same byte `trellis::dev::intake::extract_key`'s composite-key encoding treats
+/// same byte `intake::extract_key`'s composite-key encoding treats
 /// specially, so proving *this* value round-trips correctly through a plain
 /// `Text` column — SQL binding, the `::text` cast on both insert and every
 /// read-back, this harness's own snapshot diffing — is the most direct way
@@ -766,7 +766,7 @@ async fn deleting_a_groups_current_min_and_max_forces_a_real_recompute() {
 /// Improvement-plan task B4: `AVG`'s hidden sum/count partials
 /// (`trellis::dev::defs::invertibility::PartialField`), and — since this def's
 /// `SUM` and `AVG` both aggregate the exact same column — the shared hidden
-/// running-count column `trellis::dev::defs::ddl::count_column_names` gives them
+/// running-count column `defs::ddl::count_column_names` gives them
 /// (`trellis/tests/apply_aggregate.rs` covers the shared-count-column shape by
 /// hand; this drives the same shape through the generative harness). An
 /// insert, an update that changes the aggregated value, and a delete all
@@ -1201,7 +1201,7 @@ async fn truncating_a_relationship_to_side_table_leaves_a_stale_aggregate_enrich
 /// *through a relationship* used to leave that definition's enrichment
 /// permanently stale.
 ///
-/// Mechanism (`trellis::dev::staging::apply`): the truncate-clear path resolves
+/// Mechanism (`staging::apply`): the truncate-clear path resolves
 /// affected targets with `catalog::transforms_for_source` — definitions whose
 /// **source** is the truncated table — while reverse propagation into
 /// definitions that merely *read* the table lived in the separate keyed

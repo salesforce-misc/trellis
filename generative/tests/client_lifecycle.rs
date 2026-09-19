@@ -15,7 +15,7 @@
 //! from `tests/convergence.rs`.
 //!
 //! **This file's restart property found a real engine bug, and fixed the
-//! majority of it.** `trellis::dev::intake::Intake::connect` built its replication
+//! majority of it.** The engine's own `intake::Intake::connect` built its replication
 //! connection with no explicit `start_lsn`, so a fresh connection (as a
 //! restart produces) resumed from the replication *slot's own*
 //! server-tracked position rather than this application's own durably
@@ -24,7 +24,7 @@
 //! and-applied transactions, which the ring's fold only dedupes within a
 //! still-active segment, silently double-counting an `Aggregate` target's
 //! `SUM`/`COUNT` once the original segment had already sealed and drained.
-//! See `trellis::dev::intake::Intake::connect`'s doc comment for the fix (pass
+//! See `intake::Intake::connect`'s doc comment for the fix (pass
 //! `last_confirmed` as `start_lsn` explicitly).
 //!
 //! **Independent-review update, since resolved:** a second, deeper bug
@@ -45,9 +45,9 @@
 //! replication redelivery, and nothing to do with `claim`'s bucket-share
 //! math either (the leading hypothesis this comment previously carried, laid
 //! to rest below) — a genuine seal/append race in
-//! `trellis::dev::staging::seal::seal_if_active_nonempty`, latent regardless of
+//! `staging::seal::seal_if_active_nonempty`, latent regardless of
 //! restart or scale-out, that both simply made common by perturbing timing.
-//! `trellis::dev::staging::append::append` resolves the active ring slot with a
+//! `staging::append::append` resolves the active ring slot with a
 //! plain, unlocked read (by design — "you cannot fix this by locking the
 //! pointer," docs/staging-and-claiming/03-sealing-and-the-fence.md), so a
 //! writer can still be resolving slot *k* at the exact moment a concurrent
@@ -62,7 +62,7 @@
 //! a non-empty active segment" busy-loop guard meant nothing ever forced
 //! that seal if the ring went quiet right after (exactly what a `quiesce()`
 //! poll immediately following the triggering op does). The straggler was
-//! stranded permanently, and `trellis::dev::staging::converge::converged_through`
+//! stranded permanently, and `staging::converge::converged_through`
 //! compounded it into a *false positive*: condition 3 treated any
 //! `'drained'` segment's slot as fully resolved, so the run reported
 //! `converged` while the write was still missing. **Fixed** in two places
@@ -170,7 +170,7 @@ proptest! {
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
     /// fixed.** This property is exactly what surfaced the bug, in two
-    /// layers: first `trellis::dev::intake::Intake::connect`'s missing `start_lsn`
+    /// layers: first `intake::Intake::connect`'s missing `start_lsn`
     /// (fixed, see its own doc comment), then a second, deeper one this
     /// property (and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
     /// below) kept reproducing even after that fix — a genuine `MissingRow`
@@ -178,8 +178,8 @@ proptest! {
     /// have nothing to do with restart specifically, or with replication at
     /// all: see this file's own top-of-file doc comment for the full,
     /// confirmed root cause (a seal/append race in
-    /// `trellis::dev::staging::seal::seal_if_active_nonempty`, compounded by a
-    /// false-positive gap in `trellis::dev::staging::converge::converged_through`)
+    /// `staging::seal::seal_if_active_nonempty`, compounded by a
+    /// false-positive gap in `staging::converge::converged_through`)
     /// and the fix, now landed in both places. Re-enabled.
     #[test]
     fn property_convergence_holds_across_a_mid_stream_client_restart(
@@ -242,8 +242,8 @@ proptest! {
 /// not checked in) against exactly this pin is what pinned the root cause
 /// down to a seal/append race — see this file's own top-of-file doc comment
 /// for the full mechanism and the fix, now landed in
-/// `trellis::dev::staging::seal::seal_if_active_nonempty` and
-/// `trellis::dev::staging::converge::converged_through`. Restarting this file's
+/// `staging::seal::seal_if_active_nonempty` and
+/// `staging::converge::converged_through`. Restarting this file's
 /// *other* hand-built pin
 /// ([`restart_then_scale_out_are_independently_usable_against_a_live_backend`])
 /// never reproduced it because that pin applies an `Update` to an

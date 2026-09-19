@@ -33,7 +33,7 @@
 //! table gets a matching identity-passthrough field for each (`SELECT <col>
 //! AS <col>`, the same bare-`Expr::Column` shape
 //! `trellis/tests/defs_backfill_direct.rs` already exercises by hand, and the
-//! same narrowing `trellis::dev::defs::ddl::passthrough_source_column` already
+//! same narrowing `defs::ddl::passthrough_source_column` already
 //! special-cases). See [`TableSpec`]'s `text_values`/`bool_values`/
 //! `uuid_values` fields and the `text_value`/`bool_value`/`uuid_value`
 //! strategies below.
@@ -62,7 +62,7 @@
 //! **The domain *is* now "0, 1, 2, plus `NULL`"**, matching the improvement
 //! plan's original text (issue #128). It wasn't always: a `NULL` grouping
 //! value was implemented and drawn early in task B4's development, and
-//! immediately found a real engine bug — `trellis::dev::defs::ddl::create_aggregate_target_table`
+//! immediately found a real engine bug — `defs::ddl::create_aggregate_target_table`
 //! declared the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
 //! which is unconditionally `NOT NULL`, so a source row with a `NULL`
 //! grouping value made every attempted write to that group fail with a
@@ -150,7 +150,7 @@
 //!   (this doc comment is written after both have merged): a derived field
 //!   is attached only to `OneToOne` defs, never `Aggregate` ones — see that
 //!   function's own doc comment for why (in short,
-//!   `trellis::dev::defs::validate::validate`'s `UngroupedColumnReference` check
+//!   `defs::validate::validate`'s `UngroupedColumnReference` check
 //!   would reject a derived field's bare, unaggregated column reference on
 //!   an `Aggregate` def; every `DerivedShape` references `c1`/`c2`/the text
 //!   column bare, none of them wrapped in `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`).
@@ -161,7 +161,7 @@
 //! - Awkward text values (empty string, the literal text `"NULL"`, a
 //!   U+001F-containing string, a comma/quote/backslash string) are drawn
 //!   here, but this does **not** close the improvement plan's "attacks the
-//!   key encoding" framing for B1: `trellis::dev::intake::extract_key`'s
+//!   key encoding" framing for B1: `intake::extract_key`'s
 //!   composite-key delimiter and `defs::oracle::group_key`'s `Aggregate`
 //!   grouping-key encoding only matter for a *multi-column* primary key
 //!   (never drawn — the pk stays single-column `Numeric`) or a *`Text`-typed*
@@ -204,7 +204,7 @@
 //!   nullable at the schema level (`ManualBackend::create_source_table` never
 //!   emits `NOT NULL` for a non-primary-key column), and the engine's `+`
 //!   evaluator already treats a `NULL` operand as short-circuiting to `NULL`
-//!   (`trellis::dev::defs::eval`'s `Operator::Add` arm), matching Postgres's own
+//!   (`defs::eval`'s `Operator::Add` arm), matching Postgres's own
 //!   `numeric + NULL = NULL`. So drawing `None` for `c1`/`c2` needed no
 //!   engine or model change — see [`Mutate`] and the `value` strategy below.
 //! - **Empty string, the literal text `"NULL"`, delimiter-containing
@@ -306,7 +306,7 @@ pub const REL_FK_COLUMN: usize = 8;
 /// (case), and the date/time types (session-dependent rendering).
 ///
 /// **Deliberately duplicated here rather than imported.** The engine's own
-/// copy (`trellis::dev::defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
+/// copy (`defs::catalog`'s `TEXT_STABLE_JOIN_KEY_TYPES`) is private
 /// to that module, and the design doc's seam (§1/§2) says this crate should
 /// not reach into engine internals to decide what a valid program is — the
 /// generator's job is to *independently* know the rules and only emit
@@ -1014,7 +1014,7 @@ pub fn build_program_multi_with_shapes(
                 DefShape::Aggregate { functions } => {
                     // The grouping-column passthrough field
                     // (`SELECT <grain> AS <grain>`) is required —
-                    // `trellis::dev::defs::validate::validate` rejects any other
+                    // `defs::validate::validate` rejects any other
                     // expression under a grouping column's own name — and
                     // every other field is one of `functions`, drawn from
                     // `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over `c1`/`c2` (see
@@ -1076,7 +1076,7 @@ pub fn build_program_multi_with_shapes(
 /// B4): the field name encodes both the function and its aggregated column
 /// (`sum_c1`, `avg_c2`, ...) so distinct `(function, column)` draws — even two
 /// functions sharing the same column, e.g. `SUM(c1)` and `AVG(c1)`, which
-/// deliberately exercises `trellis::dev::defs::ddl::count_column_names`'s shared
+/// deliberately exercises `defs::ddl::count_column_names`'s shared
 /// hidden-count-column path — never collide; `COUNT` has no column and always
 /// takes the fixed name `cnt`. `c1`/`c2` are the source table's own rendered
 /// column names (as everywhere else in this module).
@@ -1169,7 +1169,7 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// (`Expr::Column`), never wrapped in an aggregate function — that's exactly
 /// what makes a `OneToOne` field a legal `SELECT` projection. On an
 /// `Aggregate` def, a bare reference to a non-grouping-key source column is
-/// rejected by `trellis::dev::defs::validate::validate`'s
+/// rejected by `defs::validate::validate`'s
 /// `UngroupedColumnReference` check (every row in a group must be folded to
 /// one value before it can appear in the target). So a `DerivedShape` field
 /// could never be attached to an `Aggregate` def and still validate — see
@@ -1281,7 +1281,7 @@ impl DerivedShape {
 /// only ever attached when `derived[j]` is `Some` *and* `defs[j]`'s shape is
 /// `DefShape::OneToOne` — see [`DerivedShape`]'s own doc comment for why an
 /// `Aggregate` def can never legally carry one (every `DerivedShape` variant
-/// references a source column bare, and `trellis::dev::defs::validate::validate`
+/// references a source column bare, and `defs::validate::validate`
 /// rejects a bare, ungrouped column reference on an `Aggregate` def). This
 /// function enforces that pairing with an assertion rather than silently
 /// ignoring a `Some` paired with `DefShape::Aggregate`: a caller that drew
@@ -1378,7 +1378,7 @@ pub fn build_program_multi_with_shapes_and_derived(
 /// `COUNT(*)` has no relationship form at all (`COUNT(<rel>.<column>)` — the
 /// per-related-row count — is a separate shape carried by
 /// [`RelAggregateFn::Count`], and is the *only* `COUNT` shape
-/// `trellis::dev::defs::parser` accepts over a path).
+/// `defs::parser` accepts over a path).
 ///
 /// `Count` is legal only over a **to-many** path in a row-grain (`OneToOne`)
 /// definition. Inside a `GROUP BY` definition the parser routes `COUNT(...)`
@@ -1411,7 +1411,7 @@ impl RelAggregateFn {
 /// Which of the three **engine-supported** relationship-reference shapes a
 /// generated definition takes (issue #34). Every other combination of
 /// cardinality × wrapping × key-space is rejected by
-/// `trellis::dev::defs::validate`, and an install rejection is a hard failure,
+/// `defs::validate`, and an install rejection is a hard failure,
 /// never a skip (design doc §3), so those are structurally unrepresentable
 /// here rather than merely undrawn:
 ///
@@ -1925,7 +1925,7 @@ pub fn build_program_multi_with_derived(
 /// By the time `defs[def_index]` installs, `program.ops[0..after_op]` have
 /// already run — including, if `after_op` is chosen past that definition's
 /// own source table's first seed insert, real pre-existing source rows for
-/// [`trellis::dev::defs::catalog::install_definition`]'s direct-backfill path to
+/// the engine's own `defs::catalog::install_definition`'s direct-backfill path to
 /// build from (exactly the scenario `generative/tests/backfill.rs` exercises
 /// by hand against a bare [`crate::backend::ManualBackend`], now reachable
 /// from inside [`crate::run::run_convergence`]'s own op-stream loop). This
@@ -2477,7 +2477,7 @@ mod strategy {
     /// task B1): the empty string; the literal four-character text `"NULL"`
     /// (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s job, this
     /// is the string that spells the word); a string containing the U+001F
-    /// unit-separator (`trellis::dev::intake::extract_key`'s composite-key
+    /// unit-separator (`intake::extract_key`'s composite-key
     /// delimiter — see the module doc comment's scope-cut note on why this
     /// doesn't yet reach that risk); and a string containing a
     /// comma/quote/backslash (SQL-binding/escaping awkwardness, independent
@@ -2649,7 +2649,7 @@ mod strategy {
     /// deliberately cut down to the three non-`NULL` values for a while
     /// (issue #128): a `NULL` grouping value is real, standard SQL (Postgres's
     /// `GROUP BY` puts every `NULL` into one group, like any other value),
-    /// but `trellis::dev::defs::ddl::create_aggregate_target_table` used to declare
+    /// but `defs::ddl::create_aggregate_target_table` used to declare
     /// the `group_by` columns as the target's `PRIMARY KEY`, and Postgres
     /// primary-key columns are `NOT NULL` unconditionally — so a source row
     /// whose grouping column was `NULL` made every write to that group's
@@ -2729,7 +2729,7 @@ mod strategy {
     /// (not per occurrence, since each function occurs at most once anyway),
     /// so two different functions landing on the *same* column — e.g.
     /// `SUM(c1)` and `AVG(c1)` — is a real, reachable draw: that's precisely
-    /// the shape that exercises `trellis::dev::defs::ddl::count_column_names`'s
+    /// the shape that exercises `defs::ddl::count_column_names`'s
     /// shared hidden-count-column path (two fields aggregating the exact same
     /// argument share one partial column) from the generative side, not just
     /// `trellis/tests/apply_aggregate.rs`'s hand-built fixture.
@@ -2821,7 +2821,7 @@ mod strategy {
     /// Which aggregate function wraps a generated relationship path.
     ///
     /// `in_aggregate_def` excludes [`RelAggregateFn::Count`]: inside a
-    /// `GROUP BY` definition `trellis::dev::defs::parser` routes every `COUNT(...)`
+    /// `GROUP BY` definition `defs::parser` routes every `COUNT(...)`
     /// through its `COUNT(*)`-only branch and rejects `COUNT(<rel>.<col>)`
     /// outright (`UnsupportedAggregateFunction`), so drawing it there would
     /// be a parse-time install rejection — a hard failure, never a skip
@@ -3235,7 +3235,7 @@ mod strategy {
     /// cut, discovered *while building this task*, mirroring
     /// [`grain_value`]'s own history of a found-but-then-out-of-scope engine
     /// bug (issue #128, since fixed).** Restarting the primary client mid-stream originally reproduced
-    /// a real engine bug: `trellis::dev::intake::Intake::connect` built its
+    /// a real engine bug: `intake::Intake::connect` built its
     /// `pgwire_replication::ReplicationConfig` with no explicit `start_lsn`,
     /// so a fresh connection resumed from the replication *slot's own*
     /// server-tracked `confirmed_flush_lsn` — which only advances once a
@@ -3250,7 +3250,7 @@ mod strategy {
     /// segment seals — once draining has already applied it, a redelivered
     /// duplicate is a second, independent delta, silently double-counting an
     /// `Aggregate` target's `SUM`/`COUNT`. **Fixed** (see
-    /// `trellis::dev::intake::Intake::connect`'s own updated doc comment/code):
+    /// `intake::Intake::connect`'s own updated doc comment/code):
     /// `Intake::connect` now passes its own durably-read `last_confirmed` as
     /// `start_lsn` explicitly, which can never be behind the slot's own
     /// position, closing the large majority of this race.
@@ -3267,7 +3267,7 @@ mod strategy {
     /// `property_convergence_holds_across_a_mid_stream_client_restart`/
     /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge` doc
     /// comments for the confirmed root cause: a seal/append race in
-    /// `trellis::dev::staging::seal::seal_if_active_nonempty`, latent regardless
+    /// `staging::seal::seal_if_active_nonempty`, latent regardless
     /// of restart or `OneToOne` vs. `Aggregate`, that a restart's extra
     /// timing perturbation (and a tiny test program's near-instant drain)
     /// simply made likely to hit. The `OneToOne` restriction here predates

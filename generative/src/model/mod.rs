@@ -30,7 +30,7 @@ pub struct Table {
     ///
     /// This exists for relationships: ADR-0006 derives a relationship's
     /// cardinality from whether its **to-side** column is provably unique
-    /// (primary key or `UNIQUE`), and `trellis::dev::defs::catalog` introspects
+    /// (primary key or `UNIQUE`), and `defs::catalog` introspects
     /// that live against `pg_catalog` at `create_relationship` time. A
     /// generated to-one relationship therefore needs a real `UNIQUE`
     /// constraint on the to-side column, which the backend can only emit if
@@ -48,7 +48,7 @@ pub struct Table {
 /// `crate::generate::build_program_multi_with_shapes`), but [`ValueType`]'s
 /// only numeric variant maps to Postgres `numeric` — and the engine rejects a
 /// `numeric` primary key outright with
-/// `trellis::dev::defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
+/// `defs::ddl::DdlError::UnsupportedPrimaryKeyType`, because
 /// `source_primary_key` gates the resolved PK type on
 /// `is_text_stable_join_key_type`'s allowlist (issue #107): every consumer
 /// compares that key via a `::text` cast, and `numeric` is not text-stable
@@ -115,7 +115,7 @@ impl Table {
 /// — not declared — from whether the **to-side** column is provably unique:
 /// the concrete-syntax declaration
 /// (`RELATIONSHIP <name> FROM <t>.<c> TO <t>.<c>`) carries no cardinality
-/// keyword at all, and `trellis::dev::defs::catalog` introspects `pg_catalog` for a
+/// keyword at all, and `defs::catalog` introspects `pg_catalog` for a
 /// primary-key/`UNIQUE` index on the to-side column to decide.
 ///
 /// This enum records the cardinality the *generator* built the relationship
@@ -291,7 +291,7 @@ pub struct Program {
     /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
     /// default). A nonzero value `N` means "install this definition only once
     /// `ops[0..N]` have already been applied" — real rows can already exist
-    /// in `defs[i].source` by then, exercising `trellis::dev::defs::catalog::install_definition`'s
+    /// in `defs[i].source` by then, exercising `defs::catalog::install_definition`'s
     /// direct-backfill-over-preexisting-rows path (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
     /// inside the harness's own op-stream loop). Must be index-aligned with

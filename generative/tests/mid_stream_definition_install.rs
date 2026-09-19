@@ -8,7 +8,7 @@
 //! `local_docs/generative-suite-improvement-plan.md`'s workstream E and this
 //! branch's own task description): "redefine" (altering an existing
 //! definition) and "remove" (dropping one) are not attempted here.
-//! `trellis::dev::defs::catalog` has no drop/alter-definition API today — only
+//! `defs::catalog` has no drop/alter-definition API today — only
 //! `create_definition`/`create_definition_without_backfill`/`install_definition`
 //! — so that half of definition lifecycle is blocked on missing engine
 //! functionality, a deferred follow-up, not something this file works around.
@@ -161,9 +161,9 @@ async fn a_definition_installed_after_preexisting_rows_backfills_and_keeps_conve
 }
 
 /// Cross-cutting holistic-review pin: does a mid-stream definition install
-/// interact with the phase-gap-straggler fix (`trellis::dev::staging::seal::
-/// seal_if_active_nonempty`'s straggler-catching case,
-/// `trellis::dev::staging::converge::converged_through`'s condition 3 — see
+/// interact with the phase-gap-straggler fix (the engine's own
+/// `staging::seal::seal_if_active_nonempty`'s straggler-catching case,
+/// `staging::converge::converged_through`'s condition 3 — see
 /// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
 /// writeup) on a table whose definition was *just* installed? Neither of
 /// this task's own properties/pins above ever combine with a restart, and

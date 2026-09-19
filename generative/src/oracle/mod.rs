@@ -467,7 +467,7 @@ fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet
 /// # Panics
 ///
 /// On a bare to-many path or an aggregate wrapping something other than a
-/// single path — shapes `trellis::dev::defs::validate` rejects, which the generator
+/// single path — shapes `defs::validate` rejects, which the generator
 /// therefore never emits. Refusing to guess (design doc §2) keeps a future
 /// widening a loud failure rather than a silent false differential.
 fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
@@ -705,7 +705,7 @@ fn render_select(def: &TransformDef, pk_column: &str, rels: &RelIndex<'_>) -> St
 /// pk expression in the rendered `SELECT` (see [`render_select`]'s doc
 /// comment), so this instead locates each `group_by` column by name among
 /// `def.fields` (every grouping column has a passthrough field of the same
-/// name — enforced by `trellis::dev::defs::validate::validate`'s
+/// name — enforced by `defs::validate::validate`'s
 /// `GroupingColumnFieldMustBePassthrough` check) and excludes it from the
 /// row's own `by_column` map, exactly as [`target_fields`] excludes the 1-1
 /// pk column.
@@ -779,7 +779,7 @@ pub async fn sql_oracle(
 /// Recomputes `def`'s target with the engine's own evaluator
 /// ([`trellis::dev::defs::oracle::recompute`] for 1-1,
 /// [`trellis::dev::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
-/// and renders each [`Value`] to text, into field-only [`Rows`] keyed by the
+/// and renders each `Value` to text, into field-only [`Rows`] keyed by the
 /// primary key (1-1) or the grouping columns' composite [`group_key`]
 /// (`Aggregate`, already computed by `recompute_aggregate` itself, since it's
 /// the engine's own private convention this generative-suite key deliberately
@@ -791,8 +791,6 @@ pub async fn sql_oracle(
 /// primary key to key an aggregate target by), and each group's grouping
 /// column(s) are excluded from `by_column`, matching [`sql_oracle`]'s
 /// `Aggregate` arm.
-///
-/// [`Value`]: trellis::dev::defs::eval::Value
 pub async fn evaluator_oracle(
     pool: &Pool,
     def: &TransformDef,

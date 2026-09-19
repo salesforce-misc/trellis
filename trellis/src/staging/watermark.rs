@@ -69,7 +69,7 @@ impl StagedWatermark {
     /// unconditionally, which is never what an unrelated test wants — this
     /// constructor makes guard (a) a pure no-op instead, so only a test that
     /// deliberately exercises it (by constructing its own
-    /// [`Self::new`]/[`Self::at`] and choosing when to [`Self::advance`] it)
+    /// [`Self::new`] and choosing when to [`Self::advance`] it)
     /// ever sees it reject anything.
     pub fn saturated() -> Self {
         Self(Arc::new(AtomicU64::new(u64::MAX)))

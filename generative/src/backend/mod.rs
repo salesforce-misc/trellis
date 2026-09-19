@@ -1,7 +1,7 @@
 //! The backend seam (design doc §1 "The backend seam"): the ONLY module
 //! that drives the engine's maintenance pipeline and reads back derived
 //! state. Nothing outside this module may import `trellis::client`,
-//! `trellis::staging`, or `trellis::dev::defs::catalog`/`ddl` — the oracle
+//! `trellis::staging`, or the engine's own `defs::catalog`/`ddl` — the oracle
 //! (`crate::oracle`) and generators (`crate::generate`) must stay reachable
 //! only through the shared, engine-independent pieces named in the design
 //! doc, so a second backend can be added without touching either. Two

@@ -2715,8 +2715,9 @@ async fn check_source_guarantees(
 /// one place rather than being duplicated here. That function's own
 /// `needs_old_image` parameter is unconditional (it rejects whenever passed
 /// `true`, regardless of the table's actual replica identity), so it is not
-/// enough on its own — [`crate::intake::needs_old_image`] would always
-/// return `true` for [`KeySpace::Aggregate`], rejecting every aggregate
+/// enough on its own — the key-space rule behind
+/// [`crate::intake::required_source_guarantees`] always yields "needs the old
+/// image" for [`KeySpace::Aggregate`], which would reject every aggregate
 /// definition forever, even after an operator runs the suggested `ALTER
 /// TABLE`. [`check_source_guarantees`] closes that gap by querying
 /// `pg_class.relreplident` itself first and only passing `true` through

@@ -360,7 +360,7 @@ impl ManualBackend {
     /// hasn't actually been torn down yet (`trellis::Client::drop` is a
     /// best-effort shutdown signal, not a synchronous join — see its own
     /// doc comment) and get misdiagnosed by
-    /// `trellis::dev::intake::publication::initial_snapshot_handshake` as an
+    /// the engine's own `intake::publication::initial_snapshot_handshake` as an
     /// orphaned slot.
     pub fn set_slot_and_publication(
         &mut self,
@@ -372,9 +372,9 @@ impl ManualBackend {
 
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
     /// across every segment sealed so far, straight from
-    /// `trellis::dev::staging::claim`'s partition decision (`segments.bucket_count`,
+    /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
-    /// `trellis::dev::staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
+    /// `staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
     /// segment has sealed yet.
     ///
     /// This module is the one place the backend seam (its own doc comment)
@@ -534,7 +534,7 @@ impl ManualBackend {
     /// delegates to the shared [`sql::await_definitions_settled`]. See that
     /// function's doc comment for why this closes a real gap in
     /// [`ManualBackend::quiesce`] (public-api-design review): a direct-build
-    /// 1-1 definition's backfill runs through `trellis::dev::defs::chunk_queue`'s
+    /// 1-1 definition's backfill runs through the engine's own `defs::chunk_queue`
     /// durable claim/execute/finish queue entirely outside the ring
     /// (docs/decisions/0007's "Backgrounding and resumability" amendment) —
     /// `await_converged`'s CDC-ring convergence wait has no visibility into

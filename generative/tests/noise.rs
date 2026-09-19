@@ -12,7 +12,7 @@
 //! # E5 scope cut: `CHECKPOINT` only, not a full Postgres restart
 //!
 //! A full `TestCluster` restart was investigated and deliberately **not**
-//! built. `trellis::dev::intake::Intake::run` (the staging worker's logical-
+//! built. The engine's own `intake::Intake::run` (the staging worker's logical-
 //! replication consumer) returns `Err` the instant its replication
 //! connection drops — confirmed by reading `trellis/src/intake/mod.rs`
 //! directly, not assumed — and `trellis::client::run` spawns it as

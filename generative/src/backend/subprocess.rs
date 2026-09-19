@@ -26,7 +26,7 @@
 //! inside Phase 3's open transaction — this suite's programs are tiny, and a
 //! drain of them can complete in well under a millisecond. Instead,
 //! [`SubprocessBackend::arm_pause_before_commit`]/
-//! [`SubprocessBackend::wait_for_pause`] drive `trellis::dev::staging::apply`'s
+//! [`SubprocessBackend::wait_for_pause`] drive `staging::apply`'s
 //! `pause_before_commit_for_tests` test-only hook (gated behind the
 //! `trellis` crate's `test-util` feature, which this crate's `Cargo.toml`
 //! enables): arm it, apply the op(s) meant to be interrupted, wait for the
@@ -311,7 +311,7 @@ impl SubprocessBackend {
         self.publication = publication.into();
     }
 
-    /// Arms `trellis::dev::staging::apply`'s test-only pre-commit pause hook
+    /// Arms `staging::apply`'s test-only pre-commit pause hook
     /// (issue #166; see that module's `pause_before_commit_for_tests` doc
     /// comment for the full mechanism): creates the trigger file the hook
     /// polls for, so the *next* Phase 3 commit the primary engine
@@ -434,7 +434,7 @@ impl SubprocessBackend {
             // unconditionally (every spawned subprocess, primary or
             // scale-out): a no-op unless `arm_pause_before_commit` later
             // creates the trigger file, per `pause_before_commit_for_tests`'s
-            // own doc comment in `trellis::dev::staging::apply`.
+            // own doc comment in `staging::apply`.
             .env("TRELLIS_TEST_PAUSE_TRIGGER", &self.pause_trigger_path)
             .env("TRELLIS_TEST_PAUSE_MARKER", &self.pause_marker_path)
             .stdout(Stdio::inherit())

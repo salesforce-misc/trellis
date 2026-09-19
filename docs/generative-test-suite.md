@@ -20,17 +20,25 @@ The build plan lives in the tracking epic (salesforce-misc/trellis, label `Epic`
 
 ## 1. Architecture
 
-The suite is the `generative` crate — a workspace member, so ordinary
-`cargo build`/`cargo test` compile it and a signature change can't rot it
-silently. It depends on `trellis` and `testkit` (the latter became a normal
-dependency, not just a dev-dependency, once `SubprocessBackend` needed
-`CrashGuard` from the library itself).
+The suite is the `generative` crate — a workspace member, so `cargo test -p
+generative` (and CI's `clippy --all-targets --all-features`) compile it and a
+signature change can't rot it silently. It depends on `trellis` and `testkit`
+(the latter became a normal dependency, not just a dev-dependency, once
+`SubprocessBackend` needed `CrashGuard` from the library itself).
 
-Two of its features stay off by default and are switched on only by the crate's
-own self dev-dependency, so neither can reach a production
-`cargo build --workspace`: `proptest` (the generator strategies) and
-`subprocess-backend` (which enables `trellis/test-util`, the engine's test-only
-Phase 3 pre-commit pause hook).
+Three of its features stay off by default and are switched on only by the
+crate's own self dev-dependency, so none can reach a production
+`cargo build --workspace`:
+
+- `engine-access` (ADR-0012) enables `trellis/test-util`, which is what makes
+  `trellis::dev` — the curated, uncommitted door onto the engine — exist at
+  all. Every module in `src/lib.rs` is gated on it, because they pervasively
+  name engine types; a plain `cargo build --workspace` therefore compiles this
+  crate's lib to nothing. That is deliberate: a non-dev dependency edge
+  carrying `trellis/test-util` would unify into `cli`'s production binary.
+- `proptest` — the generator strategies.
+- `subprocess-backend` — the `engine_subprocess` bin and the crash backend,
+  which also needs `trellis/test-util`'s Phase 3 pre-commit pause hook.
 
 `testkit` already provides:
 
