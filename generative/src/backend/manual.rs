@@ -18,22 +18,36 @@
 //! assumes a single worker; the worker count only ever mattered to one line
 //! inside [`Backend::install`] that hardcoded `application_threads: 1`. A
 //! second type would have had to duplicate this module's substantial
-//! rendering logic (`render_definition`/`render_expr`/`read_table`/
-//! `read_aggregate_table`, none of which is worker-count-dependent) for zero
-//! behavioral difference; a parameterized constructor shares all of it and
-//! keeps exactly one implementation of the seam's DDL/DML/read-back logic to
-//! maintain. See `generative/tests/concurrent_convergence.rs` for the new,
-//! separate property/test file this constructor is meant to be driven from.
+//! rendering logic for zero behavioral difference; a parameterized
+//! constructor shares all of it and keeps exactly one implementation of the
+//! seam's DDL/DML/read-back logic to maintain. See
+//! `generative/tests/concurrent_convergence.rs` for the new, separate
+//! property/test file this constructor is meant to be driven from.
+//!
+//! **Issue #166 update**: that same DDL/DML/read-back rendering logic
+//! (`render_definition`/`render_expr`/`create_source_table`/`apply_op`/
+//! `read_table`/`read_aggregate_table`, none of which cares whether the
+//! engine driving the ring is in-process or a real subprocess) has since
+//! moved to [`super::sql`], a module shared with
+//! [`super::SubprocessBackend`] — the second `Backend` impl this doc comment
+//! used to argue against, but for a genuinely different reason than D4's
+//! worker count: a subprocess-supervised engine that `testkit::CrashGuard`
+//! can `SIGKILL` mid-drain. What differs between `ManualBackend` and
+//! `SubprocessBackend` is *only* how the engine itself is started, stopped,
+//! and restarted — never the DDL/DML/read-back shape, which is why sharing
+//! [`super::sql`] rather than duplicating it keeps exactly one
+//! implementation of the seam's rendering logic, same as this doc comment's
+//! original D4 argument.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::defs::{
-    CatalogError, DdlError, TransformStatus, create_relationship, install_definition,
-    qualified_target_table, require_single_column_pk, source_primary_key,
+    CatalogError, DdlError, create_relationship, install_definition, qualified_target_table,
+    require_single_column_pk, source_primary_key,
 };
 use trellis::staging::{
     StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
@@ -42,10 +56,8 @@ use trellis::staging::{
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
 
 use super::Snapshot;
-use crate::model::{
-    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, PRIMARY_KEY_PG_TYPE, Program,
-    Relationship, Table, group_key,
-};
+use super::sql::{self, quote_ident};
+use crate::model::{Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table};
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
 /// up. Generous: this backend targets correctness, not latency, and a
@@ -131,140 +143,6 @@ impl From<tokio_postgres::Error> for ManualBackendError {
     }
 }
 
-/// Quotes a Postgres identifier for safe interpolation into SQL text,
-/// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
-/// The Postgres type name a [`ValueType`] casts to.
-fn pg_type_name(value_type: ValueType) -> &'static str {
-    match value_type {
-        ValueType::Numeric => "numeric",
-        ValueType::Text => "text",
-        ValueType::Boolean => "boolean",
-        ValueType::Uuid => "uuid",
-        // Issue #108: the generator itself never emits an `Other`-typed
-        // column (see `generate::Column`'s doc comment), but this mirrors
-        // `trellis::defs::ddl::pg_type_name` for exhaustiveness/parity.
-        ValueType::Other(pg_type) => pg_type.sql_type_name(),
-    }
-}
-
-/// Renders `def` back to the concrete `TRANSFORM ... FROM ... SELECT ...`
-/// syntax [`create_definition`] parses — the manual backend's only reason
-/// to exist, since [`crate::model::Program`] stores the parsed AST
-/// directly rather than source text. [`KeySpace::OneToOne`] and (as of
-/// improvement-plan task B4) [`KeySpace::Aggregate`] are both supported,
-/// matching `trellis::defs::parser`'s own `GROUP BY <cols>` clause, which sits
-/// directly after `FROM <source>` and before `SELECT` (ADR-0004's reserved
-/// slot).
-fn render_definition(def: &TransformDef) -> Result<String, ManualBackendError> {
-    let fields: Vec<String> = def
-        .fields
-        .iter()
-        .map(|field| format!("{} AS {}", render_expr(&field.expr), field.name))
-        .collect();
-    debug_assert_eq!(def.predicate, Predicate::True);
-    let key_space_clause = match &def.key_space {
-        KeySpace::OneToOne => String::new(),
-        KeySpace::Aggregate { group_by } => format!(
-            " GROUP BY {}",
-            group_by
-                .iter()
-                .map(|k| k.target_column_name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    Ok(format!(
-        "TRANSFORM {} FROM {}{key_space_clause} SELECT {}",
-        def.target,
-        def.source,
-        fields.join(", ")
-    ))
-}
-
-/// Renders a generator-built [`Expr`] back to the source text
-/// [`super::install_definition`]/`trellis::defs::parser::parse` re-parses.
-///
-/// A `BinaryOp`'s operands are *unconditionally* parenthesized (issue #67's
-/// reviewer follow-up), not only when the operand is itself a lower-
-/// precedence `BinaryOp`: with real operator precedence now in the parser
-/// (`trellis::defs::registry::OPERATORS`), a flat render like `a + b > c`
-/// silently reconstructs a *different* tree than a nested one the generator
-/// might build — e.g. `Add(a, GreaterThan(b, c))` would round-trip as
-/// `a + b > c`, which `+`'s tighter binding re-parses as `Add(a,b) >
-/// c` — the wrong tree. Always parenthesizing every operand (`(a) + (b > c)`)
-/// is simpler than computing whether a given operand's own precedence
-/// requires it, and correct regardless of what tree the generator composes,
-/// so it's the shape this renderer commits to before the generator ever
-/// nests `+` and `>` together (improvement-plan task B2). See
-/// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
-/// for the regression pin, and `trellis::defs::parser`'s grouping-paren
-/// support (issue #67 follow-up) that makes the rendered text re-parseable
-/// at all.
-fn render_expr(expr: &Expr) -> String {
-    match expr {
-        Expr::Column(name) => name.clone(),
-        Expr::NumberLiteral(text) => text.clone(),
-        Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
-        Expr::BinaryOp { op, lhs, rhs } => {
-            format!(
-                "({}) {} ({})",
-                render_expr(lhs),
-                render_operator(*op),
-                render_expr(rhs)
-            )
-        }
-        // `COUNT(*)` (task B4): the AST carries no argument for this shape
-        // (`args` is empty) — `trellis::defs::parser` only ever accepts the
-        // literal `*` here, not an empty argument list, so this must render
-        // it back explicitly rather than falling through to the generic
-        // `name(args)` arm below (which would emit the invalid `COUNT()`).
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "COUNT(*)".to_string()
-        }
-        Expr::FunctionCall { name, args } => {
-            let args: Vec<String> = args.iter().map(render_expr).collect();
-            format!("{name}({})", args.join(", "))
-        }
-        // Issue #34: a `<rel>.<column>` path renders back to exactly the
-        // concrete syntax ADR-0006 specifies — the *relationship* name as
-        // the head, never a table name or alias. The parser resolves an
-        // `ident.ident` in expression position straight to
-        // `Expr::RelationshipPath`, so this round-trips.
-        Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
-    }
-}
-
-/// Renders a [`Relationship`] back to the concrete
-/// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` syntax
-/// [`create_relationship`] parses (ADR-0006) — the relationship analog of
-/// [`render_definition`], for the same reason: [`crate::model::Program`]
-/// stores plain data, and the engine's front door takes source text.
-///
-/// Cardinality is deliberately **not** rendered: ADR-0006's grammar has no
-/// cardinality keyword, because the engine derives it by introspecting
-/// whether the to-side column is provably unique. The model's recorded
-/// [`crate::model::Cardinality`] is the generator's claim about what that
-/// introspection will conclude; this is the point where the engine gets to
-/// disagree, and a disagreement surfaces as a definition-time rejection
-/// (a hard failure, never a skip).
-fn render_relationship(rel: &Relationship) -> String {
-    format!(
-        "RELATIONSHIP {} FROM {}.{} TO {}.{}",
-        rel.name, rel.from_table, rel.from_col, rel.to_table, rel.to_col
-    )
-}
-
-fn render_operator(op: Operator) -> &'static str {
-    match op {
-        Operator::Add => "+",
-        Operator::GreaterThan => ">",
-    }
-}
-
 /// Renders one [`NoiseAction`] to the SQL text [`ManualBackend::fire_noise_event`]
 /// runs directly (task E1) — the noise-table analog of [`render_definition`]/
 /// [`render_expr`], but for plain DDL/DML rather than a `TRANSFORM`
@@ -303,7 +181,7 @@ fn render_noise_action(table: &Table, action: &NoiseAction) -> String {
             "alter table {} add column {} {}",
             quote_ident(&table.name),
             quote_ident(name),
-            pg_type_name(*value_type),
+            sql::pg_type_name(*value_type),
         ),
         NoiseAction::DropColumn { name } => format!(
             "alter table {} drop column {}",
@@ -318,21 +196,13 @@ fn render_noise_action(table: &Table, action: &NoiseAction) -> String {
 /// the target column's declared type: an untyped string literal in an
 /// `INSERT`/`UPDATE`'s value position is coerced to whatever the target
 /// column's real type is (standard Postgres literal-type inference), so this
-/// needs no type dispatch of its own the way [`Assignment`]'s real-op
+/// needs no type dispatch of its own the way [`sql::Assignment`]'s real-op
 /// rendering does with its explicit `::text::<type>` casts.
 fn noise_sql_literal(value: &Option<String>) -> String {
     match value {
         None => "NULL".to_string(),
         Some(text) => format!("'{}'", text.replace('\'', "''")),
     }
-}
-
-/// One row's placeholder assignment for an `INSERT`/`UPDATE` statement:
-/// `column = $n::type` (or `column` for the column list), plus the bound
-/// text value at that position.
-struct Assignment {
-    fragment: String,
-    value: Option<String>,
 }
 
 /// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
@@ -569,69 +439,11 @@ impl ManualBackend {
         Ok(outcome.sealed_seg_seq)
     }
 
+    /// Delegates to the shared [`sql::create_source_table`] — see that
+    /// function's doc comment for the exact DDL shape (`PRIMARY_KEY_PG_TYPE`
+    /// pk, per-column `UNIQUE`, unconditional `REPLICA IDENTITY FULL`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
-        let mut sql = format!("create table {} (", quote_ident(&table.name));
-        for (i, column) in table.columns.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&quote_ident(&column.name));
-            sql.push(' ');
-            if column.name == table.pk_col {
-                // The PK's declared type comes from `PRIMARY_KEY_PG_TYPE`,
-                // never from its `ValueType` — see that constant's doc
-                // comment for why a `numeric` PK is rejected at install time.
-                sql.push_str(PRIMARY_KEY_PG_TYPE);
-                sql.push_str(" primary key");
-            } else {
-                sql.push_str(pg_type_name(column.value_type));
-                if table.unique_cols.iter().any(|c| c == &column.name) {
-                    // Issue #34: a real single-column UNIQUE constraint,
-                    // which is what makes `trellis::defs::catalog`'s live
-                    // `pg_catalog` introspection resolve a relationship whose
-                    // *to*-side is this column as to-one (ADR-0006's
-                    // cardinality rule). A generated to-one relationship is
-                    // otherwise rejected as a bare reference to a to-many
-                    // relationship.
-                    sql.push_str(" unique");
-                }
-            }
-        }
-        sql.push(')');
-        self.raw.batch_execute(&sql).await?;
-
-        // Improvement-plan task B4: a `KeySpace::Aggregate` definition needs
-        // a changed row's *old* image to know which group a deleted/
-        // re-parented row is leaving (`trellis::intake::replica_identity`'s
-        // `needs_old_image`), and the engine checks this eagerly — creating
-        // an aggregate definition over a table with only the default replica
-        // identity (old image limited to the pk) is rejected outright with
-        // `CatalogError::ReplicaIdentityRequired`, exactly like
-        // `trellis/tests/apply_aggregate.rs`'s own hand-built fixtures always
-        // `alter table ... replica identity full` up front. Every table this
-        // backend creates gets it unconditionally, rather than only tables
-        // an `Aggregate` def happens to source from: it's harmless for a
-        // `OneToOne` definition (strictly more WAL detail, never less), and
-        // doing it unconditionally means `install` never has to know in
-        // advance which of a program's tables end up feeding an aggregate
-        // def before any of them are created.
-        self.raw
-            .batch_execute(&format!(
-                "alter table {} replica identity full",
-                quote_ident(&table.name)
-            ))
-            .await?;
-        Ok(())
-    }
-
-    /// `source_columns` for `table`, as `trellis::defs::install_definition`
-    /// wants it.
-    fn source_columns(table: &Table) -> HashMap<String, ValueType> {
-        table
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.value_type))
-            .collect()
+        Ok(sql::create_source_table(&self.raw, table).await?)
     }
 
     async fn install_definition(&mut self, def: &TransformDef) -> Result<(), ManualBackendError> {
@@ -642,9 +454,9 @@ impl ManualBackend {
                 table: def.source.clone(),
             })?
             .clone();
-        let source_columns = Self::source_columns(&source_table);
+        let source_columns = sql::source_columns(&source_table);
 
-        let text = render_definition(def)?;
+        let text = sql::render_definition(def);
 
         // Issue #63 C1: `install_definition` is the same front door real
         // callers use — it creates the target table, then tries the fast,
@@ -657,55 +469,6 @@ impl ManualBackend {
         // takes.
         install_definition(&self.pool, &text, &source_columns, "public").await?;
         Ok(())
-    }
-
-    fn column(&self, table: &str, column: &str) -> Option<&Column> {
-        self.tables
-            .get(table)
-            .and_then(|t| t.columns.iter().find(|c| c.name == column))
-    }
-
-    /// The Postgres type `column` was actually declared with in
-    /// [`Self::create_source_table`] — the single source of truth every
-    /// `$n::text::<type>` cast in this backend renders from.
-    ///
-    /// A primary-key column resolves to [`PRIMARY_KEY_PG_TYPE`] rather than
-    /// to [`pg_type_name`] of its [`ValueType`], because [`ValueType`] cannot
-    /// name an integer type and the placeholder it carries (`Numeric`) is not
-    /// what the column was declared as. Casting a pk through `numeric` still
-    /// *worked* — Postgres assignment-casts `numeric` to `bigint` — but it
-    /// round-trips an integer key through an arbitrary-precision type for no
-    /// reason, and it is exactly the kind of near-miss that hid the original
-    /// `numeric`-pk bug. Routing every site through here keeps the DDL and
-    /// the DML casts from drifting apart again.
-    fn column_pg_type(&self, table: &str, column: &str) -> &'static str {
-        let is_pk = self.tables.get(table).is_some_and(|t| t.pk_col == column);
-        if is_pk {
-            return PRIMARY_KEY_PG_TYPE;
-        }
-        pg_type_name(
-            self.column(table, column)
-                .map(|c| c.value_type)
-                .unwrap_or(ValueType::Numeric),
-        )
-    }
-
-    fn assignment(
-        &self,
-        table: &str,
-        column: &str,
-        index: usize,
-        value: &Option<String>,
-    ) -> Assignment {
-        Assignment {
-            fragment: format!(
-                "{}=${}::text::{}",
-                quote_ident(column),
-                index,
-                self.column_pg_type(table, column)
-            ),
-            value: value.clone(),
-        }
     }
 
     /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
@@ -767,95 +530,22 @@ impl ManualBackend {
 
     /// Polls every installed definition's status
     /// (`transform_definitions.status`) until each has reached a terminal
-    /// backfill outcome — [`TransformStatus::Live`] (the ordinary case) or
-    /// [`TransformStatus::Quarantined`] — or `timeout` elapses. Matches
-    /// `trellis::staging::await_converged`'s own backoff shape (5ms initial,
-    /// doubling to a 250ms ceiling, never resetting within one call) so both
-    /// halves of [`ManualBackend::quiesce`] share one polling discipline.
-    ///
-    /// `Quarantined` stops the wait rather than being treated as "not yet
-    /// settled": per `docs/transforms.md`'s "Status" section, a quarantined
-    /// transform "is broken and no longer maintained" — it never becomes
-    /// `Live` on its own, only by an explicit resume that restarts its
-    /// backfill from `waiting_to_backfill`. Waiting past it here would just
-    /// hang until `timeout` for no reason; it's as settled as this call can
-    /// ever observe it.
-    ///
-    /// Closes a real gap in [`ManualBackend::quiesce`] (public-api-design
-    /// review): a direct-build 1-1 definition's backfill runs through
-    /// `trellis::defs::chunk_queue`'s durable claim/execute/finish queue
-    /// entirely outside the ring (docs/decisions/0007's "Backgrounding and
-    /// resumability" amendment) — `await_converged`'s CDC-ring convergence
-    /// wait has no visibility into that queue at all. Before this,
-    /// `quiesce` only *appeared* to wait for such a backfill to finish by
-    /// accident: a large, unrelated ~10s ring-seal age-gate stall happened
-    /// to give drain workers enough real wall-clock time to finish the
-    /// suite's small test backfills before the harness ever snapshotted
-    /// state. Shortening that stall, or a scenario installing a definition
-    /// needing more than one chunk, would have started producing flaky/wrong
-    /// convergence results with no real product bug behind them.
+    /// backfill outcome (`live`/`quarantined`) or `timeout` elapses —
+    /// delegates to the shared [`sql::await_definitions_settled`]. See that
+    /// function's doc comment for why this closes a real gap in
+    /// [`ManualBackend::quiesce`] (public-api-design review): a direct-build
+    /// 1-1 definition's backfill runs through `trellis::defs::chunk_queue`'s
+    /// durable claim/execute/finish queue entirely outside the ring
+    /// (docs/decisions/0007's "Backgrounding and resumability" amendment) —
+    /// `await_converged`'s CDC-ring convergence wait has no visibility into
+    /// that queue at all.
     async fn await_definitions_settled(&self, timeout: Duration) -> Result<(), ManualBackendError> {
-        const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
-        const MAX_BACKOFF: Duration = Duration::from_millis(250);
-
-        let started = std::time::Instant::now();
-        let mut backoff = INITIAL_BACKOFF;
-        loop {
-            let unsettled = self.unsettled_definitions().await?;
-            if unsettled.is_empty() {
-                return Ok(());
-            }
-            let waited = started.elapsed();
-            if waited >= timeout {
-                return Err(ManualBackendError::DefinitionSettleTimeout { unsettled, waited });
-            }
-            tokio::time::sleep(backoff.min(timeout - waited)).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        }
-    }
-
-    /// The target tables of every definition [`ManualBackend::install`] has
-    /// installed (`self.defs`) whose current `transform_definitions.status`
-    /// is neither `live` nor `quarantined` — i.e. still `waiting_to_backfill`
-    /// or `backfilling`. Reads directly against `self.raw` (the same table
-    /// `trellis::Trellis::definitions`/`trellis::Trellis::status` query) rather
-    /// than through a `Trellis` handle: `ManualBackend` never holds one — it
-    /// drives `trellis::defs`/`trellis::Client` directly — so re-running the
-    /// same simple by-target-table lookup here is the one query path this
-    /// backend already has, not a new one invented for this.
-    async fn unsettled_definitions(&self) -> Result<Vec<String>, ManualBackendError> {
-        let mut unsettled = Vec::new();
-        for def in &self.defs {
-            // Issue #73: `target_table` is persisted fully-qualified now,
-            // but `def.target` (freshly parsed definition text) is bare —
-            // match against `target_table`'s bare table-name suffix, same
-            // convention `trellis::app::Trellis::status` itself uses.
-            let Some(row) = self
-                .raw
-                .query_opt(
-                    "select status from transform_definitions \
-                     where split_part(target_table, '.', 2) = $1",
-                    &[&def.target],
-                )
-                .await?
-            else {
-                // No row yet for a definition `install_definition` is still
-                // in the middle of creating is the same "not settled" case
-                // as an explicit non-terminal status — keep waiting rather
-                // than treating a momentarily-missing row as vacuously
-                // settled.
-                unsettled.push(def.target.clone());
-                continue;
-            };
-            let status_text: String = row.get(0);
-            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                panic!("transform_definitions.status held unrecognized value '{status_text}'")
-            });
-            if !matches!(status, TransformStatus::Live | TransformStatus::Quarantined) {
-                unsettled.push(def.target.clone());
-            }
-        }
-        Ok(unsettled)
+        sql::await_definitions_settled(&self.raw, &self.defs, timeout)
+            .await
+            .map_err(|timeout| ManualBackendError::DefinitionSettleTimeout {
+                unsettled: timeout.unsettled,
+                waited: timeout.waited,
+            })
     }
 }
 
@@ -876,7 +566,7 @@ impl super::Backend for ManualBackend {
         // `crate::run::run_convergence`, which passes relationships only
         // alongside the tables).
         for rel in &program.relationships {
-            create_relationship(&self.pool, &render_relationship(rel)).await?;
+            create_relationship(&self.pool, &sql::render_relationship(rel)).await?;
         }
         for def in &program.defs {
             self.install_definition(def).await?;
@@ -915,178 +605,17 @@ impl super::Backend for ManualBackend {
         Ok(())
     }
 
+    /// Delegates to the shared [`sql::apply_op`] — see that function's doc
+    /// comment. Every op shape's exact SQL rendering (the `$n::text::<type>`
+    /// cast discipline, the transactional count-then-truncate) lives there
+    /// now, shared verbatim with [`super::SubprocessBackend::apply`].
     async fn apply(&mut self, op: &Op) -> Result<u64, ManualBackendError> {
-        let affected = match op {
-            Op::Insert { table, row, .. } => {
-                let columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
-                let assignments: Vec<Assignment> = row
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (col, val))| Assignment {
-                        fragment: format!("${}::text::{}", i + 1, self.column_pg_type(table, col)),
-                        value: val.clone(),
-                    })
-                    .collect();
-                let column_list = columns
-                    .iter()
-                    .map(|c| quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let placeholders = assignments
-                    .iter()
-                    .map(|a| a.fragment.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "insert into {} ({column_list}) values ({placeholders})",
-                    quote_ident(table)
-                );
-                let params: Vec<Option<String>> =
-                    assignments.into_iter().map(|a| a.value).collect();
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                    .iter()
-                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-                    .collect();
-                self.raw.execute(&sql, &params).await?
-            }
-            Op::Update {
-                table, pk, changes, ..
-            } => {
-                let pk_col = self
-                    .tables
-                    .get(table)
-                    .map(|t| t.pk_col.clone())
-                    .ok_or_else(|| ManualBackendError::UnknownTable {
-                        table: table.clone(),
-                    })?;
-                let mut assignments = Vec::with_capacity(changes.len());
-                for (i, (col, val)) in changes.iter().enumerate() {
-                    assignments.push(self.assignment(table, col, i + 1, val));
-                }
-                let set_clause = assignments
-                    .iter()
-                    .map(|a| a.fragment.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                // `PRIMARY_KEY_PG_TYPE`, not the pk column's `ValueType`:
-                // the cast has to name the type the column was actually
-                // declared with in `create_source_table`.
-                let sql = format!(
-                    "update {} set {set_clause} where {}=${}::text::{}",
-                    quote_ident(table),
-                    quote_ident(&pk_col),
-                    changes.len() + 1,
-                    PRIMARY_KEY_PG_TYPE,
-                );
-                let mut params: Vec<Option<String>> =
-                    assignments.into_iter().map(|a| a.value).collect();
-                params.push(Some(pk.clone()));
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                    .iter()
-                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-                    .collect();
-                self.raw.execute(&sql, &params).await?
-            }
-            Op::Delete { table, pk, .. } => {
-                let pk_col = self
-                    .tables
-                    .get(table)
-                    .map(|t| t.pk_col.clone())
-                    .ok_or_else(|| ManualBackendError::UnknownTable {
-                        table: table.clone(),
-                    })?;
-                // Same as the `Update` arm above: the cast names
-                // `PRIMARY_KEY_PG_TYPE`, the declared type of the column.
-                let sql = format!(
-                    "delete from {} where {}=$1::text::{}",
-                    quote_ident(table),
-                    quote_ident(&pk_col),
-                    PRIMARY_KEY_PG_TYPE,
-                );
-                self.raw.execute(&sql, &[pk]).await?
-            }
-            Op::Truncate { table, .. } => {
-                // Improvement-plan task E6's load-bearing gotcha: Postgres's
-                // `TRUNCATE` command tag always reports `0` rows affected,
-                // regardless of how many rows actually existed — trusting
-                // that raw count into `run_convergence`'s
-                // `Ok(0) => AffectsNoRows` classifier would misclassify every
-                // non-empty truncate as a no-op, defeating "operation errors
-                // are checked, not swallowed" for this op entirely. So the
-                // real row count is synthesized here instead: a `SELECT
-                // count(*)` in the *same transaction* as the `TRUNCATE`,
-                // taken before it runs, so nothing can slip a concurrent
-                // write in between the count and the clear (moot for this
-                // single-threaded harness, but it's the honest way to make
-                // "the count reflects what actually got cleared" true by
-                // construction rather than by accident of timing).
-                let quoted = quote_ident(table);
-                let txn = self.raw.transaction().await?;
-                let count_row = txn
-                    .query_one(&format!("select count(*) from {quoted}"), &[])
-                    .await?;
-                let count: i64 = count_row.get(0);
-                txn.batch_execute(&format!("truncate table {quoted}"))
-                    .await?;
-                txn.commit().await?;
-                count as u64
-            }
-            Op::BulkInsert { table, rows, .. } => {
-                let Some(first_row) = rows.first() else {
-                    // An empty `rows` is a generator bug (there is no valid
-                    // SQL "insert zero rows" via a VALUES list) — not a
-                    // condition this backend should paper over by silently
-                    // doing nothing.
-                    panic!(
-                        "ManualBackend::apply: Op::BulkInsert against table {table:?} carries no \
-                         rows — a generator bug"
-                    );
-                };
-                let columns: Vec<&str> = first_row.iter().map(|(c, _)| c.as_str()).collect();
-                let column_list = columns
-                    .iter()
-                    .map(|c| quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let mut placeholder_groups = Vec::with_capacity(rows.len());
-                let mut params: Vec<Option<String>> =
-                    Vec::with_capacity(rows.len() * columns.len());
-                for row in rows {
-                    let row_columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
-                    assert_eq!(
-                        row_columns, columns,
-                        "ManualBackend::apply: every Op::BulkInsert row must carry the same \
-                         columns in the same order as the first row — a generator bug (table \
-                         {table:?})"
-                    );
-                    let placeholders: Vec<String> = row
-                        .iter()
-                        .map(|(col, val)| {
-                            params.push(val.clone());
-                            format!(
-                                "${}::text::{}",
-                                params.len(),
-                                self.column_pg_type(table, col)
-                            )
-                        })
-                        .collect();
-                    placeholder_groups.push(format!("({})", placeholders.join(", ")));
-                }
-
-                let sql = format!(
-                    "insert into {} ({column_list}) values {}",
-                    quote_ident(table),
-                    placeholder_groups.join(", ")
-                );
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                    .iter()
-                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
-                    .collect();
-                self.raw.execute(&sql, &params).await?
-            }
-        };
-        Ok(affected)
+        sql::apply_op(&mut self.raw, &self.tables, op)
+            .await
+            .map_err(|err| match err {
+                sql::ApplyOpError::UnknownTable(table) => ManualBackendError::UnknownTable { table },
+                sql::ApplyOpError::Db(err) => ManualBackendError::Db(err),
+            })
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
@@ -1123,7 +652,7 @@ impl super::Backend for ManualBackend {
         let mut snapshot: Snapshot = BTreeMap::new();
 
         for table in self.tables.values() {
-            let rows = read_table(
+            let rows = sql::read_table(
                 &self.raw,
                 &quote_ident(&table.name),
                 &table.pk_col,
@@ -1158,7 +687,7 @@ impl super::Backend for ManualBackend {
                         value_type: ValueType::Text,
                     }))
                     .collect();
-                    read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
+                    sql::read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
                     // The generative suite never constructs a relationship-path
@@ -1170,7 +699,7 @@ impl super::Backend for ManualBackend {
                         .iter()
                         .map(|k| k.target_column_name().to_string())
                         .collect();
-                    read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
+                    sql::read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
                         .await?
                 }
             };
@@ -1220,176 +749,5 @@ impl super::Backend for ManualBackend {
         let client = EngineClient::start(self.dsn.clone(), options)?;
         self.scale_out_clients.push(client);
         Ok(())
-    }
-}
-
-/// Reads `qualified_table` back as text, ordered by `pk_col`, into `pk ->
-/// column -> value`.
-async fn read_table(
-    client: &tokio_postgres::Client,
-    qualified_table: &str,
-    pk_col: &str,
-    columns: &[Column],
-) -> Result<BTreeMap<String, BTreeMap<String, Option<String>>>, ManualBackendError> {
-    let select_list = columns
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(&c.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "select {select_list} from {qualified_table} order by {}",
-        quote_ident(pk_col)
-    );
-    let rows = client.query(&sql, &[]).await?;
-
-    let mut result = BTreeMap::new();
-    for row in rows {
-        let mut by_column = BTreeMap::new();
-        let pk_value: Option<String> = row.get(0);
-        let pk_value = pk_value.expect("primary key column is never NULL");
-        for (i, column) in columns.iter().enumerate() {
-            by_column.insert(column.name.clone(), row.get::<_, Option<String>>(i));
-        }
-        result.insert(pk_value, by_column);
-    }
-    Ok(result)
-}
-
-/// Reads an `Aggregate` key-space target table back as text, keyed by the
-/// same composite [`group_key`] convention the SQL oracle and the evaluator
-/// oracle key their own rows by (see `crate::oracle`'s module doc comment and
-/// [`group_key`]'s own) — so the three-way comparison lines the same group up
-/// across all three sources (improvement-plan task B4).
-///
-/// Unlike [`read_table`]'s single-column primary key (a real Postgres
-/// `primary key` constraint on the *source* table, so it's never `NULL`), a
-/// `GROUP BY` grouping column genuinely can be `NULL` (the generative suite's
-/// grain column deliberately draws one) — so every grouping column here is
-/// read as a nullable `Option<String>` rather than `expect`-ed `Some`, and
-/// `group_key` is what turns a possibly-`NULL` tuple of them into one
-/// [`Rows`]-shaped map key.
-///
-/// `fields` is `def.fields` — every field whose name matches one of
-/// `group_by`'s columns is excluded from the row's own value columns (it
-/// contributes no separate target column at all, mirroring
-/// `trellis::defs::ddl::create_aggregate_target_table`'s own "a field named
-/// after a grouping column is that column's passthrough" rule), leaving only
-/// the real aggregate-measure columns.
-///
-/// [`Rows`]: crate::oracle::Rows
-async fn read_aggregate_table(
-    client: &tokio_postgres::Client,
-    qualified_table: &str,
-    group_by: &[String],
-    fields: &[FieldDef],
-) -> Result<BTreeMap<String, BTreeMap<String, Option<String>>>, ManualBackendError> {
-    let value_fields: Vec<&str> = fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .filter(|name| !group_by.iter().any(|g| g == name))
-        .collect();
-
-    let mut select_list: Vec<String> = group_by
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(c)))
-        .collect();
-    select_list.extend(
-        value_fields
-            .iter()
-            .map(|c| format!("{}::text", quote_ident(c))),
-    );
-    let sql = format!("select {} from {qualified_table}", select_list.join(", "));
-    let rows = client.query(&sql, &[]).await?;
-
-    let mut result = BTreeMap::new();
-    for row in rows {
-        let group_values: Vec<Option<String>> = (0..group_by.len())
-            .map(|i| row.get::<_, Option<String>>(i))
-            .collect();
-        let key = group_key(&group_values);
-        let mut by_column = BTreeMap::new();
-        for (i, name) in value_fields.iter().enumerate() {
-            by_column.insert(
-                (*name).to_string(),
-                row.get::<_, Option<String>>(group_by.len() + i),
-            );
-        }
-        result.insert(key, by_column);
-    }
-    Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use trellis::defs::parse;
-
-    /// The reviewer-flagged follow-up to issue #67 (real operator
-    /// precedence): a nested, mixed-operator `Expr` — `Add(Column("a"),
-    /// GreaterThan(Column("b"), Column("c")))`, i.e. the tree a source
-    /// author would have to spell `a + (b > c)` to get — must round-trip
-    /// through `render_expr` and back through the real parser to the exact
-    /// same tree, not a reflowed one.
-    ///
-    /// Before this fix, `render_expr` rendered this tree flat as
-    /// `a + b > c`, which the precedence-climbing parser (issue #67) then
-    /// re-parses as `GreaterThan(Add(a, b), c)` — `+` binds tighter than
-    /// `>`, so it silently reconstructs the *wrong* tree, one that even
-    /// type-checks (`Numeric, Numeric -> Boolean`) even though it isn't what
-    /// was rendered. Unconditional parenthesization
-    /// (`render_expr`'s doc comment) fixes this by always rendering
-    /// `(a) + (b > c)`, which only parses one way regardless of any
-    /// operator's precedence.
-    #[test]
-    fn render_expr_parenthesizes_nested_binary_ops_so_they_round_trip() {
-        let expr = Expr::BinaryOp {
-            op: Operator::Add,
-            lhs: Box::new(Expr::Column("a".to_string())),
-            rhs: Box::new(Expr::BinaryOp {
-                op: Operator::GreaterThan,
-                lhs: Box::new(Expr::Column("b".to_string())),
-                rhs: Box::new(Expr::Column("c".to_string())),
-            }),
-        };
-
-        let rendered = render_expr(&expr);
-        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
-        let def = parse(&text).unwrap_or_else(|e| {
-            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
-        });
-
-        assert_eq!(
-            def.fields[0].expr, expr,
-            "round-tripping through render_expr -> parse must reproduce the exact original \
-             tree; without unconditional parenthesization this would silently come back as \
-             `GreaterThan(Add(a, b), c)` instead (`+` binds tighter than `>`, so a flat, \
-             unparenthesized render loses the original grouping)"
-        );
-    }
-
-    /// The mirror shape — `GreaterThan(Add(a, b), c)`, i.e. `(a + b) > c` —
-    /// which happens to round-trip correctly even *without* parens (since
-    /// `+`'s tighter precedence reconstructs the same grouping by accident).
-    /// Pinned anyway so a future change to `render_expr` can't quietly regress
-    /// this direction while only testing the other one.
-    #[test]
-    fn render_expr_round_trips_a_greater_than_wrapping_an_add() {
-        let expr = Expr::BinaryOp {
-            op: Operator::GreaterThan,
-            lhs: Box::new(Expr::BinaryOp {
-                op: Operator::Add,
-                lhs: Box::new(Expr::Column("a".to_string())),
-                rhs: Box::new(Expr::Column("b".to_string())),
-            }),
-            rhs: Box::new(Expr::Column("c".to_string())),
-        };
-
-        let rendered = render_expr(&expr);
-        let text = format!("TRANSFORM t FROM s SELECT {rendered} AS out");
-        let def = parse(&text).unwrap_or_else(|e| {
-            panic!("rendered expression {rendered:?} must re-parse cleanly: {e:?}")
-        });
-
-        assert_eq!(def.fields[0].expr, expr);
     }
 }

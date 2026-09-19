@@ -4,9 +4,23 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-trellis = { path = "../trellis" }
+# `test-util` (issue #166): compiles in `trellis::staging::apply`'s
+# test-only pre-commit pause hook (see that module for the mechanism) that
+# `backend::subprocess::SubprocessBackend` needs to land a `SIGKILL`
+# deterministically. `generative` is itself test-infrastructure-only (never
+# depended on by `trellis`/`cli`/`benchmark`), so enabling this here doesn't
+# leak it into anything production-facing — see `trellis/Cargo.toml`'s
+# `test-util` feature doc comment.
+trellis = { path = "../trellis", features = ["test-util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
+# Issue #166: `backend::subprocess::SubprocessBackend` spawns/supervises the
+# engine as a real child process via `testkit::crash::CrashGuard`, so this
+# needs to be a normal dependency now, not (as before #166) only a
+# dev-dependency every integration test pulled in separately. `testkit`
+# stays dev-only scaffolding itself (see its own doc comment) — it has no
+# production-facing dependents either.
+testkit = { path = "../testkit" }
 # proptest powers the generator's strategies and integrated shrinking, but it
 # must never enter a normal `cargo build`: it's an optional dependency behind
 # the `proptest` feature, and the `generative` self dev-dependency below turns
@@ -18,5 +32,4 @@ proptest = { version = "1.11", optional = true }
 proptest = ["dep:proptest"]
 
 [dev-dependencies]
-testkit = { path = "../testkit" }
 generative = { path = ".", features = ["proptest"] }

@@ -4,12 +4,20 @@
 //! `trellis::staging`, or `trellis::defs::catalog`/`ddl` — the oracle
 //! (`crate::oracle`) and generators (`crate::generate`) must stay reachable
 //! only through the shared, engine-independent pieces named in the design
-//! doc, so a second backend (a concurrent runtime, later a
-//! subprocess-supervised one) can be added without touching either.
+//! doc, so a second backend can be added without touching either. Two
+//! backends exist today: [`ManualBackend`] (a concurrent-runtime-capable, but
+//! always in-process, [`trellis::Client`]) and [`SubprocessBackend`] (issue
+//! #166: a real OS subprocess `testkit::CrashGuard` can `SIGKILL`, for tests
+//! that need a genuine crash rather than an in-process simulation). Both
+//! share [`sql`]'s DDL/DML/read-back rendering — see that module's doc
+//! comment.
 
 mod manual;
+mod sql;
+mod subprocess;
 
 pub use manual::{ManualBackend, ManualBackendError};
+pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -58,15 +66,17 @@ pub trait Backend {
 
     /// Simulates an ungraceful crash-and-restart of the backend's primary
     /// engine client (improvement-plan task E3): drops whatever is currently
-    /// running it and starts a fresh one against the same target. A real
-    /// `trellis::Client`'s own `Drop` impl already performs a best-effort,
-    /// non-graceful shutdown signal with no draining — this is deliberately
-    /// *not* the graceful `shutdown().await` path — so simply dropping and
-    /// replacing the client is a faithful, free stand-in for "the process
-    /// died", with no subprocess/`SIGKILL` machinery needed. The ring is
-    /// durable Postgres state, not in-memory, so a fresh client is expected to
-    /// pick back up exactly where the crashed one left off: no stuck or lost
-    /// work, no duplicate processing.
+    /// running it and starts a fresh one against the same target. The ring
+    /// is durable Postgres state, not in-memory, so a fresh client is
+    /// expected to pick back up exactly where the crashed one left off: no
+    /// stuck or lost work, no duplicate processing. Each implementation
+    /// picks its own faithful stand-in for "the process died": [`ManualBackend`]
+    /// (in-process) just drops and replaces its `trellis::Client` — its own
+    /// `Drop` impl already performs a best-effort, non-graceful shutdown
+    /// signal with no draining (deliberately *not* the graceful
+    /// `shutdown().await` path), so no subprocess/`SIGKILL` machinery is
+    /// needed there. [`SubprocessBackend`] (issue #166) does the real thing:
+    /// `SIGKILL`s the actual OS process and spawns a fresh one.
     fn restart(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Starts an additional engine client alongside whatever is already
