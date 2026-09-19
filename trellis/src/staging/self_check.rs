@@ -79,7 +79,7 @@ use std::time::Duration;
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator};
+use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::Definition;
@@ -133,9 +133,14 @@ pub struct SelfCheckReport {
     /// [`SelfCheckOutcome::NotCaughtUp`] (the comparison never ran).
     pub rows_compared: i64,
     /// The keyset cursor a following call should pass as
-    /// [`SelfCheckScope::after`] to continue past this page — `None` when
-    /// this page reached the end of the target's keyspace (nothing on
-    /// either side of the comparison had a key past `scope.after`).
+    /// [`SelfCheckScope::after`] to continue past this page — the key this
+    /// page's bound actually ended at, which is the *lower* of the two
+    /// sides' last keys whenever either side hit
+    /// [`SelfCheckScope::limit`] (keys past it fell off one side's page and
+    /// are deliberately left for the next call rather than diffed against a
+    /// truncated counterpart). `None` means neither side hit the limit, so
+    /// this page reached the end of the target's keyspace and a following
+    /// call would have nothing to do.
     pub next_after: Option<String>,
     pub outcome: SelfCheckOutcome,
 }
@@ -196,6 +201,13 @@ pub enum SelfCheckError {
     UnsupportedKeySpace {
         target: String,
     },
+    /// [`SelfCheckScope::limit`] wasn't a positive row count. Refused rather
+    /// than run: a zero/negative limit compares nothing at all, and would
+    /// otherwise report a cheerful `Converged` over an empty page — an audit
+    /// that silently checks nothing is worse than one that declines.
+    InvalidScope {
+        limit: i64,
+    },
     /// The audited definition's fields reference a construct [`render_leaf`]
     /// doesn't render yet (a relationship path) — see the module doc
     /// comment's "Scope" section.
@@ -219,9 +231,9 @@ impl SelfCheckError {
     pub fn code(&self) -> ErrorCode {
         match self {
             SelfCheckError::TargetNotFound(_) => ErrorCode::NotFound,
-            SelfCheckError::UnsupportedKeySpace { .. } | SelfCheckError::UnsupportedExpr { .. } => {
-                ErrorCode::Validation
-            }
+            SelfCheckError::UnsupportedKeySpace { .. }
+            | SelfCheckError::UnsupportedExpr { .. }
+            | SelfCheckError::InvalidScope { .. } => ErrorCode::Validation,
             SelfCheckError::Ddl(err) => err.code(),
             SelfCheckError::Catalog(err) => err.code(),
             SelfCheckError::Staging(err) => err.code(),
@@ -245,6 +257,10 @@ impl fmt::Display for SelfCheckError {
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
             }
+            SelfCheckError::InvalidScope { limit } => write!(
+                f,
+                "self_check needs a positive SelfCheckScope::limit; got {limit}"
+            ),
             SelfCheckError::Ddl(err) => write!(f, "{err}"),
             SelfCheckError::Catalog(err) => write!(f, "{err}"),
             SelfCheckError::Staging(err) => write!(f, "{err}"),
@@ -267,7 +283,8 @@ impl std::error::Error for SelfCheckError {
             SelfCheckError::Pool(err) => Some(err),
             SelfCheckError::TargetNotFound(_)
             | SelfCheckError::UnsupportedKeySpace { .. }
-            | SelfCheckError::UnsupportedExpr { .. } => None,
+            | SelfCheckError::UnsupportedExpr { .. }
+            | SelfCheckError::InvalidScope { .. } => None,
         }
     }
 }
@@ -313,6 +330,10 @@ pub async fn self_check(
     mode: SelfCheckMode,
     timeout: Duration,
 ) -> Result<SelfCheckReport, SelfCheckError> {
+    if scope.limit <= 0 {
+        return Err(SelfCheckError::InvalidScope { limit: scope.limit });
+    }
+
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
@@ -503,6 +524,17 @@ async fn compare_once(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
+    // The recompute `SELECT` below carries no `WHERE` for the definition's
+    // own partial-data predicate, which is sound only because `Predicate`
+    // has exactly one variant today. Matched exhaustively (rather than
+    // ignored) so that adding a real predicate variant breaks *here* — a
+    // silently unfiltered recompute would report every predicate-excluded
+    // source row as a `MissingRow`. `defs::oracle` and `generative::oracle`
+    // pin the same assumption the same way.
+    match def.def.predicate {
+        Predicate::True => {}
+    }
+
     let comparable: Vec<&FieldDef> = def
         .def
         .fields
@@ -573,6 +605,39 @@ async fn compare_once(
         persisted.insert(key, values);
     }
 
+    // The two `LIMIT`ed reads are keyset-scoped independently, so whenever a
+    // divergence makes the two sides' key sets differ, their pages end at
+    // *different* keys: a target missing one row inside the page pulls one
+    // extra key in on the persisted side that the recompute side's own limit
+    // cut off. Diffing the raw pages would then report that trailing key as a
+    // `ExtraRow`/`MissingRow` purely because it fell off the other side's
+    // page — a deterministic false divergence (it reproduces on the re-check
+    // pass, so the ADR's re-check can't filter it), and `next_after` would
+    // skip past it, never comparing it honestly on the following page.
+    //
+    // So: whichever side(s) actually hit the limit bound this page, and the
+    // *lowest* such bound is the page's real end. Keys past it belong to the
+    // next page and are dropped from both sides here; `next_after` is that
+    // boundary, so the following call picks them up. A page where neither
+    // side hit the limit reached the end of the keyspace — no boundary, and
+    // `next_after` is `None`.
+    let recompute_bound = (recompute_rows.len() as i64 >= scope.limit)
+        .then(|| recomputed.keys().next_back().cloned())
+        .flatten();
+    let persisted_bound = (persisted_rows.len() as i64 >= scope.limit)
+        .then(|| persisted.keys().next_back().cloned())
+        .flatten();
+    let page_end = match (recompute_bound, persisted_bound) {
+        (Some(r), Some(p)) => Some(r.min(p)),
+        (Some(r), None) => Some(r),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+    if let Some(page_end) = &page_end {
+        recomputed.retain(|key, _| key <= page_end);
+        persisted.retain(|key, _| key <= page_end);
+    }
+
     let mut divergences = Vec::new();
     for (key, r_values) in &recomputed {
         match persisted.get(key) {
@@ -599,12 +664,11 @@ async fn compare_once(
 
     let all_keys: BTreeSet<&String> = recomputed.keys().chain(persisted.keys()).collect();
     let rows_compared = all_keys.len() as i64;
-    let next_after = all_keys.iter().max().map(|k| (*k).clone());
 
     Ok(ComparePass {
         checked_through,
         rows_compared,
-        next_after,
+        next_after: page_end,
         divergences,
     })
 }

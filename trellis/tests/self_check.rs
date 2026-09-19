@@ -124,7 +124,10 @@ async fn converged_target_reports_no_divergence() {
         report.outcome
     );
     assert_eq!(report.rows_compared, 2);
-    assert_eq!(report.next_after, Some("2".to_string()));
+    assert_eq!(
+        report.next_after, None,
+        "neither side hit the limit, so this page reached the end of the keyspace"
+    );
 
     running.shutdown().await.expect("shutdown running");
 }
@@ -395,4 +398,229 @@ async fn self_check_excludes_a_paused_column_from_the_comparison() {
     );
 
     running.shutdown().await.expect("shutdown running");
+}
+
+/// Regression, keyset page alignment: the recompute read and the persisted
+/// read are two independently-`LIMIT`ed queries, so as soon as a real
+/// divergence makes their key sets differ, their pages end at *different*
+/// keys. Here the target is missing row `2` and the limit is 3, so the
+/// recompute page is `{1,2,3}` while the persisted page is `{1,3,4}`.
+/// Diffing those raw would report key `4` as an `ExtraRow` purely because it
+/// fell off the recompute side's page — a deterministic false divergence
+/// (it reproduces on the re-check pass, so the ADR's re-check can't filter
+/// it), and `next_after` would then skip past `4` entirely, so the following
+/// page would never compare it honestly either. Only the genuine
+/// `MissingRow { 2 }` may be reported, and `next_after` must land on `3`.
+#[tokio::test]
+async fn a_bounded_page_does_not_invent_a_divergence_from_the_two_sides_ending_at_different_keys() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute(
+        "insert into widgets (id, price) values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+        &[],
+    )
+    .await
+    .expect("insert source rows");
+
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, GENEROUS_TIMEOUT)
+        .await
+        .expect("await_converged");
+
+    // Delete one persisted row directly, bypassing the engine — a genuine
+    // MissingRow, seeded the same way the corruption test above seeds its
+    // own Cell divergence.
+    raw.execute("delete from widget_prices where id = '2'", &[])
+        .await
+        .expect("delete a target row");
+
+    let report = running
+        .self_check(
+            "widget_prices",
+            SelfCheckScope {
+                after: None,
+                limit: 3,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    match report.outcome {
+        SelfCheckOutcome::Diverged(divergences) => assert_eq!(
+            divergences,
+            vec![Divergence::MissingRow {
+                key: "2".to_string()
+            }],
+            "only the genuine missing row may be reported; a key that merely fell off one \
+             side's bounded page is not a divergence"
+        ),
+        other => panic!("expected Diverged with the missing row, got {other:?}"),
+    }
+    assert_eq!(
+        report.next_after,
+        Some("3".to_string()),
+        "the page ends at the lower of the two sides' last keys, so key 4 is picked up whole \
+         by the next call rather than skipped"
+    );
+
+    // And the next page genuinely continues from there, with no gap: keys 4
+    // and 5 are both intact, so it converges.
+    let next = running
+        .self_check(
+            "widget_prices",
+            SelfCheckScope {
+                after: report.next_after.clone(),
+                limit: 3,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check page 2");
+    assert!(
+        matches!(next.outcome, SelfCheckOutcome::Converged),
+        "expected the second page to converge, got {:?}",
+        next.outcome
+    );
+    assert_eq!(next.rows_compared, 2, "keys 4 and 5, neither skipped");
+    assert_eq!(next.next_after, None, "end of the keyspace");
+
+    running.shutdown().await.expect("shutdown running");
+}
+
+/// A zero (or negative) `limit` compares nothing at all, so reporting a
+/// cheerful `Converged` over an empty page would be an audit that silently
+/// checked nothing — refuse instead.
+#[tokio::test]
+async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_converging() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+
+    let err = trellis
+        .self_check(
+            "widget_prices",
+            SelfCheckScope {
+                after: None,
+                limit: 0,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect_err("a zero limit must be refused");
+    assert_eq!(err.code(), trellis::ErrorCode::Validation);
+    assert!(
+        err.to_string().contains("positive"),
+        "expected a limit-specific message, got {err}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// ADR-0013's "1-1 first, then aggregates and relationships": an aggregate
+/// target is out of scope for this slice, and `self_check` must *refuse* it
+/// rather than silently run a plain keyset comparison that would mis-audit
+/// the group-key space (every group would read as a divergence). A tool that
+/// silently mis-audits an unsupported shape is worse than one that declines.
+#[tokio::test]
+async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute(
+            "create table orders (id integer primary key, region text); \
+             alter table orders replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .define("TRANSFORM region_counts FROM orders GROUP BY region SELECT region AS region, COUNT(*) AS n")
+        .await
+        .expect("define aggregate transform");
+
+    let err = trellis
+        .self_check(
+            "region_counts",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect_err("an aggregate target must be refused, not audited");
+    assert_eq!(err.code(), trellis::ErrorCode::Validation);
+    assert!(
+        err.to_string().contains("aggregate"),
+        "expected a scope-specific message naming the aggregate shape, got {err}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
 }
