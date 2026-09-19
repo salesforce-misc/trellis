@@ -58,7 +58,8 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     // re-points onto it. `parent_op`/`from_side_op` mark the two ops meant
     // to be applied back-to-back with no intervening `quiesce()`; every op
     // before `parent_op` is ordinary seeding.
-    let scenario = build_relationship_interleaving_scenario(RelInterleavingVariant::ParentFieldUpdate);
+    let scenario =
+        build_relationship_interleaving_scenario(RelInterleavingVariant::ParentFieldUpdate);
     let program = scenario.program;
 
     let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
@@ -110,6 +111,31 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
          never engaged, so nothing below would actually be testing a mid-transaction kill"
     );
 
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+    // Anti-vacuity guard. Everything below only *means* something if the
+    // crash actually destroys work the system then has to redo: if the
+    // critical pair had somehow already landed before the pause engaged,
+    // the final convergence check would pass no matter how badly broken
+    // Phase 3's atomicity was. So pin the precondition explicitly — while
+    // the engine is parked mid-transaction, the oracle must still see the
+    // target side as diverged from the settled-state model. (A plain
+    // `SELECT` here can't block on the paused transaction: it only ever
+    // wrote rows, and this reads through a separate connection under MVCC.)
+    let mid_crash = backend
+        .snapshot()
+        .await
+        .expect("snapshot while the engine is paused mid-Phase-3");
+    let mid_crash_diverged = check_program(&pool, &program, &mid_crash)
+        .await
+        .expect("oracle check must run mid-pause");
+    assert!(
+        mid_crash_diverged.is_some(),
+        "the paused Phase 3 batch must still have real, uncommitted work in it — if the system \
+         already matches the model here, the SIGKILL below destroys nothing and the final \
+         convergence assertion passes vacuously"
+    );
+
     // Disarm before restarting: the respawned subprocess inherits the same
     // trigger-file path and must not immediately re-pause while redraining
     // the very batch the killed process never got to commit.
@@ -141,14 +167,12 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     // (`RelInterleavingScenario`'s own doc comment), so there is nothing
     // left to apply — just wait for the fresh subprocess to finish
     // redraining what the killed one left mid-flight.
-    backend
-        .quiesce()
-        .await
-        .expect("quiesce must converge after the redrive — a stuck ring here would mean the \
-                 crashed batch was left unrecoverable");
+    backend.quiesce().await.expect(
+        "quiesce must converge after the redrive — a stuck ring here would mean the \
+                 crashed batch was left unrecoverable",
+    );
 
     let snapshot = backend.snapshot().await.expect("snapshot after redrive");
-    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let diverged = check_program(&pool, &program, &snapshot)
         .await
         .expect("oracle check must run");
