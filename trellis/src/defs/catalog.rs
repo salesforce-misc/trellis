@@ -1604,8 +1604,14 @@ pub async fn create_relationship(
     if cardinality == RelationshipCardinality::ToMany {
         assert_replica_identity_supports_to_many(&txn, &def, &qualified_to).await?;
     } else {
-        assert_replica_identity_supports_projection(&txn, &def.to_table, &qualified_to).await?;
-        assert_replica_identity_supports_projection(&txn, &def.from_table, &qualified_from).await?;
+        assert_replica_identity_supports_projection(
+            &txn,
+            &def.to_table,
+            &qualified_to,
+            &def.from_table,
+            &qualified_from,
+        )
+        .await?;
     }
 
     let mut warnings = Vec::new();
@@ -2631,6 +2637,50 @@ async fn assert_replica_identity_supports_to_many(
     }
 }
 
+/// Checks every guarantee [`crate::intake::required_source_guarantees`]
+/// derives for `plan` against the live catalog, in order, returning the
+/// first violation — issue #173 phase 2's single checker. Before this, each
+/// of [`assert_replica_identity_supports_aggregate`] and
+/// [`assert_replica_identity_supports_projection`] ran its own ad hoc
+/// `pg_class.relreplident` query; this is the one place that both (a) walks
+/// the derived [`crate::intake::SourceGuarantee`] list and (b) turns each
+/// one into a database round trip, so a future [`crate::intake::SourceGuarantee`]
+/// variant only needs a new match arm here, not a fourth hand-rolled
+/// assertion function.
+///
+/// `SourceGuarantee::ReplicaIdentityFull`'s `qualified_table` (not `table`)
+/// is what's actually queried — see that variant's own doc comment for why
+/// a bare name can't be trusted with a plain `to_regclass` `search_path`
+/// walk — while `table` is what the resulting error names, matching every
+/// existing replica-identity error message's convention of reporting the
+/// relationship/definition's own source text.
+async fn check_source_guarantees(
+    txn: &tokio_postgres::Transaction<'_>,
+    plan: &crate::intake::ResolvedPlan<'_>,
+) -> Result<(), CatalogError> {
+    for guarantee in crate::intake::required_source_guarantees(plan) {
+        match guarantee {
+            crate::intake::SourceGuarantee::ReplicaIdentityFull {
+                table,
+                qualified_table,
+            } => {
+                let is_full: bool = txn
+                    .query_one(
+                        "select relreplident = 'f' from pg_class where oid = \
+                         pg_catalog.to_regclass($1)",
+                        &[&qualified_table],
+                    )
+                    .await?
+                    .get(0);
+
+                crate::intake::require_replica_identity_full(&table, !is_full)
+                    .map_err(CatalogError::ReplicaIdentityRequired)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rejects an aggregate (`GROUP BY`) definition (issue #47) whose source
 /// table's replica identity doesn't guarantee an old row image on
 /// delete/update. Unlike [`assert_replica_identity_supports_to_many`]'s
@@ -2645,6 +2695,16 @@ async fn assert_replica_identity_supports_to_many(
 /// this doesn't attempt the narrower per-column index check the to-many path
 /// does.
 ///
+/// Issue #173 phase 2: delegates both "does this plan need a guarantee?"
+/// and "does the table already have it?" to the shared, single-derivation
+/// path — [`crate::intake::required_source_guarantees`] over a
+/// [`crate::intake::ResolvedPlan::Transform`], checked by
+/// [`check_source_guarantees`] — rather than re-deriving either step here.
+/// Kept as a thin, named wrapper (rather than inlining its callers into
+/// [`check_source_guarantees`] directly) so `create_definition_inner`'s own
+/// call site, and this function's pre-existing doc history below, don't
+/// have to change.
+///
 /// Delegates the actual rejection to
 /// [`crate::intake::require_replica_identity_full`] (issue #7's scaffolding,
 /// previously unwired — see its module doc) so the error text — including
@@ -2655,9 +2715,9 @@ async fn assert_replica_identity_supports_to_many(
 /// enough on its own — [`crate::intake::needs_old_image`] would always
 /// return `true` for [`KeySpace::Aggregate`], rejecting every aggregate
 /// definition forever, even after an operator runs the suggested `ALTER
-/// TABLE`. This function closes that gap by querying `pg_class.relreplident`
-/// itself first and only passing `true` through when the source table is
-/// actually inadequate today.
+/// TABLE`. [`check_source_guarantees`] closes that gap by querying
+/// `pg_class.relreplident` itself first and only passing `true` through
+/// when the source table is actually inadequate today.
 async fn assert_replica_identity_supports_aggregate(
     txn: &tokio_postgres::Transaction<'_>,
     def: &TransformDef,
@@ -2704,16 +2764,15 @@ async fn assert_replica_identity_supports_aggregate(
         None => resolve_graph_identity_in_txn(txn, &def.source).await?,
     };
 
-    let is_full: bool = txn
-        .query_one(
-            "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
-            &[&qualified_source],
-        )
-        .await?
-        .get(0);
-
-    crate::intake::require_replica_identity_full(&def.source, !is_full)
-        .map_err(CatalogError::ReplicaIdentityRequired)
+    check_source_guarantees(
+        txn,
+        &crate::intake::ResolvedPlan::Transform {
+            source_table: &def.source,
+            qualified_source_table: &qualified_source,
+            key_space: &def.key_space,
+        },
+    )
+    .await
 }
 
 /// Rejects a to-one relationship (issue #129, epic #127) whose to-side or
@@ -2726,14 +2785,7 @@ async fn assert_replica_identity_supports_aggregate(
 /// enforces for an aggregate's source; see that function's doc comment for
 /// why only `REPLICA IDENTITY FULL` — not the narrower `USING INDEX` a
 /// single-column `to_col` check ([`assert_replica_identity_supports_to_many`])
-/// would accept — is enough for an old image of unpredictably-many columns,
-/// and for why this delegates to
-/// [`crate::intake::require_replica_identity_full`] rather than duplicating
-/// its rejection text: that function's own `needs_old_image` parameter is
-/// unconditional, so this queries `pg_class.relreplident` itself first and
-/// only passes `true` through when the checked table is actually inadequate
-/// today, exactly mirroring [`assert_replica_identity_supports_aggregate`]'s
-/// own two-step shape.
+/// would accept — is enough for an old image of unpredictably-many columns.
 ///
 /// **Issue #158: the from-side (child) table needs this too, not just the
 /// to-side.** A to-one relationship's `from_col` is an ordinary non-key
@@ -2744,11 +2796,19 @@ async fn assert_replica_identity_supports_aggregate(
 /// column. That breaks anything reading a from-side row's prior state off a
 /// replication message, including the `group_key` union mechanism (issue
 /// #133) that recovers a row's true prior parent. The to-side's own gate
-/// (above) can't catch this — it only ever inspects `to_table`, and a
-/// from-side re-point doesn't touch the to-side row at all — so this
-/// function takes the table to check as a plain parameter and is called once
-/// per relationship endpoint ([`create_relationship`]) rather than being
-/// hardcoded to `to_table`.
+/// can't catch this — it only ever inspects `to_table`, and a from-side
+/// re-point doesn't touch the to-side row at all.
+///
+/// Issue #173 phase 2: both endpoints used to be checked via two separate
+/// calls to this function (one per table); now it takes both endpoints at
+/// once and routes them through a single
+/// [`crate::intake::ResolvedPlan::ToOneRelationship`] plan, checked by
+/// [`check_source_guarantees`] — one derivation call per relationship
+/// installed, not one ad hoc `pg_class` query per endpoint. Order is
+/// preserved (to-side checked before from-side, matching
+/// [`crate::intake::required_source_guarantees`]'s own ordering for this
+/// variant), so an operator whose relationship fails both still sees the
+/// same first error they always did.
 ///
 /// **Gated on cardinality alone, not on whether the relationship has a
 /// consumer yet.** A relationship must be declared before anything can
@@ -2769,19 +2829,21 @@ async fn assert_replica_identity_supports_aggregate(
 /// relationship itself, not deferred until first use.
 async fn assert_replica_identity_supports_projection(
     txn: &tokio_postgres::Transaction<'_>,
-    reported_table: &str,
-    qualified_table: &str,
+    to_table: &str,
+    qualified_to_table: &str,
+    from_table: &str,
+    qualified_from_table: &str,
 ) -> Result<(), CatalogError> {
-    let is_full: bool = txn
-        .query_one(
-            "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
-            &[&qualified_table],
-        )
-        .await?
-        .get(0);
-
-    crate::intake::require_replica_identity_full(reported_table, !is_full)
-        .map_err(CatalogError::ReplicaIdentityRequired)
+    check_source_guarantees(
+        txn,
+        &crate::intake::ResolvedPlan::ToOneRelationship {
+            to_table,
+            qualified_to_table,
+            from_table,
+            qualified_from_table,
+        },
+    )
+    .await
 }
 
 /// A to-one relationship's settled parent projection (issue #129, epic

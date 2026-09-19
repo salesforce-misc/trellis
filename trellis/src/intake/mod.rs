@@ -30,7 +30,10 @@ pub mod replica_identity;
 pub mod spill;
 
 pub use error::IntakeError;
-pub use replica_identity::{needs_old_image, require_replica_identity_full};
+pub use replica_identity::{
+    ResolvedPlan, SourceGuarantee, needs_old_image, require_replica_identity_full,
+    required_source_guarantees,
+};
 
 use std::time::{Duration, Instant, SystemTime};
 
