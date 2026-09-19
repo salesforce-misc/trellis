@@ -129,6 +129,10 @@ pub struct TrellisOptions {
     /// can't see, account for, or size around. Since the embedded runtime's
     /// own work is I/O, not compute-bound, a small explicit count (2, say)
     /// is enough; see issue #141.
+    ///
+    /// Must be at least 1 when set: `Some(0)` fails the connect with
+    /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
+    /// threads couldn't run anything anyway.
     pub worker_threads: Option<usize>,
 }
 

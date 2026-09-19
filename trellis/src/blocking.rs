@@ -100,6 +100,11 @@ impl BlockingTrellis {
     /// Spawns the dedicated background thread, builds its `tokio` runtime,
     /// and connects the real [`Trellis`] against `config`/`options` (see
     /// [`Trellis::connect`]) — blocking until that setup finishes or fails.
+    ///
+    /// [`TrellisOptions::worker_threads`] sizes that runtime's worker-thread
+    /// pool; leaving it at `None` keeps `tokio`'s own per-core default. It's
+    /// the one option that only matters here — the async [`Trellis`] never
+    /// builds a runtime of its own.
     pub fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), TrellisError>>();
@@ -289,9 +294,25 @@ impl BlockingTrellis {
 /// [`BlockingTrellis::connect`] so the worker-count wiring itself is
 /// unit-testable without needing a real database (see the `tests` module
 /// below).
+///
+/// `Some(0)` is rejected here rather than passed through: `tokio`'s
+/// `Builder::worker_threads` *panics* on zero, and that panic would fire on
+/// the background thread we just spawned — leaving [`BlockingTrellis::connect`]
+/// to report the generic
+/// [`TrellisError::BlockingThreadExitedBeforeReady`](crate::TrellisError::BlockingThreadExitedBeforeReady)
+/// alongside a stray panic on stderr. An FFI caller handing us an integer
+/// straight from Elixir or Ruby (issue #141's motivating case) can easily pass
+/// zero, so turn it into an ordinary error the caller can read instead.
 fn build_runtime(worker_threads: Option<usize>) -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     if let Some(worker_threads) = worker_threads {
+        if worker_threads == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TrellisOptions::worker_threads must be at least 1 when set; \
+                 leave it as None for tokio's own per-core default",
+            ));
+        }
         builder.worker_threads(worker_threads);
     }
     builder.enable_all().build()
@@ -411,6 +432,20 @@ mod tests {
             runtime.handle().metrics().num_workers(),
             expected,
             "worker_threads(None) must preserve tokio's own default worker count"
+        );
+    }
+
+    /// `tokio`'s own `Builder::worker_threads` panics on zero, which on the
+    /// background thread would surface as the generic
+    /// `BlockingThreadExitedBeforeReady` plus a stray panic on stderr. A
+    /// zero from an FFI caller must come back as an ordinary error instead.
+    #[test]
+    fn worker_threads_some_zero_is_an_error_not_a_panic() {
+        let err = build_runtime(Some(0)).expect_err("Some(0) must not build a runtime");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("worker_threads"),
+            "error should name the offending option, got: {err}"
         );
     }
 }
