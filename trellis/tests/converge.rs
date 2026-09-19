@@ -10,8 +10,8 @@
 //! `origin_lsn` as "not pending".
 //!
 //! Deliberately out of scope: the doc's "a round did no work" classification
-//! (pause-lease-active, refused-seal backpressure, peer-holds-claim) is a
-//! worker-side drain-to-convergence helper that depends on claiming/sweeping
+//! (refused-seal backpressure, peer-holds-claim) is a worker-side
+//! drain-to-convergence helper that depends on claiming/sweeping
 //! (#14/#15), which aren't built yet — not tested here.
 
 use std::time::Duration;

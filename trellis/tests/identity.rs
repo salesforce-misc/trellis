@@ -215,7 +215,7 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
 
     // Simulate a process death between the runner creating
     // `trellis_instance` (V9) and `seed_marker` committing: the ledger and
-    // every other Trellis table (V1-V8) are intact, but the marker row
+    // every other Trellis table (V1-V7) are intact, but the marker row
     // itself never made it in. This must NOT read as "foreign" (it has our
     // ledger) and must NOT error on the empty-table lookup (`read_marker`
     // uses `query_opt`, not `query_one`).
@@ -271,12 +271,15 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // (`transform_definitions.fuse_rearmed_at`, the whole-transform fuse's
     // re-arm point). Issue #159 added V30 (`transform_fuse_gate`, that same
     // fuse's per-source-table serialization point). Issue #144 added V31
-    // (`worker_registry`, one row per live drain worker).
+    // (`worker_registry`, one row per live drain worker). Issue #191
+    // removed V8 (`pause_leases`, the fleet-wide claiming-pause lease that
+    // ADR-0013's `Trellis::self_check` never ended up needing), so V8 is
+    // not reissued to anything else either.
     assert_eq!(
         applied,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            26, 27, 28, 29, 30, 31
+            1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
+            27, 28, 29, 30, 31
         ]
     );
 }

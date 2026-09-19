@@ -11,8 +11,8 @@
 //! *not* compute deltas, apply them, or complete a batch (`draining ->
 //! drained`, issue #11, blocked on aggregate transform-defs) — a claimed
 //! batch sits in `draining` with rows in `seg_claims` until #11 closes the
-//! loop. Keeping a claim alive once it's made — the heartbeat cadence,
-//! reclaim TTL, and pause lease — is [`super::liveness`], issue #15.
+//! loop. Keeping a claim alive once it's made — the heartbeat cadence and
+//! reclaim TTL — is [`super::liveness`], issue #15.
 
 use std::time::Duration;
 
