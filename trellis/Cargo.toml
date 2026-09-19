@@ -64,6 +64,19 @@ otlp = [
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
 ]
+# Issue #166: compiles in a small number of test-only pause hooks (today,
+# just `staging::apply`'s pre-commit Phase 3 pause — see that module for the
+# mechanism) that let an external harness land a `SIGKILL` at a
+# deterministic point in the engine's drain path instead of relying on
+# timing luck. No dependencies, unlike `otlp` — this only gates a few
+# `cfg`-attributed fn bodies and their call sites. Off by default; a plain
+# `cargo build -p trellis` compiles none of this in, so it costs production
+# nothing (`cfg(any(test, feature = "test-util"))` also means every `trellis`
+# unit test build gets it for free, with no feature flag needed). Only
+# `generative` (a test-infrastructure-only crate — see its own Cargo.toml)
+# enables this, so it can drive `trellis::Client` as a real subprocess and
+# still hit the pause point deterministically (`generative::backend::subprocess`).
+test-util = []
 
 [dev-dependencies]
 testkit = { path = "../testkit" }

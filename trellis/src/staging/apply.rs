@@ -6083,6 +6083,20 @@ pub async fn apply_and_mark_drained_many(
     txn.execute("select pg_notify($1, '')", &[&wake_channel])
         .await?;
 
+    // Issue #166: every DML statement this Phase 3 pass will ever issue
+    // against `txn` has now run (including the completion statement above,
+    // which is what actually marks this claim's buckets drained, and the
+    // `pg_notify` just above, whose payload Postgres won't actually deliver
+    // until commit) — nothing below this point writes anything. This is
+    // "moves computed, not yet persisted": the caller (`drain_once`/
+    // `drain_many`) commits `txn` immediately after this call returns, and
+    // not one statement earlier. See `pause_before_commit_for_tests`'s own
+    // doc comment for why a test-only hook sits exactly here. Compiled out
+    // entirely (call site included) unless this crate is built for tests or
+    // with `test-util` — see that function's doc comment.
+    #[cfg(any(test, feature = "test-util"))]
+    pause_before_commit_for_tests().await;
+
     let span = tracing::Span::current();
     span.record("keys_written", keys_written);
     span.record("keys_deleted", keys_deleted);
@@ -6093,6 +6107,68 @@ pub async fn apply_and_mark_drained_many(
         deferral_counts,
         fairness_escalations,
     })
+}
+
+/// Issue #166 (a genuine `SIGKILL`-mid-drain test, not an in-process
+/// simulation): a no-op unless the environment names a trigger file, in
+/// which case — only once that file actually exists — this blocks forever
+/// right after every write [`apply_and_mark_drained_many`]'s Phase 3 pass
+/// makes and right before its caller commits `txn`.
+///
+/// Two env vars, both read fresh on every call (cheap; this only ever runs
+/// under `cfg(any(test, feature = "test-util"))` — see this crate's
+/// `Cargo.toml` `test-util` feature doc comment):
+///
+/// - `TRELLIS_TEST_PAUSE_TRIGGER`: a path. If unset, or if the path doesn't
+///   exist yet, this returns immediately — an ordinary, unpaused commit.
+///   Checking *existence* (rather than gating on the env var alone) is what
+///   lets a long-running subprocess engine pause on-demand: the env var is
+///   fixed for the process's whole lifetime, but a test can create this file
+///   at exactly the moment it wants the *next* Phase 3 commit — and only
+///   that one — to pause, letting every earlier commit (schema setup,
+///   seeding) proceed normally.
+/// - `TRELLIS_TEST_PAUSE_MARKER`: a path this touches right before parking,
+///   once the trigger above has fired — so the test, polling for this file
+///   (`generative::backend::subprocess::SubprocessBackend::wait_for_pause`,
+///   the same existence-polling idea as `testkit::crash::wait_until`, just
+///   async), can observe "now paused, transaction open, not yet committed"
+///   deterministically instead of guessing with a sleep before sending
+///   `SIGKILL`.
+///
+/// Blocking here is sound specifically because Phase 3 is one transaction
+/// (this module's own doc comment, "apply ∪ mark-drained is one
+/// transaction"): every statement this pass issued against `txn` is still
+/// uncommitted, so a `SIGKILL` landing anywhere inside this pause drops the
+/// connection and Postgres rolls the whole batch back — nothing partially
+/// applied, nothing "half-drained." A fresh engine's next drain of the same
+/// (still-`'draining'`, still-claimed-until-`reclaim_ttl`-or-liveness-catches-it)
+/// segment redoes Phase 2 and Phase 3 in full, which is exactly the
+/// atomicity `generative::backend::subprocess::SubprocessBackend`'s
+/// SIGKILL-mid-Phase-3 regression test exists to prove holds across a real
+/// crash, not just a simulated one.
+#[cfg(any(test, feature = "test-util"))]
+async fn pause_before_commit_for_tests() {
+    let Ok(trigger_path) = std::env::var("TRELLIS_TEST_PAUSE_TRIGGER") else {
+        return;
+    };
+    if !std::path::Path::new(&trigger_path).exists() {
+        return;
+    }
+    tracing::warn!(
+        trigger_path,
+        "TRELLIS_TEST_PAUSE_TRIGGER fired: pausing Phase 3 indefinitely before commit \
+         (test-only hook, issue #166)"
+    );
+    if let Ok(marker_path) = std::env::var("TRELLIS_TEST_PAUSE_MARKER")
+        && let Err(err) = std::fs::write(&marker_path, b"paused")
+    {
+        tracing::warn!(?err, marker_path, "failed to write Phase 3 pause marker");
+    }
+    // Never resolves on its own: the only way out is an external kill (the
+    // intended path) or the process exiting some other way (e.g. the test
+    // binary itself tearing down without ever arming the trigger, which
+    // never reaches this branch in the first place).
+    std::future::pending::<()>().await;
 }
 
 /// What one successful [`apply_and_mark_drained`] call did: how many target
