@@ -24,8 +24,8 @@
 //! enough to distort the numbers. Each scenario prints one line of JSON to
 //! stdout (see [`scenario::BenchResult::to_json`]) and the process exits
 //! non-zero if the aggregate-backfill phase exceeds its regression
-//! ceiling — wire this into CI as `cargo run -p benchmark --release --
-//! high-cardinality`.
+//! ceiling — wire this into CI as `cargo run -p benchmark --features
+//! engine-access --release -- high-cardinality`.
 
 mod generate;
 mod scenario;
