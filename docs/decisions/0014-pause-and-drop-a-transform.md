@@ -107,11 +107,13 @@ safe in both directions, so pausing an already-paused definition and dropping an
 one are no-op successes. The two states a caller can be uncertain about — "did the pause
 land?", "is it already gone?" — resolve to success, not error.
 
-### Pause, resume, and drop are facade capabilities
+### Pause, resume, and drop are grammar, entered through the one facade entrypoint
 
-They are methods on the front-door facade, returning plain data, alongside a synchronous
-mirror. They are not staging internals a caller reaches around with its own SQL; the
-engine composes them behind the facade.
+They are not separate typed methods and not staging internals reached around with SQL.
+Each is a statement in Trellis's grammar, submitted through the single definition
+entrypoint the facade exposes — the same entrypoint and grammar that define a transform
+or a relationship, the same text the CLI speaks. The engine parses the statement to
+decide the operation and composes it behind the facade, returning plain data.
 
 ## Consequences
 

@@ -16,7 +16,8 @@ behaviour without the engine's internals becoming API.
 **Tier 1 — the facade.** `Trellis`, `Client`, and `BlockingTrellis` are the only
 front doors. `Trellis` covers the whole lifecycle; `Client` starts and stops the
 in-process engine; `BlockingTrellis` is the synchronous mirror. Everything an
-application does, it does through these.
+application does, it does through these — and every definition-changing operation
+enters through a single grammar-driven entrypoint on them (see below).
 
 **Tier 2 — composable primitives.** An embedder may reach these directly: `Config`,
 `Pool`, `migrate`, `Identity`, `metrics`, `Error`/`ErrorCode`, `Numeric`, and `otel`
@@ -42,6 +43,29 @@ The error types the public errors wrap — `CatalogError`, `DdlError`, `ParseErr
 though they originate in `pub(crate)` modules. An embedder handed an `Error` must be
 able to name and match its payload (`fn handle(e: &CatalogError)`, `impl From<...>`);
 an unnameable public error type is not an acceptable surface.
+
+### One grammar-driven entrypoint for every definition change
+
+The facade does not grow a typed method per operation — `define`,
+`define_relationship`, `pause`, `resume`, `amend`, `drop`, and whatever comes next.
+Every definition-changing operation enters through a **single `define` entrypoint**
+(and its blocking mirror) that accepts a statement in Trellis's grammar — the same
+grammar the CLI client speaks. The statement itself discriminates the operation:
+define a transform, define a relationship, pause, resume, amend, drop. Parsing the
+statement is where the operation is decided; the facade signature does not change as
+operations are added.
+
+This is the deliberate front door, not a convenience layered over typed methods. The
+CLI, the embedded language bindings, and framework migration files all present the
+same text, so one grammar and one entrypoint mean each operation's semantics live in
+exactly one place instead of being re-spelled as a method on every binding. Text is
+also the simplest thing to carry across an FFI boundary — a single string in, plain
+data out — so a new operation is a grammar addition, not new surface each host must
+mirror and keep in sync.
+
+Read paths stay typed. Status, the recompute audit, quarantine sampling, and
+convergence-await return structured data and take structured arguments, not grammar;
+the unified entrypoint governs the definition/mutation surface, not queries.
 
 ### Read-your-writes is a facade capability
 
