@@ -22,8 +22,10 @@ use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use generative::oracle::sql_oracle;
 use testkit::TestCluster;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::qualified_target_table;
+use trellis::dev::defs::ast::{
+    Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
+use trellis::dev::defs::qualified_target_table;
 use trellis::{
     Config, Divergence, Pool, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis,
     TrellisOptions,
