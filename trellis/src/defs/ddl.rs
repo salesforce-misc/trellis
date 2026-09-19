@@ -76,9 +76,12 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
         ValueType::Uuid => "uuid",
         // Issue #108: a passthrough-only `Other` family still needs a real
         // column type when it *is* rendered into DDL/cast SQL (e.g. a
-        // `SELECT jsonb_col AS jsonb_col` passthrough field) — `PgType::name`
-        // doubles as the Postgres type keyword for exactly this reason.
-        ValueType::Other(pg_type) => pg_type.name(),
+        // `SELECT jsonb_col AS jsonb_col` passthrough field) —
+        // `PgType::sql_type_name` is that keyword. Note it is deliberately
+        // *not* `PgType::name` (the persisted token): `Unrecognized` has no
+        // real Postgres type keyword and renders as `text` here, matching
+        // the pre-#108 fallthrough. See that method's doc comment.
+        ValueType::Other(pg_type) => pg_type.sql_type_name(),
     }
 }
 

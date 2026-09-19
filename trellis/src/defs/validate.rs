@@ -102,6 +102,32 @@ pub enum ValidationError {
     /// column that isn't a real source column.
     UnresolvedGroupByColumn { column: String },
     /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
+    /// column typed [`ValueType::Other`] (issue #108 review) — a Postgres
+    /// family the OID registry recognizes but that `docs/type-support.md`
+    /// still lists as passthrough-only, with no key role.
+    ///
+    /// This is the `GROUP BY` twin of the check the two *other* key roles
+    /// already make on the raw pg type name
+    /// (`super::catalog::is_text_stable_join_key_type`, gating relationship
+    /// join keys in #28 and 1-1 primary keys in #107). A `GROUP BY` key is
+    /// matched by its `::text` rendering exactly like those are, so the same
+    /// hazards apply and then some: `interval`'s native `=` holds
+    /// `'1 day' = '24 hours'` while their renderings differ (two groups
+    /// where Postgres's own `GROUP BY` has one), `timestamptz`/`bytea`
+    /// render under session GUCs, `money` under `lc_monetary`, and `json`
+    /// has no `=` at all, so its key column can't even take the unique index
+    /// the aggregate target needs.
+    ///
+    /// Nothing could reach this before #108 — an `Other`-typed column was
+    /// dropped from the validator's view entirely — so this gate only
+    /// narrows the surface that issue newly opened. The typed key index
+    /// (`docs/type-support.md`'s "Cross-cutting concerns") is what lifts it
+    /// per family.
+    UnsupportedGroupByKeyType {
+        column: String,
+        value_type: ValueType,
+    },
+    /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
     /// `<rel>.<column>` path whose `<rel>` is not a relationship declared on
     /// this definition's source table (ADR-0006: relationship names are
     /// scoped per from-table) — the `GROUP BY` twin of
@@ -363,6 +389,13 @@ impl fmt::Display for ValidationError {
                 f,
                 "GROUP BY references '{column}', which is not a source column"
             ),
+            ValidationError::UnsupportedGroupByKeyType { column, value_type } => write!(
+                f,
+                "GROUP BY key '{column}' is a {value_type} column, a type Trellis can only pass \
+                 through today: GROUP BY keys are matched by their text rendering, which doesn't \
+                 agree with this type's own equality (see docs/type-support.md). Supported GROUP \
+                 BY key types are numeric, text, boolean, and uuid"
+            ),
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
                 "GROUP BY references relationship '{rel}', which is not declared on this \
@@ -583,11 +616,12 @@ pub fn validate(
             for key in group_by {
                 match key {
                     GroupByKey::Column(column) => {
-                        if !source_columns.contains_key(column) {
+                        let Some(value_type) = source_columns.get(column) else {
                             return Err(ValidationError::UnresolvedGroupByColumn {
                                 column: column.clone(),
                             });
-                        }
+                        };
+                        reject_unsupported_group_by_key_type(column, *value_type)?;
                     }
                     GroupByKey::RelationshipPath { rel, column } => {
                         let resolved = relationships.get(rel).ok_or_else(|| {
@@ -599,12 +633,13 @@ pub fn validate(
                                 column: column.clone(),
                             });
                         }
-                        if !resolved.column_types.contains_key(column) {
+                        let Some(value_type) = resolved.column_types.get(column) else {
                             return Err(ValidationError::UnknownRelationshipColumn {
                                 table: resolved.to_table.clone(),
                                 column: column.clone(),
                             });
-                        }
+                        };
+                        reject_unsupported_group_by_key_type(column, *value_type)?;
                     }
                 }
             }
@@ -943,6 +978,23 @@ fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
 /// that reaches this function without either guarantee having been checked
 /// gets the same `Cycle`/defense-in-depth treatment [`super::eval`] gives
 /// its own recursion, rather than overflowing the stack.
+/// Rejects an [`super::ast::KeySpace::Aggregate`] `GROUP BY` key whose
+/// column is typed [`ValueType::Other`] — see
+/// [`ValidationError::UnsupportedGroupByKeyType`] for why a key role needs
+/// more than #108's passthrough classification.
+fn reject_unsupported_group_by_key_type(
+    column: &str,
+    value_type: ValueType,
+) -> Result<(), ValidationError> {
+    match value_type {
+        ValueType::Numeric | ValueType::Text | ValueType::Boolean | ValueType::Uuid => Ok(()),
+        ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
+            column: column.to_string(),
+            value_type,
+        }),
+    }
+}
+
 pub(crate) fn infer_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
@@ -1248,6 +1300,7 @@ fn visit<'a>(
 mod tests {
     use super::*;
     use crate::defs::ast::{FieldDef, Operator};
+    use crate::defs::pg_type::PgType;
 
     fn def(fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
@@ -1501,6 +1554,66 @@ mod tests {
             ("author".to_string(), ValueType::Uuid),
             ("word_count".to_string(), ValueType::Numeric),
         ]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    /// Issue #108 review: a `GROUP BY` key is matched by its `::text`
+    /// rendering, so a `ValueType::Other` column — passthrough-only per
+    /// `docs/type-support.md`, with no key role yet — must be rejected here
+    /// rather than silently become a text-matched key. `interval` is the
+    /// sharpest case: Postgres holds `'1 day' = '24 hours'`, but those
+    /// render differently, so a text-matched key would split one real group
+    /// into two and diverge from the Postgres oracle.
+    ///
+    /// Nothing could reach this before #108 (an `Other`-typed column never
+    /// made it into `source_columns` at all), so this only narrows that
+    /// issue's newly opened surface — the two other key roles already gate
+    /// on `catalog::is_text_stable_join_key_type`.
+    #[test]
+    fn an_other_typed_column_is_rejected_as_an_aggregate_group_by_key() {
+        for pg_type in [PgType::Interval, PgType::TimestampTz, PgType::Json] {
+            let d = aggregate_def(
+                &["k"],
+                vec![
+                    FieldDef {
+                        name: "k".to_string(),
+                        expr: col("k"),
+                    },
+                    FieldDef {
+                        name: "total_words".to_string(),
+                        expr: Expr::FunctionCall {
+                            name: "SUM".to_string(),
+                            args: vec![col("word_count")],
+                        },
+                    },
+                ],
+            );
+            let source_columns = HashMap::from([
+                ("k".to_string(), ValueType::Other(pg_type)),
+                ("word_count".to_string(), ValueType::Numeric),
+            ]);
+            assert_eq!(
+                validate(&d, &source_columns, &HashMap::new()),
+                Err(ValidationError::UnsupportedGroupByKeyType {
+                    column: "k".to_string(),
+                    value_type: ValueType::Other(pg_type),
+                }),
+                "{pg_type} must not be accepted as a GROUP BY key"
+            );
+        }
+    }
+
+    /// The counterpart to the above: an `Other`-typed column is still a
+    /// perfectly good bare *passthrough* field (#108's actual scope) — only
+    /// the key role is gated.
+    #[test]
+    fn an_other_typed_column_passthrough_is_still_accepted() {
+        let d = def(vec![FieldDef {
+            name: "payload".to_string(),
+            expr: col("payload"),
+        }]);
+        let source_columns =
+            HashMap::from([("payload".to_string(), ValueType::Other(PgType::Jsonb))]);
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 

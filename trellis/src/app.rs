@@ -789,10 +789,30 @@ impl Trellis {
 
         Ok(rows
             .into_iter()
-            .map(|row| {
+            .filter_map(|row| {
                 let column_name: String = row.get(0);
                 let type_oid: u32 = row.get(1);
-                (column_name, defs::pg_type::value_type_for_oid(type_oid))
+                match defs::pg_type::value_type_for_oid(type_oid) {
+                    // Issue #108 review: a column whose OID the registry
+                    // can't place at all (an enum — enum OIDs are assigned
+                    // per `CREATE TYPE`, not fixed builtins — an array, a
+                    // range, a composite, a domain, `citext`, ...) stays
+                    // *out* of the validator's view, exactly as the old
+                    // `pg_value_type` dropped it. `Other(Unrecognized)` is an
+                    // honest label but not an actionable one: everything
+                    // downstream is keyed on knowing the column's real
+                    // Postgres type, and this doesn't. Admitting it made
+                    // `GROUP BY <enum col>` fail at `create table` with a raw
+                    // `type "unrecognized" does not exist`, and let a bare
+                    // enum passthrough `define()` succeed only to fail later
+                    // in `apply_target`'s `$n::text::<type>` cast — both
+                    // strictly worse than the clean
+                    // `ValidationError::UnknownColumn` this drop preserves.
+                    // Promoting these families is `docs/type-support.md`'s
+                    // deferred work (#117 for enums, #122 for the rest).
+                    ValueType::Other(defs::PgType::Unrecognized) => None,
+                    value_type => Some((column_name, value_type)),
+                }
             })
             .collect())
     }

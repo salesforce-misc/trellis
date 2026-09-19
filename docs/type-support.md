@@ -12,14 +12,29 @@ climb it left-to-right:
 
 1. **Ingest / passthrough** — decode from logical replication and copy into a
    derived table unchanged. The floor under every other role, and nearly
-   everything clears it: unmapped types fall through to `Text`, keeping the
-   source's concrete PG type (`trellis/src/defs/ddl.rs:293-324`).
+   everything clears it. Since #108 a column's role is decided by its raw
+   `pg_attribute.atttypid`, through the OID registry in
+   `trellis/src/defs/pg_type.rs`, rather than by text-matching
+   `format_type`'s rendering: every family the registry knows becomes a
+   `ValueType::Other(PgType)` that keeps its concrete PG type end-to-end
+   (`ddl::pg_type_name`), instead of the old `_ => Text` lie. An OID the
+   registry *can't* place — an enum (dynamically assigned OID), an array,
+   range, composite, domain or extension type — is `PgType::Unrecognized`
+   and stays out of the validator's view entirely (`Trellis::source_columns`),
+   so referencing it is a clean unresolved-column error; promoting those
+   families is #117/#122's job.
 2. **Filter (predicate)** — appear in a `WHERE` predicate. Needs immutable
    comparison operators and the predicate grammar (stubbed to `TRUE` today,
    `ast.rs:185`).
 3. **Join / relationship / `GROUP BY` key** — be matched by equality. Today via
    raw `::text` rendering (`TEXT_STABLE_JOIN_KEY_TYPES`,
-   `trellis/src/defs/catalog.rs:2156`; `to_rows_by_key`, `eval.rs:65-106`).
+   `trellis/src/defs/catalog.rs`; `to_rows_by_key`, `eval.rs`). Relationship
+   join keys and 1-1 primary keys gate on that allowlist by pg type name; a
+   `GROUP BY` key gates on its `ValueType` instead
+   (`validate::UnsupportedGroupByKeyType`), rejecting every
+   `ValueType::Other` family — `::text` matching disagrees with those types'
+   own `=` (`'1 day'::interval = '24 hours'`, `timestamptz`/`bytea` under
+   session GUCs), and `json` has no `=` at all.
 4. **Primary key** — identify a target row. A stricter join key: it must come
    from the source's replica identity and present in the old-image for
    updates/deletes. Gated to the join-key-safe allowlist

@@ -76,12 +76,13 @@ pub enum PgType {
 impl PgType {
     /// The stable token this family serializes to in
     /// `transform_definitions.source_columns` (`catalog::encode_value_type`)
-    /// and the Postgres type keyword used to cast a text-encoded value back
-    /// to its native type in generated SQL (`staging::apply`'s
-    /// `field_pg_types`). These intentionally coincide: every name below is
-    /// both a valid `pg_type.typname` (so `'...'::<name>` always parses) and
+    /// — a persistence/diagnostic identity only. Every token below is
     /// unambiguous against [`ValueType`]'s own `numeric`/`text`/`boolean`/
-    /// `uuid` tokens.
+    /// `uuid` tokens, so the two namespaces can share one column.
+    ///
+    /// **Not** the token to emit into generated SQL: [`Self::Unrecognized`]'s
+    /// `"unrecognized"` is a deliberate non-type, so use
+    /// [`Self::sql_type_name`] for DDL and `::` casts.
     pub const fn name(self) -> &'static str {
         match self {
             PgType::Oid => "oid",
@@ -105,6 +106,32 @@ impl PgType {
             PgType::TsVector => "tsvector",
             PgType::TsQuery => "tsquery",
             PgType::Unrecognized => "unrecognized",
+        }
+    }
+
+    /// The Postgres type keyword this family renders as in generated SQL —
+    /// a target-table column's declared type (`super::ddl::pg_type_name`)
+    /// and the cast that turns a staged text value back into its native
+    /// type (`staging::apply`'s `field_pg_types`, `$n::text::<name>`).
+    ///
+    /// Identical to [`Self::name`] for every *recognized* family — each of
+    /// those tokens is a real `pg_type.typname`, so `'...'::<name>` always
+    /// parses. [`Self::Unrecognized`] is the exception and the reason this
+    /// is a separate method: `"unrecognized"` is not a Postgres type, and
+    /// interpolating it produced a raw `type "unrecognized" does not exist`
+    /// (SQLSTATE 42704) out of `create table`/`insert` (issue #108 review).
+    /// It renders as `text` instead — exactly what the pre-#108
+    /// `value_type_from_pg` `_ => ValueType::Text` fallthrough emitted for
+    /// these same types, so an unrecognized *to-side* relationship column
+    /// (an enum, an array, a domain, `citext`, ...) keeps behaving as the
+    /// verbatim text passthrough it always was, rather than newly failing.
+    /// The *from-side* never reaches here at all: `Trellis::source_columns`
+    /// drops unrecognized-typed source columns outright, the same as before
+    /// this issue (see that method).
+    pub const fn sql_type_name(self) -> &'static str {
+        match self {
+            PgType::Unrecognized => "text",
+            other => other.name(),
         }
     }
 
@@ -266,33 +293,56 @@ mod tests {
         );
     }
 
+    /// Every [`PgType`] variant, so the tests below stay exhaustive by
+    /// construction.
+    const ALL: [PgType; 21] = [
+        PgType::Oid,
+        PgType::Bytea,
+        PgType::Date,
+        PgType::Time,
+        PgType::TimeTz,
+        PgType::Timestamp,
+        PgType::TimestampTz,
+        PgType::Interval,
+        PgType::Json,
+        PgType::Jsonb,
+        PgType::Inet,
+        PgType::Cidr,
+        PgType::MacAddr,
+        PgType::MacAddr8,
+        PgType::Bit,
+        PgType::VarBit,
+        PgType::Money,
+        PgType::Xml,
+        PgType::TsVector,
+        PgType::TsQuery,
+        PgType::Unrecognized,
+    ];
+
     #[test]
     fn every_pg_type_name_round_trips() {
-        let all = [
-            PgType::Oid,
-            PgType::Bytea,
-            PgType::Date,
-            PgType::Time,
-            PgType::TimeTz,
-            PgType::Timestamp,
-            PgType::TimestampTz,
-            PgType::Interval,
-            PgType::Json,
-            PgType::Jsonb,
-            PgType::Inet,
-            PgType::Cidr,
-            PgType::MacAddr,
-            PgType::MacAddr8,
-            PgType::Bit,
-            PgType::VarBit,
-            PgType::Money,
-            PgType::Xml,
-            PgType::TsVector,
-            PgType::TsQuery,
-            PgType::Unrecognized,
-        ];
-        for pg_type in all {
+        for pg_type in ALL {
             assert_eq!(PgType::from_name(pg_type.name()), Some(pg_type));
+        }
+    }
+
+    #[test]
+    fn sql_type_name_is_never_the_unrecognized_non_type() {
+        for pg_type in ALL {
+            let sql = pg_type.sql_type_name();
+            assert_ne!(
+                sql, "unrecognized",
+                "{pg_type} must not render a fake pg type into SQL"
+            );
+            if pg_type == PgType::Unrecognized {
+                assert_eq!(sql, "text");
+            } else {
+                assert_eq!(
+                    sql,
+                    pg_type.name(),
+                    "a recognized family's SQL keyword is its persisted token"
+                );
+            }
         }
     }
 
