@@ -30,6 +30,7 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
             ValueType::Text => "text",
             ValueType::Boolean => "boolean",
             ValueType::Uuid => "uuid",
+            ValueType::Other(pg_type) => pg_type.name(),
         })
         .collect();
     names.sort_unstable();

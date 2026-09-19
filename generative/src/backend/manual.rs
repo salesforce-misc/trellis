@@ -144,6 +144,10 @@ fn pg_type_name(value_type: ValueType) -> &'static str {
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
+        // Issue #108: the generator itself never emits an `Other`-typed
+        // column (see `generate::Column`'s doc comment), but this mirrors
+        // `trellis::defs::ddl::pg_type_name` for exhaustiveness/parity.
+        ValueType::Other(pg_type) => pg_type.name(),
     }
 }
 

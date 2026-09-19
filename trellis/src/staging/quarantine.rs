@@ -1483,12 +1483,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         let types = apply::to_column_types(pool, &def.target_table, &col_names).await?;
         types.get(column).copied().unwrap_or(ValueType::Numeric)
     };
-    let pg_type = match field_type {
-        ValueType::Numeric => "numeric",
-        ValueType::Text => "text",
-        ValueType::Boolean => "boolean",
-        ValueType::Uuid => "uuid",
-    };
+    let pg_type = ddl::pg_type_name(field_type);
 
     // `def.target_table` (issue #73's persisted, qualified identity), not a
     // bare `quote_ident(&def.def.target)` — reviewer follow-up to issue #74

@@ -303,6 +303,7 @@ fn value_type_name(value_type: ValueType) -> &'static str {
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
+        ValueType::Other(pg_type) => pg_type.name(),
     }
 }
 

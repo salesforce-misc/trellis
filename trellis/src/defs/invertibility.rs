@@ -27,17 +27,17 @@
 //!   column's [`ValueType`] — counting rows or non-null occurrences needs no
 //!   arithmetic on the value itself, just a +1/-1 per fold, so there is no
 //!   type restriction to encode.
-//! - **`SUM`/`AVG` over `Text`/`Boolean`**: the grammar's [`ValueType`] has
-//!   no int/float distinction yet (`Numeric`, `Text`, `Boolean` only), so
-//!   this gate classifies against `ValueType` as it exists today.
-//!   `SUM`/`AVG` over `Text` or `Boolean` isn't a type error this module is
-//!   positioned to raise — that belongs to the validator
-//!   (`super::validate`), which type-checks aggregate arguments once the
-//!   grammar accepts them. This gate answers a narrower question ("if this
-//!   aggregate call were valid, is it delta-able?"), so `Text`/`Boolean`
-//!   arguments to `SUM`/`AVG` are classified as
+//! - **`SUM`/`AVG` over `Text`/`Boolean`/`Uuid`/`Other`**: `SUM`/`AVG` over
+//!   any non-`Numeric` [`ValueType`] (including issue #108's [`ValueType::Other`]
+//!   passthrough types) isn't a type error this module is positioned to
+//!   raise — that belongs to the validator (`super::validate`), which
+//!   type-checks aggregate arguments once the grammar accepts them ([`super::registry::AGGREGATE_FUNCTION_SPECS`]
+//!   is `Numeric`-only, so this shape can't actually reach here through a
+//!   parsed definition). This gate answers a narrower question ("if this
+//!   aggregate call were valid, is it delta-able?"), so a non-`Numeric`
+//!   argument to `SUM`/`AVG` is classified as
 //!   [`Invertibility::RecomputeOnly`] rather than a distinct error variant:
-//!   they are certainly not invertible, and folding them into the same
+//!   it is certainly not invertible, and folding it into the same
 //!   recompute path as `MIN`/`MAX` means every caller has exactly one
 //!   fallback to implement, rather than two (recompute vs. reject).
 //! - **`MIN`/`MAX`**: never invertible, regardless of argument type — a
@@ -164,17 +164,23 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         ("COUNT", AggregateArg::Count(_)) => Some(Verdict::invertible(&[])),
 
         ("SUM", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[])),
-        ("SUM", AggregateArg::Column(ValueType::Text | ValueType::Boolean | ValueType::Uuid)) => {
-            Some(Verdict::recompute_only())
-        }
+        (
+            "SUM",
+            AggregateArg::Column(
+                ValueType::Text | ValueType::Boolean | ValueType::Uuid | ValueType::Other(_),
+            ),
+        ) => Some(Verdict::recompute_only()),
 
         ("AVG", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[
             PartialField::Sum,
             PartialField::Count,
         ])),
-        ("AVG", AggregateArg::Column(ValueType::Text | ValueType::Boolean | ValueType::Uuid)) => {
-            Some(Verdict::recompute_only())
-        }
+        (
+            "AVG",
+            AggregateArg::Column(
+                ValueType::Text | ValueType::Boolean | ValueType::Uuid | ValueType::Other(_),
+            ),
+        ) => Some(Verdict::recompute_only()),
 
         ("MIN", AggregateArg::Column(_)) | ("MAX", AggregateArg::Column(_)) => {
             Some(Verdict::recompute_only())

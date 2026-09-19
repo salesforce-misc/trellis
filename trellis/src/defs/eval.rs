@@ -29,6 +29,7 @@ use crate::numeric::{Numeric, NumericParseError};
 
 use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Operator, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
+use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
 
 /// A source-row image: column name to its text value, or `None` for SQL
@@ -168,12 +169,19 @@ impl RelationshipContext {
 /// (issue #79) carries its Postgres text rendering verbatim, the same way
 /// `Text` does — there's no arithmetic to normalize it against, just
 /// passthrough and equality comparison.
+///
+/// [`Value::Other`] (issue #108) is [`ValueType::Other`]'s value-level twin:
+/// a [`PgType`]-tagged column's CDC-decoded text, carried verbatim exactly
+/// like `Uuid`/`Text` — this is the "typed CDC round-trip" the issue asks
+/// for, a value now remembers its real Postgres type family all the way
+/// through [`parse_value`] instead of arriving pre-flattened to `Text`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Numeric(Numeric),
     Text(String),
     Boolean(bool),
     Uuid(String),
+    Other(PgType, String),
 }
 
 impl Value {
@@ -183,6 +191,7 @@ impl Value {
             Value::Text(_) => ValueType::Text,
             Value::Boolean(_) => ValueType::Boolean,
             Value::Uuid(_) => ValueType::Uuid,
+            Value::Other(pg_type, _) => ValueType::Other(*pg_type),
         }
     }
 }
@@ -194,6 +203,7 @@ impl fmt::Display for Value {
             Value::Text(s) => write!(f, "{s}"),
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Uuid(u) => write!(f, "{u}"),
+            Value::Other(_, text) => write!(f, "{text}"),
         }
     }
 }
@@ -1326,6 +1336,11 @@ fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Va
         ValueType::Text => Ok(Value::Text(text.to_string())),
         ValueType::Boolean => parse_boolean(field_name, text).map(Value::Boolean),
         ValueType::Uuid => Ok(Value::Uuid(text.to_string())),
+        // Passthrough, like `Uuid`/`Text` above: the epic's per-family
+        // children (#111–#122) are what teach a `PgType` how to actually
+        // parse/validate its own text form; #108's job is only to carry it
+        // through tagged with its real type instead of mislabeling it.
+        ValueType::Other(pg_type) => Ok(Value::Other(pg_type, text.to_string())),
     }
 }
 
@@ -1566,6 +1581,38 @@ mod tests {
             Some(Value::Uuid(
                 "11111111-1111-1111-1111-111111111111".to_string()
             ))
+        );
+    }
+
+    /// Issue #108's typed CDC round-trip: a column classified as
+    /// [`ValueType::Other`] (a recognized-but-not-first-class-yet PG type
+    /// family, e.g. `jsonb`) still passes through `parse_value` tagged with
+    /// its real [`PgType`], carrying the CDC-decoded text verbatim exactly
+    /// like [`Value::Uuid`]/[`Value::Text`] above — not silently
+    /// mislabeled/misrouted as `Text` the way it collapsed pre-#108.
+    #[test]
+    fn other_typed_column_passes_through_tagged_with_its_real_pg_type() {
+        let d = def(vec![FieldDef {
+            name: "payload".to_string(),
+            expr: col("payload"),
+        }]);
+        let r = row(&[("payload", Some(r#"{"a": 1}"#))]);
+        let types: HashMap<String, ValueType> =
+            HashMap::from([("payload".to_string(), ValueType::Other(PgType::Jsonb))]);
+        let result = eval(&d, &r, &types).unwrap();
+        assert_eq!(
+            result["payload"],
+            Some(Value::Other(PgType::Jsonb, r#"{"a": 1}"#.to_string()))
+        );
+        // `value_type()`/`Display` stay consistent with the tagged value,
+        // the same contract every other `Value` variant holds.
+        assert_eq!(
+            result["payload"].as_ref().unwrap().value_type(),
+            ValueType::Other(PgType::Jsonb)
+        );
+        assert_eq!(
+            result["payload"].as_ref().unwrap().to_string(),
+            r#"{"a": 1}"#
         );
     }
 

@@ -74,6 +74,11 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
+        // Issue #108: a passthrough-only `Other` family still needs a real
+        // column type when it *is* rendered into DDL/cast SQL (e.g. a
+        // `SELECT jsonb_col AS jsonb_col` passthrough field) — `PgType::name`
+        // doubles as the Postgres type keyword for exactly this reason.
+        ValueType::Other(pg_type) => pg_type.name(),
     }
 }
 

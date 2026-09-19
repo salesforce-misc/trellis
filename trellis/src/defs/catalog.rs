@@ -104,6 +104,7 @@ use super::model::{
     SchemaNode, TransformStatus,
 };
 use super::parser::{parse, parse_relationship};
+use super::pg_type::PgType;
 use super::validate::{
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
 };
@@ -3443,6 +3444,39 @@ pub async fn edges_from(
         .collect())
 }
 
+/// The stable token a [`ValueType`] persists as in
+/// `transform_definitions.source_columns` — the write side of
+/// [`decode_value_type`], which every read site below (`dependents_of`,
+/// `definition_by_id`, `definition_by_target`) shares rather than
+/// re-implementing its own copy of this match, the way three independent
+/// copies used to (issue #108 review).
+fn encode_value_type(value_type: &ValueType) -> &'static str {
+    match value_type {
+        ValueType::Numeric => "numeric",
+        ValueType::Text => "text",
+        ValueType::Boolean => "boolean",
+        ValueType::Uuid => "uuid",
+        // `PgType::name` doubles as this persisted token (issue #108): every
+        // name is already a distinct, stable string disjoint from the four
+        // above (see that method's doc comment).
+        ValueType::Other(pg_type) => pg_type.name(),
+    }
+}
+
+/// The inverse of [`encode_value_type`]. `None` for a token this build
+/// doesn't recognize — every call site turns that into
+/// [`CatalogError::UnknownValueType`], the same forward-compat guard the
+/// three duplicated inline matches enforced before this was pulled out.
+fn decode_value_type(text: &str) -> Option<ValueType> {
+    Some(match text {
+        "numeric" => ValueType::Numeric,
+        "text" => ValueType::Text,
+        "boolean" => ValueType::Boolean,
+        "uuid" => ValueType::Uuid,
+        other => ValueType::Other(PgType::from_name(other)?),
+    })
+}
+
 /// Splits `source_columns` into the parallel key/value text arrays
 /// `jsonb_object`'s two-array form wants (see `create_definition`'s insert
 /// and [`transforms_for_source`]'s matching read side).
@@ -3451,12 +3485,7 @@ fn encode_type_map(source_columns: &HashMap<String, ValueType>) -> (Vec<&str>, V
     let mut vals = Vec::with_capacity(source_columns.len());
     for (name, value_type) in source_columns {
         keys.push(name.as_str());
-        vals.push(match value_type {
-            ValueType::Numeric => "numeric",
-            ValueType::Text => "text",
-            ValueType::Boolean => "boolean",
-            ValueType::Uuid => "uuid",
-        });
+        vals.push(encode_value_type(value_type));
     }
     (keys, vals)
 }
@@ -3565,17 +3594,11 @@ pub async fn dependents_of(
         });
 
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             pending.source_columns.insert(key, value_type);
         }
@@ -3778,17 +3801,11 @@ pub(crate) async fn definition_by_id(
         let key: Option<String> = row.get(5);
         let value: Option<String> = row.get(6);
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             source_columns.insert(key, value_type);
         }
@@ -3858,17 +3875,11 @@ pub async fn definition_by_target(
         let key: Option<String> = row.get(6);
         let value: Option<String> = row.get(7);
         if let (Some(key), Some(value)) = (key, value) {
-            let value_type = match value.as_str() {
-                "numeric" => ValueType::Numeric,
-                "text" => ValueType::Text,
-                "boolean" => ValueType::Boolean,
-                "uuid" => ValueType::Uuid,
-                other => {
-                    return Err(CatalogError::UnknownValueType {
-                        column: key,
-                        text: other.to_string(),
-                    });
-                }
+            let Some(value_type) = decode_value_type(&value) else {
+                return Err(CatalogError::UnknownValueType {
+                    column: key,
+                    text: value,
+                });
             };
             source_columns.insert(key, value_type);
         }
@@ -4063,7 +4074,11 @@ mod error_code_tests {
         assert_eq!(
             CatalogError::UnknownValueType {
                 column: "price".to_string(),
-                text: "money".to_string(),
+                // Issue #108: `money` used to be this test's example of an
+                // unrecognized persisted token — it isn't anymore (the OID
+                // registry now classifies it as `ValueType::Other(PgType::Money)`),
+                // so a genuinely made-up token stands in instead.
+                text: "frobnicate".to_string(),
             }
             .code(),
             ErrorCode::Internal
@@ -4098,5 +4113,55 @@ mod error_code_tests {
 
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+}
+
+/// Issue #108: [`encode_value_type`]/[`decode_value_type`] are the
+/// persistence codec for `transform_definitions.source_columns` — every
+/// [`ValueType`] a real column can carry must round-trip through it exactly,
+/// and an unrecognized token must be rejected rather than silently
+/// misparsed, since `dependents_of`/`definition_by_id`/`definition_by_target`
+/// all trust this pair to reconstruct a live [`TransformDef`]'s typing.
+#[cfg(test)]
+mod value_type_codec_tests {
+    use super::*;
+
+    #[test]
+    fn every_value_type_round_trips_through_the_persisted_token() {
+        let all = [
+            ValueType::Numeric,
+            ValueType::Text,
+            ValueType::Boolean,
+            ValueType::Uuid,
+            ValueType::Other(PgType::Bytea),
+            ValueType::Other(PgType::Jsonb),
+            ValueType::Other(PgType::TimestampTz),
+            ValueType::Other(PgType::Unrecognized),
+        ];
+        for value_type in all {
+            let token = encode_value_type(&value_type);
+            assert_eq!(
+                decode_value_type(token),
+                Some(value_type),
+                "token {token:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_original_tokens_are_unchanged() {
+        // Issue #108 review: the pre-existing lattice's persisted spelling
+        // must stay byte-identical — these tokens are already durably stored
+        // in real `transform_definitions` rows, so changing them would break
+        // every definition persisted before this issue.
+        assert_eq!(encode_value_type(&ValueType::Numeric), "numeric");
+        assert_eq!(encode_value_type(&ValueType::Text), "text");
+        assert_eq!(encode_value_type(&ValueType::Boolean), "boolean");
+        assert_eq!(encode_value_type(&ValueType::Uuid), "uuid");
+    }
+
+    #[test]
+    fn an_unrecognized_token_does_not_decode() {
+        assert_eq!(decode_value_type("frobnicate"), None);
     }
 }

@@ -77,7 +77,14 @@ impl Comparison {
     fn for_type(value_type: ValueType) -> Comparison {
         match value_type {
             ValueType::Numeric => Comparison::DecimalByValue,
-            ValueType::Text | ValueType::Boolean | ValueType::Uuid => Comparison::Exact,
+            // Issue #108: `Other` is passthrough-only (no arithmetic, no
+            // scale-insensitive semantics defined for it yet), same footing
+            // as `Text`/`Boolean`/`Uuid` — byte-exact text equality is the
+            // right default until a family's own epic child teaches it
+            // something more specific.
+            ValueType::Text | ValueType::Boolean | ValueType::Uuid | ValueType::Other(_) => {
+                Comparison::Exact
+            }
         }
     }
 

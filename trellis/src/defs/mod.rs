@@ -36,6 +36,7 @@ mod lexer;
 pub mod model;
 pub mod oracle;
 mod parser;
+pub mod pg_type;
 pub mod registry;
 pub mod validate;
 
@@ -67,6 +68,7 @@ pub use oracle::{
     render_relationship_select_sql,
 };
 pub use parser::{parse, parse_relationship};
+pub use pg_type::PgType;
 pub use validate::{RelationshipTypeMismatch, RelationshipWarning, ValidationError, validate};
 
 #[cfg(test)]

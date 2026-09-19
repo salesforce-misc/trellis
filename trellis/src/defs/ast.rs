@@ -12,6 +12,8 @@
 
 use std::fmt;
 
+use super::pg_type::PgType;
+
 /// A parsed transform definition, ready for the validator (issue #23) and
 /// evaluator (issue #24).
 ///
@@ -209,12 +211,24 @@ pub enum Expr {
 /// aggregate `GROUP BY` key), but has no arithmetic/regex operations the way
 /// `Numeric`/`Text` do — there's no real-world use for `uuid + uuid`, so
 /// [`super::registry`] never grants it an operator or function.
+///
+/// [`ValueType::Other`] (issue #108) widens this from a 4-bucket lattice to
+/// an open one: any Postgres type the [`super::pg_type`] OID registry
+/// recognizes as a distinct family, but that hasn't yet earned its own
+/// first-class variant here, carries its [`PgType`] tag instead of silently
+/// collapsing into `Text` the way it used to. Per `docs/type-support.md`,
+/// it's passthrough-only — [`super::registry`] grants it no operator or
+/// function, [`super::validate`] rejects it as a key/predicate/computed
+/// target — until the type family's own epic child (#109, #111–#122)
+/// promotes it to a real variant with real semantics. This issue's job is
+/// only to stop lying about what the column is, not to add those semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     Numeric,
     Text,
     Boolean,
     Uuid,
+    Other(PgType),
 }
 
 impl fmt::Display for ValueType {
@@ -224,6 +238,7 @@ impl fmt::Display for ValueType {
             ValueType::Text => write!(f, "text"),
             ValueType::Boolean => write!(f, "boolean"),
             ValueType::Uuid => write!(f, "uuid"),
+            ValueType::Other(pg_type) => write!(f, "{pg_type}"),
         }
     }
 }

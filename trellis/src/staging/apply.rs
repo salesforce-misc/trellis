@@ -4889,12 +4889,7 @@ async fn apply_target(
     let field_pg_types: Vec<&str> = plan
         .field_types
         .iter()
-        .map(|t| match t {
-            ValueType::Numeric => "numeric",
-            ValueType::Text => "text",
-            ValueType::Boolean => "boolean",
-            ValueType::Uuid => "uuid",
-        })
+        .map(|t| ddl::pg_type_name(*t))
         .collect();
 
     let col_list = std::iter::once(pk_ident.clone())
