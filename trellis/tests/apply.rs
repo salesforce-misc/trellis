@@ -17,7 +17,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    create_definition, create_target_table, recompute, require_single_column_pk, source_primary_key,
+    PgType, create_definition, create_target_table, recompute, require_single_column_pk,
+    source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{SegmentState, StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, fold};
@@ -1638,6 +1639,131 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     let out2: bool = rows[1].get(1);
     assert!(out1);
     assert!(!out2);
+}
+
+/// Issue #108's "typed CDC round-trip": a column whose Postgres type has no
+/// first-class [`ValueType`] variant of its own — here `jsonb`, classified
+/// as [`ValueType::Other`] via the PG-OID registry — still round-trips
+/// byte-exact through the real `compute()` write path: `parse_value` tags
+/// the CDC-decoded text with its [`trellis::defs::PgType`] family
+/// ([`Value::Other`]), and the write plan's `field_pg_types` (`ddl::pg_type_name`)
+/// casts it back to a genuine `jsonb` target column — not the `text` column
+/// a pre-#108 build would have silently created and wired here.
+#[tokio::test]
+async fn a_jsonb_column_passthrough_round_trips_through_compute() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // `items` starts empty so the definition's own initial backfill
+    // enumerates nothing; its rows arrive afterward as this batch's staged
+    // CDC events.
+    client
+        .batch_execute("create table items (id integer primary key, payload jsonb)")
+        .await
+        .expect("seed source table");
+
+    let def = TransformDef {
+        target: "payloads".to_string(),
+        source: "items".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "out".to_string(),
+            expr: Expr::Column("payload".to_string()),
+        }],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    };
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("payload", ValueType::Other(PgType::Jsonb)),
+    ]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM payloads FROM items SELECT payload AS out",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
+        .await
+        .expect("create target table");
+
+    client
+        .execute(
+            "insert into items (id, payload) values \
+             (1, '{\"a\": 1, \"b\": [1, 2, 3]}'), (2, '\"just a string\"')",
+            &[],
+        )
+        .await
+        .expect("seed source rows after the definition exists");
+
+    // The exact CDC-decoded text a real logical-decoding stream would send
+    // for each row is jsonb's own canonical text rendering — captured live
+    // rather than hand-guessed, so this test doesn't depend on Postgres's
+    // exact jsonb whitespace-normalization rules.
+    let seeded = client
+        .query("select id, payload::text from items order by id", &[])
+        .await
+        .expect("read back seeded jsonb text");
+    let payload1: String = seeded[0].get(1);
+    let payload2: String = seeded[1].get(1);
+
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "items",
+        "1",
+        "insert",
+        None,
+        Some(&format!(r#"{{"payload":"{}"}}"#, escape(&payload1))),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "items",
+        "2",
+        "insert",
+        None,
+        Some(&format!(r#"{{"payload":"{}"}}"#, escape(&payload2))),
+    )
+    .await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 2);
+
+    let target_columns = client
+        .query(
+            "select column_name, data_type from information_schema.columns \
+             where table_name = 'payloads' and column_name = 'out'",
+            &[],
+        )
+        .await
+        .expect("introspect target column type");
+    assert_eq!(target_columns[0].get::<_, String>(1), "jsonb");
+
+    let rows = client
+        .query("select id, out::text from payloads order by id", &[])
+        .await
+        .expect("read target table");
+    let out1: String = rows[0].get(1);
+    let out2: String = rows[1].get(1);
+    assert_eq!(out1, payload1, "jsonb object value must round-trip exactly");
+    assert_eq!(
+        out2, payload2,
+        "jsonb string scalar must round-trip exactly"
+    );
 }
 
 /// `SELECT strpos(name, 'foo') > 0 AS has_foo` (issue #65's composed

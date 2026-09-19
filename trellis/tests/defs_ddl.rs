@@ -8,7 +8,7 @@ use trellis::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::defs::{
-    DdlError, create_aggregate_target_table, create_target_table, require_single_column_pk,
+    DdlError, PgType, create_aggregate_target_table, create_target_table, require_single_column_pk,
     source_primary_key,
 };
 
@@ -377,6 +377,102 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
         vec![
             ("id".to_string(), "uuid".to_string()),
             ("author".to_string(), "uuid".to_string()),
+        ]
+    );
+}
+
+/// Issue #108: a bare passthrough of a column whose Postgres type has no
+/// first-class [`ValueType`] variant of its own — classified via the
+/// PG-OID registry as [`ValueType::Other`] instead of the old `_ => Text`
+/// fallthrough — still creates a target column of the *correct native*
+/// Postgres type, not `text`. Before this issue, a `jsonb`/`bytea`/
+/// `timestamptz` passthrough column would have been silently mislabeled as
+/// `ValueType::Text` and its target column created as plain `text`.
+#[tokio::test]
+async fn other_typed_passthrough_columns_get_their_real_native_target_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+
+    client
+        .batch_execute(
+            "create table events (
+                 id bigint generated always as identity primary key,
+                 payload jsonb not null,
+                 raw bytea not null,
+                 happened_at timestamptz not null
+             )",
+        )
+        .await
+        .expect("seed source table");
+
+    let def = TransformDef {
+        target: "events_calc".to_string(),
+        source: "events".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![
+            FieldDef {
+                name: "payload".to_string(),
+                expr: Expr::Column("payload".to_string()),
+            },
+            FieldDef {
+                name: "raw".to_string(),
+                expr: Expr::Column("raw".to_string()),
+            },
+            FieldDef {
+                name: "happened_at".to_string(),
+                expr: Expr::Column("happened_at".to_string()),
+            },
+        ],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    };
+    let source_columns = HashMap::from([
+        ("payload".to_string(), ValueType::Other(PgType::Jsonb)),
+        ("raw".to_string(), ValueType::Other(PgType::Bytea)),
+        (
+            "happened_at".to_string(),
+            ValueType::Other(PgType::TimestampTz),
+        ),
+    ]);
+
+    let pk = require_single_column_pk(
+        source_primary_key(&db.pool, &def.source)
+            .await
+            .expect("introspect source primary key"),
+        &def.source,
+    )
+    .expect("single-column pk");
+
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
+        .await
+        .expect("create target table with Other-typed passthrough columns");
+
+    let columns = client
+        .query(
+            "select column_name, data_type
+             from information_schema.columns
+             where table_name = $1
+             order by ordinal_position",
+            &[&def.target],
+        )
+        .await
+        .expect("introspect target columns");
+    let columns: Vec<(String, String)> = columns
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), "bigint".to_string()),
+            ("payload".to_string(), "jsonb".to_string()),
+            ("raw".to_string(), "bytea".to_string()),
+            (
+                "happened_at".to_string(),
+                "timestamp with time zone".to_string()
+            ),
         ]
     );
 }
