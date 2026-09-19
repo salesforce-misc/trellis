@@ -871,11 +871,11 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     );
 }
 
-/// `resume_transform` refuses a target that isn't currently quarantined —
-/// caller error, not a silent no-op, mirroring `resume_column`'s
-/// `ColumnNotPaused` discipline.
+/// `resume_transform` refuses a target that isn't currently frozen by either
+/// of ADR-0014's two pause triggers — caller error, not a silent no-op,
+/// mirroring `resume_column`'s `ColumnNotPaused` discipline.
 #[tokio::test]
-async fn resume_transform_refuses_a_target_that_is_not_quarantined() {
+async fn resume_transform_refuses_a_target_that_is_not_paused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -894,12 +894,12 @@ async fn resume_transform_refuses_a_target_that_is_not_quarantined() {
 
     let err = quarantine::resume_transform(&db.pool, "t3")
         .await
-        .expect_err("t3 is live, not quarantined");
+        .expect_err("t3 is live, so it is frozen by neither trigger");
     match err {
-        apply::ApplyError::TransformNotQuarantined { transform } => {
+        apply::ApplyError::TransformNotPaused { transform } => {
             assert_eq!(transform, "t3");
         }
-        other => panic!("expected TransformNotQuarantined, got {other:?}"),
+        other => panic!("expected TransformNotPaused, got {other:?}"),
     }
 }
 

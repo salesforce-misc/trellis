@@ -529,7 +529,15 @@ async fn unsettled_definitions(
         let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
             panic!("transform_definitions.status held unrecognized value '{status_text}'")
         });
-        if !matches!(status, TransformStatus::Live | TransformStatus::Quarantined) {
+        // `Paused` joins the terminal set for the same reason `Quarantined`
+        // is in it (issue #142): a frozen definition never progresses on its
+        // own, so waiting for it to settle any further is waiting forever.
+        // The suite doesn't pause anything today — this is here so that if it
+        // ever does, the wait fails its assertion rather than hanging.
+        if !matches!(
+            status,
+            TransformStatus::Live | TransformStatus::Quarantined | TransformStatus::Paused
+        ) {
             unsettled.push(def.target.clone());
         }
     }

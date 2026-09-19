@@ -211,10 +211,28 @@ pub async fn claim_chunks(
     }
     let rows = client
         .query(
+            // The `exists` gate is issue #142 / ADR-0014's: the pause is what
+            // quiesces in-flight work, and a *backfilling* definition's
+            // in-flight work lives here rather than in the claim-time fold.
+            // So this consults the same `transform_definitions.status` the
+            // fold's own `status = 'live'` gate reads, and stops handing out
+            // new chunks for a paused definition. A chunk a worker already
+            // holds is deliberately left alone: per the ADR it is released on
+            // its own heartbeat/TTL ([`reclaim_stale_chunks`]), never
+            // force-cleared out from under a running worker.
+            //
+            // It sits inside the candidate CTE rather than on the outer
+            // `update` so a paused definition's chunks never enter the
+            // `for update skip locked` window at all — a paused definition
+            // can't starve its siblings out of the `limit $2` budget.
             "with candidate as ( \
-                 select id from backfill_chunks \
-                 where not done and claimed_by is null \
-                 order by id \
+                 select bc.id from backfill_chunks bc \
+                 where not bc.done and bc.claimed_by is null \
+                   and exists ( \
+                       select 1 from transform_definitions d \
+                       where d.id = bc.definition_id and d.status <> 'paused' \
+                   ) \
+                 order by bc.id \
                  for update skip locked \
                  limit $2 \
              ) \

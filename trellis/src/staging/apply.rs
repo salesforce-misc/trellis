@@ -196,13 +196,15 @@ pub enum ApplyError {
     /// [`super::quarantine::resume_transform`] was asked to resume a target
     /// with no corresponding `transform_definitions` row at all.
     TransformNotFound { transform: String },
-    /// [`super::quarantine::resume_transform`] was asked to resume a
-    /// target whose current status isn't
-    /// [`crate::defs::model::TransformStatus::Quarantined`] — resuming a
-    /// transform that isn't quarantined is caller error, not a silent
-    /// no-op, mirroring [`ApplyError::ColumnNotPaused`]'s same discipline
-    /// for the column-level tier.
-    TransformNotQuarantined { transform: String },
+    /// [`super::quarantine::resume_transform`] was asked to resume a target
+    /// whose current status is neither of ADR-0014's two frozen states —
+    /// [`crate::defs::model::TransformStatus::Quarantined`] (the poison fuse
+    /// tripped it) nor [`crate::defs::model::TransformStatus::Paused`] (an
+    /// operator froze it deliberately). Resuming a transform that isn't
+    /// frozen at all is caller error, not a silent no-op, mirroring
+    /// [`ApplyError::ColumnNotPaused`]'s same discipline for the
+    /// column-level tier.
+    TransformNotPaused { transform: String },
     /// [`from_side_rows_for_trigger_txn`] was asked to resolve a
     /// [`ReverseTrigger::WholeKeyspace`] against live, transactional full row
     /// images. Not reachable today — both of that function's call sites
@@ -256,7 +258,7 @@ impl ApplyError {
             ApplyError::DefinitionNotLive { .. } => ErrorCode::Conflict,
             ApplyError::Intake(err) => err.code(),
             ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
-            ApplyError::TransformNotQuarantined { .. } => ErrorCode::Conflict,
+            ApplyError::TransformNotPaused { .. } => ErrorCode::Conflict,
         }
     }
 }
@@ -312,10 +314,10 @@ impl fmt::Display for ApplyError {
             ApplyError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
             }
-            ApplyError::TransformNotQuarantined { transform } => write!(
+            ApplyError::TransformNotPaused { transform } => write!(
                 f,
-                "'{transform}' is not currently quarantined; resuming it re-runs its full \
-                 backfill, which is only valid from `quarantined`"
+                "'{transform}' is not currently paused; resuming it re-runs its full \
+                 backfill, which is only valid from `paused` or `quarantined`"
             ),
             ApplyError::ReverseTriggerNotResolvable { from_table } => write!(
                 f,
@@ -348,7 +350,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::ColumnNotPaused { .. }
             | ApplyError::DefinitionNotLive { .. }
             | ApplyError::TransformNotFound { .. }
-            | ApplyError::TransformNotQuarantined { .. }
+            | ApplyError::TransformNotPaused { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. } => None,
         }
     }

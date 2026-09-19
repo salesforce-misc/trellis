@@ -71,6 +71,9 @@ enum Job {
         oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
     ),
     ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
+    PauseTransform(String, oneshot::Sender<Result<(), TrellisError>>),
+    DropTransform(String, oneshot::Sender<Result<(), TrellisError>>),
+    DropRelationship(String, String, oneshot::Sender<Result<(), TrellisError>>),
     HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
@@ -243,11 +246,33 @@ impl BlockingTrellis {
         self.submit(|reply| Job::ResumeColumn(target, reply))
     }
 
-    /// Resumes a whole-transform-quarantined transform. See
-    /// [`Trellis::resume_transform`].
+    /// Resumes a frozen transform — either trigger — by rebuilding it with a
+    /// fresh backfill. See [`Trellis::resume_transform`].
     pub fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
         let target = target.to_string();
         self.submit(|reply| Job::ResumeTransform(target, reply))
+    }
+
+    /// Deliberately freezes a transform; idempotent. See
+    /// [`Trellis::pause_transform`].
+    pub fn pause_transform(&self, target: &str) -> Result<(), TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::PauseTransform(target, reply))
+    }
+
+    /// Removes a paused transform definition and its target table;
+    /// idempotent. See [`Trellis::drop_transform`].
+    pub fn drop_transform(&self, target: &str) -> Result<(), TrellisError> {
+        let target = target.to_string();
+        self.submit(|reply| Job::DropTransform(target, reply))
+    }
+
+    /// Removes a relationship declaration; idempotent. See
+    /// [`Trellis::drop_relationship`].
+    pub fn drop_relationship(&self, from_table: &str, name: &str) -> Result<(), TrellisError> {
+        let from_table = from_table.to_string();
+        let name = name.to_string();
+        self.submit(|reply| Job::DropRelationship(from_table, name, reply))
     }
 
     /// Whether at least one live drain worker is registered anywhere in
@@ -415,6 +440,15 @@ async fn run(
             }
             Job::ResumeTransform(target, reply) => {
                 let _ = reply.send(trellis.resume_transform(&target).await);
+            }
+            Job::PauseTransform(target, reply) => {
+                let _ = reply.send(trellis.pause_transform(&target).await);
+            }
+            Job::DropTransform(target, reply) => {
+                let _ = reply.send(trellis.drop_transform(&target).await);
+            }
+            Job::DropRelationship(from_table, name, reply) => {
+                let _ = reply.send(trellis.drop_relationship(&from_table, &name).await);
             }
             Job::HasLiveDrainWorkers(reply) => {
                 let _ = reply.send(trellis.has_live_drain_workers().await);

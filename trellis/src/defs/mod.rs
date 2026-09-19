@@ -33,6 +33,7 @@ pub mod error;
 pub mod eval;
 pub mod invertibility;
 mod lexer;
+pub mod lifecycle;
 pub mod model;
 pub mod oracle;
 mod parser;

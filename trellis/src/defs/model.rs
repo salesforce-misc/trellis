@@ -63,16 +63,34 @@ pub struct Definition {
 /// once its (still fully synchronous) backfill completes; every other
 /// creation path persists [`TransformStatus::Live`] directly, since by the
 /// time those rows exist their backfill (ring-enumeration or direct build)
-/// has already been staged/completed. [`TransformStatus::WaitingToBackfill`]
-/// and [`TransformStatus::Quarantined`] aren't produced by any writer yet —
-/// they're reserved for the backgrounded-backfill and quarantine-fuse work
-/// this status field is foundational for.
+/// has already been staged/completed.
+///
+/// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
+/// two triggers of ADR-0014's single "frozen" state: the poison fuse trips
+/// the first, an operator [`pause`](crate::Trellis::pause_transform) sets the
+/// second, and nothing else distinguishes them — both are simply *not*
+/// `live`, which is the one gate the claim-time fold has ever honored (the
+/// `t.status = 'live'` predicate in [`super::catalog::dependents_of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,
     Live,
     Quarantined,
+    /// Deliberately frozen by an operator (issue #142, ADR-0014) — the same
+    /// freeze [`TransformStatus::Quarantined`] is, reached by the other of
+    /// the two triggers the ADR names. The target holds its current,
+    /// now-stale value until
+    /// [`crate::staging::quarantine::resume_transform`] rebuilds it by a
+    /// fresh backfill; meanwhile its share of the change stream is drained
+    /// for its siblings and is not recoverable by replay, so a paused
+    /// definition never pins the staging ring.
+    ///
+    /// Kept a distinct persisted word from `quarantined` only so the
+    /// *trigger* stays legible: [`crate::Trellis::quarantined`] reports
+    /// poison incidents, and an operator pause taken to stage a schema
+    /// change is not one.
+    Paused,
 }
 
 impl TransformStatus {
@@ -84,13 +102,14 @@ impl TransformStatus {
             TransformStatus::Backfilling => "backfilling",
             TransformStatus::Live => "live",
             TransformStatus::Quarantined => "quarantined",
+            TransformStatus::Paused => "paused",
         }
     }
 
     /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
     /// other text — meaning the row was written by something other than
     /// this module's own writers, since `transform_definitions.status`'s
-    /// `check` constraint only allows these four values. Named
+    /// `check` constraint only allows these five values. Named
     /// `from_persisted` for the same reason [`RelationshipCardinality::from_persisted`]
     /// is: this isn't `std::str::FromStr` (no matching `Err` type worth
     /// inventing for a value that should only ever come from this table's
@@ -101,6 +120,7 @@ impl TransformStatus {
             "backfilling" => Some(TransformStatus::Backfilling),
             "live" => Some(TransformStatus::Live),
             "quarantined" => Some(TransformStatus::Quarantined),
+            "paused" => Some(TransformStatus::Paused),
             _ => None,
         }
     }

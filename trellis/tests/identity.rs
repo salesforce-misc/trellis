@@ -274,12 +274,15 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // (`worker_registry`, one row per live drain worker). Issue #191
     // removed V8 (`pause_leases`, the fleet-wide claiming-pause lease that
     // ADR-0013's `Trellis::self_check` never ended up needing), so V8 is
-    // not reissued to anything else either.
+    // not reissued to anything else either. Issue #142 (ADR-0014) added V32
+    // (`paused` joins `transform_definitions.status`'s check constraint —
+    // the operator-driven half of the pause state whose other half is the
+    // poison fuse's `quarantined`).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31
+            27, 28, 29, 30, 31, 32
         ]
     );
 }

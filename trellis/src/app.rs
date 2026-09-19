@@ -693,19 +693,206 @@ impl Trellis {
         }
     }
 
-    /// Resumes a whole-transform-quarantined transform (issue #55; ADR-0003's
-    /// coarser, transform-wide fuse tier — the counterpart to
-    /// [`Trellis::resume_column`]'s per-column tier). `target` must be a bare
-    /// transform's target table, not a `transform.column` address — see
+    /// Resumes a frozen transform — either trigger (issue #55, issue #142;
+    /// ADR-0003's coarser, transform-wide fuse tier and ADR-0014's operator
+    /// pause share one recovery path, because the state they produce is the
+    /// same state). `target` must be a bare transform's target table, not a
+    /// `transform.column` address — see
     /// [`crate::staging::quarantine::resume_transform`] for the full
     /// contract, including why this drops the transform to
     /// [`TransformStatus::WaitingToBackfill`] and re-runs its backfill
     /// through the same `xmin`-fence-respecting path a fresh transform's own
     /// initial backfill uses, rather than a shortcut.
+    ///
+    /// **Resume rebuilds; it does not catch up** (ADR-0014). A frozen
+    /// definition must not pin the staging ring — holding ring segments open
+    /// for it would wedge the ring for every sibling reading the same source
+    /// — so while it is frozen its share of the change stream is drained for
+    /// those siblings and is *not* recoverable by replay. There are no
+    /// buffered changes to apply on the way back, which is why the recovery
+    /// is a fresh backfill from source. The cost of resuming therefore scales
+    /// with the data, not with the length of the pause.
     pub async fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
         quarantine::resume_transform(&self.pool, target)
             .await
             .map_err(TrellisError::Apply)
+    }
+
+    /// Freezes a transform deliberately (issue #142, ADR-0014) — the
+    /// operator-driven half of the pause state whose other half is the
+    /// poison fuse's auto-pause.
+    ///
+    /// The target stops being written to and holds its current, now-stale
+    /// value: [`TransformStatus::Paused`] fails the one gate every
+    /// claim-time fold dispatch already resolves targets through, so this
+    /// reuses the existing freeze rather than adding a second one. Its share
+    /// of the change stream is drained for its siblings meanwhile, so it
+    /// never pins the staging ring — and [`resume_transform`](Trellis::resume_transform)
+    /// consequently rebuilds by a fresh backfill rather than catching up.
+    ///
+    /// Pausing an already-frozen transform — whether by an earlier pause or
+    /// by the poison fuse — **succeeds as a no-op**. Pause runs on Trellis's
+    /// own connections, not inside a caller's migration transaction, so a
+    /// migration that is replayed or interleaved with a rollback has to be
+    /// safe to re-run; "did the pause land?" resolves to success either way.
+    ///
+    /// A `target` that was never defined is
+    /// [`CatalogError::TransformNotFound`] — unlike
+    /// [`drop_transform`](Trellis::drop_transform), whose absent case *is* the
+    /// outcome its caller wanted.
+    pub async fn pause_transform(&self, target: &str) -> Result<(), TrellisError> {
+        defs::lifecycle::pause_transform(&self.pool, target)
+            .await
+            .map(|_| ())
+            .map_err(TrellisError::Catalog)
+    }
+
+    /// Removes a transform definition (issue #142, ADR-0014) — the terminal
+    /// reap of a paused definition, and the inverse of
+    /// [`define`](Trellis::define).
+    ///
+    /// **Pause it first.** There is no direct live-to-gone edge in the
+    /// lifecycle: a definition that isn't frozen is refused with
+    /// [`CatalogError::TransformNotPaused`]. Quiescing through the pause is
+    /// what lets the removal skip reasoning about a fold still dispatching to
+    /// the target.
+    ///
+    /// **The data goes with it.** Dropping a definition drops its target
+    /// table, unconditionally — there is no option to retire the definition
+    /// while keeping its rows. Keeping derived rows after removing the
+    /// definition that explains them has no use worth naming, and the paused
+    /// state already serves the caller who wants the data to stick around
+    /// unmaintained: leave it paused rather than dropping it. Only the
+    /// Trellis-owned target table is ever dropped; source tables are
+    /// user-owned and untouched.
+    ///
+    /// **Refuses rather than cascades.** If a live definition still chains
+    /// off this target, the drop fails with
+    /// [`CatalogError::DependentsBlockDrop`] naming the blockers, so the
+    /// order to retire them in is explicit. Work from the leaves inward.
+    ///
+    /// **Shrinks the publication inline.** Once the drop commits, the
+    /// replication publication is reconciled against the definitions that
+    /// remain, so a source table leaves replication exactly when nothing
+    /// derives from it any longer — by reconciliation, not by hand-editing,
+    /// and at drop time rather than deferred to a maintenance pass.
+    ///
+    /// Dropping a definition that isn't registered **succeeds as a no-op**,
+    /// for the same replayed-migration reason [`pause_transform`](Trellis::pause_transform)
+    /// is idempotent: "is it already gone?" resolves to success.
+    pub async fn drop_transform(&self, target: &str) -> Result<(), TrellisError> {
+        let outcome = defs::lifecycle::drop_transform(&self.pool, target)
+            .await
+            .map_err(TrellisError::Catalog)?;
+
+        if outcome == defs::lifecycle::DropOutcome::Dropped {
+            self.reconcile_publication_after_drop().await?;
+        }
+        Ok(())
+    }
+
+    /// Removes a relationship declaration (issue #142, ADR-0014) — the
+    /// inverse of [`define_relationship`](Trellis::define_relationship).
+    ///
+    /// Addressed by `(from_table, name)` because a relationship name is
+    /// unique per from-table rather than globally — the same pair a
+    /// calculated field's `<rel>.<column>` head resolves against. Drops the
+    /// Trellis-owned parent projection table the declaration created along
+    /// with it; both endpoint tables are the user's and are untouched.
+    ///
+    /// **Refuses rather than cascades**, like
+    /// [`drop_transform`](Trellis::drop_transform): any live transform whose
+    /// text still references this relationship blocks the drop and is named
+    /// in [`CatalogError::DependentsBlockDrop`].
+    ///
+    /// There is deliberately no `pause_relationship`: a relationship carries
+    /// no lifecycle status and nothing in the fold gates on one, so freezing
+    /// it would mean building the second freezing mechanism ADR-0014 rules
+    /// out. A relationship is dropped outright, once nothing live reads it.
+    ///
+    /// Dropping an unregistered relationship **succeeds as a no-op**.
+    pub async fn drop_relationship(
+        &self,
+        from_table: &str,
+        name: &str,
+    ) -> Result<(), TrellisError> {
+        let outcome = defs::lifecycle::drop_relationship(&self.pool, from_table, name)
+            .await
+            .map_err(TrellisError::Catalog)?;
+
+        if outcome == defs::lifecycle::DropOutcome::Dropped {
+            self.reconcile_publication_after_drop().await?;
+        }
+        Ok(())
+    }
+
+    /// Reconciles the replication publication against whatever definitions
+    /// are left, immediately after a drop (ADR-0014, "The publication shrinks
+    /// by reconciliation").
+    ///
+    /// Lives here rather than in `defs::lifecycle` for two reasons the engine
+    /// layer can't supply on its own:
+    /// [`crate::intake::publication::reconcile_publication`] needs a concrete
+    /// `tokio_postgres::Client` (not a pooled one — see its own doc comment
+    /// for why intake's session isn't available), and it needs the configured
+    /// publication name, which only the facade knows. It mirrors
+    /// [`crate::client`]'s own periodic `reconcile_source_tables` exactly:
+    /// derive the desired set from the catalog, then diff. Because
+    /// `defs::all_source_tables` walks the definitions that still exist, a
+    /// source table leaves the publication precisely when its last reader
+    /// does — never while a sibling definition still reads it.
+    ///
+    /// A publication that doesn't exist yet is skipped rather than an error:
+    /// a define-only connection that never ran with `staging: true` has no
+    /// publication to shrink, and refusing its drop over that would be
+    /// gratuitous.
+    async fn reconcile_publication_after_drop(&self) -> Result<(), TrellisError> {
+        let publication = ClientOptions::default().publication;
+        let exists: bool = self
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "select exists(select 1 from pg_publication where pubname = $1)",
+                &[&publication],
+            )
+            .await?
+            .get(0);
+        if !exists {
+            return Ok(());
+        }
+
+        let desired = defs::all_source_tables(&self.pool)
+            .await
+            .map_err(TrellisError::Catalog)?;
+
+        let (mut client, connection) =
+            tokio_postgres::connect(self.config.dsn(), tokio_postgres::NoTls).await?;
+        let handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        // A bare `tokio_postgres::connect` lands on the *default*
+        // `search_path`, not the Trellis schema — unlike every pooled
+        // connection, which `pool::session_bootstrap` pins. Without this,
+        // `reconcile_publication`'s add path (which parks a
+        // `pending_backfill` marker for a table joining the publication)
+        // fails with a `42P01` "relation \"pending_backfill\" does not
+        // exist" against any non-`public` Trellis schema, so a drop that
+        // leaves the desired set *larger* than the published one reports
+        // `TrellisError::Publication` after the definition is already gone.
+        // Mirrors `client::connect_plain`'s own bootstrap.
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::pool::quote_ident(self.config.schema())
+            ))
+            .await?;
+        let result =
+            crate::intake::publication::reconcile_publication(&mut client, &publication, &desired)
+                .await;
+        drop(client);
+        handle.abort();
+        result.map_err(TrellisError::Publication)
     }
 
     /// Stops any background work this connection started (staging worker and
@@ -1127,11 +1314,20 @@ pub enum QuarantineState {
     /// A whole transform's keyspace fuse has tripped (mirrors
     /// [`TransformStatus::Quarantined`]).
     Quarantined,
-    /// One column's fuse has tripped, or it's paused only because an
-    /// upstream column it reads is (decision #5's cascade) — both look the
-    /// same from this read; see [`Trellis::quarantine_status`] for whether a
-    /// caller needs to distinguish them (today, [`QuarantineEntry::last_error`]
-    /// is `None` for a purely cascaded pause, since it never itself failed).
+    /// Frozen without a whole-keyspace fuse having tripped.
+    ///
+    /// At **column** granularity: one column's own fuse has tripped, or it's
+    /// paused only because an upstream column it reads is (decision #5's
+    /// cascade) — both look the same from this read; see
+    /// [`Trellis::quarantine_status`] for whether a caller needs to
+    /// distinguish them (today, [`QuarantineEntry::last_error`] is `None` for
+    /// a purely cascaded pause, since it never itself failed).
+    ///
+    /// At **whole-transform** granularity (issue #142): an operator
+    /// deliberately froze it via [`Trellis::pause_transform`], mirroring
+    /// [`TransformStatus::Paused`] — the same freeze
+    /// [`QuarantineState::Quarantined`] is, reached by the other of
+    /// ADR-0014's two triggers.
     Paused,
 }
 
@@ -1142,6 +1338,7 @@ impl From<TransformStatus> for QuarantineState {
             TransformStatus::Backfilling => QuarantineState::Backfilling,
             TransformStatus::Live => QuarantineState::Live,
             TransformStatus::Quarantined => QuarantineState::Quarantined,
+            TransformStatus::Paused => QuarantineState::Paused,
         }
     }
 }
@@ -1239,6 +1436,15 @@ pub enum TrellisError {
     /// reporting a divergence, which is a successful audit) — see
     /// [`SelfCheckError`].
     SelfCheck(SelfCheckError),
+    /// Reconciling the replication publication after a
+    /// [`Trellis::drop_transform`]/[`Trellis::drop_relationship`] failed
+    /// (issue #142). The definition is already gone when this surfaces — the
+    /// drop and the reconcile are deliberately not one transaction, since
+    /// `alter publication` is its own DDL and the drop must not be held open
+    /// across it — so the recovery is to re-run the reconcile (the running
+    /// client's own periodic `reconcile_source_tables` pass will, unprompted),
+    /// not to re-run the drop.
+    Publication(crate::intake::IntakeError),
 }
 
 impl TrellisError {
@@ -1278,6 +1484,7 @@ impl TrellisError {
             TrellisError::ColumnAddressRequired => ErrorCode::Validation,
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
+            TrellisError::Publication(err) => err.code(),
         }
     }
 }
@@ -1333,6 +1540,11 @@ impl std::fmt::Display for TrellisError {
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
             TrellisError::SelfCheck(err) => write!(f, "{err}"),
+            TrellisError::Publication(err) => write!(
+                f,
+                "the definition was dropped, but reconciling the replication publication \
+                 afterwards failed: {err}"
+            ),
         }
     }
 }
@@ -1356,6 +1568,7 @@ impl std::error::Error for TrellisError {
             TrellisError::TransformNotFound(_) | TrellisError::ColumnAddressRequired => None,
             TrellisError::Staging(err) => Some(err),
             TrellisError::SelfCheck(err) => Some(err),
+            TrellisError::Publication(err) => Some(err),
         }
     }
 }

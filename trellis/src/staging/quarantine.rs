@@ -1247,16 +1247,23 @@ pub async fn resume_column(
     Ok(resumed)
 }
 
-/// Resumes a whole-transform-quarantined definition — ADR-0003's coarser,
+/// Resumes a whole-transform-frozen definition — ADR-0003's coarser,
 /// transform-wide fuse tier, distinct from [`resume_column`]'s per-column
 /// tier (which additionally requires the owning definition to already be
-/// `live`; a `quarantined` definition is, by construction, never that).
+/// `live`; a frozen definition is, by construction, never that).
 ///
-/// Requires `target`'s current status to be
-/// [`TransformStatus::Quarantined`] ([`ApplyError::TransformNotQuarantined`]
-/// otherwise, checked before any mutation — resuming a transform that isn't
-/// quarantined is caller error, not a silent no-op, matching
-/// [`resume_column`]'s [`ApplyError::ColumnNotPaused`] discipline). Drops
+/// **One resume for both of ADR-0014's pause triggers** (issue #142).
+/// `target`'s current status must be either [`TransformStatus::Quarantined`]
+/// (the poison fuse tripped it) or [`TransformStatus::Paused`] (an operator
+/// froze it deliberately via [`crate::Trellis::pause_transform`]) —
+/// [`ApplyError::TransformNotPaused`] otherwise, checked before any
+/// mutation, because resuming a transform that isn't frozen at all is caller
+/// error, not a silent no-op, matching [`resume_column`]'s
+/// [`ApplyError::ColumnNotPaused`] discipline. The recovery is identical for
+/// both triggers and deliberately so: ADR-0014's "resume rebuilds by
+/// backfill, not by catch-up" is exactly the behaviour this function already
+/// had, since a frozen definition's share of the change stream is drained
+/// for its siblings while it's frozen and is not recoverable by replay. Drops
 /// the definition to [`TransformStatus::WaitingToBackfill`] and re-parks a
 /// fresh `pending_backfill` marker for its source table (reusing
 /// [`crate::intake::publication::park_backfill_catchup`] — the exact
@@ -1326,8 +1333,11 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if status != TransformStatus::Quarantined {
-        return Err(ApplyError::TransformNotQuarantined {
+    if !matches!(
+        status,
+        TransformStatus::Quarantined | TransformStatus::Paused
+    ) {
+        return Err(ApplyError::TransformNotPaused {
             transform: target.to_string(),
         });
     }
@@ -1360,9 +1370,9 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     txn.commit().await?;
     tracing::info!(
         transform = %target,
-        from = %TransformStatus::Quarantined.as_str(),
+        from = %status.as_str(),
         to = %TransformStatus::WaitingToBackfill.as_str(),
-        "transform resumed from quarantine; re-parked for a fresh backfill"
+        "transform resumed; re-parked for a fresh backfill"
     );
     Ok(())
 }

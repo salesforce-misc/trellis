@@ -224,6 +224,36 @@ pub enum CatalogError {
     /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
     /// back to the ring ([`create_definition`]) rather than surfacing here.
     DirectBackfill(BackfillError),
+    /// [`super::lifecycle::pause_transform`] was asked to pause a target with
+    /// no corresponding `transform_definitions` row at all (issue #142). Its
+    /// sibling verb, `drop`, deliberately treats the same situation as an
+    /// idempotent success instead — see
+    /// [`super::lifecycle::drop_transform`]'s doc comment for why the two
+    /// differ.
+    TransformNotFound { transform: String },
+    /// [`super::lifecycle::drop_transform`] was asked to drop a definition
+    /// that is not frozen (issue #142, ADR-0014). There is no direct
+    /// live-to-gone edge in the lifecycle: quiescing through a pause is a
+    /// precondition, so the removal never has to reason about a claim-time
+    /// fold still dispatching to the target. Carries the status it actually
+    /// found, so the caller knows whether to pause first or to wait out a
+    /// backfill.
+    TransformNotPaused {
+        transform: String,
+        status: TransformStatus,
+    },
+    /// A still-live definition depends on the definition being dropped
+    /// (issue #142, ADR-0014's "Drops go in reverse dependency order — no
+    /// cascade"). Trellis refuses rather than cascading, and names the
+    /// blockers so the order to retire them in is explicit rather than
+    /// something the operator has to reconstruct.
+    DependentsBlockDrop {
+        /// What the caller asked to drop: a bare transform name, or
+        /// `from_table.relationship_name` for a relationship.
+        subject: String,
+        /// The bare target names of the live definitions standing in the way.
+        dependents: Vec<String>,
+    },
 }
 
 impl CatalogError {
@@ -255,6 +285,13 @@ impl CatalogError {
             CatalogError::ReplicaIdentityRequired(err) => err.code(),
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
+            CatalogError::TransformNotFound { .. } => ErrorCode::NotFound,
+            // Both are "the world isn't in the state this operation needs",
+            // not a rejection of the request's own shape — the same category
+            // `ApplyError::TransformNotPaused` reports for its own
+            // precondition.
+            CatalogError::TransformNotPaused { .. } => ErrorCode::Conflict,
+            CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
         }
     }
 }
@@ -306,6 +343,26 @@ impl fmt::Display for CatalogError {
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
+            CatalogError::TransformNotFound { transform } => {
+                write!(f, "no transform named '{transform}' is registered")
+            }
+            CatalogError::TransformNotPaused { transform, status } => write!(
+                f,
+                "'{transform}' is {}, not paused; a definition must be paused before it can \
+                 be dropped, so the apply path is quiesced before its target goes away",
+                status.as_str()
+            ),
+            CatalogError::DependentsBlockDrop {
+                subject,
+                dependents,
+            } => write!(
+                f,
+                "cannot drop '{subject}': {} still derive{} from it — retire {} first \
+                 (Trellis refuses rather than cascading)",
+                dependents.join(", "),
+                if dependents.len() == 1 { "s" } else { "" },
+                if dependents.len() == 1 { "it" } else { "them" },
+            ),
         }
     }
 }
@@ -324,6 +381,9 @@ impl std::error::Error for CatalogError {
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
+            CatalogError::TransformNotFound { .. } => None,
+            CatalogError::TransformNotPaused { .. } => None,
+            CatalogError::DependentsBlockDrop { .. } => None,
         }
     }
 }
