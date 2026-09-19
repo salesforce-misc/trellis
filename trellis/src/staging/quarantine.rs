@@ -1433,7 +1433,51 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let mut order: Vec<String> = Vec::new();
     let mut rows_by_pk: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
-        let pk_text: String = db_row.get(0);
+        // Issue #211: unlike this crate's shared key-contract text
+        // (`ddl::pk_key_sql_expr`/`join_pk_key`, which routes a nullable
+        // column's part through issue #110's `NULL_KEY_SENTINEL`/escape
+        // treatment before it's ever bound anywhere), `pk_text` here is a
+        // raw, unencoded `{pk_ident}::text` cast straight against `source`'s
+        // own column — there is no sentinel to decode, just a genuine SQL
+        // `NULL` for a source row belonging to a NULL-keyed group. That's
+        // only reachable when `source` is itself an aggregate target: `pk`
+        // (`ddl::source_primary_key`) is that aggregate's `GROUP BY`
+        // grouping-column PK, which `create_aggregate_target_table` declares
+        // `UNIQUE NULLS NOT DISTINCT` rather than a real `PRIMARY KEY`
+        // specifically so it *can* hold NULL (issue #110's whole subject) —
+        // a genuine, never-NULL source primary key can never produce this.
+        //
+        // `def` (this recompute's own target, gated single-column-PK-1-1 by
+        // `require_single_column_pk` above) can never hold a row for that
+        // NULL-keyed group either way: `ddl::create_target_table` always
+        // declares its own primary key column a real `primary key`, which
+        // Postgres makes NOT NULL unconditionally regardless of whether the
+        // *source* column this target's key was narrowed from is itself
+        // nullable. That's exactly the reasoning issue #205 used to drop a
+        // NULL-keyed group from `apply::apply_target`'s write path instead
+        // of storing a literal sentinel/NULL as a target PK value, and the
+        // same outcome `defs::backfill::discover_pk_ranges`'s ordered
+        // `(lo, hi]` PK-range walk already produces structurally (a
+        // NULL-keyed row is `unknown` against every `<=`/`>` chunk bound, so
+        // it's never selected by any chunk, and a from-scratch backfill of
+        // this same target never attempts to insert it either).
+        //
+        // So a NULL-keyed group's row has nothing to recompute *and* nothing
+        // to write back — there is no target row `column`'s new value could
+        // ever land in — and is dropped here before it ever reaches
+        // `rows_by_pk`/`order`: it never gets an entry in the relationship
+        // context this function builds below (`build_relationship_context`,
+        // for any definition that reads relationships), and the row loop
+        // further down (which walks `order` and issues one `UPDATE ...
+        // where {pk_ident}::text = $2` per entry) never attempts a write for
+        // it — the same "no representable row" answer a from-scratch
+        // backfill already gives this group, kept consistent here rather
+        // than panicking (the pre-fix behavior: `tokio-postgres` refuses to
+        // convert a SQL `NULL` into a `String`) or attempting a write no
+        // primary-key constraint could ever accept anyway.
+        let Some(pk_text): Option<String> = db_row.get(0) else {
+            continue;
+        };
         let key: String = db_row.get(1);
         let value: Option<String> = db_row.get(2);
         rows_by_pk
