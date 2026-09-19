@@ -13,9 +13,10 @@
 //! is the generative fuzz suite's *independent, evaluator-driven cross-check
 //! leg* — a second recompute whose only job is to catch divergence between
 //! the engine's Rust evaluator and Postgres semantics. Because it must stay
-//! independent of both [`crate::Trellis::self_check`] and the suite's own SQL
-//! oracle, it cannot become a public method. This module is that leg's reach
-//! into the engine, plus the small set of type and registry lookups its
+//! independent of both the shipped `self_check` audit (ADR-0013; not yet
+//! implemented) and the suite's own SQL oracle, it cannot become a public
+//! method. This module is that leg's reach into the
+//! engine, plus the small set of type and registry lookups its
 //! correctness assertions need. `benchmark`'s scenario oracle, which renders
 //! the engine's own `SELECT` for a definition and compares a persisted target
 //! against it, is the same shape of consumer.
