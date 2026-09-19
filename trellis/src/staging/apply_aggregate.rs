@@ -3038,10 +3038,18 @@ mod tests {
             ddl::PrimaryKeyColumn {
                 name: "warehouse".to_string(),
                 data_type: "text".to_string(),
+                // An aggregate target's grouping columns are nullable
+                // (`UNIQUE NULLS NOT DISTINCT`), which is what selects the
+                // NULL-sentinel encoding `derive_group_key` produces.
+                nullable: true,
             },
             ddl::PrimaryKeyColumn {
                 name: "sku".to_string(),
                 data_type: "text".to_string(),
+                // An aggregate target's grouping columns are nullable
+                // (`UNIQUE NULLS NOT DISTINCT`), which is what selects the
+                // NULL-sentinel encoding `derive_group_key` produces.
+                nullable: true,
             },
         ];
         assert_eq!(
@@ -3100,10 +3108,18 @@ mod tests {
             ddl::PrimaryKeyColumn {
                 name: "warehouse".to_string(),
                 data_type: "text".to_string(),
+                // An aggregate target's grouping columns are nullable
+                // (`UNIQUE NULLS NOT DISTINCT`), which is what selects the
+                // NULL-sentinel encoding `derive_group_key` produces.
+                nullable: true,
             },
             ddl::PrimaryKeyColumn {
                 name: "sku".to_string(),
                 data_type: "text".to_string(),
+                // An aggregate target's grouping columns are nullable
+                // (`UNIQUE NULLS NOT DISTINCT`), which is what selects the
+                // NULL-sentinel encoding `derive_group_key` produces.
+                nullable: true,
             },
         ];
         assert_eq!(
@@ -3145,6 +3161,9 @@ mod tests {
         let pk = vec![ddl::PrimaryKeyColumn {
             name: "sku".to_string(),
             data_type: "text".to_string(),
+            // Nullable: an aggregate target's `UNIQUE NULLS NOT DISTINCT`
+            // grouping column, not a real PRIMARY KEY.
+            nullable: true,
         }];
         assert_eq!(
             ddl::split_pk_key(&pk, "sku_totals", &null_key)

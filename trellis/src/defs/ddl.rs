@@ -117,6 +117,20 @@ pub struct PrimaryKeyColumn {
     /// `integer`, `text`, `bigint`) — safe to interpolate directly into DDL
     /// text since it comes from the catalog, not user input.
     pub data_type: String,
+    /// Whether this key column can actually hold SQL `NULL` (`not
+    /// pg_attribute.attnotnull`), which is what selects between this crate's
+    /// two key-component encodings — see [`encode_key_part`]'s
+    /// "[`nullable`](PrimaryKeyColumn::nullable) selects the encoding"
+    /// section.
+    ///
+    /// `false` for every real `PRIMARY KEY` column (Postgres makes a primary
+    /// key's columns `NOT NULL` unconditionally) and for the all-`NOT NULL`
+    /// `UNIQUE` index [`source_primary_key`] also accepts. `true` only for
+    /// the `UNIQUE NULLS NOT DISTINCT` grouping-column constraint
+    /// [`create_aggregate_target_table`] puts on an aggregate target, whose
+    /// `GROUP BY` columns are deliberately nullable — issue #110's whole
+    /// subject.
+    pub nullable: bool,
 }
 
 /// Why target-table DDL could not be generated or executed.
@@ -439,7 +453,9 @@ pub(crate) async fn source_primary_key_in_txn(
                  order by i.indisprimary desc, i.indexrelid asc
                  limit 1
              )
-             select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod)
+             select a.attname::text,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    not a.attnotnull
              from pg_index i
              join chosen_index c on c.indexrelid = i.indexrelid
              join pg_attribute a
@@ -459,6 +475,7 @@ pub(crate) async fn source_primary_key_in_txn(
     for row in rows {
         let name: String = row.get(0);
         let data_type: String = row.get(1);
+        let nullable: bool = row.get(2);
         if !super::catalog::is_text_stable_join_key_type(&data_type) {
             return Err(DdlError::UnsupportedPrimaryKeyType {
                 source_table: source_table.to_string(),
@@ -466,7 +483,11 @@ pub(crate) async fn source_primary_key_in_txn(
                 pg_type: data_type,
             });
         }
-        columns.push(PrimaryKeyColumn { name, data_type });
+        columns.push(PrimaryKeyColumn {
+            name,
+            data_type,
+            nullable,
+        });
     }
     Ok(columns)
 }
@@ -545,17 +566,23 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 /// contract.
 ///
 /// Every producer of this crate's composite/single key text must route
-/// *every* component — `NULL` or not — through [`encode_key_part`] (Rust
-/// side) or the equivalent [`null_key_escape_sql`] (SQL side, baked into
-/// [`pk_key_sql_expr`]) before joining it in, and every consumer must decode
-/// it back through [`decode_key_part`] (used by [`split_pk_key`]) — so a
-/// `NULL` component agrees byte-for-byte on both sides of the wire, the same
-/// "one shape, every producer and consumer" property
-/// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment describes for the separator.
-/// "Every component, not just the `NULL` ones" is what makes the escape
-/// above actually hold: a producer that skipped the encode for its non-`NULL`
-/// parts would emit a *different* text than one that did, for any value
-/// containing a U+0001.
+/// every component of a **nullable** key column — `NULL` or not — through
+/// [`encode_key_part`] (Rust side) or the equivalent
+/// [`null_key_escape_sql`] (SQL side, baked into [`pk_key_sql_expr`]) before
+/// joining it in, and every consumer must decode it back through
+/// [`decode_key_part`] (used by [`split_pk_key`]) — so a `NULL` component
+/// agrees byte-for-byte on both sides of the wire, the same "one shape,
+/// every producer and consumer" property [`COMPOSITE_KEY_SEPARATOR`]'s doc
+/// comment describes for the separator. "Every component of that column, not
+/// just the `NULL` ones" is what makes the escape above actually hold: a
+/// producer that skipped the encode for its non-`NULL` parts would emit a
+/// *different* text than one that did, for any value containing a U+0001.
+///
+/// A `NOT NULL` key column takes the *other* encoding — its raw `col::text`,
+/// unchanged — for the reason spelled out in [`encode_key_part`]'s
+/// "[`PrimaryKeyColumn::nullable`] selects the encoding" section. Which of
+/// the two a given column gets is decided per column, from the catalog, by
+/// [`PrimaryKeyColumn::nullable`]; it is never decided by the key's arity.
 pub(crate) const NULL_KEY_SENTINEL: &str = "\u{1}";
 
 /// What [`encode_key_part`] rewrites a genuine, in-value U+0001 to: the
@@ -592,6 +619,37 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// whose key column genuinely held a lone U+0001 would silently share one
 /// encoded key with the `NULL` group — two distinct groups folded into one,
 /// a silent-corruption bug strictly worse than issue #110's own.
+///
+/// # [`PrimaryKeyColumn::nullable`] selects the encoding
+///
+/// This encoding is applied to a key component **if and only if that
+/// component's key column is nullable** ([`PrimaryKeyColumn::nullable`]) —
+/// in practice, only an aggregate target's `UNIQUE NULLS NOT DISTINCT`
+/// `GROUP BY` columns ([`create_aggregate_target_table`]) and the Rust-side
+/// group key `staging::apply_aggregate::derive_group_key` builds for them. A
+/// `NOT NULL` key column — every real `PRIMARY KEY`, and the all-`NOT NULL`
+/// `UNIQUE` index [`source_primary_key`] also accepts — keeps its raw
+/// `col::text` instead, with no substitution and no escape.
+///
+/// That is not an optimization, it is a correctness requirement, and it is
+/// specifically *not* an arity-1 exemption (a single-column nullable `GROUP
+/// BY` is exactly issue #110's original bug and still gets the full
+/// treatment here). The reason is that a not-null primary key's encoded text
+/// does not stay internal to the ring: for a 1-1 definition,
+/// `staging::apply::apply_target` binds the staged key text *directly* as
+/// the literal stored value of the target table's own primary-key column
+/// (`$n::text::{pk_cast}`), while three other writers/readers of that very
+/// column use the source's raw value instead —
+/// `defs::backfill`'s `insert into {target} select {pk} from {source}`,
+/// `staging::quarantine::recompute_column`'s `where {pk}::text = $2`
+/// write-back, and `defs::oracle::recompute`'s `{pk}::text`. An encoding
+/// that changes a real value's text therefore makes those paths disagree,
+/// duplicating or orphaning the target row for exactly the values it
+/// rewrites — empirically reproduced for a `text` primary key holding a
+/// literal U+0001 (see
+/// `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
+/// never *need* the `NULL` substitution, the only safe encoding for it is
+/// the identity one.
 pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
     match value {
         None => Cow::Borrowed(NULL_KEY_SENTINEL),
@@ -667,6 +725,20 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
                 Some(a) => format!("{a}.{ident}::text"),
                 None => format!("{ident}::text"),
             };
+            // A NOT NULL key column (every real PRIMARY KEY) renders as its
+            // raw `col::text`, exactly as it did before issue #110 — it can
+            // never produce the NULL component the encoding below exists
+            // for, and its encoded text is not private to the ring: a 1-1
+            // definition's `staging::apply::apply_target` binds it straight
+            // in as the *stored value* of the target's own primary-key
+            // column, where `defs::backfill`/`staging::quarantine`/
+            // `defs::oracle` all use the raw source value. See
+            // `encode_key_part`'s "`PrimaryKeyColumn::nullable` selects the
+            // encoding" section; `encode_key_part` is this branch's Rust
+            // twin (its callers skip it outright for a not-null key).
+            if !c.nullable {
+                return col_text;
+            }
             // Issue #110: a NULL component is coalesced to `chr(1)`
             // (`NULL_KEY_SENTINEL`; deliberately not `chr(0)` — Postgres's
             // `chr()` itself refuses to construct a NUL byte, see that
@@ -751,7 +823,22 @@ pub(crate) fn split_pk_key<'a>(
             actual_arity: parts.len(),
         });
     }
-    Ok(parts.into_iter().map(decode_key_part).collect())
+    // Per column, the exact inverse of what `pk_key_sql_expr`/
+    // `encode_key_part` produced for it: a nullable column's part is
+    // decoded, a NOT NULL column's part is its own raw text (which is all
+    // that was ever encoded for it). See `encode_key_part`'s
+    // "`PrimaryKeyColumn::nullable` selects the encoding" section.
+    Ok(parts
+        .into_iter()
+        .zip(pk)
+        .map(|(part, column)| {
+            if column.nullable {
+                decode_key_part(part)
+            } else {
+                Some(Cow::Borrowed(part))
+            }
+        })
+        .collect())
 }
 
 /// [`split_pk_key`], applied to a whole batch of keys and transposed so
@@ -1448,12 +1535,29 @@ mod tests {
         assert_eq!(neighbor_table_name(&def()), "order_totals");
     }
 
+    /// A **nullable** key — the aggregate-target (`UNIQUE NULLS NOT
+    /// DISTINCT`) shape every issue #110 encoding test here is about. Use
+    /// [`not_null_pk`] for a real `PRIMARY KEY`.
     fn pk(columns: &[&str]) -> Vec<PrimaryKeyColumn> {
         columns
             .iter()
             .map(|name| PrimaryKeyColumn {
                 name: (*name).to_string(),
                 data_type: "text".to_string(),
+                nullable: true,
+            })
+            .collect()
+    }
+
+    /// A real `PRIMARY KEY`'s columns: `NOT NULL`, and therefore rendered
+    /// and decoded raw — see [`encode_key_part`]'s
+    /// "[`PrimaryKeyColumn::nullable`] selects the encoding" section.
+    fn not_null_pk(columns: &[&str]) -> Vec<PrimaryKeyColumn> {
+        pk(columns)
+            .into_iter()
+            .map(|c| PrimaryKeyColumn {
+                nullable: false,
+                ..c
             })
             .collect()
     }
@@ -1480,6 +1584,83 @@ mod tests {
             "array_to_string(array[\
              coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1)), \
              coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))], chr(31))"
+        );
+    }
+
+    /// The other half of that contract, and the fix for the data-corruption
+    /// bug issue #110's own escape introduced: a **not-null** key column —
+    /// every real `PRIMARY KEY` — renders as its bare `<col>::text`, with no
+    /// `coalesce` and no `replace`, at either arity. It can never produce a
+    /// `NULL` component to substitute, and its rendered text is not private
+    /// to the ring: `staging::apply::apply_target` binds the staged key
+    /// straight in as a 1-1 target's own literal primary-key value, which
+    /// `defs::backfill`/`staging::quarantine`/`defs::oracle` write and read
+    /// raw. Deliberately *not* an arity-1 exemption — the arity-1 nullable
+    /// case above (a single-column nullable `GROUP BY`) is issue #110's
+    /// original bug and keeps the full encoding.
+    #[test]
+    fn pk_key_sql_expr_renders_a_not_null_key_column_raw() {
+        assert_eq!(
+            pk_key_sql_expr(&not_null_pk(&["warehouse"]), Some("t")),
+            "t.\"warehouse\"::text"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&not_null_pk(&["warehouse", "sku"]), Some("t")),
+            "array_to_string(array[t.\"warehouse\"::text, t.\"sku\"::text], chr(31))"
+        );
+        assert_eq!(pk_key_sql_expr(&not_null_pk(&["id"]), None), "\"id\"::text");
+    }
+
+    /// The Rust-side producer's twin of the test above: nothing encodes a
+    /// not-null key's parts, so a genuine U+0001 inside a primary-key value
+    /// survives [`join_pk_key`]/[`split_pk_key`] verbatim rather than being
+    /// doubled — and the lone-sentinel text is *not* decoded back to `None`
+    /// for such a column, since a not-null column never had a `NULL` to
+    /// encode.
+    #[test]
+    fn split_pk_key_leaves_a_not_null_columns_part_verbatim() {
+        let key = join_pk_key(["a\u{1}b", "\u{1}"]);
+        assert_eq!(key, "a\u{1}b\u{1f}\u{1}");
+        assert_eq!(
+            split_pk_key(&not_null_pk(&["warehouse", "sku"]), "t", &key)
+                .expect("decodes")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("a\u{1}b"), Some("\u{1}")]
+        );
+    }
+
+    /// Nullability is decided per *column*, not per key: a mixed key (a
+    /// not-null column alongside a nullable one) encodes each half its own
+    /// way, and each decodes back exactly.
+    #[test]
+    fn a_mixed_nullability_key_encodes_each_column_its_own_way() {
+        let mixed = vec![
+            PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+            },
+            PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+            },
+        ];
+        assert_eq!(
+            pk_key_sql_expr(&mixed, Some("t")),
+            "array_to_string(array[t.\"warehouse\"::text, \
+             coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))], chr(31))"
+        );
+        let key = join_pk_key(["a\u{1}b", NULL_KEY_SENTINEL]);
+        assert_eq!(
+            split_pk_key(&mixed, "t", &key)
+                .expect("decodes")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("a\u{1}b"), None]
         );
     }
 

@@ -179,18 +179,31 @@ async fn fetch_confirmed_lsn(
 /// written to the WAL, say — where the flags remain the only surviving
 /// description of its key; see `handle_xlog_data`'s `Relation` arm.
 ///
-/// Issue #110's NULL-safe key encoding: this function can never produce a
-/// `NULL` component itself — `key_value` below already rejects anything but
-/// [`ColumnValue::Text`] with [`IntakeError::MissingKeyValue`], and a real
-/// table's `PRIMARY KEY`/`REPLICA IDENTITY FULL` column can never itself be
-/// SQL `NULL`. It must nevertheless route every part through
-/// [`crate::defs::ddl::encode_key_part`], exactly like the SQL-side producer
-/// (`ddl::pk_key_sql_expr`) and `staging::apply_aggregate::derive_group_key`
-/// do, because that encoding is not a no-op for a *non*-`NULL` value either:
-/// a real U+0001 inside a key column's text is escaped (doubled) so it can
-/// never be read back as the `NULL` sentinel. Skipping it here would make
-/// this producer disagree byte-for-byte with `pk_key_sql_expr` for exactly
-/// those values, and a live refetch would then miss the row.
+/// Issue #110's NULL-safe key encoding deliberately does **not** apply here:
+/// every part is its column's raw text. This function can never produce a
+/// `NULL` component in the first place — `key_value` below already rejects
+/// anything but [`ColumnValue::Text`] with [`IntakeError::MissingKeyValue`],
+/// and the key columns it reads are a real `PRIMARY KEY`'s
+/// ([`primary_key_columns`] filters on `pg_index.indisprimary`, so Postgres
+/// itself guarantees them `NOT NULL`) or a replica identity's, likewise
+/// never `NULL`. The SQL-side producer (`ddl::pk_key_sql_expr`) renders
+/// those same not-null columns raw for exactly that reason
+/// ([`crate::defs::ddl::PrimaryKeyColumn::nullable`] is `false` for them),
+/// so the two agree byte-for-byte.
+///
+/// Routing this side through [`crate::defs::ddl::encode_key_part`] instead
+/// would not merely be redundant, it would corrupt data: for a 1-1
+/// definition the staged key text is bound *directly* in as the target
+/// table's own literal primary-key value by `staging::apply::apply_target`,
+/// while `defs::backfill`, `staging::quarantine::recompute_column` and
+/// `defs::oracle::recompute` all write/read that same column from the raw
+/// source value — so a key column whose text genuinely contains a U+0001
+/// would land under the escaped (doubled) text on the incremental path and
+/// the raw text on every other one. See `ddl::encode_key_part`'s
+/// "`PrimaryKeyColumn::nullable` selects the encoding" section. Only a
+/// genuinely nullable key — an aggregate target's `GROUP BY` columns, which
+/// never reach this function — takes the encoded form
+/// (`staging::apply_aggregate::derive_group_key`).
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],
@@ -218,7 +231,7 @@ fn extract_key(
                     .iter()
                     .position(|col| &col.name == name)
                     .ok_or_else(missing_key)?;
-                parts.push(crate::defs::ddl::encode_key_part(Some(key_value(i)?)));
+                parts.push(key_value(i)?);
             }
         }
         None => {
@@ -226,7 +239,7 @@ fn extract_key(
                 if !col.is_key {
                     continue;
                 }
-                parts.push(crate::defs::ddl::encode_key_part(Some(key_value(i)?)));
+                parts.push(key_value(i)?);
             }
         }
     }
@@ -1120,6 +1133,40 @@ mod tests {
             ColumnValue::Text("hello".into()),
         ];
         assert_eq!(extract_key(&r, &tuple, None).unwrap(), "t1\u{1f}42");
+    }
+
+    /// A primary-key value that genuinely contains a U+0001 is staged
+    /// **verbatim**, not escaped: `ddl::pk_key_sql_expr` renders a not-null
+    /// key column raw too, and — decisively — a 1-1 definition's
+    /// `staging::apply::apply_target` binds this very text in as the target
+    /// table's own literal primary-key value, where `defs::backfill`,
+    /// `staging::quarantine::recompute_column` and `defs::oracle::recompute`
+    /// all write and read the raw source value. Escaping here doubled the
+    /// U+0001 on the incremental path only, so the source row's target row
+    /// was written under a key no other path could find — duplicating it on
+    /// re-derive and orphaning it on delete. See
+    /// `ddl::encode_key_part`'s "`PrimaryKeyColumn::nullable` selects the
+    /// encoding" section, and the end-to-end
+    /// `trellis/tests/one_to_one_control_char_pk.rs`.
+    #[test]
+    fn extract_key_keeps_a_control_character_in_a_key_value_verbatim() {
+        let r = relation(vec![("id", true), ("payload", false)]);
+        let tuple = vec![
+            ColumnValue::Text("a\u{1}b".into()),
+            ColumnValue::Text("hello".into()),
+        ];
+        assert_eq!(extract_key(&r, &tuple, None).unwrap(), "a\u{1}b");
+
+        let pk = vec!["tenant".to_string(), "id".to_string()];
+        let r = relation(vec![("tenant", true), ("id", true)]);
+        let tuple = vec![
+            ColumnValue::Text("\u{1}".into()),
+            ColumnValue::Text("a\u{1}\u{1}b".into()),
+        ];
+        assert_eq!(
+            extract_key(&r, &tuple, Some(&pk)).unwrap(),
+            "\u{1}\u{1f}a\u{1}\u{1}b"
+        );
     }
 
     #[test]
