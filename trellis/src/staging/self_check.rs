@@ -110,6 +110,36 @@ pub enum SelfCheckMode {
     /// A divergence is provisional until it survives a re-check after a
     /// fresh await — sound under live load, at the cost of up to double the
     /// work when something actually diverges.
+    ///
+    /// **Known, accepted limitation: the re-check's guarantee is identity
+    /// stability, not value non-transience.** [`await_then_compare`] takes
+    /// its watermark token and runs [`converge::await_converged`] on one
+    /// connection borrowed from the pool, then [`compare_once`] opens its
+    /// `REPEATABLE READ` transaction on a separate `pool.get()` call — which
+    /// may hand back a *different* connection. A commit landing in that gap
+    /// is visible to the source read but not yet applied to the target. Two
+    /// independent passes can each catch this same lag race on the same hot
+    /// `(key, column)`, with a different transient value each time, and
+    /// because divergences are matched by identity (key/column) across
+    /// passes rather than by exact value (see [`DivergenceIdentity`]), such
+    /// a case is reported as a stable, real divergence even though it is
+    /// still just lag.
+    ///
+    /// This is a deliberate tradeoff, not a bug to fix by changing the
+    /// matching logic: matching by exact value instead would trade this
+    /// narrow false-positive risk for false *negatives* — a genuinely-broken
+    /// column that happens to change value on every pass under active writes
+    /// would then be silently suppressed, which is worse for an audit tool.
+    /// The window is also intrinsic to the whole re-check approach — you
+    /// cannot await convergence for a snapshot you have already pinned — so
+    /// there is no narrower fix available within this design.
+    ///
+    /// In short: a [`SelfCheckOutcome::Diverged`] under `Standard` means
+    /// "this divergence's identity was stable across two passes," not "this
+    /// divergence's value is guaranteed non-transient." Callers needing the
+    /// stronger guarantee should quiesce writes themselves and use
+    /// [`SelfCheckMode::Strict`], which skips the re-check (and therefore
+    /// this window) entirely.
     Standard,
     /// Skips the re-check: a divergence found on the first pass is reported
     /// immediately. **Sound only when the caller has already stopped writes
@@ -437,6 +467,12 @@ pub async fn self_check(
 /// to differ between the two passes (a target genuinely mid-catch-up can
 /// hold a different, still-wrong value on each pass and still be the *same*
 /// stable divergence) as long as the cell keeps diverging at all.
+///
+/// Matching by identity rather than by exact value is what makes the
+/// cross-connection lag window documented on [`SelfCheckMode::Standard`]
+/// possible: a hot `(key, column)` caught mid-lag on both passes, with two
+/// different transient values, matches here and is reported as stable. See
+/// that doc comment for why this is the accepted tradeoff rather than a bug.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum DivergenceIdentity {
     Cell { key: String, column: String },
