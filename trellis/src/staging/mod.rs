@@ -93,7 +93,9 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `staging::self_check::SelfCheckError`, matching `ApplyError`/
 // `StagingError`'s own error-type precedent, so this flat re-export would
 // be unused.
-pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope};
+pub use self_check::{
+    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope,
+};
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
 pub use watermark::StagedWatermark;
