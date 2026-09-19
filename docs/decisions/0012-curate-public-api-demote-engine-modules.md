@@ -48,7 +48,7 @@ an unnameable public error type is not an acceptable surface.
 
 The facade does not grow a typed method per operation — `define`,
 `define_relationship`, `pause`, `resume`, `amend`, `drop`, and whatever comes next.
-Every definition-changing operation enters through a **single `define` entrypoint**
+Every definition-changing operation enters through a **single `apply` entrypoint**
 (and its blocking mirror) that accepts a statement in Trellis's grammar — the same
 grammar the CLI client speaks. The statement itself discriminates the operation:
 define a transform, define a relationship, pause, resume, amend, drop. Parsing the
