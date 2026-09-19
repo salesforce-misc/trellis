@@ -119,8 +119,7 @@ drained?"), not a work-arrival poll.
 
 A loop that drains until a round claims nothing is ambiguous: a zero-work round means
 *idle*, **or** the claim was **refused** — seal-gate backpressure
-([03](03-sealing-and-the-fence.md)), a pause lease held by an auditor
-([04](04-claiming-and-the-fold.md)), a lost seal race, or a sealed batch another
+([03](03-sealing-and-the-fence.md)), a lost seal race, or a sealed batch another
 worker holds. The idle sweep makes no progress in the refused cases, so "claimed
 nothing and the sweep did nothing" is not convergence. Split it:
 
@@ -128,7 +127,6 @@ nothing and the sweep did nothing" is not convergence. Split it:
 |---|---|---|
 | nothing drainable pending anywhere | converged | return |
 | the sweep freed something | more to do | loop |
-| pause lease active | claiming gated fleet-wide | wait; lease auto-expires |
 | pending **and** sealable here | this connection's seal is refused | wait in short steps against a bounded budget, then a **named backpressure error** — never a generic "values are not stabilizing", which would point at a schema cycle that does not exist |
 | pending and not sealable here | a peer holds the batch | wait; bounded by the peer finishing, or the claim TTL if it died. Timing out names the *holder*, not a cycle |
 

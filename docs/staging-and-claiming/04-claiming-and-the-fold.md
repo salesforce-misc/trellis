@@ -243,17 +243,20 @@ mirror-image reason the keepalive does: a registry row locked by its own
 claimant's apply transaction is not a dead claimant, and the sweep must never block
 behind one.
 
-## An orthogonal gate: the pause lease
+## A gate that was considered and not adopted: the pause lease
 
-Suspending *claiming* fleet-wide is occasionally necessary — a self-check auditor
-needs a quiescent read. It is a heartbeated **lease** with an `expires_at`, not a
-latch, so a dead pauser can never wedge the fleet. It gates the claim and
-seal-on-demand at the top of a drain call; a batch already claimed finishes
-normally.
+Suspending *claiming* fleet-wide — a heartbeated **lease** with an `expires_at`
+gating the claim at the top of a drain call — was scaffolded as one way to give an
+auditor a quiescent read. It is **not** how the shipped auditor works.
 
-If you build one, make the heartbeat `WHERE expires_at > now()` so a heartbeat
-arriving *after* expiry cannot silently resurrect a lapsed lease and mask the very
-window that made the paused read unsound.
+The self-check auditor is `Trellis::self_check`
+([ADR-0013](../decisions/0013-self-check-production-recompute-audit.md)), and it gets
+its quiescence a different way: it awaits convergence through a watermark, reads the
+target and its recompute inside one `REPEATABLE READ` transaction, and reports a
+divergence only if it *survives a fresh await*. Its strict mode assumes writes to the
+audited tables are stopped by the caller, not that Trellis pauses its own claim path.
+No caught-up-read guarantee depends on suspending claiming fleet-wide, so the pause
+lease has no consumer and the scaffolding is being removed (see #191).
 
 ## What is load-bearing here
 
