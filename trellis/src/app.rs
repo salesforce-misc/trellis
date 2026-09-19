@@ -64,7 +64,11 @@
 //! // a plain 1-1 transform `define()` returned before fully building.
 //! let running = Trellis::connect(
 //!     Config::resolve(None)?,
-//!     TrellisOptions { staging: true, drain_threads: 2 },
+//!     TrellisOptions {
+//!         staging: true,
+//!         drain_threads: 2,
+//!         ..Default::default()
+//!     },
 //! )
 //! .await?;
 //! // Poll until every registered transform is done backfilling.
@@ -93,12 +97,13 @@ use crate::staging::quarantine;
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
 ///
-/// The two knobs mirror [`ClientOptions`]'s core contract (see its doc
-/// comment): whether this connection owns CDC intake + ring maintenance, and
-/// how many drain (application) workers it runs. A connection that only
-/// defines transforms leaves both at their defaults (nothing background
-/// starts); a connection that runs the live pipeline sets `staging` and a
-/// non-zero `drain_threads`.
+/// `staging`/`drain_threads` mirror [`ClientOptions`]'s core contract (see
+/// its doc comment): whether this connection owns CDC intake + ring
+/// maintenance, and how many drain (application) workers it runs. A
+/// connection that only defines transforms leaves both at their defaults
+/// (nothing background starts); a connection that runs the live pipeline
+/// sets `staging` and a non-zero `drain_threads`. `worker_threads` is
+/// unrelated to either — see its own doc comment.
 #[derive(Debug, Clone, Default)]
 pub struct TrellisOptions {
     /// Whether this connection runs the CDC subscriber and ring maintenance
@@ -110,6 +115,21 @@ pub struct TrellisOptions {
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
     pub drain_threads: usize,
+    /// Caps the worker-thread count of the `tokio` runtime
+    /// [`BlockingTrellis::connect`](crate::BlockingTrellis::connect) builds
+    /// to own this connection (see its module doc comment) — irrelevant to
+    /// [`Trellis::connect`] itself, which never builds a runtime of its own.
+    /// `None` (the default) preserves today's behavior: `tokio`'s own
+    /// default of one worker thread per core.
+    ///
+    /// Matters chiefly when Trellis is embedded inside a host VM that
+    /// already sized its own scheduler pool to core count — a BEAM node, or
+    /// a Ruby process with its own thread pool — where the unbounded
+    /// default silently doubles the thread population with threads the host
+    /// can't see, account for, or size around. Since the embedded runtime's
+    /// own work is I/O, not compute-bound, a small explicit count (2, say)
+    /// is enough; see issue #141.
+    pub worker_threads: Option<usize>,
 }
 
 /// A connected Trellis instance — see the [module docs](self).

@@ -211,6 +211,7 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     let options = TrellisOptions {
         staging: args.staging,
         drain_threads: args.drain_threads,
+        ..Default::default()
     };
     let trellis = Trellis::connect(config, options)
         .await

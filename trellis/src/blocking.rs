@@ -107,10 +107,7 @@ impl BlockingTrellis {
         let thread = std::thread::Builder::new()
             .name("trellis-blocking".to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                {
+                let runtime = match build_runtime(options.worker_threads) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         let _ = ready_tx.send(Err(TrellisError::BlockingSpawn(err)));
@@ -285,6 +282,21 @@ impl BlockingTrellis {
     }
 }
 
+/// Builds the background thread's `tokio` runtime, capping its worker-thread
+/// count at `worker_threads` when given (see
+/// [`TrellisOptions::worker_threads`]'s doc comment) and leaving `tokio`'s
+/// own default (one worker thread per core) otherwise. Split out from
+/// [`BlockingTrellis::connect`] so the worker-count wiring itself is
+/// unit-testable without needing a real database (see the `tests` module
+/// below).
+fn build_runtime(worker_threads: Option<usize>) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(worker_threads) = worker_threads {
+        builder.worker_threads(worker_threads);
+    }
+    builder.enable_all().build()
+}
+
 /// Runs entirely inside the background thread's runtime: connects the real
 /// [`Trellis`], signals readiness, then services [`Job`]s until the channel
 /// closes (every [`BlockingTrellis`] handle dropped without calling
@@ -355,5 +367,50 @@ async fn run(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_runtime;
+
+    /// Issue #141: an explicit `Some(n)` must actually cap the runtime's
+    /// worker-thread count at `n`, not just get accepted and ignored.
+    /// `RuntimeMetrics::num_workers` reports the runtime's real worker-thread
+    /// count, so this exercises the same `Builder::worker_threads` call
+    /// [`super::BlockingTrellis::connect`] makes, without needing a real
+    /// database.
+    #[test]
+    fn worker_threads_some_caps_the_runtime_at_that_count() {
+        for n in [1, 2, 3] {
+            let runtime = build_runtime(Some(n)).expect("build runtime");
+            assert_eq!(
+                runtime.handle().metrics().num_workers(),
+                n,
+                "worker_threads(Some({n})) must produce a runtime with exactly {n} workers"
+            );
+        }
+    }
+
+    /// Issue #141: leaving `worker_threads` at `None` (the default) must
+    /// preserve today's behavior untouched — `tokio`'s own per-core default
+    /// — rather than this crate silently substituting some other number.
+    /// `tokio` computes that default from `std::thread::available_parallelism`
+    /// (falling back to 1), so this asserts against that same source rather
+    /// than a hardcoded count.
+    #[test]
+    fn worker_threads_none_preserves_tokios_own_default() {
+        // `tokio` lets `TOKIO_WORKER_THREADS` override its default too; skip
+        // rather than false-fail if this process happens to run with it set.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_some() {
+            return;
+        }
+        let expected = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let runtime = build_runtime(None).expect("build runtime");
+        assert_eq!(
+            runtime.handle().metrics().num_workers(),
+            expected,
+            "worker_threads(None) must preserve tokio's own default worker count"
+        );
     }
 }
