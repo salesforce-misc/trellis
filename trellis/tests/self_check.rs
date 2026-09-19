@@ -1,0 +1,398 @@
+//! Integration tests for `Trellis::self_check` (issue #174, ADR-0013's
+//! production recompute audit).
+//!
+//! Follows `trellis/tests/app_converge.rs`/`trellis/tests/quarantine.rs`'s
+//! own conventions: a real, ephemeral Postgres instance per test
+//! (`testkit::TestCluster`), drives setup through the public `Trellis`
+//! facade (`define`, `watermark_token`/`await_converged`), and "reaches past
+//! the mechanism, inserts directly" for whichever half of a scenario the
+//! mechanism under test doesn't itself produce — corrupting a target row or
+//! seeding `column_status` via a raw connection, the same way
+//! `trellis/tests/column_quarantine.rs` seeds its own scenarios.
+//!
+//! **A deliberately out-of-scope race** (judgment call, flagged rather than
+//! silently skipped): ADR-0013's re-check-on-divergence design also guards
+//! against a *sub-transaction* race — a brand-new commit landing in the
+//! narrow window between `self_check`'s own internal `await_converged`
+//! succeeding and the `REPEATABLE READ` transaction it opens immediately
+//! after actually establishing its snapshot. That window is microseconds
+//! wide with no artificial delay hook in the production code to widen it
+//! (adding one purely for this test wasn't judged worth the production-code
+//! complexity), so it isn't reproduced deterministically here.
+//! `self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_lagging_target`
+//! below covers the coarser, reliably-reproducible half of the same
+//! guarantee (a target that hasn't even begun to catch up must never be
+//! compared at all), and
+//! `staging::self_check::tests::divergence_identity_ignores_a_cells_persisted_and_recomputed_text`
+//! (`trellis/src/staging/self_check.rs`) unit-tests the re-check's own
+//! matching logic directly.
+
+use std::time::Duration;
+
+use testkit::TestCluster;
+use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::{
+    Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, Trellis, TrellisOptions,
+};
+
+/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// `trellis/tests/app_converge.rs`'s own helper of the same name.
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .await
+        .expect("set search_path");
+    client
+}
+
+const GENEROUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A correctly-converged 1-1 target must report
+/// [`SelfCheckOutcome::Converged`] — no divergence — the steady-state case
+/// every other test in this file is a variation on.
+#[tokio::test]
+async fn converged_target_reports_no_divergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer, tax integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute(
+        "insert into widgets (id, price, tax) values (1, 10, 1), (2, 20, 2)",
+        &[],
+    )
+    .await
+    .expect("insert source rows");
+
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, GENEROUS_TIMEOUT)
+        .await
+        .expect("await_converged");
+
+    let report = running
+        .self_check(
+            "widget_totals",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "expected Converged, got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 2);
+    assert_eq!(report.next_after, Some("2".to_string()));
+
+    running.shutdown().await.expect("shutdown running");
+}
+
+/// A target row corrupted directly via raw SQL (bypassing the engine
+/// entirely, the way `trellis/tests/quarantine.rs`/`column_quarantine.rs`
+/// seed their own scenarios) must be caught: `self_check` reports a
+/// [`Divergence::Cell`] whose `persisted` half is the corrupted value and
+/// whose `recomputed` half is the value the source data actually implies.
+/// Run under [`SelfCheckMode::Standard`] (not [`SelfCheckMode::Strict`]) —
+/// with nothing else writing to `widgets`/`widget_totals` after the
+/// corruption, this also proves the re-check pass doesn't spuriously erase a
+/// genuine, stable divergence.
+#[tokio::test]
+async fn self_check_detects_a_divergence_seeded_by_directly_corrupting_a_target_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer, tax integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute(
+        "insert into widgets (id, price, tax) values (1, 10, 1), (2, 20, 2)",
+        &[],
+    )
+    .await
+    .expect("insert source rows");
+
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, GENEROUS_TIMEOUT)
+        .await
+        .expect("await_converged");
+
+    // Directly corrupt row 1's persisted total — the correct value is 11
+    // (10 + 1); the engine never wrote 9999, this test does.
+    raw.execute("update widget_totals set total = 9999 where id = '1'", &[])
+        .await
+        .expect("corrupt target row");
+
+    let report = running
+        .self_check(
+            "widget_totals",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    match report.outcome {
+        SelfCheckOutcome::Diverged(divergences) => {
+            assert_eq!(
+                divergences,
+                vec![Divergence::Cell {
+                    key: "1".to_string(),
+                    column: "total".to_string(),
+                    persisted: Some("9999".to_string()),
+                    recomputed: Some("11".to_string()),
+                }]
+            );
+        }
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+
+    running.shutdown().await.expect("shutdown running");
+}
+
+/// A target that has real, unapplied source work pending — i.e. is merely
+/// lagging, not wrong — must report [`SelfCheckOutcome::NotCaughtUp`], never
+/// [`SelfCheckOutcome::Diverged`] (ADR-0013: "the correctness promise is
+/// conditional on being caught up ... self_check must never report a
+/// merely-lagging target as diverged"). Starts `running` staging-only (zero
+/// drain workers, mirroring `trellis/tests/app_converge.rs`'s own timeout
+/// test), so the inserted row is genuinely staged and sealed but never
+/// applied — deterministic, not a timing coincidence: nothing in this test
+/// could possibly converge before `self_check`'s own short timeout expires.
+#[tokio::test]
+async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_lagging_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    // Staging only: CDC intake + ring maintenance, but zero drain workers —
+    // nothing will ever apply this row.
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running (staging only)");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute("insert into widgets (id, price) values (1, 9)", &[])
+        .await
+        .expect("insert source row");
+
+    let report = running
+        .self_check(
+            "widget_prices",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("self_check");
+
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::NotCaughtUp),
+        "a target with real, unapplied work pending must report NotCaughtUp rather than \
+         diverging on a row that legitimately hasn't landed yet — got {:?}",
+        report.outcome
+    );
+    assert_eq!(
+        report.rows_compared, 0,
+        "NotCaughtUp must short-circuit before any comparison runs"
+    );
+
+    running.shutdown().await.expect("shutdown running");
+}
+
+/// A currently-paused column's deliberately-stale persisted value must be
+/// excluded from the comparison entirely (ADR-0013: "auditing it would
+/// report a false divergence on exactly the targets an operator is most
+/// likely to be inspecting"). Seeds `column_status` directly via raw SQL,
+/// the way `trellis/tests/column_quarantine.rs` seeds its own pause
+/// scenarios, rather than driving a real column fuse trip end to end.
+#[tokio::test]
+async fn self_check_excludes_a_paused_column_from_the_comparison() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer, tax integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_view FROM widgets SELECT price AS price, tax AS tax")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute(
+        "insert into widgets (id, price, tax) values (1, 10, 1)",
+        &[],
+    )
+    .await
+    .expect("insert source row");
+
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, GENEROUS_TIMEOUT)
+        .await
+        .expect("await_converged");
+
+    // Corrupt `tax` (a stand-in for "the value it was frozen to when its
+    // fuse tripped") and mark it paused — `self_check` must not report this
+    // as a divergence, since it's *supposed* to be stale while paused.
+    raw.execute("update widget_view set tax = -1 where id = '1'", &[])
+        .await
+        .expect("corrupt the soon-to-be-paused column");
+    raw.execute(
+        "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+         values ('widget_view', 'tax', 'seeded directly for self_check test', true)",
+        &[],
+    )
+    .await
+    .expect("seed column_status");
+
+    let report = running
+        .self_check(
+            "widget_view",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "a paused column's stale value must be excluded from comparison, not reported as a \
+         divergence — got {:?}",
+        report.outcome
+    );
+
+    running.shutdown().await.expect("shutdown running");
+}

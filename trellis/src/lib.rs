@@ -87,6 +87,7 @@ pub use identity::Identity;
 pub use migrate::migrate;
 pub use numeric::Numeric;
 pub use pool::Pool;
+pub use staging::{Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SelfCheckScope};
 
 /// Placeholder entry point exercising the async plumbing the engine will
 /// build on. Returns the crate version so callers have something to check.

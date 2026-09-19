@@ -96,6 +96,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::quarantine;
+use crate::staging::self_check::{SelfCheckError, SelfCheckMode, SelfCheckReport, SelfCheckScope};
 use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registry};
 
 /// Options a client sets when it [`connect`](Trellis::connect)s.
@@ -832,6 +833,49 @@ impl Trellis {
         Ok(converge::await_converged(&**client, token, timeout).await?)
     }
 
+    /// Audits one target's persisted rows against an independently-rendered
+    /// Postgres recompute — issue #174, ADR-0013's production recompute
+    /// audit. Read-only.
+    ///
+    /// `target_table` names a registered transform, same convention as
+    /// [`Trellis::status`]/[`Trellis::quarantine_status`] (its bare target
+    /// table name). `scope` bounds this call to one keyset page — there is
+    /// no unbounded "check everything" convenience method here; a
+    /// fleet-wide sweep is a caller-side loop over
+    /// [`Trellis::definitions`] and repeated `self_check` calls chained by
+    /// [`SelfCheckReport::next_after`]. `mode` picks
+    /// [`SelfCheckMode::Standard`] (safe under live load: a divergence must
+    /// survive a re-check behind a fresh await before it's reported) or
+    /// [`SelfCheckMode::Strict`] (skips the re-check — sound only once the
+    /// caller has itself stopped writes to the audited tables). `timeout`
+    /// bounds each convergence await this call makes (one under
+    /// [`SelfCheckMode::Strict`], up to two under
+    /// [`SelfCheckMode::Standard`]) — see [`Trellis::await_converged`]'s own
+    /// doc comment for how to size it; a target that's merely still
+    /// catching up reports [`crate::staging::self_check::SelfCheckOutcome::NotCaughtUp`],
+    /// never a divergence.
+    ///
+    /// Only a [`crate::defs::ast::KeySpace::OneToOne`] target is supported
+    /// this issue (see the module doc comment on
+    /// [`crate::staging::self_check`]); an aggregate target's audit errors
+    /// with [`SelfCheckError::UnsupportedKeySpace`], wrapped in
+    /// [`TrellisError::SelfCheck`].
+    ///
+    /// A currently-paused column (`docs/decisions/0003-quarantine-storage-and-api.md`)
+    /// is excluded from the comparison entirely — its persisted value is
+    /// deliberately stale, so comparing it would report a false divergence.
+    pub async fn self_check(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> Result<SelfCheckReport, TrellisError> {
+        crate::staging::self_check::self_check(&self.pool, target_table, scope, mode, timeout)
+            .await
+            .map_err(TrellisError::SelfCheck)
+    }
+
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. When staging, derives the source-table set from the
     /// catalog (a staging worker needs it non-empty).
@@ -1190,6 +1234,10 @@ pub enum TrellisError {
     /// [`StagingError::ConvergenceTimeout`], but also a lower-level DB
     /// failure encountered while polling.
     Staging(StagingError),
+    /// [`Trellis::self_check`] failed outright (as opposed to succeeding and
+    /// reporting a divergence, which is a successful audit) — see
+    /// [`SelfCheckError`].
+    SelfCheck(SelfCheckError),
 }
 
 impl TrellisError {
@@ -1228,6 +1276,7 @@ impl TrellisError {
             TrellisError::TransformNotFound(_) => ErrorCode::NotFound,
             TrellisError::ColumnAddressRequired => ErrorCode::Validation,
             TrellisError::Staging(err) => err.code(),
+            TrellisError::SelfCheck(err) => err.code(),
         }
     }
 }
@@ -1282,6 +1331,7 @@ impl std::fmt::Display for TrellisError {
                  quarantined transform, call resume_transform instead"
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
+            TrellisError::SelfCheck(err) => write!(f, "{err}"),
         }
     }
 }
@@ -1304,6 +1354,7 @@ impl std::error::Error for TrellisError {
             TrellisError::Apply(err) => Some(err),
             TrellisError::TransformNotFound(_) | TrellisError::ColumnAddressRequired => None,
             TrellisError::Staging(err) => Some(err),
+            TrellisError::SelfCheck(err) => Some(err),
         }
     }
 }
@@ -1347,6 +1398,12 @@ impl From<tokio_postgres::Error> for TrellisError {
 impl From<StagingError> for TrellisError {
     fn from(err: StagingError) -> Self {
         TrellisError::Staging(err)
+    }
+}
+
+impl From<SelfCheckError> for TrellisError {
+    fn from(err: SelfCheckError) -> Self {
+        TrellisError::SelfCheck(err)
     }
 }
 
