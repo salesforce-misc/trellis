@@ -542,9 +542,14 @@ impl ManualBackend {
     async fn await_definitions_settled(&self, timeout: Duration) -> Result<(), ManualBackendError> {
         sql::await_definitions_settled(&self.raw, &self.defs, timeout)
             .await
-            .map_err(|timeout| ManualBackendError::DefinitionSettleTimeout {
-                unsettled: timeout.unsettled,
-                waited: timeout.waited,
+            // Both arms match pre-#166 `ManualBackend` behavior exactly: a
+            // query failure was, and still is, an ordinary `Db` error on
+            // `quiesce`'s `Result` — not a panic.
+            .map_err(|err| match err {
+                sql::DefinitionSettleError::Db(err) => ManualBackendError::Db(err),
+                sql::DefinitionSettleError::Timeout { unsettled, waited } => {
+                    ManualBackendError::DefinitionSettleTimeout { unsettled, waited }
+                }
             })
     }
 }
@@ -613,7 +618,9 @@ impl super::Backend for ManualBackend {
         sql::apply_op(&mut self.raw, &self.tables, op)
             .await
             .map_err(|err| match err {
-                sql::ApplyOpError::UnknownTable(table) => ManualBackendError::UnknownTable { table },
+                sql::ApplyOpError::UnknownTable(table) => {
+                    ManualBackendError::UnknownTable { table }
+                }
                 sql::ApplyOpError::Db(err) => ManualBackendError::Db(err),
             })
     }

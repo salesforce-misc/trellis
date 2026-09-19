@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::TransformStatus;
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 
 use crate::model::{Column, Op, PRIMARY_KEY_PG_TYPE, Relationship, Table};
 
@@ -146,7 +146,11 @@ pub(super) struct Assignment {
 /// cast renders from. A primary-key column resolves to [`PRIMARY_KEY_PG_TYPE`]
 /// rather than to [`pg_type_name`] of its [`ValueType`] — see
 /// `ManualBackend`'s former doc comment (git history) for why.
-pub(super) fn column_pg_type(tables: &HashMap<String, Table>, table: &str, column: &str) -> &'static str {
+pub(super) fn column_pg_type(
+    tables: &HashMap<String, Table>,
+    table: &str,
+    column: &str,
+) -> &'static str {
     let is_pk = tables.get(table).is_some_and(|t| t.pk_col == column);
     if is_pk {
         return PRIMARY_KEY_PG_TYPE;
@@ -369,7 +373,11 @@ pub(super) async fn apply_op(
                     .iter()
                     .map(|(col, val)| {
                         params.push(val.clone());
-                        format!("${}::text::{}", params.len(), column_pg_type(tables, table, col))
+                        format!(
+                            "${}::text::{}",
+                            params.len(),
+                            column_pg_type(tables, table, col)
+                        )
                     })
                     .collect();
                 placeholder_groups.push(format!("({})", placeholders.join(", ")));
@@ -397,8 +405,10 @@ pub(super) async fn read_table(
     qualified_table: &str,
     pk_col: &str,
     columns: &[Column],
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>, tokio_postgres::Error>
-{
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
+    tokio_postgres::Error,
+> {
     let select_list = columns
         .iter()
         .map(|c| format!("{}::text", quote_ident(&c.name)))
@@ -432,8 +442,10 @@ pub(super) async fn read_aggregate_table(
     qualified_table: &str,
     group_by: &[String],
     fields: &[FieldDef],
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>, tokio_postgres::Error>
-{
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
+    tokio_postgres::Error,
+> {
     let value_fields: Vec<&str> = fields
         .iter()
         .map(|f| f.name.as_str())
@@ -470,13 +482,24 @@ pub(super) async fn read_aggregate_table(
     Ok(result)
 }
 
-/// [`await_definitions_settled`] timed out: `unsettled` names every target
-/// table (`def.target`) whose `transform_definitions.status` never reached a
-/// terminal backfill outcome within `waited`.
+/// Why [`await_definitions_settled`] gave up.
 #[derive(Debug)]
-pub(super) struct DefinitionSettleTimeout {
-    pub(super) unsettled: Vec<String>,
-    pub(super) waited: Duration,
+pub(super) enum DefinitionSettleError {
+    /// The status query itself failed — a dropped connection, a catalog
+    /// table that isn't there. Propagated, deliberately not panicked on:
+    /// pre-#166 `ManualBackend::await_definitions_settled` surfaced this as
+    /// `ManualBackendError::Db` through `Backend::quiesce`'s `Result`, and
+    /// the proptest-driven harness above it (`run::check_program`'s callers)
+    /// depends on that — a structured, shrinkable failure rather than an
+    /// unwind from inside the settle loop.
+    Db(tokio_postgres::Error),
+    /// The wait timed out: `unsettled` names every target table
+    /// (`def.target`) whose `transform_definitions.status` never reached a
+    /// terminal backfill outcome within `waited`.
+    Timeout {
+        unsettled: Vec<String>,
+        waited: Duration,
+    },
 }
 
 /// The target tables of every `defs` entry whose current
@@ -521,7 +544,7 @@ pub(super) async fn await_definitions_settled(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
     timeout: Duration,
-) -> Result<(), DefinitionSettleTimeout> {
+) -> Result<(), DefinitionSettleError> {
     const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -530,13 +553,13 @@ pub(super) async fn await_definitions_settled(
     loop {
         let unsettled = unsettled_definitions(raw, defs)
             .await
-            .expect("transform_definitions is queryable");
+            .map_err(DefinitionSettleError::Db)?;
         if unsettled.is_empty() {
             return Ok(());
         }
         let waited = started.elapsed();
         if waited >= timeout {
-            return Err(DefinitionSettleTimeout { unsettled, waited });
+            return Err(DefinitionSettleError::Timeout { unsettled, waited });
         }
         tokio::time::sleep(backoff.min(timeout - waited)).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);

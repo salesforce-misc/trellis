@@ -73,7 +73,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum SubprocessBackendError {
     /// An op named a table [`SubprocessBackend::install`] was never given.
-    UnknownTable { table: String },
+    UnknownTable {
+        table: String,
+    },
     /// [`SubprocessBackend::connect`] was given no explicitly-named
     /// connection target — see `ManualBackendError::UnnamedTarget`'s doc
     /// comment for the rationale (design doc §6).
@@ -91,7 +93,9 @@ pub enum SubprocessBackendError {
     /// it (check its inherited stderr, which
     /// [`SubprocessBackend::spawn_engine`] leaves attached to this test
     /// process's own for exactly this kind of diagnosis).
-    EngineNotReady { waited: Duration },
+    EngineNotReady {
+        waited: Duration,
+    },
     /// [`SubprocessBackend::quiesce`] waited [`QUIESCE_TIMEOUT`] for every
     /// installed definition to reach a terminal backfill outcome and at
     /// least one never did — see `ManualBackendError::DefinitionSettleTimeout`'s
@@ -140,7 +144,9 @@ impl From<tokio_postgres::Error> for SubprocessBackendError {
 impl From<sql::ApplyOpError> for SubprocessBackendError {
     fn from(err: sql::ApplyOpError) -> Self {
         match err {
-            sql::ApplyOpError::UnknownTable(table) => SubprocessBackendError::UnknownTable { table },
+            sql::ApplyOpError::UnknownTable(table) => {
+                SubprocessBackendError::UnknownTable { table }
+            }
             sql::ApplyOpError::Db(err) => SubprocessBackendError::Db(err),
         }
     }
@@ -296,7 +302,11 @@ impl SubprocessBackend {
     /// names. Must be called before the first [`SubprocessBackend::install`]
     /// (which is the only call that spawns the primary subprocess); a
     /// subprocess already spawned ignores a later call.
-    pub fn set_slot_and_publication(&mut self, slot: impl Into<String>, publication: impl Into<String>) {
+    pub fn set_slot_and_publication(
+        &mut self,
+        slot: impl Into<String>,
+        publication: impl Into<String>,
+    ) {
         self.slot = slot.into();
         self.publication = publication.into();
     }
@@ -313,6 +323,12 @@ impl SubprocessBackend {
     /// [`SubprocessBackend::disarm_pause_before_commit`] (before restarting,
     /// so the *redrive* isn't paused too — see that method's doc comment).
     pub fn arm_pause_before_commit(&self) -> std::io::Result<()> {
+        // Clear any marker a *previous* arm/kill cycle left behind first, so
+        // `wait_for_pause` can only ever observe a marker this arming
+        // produced. Without this, a second arm in the same test would return
+        // `true` instantly off the stale file and the `SIGKILL` would land
+        // nowhere near an open transaction — a silently vacuous crash test.
+        let _ = std::fs::remove_file(&self.pause_marker_path);
         std::fs::write(&self.pause_trigger_path, b"armed")
     }
 
@@ -357,7 +373,10 @@ impl SubprocessBackend {
         self.last_kill_status
     }
 
-    async fn install_definition(&mut self, def: &TransformDef) -> Result<(), SubprocessBackendError> {
+    async fn install_definition(
+        &mut self,
+        def: &TransformDef,
+    ) -> Result<(), SubprocessBackendError> {
         let source_table = self
             .tables
             .get(&def.source)
@@ -500,9 +519,11 @@ impl super::Backend for SubprocessBackend {
         // (docs/decisions/0007's amendment), invisible to `await_converged`.
         sql::await_definitions_settled(&self.raw, &self.defs, QUIESCE_TIMEOUT)
             .await
-            .map_err(|timeout| SubprocessBackendError::DefinitionSettleTimeout {
-                unsettled: timeout.unsettled,
-                waited: timeout.waited,
+            .map_err(|err| match err {
+                sql::DefinitionSettleError::Db(err) => SubprocessBackendError::Db(err),
+                sql::DefinitionSettleError::Timeout { unsettled, waited } => {
+                    SubprocessBackendError::DefinitionSettleTimeout { unsettled, waited }
+                }
             })
     }
 
@@ -532,15 +553,16 @@ impl super::Backend for SubprocessBackend {
                         source_primary_key(&self.pool, &def.source).await?,
                         &def.source,
                     )?;
-                    let target_columns: Vec<crate::model::Column> = std::iter::once(crate::model::Column {
-                        name: pk.name.clone(),
-                        value_type: ValueType::Numeric,
-                    })
-                    .chain(def.fields.iter().map(|f| crate::model::Column {
-                        name: f.name.clone(),
-                        value_type: ValueType::Text,
-                    }))
-                    .collect();
+                    let target_columns: Vec<crate::model::Column> =
+                        std::iter::once(crate::model::Column {
+                            name: pk.name.clone(),
+                            value_type: ValueType::Numeric,
+                        })
+                        .chain(def.fields.iter().map(|f| crate::model::Column {
+                            name: f.name.clone(),
+                            value_type: ValueType::Text,
+                        }))
+                        .collect();
                     sql::read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
@@ -571,7 +593,10 @@ impl super::Backend for SubprocessBackend {
     /// transaction rollback (triggered by the killed process's connection
     /// dropping) already guarantees was never partially applied.
     async fn restart(&mut self) -> Result<(), SubprocessBackendError> {
-        let mut guard = self.child.take().ok_or(SubprocessBackendError::NoClientStarted)?;
+        let mut guard = self
+            .child
+            .take()
+            .ok_or(SubprocessBackendError::NoClientStarted)?;
         // `kill` (SIGKILL) then `wait`, not just letting `guard` drop:
         // `CrashGuard::drop` performs the same two calls best-effort, but
         // doing it explicitly here means this method can surface the real
