@@ -22,7 +22,15 @@ The build plan lives in the tracking epic (salesforce-misc/trellis, label `Epic`
 
 The suite is the `generative` crate — a workspace member, so ordinary
 `cargo build`/`cargo test` compile it and a signature change can't rot it
-silently. It dev-depends on `testkit` and `trellis`.
+silently. It depends on `trellis` and `testkit` (the latter became a normal
+dependency, not just a dev-dependency, once `SubprocessBackend` needed
+`CrashGuard` from the library itself).
+
+Two of its features stay off by default and are switched on only by the crate's
+own self dev-dependency, so neither can reach a production
+`cargo build --workspace`: `proptest` (the generator strategies) and
+`subprocess-backend` (which enables `trellis/test-util`, the engine's test-only
+Phase 3 pre-commit pause hook).
 
 `testkit` already provides:
 
@@ -47,8 +55,12 @@ tests/      property declarations, hand-built pins, meta-tests.
 
 The seam is a structural guarantee: the oracle *cannot* cheat by calling
 maintenance code if that code is only reachable through `backend/`, and a second
-backend (concurrent, later subprocess-supervised) drops in without touching
-generators or oracle.
+backend drops in without touching generators or oracle. Two exist today:
+`ManualBackend` (an in-process `trellis::Client`) and `SubprocessBackend`
+(issue #166 — a real OS child process `CrashGuard` can genuinely `SIGKILL`, for
+crash tests that an in-process drop-and-replace cannot honestly stand in for).
+They share all DDL/DML/read-back rendering via `backend/sql.rs`; the only thing
+that actually differs between them is how the engine is started and stopped.
 
 ### The model
 
