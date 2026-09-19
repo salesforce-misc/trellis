@@ -418,10 +418,12 @@ fn reap_orphans_once() {
 /// freeing each one's leaked SysV shared-memory segment (via its
 /// `postmaster.pid`) and removing the directory. A dir whose recorded
 /// postmaster is still alive belongs to a running test process and is left
-/// untouched; a dir with no `postmaster.pid` never got a server (or it already
-/// stopped), so there's no segment to free — just remove it, unless the
-/// *owning* process (see [`owning_pid`]) is still alive, in which case it's
-/// simply mid-`initdb`/mid-startup and must be left alone.
+/// untouched no matter what; one whose postmaster is dead (or has no
+/// `postmaster.pid` at all) is only a genuine orphan if its *owning* process
+/// (see [`owning_pid`]) is also confirmed dead — a live owner can be
+/// mid-`initdb`/mid-startup (no pidfile yet) or, per #206, mid-teardown of a
+/// postgres it just had to SIGKILL and may still be depending on that
+/// directory for (e.g. a retry) — so a live owner is left alone either way.
 ///
 /// Everything here is best-effort: this reclaims resources that already leaked,
 /// so any failure (a segment already gone, a dir we can't read) is not worth
@@ -441,18 +443,36 @@ fn reap_orphans_in(tmp: &Path) {
         match fs::read_to_string(data_dir.join("postmaster.pid")) {
             // First line of `postmaster.pid` is the postmaster PID. If it's
             // still alive this cluster is in use by a running test process
-            // (possibly a parallel test binary) — leave it entirely alone.
+            // (possibly a parallel test binary) — leave it entirely alone,
+            // regardless of the owning process (below): never reap a
+            // directory backing a postgres that's actually running.
             Ok(contents) => {
-                let alive = contents
+                let postgres_alive = contents
                     .lines()
                     .next()
                     .and_then(|line| line.trim().parse::<i32>().ok())
                     .is_some_and(process_alive);
-                if alive {
+                if postgres_alive {
                     continue;
                 }
-                reap_shmem_segment(&data_dir);
-                let _ = fs::remove_dir_all(&dir);
+                // Postgres itself is confirmed dead, but a dead postmaster
+                // doesn't make the *directory* an orphan: testkit's own
+                // teardown (`TestCluster::drop`) SIGKILLs a wedged postgres
+                // as a fallback while its owning harness process is still
+                // alive and using this directory (#206) — so, exactly like
+                // the no-pidfile case below, only reap once the owning
+                // process is confirmed dead too. A name that doesn't match
+                // the `<owning-pid>-<counter>` shape (so `owning_pid`
+                // returns `None`) falls back to the pre-#206 behavior of
+                // reaping on the postmaster PID alone, since there's no
+                // owner to check.
+                match owning_pid(&name) {
+                    Some(pid) if process_alive(pid) => continue,
+                    Some(_) | None => {
+                        reap_shmem_segment(&data_dir);
+                        let _ = fs::remove_dir_all(&dir);
+                    }
+                }
             }
             // No `postmaster.pid`: either a run was killed mid-`initdb` (no
             // server, no segment — safe to drop) or a cluster in *another*,
@@ -623,6 +643,29 @@ mod tests {
         dir
     }
 
+    // Like `write_fake_cluster_owned_by`, but also writes a `postmaster.pid`
+    // naming `postmaster_pid` — standing in for a cluster whose postgres has
+    // (or hasn't) died while its owning process is a separate, independently
+    // tracked PID. Exercises the `Ok(contents)` branch's owning-process
+    // check, the #206 case, the same way `write_fake_cluster_owned_by`
+    // exercises it for the `Err(_)` (no-pidfile) branch.
+    fn write_fake_cluster_owned_by_with_pidfile(
+        sandbox: &Path,
+        owning_pid: i32,
+        counter: u32,
+        postmaster_pid: i32,
+    ) -> PathBuf {
+        let dir = sandbox.join(format!("trellis-testkit-{owning_pid}-{counter}"));
+        let data_dir = dir.join("data");
+        fs::create_dir_all(&data_dir).expect("create fake data dir");
+        let contents = format!(
+            "{postmaster_pid}\n{}\n0\n5432\n\n\n123 987654321\nready\n",
+            dir.display()
+        );
+        fs::write(data_dir.join("postmaster.pid"), contents).expect("write fake pidfile");
+        dir
+    }
+
     // Std has no set-mtime API, so shell out to `touch -t` to push a dir's
     // modification time far enough back to clear `older_than`'s guard.
     fn backdate(path: &Path) {
@@ -788,6 +831,55 @@ mod tests {
 
         // Once that process actually exits, its directory is a genuine
         // orphan and the next reap pass must clean it up.
+        other_process.kill().expect("kill stand-in process");
+        other_process.wait().expect("reap stand-in process");
+
+        reap_orphans_in(&sandbox);
+        assert!(
+            !dir.exists(),
+            "must reap the directory once its owning process has actually exited"
+        );
+
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// Regression test for #206: the `Ok(contents)` (pidfile-present) branch
+    /// must respect the same owning-process liveness check #198 gave the
+    /// `Err(_)` (no-pidfile) branch. A `postmaster.pid` naming a dead
+    /// postgres PID does not by itself mean the *directory* is an orphan —
+    /// its owning process (the harness that called `TestCluster::start`,
+    /// per the directory name) can still be alive and depending on that
+    /// directory, e.g. immediately after SIGKILLing a wedged postgres as
+    /// part of its own teardown. As in #198's own regression test, a real
+    /// child process stands in for that independent owner so this exercises
+    /// `owning_pid` + `process_alive` for real, not a simulation that would
+    /// all share this process's own PID.
+    #[test]
+    fn does_not_reap_live_owners_dir_with_stale_pidfile() {
+        let sandbox = fresh_sandbox("stale-pidfile-owner-alive");
+
+        // Stand-in for another live `TestCluster` owner in a different
+        // process, analogous to #198's `does_not_reap_concurrent_processes_in_flight_cluster`.
+        let mut other_process = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in process");
+        let other_pid = other_process.id() as i32;
+
+        // i32::MAX is above macOS's PID ceiling, so it's reliably not a live
+        // process: this postmaster.pid is stale, naming a dead postgres PID,
+        // even though the *owning* process is still alive.
+        let dir = write_fake_cluster_owned_by_with_pidfile(&sandbox, other_pid, 0, i32::MAX);
+
+        reap_orphans_in(&sandbox);
+        assert!(
+            dir.exists(),
+            "must not reap a directory whose owning process is alive, even if its \
+             postmaster.pid names a dead PID"
+        );
+
+        // Once the owning process actually exits, the directory (stale
+        // pidfile and all) is a genuine orphan and must be reaped.
         other_process.kill().expect("kill stand-in process");
         other_process.wait().expect("reap stand-in process");
 
