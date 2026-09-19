@@ -256,6 +256,16 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
         .await
         .expect("seed column_status directly");
 
+    // Anti-vacuity: deliberately corrupt every *representable* row's
+    // `echo_total` first, so the assertion below can tell "recompute skipped
+    // only the NULL-keyed group and recomputed everything else" apart from
+    // "recompute skipped every row" (which, on its own, would also leave
+    // `echo_after == echo_before` and quietly pass a broken skip condition).
+    client
+        .execute("update sku_totals_echo set echo_total = -1", &[])
+        .await
+        .expect("corrupt the recomputable rows");
+
     let resumed = quarantine::resume_column(&db.pool, "sku_totals_echo", "echo_total")
         .await
         .expect(
@@ -271,8 +281,10 @@ async fn recompute_column_skips_a_null_keyed_upstream_group_instead_of_panicking
     let echo_after = sku_totals_echo(&client).await;
     assert_eq!(
         echo_after, echo_before,
-        "issue #211: recompute must not create a phantom row for the NULL-keyed group — \
-         a_null-keyed source row has no representable row in this target, so the recompute \
-         pass must simply skip it, the same as a from-scratch backfill already does"
+        "issue #211: recompute must restore every representable row's value (proving the \
+         pass really ran, not that it skipped everything) while creating no phantom row for \
+         the NULL-keyed group — a NULL-keyed source row has no representable row in this \
+         target, so the recompute pass must simply skip it, the same as a from-scratch \
+         backfill already does"
     );
 }
