@@ -257,6 +257,15 @@ impl BlockingTrellis {
     /// Blocks until every effect committed at or before `token` has been
     /// reflected in its target(s), or `timeout` elapses. See
     /// [`Trellis::await_converged`].
+    ///
+    /// **The one method that can occupy the background thread for a
+    /// caller-chosen duration.** That thread services jobs strictly one
+    /// at a time, so any other `BlockingTrellis` call issued concurrently
+    /// from another thread — [`BlockingTrellis::shutdown`] included — queues
+    /// behind an in-flight `await_converged` for up to `timeout`. Bounded,
+    /// never a hang (`timeout` always expires and the loop moves on), but it
+    /// does mean `timeout` sets the worst-case latency of every *other* call
+    /// on a shared handle, not just this one. Size it accordingly.
     pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
         self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
     }

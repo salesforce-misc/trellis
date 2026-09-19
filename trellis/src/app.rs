@@ -765,6 +765,27 @@ impl Trellis {
     /// [`TrellisError::Staging`]`(`[`StagingError::ConvergenceTimeout`]`)`
     /// on timeout — a named, matchable condition rather than a generic
     /// failure.
+    ///
+    /// **Size `timeout` in seconds, not milliseconds.** `token` is
+    /// `pg_current_wal_lsn()`, which normally sits *ahead* of the caller's
+    /// own commit (any unrelated WAL — another backend, a checkpoint, the
+    /// engine's own bookkeeping — advances it), and the convergence
+    /// predicate's first condition is `replication_progress.confirmed_lsn >=
+    /// token`. On a busy pipeline that clears almost immediately, but on a
+    /// *quiet* stream `confirmed_lsn` only catches up to a token past the
+    /// last decoded change when intake's keepalive-driven advance persists —
+    /// throttled to once per `intake::KEEPALIVE_PERSIST_INTERVAL` (10s), and
+    /// itself paced by the server's own walsender keepalive cadence. A
+    /// sub-second budget can therefore report
+    /// [`StagingError::ConvergenceTimeout`] on a pipeline that is in fact
+    /// fully caught up. The one real in-tree caller
+    /// (`generative`'s `ManualBackend::quiesce`) uses 30s; that's the right
+    /// order of magnitude.
+    ///
+    /// Holds one pooled connection for the whole call (it polls on it), so a
+    /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw
+    /// on this [`Trellis`]'s own pool — note the background [`Client`]'s
+    /// drain workers use a *separate* pool, so this can't starve them.
     pub async fn await_converged(
         &self,
         token: PgLsn,
@@ -1333,5 +1354,35 @@ mod error_code_tests {
 
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+
+    /// The same composition-through-nesting contract for
+    /// [`TrellisError::Staging`] (issue #192's new arm): it must delegate to
+    /// [`StagingError::code`] rather than hardcoding a category. Checked with
+    /// a variant whose code is *not* [`ErrorCode::Internal`], so a hardcoded
+    /// "staging failures are internal" would fail this test rather than
+    /// coincidentally pass it.
+    #[test]
+    fn staging_delegates_to_the_wrapped_staging_error() {
+        let inner = StagingError::ProducerAlreadyRunning;
+        let expected = inner.code();
+        let wrapped = TrellisError::Staging(inner);
+
+        assert_eq!(wrapped.code(), expected);
+        assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+
+    /// [`StagingError::ConvergenceTimeout`] is the one variant
+    /// [`Trellis::await_converged`] actually surfaces, so its category is
+    /// pinned separately from the delegation test above — an embedder
+    /// branching on [`TrellisError::code`] shouldn't see it drift silently.
+    #[test]
+    fn a_convergence_timeout_surfaces_as_internal_through_the_facade() {
+        let err = TrellisError::Staging(StagingError::ConvergenceTimeout {
+            token: PgLsn::from(0),
+            waited: Duration::from_secs(1),
+        });
+
+        assert_eq!(err.code(), ErrorCode::Internal);
     }
 }
