@@ -302,6 +302,73 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
     );
 }
 
+/// Issue #200, end to end: the same chain, but one grouping component's own
+/// text genuinely contains U+001F — `ddl::COMPOSITE_KEY_SEPARATOR` itself —
+/// and U+001E (`ddl::KEY_PART_ESCAPE`), adjacent to each other so an
+/// off-by-one in either direction of the escape shows up rather than
+/// cancelling out.
+///
+/// This is the only end-to-end test that forces the Rust and SQL halves of
+/// the escape to agree against a real Postgres: `derive_group_key` →
+/// `ddl::join_pk_key` encodes the downstream `Recompute`'s key in Rust,
+/// while `stock_totals_v2`'s live re-fetch re-derives that same key *in
+/// SQL* (`read_live_rows_batch`'s `ddl::pk_key_sql_expr`, whose multi-column
+/// arm wraps every column in `ddl::composite_key_escape_sql`) and then
+/// decodes it back with `ddl::split_pk_key`. A disagreement anywhere in that
+/// triangle either fails the drain outright with
+/// `DdlError::MalformedCompositeKey` (what happened before #200: the raw
+/// U+001F split into a third phantom part) or silently resolves the group's
+/// row to "missing", which shows up here as a wrong `stock_totals_v2` total.
+#[tokio::test]
+async fn a_live_separator_valued_group_component_propagates_downstream() {
+    // `sku` carrying both control characters the encoding cares about.
+    const AWKWARD_SKU: &str = "a\u{1f}\u{1e}b";
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    install_the_chain(&db, &mut client).await;
+
+    // A brand-new (w1, "a\u{1f}\u{1e}b") group worth 4: w1 goes 14 -> 18.
+    client
+        .execute(
+            "insert into inventory (id, warehouse, sku, qty) values (5, 'w1', $1, 4)",
+            &[&AWKWARD_SKU],
+        )
+        .await
+        .expect("insert an inventory row whose sku contains the key separator");
+    stage_cdc(
+        &client,
+        "inventory",
+        "5",
+        "insert",
+        None,
+        // The JSON `\u001f`/`\u001e` escapes decode to the literal control characters —
+        // exactly what a real CDC image of this row carries.
+        r#"{"id":"5","warehouse":"w1","sku":"a\u001f\u001eb","qty":"4"}"#.into(),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        stock_totals(&client)
+            .await
+            .get(&("w1".to_string(), AWKWARD_SKU.to_string())),
+        Some(&Some("4".to_string())),
+        "the separator-valued group must land under its own real sku text"
+    );
+    assert_eq!(
+        stock_totals_v2(&client).await,
+        HashMap::from([
+            ("w1".to_string(), Some("18".to_string())),
+            ("w2".to_string(), Some("11".to_string())),
+        ]),
+        "a group component containing the key separator must still propagate \
+         downstream (issue #200)"
+    );
+}
+
 /// The other two live shapes a composite-key group can take downstream, in
 /// one batch: a brand-new group (an `INSERT` under a `sku` that didn't exist
 /// yet) and a group that goes extinct (a `DELETE` of its only row, which
@@ -534,5 +601,97 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
         ]),
         "issue #110 + #180: the (w1, NULL) group's extinction propagates \
          downstream too, back to w1's original 14"
+    );
+}
+
+/// Issues #110 and #200 *in the same composite group key*, end to end: one
+/// component (`warehouse`) genuinely holds both reserved characters of the
+/// separator scheme (U+001F and U+001E, adjacent), while the other (`sku`)
+/// is a genuine SQL `NULL`. The encoded key therefore carries
+/// `ddl::NULL_KEY_SENTINEL` in one field and a `ddl::KEY_PART_ESCAPE` pair
+/// in the other, and the Rust producer (`derive_group_key` →
+/// `ddl::join_pk_key`) and the SQL producer (`ddl::pk_key_sql_expr`, which
+/// nests `composite_key_escape_sql` *around* `null_key_escape_sql`) must
+/// agree on it byte-for-byte against a real Postgres, or the chained
+/// definition's live re-fetch either fails the drain with
+/// `MalformedCompositeKey` or silently resolves the group to "missing".
+#[tokio::test]
+async fn a_null_component_and_a_separator_valued_component_propagate_together() {
+    // A warehouse name carrying both control characters the #200 escape
+    // reserves, adjacent so an off-by-one in either direction shows up.
+    const AWKWARD_WAREHOUSE: &str = "w\u{1f}\u{1e}3";
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+    install_the_chain(&db, &mut client).await;
+
+    client
+        .execute(
+            "insert into inventory (id, warehouse, sku, qty) values (7, $1, null, 6)",
+            &[&AWKWARD_WAREHOUSE],
+        )
+        .await
+        .expect("insert a row whose warehouse holds the key separator and a NULL sku");
+    stage_cdc(
+        &client,
+        "inventory",
+        "7",
+        "insert",
+        None,
+        // The JSON `\u001f`/`\u001e` escapes decode to the literal control characters, and
+        // `null` to a real SQL NULL — exactly what a real CDC image carries.
+        Some(r#"{"id":"7","warehouse":"w\u001f\u001e3","sku":null,"qty":"6"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        null_sku_total(&client, AWKWARD_WAREHOUSE).await,
+        Some("6".to_string()),
+        "the (separator-valued warehouse, NULL sku) group is maintained at its own level"
+    );
+    assert_eq!(
+        stock_totals_v2(&client).await,
+        HashMap::from([
+            ("w1".to_string(), Some("14".to_string())),
+            ("w2".to_string(), Some("11".to_string())),
+            (AWKWARD_WAREHOUSE.to_string(), Some("6".to_string())),
+        ]),
+        "issues #110 and #200 together: a group key carrying both a NULL \
+         component and a separator/escape-valued one must propagate downstream"
+    );
+
+    // And its extinction, which re-derives the very same key from the
+    // pre-delete image on the Rust side and matches it against the SQL-side
+    // rendering — the direction a one-sided escape bug shows up in loudest.
+    client
+        .execute("delete from inventory where id = 7", &[])
+        .await
+        .expect("delete the group's only row");
+    stage_cdc(
+        &client,
+        "inventory",
+        "7",
+        "delete",
+        Some(r#"{"id":"7","warehouse":"w\u001f\u001e3","sku":null,"qty":"6"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        null_sku_total(&client, AWKWARD_WAREHOUSE).await,
+        None,
+        "the group goes extinct upstream"
+    );
+    assert_eq!(
+        stock_totals_v2(&client).await,
+        HashMap::from([
+            ("w1".to_string(), Some("14".to_string())),
+            ("w2".to_string(), Some("11".to_string())),
+        ]),
+        "and its extinction propagates downstream, leaving no stale row"
     );
 }

@@ -517,15 +517,187 @@ pub fn require_single_column_pk(
 /// The separator a composite primary-key identity string joins its column
 /// values on, matching [`crate::intake::extract_key`]'s own composite-key
 /// encoding exactly (see that function's doc comment, and
-/// `staging::append::TRUNCATE_SENTINEL_KEY`'s, for why U+001F — no ordinary
-/// column value can contain it). Reusing the identical separator here (not a
+/// `staging::append::TRUNCATE_SENTINEL_KEY`'s, for the same U+001F choice —
+/// but, unlike those whole-key sentinels, a *component's own value* is not
+/// simply assumed never to contain it: Postgres `text`/`varchar` happily
+/// stores U+001F, so [`join_pk_key`]/[`pk_key_sql_expr`] escape a genuine
+/// occurrence in a *multi-column* key (issue #200) rather than assuming it
+/// away — a single-column key needs no escape and deliberately gets none,
+/// see [`push_escaped_composite_key_part`]'s "why arity 1 is exempt". See
+/// [`KEY_PART_ESCAPE`] for the escape itself, and [`split_pk_key`]'s doc
+/// comment for what happened pre-#200, when a real separator collided
+/// unescaped: a loud [`DdlError::MalformedCompositeKey`] arity mismatch, not
+/// silent corruption — still worth closing, just lower urgency than issue
+/// #110's silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]).
+/// Reusing the identical separator here (not a
 /// second one) is what lets a from-side row's composite key, however it
 /// entered the ring — real CDC intake, or a synthetic
 /// [`crate::staging::append::StagedChange::Recompute`] this crate's own
 /// reverse-relationship path stages — decode identically wherever it's later
 /// read back (`staging::apply::read_live_rows_batch`'s live re-fetch, most
 /// notably): both producers, and every consumer, agree on one shape.
+///
+/// # How this composes with [`NULL_KEY_SENTINEL`]
+///
+/// The two escapes this module runs answer two *independent* questions, and
+/// are applied as two nested layers, never as one combined branch:
+///
+/// 1. **"Can this column be `NULL`?"** — decided per column from the
+///    catalog ([`PrimaryKeyColumn::nullable`]). A nullable column's value
+///    goes through [`encode_key_part`]/[`null_key_escape_sql`] (issue #110),
+///    which only ever substitutes or doubles U+0001.
+/// 2. **"Does this key have a delimiter to protect?"** — decided by the
+///    key's arity. At arity ≥ 2 every part (nullable or not) then goes
+///    through [`push_escaped_composite_key_part`]/
+///    [`composite_key_escape_sql`] (issue #200), which only ever inspects
+///    and inserts U+001E/U+001F.
+///
+/// Layer 1 is always the inner one, layer 2 always the outer one, on both
+/// the SQL and the Rust side. They cannot interfere: layer 1 neither reads
+/// nor writes U+001E/U+001F, and layer 2 neither reads nor writes U+0001,
+/// so layer 2's inverse ([`split_composite_key`]) recovers layer 1's output
+/// byte-for-byte before [`decode_key_part`] ever looks at it. A nullable
+/// column in a composite key therefore gets *both* treatments, a not-null
+/// column in a composite key gets only the second, a nullable column in an
+/// arity-1 key gets only the first, and a not-null arity-1 key (a real
+/// single-column `PRIMARY KEY`) gets neither — which is exactly the raw
+/// `col::text` the write path binds as a literal PK value.
 pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
+
+/// The escape introducer [`join_pk_key`]/[`pk_key_sql_expr`] prefix onto a
+/// real, in-value occurrence of [`COMPOSITE_KEY_SEPARATOR`] (or of this very
+/// character) in a *multi-column* key, so [`split_pk_key`] can tell a
+/// genuine field boundary apart from a column value that simply *contains*
+/// U+001F (issue #200; arity 1 is exempt — see
+/// [`push_escaped_composite_key_part`]). U+001E
+/// (INFORMATION SEPARATOR TWO) — Postgres `text` can hold this too, so, like
+/// [`COMPOSITE_KEY_SEPARATOR`], a real occurrence of *this* character is
+/// escaped (by doubling it) rather than assumed absent, exactly like a real
+/// [`COMPOSITE_KEY_SEPARATOR`] occurrence is escaped by prefixing it with
+/// this character; see [`push_escaped_composite_key_part`].
+///
+/// # Why not simply double a real [`COMPOSITE_KEY_SEPARATOR`] occurrence
+///
+/// Issue #110's [`NULL_KEY_SENTINEL`] escape doubles a real sentinel
+/// occurrence and that is provably safe *there* because a
+/// [`NULL_KEY_SENTINEL`] part is checked as a whole token against exactly
+/// one already-delimited field (delimited by the *different* character
+/// [`COMPOSITE_KEY_SEPARATOR`]) — doubling can never be confused with a
+/// field boundary because the sentinel and the delimiter are different
+/// characters.
+///
+/// [`COMPOSITE_KEY_SEPARATOR`] is itself the delimiter, so doubling *it*
+/// directly is genuinely ambiguous, not merely more complex: consider
+/// joining `"x\u{1f}"` and `"y"` (arity 2) versus joining `"x"` and
+/// `"\u{1f}y"` (arity 2). Naive doubling would render both as
+/// `"x\u{1f}\u{1f}\u{1f}y"` — the same three-separator run either way — and
+/// a decoder given only that run has no way to tell whether the *first* pair
+/// is the escaped literal (leaving the third as the real delimiter) or the
+/// *second* pair is (leaving the first as the real delimiter): both
+/// segmentations are locally consistent with "pairs are escapes, singles are
+/// delimiters." The ambiguity is inherent to using one character as both the
+/// delimiter and its own escape target in a multi-field join, not a
+/// property of any particular decoder implementation.
+///
+/// Introducing a second, distinct escape character avoids this: a bare
+/// [`COMPOSITE_KEY_SEPARATOR`] in the encoded text is *always* a real field
+/// boundary (a genuine one is only ever emitted prefixed by
+/// [`KEY_PART_ESCAPE`], never bare), and [`KEY_PART_ESCAPE`] itself is
+/// escaped by the same rule, so every occurrence of it in the encoded text
+/// is unambiguously the first character of a two-character escape pair. See
+/// [`split_composite_key`] for the decoder this makes possible with no
+/// lookahead ambiguity.
+const KEY_PART_ESCAPE: char = '\u{1e}';
+
+/// Escapes `part` onto `out` (appending, not overwriting) the way every
+/// producer of this crate's composite key text must: a real
+/// [`COMPOSITE_KEY_SEPARATOR`] or [`KEY_PART_ESCAPE`] character is prefixed
+/// with [`KEY_PART_ESCAPE`], everything else copied through unchanged. Used
+/// by [`join_pk_key`] for a *multi-part* key only (issue #200).
+///
+/// This is the **outer** of the two escape layers described in
+/// [`COMPOSITE_KEY_SEPARATOR`]'s "how this composes with
+/// [`NULL_KEY_SENTINEL`]" section: `part` is whatever the caller already
+/// rendered for that column — for a nullable column, that means
+/// [`encode_key_part`]'s output (which may be the bare
+/// [`NULL_KEY_SENTINEL`]), and for a not-null column the raw value. Since
+/// this pass only ever inspects U+001E/U+001F and [`encode_key_part`] only
+/// ever emits U+0001 substitutions, the two are order-independent in effect
+/// but strictly nested in application: null-encode first, escape second,
+/// unescape first, null-decode second.
+///
+/// # Why arity 1 is exempt
+///
+/// An arity-1 encoded key is not merely an identity string: it doubles as a
+/// real primary-key *value* everywhere this crate writes one.
+/// `staging::apply::apply_target` binds the staged `key` text straight into
+/// the target table's own PK column (`$n::text::{pk_cast}`), and the
+/// delete path filters on it the same way; `defs::backfill`'s initial build
+/// of that same target inserts the source's PK column *raw*
+/// (`insert into target (pk, …) select pk, …`), never through any encoder;
+/// `staging::quarantine::recompute_column` re-reads the source's
+/// `pk::text` raw and updates the target by it. Escaping at arity 1 would
+/// silently desynchronize those: for a PK value that genuinely contains
+/// U+001F, backfill would write the raw value and the incremental apply an
+/// escaped one — two rows for one source row, and a delete that matches
+/// neither. That is exactly the silent-corruption failure mode
+/// [`encode_key_part`]'s own "[`PrimaryKeyColumn::nullable`] selects the
+/// encoding" section describes for issue #110's escape, and it would be
+/// *introduced*, not closed, by escaping here.
+///
+/// It is also unnecessary: an arity-1 key has no delimiter to protect, and
+/// [`split_pk_key`] knows the target arity, so it returns a single-column
+/// key whole rather than splitting it. That, not escaping, is what closes
+/// issue #200's single-column half (a value containing U+001F used to reach
+/// a loud [`DdlError::MalformedCompositeKey`] arity mismatch, even with no
+/// composite key involved at all). Escaping is only needed where a real
+/// delimiter is actually emitted — arity ≥ 2.
+///
+/// Note this exemption is *only* about this separator/escape layer. Issue
+/// #110's [`NULL_KEY_SENTINEL`] layer has no arity exemption at all: a
+/// nullable arity-1 key (a single-column aggregate `GROUP BY`) still gets
+/// the full [`encode_key_part`] treatment, because a nullable column is
+/// never a 1-1 target's primary key in the first place. The two decisions
+/// are independent — see [`COMPOSITE_KEY_SEPARATOR`]'s composition section.
+fn push_escaped_composite_key_part(out: &mut String, part: &str) {
+    for ch in part.chars() {
+        if ch == COMPOSITE_KEY_SEPARATOR || ch == KEY_PART_ESCAPE {
+            out.push(KEY_PART_ESCAPE);
+        }
+        out.push(ch);
+    }
+}
+
+/// [`push_escaped_composite_key_part`]'s exact SQL twin, wrapping one
+/// column-text expression — [`pk_key_sql_expr`] renders one per key column
+/// of a multi-column key (and none at all at arity 1, see
+/// [`push_escaped_composite_key_part`]'s "why arity 1 is exempt"), *outside*
+/// [`null_key_escape_sql`] where that applies.
+/// Two sequential `replace()` calls,
+/// in this order: first double a real [`KEY_PART_ESCAPE`] (`chr(30)`), then
+/// prefix a real [`COMPOSITE_KEY_SEPARATOR`] (`chr(31)`) with
+/// [`KEY_PART_ESCAPE`]. The order matters — reversing it would re-escape the
+/// [`KEY_PART_ESCAPE`] characters the second step just inserted — but doing
+/// it in *this* order is safe: the first `replace()` only touches
+/// `chr(30)` occurrences, so it can't introduce or remove any `chr(31)`
+/// for the second `replace()` to react to, and the second `replace()` only
+/// touches `chr(31)` occurrences (all of them genuine, since the first step
+/// never produced one), so it can't disturb the `chr(30)` pairs the first
+/// step already produced. The result is byte-identical, for every input, to
+/// [`push_escaped_composite_key_part`]'s single left-to-right pass.
+///
+/// Neither `replace()` here touches `chr(1)`, so wrapping this *around* a
+/// [`null_key_escape_sql`] expression (what [`pk_key_sql_expr`] does for a
+/// nullable column of a multi-column key) leaves that inner layer's output
+/// recoverable exactly — and, because the inner `coalesce` has already
+/// turned a SQL `NULL` into a real `chr(1)` string, this wrapper never sees
+/// `NULL` and so can never re-introduce the `array_to_string` element-drop
+/// issue #110 closed.
+pub(crate) fn composite_key_escape_sql(col_text: &str) -> String {
+    format!(
+        "replace(replace({col_text}, chr(30), chr(30) || chr(30)), chr(31), chr(30) || chr(31))"
+    )
+}
 
 /// The per-part text substituted for a `NULL` key/group component wherever
 /// this crate's shared key contract renders one — the fix for issue #110's
@@ -680,9 +852,15 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// The SQL expression computing one row's composite primary-key identity
 /// text, from `pk`'s columns (in the key's own declared order) — the
 /// multi-column generalization of a bare `{pk}::text`. A single-column key
-/// renders byte-identical to that bare form (no separator, since there's
-/// nothing to join); a multi-arity key renders
-/// `array_to_string(array[col0::text, col1::text, ...], chr(31))`, matching
+/// renders with no separator (nothing to join) and, deliberately, no
+/// [`composite_key_escape_sql`] either — see
+/// [`push_escaped_composite_key_part`]'s "why arity 1 is exempt"; for a
+/// *not-null* single column that makes it byte-identical to the bare
+/// `{pk}::text` form the write path binds as a real PK value, while a
+/// *nullable* single column still gets its [`null_key_escape_sql`] layer
+/// (issue #110 has no arity exemption). A multi-arity key renders
+/// `array_to_string(array[<escaped col0>, <escaped col1>, ...], chr(31))`,
+/// matching
 /// [`COMPOSITE_KEY_SEPARATOR`] via `chr(31)` (U+001F's code point) since SQL
 /// has no literal syntax for an unprintable control character that survives
 /// every driver/encoding path as reliably as the numeric `chr()` form.
@@ -717,6 +895,12 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// `pgoutput`'s physical column order and so has to normalize back onto this
 /// one — see its own doc comment).
 pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> String {
+    // The *outer* escape layer (issue #200) runs only where a real delimiter
+    // is actually emitted. Decided once, from the key's arity, and applied
+    // uniformly to every column — independently of each column's own
+    // nullability, which decides the *inner* layer below. See
+    // `COMPOSITE_KEY_SEPARATOR`'s "how this composes with NULL_KEY_SENTINEL".
+    let composite = pk.len() > 1;
     let parts: Vec<String> = pk
         .iter()
         .map(|c| {
@@ -737,7 +921,11 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
             // encoding" section; `encode_key_part` is this branch's Rust
             // twin (its callers skip it outright for a not-null key).
             if !c.nullable {
-                return col_text;
+                return if composite {
+                    composite_key_escape_sql(&col_text)
+                } else {
+                    col_text
+                };
             }
             // Issue #110: a NULL component is coalesced to `chr(1)`
             // (`NULL_KEY_SENTINEL`; deliberately not `chr(0)` — Postgres's
@@ -752,10 +940,28 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
             // counterpart, which every producer of this crate's *other* half
             // of this same key (`join_pk_key`'s callers) must use so the two
             // sides render byte-identical text for the same value.
-            null_key_escape_sql(&col_text)
+            //
+            // Issue #200's separator escape then wraps *around* that, never
+            // inside it: `composite_key_escape_sql` only touches
+            // chr(30)/chr(31) and the `coalesce` has already replaced SQL
+            // NULL with a real chr(1) string, so neither layer can disturb
+            // the other and `split_pk_key` can undo them in the mirror
+            // order (unescape, then `decode_key_part`).
+            let encoded = null_key_escape_sql(&col_text);
+            if composite {
+                composite_key_escape_sql(&encoded)
+            } else {
+                encoded
+            }
         })
         .collect();
     match parts.len() {
+        // Arity 1: no separator, and no issue-#200 escape (already skipped
+        // above) — for a not-null column this is the bare `{pk}::text` whose
+        // result doubles as a real primary-key *value* on the write side
+        // (`staging::apply::apply_target` binds it into the target's own PK
+        // column, and `defs::backfill` inserts that column straight across),
+        // so it must equal the column's own text exactly.
         1 => parts.into_iter().next().unwrap(),
         _ => format!("array_to_string(array[{}], chr(31))", parts.join(", ")),
     }
@@ -765,8 +971,18 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// per-column text values into one composite primary-key identity string, in
 /// the key's own declared column order (the caller's responsibility — see
 /// [`split_pk_key`]'s doc comment for that convention), and the exact inverse
-/// of [`split_pk_key`]. A single part renders as itself, byte-identical to
-/// the bare `{pk}::text` form, so an arity-1 key never carries a separator.
+/// of [`split_pk_key`]. A single part renders as itself, verbatim —
+/// byte-identical to what [`pk_key_sql_expr`] renders at arity 1, escape and
+/// all (i.e. none): see [`push_escaped_composite_key_part`]'s "why arity 1
+/// is exempt" section. Only a genuinely multi-part key escapes, because only
+/// a multi-part key has a delimiter to protect.
+///
+/// The `parts` handed in are already whatever their own columns render —
+/// in particular, a nullable column's part must already have been through
+/// [`encode_key_part`] (issue #110) by the caller, since only the caller
+/// knows each column's nullability. This function applies issue #200's
+/// separator escape *on top of* that, the same nesting
+/// [`pk_key_sql_expr`] uses on the SQL side.
 ///
 /// Every producer of an encoded key this crate has goes through either this
 /// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
@@ -780,14 +996,75 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// "producers and consumers agree on one shape" claim in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.
 pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> String {
+    let parts: Vec<S> = parts.into_iter().collect();
+    // Arity 1: verbatim, no escape — see
+    // `push_escaped_composite_key_part`'s "why arity 1 is exempt".
+    if parts.len() == 1 {
+        return parts[0].as_ref().to_string();
+    }
     let mut out = String::new();
-    for (i, part) in parts.into_iter().enumerate() {
+    for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             out.push(COMPOSITE_KEY_SEPARATOR);
         }
-        out.push_str(part.as_ref());
+        push_escaped_composite_key_part(&mut out, part.as_ref());
     }
     out
+}
+
+/// Splits `key` into its raw (still-escaped) [`COMPOSITE_KEY_SEPARATOR`]-
+/// delimited fields, then un-escapes each one — the exact inverse of
+/// [`push_escaped_composite_key_part`] applied across the whole joined
+/// string. See [`KEY_PART_ESCAPE`]'s doc comment for why this needs a
+/// dedicated scan rather than a bare `str::split`: a bare split would
+/// misparse a field whose own value contains a real, escaped
+/// [`COMPOSITE_KEY_SEPARATOR`].
+///
+/// What comes back is each column's *pre-issue-#200* text — i.e. still
+/// [`encode_key_part`]-encoded for a nullable column. [`split_pk_key`] runs
+/// [`decode_key_part`] over these, undoing the two layers in the mirror of
+/// the order [`join_pk_key`]/[`pk_key_sql_expr`] applied them.
+///
+/// Fast path: a `key` containing no [`KEY_PART_ESCAPE`] at all can only have
+/// been produced from parts that themselves contained no
+/// [`COMPOSITE_KEY_SEPARATOR`]/[`KEY_PART_ESCAPE`] (any real occurrence
+/// would have forced [`push_escaped_composite_key_part`] to insert one) —
+/// so every remaining [`COMPOSITE_KEY_SEPARATOR`] in `key` is a genuine
+/// field boundary, and a plain `str::split` is both correct and
+/// allocation-free (borrowing straight out of `key`). This covers every
+/// value in practice.
+fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
+    if !key.contains(KEY_PART_ESCAPE) {
+        return key
+            .split(COMPOSITE_KEY_SEPARATOR)
+            .map(Cow::Borrowed)
+            .collect();
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = key.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            KEY_PART_ESCAPE => {
+                // By construction (`push_escaped_composite_key_part`), a
+                // `KEY_PART_ESCAPE` is always immediately followed by the
+                // one real character it escaped — a lone trailing escape
+                // (`chars.next()` returning `None`) can't come from any key
+                // this crate itself produced, but is handled by simply
+                // dropping it rather than panicking on data this module
+                // doesn't fully control the provenance of (matching
+                // `DdlError::MalformedCompositeKey`'s own "stale staged
+                // data" posture).
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            COMPOSITE_KEY_SEPARATOR => parts.push(Cow::Owned(std::mem::take(&mut current))),
+            other => current.push(other),
+        }
+    }
+    parts.push(Cow::Owned(current));
+    parts
 }
 
 /// Splits a composite primary-key identity string (built by
@@ -801,28 +1078,48 @@ pub(crate) fn join_pk_key<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> 
 /// `pk.len()` parts, rather than silently truncating/padding — "the same
 /// declared order" here is [`pk_key_sql_expr`]'s documented declared-order
 /// convention (issue #163), not the table's physical column order; see that
-/// variant's doc comment for when this can genuinely happen.
+/// variant's doc comment for when this can genuinely happen. Pre-issue-#200,
+/// a genuine, unescaped [`COMPOSITE_KEY_SEPARATOR`] inside one column's own
+/// value could *also* reach this arity mismatch, at any arity, including a
+/// single-column one. Both halves are closed here, by arity:
+/// - **arity 1**: `key` *is* the column's own (possibly
+///   [`encode_key_part`]-encoded) text, never separator-escaped (see
+///   [`push_escaped_composite_key_part`]'s "why arity 1 is exempt"), so it
+///   is taken whole, unsplit — a separator inside it is just data;
+/// - **arity ≥ 2**: [`split_composite_key`] splits only on a *bare*
+///   separator, and an escaped occurrence never contributes a field
+///   boundary, so only a real join produces one.
 ///
-/// Each returned part is run through [`decode_key_part`] (issue #110): a
+/// Each returned part is then run through [`decode_key_part`] (issue #110): a
 /// part that is exactly [`NULL_KEY_SENTINEL`] decodes to `None` (a real
 /// `NULL` component), not the literal sentinel text, so a caller binding
 /// these back against the live columns (`staging::apply::read_live_rows_batch`)
 /// can bind a genuine SQL `NULL` — and, critically, tell that column apart
-/// from one that merely holds an empty string.
+/// from one that merely holds an empty string. That decode is the *inner*
+/// layer, undone after [`split_composite_key`]'s outer one — see
+/// [`COMPOSITE_KEY_SEPARATOR`]'s composition section.
 pub(crate) fn split_pk_key<'a>(
     pk: &[PrimaryKeyColumn],
     source_table: &str,
     key: &'a str,
 ) -> Result<Vec<Option<Cow<'a, str>>>, DdlError> {
-    let parts: Vec<&str> = key.split(COMPOSITE_KEY_SEPARATOR).collect();
-    if parts.len() != pk.len() {
-        return Err(DdlError::MalformedCompositeKey {
-            source_table: source_table.to_string(),
-            key: key.to_string(),
-            expected_arity: pk.len(),
-            actual_arity: parts.len(),
-        });
-    }
+    // Arity 1 carries no separator and no issue-#200 escape, so the whole
+    // key is that one column's encoded text — splitting it would misread a
+    // separator the column genuinely contains.
+    let parts: Vec<Cow<'a, str>> = if pk.len() == 1 {
+        vec![Cow::Borrowed(key)]
+    } else {
+        let parts = split_composite_key(key);
+        if parts.len() != pk.len() {
+            return Err(DdlError::MalformedCompositeKey {
+                source_table: source_table.to_string(),
+                key: key.to_string(),
+                expected_arity: pk.len(),
+                actual_arity: parts.len(),
+            });
+        }
+        parts
+    };
     // Per column, the exact inverse of what `pk_key_sql_expr`/
     // `encode_key_part` produced for it: a nullable column's part is
     // decoded, a NOT NULL column's part is its own raw text (which is all
@@ -832,10 +1129,17 @@ pub(crate) fn split_pk_key<'a>(
         .into_iter()
         .zip(pk)
         .map(|(part, column)| {
-            if column.nullable {
-                decode_key_part(part)
-            } else {
-                Some(Cow::Borrowed(part))
+            if !column.nullable {
+                return Some(part);
+            }
+            match part {
+                // Borrowed straight out of `key`, so `decode_key_part` can
+                // keep borrowing from `key` for the (overwhelmingly common)
+                // no-sentinel case.
+                Cow::Borrowed(s) => decode_key_part(s),
+                // Already owned by `split_composite_key`'s un-escaping
+                // pass, so the decode has to own its result too.
+                Cow::Owned(s) => decode_key_part(&s).map(|d| Cow::Owned(d.into_owned())),
             }
         })
         .collect())
@@ -1579,11 +1883,15 @@ mod tests {
             pk_key_sql_expr(&pk(&["warehouse"]), Some("t")),
             "coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1))"
         );
+        // At arity ≥ 2, issue #200's separator escape wraps *around* that —
+        // see `pk_key_sql_expr_nests_the_null_and_separator_escapes_per_column`.
         assert_eq!(
             pk_key_sql_expr(&pk(&["warehouse", "sku"]), Some("t")),
-            "array_to_string(array[\
-             coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1)), \
-             coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))], chr(31))"
+            format!(
+                "array_to_string(array[{}, {}], chr(31))",
+                composite_key_escape_sql(&null_key_escape_sql("t.\"warehouse\"::text")),
+                composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
+            )
         );
     }
 
@@ -1606,7 +1914,13 @@ mod tests {
         );
         assert_eq!(
             pk_key_sql_expr(&not_null_pk(&["warehouse", "sku"]), Some("t")),
-            "array_to_string(array[t.\"warehouse\"::text, t.\"sku\"::text], chr(31))"
+            format!(
+                "array_to_string(array[{}, {}], chr(31))",
+                composite_key_escape_sql("t.\"warehouse\"::text"),
+                composite_key_escape_sql("t.\"sku\"::text"),
+            ),
+            "no `coalesce`/`chr(1)` anywhere — only issue #200's separator \
+             escape, which a composite key of any nullability gets"
         );
         assert_eq!(pk_key_sql_expr(&not_null_pk(&["id"]), None), "\"id\"::text");
     }
@@ -1650,8 +1964,11 @@ mod tests {
         ];
         assert_eq!(
             pk_key_sql_expr(&mixed, Some("t")),
-            "array_to_string(array[t.\"warehouse\"::text, \
-             coalesce(replace(t.\"sku\"::text, chr(1), chr(1) || chr(1)), chr(1))], chr(31))"
+            format!(
+                "array_to_string(array[{}, {}], chr(31))",
+                composite_key_escape_sql("t.\"warehouse\"::text"),
+                composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
+            )
         );
         let key = join_pk_key(["a\u{1}b", NULL_KEY_SENTINEL]);
         assert_eq!(
@@ -1816,6 +2133,326 @@ mod tests {
             }
             other => panic!("expected MalformedCompositeKey, got {other:?}"),
         }
+    }
+
+    /// [`split_pk_key`] against a fixed table name, unwrapped — every test
+    /// below is about the encoding round-tripping, not about the
+    /// [`DdlError::MalformedCompositeKey`] path
+    /// `split_pk_key_rejects_the_pre_171_length_prefixed_encoding` covers.
+    fn split_ok<'a>(pk: &[PrimaryKeyColumn], key: &'a str) -> Vec<Option<Cow<'a, str>>> {
+        split_pk_key(pk, "t", key).expect("decodes")
+    }
+
+    /// Issue #200: a real, embedded [`COMPOSITE_KEY_SEPARATOR`] inside one
+    /// key component's own value must round-trip through
+    /// [`join_pk_key`]/[`split_pk_key`] instead of being misread as a field
+    /// boundary — the exact failure mode
+    /// `split_pk_key_rejects_the_pre_171_length_prefixed_encoding` above
+    /// shows the *error path* for (a genuine arity mismatch), except this
+    /// one used to fire on perfectly valid data whenever a real column value
+    /// happened to contain U+001F, at any arity, not only >1.
+    #[test]
+    fn a_real_separator_valued_component_survives_the_round_trip() {
+        // Arity 1: pre-#200, `split_pk_key` unconditionally split on
+        // `COMPOSITE_KEY_SEPARATOR` regardless of the target arity, so a
+        // single-column key whose own value was `"a\u{1f}b"` split into two
+        // parts against an arity-1 `pk` and failed loudly
+        // (`MalformedCompositeKey { expected_arity: 1, actual_arity: 2 }`)
+        // even though there was no real composite key involved at all.
+        let one_col = not_null_pk(&["sku"]);
+        for value in ["a\u{1f}b", "\u{1f}", "\u{1f}\u{1f}", "\u{1f}a\u{1f}"] {
+            let key = join_pk_key([value]);
+            assert_eq!(
+                key, value,
+                "an arity-1 key must stay the column's own raw text, escape-free — it \
+                 doubles as a real PK value on the write side (see \
+                 `push_escaped_composite_key_part`'s \"why arity 1 is exempt\")"
+            );
+            assert_eq!(
+                split_ok(&one_col, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(value)],
+                "{value:?} must still decode at arity 1"
+            );
+        }
+
+        // Arity 2, separator embedded in either component, alongside a
+        // genuinely separator-free neighbor — and then in both at once.
+        let two_col = not_null_pk(&["warehouse", "sku"]);
+        for (a, b) in [
+            ("a\u{1f}b", "c"),
+            ("c", "a\u{1f}b"),
+            ("x\u{1f}y", "\u{1f}z"),
+        ] {
+            let key = join_pk_key([a, b]);
+            assert_eq!(
+                split_ok(&two_col, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(a), Some(b)],
+                "{a:?}/{b:?} must decode at arity 2"
+            );
+        }
+    }
+
+    /// A real [`KEY_PART_ESCAPE`] character in a value must itself round-trip
+    /// — it is not a hypothetical: the whole point of introducing a second
+    /// escape character (rather than doubling [`COMPOSITE_KEY_SEPARATOR`]
+    /// directly, per [`KEY_PART_ESCAPE`]'s doc comment) is that it too can
+    /// appear in ordinary column text and must not be assumed absent either.
+    #[test]
+    fn a_real_escape_valued_component_survives_the_round_trip() {
+        let one_col = not_null_pk(&["sku"]);
+        for value in ["\u{1e}", "\u{1e}\u{1e}", "a\u{1e}b", "\u{1e}\u{1f}\u{1e}"] {
+            let key = join_pk_key([value]);
+            assert_eq!(
+                key, value,
+                "arity 1 is verbatim, escape characters included"
+            );
+            assert_eq!(
+                split_ok(&one_col, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(value)]
+            );
+        }
+
+        // Arity 2 is where the escape actually runs: every adversarial
+        // shape — runs of both characters, adjacent to each other and to
+        // the real field boundary, and a component that is *nothing but*
+        // escape/separator characters — must survive.
+        let two_col = not_null_pk(&["warehouse", "sku"]);
+        for (a, b) in [
+            ("\u{1e}", "\u{1f}"),
+            ("\u{1e}\u{1f}", "\u{1f}\u{1e}"),
+            ("\u{1e}\u{1e}\u{1f}\u{1f}\u{1e}", "\u{1f}\u{1f}\u{1e}\u{1e}"),
+            ("a\u{1e}\u{1e}b", "\u{1e}\u{1f}\u{1e}\u{1f}"),
+            ("", "\u{1e}"),
+            ("\u{1f}", ""),
+        ] {
+            let key = join_pk_key([a, b]);
+            assert_eq!(
+                split_ok(&two_col, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(a), Some(b)],
+                "adversarial escape/separator run {a:?}/{b:?} must round-trip"
+            );
+        }
+    }
+
+    /// The precise ambiguity [`KEY_PART_ESCAPE`]'s doc comment argues naive
+    /// doubling of [`COMPOSITE_KEY_SEPARATOR`] itself would create: joining
+    /// `["x\u{1f}", "y"]` and joining `["x", "\u{1f}y"]` both place a
+    /// trailing/leading real separator adjacent to the real field-boundary
+    /// separator, producing a run of consecutive U+001F either way. A
+    /// decoder that can't tell them apart would parse one of these two,
+    /// distinct two-part keys wrong. This crate's two-escape-character
+    /// scheme must keep them distinct and each internally correct.
+    #[test]
+    fn adjacent_separator_runs_do_not_collide() {
+        let two_col = not_null_pk(&["warehouse", "sku"]);
+
+        let trailing = join_pk_key(["x\u{1f}", "y"]);
+        let leading = join_pk_key(["x", "\u{1f}y"]);
+        assert_ne!(
+            trailing, leading,
+            "a trailing separator on the first component and a leading \
+             separator on the second must not encode to the same text"
+        );
+
+        for (key, expected) in [
+            (&trailing, vec![Some("x\u{1f}"), Some("y")]),
+            (&leading, vec![Some("x"), Some("\u{1f}y")]),
+        ] {
+            assert_eq!(
+                split_ok(&two_col, key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        // And the case where *both* sides of the join carry a real
+        // separator right at the boundary.
+        let both = join_pk_key(["x\u{1f}", "\u{1f}y"]);
+        assert_eq!(
+            split_ok(&two_col, &both)
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("x\u{1f}"), Some("\u{1f}y")]
+        );
+    }
+
+    /// [`composite_key_escape_sql`] must render the exact SQL twin of
+    /// [`push_escaped_composite_key_part`]'s Rust-side escape — same
+    /// ordering rationale (escape `KEY_PART_ESCAPE` first, then
+    /// `COMPOSITE_KEY_SEPARATOR`) — and [`pk_key_sql_expr`] must route every
+    /// column of a *multi-column* key through it, while leaving an arity-1
+    /// not-null key as the bare `{pk}::text` the write path binds as a real
+    /// PK value (see [`push_escaped_composite_key_part`]'s "why arity 1 is
+    /// exempt").
+    #[test]
+    fn pk_key_sql_expr_escapes_a_real_separator_in_the_value() {
+        assert_eq!(
+            composite_key_escape_sql("t.\"sku\"::text"),
+            "replace(replace(t.\"sku\"::text, chr(30), chr(30) || chr(30)), chr(31), \
+             chr(30) || chr(31))"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&not_null_pk(&["sku"]), Some("t")),
+            "t.\"sku\"::text",
+            "an arity-1 not-null key renders the bare column text, unescaped"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&not_null_pk(&["warehouse", "sku"]), Some("t")),
+            format!(
+                "array_to_string(array[{}, {}], chr(31))",
+                composite_key_escape_sql("t.\"warehouse\"::text"),
+                composite_key_escape_sql("t.\"sku\"::text"),
+            )
+        );
+    }
+
+    /// The two escape layers are two independent, per-concern decisions —
+    /// "can this column be `NULL`?" (issue #110, per column, from the
+    /// catalog) and "does this key have a delimiter to protect?" (issue
+    /// #200, per key, from its arity) — nested, never merged. This pins all
+    /// four combinations on the SQL side: [`null_key_escape_sql`] is always
+    /// the *inner* layer and [`composite_key_escape_sql`] always the outer
+    /// one, so the `coalesce` still sees SQL `NULL` as `NULL` and the outer
+    /// `replace`s only ever see a non-`NULL` string.
+    #[test]
+    fn pk_key_sql_expr_nests_the_null_and_separator_escapes_per_column() {
+        // Arity 1: neither key gets the separator escape; only the nullable
+        // one gets the NULL layer.
+        assert_eq!(
+            pk_key_sql_expr(&not_null_pk(&["id"]), Some("t")),
+            "t.\"id\"::text"
+        );
+        assert_eq!(
+            pk_key_sql_expr(&pk(&["sku"]), Some("t")),
+            null_key_escape_sql("t.\"sku\"::text")
+        );
+
+        // Arity 2, one column of each nullability: the not-null column gets
+        // only the separator escape, the nullable one gets it wrapped
+        // around its NULL escape.
+        let mixed = vec![
+            PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+            },
+            PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+            },
+        ];
+        assert_eq!(
+            pk_key_sql_expr(&mixed, Some("t")),
+            format!(
+                "array_to_string(array[{}, {}], chr(31))",
+                composite_key_escape_sql("t.\"warehouse\"::text"),
+                composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
+            )
+        );
+    }
+
+    /// The Rust-side twin of the test above, end to end: one composite key
+    /// holding *both* concerns at once — a nullable column carrying a real
+    /// `NULL` (and, separately, a real [`NULL_KEY_SENTINEL`] value) next to
+    /// a not-null column carrying a real [`COMPOSITE_KEY_SEPARATOR`] and
+    /// [`KEY_PART_ESCAPE`]. Every combination must round-trip exactly, which
+    /// is what "the two layers touch disjoint characters" actually buys.
+    #[test]
+    fn both_escape_layers_compose_in_one_composite_key() {
+        let mixed = vec![
+            PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+            },
+            PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+            },
+        ];
+
+        // A NULL nullable component beside a not-null component whose value
+        // genuinely contains the separator and the escape character.
+        let not_null_value = "w\u{1f}1\u{1e}x";
+        let key = join_pk_key([Cow::Borrowed(not_null_value), encode_key_part(None)]);
+        assert_eq!(
+            split_ok(&mixed, &key)
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some(not_null_value), None]
+        );
+
+        // And the fully adversarial shape: every reserved character of
+        // either scheme in both components, with the nullable one holding a
+        // real (non-NULL) U+0001 that must not be read back as the NULL
+        // sentinel.
+        for nullable_value in [
+            "\u{1}",
+            "\u{1}\u{1}",
+            "\u{1}\u{1f}\u{1e}\u{1}",
+            "",
+            "\u{1e}\u{1}\u{1f}",
+        ] {
+            let key = join_pk_key([
+                Cow::Borrowed(not_null_value),
+                encode_key_part(Some(nullable_value)),
+            ]);
+            assert_eq!(
+                split_ok(&mixed, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(not_null_value), Some(nullable_value)],
+                "{nullable_value:?} beside a separator-valued not-null column \
+                 must survive both escape layers"
+            );
+            assert_ne!(
+                key,
+                join_pk_key([Cow::Borrowed(not_null_value), encode_key_part(None)]),
+                "a genuine {nullable_value:?} must never encode to the NULL key"
+            );
+        }
+
+        // Arity 1 for the nullable column on its own: the NULL layer still
+        // applies (issue #110 has no arity exemption) while the separator
+        // layer still does not (issue #200's arity-1 exemption), so a value
+        // carrying both a real sentinel and a real separator round-trips.
+        let one_nullable = pk(&["sku"]);
+        for value in ["\u{1}\u{1f}\u{1e}", "\u{1f}", "\u{1}"] {
+            let key = join_pk_key([encode_key_part(Some(value))]);
+            assert_eq!(
+                split_ok(&one_nullable, &key)
+                    .iter()
+                    .map(Option::as_deref)
+                    .collect::<Vec<_>>(),
+                vec![Some(value)]
+            );
+        }
+        assert_eq!(
+            split_ok(&one_nullable, &join_pk_key([encode_key_part(None)]))
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![None]
+        );
     }
 
     #[test]

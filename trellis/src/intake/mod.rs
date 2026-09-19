@@ -204,6 +204,15 @@ async fn fetch_confirmed_lsn(
 /// genuinely nullable key — an aggregate target's `GROUP BY` columns, which
 /// never reach this function — takes the encoded form
 /// (`staging::apply_aggregate::derive_group_key`).
+///
+/// Issue #200's separator escape, by contrast, *does* apply here, and comes
+/// for free: [`crate::defs::ddl::join_pk_key`] applies it to a multi-part
+/// key, exactly as `ddl::pk_key_sql_expr` applies its SQL twin
+/// (`ddl::composite_key_escape_sql`) to a multi-column one, so a key column
+/// whose value genuinely contains U+001F/U+001E still decodes at the right
+/// arity. A single-column key stays verbatim on both sides — see
+/// `ddl::push_escaped_composite_key_part`'s "why arity 1 is exempt", which
+/// turns on the same write-path argument the U+0001 discussion above makes.
 fn extract_key(
     relation: &Relation,
     tuple: &[ColumnValue],
@@ -1166,6 +1175,57 @@ mod tests {
         assert_eq!(
             extract_key(&r, &tuple, Some(&pk)).unwrap(),
             "\u{1}\u{1f}a\u{1}\u{1}b"
+        );
+    }
+
+    /// Issue #200's counterpart of the test above, and the one place the two
+    /// escape layers meet on this side: a U+0001 is still verbatim (a real
+    /// `PRIMARY KEY` is `NOT NULL`, so there is no NULL layer at all here),
+    /// but a genuine U+001F/U+001E in a *composite* key's component is
+    /// escaped by `ddl::join_pk_key`, so the staged key still decodes at
+    /// arity 2 instead of tripping `MalformedCompositeKey`. At arity 1
+    /// nothing is escaped, since the staged text doubles as a 1-1 target's
+    /// literal primary-key value.
+    #[test]
+    fn extract_key_escapes_a_separator_valued_component_only_in_a_composite_key() {
+        use crate::defs::ddl;
+
+        let r = relation(vec![("id", true), ("payload", false)]);
+        let tuple = vec![
+            ColumnValue::Text("a\u{1f}\u{1e}b".into()),
+            ColumnValue::Text("hello".into()),
+        ];
+        assert_eq!(
+            extract_key(&r, &tuple, None).unwrap(),
+            "a\u{1f}\u{1e}b",
+            "an arity-1 key is the column's own text, verbatim"
+        );
+
+        let pk = vec!["tenant".to_string(), "id".to_string()];
+        let r = relation(vec![("tenant", true), ("id", true)]);
+        let tuple = vec![
+            ColumnValue::Text("t\u{1f}1".into()),
+            ColumnValue::Text("a\u{1e}\u{1}b".into()),
+        ];
+        let key = extract_key(&r, &tuple, Some(&pk)).unwrap();
+        // The consumer side decodes it back at the right arity — a real
+        // `PRIMARY KEY`'s columns are not-null, so `split_pk_key` applies
+        // only issue #200's un-escape, never issue #110's decode.
+        let pk_columns: Vec<ddl::PrimaryKeyColumn> = ["tenant", "id"]
+            .iter()
+            .map(|name| ddl::PrimaryKeyColumn {
+                name: (*name).to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+            })
+            .collect();
+        assert_eq!(
+            ddl::split_pk_key(&pk_columns, "widgets", &key)
+                .expect("decodes at arity 2 despite the embedded separator")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("t\u{1f}1"), Some("a\u{1e}\u{1}b")]
         );
     }
 

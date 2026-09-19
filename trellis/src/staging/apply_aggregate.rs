@@ -540,14 +540,27 @@ impl AggregateTargetPlan {
 /// persisted anywhere across versions (the ring's staged `key` text is the
 /// only place it lands, and only for the duration of one hop).
 ///
-/// The U+001F join is injective under exactly the assumption the rest of
-/// this codebase already makes for a real composite primary key and for
-/// `staging::append::TRUNCATE_SENTINEL_KEY`: no ordinary column value
-/// contains U+001F. The old length-prefixed form was injective without that
-/// assumption, which is the one property given up here — deliberately, since
-/// agreeing with the crate's single composite-key convention is worth
-/// strictly more than being independently self-describing, and a value
-/// containing U+001F already corrupts `intake::extract_key` today.
+/// The U+001F join is injective regardless of what a real column value
+/// contains: [`ddl::join_pk_key`] (which this function goes through, not a
+/// local join) escapes a genuine `COMPOSITE_KEY_SEPARATOR`/`KEY_PART_ESCAPE`
+/// occurrence rather than assuming it away (issue #200 — see
+/// `ddl::KEY_PART_ESCAPE`'s doc comment). Before that fix this paragraph
+/// described an *assumption*, not a guarantee, matching
+/// `staging::append::TRUNCATE_SENTINEL_KEY`'s own pre-#200 caveat; the old
+/// length-prefixed form was injective without needing any such assumption,
+/// which is the one property this encoding gives up in exchange for
+/// agreeing with the crate's single composite-key convention — a trade now
+/// made safe rather than merely convenient. (Injective *for a fixed arity*,
+/// which is all any consumer needs: `ddl::split_pk_key` always knows the
+/// arity it is decoding at, and a one-column group's key is deliberately
+/// left unescaped — see the single-column paragraph below.)
+///
+/// That escape composes with (rather than replacing) the
+/// [`ddl::encode_key_part`] `NULL` encoding described next: this function
+/// hands `join_pk_key` already-`encode_key_part`-encoded parts, and
+/// `join_pk_key` escapes U+001F/U+001E on top of them. The two layers touch
+/// disjoint characters — see `ddl::COMPOSITE_KEY_SEPARATOR`'s "how this
+/// composes with `NULL_KEY_SENTINEL`" section.
 ///
 /// A `NULL` grouping component (issue #110) is rendered through
 /// [`ddl::encode_key_part`] as [`ddl::NULL_KEY_SENTINEL`] — a lone U+0001,
@@ -568,9 +581,13 @@ impl AggregateTargetPlan {
 /// byte-for-byte on both sides of the wire regardless of arity.
 ///
 /// For a **single-column** `GROUP BY`, the key is that one column's own
-/// text value, completely unencoded — no length prefix, and no separator to
-/// join on, byte-identical to what [`ddl::pk_key_sql_expr`] renders for a
-/// single-column key. This case *does*
+/// text value, `encode_key_part`-encoded but otherwise untouched — no
+/// length prefix, no separator to join on, and (issue #200) no
+/// separator escape either: [`ddl::join_pk_key`] passes a lone part through
+/// verbatim, byte-identical to what [`ddl::pk_key_sql_expr`] renders for
+/// that same single-column key. That arity-1 exemption is deliberate and
+/// load-bearing — see `ddl::push_escaped_composite_key_part`'s "why arity 1
+/// is exempt". This case *does*
 /// need to double as a real primary key value: the aggregate target's
 /// actual Postgres identity (its `UNIQUE NULLS NOT DISTINCT` grouping-column
 /// constraint, the same one [`ddl::source_primary_key`] falls back to for a
@@ -3073,6 +3090,65 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("w1"), Some("a")],
             "the downstream consumer must decode exactly the grouping values back"
+        );
+    }
+
+    /// Issue #200: a group whose own column value genuinely contains
+    /// `ddl::COMPOSITE_KEY_SEPARATOR` must still decode back to that exact
+    /// value, not be misread as an extra field boundary — the same class of
+    /// gap issue #171's arity check above guards, except this one could fire
+    /// on perfectly valid source data. The grouping columns are nullable, so
+    /// this simultaneously exercises issue #110's `NULL_KEY_SENTINEL` layer
+    /// underneath the #200 escape: one component is a real `NULL`, one holds
+    /// a real U+0001 *and* a real U+001F/U+001E at once.
+    #[test]
+    fn derive_group_key_round_trips_a_real_separator_valued_component() {
+        let group_by = vec!["warehouse".to_string(), "sku".to_string()];
+        let (_, key) = derive_group_key(
+            &row(&[("warehouse", Some("w1\u{1f}extra")), ("sku", Some("a"))]),
+            &group_by,
+        );
+        assert_ne!(
+            key, "w1\u{1f}extra\u{1f}a",
+            "a real separator inside a component must not pass through unescaped"
+        );
+
+        let pk = vec![
+            ddl::PrimaryKeyColumn {
+                name: "warehouse".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+            },
+            ddl::PrimaryKeyColumn {
+                name: "sku".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+            },
+        ];
+        assert_eq!(
+            ddl::split_pk_key(&pk, "stock_totals", &key)
+                .expect("decodes despite the embedded separator")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![Some("w1\u{1f}extra"), Some("a")],
+        );
+
+        // Both layers at once: a genuinely NULL component alongside one
+        // carrying every control character either scheme reserves.
+        let (_, both) = derive_group_key(
+            &row(&[("warehouse", None), ("sku", Some("\u{1}\u{1f}\u{1e}\u{1}"))]),
+            &group_by,
+        );
+        assert_eq!(
+            ddl::split_pk_key(&pk, "stock_totals", &both)
+                .expect("decodes with both escape layers in play")
+                .iter()
+                .map(Option::as_deref)
+                .collect::<Vec<_>>(),
+            vec![None, Some("\u{1}\u{1f}\u{1e}\u{1}")],
+            "issue #110's NULL sentinel and issue #200's separator escape must \
+             compose without either corrupting the other"
         );
     }
 

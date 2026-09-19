@@ -54,13 +54,29 @@ impl CdcOp {
 /// internally; the wire protocol rejects it outright), which a real
 /// truncate sentinel value would need to survive an actual round trip
 /// through the ring. U+001F is exactly the separator
-/// `intake::extract_key` itself already joins composite-key parts on — this
-/// reuses that same "no real column value contains this control character"
-/// assumption the codebase already relies on, rather than inventing a
-/// second one. A real key can, in principle, still collide if source data
-/// itself contains U+001F, but that would already corrupt
-/// `intake::extract_key`'s own composite-key joining today, independent of
-/// this sentinel.
+/// `intake::extract_key`/`defs::ddl::join_pk_key` themselves join
+/// composite-key parts on, and this sentinel — unlike a real key — never
+/// passes through that encoding at all: it is one fixed literal, compared
+/// (and grouped by the fold) as an opaque whole string, not split back into
+/// parts.
+///
+/// This is a *different* question from the one issue #200 closed in
+/// `defs::ddl` (a real, in-value U+001F no longer misparses as a field
+/// boundary, because a multi-column key now escapes one and a single-column
+/// key is never split at all). Neither half of that fix narrows this
+/// sentinel, which collides with any key whose text happens to *equal* this
+/// exact literal — two ways, both pre-existing and both unchanged by #200:
+/// a single-column key whose own value literally spells
+/// `"\u{1f}trellis-truncate-sentinel"` (arity-1 keys are deliberately
+/// verbatim, see `defs::ddl::push_escaped_composite_key_part`'s "why arity 1
+/// is exempt"), and a composite key whose first declared-order component is
+/// a genuine empty string and whose remaining components spell
+/// `"trellis-truncate-sentinel"` (the U+001F between them is a real,
+/// correctly-unescaped field boundary). Both are accepted as the same class
+/// of vanishingly unlikely risk every fixed reserved-token sentinel in this
+/// crate carries (`relationship_reverse_deferred_src_table` below included)
+/// — narrowing them further would mean this sentinel stops being a short,
+/// fixed, greppable literal, which is judged not worth it here.
 pub const TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-truncate-sentinel";
 
 /// One raw change to append into the active ring segment.
