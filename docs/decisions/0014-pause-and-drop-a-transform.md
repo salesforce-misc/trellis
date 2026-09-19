@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-09-19
 deciders: Michael Ries
 ---
@@ -125,12 +125,3 @@ decide the operation and composes it behind the facade, returning plain data.
   definition-owned rows, never shared source-keyed staging or poison state.
 - A framework migration's rollback is honest: pause-then-drop, idempotent in both
   directions, even though it does not share the host's migration transaction.
-
-## Open questions
-
-- **A single-verb convenience** that pauses, waits for quiescence, then drops — worth
-  offering, or is composing pause and drop enough? Deferred until a concrete caller needs
-  the one-call form.
-- **Resume's backfill scope.** A full rebuild is always correct; whether a bounded resume
-  that rebuilds only the range that changed during the pause is worth building depends on
-  how long real pauses last.
