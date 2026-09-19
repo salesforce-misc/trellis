@@ -28,9 +28,13 @@ duplication that a future reader will otherwise 'clean up'").
 
 Grounded against the code at commit `98f9672` (current `main`), not the issue text
 alone. Reading the actual code changed one important fact the issue text doesn't
-mention: **a second, already-independent SQL-rendering oracle already exists inside
-the `trellis` crate itself**, separate from `generative`'s. That finding drives most
-of the sizing and independence reasoning below.
+mention: **a second SQL-rendering oracle already exists inside the `trellis`
+crate itself**, separate from `generative`'s, and `self_check` should be built by
+hardening it rather than porting `generative`'s from scratch. Reading it closely
+also turned up a complication the first draft of this ADR got wrong and §4 now
+reckons with: that renderer's *leaf* expression function is not test-only — the
+production backfill and aggregate-apply paths already render through it. Both
+findings drive the sizing and independence reasoning below.
 
 ## What's already there
 
@@ -63,16 +67,77 @@ independent things, cleanly documented apart:
    doc comment says the same thing: "test/benchmark oracle only."
 
 Today this module is `pub mod oracle` (unconditional, no feature gate) under
-`pub mod defs` in `trellis/src/defs.rs` — reachable, but used by only one
-integration test today (`trellis/tests/client_e2e.rs`). It is not called from
-anywhere on the production apply/staging path.
+`pub mod defs` in `trellis/src/defs.rs`. Its three top-level `SELECT` renderers
+(`render_aggregate_select_sql`, `render_relationship_select_sql`,
+`render_aggregate_relationship_select_sql`) are indeed called only from tests
+and the benchmark crate — roughly ten files under `trellis/tests/`, plus
+`benchmark/src/scenario.rs:295`.
 
-So the codebase already has **two separately-authored, evaluator-independent SQL
-renderers** — `trellis::defs::oracle`'s and `generative::oracle`'s — that happen
-to live in different crates and were never plumbed together. `self_check` does not
-need to be invented from nothing; it needs `trellis::defs::oracle`'s existing
-renderer **hardened and exposed**, not a from-scratch port of `generative`'s. This
-materially shrinks the "how big is this" estimate in the issue's own phasing.
+**But the leaf expression renderer they are all built on is not test-only, and
+this is load-bearing for everything below.** `render_expr_sql` — and the two
+`pub(crate)` helpers beside it, `render_to_one_rel_expr_sql` and
+`to_one_join_clauses` — are called directly from the production write paths:
+
+- `trellis/src/defs/backfill.rs:83,592` — `write_one_to_one_range`, i.e. the
+  **1-1 direct backfill** that produces a 1-1 target's initial contents
+  (ADR-0007). Also `backfill.rs:911,930` for the aggregate direct build.
+- `trellis/src/staging/apply_aggregate.rs:2272` — `render_agg_expr`, on the
+  **incremental aggregate apply** path, plus `to_one_join_clauses` at
+  `:1365` and `render_to_one_rel_expr_sql` at `:1325`.
+
+`oracle.rs`'s own doc comment (lines 443-447) states this outright:
+`render_to_one_rel_expr_sql` "is the shared renderer for every place a to-one
+path has to become SQL over a real `LEFT JOIN` … the aggregate direct build
+(`super::backfill::backfill_aggregate`), the aggregate incremental recompute
+(`staging::apply_aggregate::apply_forced_groups_bulk`), and this module's own
+`render_aggregate_relationship_select_sql` oracle." The per-function
+"test/benchmark oracle only" doc comments apply to the top-level `SELECT`
+renderers, not to the expression leaf.
+
+The four renderers *are* evaluator-independent in the sense that matters most
+(`render_expr_sql` is a pure `match` over the AST — traced end-to-end, it never
+calls into `defs::eval`). But "barely used, nothing production depends on it" is
+wrong, and §4 has to reckon with the consequence rather than assume it away.
+
+So the codebase has **two SQL renderers that share no linkage** —
+`trellis::defs::oracle`'s and `generative::oracle`'s (verified: `generative`
+imports only `trellis::defs::oracle::{OracleError, recompute,
+recompute_aggregate}` at `generative/src/oracle/mod.rs:43`, and `recompute` is
+confined to `evaluator_oracle`, never `sql_oracle`). `self_check` does not need
+to be invented from nothing; it needs `trellis::defs::oracle`'s existing renderer
+**hardened, scoped, and exposed**. That is still less work than a from-scratch
+port of `generative`'s — but see §5 for why "already exists" is not the same as
+"almost done."
+
+### One caveat on how independent the two renderers really are
+
+At the `SELECT`-assembly level they are genuinely different designs:
+`generative` casts every projection to text and emits a leading pk expression,
+dispatches through one `render_select` that branches on `uses_relationships`,
+and renders join `ON` operands in the opposite order; `trellis` has four separate
+entry points, runs `backfill::substituted_field_exprs` first, and emits no cast
+and no pk. A pipeline, fold, or join-assembly bug on one side would show up
+against the other.
+
+At the **leaf expression** level they are not independent derivations.
+`generative::oracle::render_expr` (`mod.rs:308-338`) is a near-line-for-line
+transcription of `trellis::defs::oracle::render_expr_sql` (`oracle.rs:401-435`):
+same arm order, same `COUNT`-with-empty-args guard ahead of the generic arm,
+byte-identical `format!("({} {symbol} {})", …)` and
+`format!("'{}'::text", text.replace('\'', "''"))`. Combined with the finding
+above — that `render_expr_sql` is what production backfill and aggregate-apply
+render through — the honest picture is that **there is effectively one
+expression-rendering implementation across all three sites**. A reasoning bug at
+that level (the wrong Postgres spelling for an operator, a collation-sensitive
+form, a `COUNT` semantics mistake) is today invisible to *both* the generative
+suite's three-way check and a `self_check` built on this renderer.
+
+This does not sink the proposal — the bug class #174 is actually aimed at
+(§"Consequences" below, and #98/#165/#47/#65) is pipeline staleness, not
+expression rendering, and against that class the sharing is harmless. But it
+narrows what `self_check` can honestly claim, and it makes the §4 cross-check
+test weaker than it first appears: two transcriptions of the same arms will
+agree with each other by construction. Flagged as open question 7.
 
 ## Decision
 
@@ -110,6 +175,20 @@ second, already-independent one already exists in the right crate.
   my target correct" only needs the answer, not which of two *other* things
   would also have been wrong. (Open question 1 asks whether this should be a
   debug-only opt-in instead of omitted entirely.)
+
+  *Checked against the cited bugs, not asserted.* #98/#165 diverged as
+  `target_vs_sql` specifically — #98's issue body reports
+  `Diverged { target_vs_sql: [Cell { column: "rel_enrich", expected: None,
+  got: Some("22") }] }`, i.e. the persisted target held a stale value where the
+  `LEFT JOIN` oracle said `NULL`. The evaluator leg contributed nothing to
+  catching it. #47 (aggregates never enforcing `REPLICA IDENTITY`, so deletes
+  under-recompute and in-place updates double-count) and #65 (publication
+  silently dropping CDC) are likewise pure persisted-vs-recompute divergences:
+  the evaluator run from scratch would agree with the SQL recompute and both
+  would disagree with the target. So the two-way check covers the whole cited
+  class; the evaluator leg's distinct value is Rust-evaluator-vs-Postgres
+  semantic drift, which is not what any of #98/#165/#168/#47/#65/#79 were.
+  Dropping it loses no coverage of the bug class this ADR exists to serve.
 - **Report shape**: a `SelfCheckReport` local to `trellis`, structurally like
   `generative::oracle::Divergence`/`ThreeWayReport` but simpler (one comparison
   leg, not three) — cell/missing-row/extra-row/missing-column/extra-column
@@ -142,24 +221,76 @@ The issue names this the hardest part: the correctness promise is conditional on
 "once caught up to a given LSN," and `self_check` must distinguish "diverged" from
 "not caught up yet" or it produces false positives under live load.
 `docs/staging-and-claiming/07-convergence-and-await.md` already owns exactly this
-question — `watermark_token`/`converged_through`/`await_converged` is the
-primitive the client-facing `await(LSN, timeout)` already uses. `self_check`
-reuses it rather than building a second "quiet window" concept:
+question, and the primitive is **real code today**, not a proposal:
+`watermark_token`/`converged_through`/`await_converged` live in
+`trellis/src/staging/converge.rs` (lines 259, 110, 275), re-exported at
+`staging/mod.rs:70-72`, and are already used by
+`generative/src/backend/{manual,subprocess}.rs` and `trellis/tests/converge.rs`.
+
+Two corrections to an earlier draft of this section, because they change the
+dependency story:
+
+- There is **no** client-facing `await(LSN, timeout)` on `Trellis` today.
+  `app.rs` exposes no converge/await method at all and never calls
+  `staging::converge`. Closing that facade gap *is* issue #192, which is **open
+  and unstarted** (no branch content, no PR). So `self_check` either depends on
+  #192 landing or calls `staging::converge` crate-internally itself.
+- ADR-0012 (#190, PR #213) is **merged**, and it demotes `defs`/`staging`/
+  `intake` to `pub(crate)` while explicitly carving out
+  `defs::oracle::{OracleError, recompute, recompute_aggregate, …}` for
+  `generative`. `staging::converge` is in the same demotion, so the
+  crate-internal route is the expected one.
+
+`self_check` reuses the primitive rather than building a second "quiet window"
+concept:
 
 1. Take a watermark token (`pg_current_wal_lsn()`) before reading anything.
 2. `await_converged` on that token (bounded by a timeout) — if it doesn't
    converge in time, `self_check` returns "not yet caught up," never a false
    divergence.
-3. Once converged, read the persisted target and run the rendered `SELECT`
-   **inside one `REPEATABLE READ` transaction**, so both reads observe the same
-   snapshot even if source writes continue to land during the query. Without
-   this, a write landing between the two reads (persisted target already
-   reflects it, but the recompute `SELECT` reads a source row mid-flight, or vice
-   versa) would look like a divergence that never really existed — the same
-   failure mode the issue is worried about, just moved one step later. The
-   generative suite's oracle gets this for free today because its harness
-   quiesces the whole workload before comparing; production `self_check` cannot
-   assume that, so it has to earn point-in-time consistency explicitly.
+3. Read the persisted target and run the rendered `SELECT` **inside one
+   `REPEATABLE READ` transaction**, so the two reads are not smeared across an
+   arbitrary interval while the recompute scan runs.
+
+**This combination is necessary but not sufficient, and the gap should be
+settled before implementation rather than discovered in it.** Two distinct
+races survive it:
+
+- **`await_converged` → `BEGIN` gap.** Convergence is established at token time
+  `T1`; the snapshot is taken at `T2 > T1`. Any source transaction committing in
+  `(T1, T2)` is visible in the snapshot's *source* read but its CDC apply has
+  not necessarily landed in the snapshot's *target* read. That is a false
+  divergence, and it is exactly the failure mode step 3 was meant to remove —
+  moved one step earlier rather than eliminated.
+- **`REPEATABLE READ` freezes the wrong pair.** A single snapshot pins source
+  and target at the *same* instant. But under live load the target legitimately
+  lags the source by the CDC apply latency — that lag is the system working
+  correctly, not drift. Freezing both at one instant therefore *guarantees* a
+  false divergence for any source write in flight, rather than preventing one.
+  Reordering doesn't rescue it: if the snapshot is taken first and
+  `await_converged` runs inside it, the awaited applies are invisible to the
+  already-frozen target read.
+
+The generative suite's oracle sidesteps all of this because its harness truly
+quiesces the workload before comparing — no writer is running. Production
+`self_check` cannot assume that, and a snapshot alone does not substitute for it.
+The realistic options, none free:
+
+a. **Require a genuine quiet window** (the honest analogue of what the test
+   harness does): document `self_check` as sound only when source writes to the
+   audited tables are stopped, and have it report "not quiescent" otherwise
+   (e.g. `pending_count` non-zero at both ends of the check).
+b. **Re-check suspected divergences.** A real divergence is stable across
+   repeated checks; a convergence race resolves. Report a cell as diverged only
+   if it survives a second check after a fresh `await_converged`. Cheap,
+   defensible, and it makes the check sound under load at the cost of latency
+   on a dirty result.
+c. **Bound the check to keys with no in-flight staged work** — intersect the
+   audited key range with what `staging` reports as pending and exclude it.
+   Precise but couples `self_check` to staging internals.
+
+(b) is the recommended default, with (a) as the documented strong mode. This is
+open question 8.
 
 ### 4. What can be shared between the (now three) renderers without weakening independence — reasoned explicitly, not assumed
 
@@ -192,13 +323,27 @@ the property). The actual boundary is narrower than either extreme:
   costs nothing in independence and saves nothing meaningful in a third
   near-identical implementation either. Leave each renderer with its own.
 
-**Must stay separately authored — this is the load-bearing part:**
-- **The actual expression/`SELECT` rendering** (`render_expr`/`render_select` and
-  siblings) in all three places that have it today or will:
-  `defs::eval::evaluate` (the production incremental-maintenance path),
-  `trellis::defs::oracle`'s SQL renderer (what `self_check` productionizes), and
-  `generative::oracle`'s SQL renderer. This is precisely the logic whose bugs
-  the whole mechanism exists to catch. `self_check` must not call into
+**Must stay separately authored — this is the load-bearing part, and it is
+*not* fully true today:**
+- **The actual `SELECT` assembly** (`render_select`/`render_rel_select` and
+  siblings) must stay separate across: `defs::eval::evaluate` (the production
+  incremental-maintenance path), `trellis::defs::oracle`'s SQL renderer (what
+  `self_check` productionizes), and `generative::oracle`'s SQL renderer. This
+  holds today and must keep holding.
+- **The leaf expression rendering does not hold today.** Per "What's already
+  there" above, `render_expr_sql` is shared by the production 1-1 backfill and
+  aggregate-apply paths, and `generative`'s `render_expr` is a transcription of
+  it. So for expression-level rendering the intended three-way independence is
+  currently one-way. `self_check` v1 built on this renderer therefore has a real
+  blind spot: a 1-1 target's **backfilled, never-since-modified rows** were
+  written by `render_expr_sql` and would be re-derived by `render_expr_sql`,
+  so a rendering bug agrees with itself. Rows modified since backfill were
+  written by the evaluator (`staging/apply.rs` uses `eval::evaluate`, not
+  oracle SQL — verified), so those legs stay independent. Open question 7 asks
+  whether to close this (give `self_check` its own expression renderer) or
+  accept and document it.
+- Whatever is decided, the linkage rule stands: `self_check` must not call into
+  `generative::oracle`, and `generative` must not import `self_check`'s renderer. `self_check` must not call into
   `generative::oracle` (wrong dependency direction besides), and `generative`
   must not import `self_check`'s renderer — if it ever did, a bug in that shared
   code would be invisible to the very comparison meant to catch it, which is the
@@ -228,16 +373,49 @@ already exists:
    `trellis::defs::oracle`'s existing renderer (hardened: explicit
    quiescence/LSN contract per §3, mandatory limit/cursor per §2, a
    `SelfCheckReport` type, public API wrapper). Add the `generative`-crate
-   cross-check test from §4. Smaller than a port because the renderer already
-   exists and is already unit-tested; the new work is almost entirely the
-   safety contract and the API surface, not new rendering logic.
-3. **Extend to aggregate and relationship-enriched targets.** Mostly wiring:
-   `trellis::defs::oracle::render_aggregate_select_sql`/
-   `render_relationship_select_sql`/`render_aggregate_relationship_select_sql`
-   already exist and are already unit-tested against fixture definitions; this
-   phase is assembling a target's live `HashMap<String, RelationshipDef>` from
-   the catalog (the pattern `defs::backfill.rs` already uses) and threading it
-   through, not writing new SQL generation.
+   cross-check test from §4.
+3. **Extend to aggregate and relationship-enriched targets.** The renderers
+   exist and are well exercised (heavily, by `trellis/tests/defs_oracle.rs`,
+   `apply_aggregate.rs`, `defs_aggregate_relationship.rs` and others — more
+   than "unit-tested against fixtures"), and assembling a target's live
+   `HashMap<String, RelationshipDef>` from the catalog follows the pattern
+   `defs/backfill.rs` already uses.
+
+**Do not read phases 2-3 as "almost entirely the safety contract, not new
+rendering logic."** Reading the renderers, the gap between a test oracle and a
+production-callable audit is larger than "wiring," and understating it here is
+the same mistake #190's original draft made with its "three-line fix":
+
+- **No primary key in the projection.** `render_relationship_select_sql`
+  (`oracle.rs:654`) and `render_aggregate_select_sql` (`:278`) emit only the
+  calculated fields — no pk, no group key. Today's callers compare whole
+  result sets; a `self_check` that reports "which key diverged" needs the key
+  in the projection. That is a change to the renderers, not around them.
+- **No scoping hook at all.** Both emit an unbounded
+  `select … from <source> [joins] [group by …]` with no `WHERE`, `ORDER BY`, or
+  `LIMIT` seam. §2 makes keyset scoping *mandatory*, so every renderer needs a
+  bounding clause threaded through. For an **aggregate** target this is not a
+  predicate push-down: a group's value depends on every source row in the
+  group, so bounding the source scan changes the answer. Scoping an aggregate
+  self-check has to bound the *group-key* space and then scan all source rows
+  belonging to those groups — a genuinely different query shape than what
+  `render_aggregate_select_sql` emits today. This is the single most
+  underestimated item in the plan.
+- **Panics on the unhappy path.** `oracle.rs` has ten `panic!`/`assert!`/
+  `expect()` sites reachable from these renderers (unresolved relationship
+  path, wrong `KeySpace`, unknown relationship name, non-substitutable
+  definition). Acceptable in a test oracle; not acceptable in a method an
+  operator can call against production. Converting these to a `Result` is
+  mechanical but touches every function.
+- **No column-level quarantine awareness.** `backfill.rs` consults
+  `paused_columns_for` before rendering; `oracle.rs` has no notion of a paused
+  column (zero references). A `self_check` that ignores ADR-0003's column-level
+  quarantine will report a paused column as diverged on every run — a false
+  positive on exactly the targets an operator is most likely to audit.
+
+None of this argues against building on this renderer; it argues that phase 2
+is "harden a real renderer into a production API," not "add a safety contract
+to a finished one."
 4. **CLI (`trellis self-check <target>`)**, alongside the Prometheus/status
    surfaces from epic #49 — e.g., "time since last self-check," "last self-check
    result" as an exported metric for whatever schedules it externally (open
@@ -256,11 +434,16 @@ already exists:
 - `trellis::defs::oracle` moves from an undocumented-audience "test/benchmark
   oracle" to a load-bearing part of the public API surface. Its doc comments
   ("test/benchmark oracle only") need updating as part of phase 2 so they don't
-  mislead a future reader about who calls it. This also interacts with the
-  in-flight ADR-0012 (PR #213, not yet merged): if `defs` is demoted to
-  `pub(crate)`, `defs::oracle`'s rendering functions need an explicit carve-out
-  (or a move to a new `pub` module `self_check` re-exporting/wrapping them)
-  rather than staying reachable only by accident of `defs` being `pub`.
+  mislead a future reader about who calls it. This interacts directly with
+  **ADR-0012 (#190, PR #213), now merged**, which demotes `defs` to
+  `pub(crate)` while carving out `defs::oracle::{OracleError, recompute,
+  recompute_aggregate, …}` for `generative`. `self_check` should be a new `pub`
+  surface that wraps these functions, rather than widening that carve-out or
+  leaving them reachable by accident.
+- `self_check` depends on issue **#192** (converge facade), which is open and
+  unstarted. Phase 2 either waits on it or uses `staging::converge`
+  crate-internally — worth deciding explicitly, since #192 also demotes
+  `staging::converge` to `pub(crate)`.
 - The two SQL renderers (`trellis::defs::oracle`'s and `generative::oracle`'s)
   remain permanently double-maintained. That's accepted, not incidental — see §4
   — and now has a concrete CI mechanism (the cross-check test) keeping the cost
@@ -290,14 +473,16 @@ calls this "a secondary cross-check, not the authority."
 
 **Write a fresh fourth renderer from scratch**, treating `trellis::defs::oracle`'s
 existing SQL renderer as off-limits too (on the theory that *any* pre-existing
-code is suspect). Rejected: `trellis::defs::oracle`'s renderer is already
+code is suspect). Rejected **for the `SELECT`-assembly layer**: that layer is
 independently authored from both the evaluator and from `generative::oracle`
-(confirmed by reading both — see "What's already there" above), so a fourth
-implementation would add authorship-independence between two things that don't
-need it (production's target vs. `self_check`'s own past self) while doing
-nothing to strengthen the one relationship that matters (production's target vs.
-an authority independent of the code that wrote it). It would also roughly
-double phase 2's cost for no corresponding safety gain.
+(confirmed by reading both — see "What's already there"), so a fourth
+implementation of it would roughly double phase 2's cost for no safety gain.
+
+Rejected only **partially for the leaf expression renderer**, because the
+premise turns out not to hold there: `render_expr_sql` is shared with production
+backfill/aggregate-apply, so re-deriving it is not duplicating an already-
+independent thing — it is creating the independence §4 assumes. It is also a
+~35-line `match`, not a meaningful share of phase 2. See open question 7.
 
 ## Open Questions for @mmmries
 
@@ -336,3 +521,23 @@ need a decision from the repo owner rather than assuming one:
    of the operator-facing API, per ADR-0003's amendment) **or does a self-check
    scope need a richer selector** (a key range, a specific pk list, a cursor) that
    doesn't fit that string shape and wants its own type from the start?
+7. **The expression-renderer blind spot (§4).** `render_expr_sql` is shared with
+   the production 1-1 backfill and aggregate-apply paths, and `generative`'s
+   `render_expr` is a transcription of it — so there is effectively one
+   expression-rendering implementation across all three sites. Options:
+   (a) accept and document it, on the grounds that the bug class #174 targets is
+   pipeline staleness rather than expression rendering (this ADR's working
+   assumption); (b) give `self_check` its own leaf expression renderer, which is
+   a small function — the one place where the rejected "write a fourth renderer"
+   alternative might actually be worth it, precisely because it's cheap here;
+   (c) rewrite `generative`'s `render_expr` as a genuinely independent
+   derivation. (b) is cheap and closes the production-vs-audit half; (c) is what
+   the generative suite's own design doc already implies it should be.
+8. **Which quiescence strategy (§3)?** `await_converged` + `REPEATABLE READ` is
+   not sufficient on its own — the await→snapshot gap, and the fact that a
+   single snapshot freezes source and target at an instant where the target
+   legitimately lags. §3 proposes re-checking suspected divergences (option b)
+   as the default with a documented quiet-window strong mode (option a). This
+   needs a decision before phase 2, because it shapes the API (does
+   `self_check` take a retry budget? does it report "not quiescent" as a third
+   outcome alongside converged/diverged, interacting with open question 3?).
