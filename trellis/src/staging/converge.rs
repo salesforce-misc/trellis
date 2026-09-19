@@ -16,8 +16,8 @@
 //! what makes convergence never report "converged" across a parked key.
 //!
 //! **Deferred to #14/#15:** the doc's "a round did no work" classification
-//! table (pause-lease-active, refused-seal backpressure, peer-holds-batch)
-//! describes a *worker-side drain-to-convergence helper* that depends on
+//! table (refused-seal backpressure, peer-holds-batch) describes a
+//! *worker-side drain-to-convergence helper* that depends on
 //! claiming/sweeping (#14/#15) and cleanup (#13) machinery this crate
 //! doesn't have yet. This module builds only the caller-side poll
 //! ([`await_converged`]) the doc's "Watermark tokens" section describes —

@@ -3,10 +3,10 @@
 //! harness (`testkit::TestCluster`).
 //!
 //! See docs/staging-and-claiming/04-claiming-and-the-fold.md, "Keeping a
-//! claim alive", "Two ways a claim comes back", and "An orthogonal gate:
-//! the pause lease" for the design these tests hold the implementation to.
-//! Short real-time windows throughout (ttl ~300ms, daemon interval ~50ms)
-//! so this runs fast against the real cluster.
+//! claim alive" and "Two ways a claim comes back" for the design these
+//! tests hold the implementation to. Short real-time windows throughout
+//! (ttl ~300ms, daemon interval ~50ms) so this runs fast against the real
+//! cluster.
 //!
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
 //! (`trellis/src/staging/liveness.rs`'s `#[cfg(test)]`), not here.
@@ -162,9 +162,9 @@ async fn a_daemon_heartbeat_survives_a_bulk_drain_that_outlives_the_ttl() {
         .expect("claim plain batch");
     assert!(!plain_won.is_empty());
 
-    // Simulate a bulk-shape drain: no `heartbeat_inline` call at all, sleep
-    // well past the TTL. The daemon (registered, ticking every 50ms) is
-    // the only thing keeping `daemon_seg`'s claim alive.
+    // Simulate a bulk-shape drain: no in-line `claimed_at` refresh at all,
+    // sleep well past the TTL. The daemon (registered, ticking every 50ms)
+    // is the only thing keeping `daemon_seg`'s claim alive.
     tokio::time::sleep(ttl + Duration::from_millis(150)).await;
 
     let reclaimed = liveness::reclaim_stale(&client, ttl)
@@ -242,143 +242,6 @@ async fn release_is_scoped_to_claimed_by_and_leaves_other_workers_claims_alone()
         .expect("release worker-a again");
     assert_eq!(released_again, 0);
     assert_eq!(claimed_buckets(&client, seg_seq, "worker-b").await, won_b);
-}
-
-#[tokio::test]
-async fn pause_lease_gates_claim_unless_paused_and_cannot_be_resurrected_after_expiry() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-
-    let seg_seq = seal_one_bucket_batch(&mut client, "k").await;
-    let ttl = Duration::from_millis(300);
-
-    let acquired = liveness::acquire_pause_lease(&client, "auditor", "pauser-1", ttl)
-        .await
-        .expect("acquire pause lease");
-    assert!(acquired, "no lease existed yet, so this must succeed");
-    assert!(
-        liveness::claiming_is_paused(&client)
-            .await
-            .expect("paused?")
-    );
-
-    let gated = liveness::claim_unless_paused(&client, seg_seq, "worker", 1)
-        .await
-        .expect("claim_unless_paused while paused");
-    assert!(
-        gated.is_none(),
-        "claim_unless_paused must refuse to claim while the lease is active"
-    );
-
-    // A second holder can't steal a live lease.
-    let stolen = liveness::acquire_pause_lease(&client, "auditor", "pauser-2", ttl)
-        .await
-        .expect("attempted steal");
-    assert!(
-        !stolen,
-        "a live lease must not be acquirable by a second holder"
-    );
-
-    // The dead pauser's lease auto-expires — no wedge.
-    tokio::time::sleep(ttl + Duration::from_millis(150)).await;
-    assert!(
-        !liveness::claiming_is_paused(&client)
-            .await
-            .expect("paused after expiry?"),
-        "an expired lease must stop gating claims"
-    );
-
-    // A heartbeat that arrives after expiry must not resurrect the lease.
-    let resurrected = liveness::heartbeat_pause_lease(&client, "auditor", "pauser-1", ttl)
-        .await
-        .expect("late heartbeat");
-    assert!(
-        !resurrected,
-        "a heartbeat after expiry must report false, not resurrect the lease"
-    );
-    assert!(
-        !liveness::claiming_is_paused(&client)
-            .await
-            .expect("paused after late heartbeat?"),
-        "the lapsed lease must stay lapsed after a late heartbeat"
-    );
-
-    // Takeover safety (holder-scoping): a second pauser re-acquires the now-
-    // lapsed lease_id, then the *original* pauser issues its late clean-
-    // shutdown release and heartbeat. Neither must touch pauser-2's live
-    // lease — otherwise pauser-1 silently un-pauses the fleet under an
-    // auditor that still believes claiming is suspended.
-    let reacquired = liveness::acquire_pause_lease(&client, "auditor", "pauser-2", ttl)
-        .await
-        .expect("pauser-2 re-acquires the lapsed lease");
-    assert!(reacquired, "the lapsed lease must be re-acquirable");
-
-    liveness::release_pause_lease(&client, "auditor", "pauser-1")
-        .await
-        .expect("pauser-1 late release (wrong holder — a no-op)");
-    let stale_hb = liveness::heartbeat_pause_lease(&client, "auditor", "pauser-1", ttl)
-        .await
-        .expect("pauser-1 late heartbeat (wrong holder)");
-    assert!(
-        !stale_hb,
-        "the original holder's heartbeat must not touch the successor's lease"
-    );
-    assert!(
-        liveness::claiming_is_paused(&client)
-            .await
-            .expect("paused under pauser-2?"),
-        "pauser-2's live lease must survive the original holder's late release/heartbeat"
-    );
-
-    // Drain pauser-2's lease so the tail of the test sees an unpaused fleet.
-    liveness::release_pause_lease(&client, "auditor", "pauser-2")
-        .await
-        .expect("pauser-2 clean release");
-
-    let now_allowed = liveness::claim_unless_paused(&client, seg_seq, "worker", 1)
-        .await
-        .expect("claim_unless_paused after expiry");
-    assert!(
-        now_allowed.is_some(),
-        "claiming must proceed once the lease has lapsed"
-    );
-}
-
-#[tokio::test]
-async fn heartbeat_pause_lease_keeps_a_live_lease_alive() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let ttl = Duration::from_millis(300);
-    liveness::acquire_pause_lease(&client, "auditor", "pauser-1", ttl)
-        .await
-        .expect("acquire");
-
-    // Heartbeat before expiry, repeatedly, past what the original ttl alone
-    // would have covered — the lease must stay live throughout.
-    for _ in 0..4 {
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let ok = liveness::heartbeat_pause_lease(&client, "auditor", "pauser-1", ttl)
-            .await
-            .expect("heartbeat");
-        assert!(ok, "a heartbeat before expiry must succeed");
-        assert!(
-            liveness::claiming_is_paused(&client)
-                .await
-                .expect("paused?")
-        );
-    }
-
-    liveness::release_pause_lease(&client, "auditor", "pauser-1")
-        .await
-        .expect("release");
-    assert!(
-        !liveness::claiming_is_paused(&client)
-            .await
-            .expect("paused?")
-    );
 }
 
 #[tokio::test]

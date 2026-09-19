@@ -1,10 +1,18 @@
 //! Claim liveness (issue #15, stage 04's third piece): keeping a claim
 //! alive across a drain, the two ways a claim comes back (release on error,
-//! reclaim on TTL), the loop's own backoff on consecutive fence misses, and
-//! the fleet-wide pause lease. See
-//! docs/staging-and-claiming/04-claiming-and-the-fold.md, "Keeping a claim
-//! alive", "Two ways a claim comes back", and "An orthogonal gate: the
-//! pause lease" — this module implements each in that order below.
+//! reclaim on TTL), and the loop's own backoff on consecutive fence misses.
+//! See docs/staging-and-claiming/04-claiming-and-the-fold.md, "Keeping a
+//! claim alive" and "Two ways a claim comes back" — this module implements
+//! each in that order below.
+//!
+//! The fleet-wide pause lease that once lived here (`acquire_pause_lease`,
+//! `heartbeat_pause_lease`, `release_pause_lease`, `claiming_is_paused`,
+//! `claim_unless_paused`) was deleted per issue #191: its sole documented
+//! consumer, a self-check auditor's quiescent read, shipped as
+//! `Trellis::self_check` (ADR-0013) and deliberately gets quiescence from a
+//! watermark-await + snapshot + re-check instead, never pausing claiming
+//! fleet-wide. `heartbeat_inline` (zero callers anywhere) was deleted in
+//! the same change.
 //!
 //! No claim-epoch column exists anywhere here. `seg_claims` row identity
 //! *is* the epoch: [`release`] and [`reclaim_stale`] both work by deleting
@@ -21,35 +29,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::{Client, GenericClient, NoTls};
 
-#[cfg(any(test, feature = "internals"))]
-use super::claim::claim;
 use super::error::StagingError;
-
-// ---------------------------------------------------------------------
-// In-line heartbeat
-// ---------------------------------------------------------------------
-
-/// Refreshes `claimed_at` for one claim on the worker's *own* connection
-/// (doc 04, "Keeping a claim alive" — the in-line half). Called before each
-/// source-table read; enough on its own for the steady-state trickle, where
-/// a whole drain is milliseconds. The bulk shape — one drain long enough to
-/// outlive the reclaim window on this alone — needs [`HeartbeatDaemon`]
-/// too, because the cadence must be a function of wall time, not of how
-/// many source tables the batch touches.
-#[cfg(any(test, feature = "internals"))]
-pub async fn heartbeat_inline(
-    client: &impl GenericClient,
-    seg_seq: i64,
-    claimed_by: &str,
-) -> Result<(), StagingError> {
-    client
-        .execute(
-            "update seg_claims set claimed_at = now() where seg_seq = $1 and claimed_by = $2",
-            &[&seg_seq, &claimed_by],
-        )
-        .await?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------
 // Release on error
@@ -157,8 +137,8 @@ pub const FENCE_MISS_MAX_DELAY: Duration = Duration::from_secs(1);
 /// (doc 04, "Two ways a claim comes back"). `0` on the first miss, then
 /// doubling from [`FENCE_MISS_INITIAL_DELAY`] up to [`FENCE_MISS_MAX_DELAY`],
 /// reset by any clean drain. The drain loop itself is a later stage
-/// (unassembled today — see [`claim_unless_paused`]'s doc comment); this is
-/// just the piece of state it will need.
+/// (unassembled today, issue #11, blocked on aggregate transform-defs);
+/// this is just the piece of state it will need.
 #[derive(Debug, Clone)]
 pub struct FenceMissBackoff {
     /// The delay `next_delay` will return *after* the one it's about to
@@ -475,134 +455,4 @@ async fn run_daemon(
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------
-// Pause lease
-// ---------------------------------------------------------------------
-
-/// Acquires `lease_id` for `holder` if, and only if, no unexpired lease
-/// with that id already exists (doc 04, "An orthogonal gate: the pause
-/// lease"). The `ON CONFLICT ... WHERE pause_leases.expires_at <= now()`
-/// guard is what makes this a refusal rather than a steal: a conflicting
-/// row is only overwritten if it has already lapsed, so a live holder's
-/// lease can't be taken out from under it. Returns whether this call now
-/// holds the lease.
-#[cfg(any(test, feature = "internals"))]
-const ACQUIRE_PAUSE_LEASE_SQL: &str = "\
-    insert into pause_leases (lease_id, holder, acquired_at, expires_at) \
-    values ($1, $2, now(), now() + (interval '1 second' * $3)) \
-    on conflict (lease_id) do update \
-        set holder = excluded.holder, acquired_at = excluded.acquired_at, \
-            expires_at = excluded.expires_at \
-        where pause_leases.expires_at <= now()";
-
-#[cfg(any(test, feature = "internals"))]
-pub async fn acquire_pause_lease(
-    client: &impl GenericClient,
-    lease_id: &str,
-    holder: &str,
-    ttl: Duration,
-) -> Result<bool, StagingError> {
-    let ttl_secs = ttl.as_secs_f64();
-    let n = client
-        .execute(ACQUIRE_PAUSE_LEASE_SQL, &[&lease_id, &holder, &ttl_secs])
-        .await?;
-    Ok(n == 1)
-}
-
-/// Refreshes `lease_id`'s `expires_at`. Two load-bearing guards (doc 04):
-/// `expires_at > now()` means a heartbeat arriving *after* expiry can't
-/// silently resurrect a lapsed lease, because that would mask the very
-/// window that made whatever paused read relied on it unsound; `holder = $3`
-/// means only the current holder can extend it — after a lease lapses and a
-/// *different* holder re-acquires the same `lease_id`, the original holder's
-/// stray heartbeat must not extend (or observe as live) the successor's
-/// lease. Returns whether a row was actually updated — `false` means the
-/// lease had already lapsed, never existed, or is now held by someone else,
-/// and the caller must re-[`acquire_pause_lease`] rather than assume it still
-/// holds it.
-#[cfg(any(test, feature = "internals"))]
-pub async fn heartbeat_pause_lease(
-    client: &impl GenericClient,
-    lease_id: &str,
-    holder: &str,
-    ttl: Duration,
-) -> Result<bool, StagingError> {
-    let ttl_secs = ttl.as_secs_f64();
-    let n = client
-        .execute(
-            "update pause_leases set expires_at = now() + (interval '1 second' * $2) \
-             where lease_id = $1 and holder = $3 and expires_at > now()",
-            &[&lease_id, &ttl_secs, &holder],
-        )
-        .await?;
-    Ok(n == 1)
-}
-
-/// Releases `lease_id` outright (a clean shutdown of the pauser, rather
-/// than waiting out the TTL). Scoped `holder = $2` for the mirror-image
-/// reason [`release`] scopes `claimed_by`: after this holder's lease lapsed
-/// and a *different* holder re-acquired the same `lease_id`, this holder's
-/// late clean-shutdown release must not delete the successor's live lease
-/// and silently un-pause the fleet under an auditor still relying on it.
-#[cfg(any(test, feature = "internals"))]
-pub async fn release_pause_lease(
-    client: &impl GenericClient,
-    lease_id: &str,
-    holder: &str,
-) -> Result<(), StagingError> {
-    client
-        .execute(
-            "delete from pause_leases where lease_id = $1 and holder = $2",
-            &[&lease_id, &holder],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Whether claiming is currently paused fleet-wide: any lease row with
-/// `expires_at` still in the future.
-#[cfg(any(test, feature = "internals"))]
-pub async fn claiming_is_paused(client: &impl GenericClient) -> Result<bool, StagingError> {
-    let paused: bool = client
-        .query_one(
-            "select exists(select 1 from pause_leases where expires_at > now())",
-            &[],
-        )
-        .await?
-        .get(0);
-    Ok(paused)
-}
-
-/// A guarded [`claim`](super::claim::claim): checks [`claiming_is_paused`]
-/// first and returns `Ok(None)` without claiming anything if it's paused,
-/// else claims normally. Doc 04 says the real drain loop also gates
-/// seal-on-demand on the same predicate at the top of a drain call, and
-/// that a batch already claimed on a prior call finishes normally once
-/// paused — but no drain loop is assembled yet (issue #11, blocked on
-/// aggregate transform-defs), so there is no loop here to edit; this
-/// exposes the predicate plus this one guarded call for that future loop
-/// to use.
-///
-/// Not atomic with the pause-lease table: a lease can be acquired in the
-/// gap between this call's `claiming_is_paused` read and its `claim`. That
-/// race is inherent to a check-then-act gate over two independent
-/// statements — the doc's own guarantee is only "a batch already claimed
-/// finishes normally," not "no claim ever starts within one lease
-/// acquisition's window," so this matches the design rather than falling
-/// short of it.
-#[cfg(any(test, feature = "internals"))]
-pub async fn claim_unless_paused(
-    client: &impl GenericClient,
-    seg_seq: i64,
-    claimed_by: &str,
-    live_workers: i64,
-) -> Result<Option<Vec<i16>>, StagingError> {
-    if claiming_is_paused(client).await? {
-        return Ok(None);
-    }
-    Ok(Some(
-        claim(client, seg_seq, claimed_by, live_workers).await?,
-    ))
 }

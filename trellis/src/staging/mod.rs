@@ -15,8 +15,8 @@
 //!   (issue #14): deciding a batch's bucket count at seal, the drainer
 //!   registry as the share denominator, and the one-statement claim + flip.
 //! - [`liveness`] is stage 04's claim-liveness half (issue #15): the
-//!   in-line and out-of-band heartbeats, release-on-error, reclaim-on-TTL,
-//!   the consecutive-fence-miss backoff, and the fleet-wide pause lease.
+//!   out-of-band heartbeat daemon, release-on-error, reclaim-on-TTL, and
+//!   the consecutive-fence-miss backoff.
 //! - [`apply`] is stage 05's apply ∪ mark-drained (issue #11), 1-1/scalar
 //!   subset only: the three-phase drain (claim + fold, compute, apply ∪
 //!   mark-drained), the version fence, and downstream propagation.
@@ -123,11 +123,7 @@ pub use converge::{converged_through, pending_count};
 #[cfg(any(test, feature = "internals"))]
 pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
 #[cfg(any(test, feature = "internals"))]
-pub use liveness::{
-    FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff, acquire_pause_lease,
-    claim_unless_paused, claiming_is_paused, heartbeat_inline, heartbeat_pause_lease,
-    release_pause_lease,
-};
+pub use liveness::{FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff};
 #[cfg(any(test, feature = "internals"))]
 pub use quarantine::{
     DEFAULT_DEATH_THRESHOLD, FailureClass, HaltingStopStats, classify, halting_stop_stats,

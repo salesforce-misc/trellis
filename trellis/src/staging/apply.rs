@@ -21,8 +21,8 @@
 //! [`drain_once`] is the orchestrator tying the three together, including
 //! the version-fence/serialization retry loop the design calls for.
 //! [`next_claimable_segment`] is the "which batch should a free worker pick
-//! up next" query a real drain loop (not assembled here — see doc 04's
-//! [`super::liveness::claim_unless_paused`]) would call before it.
+//! up next" query a real drain loop (not assembled here — issue #11,
+//! blocked on aggregate transform-defs) would call before it.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
