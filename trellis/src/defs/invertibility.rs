@@ -168,7 +168,18 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
     match (function, arg) {
         ("COUNT", AggregateArg::Count(_)) => Some(Verdict::invertible(&[])),
 
-        ("SUM", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[])),
+        // Issue #111: an exact-integer argument is as invertible as a
+        // `numeric` one, and for the same reason — `SUM`/`AVG` fold through
+        // `staging::apply_aggregate`'s `numeric` running partials either
+        // way (`sum(int2|int4)` is a `bigint` column fed by a `numeric`
+        // delta, `avg(<int>)` is `numeric` outright). Enumerating it here
+        // rather than leaving it to the `_ => None` fallback below is the
+        // point: `None` means "a call shape the grammar could never
+        // produce", and since #111 an integer-argument aggregate is a shape
+        // the grammar produces routinely.
+        ("SUM", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
+            Some(Verdict::invertible(&[]))
+        }
         (
             "SUM",
             AggregateArg::Column(
@@ -176,10 +187,12 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
             ),
         ) => Some(Verdict::recompute_only()),
 
-        ("AVG", AggregateArg::Column(ValueType::Numeric)) => Some(Verdict::invertible(&[
-            PartialField::Sum,
-            PartialField::Count,
-        ])),
+        ("AVG", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
+            Some(Verdict::invertible(&[
+                PartialField::Sum,
+                PartialField::Count,
+            ]))
+        }
         (
             "AVG",
             AggregateArg::Column(
@@ -230,6 +243,32 @@ mod tests {
         let verdict = classify("AVG", AggregateArg::Column(ValueType::Numeric)).unwrap();
         assert!(verdict.is_invertible());
         assert_eq!(verdict.partials, &[PartialField::Sum, PartialField::Count]);
+    }
+
+    /// Issue #111: every exact-integer width classifies exactly as `numeric`
+    /// does — `None` here would mean the gate had silently fallen through to
+    /// its "shape the grammar could never produce" arm for a shape the
+    /// grammar produces on any `SUM(<int column>)`.
+    #[test]
+    fn sum_and_avg_over_every_integer_width_classify_like_numeric() {
+        for width in crate::integer::IntWidth::ALL {
+            let arg = AggregateArg::Column(ValueType::Integer(width));
+            let sum =
+                classify("SUM", arg).unwrap_or_else(|| panic!("SUM over {width} must classify"));
+            assert!(sum.is_invertible(), "SUM over {width}");
+            assert_eq!(sum.partials, &[] as &[PartialField]);
+
+            let avg =
+                classify("AVG", arg).unwrap_or_else(|| panic!("AVG over {width} must classify"));
+            assert!(avg.is_invertible(), "AVG over {width}");
+            assert_eq!(avg.partials, &[PartialField::Sum, PartialField::Count]);
+
+            for name in ["MIN", "MAX"] {
+                let verdict = classify(name, arg)
+                    .unwrap_or_else(|| panic!("{name} over {width} must classify"));
+                assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
+            }
+        }
     }
 
     #[test]

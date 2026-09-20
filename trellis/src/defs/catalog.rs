@@ -3588,7 +3588,8 @@ fn encode_value_type(value_type: &ValueType) -> &'static str {
         // spelling (`smallint`/`integer`/`bigint`), which is distinct from
         // every other token here *and* from every `PgType::name`, so all
         // three namespaces still share one column unambiguously. The
-        // `every_value_type_token_is_distinct` test pins that.
+        // `every_value_type_round_trips_through_the_persisted_token` test
+        // pins that.
         ValueType::Integer(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
@@ -4278,6 +4279,11 @@ mod value_type_codec_tests {
             ValueType::Other(PgType::TimestampTz),
             ValueType::Other(PgType::Unrecognized),
         ];
+        // Issue #111's widths, from `IntWidth::ALL` so a future width is
+        // covered by construction rather than by remembering to add it.
+        let all = all
+            .into_iter()
+            .chain(IntWidth::ALL.into_iter().map(ValueType::Integer));
         for value_type in all {
             let token = encode_value_type(&value_type);
             assert_eq!(
