@@ -47,8 +47,10 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use trellis::FloatWidth;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
+use trellis::defs::ast::{
+    Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
+use trellis::defs::eval::{RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use trellis::defs::{chunk_queue, create_relationship, install_definition, parse, validate};
 use trellis::integer::IntWidth;
 use trellis::{Config, Trellis, TrellisOptions};
@@ -823,6 +825,114 @@ async fn min_and_max_over_nan_follow_postgres() {
     assert_eq!(pg_lo, "-Infinity");
 }
 
+/// The **Rust evaluator's own** float aggregate fold agrees with Postgres,
+/// value for value and byte for byte.
+///
+/// Found in review of #112: `eval::fold_aggregate` and
+/// `eval::eval_to_many_aggregate` both filtered their collected values with
+/// `ValueType::is_exact_numeric_family()`, which by construction excludes
+/// `ValueType::Float`. Every float row was therefore silently dropped, the
+/// fold saw an empty group, and `SUM`/`MIN`/`MAX`/`AVG` over a float column
+/// returned `NULL` — with the entire float branch of
+/// `reduce_numeric_aggregate` unreachable. The live-pipeline aggregate tests
+/// could not catch it: a float aggregate is `RecomputeOnly`, so the apply
+/// path probes a server-side `sum(...)` and never folds in Rust. This test
+/// drives the fold directly, which is what `defs::oracle::recompute_aggregate`
+/// (the ADR-0013 cross-check oracle) and the to-many relationship path do.
+///
+/// The `-0`-only group is the second half of the regression: Postgres's
+/// `sum(float8)` has a `NULL` initial condition, so `sum` over a group of
+/// `-0`s is `-0`, not the `+0` a zero-seeded accumulator produces. Both
+/// render, and `-0` is the one Postgres writes.
+#[tokio::test]
+async fn the_evaluator_fold_agrees_with_postgres_on_float_aggregates() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // `(group label, the f8 values in that group)` — chosen to cover an
+    // ordinary group, a `NaN` group (absorbing), an `Infinity` group, and
+    // the signed-zero group whose Postgres `sum` is `-0`.
+    const GROUPS: &[(&str, &[&str])] = &[
+        ("plain", &["1.5", "2.5", "3.5"]),
+        ("nan", &["1", "NaN", "2"]),
+        ("inf", &["Infinity", "1"]),
+        ("negzero", &["-0", "-0"]),
+        ("mixedzero", &["0", "-0"]),
+        // 16 orders of magnitude apart, so reassociation is visible in the
+        // last bits. Spelled in canonical `float8out` form, which is what a
+        // column's text always is.
+        ("spread", &["1e+16", "1", "1", "1"]),
+    ];
+
+    for (label, values) in GROUPS {
+        for agg in ["SUM", "MIN", "MAX", "AVG"] {
+            // The SQL oracle: the same values, the same aggregate, rendered
+            // by Postgres itself.
+            let rows_sql = values
+                .iter()
+                .map(|v| format!("('{v}'::float8)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let expected: Option<String> = client
+                .query_one(
+                    &format!(
+                        "select {}(v)::text from (values {rows_sql}) t(v)",
+                        agg.to_lowercase()
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{label}/{agg}: {e}"))
+                .get(0);
+
+            // Trellis's evaluator fold over the same values.
+            let def = TransformDef {
+                target: "t".to_string(),
+                explicit_target_schema: None,
+                source: "s".to_string(),
+                explicit_source_schema: None,
+                key_space: KeySpace::Aggregate {
+                    group_by: vec![GroupByKey::Column("i".to_string())],
+                },
+                fields: vec![FieldDef {
+                    name: "out".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: agg.to_string(),
+                        args: vec![Expr::Column("f8".to_string())],
+                    },
+                }],
+                predicate: Predicate::True,
+            };
+            let columns = HashMap::from([
+                ("i".to_string(), ValueType::Integer(IntWidth::Int4)),
+                ("f8".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ]);
+            let rows: Vec<Row> = values
+                .iter()
+                .map(|v| {
+                    HashMap::from([
+                        ("i".to_string(), Some("1".to_string())),
+                        ("f8".to_string(), Some(v.to_string())),
+                    ])
+                })
+                .collect();
+            let got = evaluate_aggregate(&def, &rows, &columns, &mut RegexCache::new())
+                .unwrap_or_else(|e| panic!("{label}/{agg}: {e}"));
+            let got = got["out"].as_ref().map(|v| v.to_string());
+
+            assert_eq!(
+                got, expected,
+                "{label}/{agg}: Trellis's fold and Postgres must agree byte for byte"
+            );
+            assert!(
+                got.is_some(),
+                "{label}/{agg}: a non-empty float group must not fold to NULL"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // 6. Key roles: deliberately refused, and why
 // ---------------------------------------------------------------------
@@ -1127,6 +1237,13 @@ async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by()
         "insert into s (id, f4, f8, i) values (7, 0.5, 1e16, 1)",
         "delete from s where id = 6",
         "update s set i = null where id = 2",
+        // Group 4: a `NaN` row deleted from a group that *survives* the
+        // delete. This is the case a delta path cannot undo — subtracting
+        // `NaN` leaves `NaN` — and it has to be a surviving group, because a
+        // group emptied entirely is deleted outright and agrees with the
+        // oracle either way.
+        "insert into s (id, f4, f8, i) values (8, 1.0, 'NaN', 4), (9, 2.0, 7.5, 4)",
+        "delete from s where id = 8",
     ] {
         raw.execute(sql, &[])
             .await

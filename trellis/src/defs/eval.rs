@@ -962,7 +962,7 @@ fn eval_to_many_aggregate(
         match row.get(column) {
             Some(Some(text)) => {
                 let value = parse_value(field_name, value_type, text)?;
-                if value.value_type().is_exact_numeric_family() {
+                if value.value_type().is_numeric_family() {
                     values.push(value);
                 }
             }
@@ -1283,11 +1283,11 @@ fn fold_aggregate(
             regex_cache,
         )?;
         if let Some(value) = value
-            && value.value_type().is_exact_numeric_family()
+            && value.value_type().is_numeric_family()
         {
             values.push(value);
         }
-        // A `NULL` (`None`) or non-exact-numeric evaluation is skipped:
+        // A `NULL` (`None`) or non-numeric evaluation is skipped:
         // `NULL` per Postgres's aggregate semantics above, and any other
         // value here would mean a hand-built AST bypassed the validator's
         // type check on these four functions' argument (defense-in-depth,
@@ -1374,18 +1374,33 @@ fn reduce_numeric_aggregate(
         if floats.is_empty() {
             return Ok(None);
         }
-        let reduce = |ord: std::cmp::Ordering| {
+        // `reject` is the ordering that makes the *incoming* value lose, so
+        // a tie keeps the incoming one — which is what Postgres's
+        // `float8smaller`/`float8larger` do (`cmp(arg1, arg2) < 0 ? arg1 :
+        // arg2` keeps `arg2` when the two compare equal). It only shows on
+        // `-0` vs `0`, the one pair that is equal but renders two ways, and
+        // matching Postgres's left fold is free.
+        let reduce = |reject: std::cmp::Ordering| {
             floats
                 .iter()
                 .copied()
-                .reduce(|a, b| if float::compare(b, a) == ord { b } else { a })
+                .reduce(|a, b| if float::compare(b, a) == reject { a } else { b })
                 .expect("checked non-empty above")
         };
         return Ok(Some(match name {
-            "MIN" => Value::Float(width, reduce(std::cmp::Ordering::Less)),
-            "MAX" => Value::Float(width, reduce(std::cmp::Ordering::Greater)),
+            "MIN" => Value::Float(width, reduce(std::cmp::Ordering::Greater)),
+            "MAX" => Value::Float(width, reduce(std::cmp::Ordering::Less)),
             "SUM" => {
-                let mut acc = 0.0f64;
+                // Seeded from the first value, *not* from `0.0`: Postgres's
+                // `sum(float4)`/`sum(float8)` have a `NULL` initial
+                // condition, so the first row becomes the state rather than
+                // being added to a zero. The difference is visible on signed
+                // zero — `select sum(v) from (values ('-0'::float8)) t(v)` is
+                // `-0`, while `0.0 + -0.0` is `+0.0` in IEEE — and `-0` and
+                // `0` are two different `float8out` renderings of one value,
+                // so a zero seed would write text Postgres never would.
+                let mut floats = floats.into_iter();
+                let mut acc = floats.next().expect("checked non-empty above");
                 for n in floats {
                     let (next, _) = float::checked_add(acc, width, n, width).map_err(|source| {
                         EvalError::FloatOutOfRange {
@@ -1398,9 +1413,19 @@ fn reduce_numeric_aggregate(
                 Value::Float(width, acc)
             }
             // `avg(real)` is `double precision` in Postgres, not `real`.
+            //
+            // Folded from an explicit `0.0` rather than through
+            // `Iterator::sum`, which is *not* the same thing for floats:
+            // Rust seeds its `Sum` impl with `-0.0` (so a list of `-0.0`s
+            // sums to `-0.0`), while Postgres's `float8_accum`/`float4_accum`
+            // carry an `initcond` of `{0,0,0}` — a `+0.0` seed. `avg` over a
+            // group of `-0`s is therefore `0` on a real server and would be
+            // `-0` here, two different `float8out` renderings of one value.
+            // Note this is the opposite seed from `SUM` above, which has a
+            // `NULL` initcond; the two genuinely differ in Postgres.
             "AVG" => {
                 let count = floats.len() as f64;
-                let sum: f64 = floats.iter().sum();
+                let sum: f64 = floats.iter().fold(0.0f64, |acc, n| acc + n);
                 Value::Float(FloatWidth::Float8, sum / count)
             }
             _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
