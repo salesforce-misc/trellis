@@ -6,8 +6,11 @@ deciders: Michael Ries
 
 # `self_check`: A Production Recompute Audit
 
-Trellis's one hard correctness promise is byte-identical convergence to a
-from-scratch recompute at any caught-up LSN. The failure mode that promise guards
+Trellis's one hard correctness promise is convergence to a from-scratch recompute
+at any caught-up LSN — **byte-identical** for almost every value, and **up to the
+type's own `=`** for the narrow class of aggregate results where byte-identity
+would be stricter than correctness (see [Comparison semantics](#comparison-semantics-byte-identical-except-non-injective-aggregate-folds)
+below). The failure mode that promise guards
 against is a *silently stale target*: a wrong answer with no error raised and no
 metric out of range, invisible without an independent recompute. `self_check` makes
 that recompute a shipped, operator-callable capability instead of something only the
@@ -31,6 +34,36 @@ evaluator would check the engine against itself; the authority is Postgres compu
 the answer from source rows independently. This also matches the failure class the
 audit exists to catch: a stale target diverges as persisted-vs-recompute, where an
 independent query is exactly the detector and the evaluator adds nothing.
+
+### Comparison semantics: byte-identical, except non-injective aggregate folds
+
+`self_check` compares a persisted cell against its recompute **byte-for-byte** by
+default. Byte-identity is the strongest, simplest yardstick — "diff the text" — and
+it is exactly what the join/`GROUP BY`/primary-key roles rely on, so keys are
+**always** compared byte-for-byte, no exception.
+
+There is one narrow class where byte-identity is *stricter than correctness*:
+`MIN`/`MAX` folded over a type whose `=` admits several textually-distinct
+representatives of the same value. `real`/`double precision` (`-0` `=` `0`,
+rendered `-0` and `0`) and `interval` (`'1 day'` `=` `'24 hours'`) are the known
+cases. Postgres's `min`/`max` is a fold that returns *whichever tied representative
+the scan saw last* (`float8larger(a,b)` is `a > b ? a : b`), so the persisted text
+and a recompute's text can differ while both are genuinely-correct answers. A
+byte-exact check reports that as a divergence no recomputation can ever settle — a
+false positive in the audit, not a caught bug.
+
+For **aggregate result cells produced by such a fold**, `self_check` therefore
+compares by the type's own `=` (asking Postgres `persisted = recompute`) rather
+than by text. A truly wrong `MAX` still fails — `3 = 5` is false — but a `-0`/`0`
+tie does not. This carve-out is scoped tightly: it applies only to `MIN`/`MAX`
+result cells of these types, never to keys, passthrough, or invertible aggregates
+(`SUM`/`AVG`/`COUNT`), which stay byte-identical. The promise, stated precisely, is
+convergence up to the target type's equality — byte-identical wherever a type has a
+single canonical representation per value, which is almost everywhere.
+
+This is what lets `MIN`/`MAX` ship uniformly across `float` and `interval` (issues
+#112/#113): both families sit on the same side of one consistent rule, rather than
+one being refused for a defect the other tolerates.
 
 ### The audit query is rendered independently of the write path
 

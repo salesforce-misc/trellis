@@ -92,9 +92,12 @@ boundary as any embedder — with one narrow, sanctioned exception (below).
 - **Postgres is the oracle.** Correctness is verified by comparing a persisted target
   against an equivalent, independently-authored SQL query — for an aggregate target,
   the corresponding `GROUP BY` — executed by Postgres, not by re-running the engine's
-  own evaluator over the same data. `Trellis::self_check` (see
-  [ADR-0013](0013-self-check-production-recompute-audit.md)) is the shipped form of
-  this check and the public API the suites use for it.
+  own evaluator over the same data. The comparison is byte-identical for almost every
+  value, and up to the type's own `=` for the narrow class of non-injective aggregate
+  folds (`MIN`/`MAX` over `float`/`interval`) where byte-identity would be stricter
+  than correctness. `Trellis::self_check` (see
+  [ADR-0013](0013-self-check-production-recompute-audit.md), *Comparison semantics*)
+  is the shipped form of this check and the public API the suites use for it.
 
 ### One sanctioned exception: the fuzz suite's independent cross-check leg
 
