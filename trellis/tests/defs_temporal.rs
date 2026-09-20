@@ -1,0 +1,1498 @@
+//! End-to-end tests for issue #113's temporal types (`date`, `time`,
+//! `timetz`, `timestamp`, `timestamptz`, `interval`) against a real,
+//! ephemeral Postgres via `testkit::TestCluster`.
+//!
+//! # Why these run against a live server
+//!
+//! `docs/type-support.md` had every temporal row marked `🎯 typed index`,
+//! on the premise that #110's typed key index was the prerequisite for any
+//! key role. #111 found that premise wrong for `oid` and #112 found it
+//! right for floats, so #113 treats it as a question to be *asked of a
+//! server*, per family, rather than answered from the block's name. Every
+//! claim below is therefore a claim about agreeing with a real Postgres,
+//! and is checked against one:
+//!
+//! 1. **Text stability.** For `date`/`timestamp`/`time`/`timetz`, equal
+//!    values must render identically and distinct values distinctly — the
+//!    exact property raw-`::text` key matching needs. Demonstrated by
+//!    asking the server to `group by` a spread of values and comparing the
+//!    group count against the distinct-`::text` count.
+//! 2. **The two refusals, demonstrated not asserted.** `interval` is
+//!    refused every key role because `'24 hours' = '1 day'` is **true**
+//!    while their `::text` differs; the test reads both facts out of the
+//!    server. `timestamptz` is refused because its rendering moves with
+//!    `TimeZone`, and the test shows that too.
+//! 3. **Comparison order.** `trellis::temporal::compare` must agree with
+//!    each family's own `<`/`=`/`>` over a grid that includes BC years,
+//!    `infinity`, sub-second fractions, `24:00:00`, and `timetz`'s
+//!    surprising GMT-then-zone tie-break.
+//! 4. **Aggregate result types.** `min`/`max` keep their argument's type
+//!    and `sum(interval)` is `interval`, checked against `pg_typeof`.
+//! 5. **`interval` arithmetic fidelity.** `trellis::temporal::Interval`'s
+//!    addition and `interval_out` rendering are compared byte-for-byte
+//!    against the server's own, including the 30-day-month comparison rule,
+//!    the no-justification addition rule, and the overflow error.
+//! 6. **Why `MIN`/`MAX(interval)` is refused.** Demonstrated from the
+//!    server: `max(v)` over the same three rows returns *different text*
+//!    for two different scan orders, so it is not a function of its input
+//!    and ADR-0013's byte-exact recompute cross-check could never settle
+//!    it.
+//!
+//! Per ADR-0013 every comparison is against independently-authored SQL —
+//! plain `pg_typeof`, plain `select ... group by ...`, plain `::text` —
+//! never against `defs::oracle::recompute`, which would be the engine's own
+//! renderer grading the engine's own evaluator.
+//!
+//! Harness conventions follow `defs_floats.rs`.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
+
+use testkit::TestCluster;
+use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::ValueType;
+use trellis::defs::eval::{RegexCache, Row, Value, evaluate_aggregate};
+use trellis::defs::pg_type::PgType;
+use trellis::defs::{create_relationship, parse, validate};
+use trellis::integer::IntWidth;
+use trellis::temporal::{self, Interval};
+
+// ---------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------
+
+/// The source table the validator-level tests below install against: one
+/// column per temporal family, plus a `bigint` key and a `numeric` measure
+/// so a `GROUP BY` definition always has something to aggregate.
+const SOURCE_DDL: &str = "create table s ( \
+     id bigint primary key, \
+     d date, \
+     ts timestamp, \
+     tstz timestamptz, \
+     tm time, \
+     tmtz timetz, \
+     iv interval, \
+     n numeric \
+   ); \
+   alter table s replica identity full";
+
+fn source_columns() -> HashMap<String, ValueType> {
+    HashMap::from([
+        ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+        ("d".to_string(), ValueType::Other(PgType::Date)),
+        ("ts".to_string(), ValueType::Other(PgType::Timestamp)),
+        ("tstz".to_string(), ValueType::Other(PgType::TimestampTz)),
+        ("tm".to_string(), ValueType::Other(PgType::Time)),
+        ("tmtz".to_string(), ValueType::Other(PgType::TimeTz)),
+        ("iv".to_string(), ValueType::Other(PgType::Interval)),
+        ("n".to_string(), ValueType::Numeric),
+    ])
+}
+
+/// A raw connection carrying the same output GUCs
+/// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins on every engine connection.
+///
+/// Spelled out here rather than read from that constant on purpose: these
+/// tests assert that Trellis's canonical forms *are* what a server so
+/// configured emits, so hardcoding the settings makes the test fail if the
+/// constant drifts away from them, instead of silently following it.
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "set search_path to {DEFAULT_SCHEMA}, public; \
+             set datestyle to 'ISO, YMD'; set intervalstyle to 'postgres'"
+        ))
+        .await
+        .expect("session bootstrap");
+    client
+}
+
+/// Postgres's own type for `sql_expr`, normalized through `format_type` so
+/// it reads in the SQL-standard spelling rather than `pg_typeof`'s internal
+/// `timestamptz`/`timetz` abbreviations.
+async fn postgres_type_of(client: &Client, sql_expr: &str) -> String {
+    client
+        .query_one(
+            &format!("select format_type(pg_typeof({sql_expr}), null)"),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("pg_typeof({sql_expr}): {e}"))
+        .get(0)
+}
+
+/// `select (<literal>::<pg_type>)::text` — the server's own canonical
+/// rendering of a value.
+async fn render(client: &Client, pg_type: &str, literal: &str) -> String {
+    client
+        .query_one(&format!("select ('{literal}'::{pg_type})::text"), &[])
+        .await
+        .unwrap_or_else(|e| panic!("render {literal}::{pg_type}: {e}"))
+        .get(0)
+}
+
+/// Every family, paired with the SQL type name and a spread of values
+/// chosen to hit the edges each one's rendering has: era boundaries and
+/// infinities for `date`/`timestamp`, the legal end-of-day for `time`,
+/// non-integral and second-resolution offsets for `timetz`, and — for
+/// `interval` — several pairs that are `=` but render differently.
+const GRID: &[(PgType, &str, &[&str])] = &[
+    (
+        PgType::Date,
+        "date",
+        &[
+            "-infinity",
+            "4713-01-01 BC",
+            "0001-01-01 BC",
+            "0001-01-01",
+            "1999-12-31",
+            "2000-01-01",
+            "2024-02-29",
+            "2024-03-01",
+            "5874897-12-31",
+            "infinity",
+        ],
+    ),
+    (
+        PgType::Timestamp,
+        "timestamp",
+        &[
+            "-infinity",
+            "4714-11-24 00:00:00 BC",
+            "0001-01-01 00:00:00",
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00.000001",
+            "2024-01-01 00:00:00.09",
+            "2024-01-01 00:00:00.1",
+            "2024-01-01 12:34:56.789012",
+            "294276-12-31 23:59:59.999999",
+            "infinity",
+        ],
+    ),
+    (
+        PgType::Time,
+        "time",
+        &[
+            "00:00:00",
+            "00:00:00.000001",
+            "01:02:03",
+            "12:34:56.09",
+            "12:34:56.1",
+            "23:59:59.999999",
+            "24:00:00",
+        ],
+    ),
+    (
+        PgType::TimeTz,
+        "timetz",
+        &[
+            "00:00:00+00",
+            "11:00:00+00",
+            // Same GMT-equivalent instant as `12:00:00+00`, different zone —
+            // Postgres orders them apart, and this grid proves it.
+            "17:30:00+05:30",
+            "12:00:00+00",
+            "12:00:00+05:30:15",
+            "12:00:00-12",
+            "12:00:00+14",
+            "23:59:59.999999+00",
+            "24:00:00+00",
+        ],
+    ),
+    (
+        PgType::TimestampTz,
+        "timestamptz",
+        &[
+            "-infinity",
+            "2024-01-01 00:00:00+00",
+            "2024-01-01 07:00:00-05",
+            "2024-01-01 12:00:00+00",
+            "2024-06-15 12:00:00+00",
+            "infinity",
+        ],
+    ),
+    (
+        PgType::Interval,
+        "interval",
+        &[
+            "-1 day",
+            "-01:00:00",
+            "00:00:00",
+            "00:00:00.000001",
+            "2 hours",
+            "1 day",
+            "24 hours",
+            "25 hours",
+            "1 mon",
+            "30 days",
+            "1 year 2 mons 3 days 04:05:06",
+        ],
+    ),
+];
+
+// ---------------------------------------------------------------------
+// 1. Text stability — the question the key roles actually turn on
+// ---------------------------------------------------------------------
+
+/// For each family, ask the server whether its `::text` rendering is a
+/// bijection on its values, and assert `temporal::is_text_stable` agrees.
+///
+/// The measurement is deliberately the one the engine's key path performs:
+/// `count(distinct v)` is how many groups *Postgres* makes, and
+/// `count(distinct v::text)` is how many the engine's `::text` matching
+/// would make. Equal counts mean a text-keyed `GROUP BY`/join produces
+/// exactly Postgres's grouping; unequal means it splits or merges one.
+///
+/// `interval`'s grid contains `'1 day'`/`'24 hours'` and
+/// `'1 mon'`/`'30 days'`, so it is expected to come back with *more* text
+/// groups than value groups — the same defect `-0`/`0` is for floats, and
+/// the reason `interval` is on neither allowlist.
+#[tokio::test]
+async fn the_text_stability_verdict_is_the_server_s_not_this_crate_s() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for (pg_type, sql_name, values) in GRID {
+        let rows = values
+            .iter()
+            .map(|v| format!("('{v}'::{sql_name})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = client
+            .query_one(
+                &format!(
+                    "select count(distinct v)::bigint, count(distinct v::text)::bigint \
+                     from (values {rows}) t(v)"
+                ),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{sql_name} stability probe: {e}"));
+        let (by_value, by_text): (i64, i64) = (row.get(0), row.get(1));
+
+        let bijective = by_value == by_text;
+
+        // Within *one* session, `interval` is the only family whose
+        // rendering is not a bijection — and that is a property of the
+        // type, which no GUC can change.
+        assert_eq!(
+            bijective,
+            *pg_type != PgType::Interval,
+            "{sql_name}: Postgres makes {by_value} value groups and {by_text} text groups"
+        );
+
+        // `timestamptz` is the one family that is bijective here and still
+        // refused, and that is the whole shape of #113's `TimeZone`
+        // finding: its defect is *cross*-session, not within-session. A
+        // single reader groups it perfectly; it is the second renderer —
+        // the walsender, whose `TimeZone` Trellis cannot pin — that
+        // disagrees. See `timestamptz_text_moves_with_the_session_timezone`
+        // below and `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`.
+        assert_eq!(
+            temporal::is_text_stable(*pg_type),
+            bijective && *pg_type != PgType::TimestampTz,
+            "{sql_name}: is_text_stable disagrees with the server (bijective = {bijective})"
+        );
+    }
+}
+
+/// `interval`'s specific defect, spelled out rather than inferred from the
+/// count above: two values that are `=` and render differently.
+///
+/// This is the `-0`/`0` of #112, one family over, and it is why no GUC
+/// rescues `interval`'s key roles — `IntervalStyle` changes *which* two
+/// spellings these are, never that there are two.
+#[tokio::test]
+async fn equal_intervals_can_render_differently() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for (a, b) in [("24 hours", "1 day"), ("30 days", "1 mon")] {
+        let row = client
+            .query_one(
+                &format!(
+                    "select ('{a}'::interval = '{b}'::interval), \
+                            ('{a}'::interval)::text, ('{b}'::interval)::text"
+                ),
+                &[],
+            )
+            .await
+            .expect("the interval demonstration");
+        let (equal, a_text, b_text): (bool, String, String) = (row.get(0), row.get(1), row.get(2));
+        assert!(equal, "'{a}' and '{b}' are = in Postgres");
+        assert_ne!(
+            a_text, b_text,
+            "...but render differently, which is what breaks a ::text-matched interval key"
+        );
+    }
+}
+
+/// `timestamptz`'s defect is different in kind: the *same* value renders
+/// differently depending on the reading session's `TimeZone`.
+///
+/// Issue #113 considered pinning `TimeZone = 'UTC'` alongside `DateStyle`
+/// to make this go away, and declined — see
+/// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` for why (Trellis renders
+/// `timestamptz` on a walsender whose GUCs it cannot set, so the pin would
+/// guarantee an asymmetry it currently only risks). What this test pins is
+/// the underlying fact the decision rests on.
+#[tokio::test]
+async fn timestamptz_text_moves_with_the_session_timezone() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let mut rendered = Vec::new();
+    for zone in ["UTC", "America/New_York", "Asia/Kathmandu"] {
+        client
+            .batch_execute(&format!("set timezone to '{zone}'"))
+            .await
+            .expect("set timezone");
+        rendered.push(render(&client, "timestamptz", "2024-01-01 12:00:00+00").await);
+    }
+    assert_eq!(
+        rendered.len(),
+        3,
+        "three readings of one instant were collected"
+    );
+    assert!(
+        rendered[0] != rendered[1] && rendered[1] != rendered[2],
+        "one timestamptz value rendered as {rendered:?} under three session TimeZones"
+    );
+
+    // ...while `date`/`timestamp`/`time`/`timetz` do not move at all, which
+    // is the control that makes the claim specific to `timestamptz`.
+    for (sql_name, literal) in [
+        ("date", "2024-01-01"),
+        ("timestamp", "2024-01-01 12:00:00"),
+        ("time", "12:00:00"),
+        ("timetz", "12:00:00+05:30"),
+    ] {
+        let mut seen = Vec::new();
+        for zone in ["UTC", "America/New_York", "Asia/Kathmandu"] {
+            client
+                .batch_execute(&format!("set timezone to '{zone}'"))
+                .await
+                .expect("set timezone");
+            seen.push(render(&client, sql_name, literal).await);
+        }
+        assert!(
+            seen.iter().all(|r| *r == seen[0]),
+            "{sql_name} must not move with TimeZone, got {seen:?}"
+        );
+    }
+}
+
+/// The same control for `DateStyle`: `time_out`/`timetz_out` are
+/// `IMMUTABLE` and read no GUC, while `date_out`/`timestamp_out` are
+/// `STABLE` and read `DateStyle` — which is exactly why the constant pins
+/// `ISO` and why `TIME`/`TIMETZ` (and not `TIMESTAMPTZ`) earned
+/// typed-literal rows.
+#[tokio::test]
+async fn datestyle_moves_date_and_timestamp_but_not_time() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // The catalog's own verdict, which is what the typed-literal allowlist
+    // cites: only `time_out`/`timetz_out` are IMMUTABLE in this block.
+    for (proname, expected) in [
+        ("time_out", "i"),
+        ("timetz_out", "i"),
+        ("date_out", "s"),
+        ("timestamp_out", "s"),
+        ("timestamptz_out", "s"),
+        ("interval_out", "s"),
+    ] {
+        let volatility: String = client
+            .query_one(
+                "select provolatile::text from pg_proc where proname = $1",
+                &[&proname],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("provolatile({proname}): {e}"))
+            .get(0);
+        assert_eq!(volatility, expected, "pg_proc.provolatile for {proname}");
+    }
+
+    for style in ["ISO, YMD", "SQL, DMY", "Postgres, DMY", "German, DMY"] {
+        client
+            .batch_execute(&format!("set datestyle to '{style}'"))
+            .await
+            .expect("set datestyle");
+        assert_eq!(
+            render(&client, "time", "12:34:56.5").await,
+            "12:34:56.5",
+            "time_out must not move with DateStyle ({style})"
+        );
+        assert_eq!(
+            render(&client, "timetz", "12:00:00+05:30").await,
+            "12:00:00+05:30",
+            "timetz_out must not move with DateStyle ({style})"
+        );
+    }
+
+    client
+        .batch_execute("set datestyle to 'SQL, MDY'")
+        .await
+        .expect("set datestyle");
+    assert_ne!(
+        render(&client, "date", "2024-01-02").await,
+        "2024-01-02",
+        "date_out *does* move with DateStyle, which is why the constant pins ISO"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 2. Comparison order
+// ---------------------------------------------------------------------
+
+/// `temporal::compare` must reproduce each family's own comparison
+/// operator, over the whole [`GRID`] — every ordered pair, in both
+/// directions.
+///
+/// The server's verdict is read as two booleans (`a < b`, `a = b`) rather
+/// than a single `cmp` function, so this compares against plain SQL
+/// operators rather than against a `*_cmp` support function the engine
+/// could have been written from.
+#[tokio::test]
+async fn temporal_compare_matches_each_family_s_own_operators() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for (pg_type, sql_name, values) in GRID {
+        // Compare the *canonical renderings*, which is what the engine
+        // actually holds — not the input literals, which may be
+        // non-canonical (`'24 hours'`).
+        let mut canonical = Vec::new();
+        for value in *values {
+            canonical.push(render(&client, sql_name, value).await);
+        }
+
+        for a in &canonical {
+            for b in &canonical {
+                let row = client
+                    .query_one(
+                        &format!(
+                            "select ('{a}'::{sql_name} < '{b}'::{sql_name}), \
+                                    ('{a}'::{sql_name} = '{b}'::{sql_name})"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql_name}: {a} vs {b}: {e}"));
+                let (less, equal): (bool, bool) = (row.get(0), row.get(1));
+                let expected = if equal {
+                    Ordering::Equal
+                } else if less {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+                let actual = temporal::compare(*pg_type, a, b).unwrap_or_else(|| {
+                    panic!("temporal::compare must handle canonical {sql_name} {a:?}/{b:?}")
+                });
+                assert_eq!(
+                    actual, expected,
+                    "{sql_name}: {a} vs {b} — Postgres says {expected:?}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 3. `interval` arithmetic and rendering fidelity
+// ---------------------------------------------------------------------
+
+/// `Interval::parse`/`render` must round-trip every canonical
+/// `interval_out` rendering the server produces, and `Interval::checked_add`
+/// must agree with `interval_pl` byte-for-byte.
+///
+/// This is the issue's "match Postgres `interval` canonicalization exactly"
+/// requirement, and it is checked the only way that means anything: by
+/// comparing against the server's own output for the same operands, not
+/// against a second copy of the same rules.
+#[tokio::test]
+async fn interval_arithmetic_and_rendering_match_the_server() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // A spread that exercises every branch of `EncodeInterval`'s postgres
+    // style: pluralisation, the `is_before` `+` prefix, the omitted
+    // all-zero time field, fractional trimming, and the year/month split.
+    const OPERANDS: &[&str] = &[
+        "0",
+        "1 year",
+        "2 years",
+        "-13 mons",
+        "1 day",
+        "-1 day",
+        "24 hours",
+        "-1 day 1 hour",
+        "1 day -1 hour",
+        "1 mon -1 day 1 hour",
+        "0.5 secs",
+        "-0.000001 secs",
+        "100:00:00",
+        "1 year 2 mons 3 days 04:05:06",
+    ];
+
+    for literal in OPERANDS {
+        let server = render(&client, "interval", literal).await;
+        let parsed = Interval::parse(&server)
+            .unwrap_or_else(|| panic!("Interval::parse must accept interval_out's {server:?}"));
+        assert_eq!(
+            parsed.render(),
+            server,
+            "Interval::render must reproduce interval_out for {literal:?}"
+        );
+    }
+
+    for a in OPERANDS {
+        for b in OPERANDS {
+            let server: String = client
+                .query_one(
+                    &format!("select ('{a}'::interval + '{b}'::interval)::text"),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{a} + {b}: {e}"))
+                .get(0);
+            let lhs = Interval::parse(&render(&client, "interval", a).await).expect("lhs parses");
+            let rhs = Interval::parse(&render(&client, "interval", b).await).expect("rhs parses");
+            let ours = lhs
+                .checked_add(rhs)
+                .unwrap_or_else(|e| panic!("{a} + {b} must not overflow: {e}"))
+                .render();
+            assert_eq!(ours, server, "{a} + {b}");
+        }
+    }
+}
+
+/// Postgres does not justify an interval sum, and this is what "1 day =
+/// 24h" does *and does not* mean: the two are `=` for **comparison**, but
+/// addition keeps the fields apart, so `'1 mon' + '30 days'` is `1 mon 30
+/// days` and not `2 mons` — even though those two are themselves `=`.
+///
+/// Getting this backwards is the fidelity risk the issue names, so it gets
+/// its own test rather than riding on the grid above.
+#[tokio::test]
+async fn interval_addition_does_not_justify() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let row = client
+        .query_one(
+            "select ('1 mon'::interval + '30 days'::interval)::text, \
+                    (('1 mon'::interval + '30 days'::interval) = '2 mons'::interval)",
+            &[],
+        )
+        .await
+        .expect("the justification demonstration");
+    let (text, equals_two_months): (String, bool) = (row.get(0), row.get(1));
+    assert_eq!(text, "1 mon 30 days", "Postgres does not justify a sum");
+    assert!(
+        equals_two_months,
+        "...even though the unjustified result is = to the justified one"
+    );
+
+    let ours = Interval::parse("1 mon")
+        .unwrap()
+        .checked_add(Interval::parse("30 days").unwrap())
+        .unwrap();
+    assert_eq!(ours.render(), text);
+}
+
+/// `interval` addition overflows rather than wrapping, matching
+/// `select '2147483647 months'::interval + '1 month'::interval`.
+#[tokio::test]
+async fn interval_overflow_agrees_with_the_server() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let server_failed = client
+        .query_one(
+            "select ('2147483647 months'::interval + '1 month'::interval)::text",
+            &[],
+        )
+        .await
+        .is_err();
+    let ours_failed = Interval {
+        months: i32::MAX,
+        days: 0,
+        micros: 0,
+    }
+    .checked_add(Interval {
+        months: 1,
+        days: 0,
+        micros: 0,
+    })
+    .is_err();
+    assert!(server_failed, "Postgres raises `interval out of range`");
+    assert_eq!(ours_failed, server_failed);
+}
+
+// ---------------------------------------------------------------------
+// 4. Aggregates
+// ---------------------------------------------------------------------
+
+/// `min`/`max` keep their argument's own type for every temporal family,
+/// and `sum(interval)` is `interval` — read off `pg_typeof`, not from the
+/// docs, exactly as #111/#112 did for their families.
+#[tokio::test]
+async fn temporal_aggregate_result_types_match_pg_typeof() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client.batch_execute(SOURCE_DDL).await.expect("source ddl");
+    client
+        .execute(
+            "insert into s (id, d, ts, tstz, tm, tmtz, iv, n) values \
+             (1, '2024-01-01', '2024-01-01 00:00:00', '2024-01-01 00:00:00+00', \
+              '12:00:00', '12:00:00+00', '1 day', 1)",
+            &[],
+        )
+        .await
+        .expect("seed");
+
+    for (column, sql_name) in [
+        ("d", "date"),
+        ("ts", "timestamp without time zone"),
+        ("tstz", "timestamp with time zone"),
+        ("tm", "time without time zone"),
+        ("tmtz", "time with time zone"),
+    ] {
+        for aggregate in ["min", "max"] {
+            let pg =
+                postgres_type_of(&client, &format!("(select {aggregate}({column}) from s)")).await;
+            assert_eq!(pg, sql_name, "{aggregate}({column}) in Postgres");
+
+            let ours = trellis::defs::registry::aggregate_result_type(
+                &aggregate.to_uppercase(),
+                source_columns()[column],
+            )
+            .unwrap_or_else(|| panic!("{aggregate}({column}) must resolve"));
+            assert_eq!(
+                ours,
+                source_columns()[column],
+                "{aggregate}({column}) keeps its argument's type, like Postgres"
+            );
+        }
+    }
+
+    let pg = postgres_type_of(&client, "(select sum(iv) from s)").await;
+    assert_eq!(pg, "interval");
+    assert_eq!(
+        trellis::defs::registry::aggregate_result_type("SUM", ValueType::Other(PgType::Interval)),
+        Some(ValueType::Other(PgType::Interval))
+    );
+
+    // Postgres has no `sum`/`avg` over the other five, and no `avg` over
+    // `interval` either — so neither does the registry.
+    for column in ["d", "ts", "tstz", "tm", "tmtz"] {
+        assert_eq!(
+            trellis::defs::registry::aggregate_result_type("SUM", source_columns()[column]),
+            None,
+            "there is no sum({column}) in Postgres"
+        );
+    }
+    assert_eq!(
+        trellis::defs::registry::aggregate_result_type("AVG", ValueType::Other(PgType::Interval)),
+        None,
+        "there is no avg(interval) in Postgres"
+    );
+}
+
+/// **Why `MIN`/`MAX(interval)` is refused**, demonstrated from the server.
+///
+/// `max(v)` over the same three rows returns different *text* depending on
+/// the scan order, because `interval_larger` is a left fold
+/// (`cmp(arg1, arg2) < 0 ? arg1 : arg2`) and `'1 day'`/`'24 hours'` tie.
+/// Postgres's own answer is therefore not a function of its input multiset,
+/// which means ADR-0013's byte-exact recompute cross-check can never settle
+/// it — whatever Trellis computes, a recompute is free to disagree. So the
+/// aggregate is refused at define time rather than shipped with a
+/// known-flaky self-check.
+///
+/// The control is `date`, whose ties are byte-identical by construction and
+/// which is therefore admitted.
+#[tokio::test]
+async fn max_interval_is_not_a_function_of_its_input_which_is_why_it_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table iv_rows (id int primary key, v interval, d date); \
+             insert into iv_rows values \
+               (1, '1 day', '2024-01-01'), \
+               (2, '24 hours', '2024-01-01'), \
+               (3, '2 hours', '2023-06-01')",
+        )
+        .await
+        .expect("seed the tie");
+
+    let mut interval_answers = Vec::new();
+    let mut date_answers = Vec::new();
+    for direction in ["asc", "desc"] {
+        let row = client
+            .query_one(
+                &format!(
+                    "select max(v)::text, max(d)::text \
+                     from (select v, d from iv_rows order by id {direction}) s"
+                ),
+                &[],
+            )
+            .await
+            .expect("scan-order probe");
+        interval_answers.push(row.get::<_, String>(0));
+        date_answers.push(row.get::<_, String>(1));
+    }
+
+    assert_ne!(
+        interval_answers[0], interval_answers[1],
+        "Postgres's own max(interval) returned {interval_answers:?} for two scan orders — \
+         this is the fact the refusal rests on"
+    );
+    assert!(
+        !temporal::supports_min_max(PgType::Interval),
+        "so MIN/MAX(interval) must be refused"
+    );
+
+    assert_eq!(
+        date_answers[0], date_answers[1],
+        "the control: max(date) is scan-order independent"
+    );
+    assert!(temporal::supports_min_max(PgType::Date));
+}
+
+/// The evaluator's `MIN`/`MAX` fold over each admitted family must produce
+/// byte-identical text to a server-side `min()`/`max()` over the same rows
+/// (ADR-0013: independently-authored SQL, not `defs::oracle`).
+#[tokio::test]
+async fn the_min_max_fold_matches_a_server_side_aggregate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for (pg_type, sql_name, values) in GRID {
+        if !temporal::supports_min_max(*pg_type) {
+            continue;
+        }
+        let rows = values
+            .iter()
+            .map(|v| format!("('{v}'::{sql_name})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = client
+            .query_one(
+                &format!("select min(v)::text, max(v)::text from (values {rows}) t(v)"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{sql_name} min/max: {e}"));
+        let (server_min, server_max): (String, String) = (row.get(0), row.get(1));
+
+        // The engine holds canonical renderings, so feed it those.
+        let mut canonical = Vec::new();
+        for value in *values {
+            canonical.push(render(&client, sql_name, value).await);
+        }
+
+        for (aggregate, expected) in [("MIN", &server_min), ("MAX", &server_max)] {
+            let def = parse(&format!(
+                "TRANSFORM t FROM s GROUP BY id SELECT id AS k, {aggregate}(col) AS out"
+            ))
+            .expect("parses");
+            let columns = HashMap::from([
+                ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+                ("col".to_string(), ValueType::Other(*pg_type)),
+            ]);
+            validate(&def, &columns, &HashMap::new())
+                .unwrap_or_else(|e| panic!("{aggregate}({sql_name}) must validate: {e}"));
+
+            let group: Vec<Row> = canonical
+                .iter()
+                .map(|text| {
+                    Row::from([
+                        ("id".to_string(), Some("1".to_string())),
+                        ("col".to_string(), Some(text.clone())),
+                    ])
+                })
+                .collect();
+            let out = evaluate_aggregate(&def, &group, &columns, &mut RegexCache::default())
+                .unwrap_or_else(|e| panic!("{aggregate}({sql_name}) fold: {e}"))
+                .remove("out")
+                .expect("the aggregate field")
+                .expect("a non-empty group folds to a value");
+            assert_eq!(
+                out,
+                Value::Other(*pg_type, expected.clone()),
+                "{aggregate}({sql_name}) must match a server-side aggregate"
+            );
+        }
+    }
+}
+
+/// The `SUM(interval)` fold must likewise match a server-side `sum()`,
+/// including over a group whose members are `=` but spelled differently —
+/// the case that makes `MIN`/`MAX` unusable but leaves `SUM` perfectly
+/// well-defined, because a sum reads all three fields of every input rather
+/// than picking one input to return.
+#[tokio::test]
+async fn the_sum_interval_fold_matches_a_server_side_sum() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    const GROUPS: &[&[&str]] = &[
+        &["1 day", "24 hours", "2 hours"],
+        &["1 mon", "30 days", "-1 day"],
+        &["0.5 secs", "-0.000001 secs", "100:00:00"],
+        &["1 year 2 mons 3 days 04:05:06", "-1 day 1 hour"],
+    ];
+
+    for group in GROUPS {
+        let rows = group
+            .iter()
+            .map(|v| format!("('{v}'::interval)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let server: String = client
+            .query_one(
+                &format!("select sum(v)::text from (values {rows}) t(v)"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("sum over {group:?}: {e}"))
+            .get(0);
+
+        let def = parse("TRANSFORM t FROM s GROUP BY id SELECT id AS k, SUM(col) AS out")
+            .expect("parses");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("col".to_string(), ValueType::Other(PgType::Interval)),
+        ]);
+        validate(&def, &columns, &HashMap::new()).expect("SUM(interval) must validate");
+
+        let mut rows_in = Vec::new();
+        for value in *group {
+            let canonical = render(&client, "interval", value).await;
+            rows_in.push(Row::from([
+                ("id".to_string(), Some("1".to_string())),
+                ("col".to_string(), Some(canonical)),
+            ]));
+        }
+        let out = evaluate_aggregate(&def, &rows_in, &columns, &mut RegexCache::default())
+            .expect("fold")
+            .remove("out")
+            .expect("the aggregate field")
+            .expect("a non-empty group folds to a value");
+        assert_eq!(
+            out,
+            Value::Other(PgType::Interval, server.clone()),
+            "SUM over {group:?}"
+        );
+    }
+}
+
+/// `SUM(interval)` is **invertible** while `SUM(<float>)` is not, and the
+/// difference is algebraic, not "exact decimal vs not": interval addition
+/// is exact, commutative and associative with an exact inverse, so a delta
+/// and a recompute agree by construction.
+///
+/// Pinned against the server for the property that actually matters — that
+/// subtracting a member recovers the sum of the rest, exactly.
+#[tokio::test]
+async fn sum_interval_has_an_exact_inverse_which_is_why_it_is_delta_able() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let row = client
+        .query_one(
+            "select (((('1 mon'::interval + '30 days') + '2 hours') - '30 days') \
+                     - '2 hours')::text, \
+                    (select sum(v)::text from (values ('1 day'::interval),('24 hours'), \
+                                                      ('2 hours')) t(v)), \
+                    (select sum(v)::text from (values ('2 hours'::interval),('24 hours'), \
+                                                      ('1 day')) t(v))",
+            &[],
+        )
+        .await
+        .expect("the invertibility demonstration");
+    let (round_tripped, forward, reversed): (String, String, String) =
+        (row.get(0), row.get(1), row.get(2));
+
+    assert_eq!(
+        round_tripped, "1 mon",
+        "adding then subtracting the same intervals returns exactly the original"
+    );
+    assert_eq!(
+        forward, reversed,
+        "sum(interval) is order-independent, unlike sum(float)"
+    );
+
+    let verdict = trellis::defs::invertibility::classify(
+        "SUM",
+        trellis::defs::invertibility::AggregateArg::Column(ValueType::Other(PgType::Interval)),
+    )
+    .expect("SUM(interval) must classify");
+    assert!(
+        verdict.is_invertible(),
+        "SUM(interval) belongs on the delta path"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 5. Key roles
+// ---------------------------------------------------------------------
+
+/// `date`/`timestamp`/`time`/`timetz` are **accepted** as relationship join
+/// keys (and therefore as 1-1 primary keys — one allowlist,
+/// `catalog::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while `timestamptz`
+/// and `interval` are refused.
+///
+/// This is the headline change of #113, and the split is the point: the
+/// matrix had all six marked `🎯 typed index`, and four of them never
+/// needed the index at all.
+#[tokio::test]
+async fn temporal_join_keys_are_admitted_per_family() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table p_date (k date primary key); \
+             create table p_ts (k timestamp primary key); \
+             create table p_tm (k time primary key); \
+             create table p_tmtz (k timetz primary key); \
+             create table p_tstz (k timestamptz primary key); \
+             create table p_iv (k interval primary key); \
+             create table child ( \
+               id bigint primary key, d date, ts timestamp, tm time, \
+               tmtz timetz, tstz timestamptz, iv interval); \
+             alter table child replica identity full; \
+             alter table p_date replica identity full; \
+             alter table p_ts replica identity full; \
+             alter table p_tm replica identity full; \
+             alter table p_tmtz replica identity full; \
+             alter table p_tstz replica identity full; \
+             alter table p_iv replica identity full",
+        )
+        .await
+        .expect("create relationship tables");
+
+    for (name, from_col, to_table) in [
+        ("r_date", "d", "p_date"),
+        ("r_ts", "ts", "p_ts"),
+        ("r_tm", "tm", "p_tm"),
+        ("r_tmtz", "tmtz", "p_tmtz"),
+    ] {
+        create_relationship(
+            &db.pool,
+            &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{from_col} must be accepted as a join key: {e}"));
+    }
+
+    for (name, from_col, to_table, pg_name) in [
+        ("r_tstz", "tstz", "p_tstz", "timestamp with time zone"),
+        ("r_iv", "iv", "p_iv", "interval"),
+    ] {
+        let err = create_relationship(
+            &db.pool,
+            &format!("RELATIONSHIP {name} FROM child.{from_col} TO {to_table}.k"),
+        )
+        .await
+        .expect_err("a timestamptz/interval join key must be refused");
+        assert!(
+            err.to_string().contains(pg_name),
+            "the rejection must name the offending type ({pg_name}): {err}"
+        );
+    }
+}
+
+/// A `timestamp(3)` column must be recognized as `timestamp without time
+/// zone` despite `format_type` rendering its modifier *inside* the name.
+///
+/// This is the concrete reason `catalog::base_type_name` replaced
+/// `split('(')`: `timestamp(3) without time zone` truncates to `timestamp`,
+/// which is on no list, so a perfectly good sub-second-precision key would
+/// have been silently refused.
+#[tokio::test]
+async fn a_precision_modified_temporal_key_is_still_recognized() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table probe (k timestamp(3))")
+        .await
+        .expect("create probe");
+    let rendered: String = client
+        .query_one(
+            "select format_type(atttypid, atttypmod) from pg_attribute \
+             where attrelid = 'probe'::regclass and attname = 'k'",
+            &[],
+        )
+        .await
+        .expect("format_type probe")
+        .get(0);
+    assert_eq!(
+        rendered, "timestamp(3) without time zone",
+        "format_type puts the modifier inside the name, which is the whole hazard"
+    );
+
+    client
+        .batch_execute(
+            "create table p3 (k timestamp(3) primary key); \
+             create table c3 (id bigint primary key, k timestamp(3)); \
+             alter table c3 replica identity full; \
+             alter table p3 replica identity full",
+        )
+        .await
+        .expect("create modified-precision tables");
+    create_relationship(&db.pool, "RELATIONSHIP r3 FROM c3.k TO p3.k")
+        .await
+        .expect("a timestamp(3) join key must be accepted");
+}
+
+/// The `GROUP BY` key gate follows the same four-accepted/two-refused
+/// split, and the rejection names the column.
+#[test]
+fn the_group_by_key_gate_follows_the_same_split() {
+    for column in ["d", "ts", "tm", "tmtz"] {
+        let def = parse(&format!(
+            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+        ))
+        .expect("parses");
+        validate(&def, &source_columns(), &HashMap::new())
+            .unwrap_or_else(|e| panic!("{column} must be accepted as a GROUP BY key: {e}"));
+    }
+
+    for column in ["tstz", "iv"] {
+        let def = parse(&format!(
+            "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
+        ))
+        .expect("parses");
+        let err = validate(&def, &source_columns(), &HashMap::new())
+            .expect_err("a timestamptz/interval GROUP BY key must be refused");
+        assert!(
+            err.to_string().contains(column),
+            "the rejection must name the column: {err}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// 6. Literals
+// ---------------------------------------------------------------------
+
+/// `TIME`/`TIMETZ` literals must be canonical, and Postgres must parse the
+/// same spelling to the same type.
+///
+/// `TIMESTAMPTZ` and `INTERVAL` are deliberately absent from the grammar;
+/// the rejections below pin that, with the reasons in
+/// `defs::typed_literal`'s allowlist doc comment.
+#[tokio::test]
+async fn time_and_timetz_literals_are_canonical_only() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for good in [
+        "TIME '13:45:00'",
+        "TIME '13:45:00.5'",
+        "TIME '24:00:00'",
+        "TIME '00:00:00'",
+        "CAST('13:45:00' AS time)",
+        "TIMETZ '13:45:00+00'",
+        "TIMETZ '13:45:00.5-05:30'",
+        "TIMETZ '13:45:00+05:30:15'",
+        "CAST('13:45:00+00' AS timetz)",
+    ] {
+        let def = parse(&format!("TRANSFORM t FROM s SELECT {good} AS x"))
+            .unwrap_or_else(|e| panic!("{good} should parse: {e}"));
+        validate(&def, &source_columns(), &HashMap::new())
+            .unwrap_or_else(|e| panic!("{good} should validate: {e}"));
+
+        let pg = postgres_type_of(&client, good).await;
+        assert!(
+            pg == "time without time zone" || pg == "time with time zone",
+            "{good} types as {pg} in Postgres"
+        );
+
+        // And the literal text is exactly what Postgres renders back — the
+        // round-trip identity the typed-literal module's doc comment
+        // requires.
+        let literal = good
+            .split_once('\'')
+            .and_then(|(_, rest)| rest.rsplit_once('\''))
+            .map(|(text, _)| text)
+            .expect("every spelling above contains a quoted literal");
+        let sql_name = if pg.contains("with time zone") {
+            "timetz"
+        } else {
+            "time"
+        };
+        assert_eq!(
+            render(&client, sql_name, literal).await,
+            literal,
+            "{good} must round-trip to the text it was written as"
+        );
+    }
+
+    for bad in [
+        // Non-canonical spellings `time_in` accepts but `time_out` never
+        // emits.
+        "TIME '13:45'",
+        "TIME '13:45:00.500'",
+        "TIME '1:45:00'",
+        "TIME '24:00:01'",
+        // Relative spellings — the reason `time_in` is STABLE.
+        "TIME 'now'",
+        "TIME 'allballs'",
+        // A zone abbreviation is a lookup against the server's timezone
+        // set, which is what makes `timetz_in` STABLE.
+        "TIMETZ '13:45:00 EST'",
+        "TIMETZ '13:45:00'",
+        // `timetz_out` omits a zero offset field, so a padded one would not
+        // round-trip; and the offset is capped at 15:59:59.
+        "TIMETZ '13:45:00+00:00'",
+        "TIMETZ '13:45:00+05:30:00'",
+        "TIMETZ '13:45:00+16'",
+    ] {
+        let parsed = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"));
+        let rejected = match parsed {
+            Err(_) => true,
+            Ok(def) => validate(&def, &source_columns(), &HashMap::new()).is_err(),
+        };
+        assert!(rejected, "{bad} must be rejected");
+    }
+
+    // The two temporal families with no literal row at all.
+    for absent in ["TIMESTAMPTZ '2024-01-01 00:00:00+00'", "INTERVAL '1 day'"] {
+        let parsed = parse(&format!("TRANSFORM t FROM s SELECT {absent} AS x"));
+        let rejected = match parsed {
+            Err(_) => true,
+            Ok(def) => validate(&def, &source_columns(), &HashMap::new()).is_err(),
+        };
+        assert!(rejected, "{absent} must not be spellable (yet)");
+    }
+}
+
+/// `interval_in` reads `IntervalStyle`, which is the input-side reason
+/// `INTERVAL` has no typed-literal row: the same text parses to different
+/// *values* on two servers, and a definition installed against one must
+/// stay correct when read on another.
+///
+/// Demonstrated rather than asserted, because it is the load-bearing half
+/// of that decision.
+#[tokio::test]
+async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_literal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let mut parsed = Vec::new();
+    for style in ["postgres", "sql_standard"] {
+        client
+            .batch_execute(&format!("set intervalstyle to '{style}'"))
+            .await
+            .expect("set intervalstyle");
+        // Read the parsed *value* as a number of seconds, so the session's
+        // *output* style cannot confound what is an input-side difference.
+        let epoch: f64 = client
+            .query_one(
+                "select extract(epoch from '-1 2:03:04'::interval)::float8",
+                &[],
+            )
+            .await
+            .expect("style-sensitive parse")
+            .get(0);
+        parsed.push(epoch);
+    }
+    assert_ne!(
+        parsed[0], parsed[1],
+        "'-1 2:03:04' parses to two different intervals under two IntervalStyles: {parsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 7. The live delta path
+// ---------------------------------------------------------------------
+
+/// `SUM(interval)` and `MAX(date)` maintained end-to-end through the ring's
+/// **incremental delta path**, checked against an independently-authored
+/// `SELECT ... GROUP BY` over the live source (ADR-0013 — not
+/// `defs::render_aggregate_select_sql`, which is the engine's own
+/// renderer).
+///
+/// This is the test that actually exercises `staging::apply_aggregate`'s
+/// interval threading: a `SUM(interval)` field's running partial is an
+/// `interval` column accumulated by Postgres's own `sum(interval)` over
+/// `unnest($n::text[]::interval[])`, not the `::numeric[]` every other
+/// `SUM` uses (`sum_accumulator_type`). Getting that wrong is not a subtly
+/// wrong number — `'1 day'::text::numeric` is a hard type error — but
+/// getting the *identity element* wrong (`0` instead of `'0'::interval`) is
+/// exactly as fatal and just as invisible until a real delta runs.
+///
+/// `MAX(date)` rides along to cover the recompute-only half of the same
+/// batch, and the insert/update/delete/grain-migration sequence is the same
+/// shape `apply_aggregate.rs`'s own oracle test uses.
+#[tokio::test]
+async fn sum_interval_and_max_date_are_maintained_through_the_live_delta_path() {
+    use tokio_postgres::types::PgLsn;
+    use trellis::defs::{create_aggregate_target_table, create_definition};
+    use trellis::staging::{StagedWatermark, apply, seal};
+
+    const DEF_SQL: &str = "TRANSFORM shift_totals FROM shifts GROUP BY crew \
+         SELECT crew AS crew, SUM(worked) AS total_worked, MAX(on_day) AS last_day";
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table shifts ( \
+               id integer primary key, crew integer, worked interval, on_day date); \
+             alter table shifts replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let columns = HashMap::from([
+        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ("crew".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ("worked".to_string(), ValueType::Other(PgType::Interval)),
+        ("on_day".to_string(), ValueType::Other(PgType::Date)),
+    ]);
+    let def = parse(DEF_SQL).expect("parse");
+    validate(&def, &columns, &HashMap::new()).expect("validate");
+    create_definition(&db.pool, DEF_SQL, &columns)
+        .await
+        .expect("create definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &columns)
+        .await
+        .expect("create aggregate target table");
+
+    // The visible columns must be declared with their real Postgres types,
+    // not coerced into `numeric` — `SUM(interval)` is `interval` and
+    // `MAX(date)` is `date` (`registry::aggregate_result_type`).
+    for (column, expected) in [("total_worked", "interval"), ("last_day", "date")] {
+        let declared: String = client
+            .query_one(
+                "select format_type(atttypid, atttypmod) from pg_attribute \
+                 where attrelid = 'shift_totals'::regclass and attname = $1",
+                &[&column],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("introspect shift_totals.{column}: {e}"))
+            .get(0);
+        assert_eq!(declared, expected, "shift_totals.{column}");
+    }
+
+    /// The independently-authored recompute: plain SQL, hand-written here,
+    /// with no reference to the engine's own renderer.
+    async fn expected(client: &Client) -> HashMap<String, (Option<String>, Option<String>)> {
+        client
+            .query(
+                "select crew::text, sum(worked)::text, max(on_day)::text \
+                 from shifts group by crew",
+                &[],
+            )
+            .await
+            .expect("hand-written recompute")
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), (row.get(1), row.get(2))))
+            .collect()
+    }
+
+    async fn actual(client: &Client) -> HashMap<String, (Option<String>, Option<String>)> {
+        client
+            .query(
+                "select crew::text, total_worked::text, last_day::text from shift_totals",
+                &[],
+            )
+            .await
+            .expect("read target")
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), (row.get(1), row.get(2))))
+            .collect()
+    }
+
+    async fn stage(
+        client: &Client,
+        segment: &str,
+        key: &str,
+        op: &str,
+        old_image: Option<&str>,
+        new_image: Option<&str>,
+    ) {
+        let src_table = format!("{DEFAULT_SCHEMA}.shifts");
+        client
+            .execute(
+                &format!(
+                    "insert into {segment} \
+                     (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                     values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+                ),
+                &[
+                    &src_table,
+                    &key,
+                    &op,
+                    &PgLsn::from(1u64),
+                    &old_image,
+                    &new_image,
+                ],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stage {key}: {e}"));
+    }
+
+    async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq)
+            .await
+            .expect("seal phase 2");
+        apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "temporal_worker",
+            1,
+            "trellis_defs_temporal_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("drain_once")
+        .expect("drain_once must claim and drain something");
+    }
+
+    // Step 1 — seed two groups. Crew 1's members are deliberately `=` but
+    // spelled differently (`1 day` / `24 hours`), which is exactly the
+    // multiset that makes `MAX(interval)` ill-defined and leaves `SUM`
+    // perfectly well-defined.
+    client
+        .batch_execute(
+            "insert into shifts (id, crew, worked, on_day) values \
+               (1, 1, '1 day',    '2024-01-01'), \
+               (2, 1, '24 hours', '2024-01-05'), \
+               (3, 2, '2 hours',  '2024-02-01'), \
+               (4, 2, '1 mon',    '2023-12-31')",
+        )
+        .await
+        .expect("seed source rows");
+    // The staged images carry `interval_out`'s **canonical** spelling,
+    // because that is what a real walsender emits — `'24 hours'` reaches
+    // the engine as `24:00:00`. Staging the input spelling instead would
+    // be testing a shape CDC cannot produce.
+    for (key, crew, worked, day) in [
+        ("1", "1", "1 day", "2024-01-01"),
+        ("2", "1", "24:00:00", "2024-01-05"),
+        ("3", "2", "02:00:00", "2024-02-01"),
+        ("4", "2", "1 mon", "2023-12-31"),
+    ] {
+        stage(
+            &client,
+            "seg_0",
+            key,
+            "insert",
+            None,
+            Some(&format!(
+                r#"{{"crew":"{crew}","worked":"{worked}","on_day":"{day}"}}"#
+            )),
+        )
+        .await;
+    }
+    drain_sealed(&mut client, &db.pool).await;
+    assert_eq!(
+        actual(&client).await,
+        expected(&client).await,
+        "the seed batch must already match a hand-written recompute"
+    );
+
+    // Step 2 — an insert, an in-place update, a grain migration (crew 2 ->
+    // 3) and a delete, all in one batch. The update and delete are what
+    // drive `SUM`'s *subtraction* leg, which is the half a recompute-only
+    // aggregate never exercises.
+    client
+        .batch_execute(
+            "insert into shifts (id, crew, worked, on_day) values \
+               (5, 1, '-1 day 1 hour', '2024-03-01'); \
+             update shifts set worked = '1 year 2 mons 3 days 04:05:06' where id = 2; \
+             update shifts set crew = 3 where id = 3; \
+             delete from shifts where id = 4",
+        )
+        .await
+        .expect("apply step 2's live end state");
+    stage(
+        &client,
+        "seg_1",
+        "5",
+        "insert",
+        None,
+        Some(r#"{"crew":"1","worked":"-1 days +01:00:00","on_day":"2024-03-01"}"#),
+    )
+    .await;
+    stage(
+        &client,
+        "seg_1",
+        "2",
+        "update",
+        Some(r#"{"crew":"1","worked":"24:00:00","on_day":"2024-01-05"}"#),
+        Some(r#"{"crew":"1","worked":"1 year 2 mons 3 days 04:05:06","on_day":"2024-01-05"}"#),
+    )
+    .await;
+    stage(
+        &client,
+        "seg_1",
+        "3",
+        "update",
+        Some(r#"{"crew":"2","worked":"02:00:00","on_day":"2024-02-01"}"#),
+        Some(r#"{"crew":"3","worked":"02:00:00","on_day":"2024-02-01"}"#),
+    )
+    .await;
+    stage(
+        &client,
+        "seg_1",
+        "4",
+        "delete",
+        Some(r#"{"crew":"2","worked":"1 mon","on_day":"2023-12-31"}"#),
+        None,
+    )
+    .await;
+    drain_sealed(&mut client, &db.pool).await;
+
+    let got = actual(&client).await;
+    assert_eq!(
+        got,
+        expected(&client).await,
+        "insert/update/grain-migration/delete must still match a hand-written recompute"
+    );
+
+    // And the sum is a real, unjustified interval rather than something
+    // that round-tripped through `numeric`: crew 1 holds
+    // `1 day + (1 year 2 mons 3 days 04:05:06) + (-1 day +01:00:00)`.
+    assert_eq!(
+        got["1"].0.as_deref(),
+        Some("1 year 2 mons 3 days 05:05:06"),
+        "crew 1's interval sum"
+    );
+}

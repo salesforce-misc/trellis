@@ -165,14 +165,27 @@ pub struct TypedLiteralSpec {
 /// * **`timestamptz`** (#113) — value comparison is immutable but *text
 ///   rendering* is not: `timestamptz_out` formats in the session's `TimeZone`,
 ///   so the same stored instant reaches the evaluator as different text on
-///   two connections. `docs/type-support.md` flags this as the reason the
-///   typed key index is the real unlock; it applies to a computed value
-///   travelling as text just as much as to a key.
-/// * **`time`, `timetz`, `interval`** (#113) — same canonical-form work as
-///   `date`/`timestamp`, deferred with the rest of the temporal family
-///   rather than half-landed here; `interval` additionally has no canonical
-///   text at all (`'1 day'` and `'24 hours'` are `=` but render
-///   differently), which is its own design question.
+///   two connections. Issue #113 investigated pinning `TimeZone` to `'UTC'`
+///   alongside `DateStyle` and declined it, because Trellis renders
+///   `timestamptz` on a second backend it cannot pin — the walsender — so
+///   the pin would guarantee a disagreement it currently only risks. See
+///   [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]. Until that changes
+///   (or #110's typed key index lands), a `timestamptz` constant has no
+///   spelling whose round-trip this module can promise.
+/// * **`interval`** (#113) — the one temporal family that stays out, and
+///   for an *input*-side reason the other five don't have: `interval_in`
+///   reads `IntervalStyle`, so the same literal text parses to different
+///   values on different servers. `'-1 2:03:04'` is `-1 days +02:03:04`
+///   under `IntervalStyle = 'postgres'` and `-1 day -2:03:04` under
+///   `sql_standard`; `'1-2'` is `1 year 2 mons` under both but `P1Y2M`
+///   under `iso_8601` output. This module's "parses to the same value under
+///   any GUC" bar — the half that `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`
+///   explicitly cannot help with, since a definition installed against one
+///   server must stay correct when read on another — is therefore
+///   unreachable for `interval` without also pinning an input GUC, which
+///   Trellis does not do. (`interval`'s *output* side is fine: #113 pins
+///   `IntervalStyle` and `crate::temporal::Interval::render` reproduces the
+///   `postgres` spelling exactly, which is what `SUM(interval)` needs.)
 /// * **`inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit`** — each
 ///   waits for its own child (#116, #118).
 /// * **`smallint`, `integer`, `bigint`** — these *do* have literal syntax of
@@ -211,6 +224,27 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "BYTEA",
         value_type: ValueType::Other(PgType::Bytea),
         canonical: canonical_bytea,
+    },
+    // Issue #113. `time_out` and `timetz_out` are the only two output
+    // functions in the temporal block `pg_proc` marks **IMMUTABLE**
+    // outright — `date_out`, `timestamp_out`, `timestamptz_out` and
+    // `interval_out` are all `STABLE` — and they read no GUC at all,
+    // verified by rendering the same values under `ISO`/`SQL`/`Postgres`/
+    // `German` `DateStyle`s and under three session `TimeZone`s and getting
+    // one answer each time. `time_in`/`timetz_in` are `STABLE` for the
+    // usual reason (`TIME 'now'`, and `timetz`'s zone *abbreviations*
+    // resolve against the session's timezone set), and the canonical
+    // checkers below remove exactly that surface by admitting only a
+    // fully-numeric offset.
+    TypedLiteralSpec {
+        keyword: "TIME",
+        value_type: ValueType::Other(PgType::Time),
+        canonical: canonical_time,
+    },
+    TypedLiteralSpec {
+        keyword: "TIMETZ",
+        value_type: ValueType::Other(PgType::TimeTz),
+        canonical: canonical_timetz,
     },
     // Issue #111. `oid` clears both bars this module sets easily: `oidin`
     // and `oidout` are `IMMUTABLE` (no session state, no relative
@@ -418,6 +452,115 @@ const TIMESTAMP_SHAPE: &str = "expected a canonical ISO-8601 timestamp literal, 
      trailing zero (e.g. '2024-01-01 12:00:00' or '2024-01-01 12:00:00.5'). Relative \
      spellings ('now', 'epoch', 'infinity') are rejected as non-immutable, and \
      non-canonical ones because they do not round-trip to the text they were written as";
+
+/// `HH:MM:SS[.F[FFFFF]]`, the spelling `time_out` emits — under every
+/// `DateStyle`, since `time_out` is `IMMUTABLE` and reads no GUC.
+///
+/// Same fractional-second rules as [`canonical_timestamp`] (1-6 digits, no
+/// trailing zero, since `time_out` trims). `24:00:00` is accepted and is a
+/// genuinely distinct value from `00:00:00` — Postgres's legal end-of-day
+/// `time` — but `24:00:01` and `24:00:00.5` are rejected, because
+/// `time_in` rejects them too (`time` is capped at exactly 24 hours).
+///
+/// Relative spellings `time_in` also accepts (`now`, `allballs`) are
+/// rejected: `'now'::time` is a different value every call, which is what
+/// makes `time_in` `STABLE`, and `'allballs'::time` renders back as
+/// `00:00:00`, so it would not round-trip to the text it was written as.
+fn canonical_time(text: &str) -> Result<(), &'static str> {
+    canonical_time_of_day(text).ok_or(TIME_SHAPE)
+}
+
+/// [`canonical_time`] plus `timetz_out`'s mandatory numeric UTC offset,
+/// `±HH[:MM[:SS]]`.
+///
+/// The offset's minute and second fields are **omitted when zero** by
+/// `timetz_out` (`'12:00:00-00:00'::timetz` renders `12:00:00+00`, and
+/// `'+05:30:00'` renders `+05:30`), so a padded spelling is rejected for
+/// the same round-trip reason an unpadded date is. Postgres's range is
+/// `-15:59:59 .. +15:59:59` — `'12:00:00+16'::timetz` errors — so the hour
+/// field is capped at 15.
+///
+/// Zone *abbreviations* and names (`'12:00:00 EST'`, `'12:00:00
+/// America/New_York'`) are rejected, and this is the load-bearing half of
+/// why a `timetz` literal can be treated as immutable at all: resolving an
+/// abbreviation is a lookup against the server's timezone set, which is
+/// exactly what makes `timetz_in` `STABLE`. A numeric offset needs no
+/// lookup — and is what `timetz_out` emits anyway.
+fn canonical_timetz(text: &str) -> Result<(), &'static str> {
+    let sign_at = text.rfind(['+', '-']).ok_or(TIMETZ_SHAPE)?;
+    let (time_part, zone) = text.split_at(sign_at);
+    canonical_time_of_day(time_part).ok_or(TIMETZ_SHAPE)?;
+
+    let mut fields = zone[1..].split(':');
+    let hours = fields
+        .next()
+        .filter(|field| field.len() == 2)
+        .and_then(parse_fixed)
+        .ok_or(TIMETZ_SHAPE)?;
+    if hours > 15 {
+        return Err(TIMETZ_SHAPE);
+    }
+    // Each optional field must be present *and non-zero*, because
+    // `timetz_out` drops a zero one — and a seconds field cannot appear
+    // without a minutes field.
+    for field in fields {
+        let value = Some(field)
+            .filter(|field| field.len() == 2)
+            .and_then(parse_fixed)
+            .ok_or(TIMETZ_SHAPE)?;
+        if value == 0 || value > 59 {
+            return Err(TIMETZ_SHAPE);
+        }
+    }
+    Ok(())
+}
+
+/// The shared `HH:MM:SS[.F[FFFFF]]` clock reading of [`canonical_time`] and
+/// [`canonical_timetz`], returning `None` rather than a message so each
+/// caller can blame its own type.
+fn canonical_time_of_day(text: &str) -> Option<()> {
+    let (hms, fraction) = match text.split_once('.') {
+        Some((hms, fraction)) => (hms, Some(fraction)),
+        None => (text, None),
+    };
+    let bytes = hms.as_bytes();
+    if bytes.len() != 8 || bytes[2] != b':' || bytes[5] != b':' {
+        return None;
+    }
+    let hour = parse_fixed(&hms[0..2])?;
+    let minute = parse_fixed(&hms[3..5])?;
+    let second = parse_fixed(&hms[6..8])?;
+    if hour > 24 || minute > 59 || second > 59 {
+        return None;
+    }
+    // `time`'s upper bound is exactly 24:00:00, not 24:59:59.
+    if hour == 24 && (minute != 0 || second != 0 || fraction.is_some()) {
+        return None;
+    }
+    if let Some(fraction) = fraction
+        && (fraction.is_empty()
+            || fraction.len() > 6
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+            || fraction.ends_with('0'))
+    {
+        return None;
+    }
+    Some(())
+}
+
+const TIME_SHAPE: &str = "expected a canonical time literal, `HH:MM:SS` with optional `.` \
+     plus 1-6 fractional-second digits and no trailing zero (e.g. '13:45:00' or \
+     '13:45:00.5'). `24:00:00` is Postgres's legal end-of-day value and is accepted; \
+     anything past it is not. Relative spellings ('now', 'allballs') are rejected as \
+     non-immutable, and non-canonical ones because they do not round-trip to the text \
+     they were written as";
+
+const TIMETZ_SHAPE: &str = "expected a canonical timetz literal, a `HH:MM:SS[.F…]` time \
+     followed by a numeric UTC offset `+HH`, `+HH:MM` or `+HH:MM:SS` in -15:59:59..+15:59:59, \
+     with zero minute/second offset fields omitted (e.g. '13:45:00+00' or \
+     '13:45:00.5-05:30'). A zone abbreviation or name ('EST', 'America/New_York') is \
+     rejected: resolving one is a lookup against the server's timezone set, which is what \
+     makes `timetz_in` STABLE rather than IMMUTABLE";
 
 const BYTEA_SHAPE: &str = "expected a canonical hex bytea literal, `\\x` followed by an \
      even number of lowercase hex digits (e.g. '\\x0102ff', or '\\x' for an empty value). \

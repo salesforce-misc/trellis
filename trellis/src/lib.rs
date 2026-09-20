@@ -106,6 +106,16 @@ pub mod intake;
 pub(crate) mod staging;
 #[cfg(feature = "internals")]
 pub mod staging;
+// `temporal` (issue #113) sits with tier 3 rather than beside `float`/
+// `integer` in tier 2 for one concrete reason: its public signatures name
+// `defs::pg_type::PgType`, which is itself crate-private above. The temporal
+// families never earned their own `ValueType` variant the way #111's
+// integers and #112's floats did (see that module's doc comment), so there
+// is no tier-2-visible type to hang them off.
+#[cfg(not(feature = "internals"))]
+pub(crate) mod temporal;
+#[cfg(feature = "internals")]
+pub mod temporal;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod dev;

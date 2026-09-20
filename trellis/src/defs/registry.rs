@@ -9,6 +9,7 @@
 //! the same source of truth rather than each hardcoding a function's shape.
 
 use super::ast::{Operator, ValueType};
+use super::pg_type::PgType;
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
@@ -322,6 +323,29 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// column's type for definitions that reference no integer at all) and is
 /// left to #120.
 pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
+    // Issue #113: the temporal families are the first non-numeric arguments
+    // any aggregate accepts. They are `ValueType::Other` passthrough types
+    // rather than a first-class variant (see `crate::temporal`'s module doc
+    // for why they never needed one), so they are dispatched before the
+    // numeric family rather than inside it. Postgres's own `pg_aggregate`
+    // rows are the rule here as everywhere: `min`/`max` keep their
+    // argument's type, and `sum(interval)` is `interval`.
+    //
+    // The two refusals are the reason this routes through
+    // `crate::temporal`'s predicates rather than listing families inline.
+    // `min`/`max` over `interval` is refused because Postgres's own answer
+    // is not a function of its input — `max` over `{'1 day', '24 hours'}`
+    // returns different *text* for different scan orders, verified live, so
+    // ADR-0013's byte-exact recompute cross-check could never settle it.
+    // `sum` over the other five is refused because Postgres simply has no
+    // such aggregate: there is no `sum(timestamp)`.
+    if let ValueType::Other(pg_type) = arg {
+        return match name {
+            "MIN" | "MAX" if crate::temporal::supports_min_max(pg_type) => Some(arg),
+            "SUM" if pg_type == PgType::Interval => Some(arg),
+            _ => None,
+        };
+    }
     if !arg.is_numeric_family() {
         return None;
     }

@@ -434,7 +434,8 @@ impl fmt::Display for ValidationError {
                 "GROUP BY key '{column}' is a {value_type} column, a type Trellis can only pass \
                  through today: GROUP BY keys are matched by their text rendering, which doesn't \
                  agree with this type's own equality (see docs/type-support.md). Supported GROUP \
-                 BY key types are numeric, text, boolean, and uuid"
+                 BY key types are numeric, text, boolean, uuid, oid, date, timestamp, time and \
+                 timetz"
             ),
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
@@ -1074,6 +1075,23 @@ fn reject_unsupported_group_by_key_type(
         // `ValueType::Integer` because Postgres gives it no arithmetic at
         // all — see `pg_type::PgType::Oid`.
         ValueType::Other(PgType::Oid) => Ok(()),
+        // Issue #113: `date`, `timestamp`, `time` and `timetz` join `oid`
+        // on the same grounds, gated by `crate::temporal`'s own per-family
+        // verdict rather than by a list repeated here — see that module's
+        // doc comment for the live evidence, and
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` for the relationship/PK
+        // half of the same decision.
+        //
+        // The two temporal families this still rejects are rejected for
+        // genuinely different reasons, which is why `is_text_stable` is
+        // per-family and not "temporal or not": `timestamptz`'s rendering
+        // is `TimeZone`-dependent and half of it is produced by a walsender
+        // Trellis cannot pin (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`),
+        // while `interval` has no canonical rendering at all — `'24 hours'`
+        // and `'1 day'` are `=` and render differently, so a text-matched
+        // `GROUP BY` would split one Postgres group in two, exactly as a
+        // float `-0`/`0` key would.
+        ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -1355,9 +1373,15 @@ fn infer_expr(
                     // argument means "any numeric type", floats included —
                     // Postgres has a `sum`/`avg`/`min`/`max` for `real` and
                     // `double precision` just as it does for the exact
-                    // types, and `registry::aggregate_result_type` knows
-                    // what each one returns.
-                    arg_t.is_numeric_family()
+                    // types. Issue #113 widened it past the numeric family
+                    // entirely (`MIN`/`MAX` over the temporal types,
+                    // `SUM(interval)`), at which point "what does this
+                    // aggregate accept?" and "what does it return?" are one
+                    // question with one answer, so the admissibility test
+                    // *is* `registry::aggregate_result_type` resolving —
+                    // rather than a predicate here that a future family
+                    // could teach one of the two and not the other.
+                    super::registry::aggregate_result_type(name, arg_t).is_some()
                 } else {
                     arg_t == *expected
                 };

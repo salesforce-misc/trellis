@@ -81,6 +81,7 @@
 //!   not chosen to offer. Never approximate an inverse.
 
 use super::ast::ValueType;
+use super::pg_type::PgType;
 
 /// Whether an aggregate measure's new value can be derived from its old
 /// value plus a folded change (invertible → delta-able), or whether it must
@@ -201,6 +202,30 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         // produce", and since #111 an integer-argument aggregate is a shape
         // the grammar produces routinely.
         ("SUM", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
+            Some(Verdict::invertible(&[]))
+        }
+        // Issue #113: `SUM(interval)` is invertible, and it is worth being
+        // explicit that this is the *opposite* verdict from #112's
+        // `SUM(<float>)` even though both arguments are non-`Numeric` — the
+        // gate's question is algebraic, not "is it an exact decimal".
+        //
+        // A Postgres `interval` is three independent signed integers
+        // (`months: i32`, `days: i32`, `micros: i64`) and `interval_pl`
+        // adds them fieldwise with overflow checks, applying no
+        // justification. Interval addition is therefore exact, commutative
+        // and associative, with exact subtraction as its inverse — every
+        // property float addition lacks. Checked against a live server
+        // rather than reasoned from the type's shape: `sum(v)` over
+        // `{'1 day', '24 hours', '2 hours'}` is `1 day 26:00:00` in either
+        // scan order, and `('1 mon' + '30 days') - '30 days'` is exactly
+        // `1 mon`.
+        //
+        // The delta path this unlocks accumulates in SQL, not in Rust
+        // (`staging::apply_aggregate`'s `sum_array_expr`), so the running
+        // partial is a real `interval` column summed by Postgres's own
+        // `sum(interval)` — no reimplementation sits between the delta and
+        // the recompute ADR-0013 checks it against.
+        ("SUM", AggregateArg::Column(ValueType::Other(PgType::Interval))) => {
             Some(Verdict::invertible(&[]))
         }
         (

@@ -88,6 +88,7 @@
 //! into the same [`CatalogError::TargetTableSuffixCollision`] rather than
 //! surfacing as an opaque [`CatalogError::Db`].
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -2483,14 +2484,51 @@ async fn column_type_in_txn(
 /// `varchar(n)`, would fall into the `other` catch-all as two distinct
 /// strings and be wrongly rejected as a type mismatch, even though they're
 /// exactly the kind of join this function exists to allow.
-fn type_family(pg_type: &str) -> &str {
-    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-    match base {
-        "smallint" | "integer" | "bigint" => "integer",
-        "numeric" | "real" | "double precision" => "numeric",
-        "text" | "character varying" | "character" => "text",
-        other => other,
+fn type_family(pg_type: &str) -> Cow<'_, str> {
+    let base = base_type_name(pg_type);
+    match base.as_ref() {
+        "smallint" | "integer" | "bigint" => Cow::Borrowed("integer"),
+        "numeric" | "real" | "double precision" => Cow::Borrowed("numeric"),
+        "text" | "character varying" | "character" => Cow::Borrowed("text"),
+        _ => base,
     }
+}
+
+/// Strips a `format_type` rendering's `(...)` type modifier, wherever it
+/// sits, leaving the bare type name: `character varying(255)` and
+/// `numeric(10,2)` become `character varying` and `numeric`, and
+/// `timestamp(3) without time zone` becomes `timestamp without time zone`.
+///
+/// That last case is why this is a function rather than the
+/// `split('(').next()` both [`type_family`] and
+/// [`is_text_stable_join_key_type`] used before issue #113. Every type name
+/// they had to handle until then carried its modifier as a *suffix*, so
+/// truncating at the first `(` was equivalent. The SQL-standard temporal
+/// names do not: `format_type` renders a `timestamp(3)` column as
+/// `timestamp(3) without time zone`, which truncates to `timestamp` — a
+/// string matching neither the unmodified `timestamp without time zone` in
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`] nor the same column declared without a
+/// precision. Left alone, a sub-second-precision `timestamp` key would have
+/// been silently refused and a `timestamp(3)`/`timestamp` join pair wrongly
+/// reported as a type mismatch.
+///
+/// A precision modifier never affects text-stability, incidentally: it
+/// rounds on *input* (`'12:00:00.5678'::time(2)` stores `12:00:00.57`), and
+/// what is stored still renders canonically.
+fn base_type_name(pg_type: &str) -> Cow<'_, str> {
+    let trimmed = pg_type.trim();
+    let Some(open) = trimmed.find('(') else {
+        return Cow::Borrowed(trimmed);
+    };
+    let Some(close) = trimmed[open..].find(')').map(|offset| open + offset) else {
+        return Cow::Borrowed(trimmed);
+    };
+    let head = trimmed[..open].trim_end();
+    let tail = trimmed[close + 1..].trim_start();
+    if tail.is_empty() {
+        return Cow::Borrowed(head);
+    }
+    Cow::Owned(format!("{head} {tail}"))
 }
 
 /// Postgres type base names (modifier already stripped, as in
@@ -2512,9 +2550,9 @@ fn type_family(pg_type: &str) -> &str {
 /// `crate::float::compare`, not a new encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
-/// `timestamp`/`timestamptz`/`date`/`time` (`::text` is session-TimeZone- or
-/// style-dependent), `boolean`, `bytea`, `json`/`jsonb`, or any unknown
-/// type — is rejected as a join key.
+/// `timestamptz` and `interval` (issue #113; see the temporal block below
+/// for why those two alone stayed off), `boolean`, `bytea`, `json`/`jsonb`,
+/// or any unknown type — is rejected as a join key.
 const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
@@ -2530,19 +2568,56 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "uuid",
     "text",
     "character varying",
+    // Issue #113: four of the six temporal families, on the same
+    // "text-stability is a property of the rendering" reasoning `oid` was
+    // admitted under. `docs/type-support.md` had all six marked `🎯 typed
+    // index`, assuming #110's typed key index was the prerequisite; for
+    // these four it is not, and the evidence is per-family rather than
+    // per-block — see `crate::temporal`'s module doc for the live queries.
+    //
+    // `date_out`/`timestamp_out` under the already-pinned `DateStyle =
+    // 'ISO, YMD'` (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) are
+    // bijections on their values: the year field widens (`5874897-12-31`),
+    // the era is an explicit ` BC` suffix, `infinity`/`-infinity` have
+    // their own spellings, and the fractional seconds are trailing-zero
+    // trimmed so one value has exactly one rendering. `time_out` and
+    // `timetz_out` need no GUC at all — verified identical under `ISO`,
+    // `SQL`, `Postgres` and `German` `DateStyle`s and under three session
+    // `TimeZone`s.
+    //
+    // `timetz` is the one to double-take on, and it is safe for a reason
+    // opposite to the obvious one: its `=` is *narrower* than "same instant
+    // of day", not wider. `select '12:00:00+00'::timetz =
+    // '17:30:00+05:30'::timetz` is **false** — `timetz_cmp_internal` sorts
+    // by GMT-equivalent time and then by zone, so equality is identity on
+    // the stored `(time, zone)` pair, which is exactly what `timetz_out`
+    // prints.
+    //
+    // Deliberately absent, and these are the two that genuinely cannot be
+    // here: `timestamp with time zone`, whose rendering is `TimeZone`-
+    // dependent and whose *other* renderer is the walsender Trellis cannot
+    // pin (see `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`), and
+    // `interval`, where `'24 hours'` and `'1 day'` are one value with two
+    // renderings — the float `-0`/`0` defect, and no GUC fixes it.
+    "date",
+    "timestamp without time zone",
+    "time without time zone",
+    "time with time zone",
 ];
 
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
 /// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of
 /// truth both [`assert_join_key_type_supported`] (relationship join keys,
 /// issue #28) and [`super::ddl::source_primary_key`] (1-1 transform primary
-/// keys, issue #107) gate on. Any modifier (`(255)`, `(10,2)`) is stripped
-/// before matching, same as [`type_family`], so `varchar(255)` and
-/// `varchar(100)` are both recognized as `character varying` rather than
-/// falling through to the catch-all rejection as two distinct strings.
+/// keys, issue #107) gate on. Any modifier (`(255)`, `(10,2)`, `(3)`) is
+/// stripped by [`base_type_name`] before matching, so `varchar(255)` and
+/// `varchar(100)` are both recognized as `character varying` — and
+/// `timestamp(3) without time zone` as `timestamp without time zone` —
+/// rather than falling through to the catch-all rejection as distinct
+/// strings.
 pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
-    let base = pg_type.split('(').next().unwrap_or(pg_type).trim();
-    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base)
+    let base = base_type_name(pg_type);
+    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base.as_ref())
 }
 
 /// Rejects `def` if either endpoint's join key type isn't

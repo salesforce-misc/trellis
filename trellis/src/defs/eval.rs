@@ -316,6 +316,18 @@ pub enum EvalError {
     /// `Infinity` arriving as data, or arising from `'Infinity' + 1`, are
     /// ordinary values in Postgres and stay ordinary values here.
     FloatOutOfRange { field: String, source: FloatError },
+    /// A `SUM(interval)` fold overflowed one of an `interval`'s three
+    /// independent fields (issue #113), or was handed text that is not a
+    /// canonical `interval_out` rendering.
+    ///
+    /// [`EvalError::IntegerOutOfRange`]'s temporal twin and, like it, not
+    /// merely defense-in-depth for the overflow half: `select '2147483647
+    /// months'::interval + '1 month'::interval` raises `interval out of
+    /// range` on a real server, so a fold that silently wrapped would put
+    /// Trellis and a backfill of the same definition into permanent
+    /// disagreement. Per ADR-0003 it pauses the offending
+    /// `(transform, column)` pair rather than the whole transform.
+    IntervalOutOfRange { field: String },
     /// A calculated field was re-entered while still being resolved on the
     /// current recursion path. The validator (#23) is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
@@ -388,6 +400,7 @@ impl EvalError {
             | EvalError::InvalidBoolean { field, .. }
             | EvalError::IntegerOutOfRange { field, .. }
             | EvalError::FloatOutOfRange { field, .. }
+            | EvalError::IntervalOutOfRange { field }
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
             | EvalError::AggregateRequiredForToMany { field, .. } => field,
@@ -422,6 +435,9 @@ impl fmt::Display for EvalError {
             EvalError::FloatOutOfRange { field, source } => {
                 write!(f, "calculated field '{field}': {source}")
             }
+            EvalError::IntervalOutOfRange { field } => {
+                write!(f, "calculated field '{field}': interval out of range")
+            }
             EvalError::Cycle(field) => write!(
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
@@ -454,6 +470,7 @@ impl std::error::Error for EvalError {
             EvalError::FloatOutOfRange { source, .. } => Some(source),
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
+            | EvalError::IntervalOutOfRange { .. }
             | EvalError::Cycle(_)
             | EvalError::UnsupportedRelationshipPath { .. }
             | EvalError::UnknownRelationship { .. }
@@ -962,7 +979,8 @@ fn eval_to_many_aggregate(
         match row.get(column) {
             Some(Some(text)) => {
                 let value = parse_value(field_name, value_type, text)?;
-                if value.value_type().is_numeric_family() {
+                // See `fold_aggregate`'s twin of this filter (issue #113).
+                if super::registry::aggregate_result_type(name, value.value_type()).is_some() {
                     values.push(value);
                 }
             }
@@ -1282,8 +1300,13 @@ fn fold_aggregate(
             &mut per_row_in_progress,
             regex_cache,
         )?;
+        // Issue #113 widened this filter past the numeric family: the
+        // aggregate registry, not a hardcoded predicate, decides which
+        // argument types an aggregate accepts, so `MIN(date_col)` and
+        // `SUM(interval_col)` reach the fold while `SUM(date_col)` — which
+        // Postgres has no aggregate for — still cannot.
         if let Some(value) = value
-            && value.value_type().is_numeric_family()
+            && super::registry::aggregate_result_type(name, value.value_type()).is_some()
         {
             values.push(value);
         }
@@ -1354,6 +1377,19 @@ fn reduce_numeric_aggregate(
 ) -> Result<Option<Value>, EvalError> {
     if values.is_empty() {
         return Ok(None);
+    }
+
+    // Issue #113: a temporal group folds on its own terms and returns
+    // early, before any of the numeric machinery below. Unlike the
+    // float/integer arms there is no widest-wins or mixed-shape case to
+    // handle: `COALESCE` cannot mix a `date` with anything else (the
+    // validator's `common_numeric_type` unifies only inside the numeric
+    // family), so a temporal fold's values are all one family or the
+    // caller's filter let something through it shouldn't have.
+    if let Value::Other(pg_type, _) = &values[0]
+        && crate::temporal::is_temporal(*pg_type)
+    {
+        return reduce_temporal_aggregate(name, *pg_type, values, field_name);
     }
 
     // Issue #112: a float anywhere in the group makes the whole fold a
@@ -1525,6 +1561,115 @@ fn reduce_numeric_aggregate(
         _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
     };
     Ok(Some(Value::Numeric(result)))
+}
+
+/// Folds a group of one temporal family's values (issue #113) —
+/// [`reduce_numeric_aggregate`]'s early-return arm for
+/// [`ValueType::Other`](super::ast::ValueType::Other) temporal columns.
+///
+/// Only the two shapes `super::registry::aggregate_result_type` admits
+/// reach here, and they are folded very differently:
+///
+/// * **`MIN`/`MAX`** over `date`/`time`/`timetz`/`timestamp`/`timestamptz`
+///   return one of their inputs *verbatim*, so this never re-renders a
+///   value — it only orders them, through [`crate::temporal::compare`],
+///   which reproduces each family's own comparison operator (including
+///   `timetz`'s surprising GMT-then-zone two-level sort and `timestamptz`'s
+///   zone-normalising one). Keeping the input text untouched is what makes
+///   the result byte-identical to a server-side `min()`/`max()` without
+///   this module owning five output functions.
+///
+///   The tie rule matches Postgres's `date_smaller`-family left fold
+///   (`cmp(arg1, arg2) < 0 ? arg1 : arg2`, so a tie keeps `arg2`, the
+///   incoming value) — the same rule #112's float fold matches. For these
+///   five families it is unobservable, because a tie can only be between
+///   two byte-identical strings; it is matched anyway so the fold is right
+///   by construction rather than by luck. `interval`, whose ties are *not*
+///   byte-identical, never reaches here: it is refused at define time
+///   precisely because that makes Postgres's own answer scan-order
+///   dependent (see [`crate::temporal`]).
+///
+/// * **`SUM(interval)`** is the one temporal fold that computes a new
+///   value, via `interval_pl`'s exact fieldwise addition
+///   ([`crate::temporal::Interval::checked_add`]) and `interval_out`'s
+///   rendering ([`crate::temporal::Interval::render`]). It can raise
+///   [`EvalError::IntervalOutOfRange`], exactly as `select '2147483647
+///   months'::interval + '1 month'::interval` does on a live server.
+///
+///   Postgres's `sum(interval)` has a `NULL` initial condition, so this
+///   seeds from the first value rather than from a zero interval. Unlike
+///   the float case that distinction is invisible in the result (interval
+///   addition has a true identity element), but the empty-group answer is
+///   `NULL` either way and is already handled by the caller.
+fn reduce_temporal_aggregate(
+    name: &str,
+    pg_type: PgType,
+    values: Vec<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
+    // Defense-in-depth, as everywhere else in this module: a value of
+    // another family here would mean a hand-built AST bypassed the
+    // validator's argument check.
+    let texts: Vec<String> = values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::Other(found, text) if found == pg_type => Some(text),
+            _ => None,
+        })
+        .collect();
+    if texts.is_empty() {
+        return Ok(None);
+    }
+
+    match name {
+        "MIN" | "MAX" => {
+            let keep = if name == "MIN" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+            let winner = texts
+                .into_iter()
+                .reduce(|a, b| match crate::temporal::compare(pg_type, &b, &a) {
+                    Some(ordering) if ordering == keep => b,
+                    // A tie keeps the incoming value, matching Postgres's
+                    // left fold. An *unparseable* value keeps the
+                    // accumulator rather than silently winning, which is
+                    // the same "leave it out of the fold" posture the
+                    // caller's filter takes.
+                    Some(_) => a,
+                    None => a,
+                })
+                .expect("checked non-empty above");
+            Ok(Some(Value::Other(pg_type, winner)))
+        }
+        "SUM" => {
+            let mut acc = crate::temporal::Interval::default();
+            for text in &texts {
+                let Some(interval) = crate::temporal::Interval::parse(text) else {
+                    // Same defense-in-depth: text Postgres itself did not
+                    // produce means the engine's invariants are already
+                    // broken, and dropping the row silently would corrupt
+                    // the sum. Reporting it as an out-of-range fold pauses
+                    // the column (ADR-0003) rather than writing a wrong
+                    // total.
+                    return Err(EvalError::IntervalOutOfRange {
+                        field: field_name.to_string(),
+                    });
+                };
+                acc = acc
+                    .checked_add(interval)
+                    .map_err(|_| EvalError::IntervalOutOfRange {
+                        field: field_name.to_string(),
+                    })?;
+            }
+            Ok(Some(Value::Other(pg_type, acc.render())))
+        }
+        // `AVG` over a temporal type is not an aggregate Postgres has, so
+        // `registry::aggregate_result_type` never admits it and the
+        // validator rejects the definition before this point.
+        _ => Ok(None),
+    }
 }
 
 /// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]

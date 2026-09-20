@@ -173,15 +173,48 @@ impl Pool {
 /// `('2024-01-01'::date)::text` renders `01/01/2024`, and nothing is
 /// actually wrong.
 ///
-/// The three pinned here cover what issue #109's typed literals can produce
-/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`) and
+/// The four pinned here cover what issue #109's typed literals can produce
+/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`),
 /// what issue #112's float split added (`real`/`double precision` under
-/// `extra_float_digits`). **Every future type family in epic #123 hits this
-/// same wall and should extend this one constant** rather than pinning a
-/// GUC at its own call site: `timestamptz` needs `TimeZone` and `interval`
-/// needs `IntervalStyle`. Keeping them in a single list is also what lets
-/// the non-pooled connect sites below stay in step with the pooled one —
-/// they each interpolate this same text.
+/// `extra_float_digits`), and what issue #113's temporal families added
+/// (`interval` under `IntervalStyle`). **Every future type family in epic
+/// #123 hits this same wall and should extend this one constant** rather
+/// than pinning a GUC at its own call site. Keeping them in a single list
+/// is also what lets the non-pooled connect sites below stay in step with
+/// the pooled one — they each interpolate this same text.
+///
+/// # `TimeZone` is deliberately *not* here (issue #113)
+///
+/// `timestamptz_out` renders in the session's `TimeZone`, so pinning it to
+/// `'UTC'` looks like the obvious way to give `timestamptz` the same
+/// text-stability `DateStyle` gave `date`/`timestamp`, and would unlock its
+/// key roles. Issue #113 investigated exactly that and declined it, for a
+/// reason that survives "but Trellis owns all its own connections":
+///
+/// **Trellis renders `timestamptz` on two backends and only controls one.**
+/// The CDC half of a value's life is rendered by the type's output function
+/// running in the **walsender**, under the walsender's GUCs — verified live
+/// by peeking one slot from two sessions with different `timezone` settings
+/// and getting two different wall clocks for one instant, on a server whose
+/// own default was a third zone. `pgwire_replication::ReplicationConfig`
+/// (v0.4) offers no way to send startup runtime parameters or to `SET` on
+/// the replication connection, so the walsender keeps the
+/// server/database/role default no matter what this constant says.
+///
+/// Today the two renderers agree by accident — both fall back to that same
+/// server default. Pinning `'UTC'` here alone would trade that accidental
+/// symmetry for a *guaranteed* asymmetry on every server whose default is
+/// not UTC. That is strictly worse, so `timestamptz` keeps its `🎯 typed
+/// index` cells in `docs/type-support.md` and this constant stays at four.
+///
+/// The same asymmetry is latent for the three that *are* pinned, and the
+/// reason it does not bite is worth stating because it is also the rule for
+/// adding a fifth: each pinned value is **output-identical to a stock
+/// server's default** (`ISO` output, `hex`, shortest-round-trip floats,
+/// `postgres` interval style), so the unpinned walsender agrees with the
+/// pinned pool unless an operator has deliberately reconfigured the server.
+/// `TimeZone` has no such stock value to pin to. Pin only GUCs that pass
+/// that test, until the replication transport can be pinned too.
 ///
 /// `extra_float_digits` deserves a word, because `1` is already Postgres
 /// 12+'s default and pinning a default can look like a no-op. It isn't: the
@@ -198,8 +231,16 @@ impl Pool {
 /// text to be in a spelling that parses to the same value under **any**
 /// `DateStyle` (leading-4-digit-year ISO is unambiguous), so a definition
 /// installed against one server stays correct if read on another.
-pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str =
-    "set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; set extra_float_digits to 1";
+/// `IntervalStyle` joins them for issue #113 and is the clearest case of
+/// all: `interval_out` renders the *same* value as `1 year 2 mons 3 days
+/// 04:05:06` under `postgres`, `+1-2 +3 +4:05:06` under `sql_standard`,
+/// `@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs` under `postgres_verbose`
+/// and `P1Y2M3DT4H5M6S` under `iso_8601` (all four read off a live server).
+/// `crate::temporal::Interval::render` reproduces the `postgres` spelling
+/// specifically, which is both Postgres's default and what an interval
+/// `SUM` has to write back.
+pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
+     set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'";
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
