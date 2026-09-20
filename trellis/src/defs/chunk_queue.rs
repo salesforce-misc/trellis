@@ -209,6 +209,9 @@ pub async fn claim_chunks(
     if limit <= 0 {
         return Ok(Vec::new());
     }
+    // The allowlist, derived from the enum rather than spelled into the SQL
+    // (issue #231) — see [`TransformStatus::dispatchable`].
+    let dispatchable = TransformStatus::dispatchable();
     let rows = client
         .query(
             // The `exists` gate is issue #142 / ADR-0014's: the pause is what
@@ -216,21 +219,31 @@ pub async fn claim_chunks(
             // in-flight work lives here rather than in the claim-time fold.
             // So this consults the same `transform_definitions.status` the
             // fold's own `status = 'live'` gate reads, and stops handing out
-            // new chunks for a paused definition. A chunk a worker already
+            // new chunks for a frozen definition. A chunk a worker already
             // holds is deliberately left alone: per the ADR it is released on
             // its own heartbeat/TTL ([`reclaim_stale_chunks`]), never
             // force-cleared out from under a running worker.
             //
+            // `= any($3)` binds an **allowlist** of the statuses a definition
+            // may still be handed work in, not a denylist of the one it may
+            // not (issue #231): this gate used to read `status <> 'paused'`,
+            // which would have silently re-opened dispatch to any
+            // frozen-but-not-`paused` status added later. The allowlist is
+            // computed from [`TransformStatus::ALL`] minus
+            // [`TransformStatus::is_frozen`], the single predicate the
+            // pause/resume/drop preconditions ask too, so a future frozen
+            // state closes this gate by existing.
+            //
             // It sits inside the candidate CTE rather than on the outer
-            // `update` so a paused definition's chunks never enter the
-            // `for update skip locked` window at all — a paused definition
+            // `update` so a frozen definition's chunks never enter the
+            // `for update skip locked` window at all — a frozen definition
             // can't starve its siblings out of the `limit $2` budget.
             "with candidate as ( \
                  select bc.id from backfill_chunks bc \
                  where not bc.done and bc.claimed_by is null \
                    and exists ( \
                        select 1 from transform_definitions d \
-                       where d.id = bc.definition_id and d.status <> 'paused' \
+                       where d.id = bc.definition_id and d.status = any($3) \
                    ) \
                  order by bc.id \
                  for update skip locked \
@@ -241,7 +254,7 @@ pub async fn claim_chunks(
              from candidate \
              where c.id = candidate.id \
              returning c.id, c.definition_id, c.lo, c.hi",
-            &[&claimed_by, &limit],
+            &[&claimed_by, &limit, &dispatchable],
         )
         .await?;
     Ok(rows

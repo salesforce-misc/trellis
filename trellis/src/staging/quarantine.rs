@@ -1333,10 +1333,10 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if !matches!(
-        status,
-        TransformStatus::Quarantined | TransformStatus::Paused
-    ) {
+    // [`TransformStatus::is_frozen`] rather than a local `matches!`: ADR-0014's
+    // frozen state is defined once, so a status folded into it later reaches
+    // every precondition and dispatch gate that asks (issue #231).
+    if !status.is_frozen() {
         return Err(ApplyError::TransformNotPaused {
             transform: target.to_string(),
         });

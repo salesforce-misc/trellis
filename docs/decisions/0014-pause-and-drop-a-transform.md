@@ -70,10 +70,16 @@ to do. Source tables remain user-owned and untouched.
 
 ### Drops go in reverse dependency order — no cascade
 
-If a live definition chains off the target being dropped, the drop is refused and names
+If any definition still chains off the target being dropped, the drop is refused and names
 the definitions that depend on it. Trellis does not cascade the removal, and does not
 leave a dependent silently deriving from a table that is about to disappear. The operator
 retires dependents first. The refusal names them so the order to follow is explicit.
+
+A dependent blocks whatever its status — being registered at all is enough. A dependent
+mid-backfill is reading the target right now; a paused one is worse, because resume
+rebuilds by a fresh backfill from source, so a dependent frozen over a dropped source can
+never be resumed. Only a fully retired dependent stops blocking. Reverse dependency order
+therefore means *dropping* the dependents first, not merely pausing them.
 
 ### In-flight work is quiesced by the pause, never by deleting shared state
 

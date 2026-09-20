@@ -18,7 +18,9 @@
 //! - a drop always takes the target table and its data with it
 //!   (`dropping_takes_the_target_table_and_its_data_with_it`)
 //! - a live dependent refuses the drop and is named
-//!   (`dropping_is_refused_and_names_the_live_dependents`)
+//!   (`dropping_is_refused_and_names_the_live_dependents`), and so does a
+//!   dependent in any other status short of gone — issue #231
+//!   (`dropping_is_refused_by_a_dependent_in_any_status_not_only_live`)
 //! - dropping an absent definition is a success
 //!   (`dropping_an_unregistered_definition_is_a_no_op_success`)
 //! - the target's own `column_*` quarantine bookkeeping goes with it; the
@@ -38,6 +40,11 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+// The one internals reach in this otherwise facade-only suite (ADR-0012's
+// `internals` feature, on for this crate's own test targets): the durable
+// chunk queue's dispatch gate has no facade spelling, and asserting it through
+// a hand-written copy of its own `where` clause is what issue #231 called out.
+use trellis::defs::chunk_queue;
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) with `search_path`
@@ -267,6 +274,16 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         .await
         .expect("pause one of the two siblings");
 
+    // Where the ring stood before any of the pause-window changes reached it
+    // — the baseline the retention assertion below is measured against, so
+    // "nothing is held" can't pass by nothing ever having been staged.
+    //
+    // `segment_pointer.active_seq`, not `max(segments.seg_seq)`: the pointer
+    // is monotonic and survives retirement, while `segments` rows are deleted
+    // by `retire::retire_drained_segments` as they drain, so a `max()` over it
+    // is a racy proxy for "did the ring cycle".
+    let active_seq_before = count(&raw, "select active_seq from segment_pointer").await;
+
     // Changes that arrive while `order_rollup` is paused. Its share of these
     // is drained for `order_echo` and is not recoverable by replay.
     raw.batch_execute(
@@ -290,6 +307,46 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
             )
             .await
                 == expected_total
+        },
+    )
+    .await;
+
+    // Claim 1, mechanism — the half this test used to leave implied. "Never
+    // pins the ring" is a statement about *segment retention*, so assert on
+    // the retention bookkeeping itself: a segment sits in `sealed`/`draining`
+    // until every bucket of it has been applied-and-marked-drained
+    // (`segments.drained_mask`, `V10__drained_mask.sql`), and `seg_claims`
+    // holds a row for every bucket a worker still owns. If a paused
+    // definition's share of the change stream were held open for its eventual
+    // resume — the thing ADR-0014's "Resume rebuilds by backfill, not by
+    // catch-up" section rules out — these segments could never finish
+    // draining, and the ring would fill and wedge for `order_echo` too.
+    // Convergence above shows the sibling got its rows; this shows nothing is
+    // still holding the slots they arrived in.
+    //
+    // All three conditions are *polled together*, deliberately. Asserting the
+    // ring advanced as a one-shot check right after a separate convergence
+    // poll is a race: `order_echo` can be observed at its final value before
+    // the seal/drain bookkeeping behind it has settled, and under parallel
+    // load that ordering flips often enough to make the test flaky. Waiting
+    // for the conjunction — the ring cycled, *and* it is holding nothing —
+    // has no such window, because that is a terminal state: once the last
+    // segment drains, nothing moves it back into `sealed`/`draining` or
+    // re-takes a claim. The anti-vacuity half stays real: if a paused
+    // definition pinned its share, `sealed`/`draining` would never clear and
+    // this would time out rather than pass on an idle ring.
+    poll_until(
+        Duration::from_secs(60),
+        "a paused definition must not hold its share of the ring open",
+        async || {
+            count(&raw, "select active_seq from segment_pointer").await > active_seq_before
+                && count(
+                    &raw,
+                    "select count(*) from segments where state in ('sealed', 'draining')",
+                )
+                .await
+                    == 0
+                && count(&raw, "select count(*) from seg_claims").await == 0
         },
     )
     .await;
@@ -482,6 +539,105 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .await
         .expect("with nothing left deriving from it, the upstream drops cleanly");
 
+    assert_eq!(
+        count(&raw, "select count(*) from transform_definitions").await,
+        0,
+        "both definitions are gone"
+    );
+}
+
+/// Issue #231: the refusal's question is "is anything still registered that
+/// could need this target?", not "is anything *live* on it right now". Every
+/// status other than gone answers yes, and for two different reasons:
+///
+/// - a `waiting_to_backfill`/`backfilling` dependent is building *from* this
+///   target at this moment, so dropping it fails that build mid-flight or
+///   leaves the dependent holding a partial result;
+/// - a `paused`/`quarantined` dependent is worse, not better: ADR-0014's
+///   resume rebuilds by a *fresh backfill from source*, so a dependent frozen
+///   over a source that has been dropped can never be resumed at all. Letting
+///   the drop through would trade a recoverable refusal for an unrecoverable
+///   definition.
+///
+/// The dependent's status is set directly here rather than provoked through a
+/// real backfill or poisoning, because what's under test is which statuses
+/// block a drop, not how a definition comes to be in one.
+#[tokio::test]
+async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 6).await;
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .await
+        .expect("define the upstream");
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_rollup replica identity full"
+    ))
+    .await
+    .expect("a chained aggregate's source needs a full replica identity");
+    trellis
+        .define("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .await
+        .expect("define a transform chained off the first one's target");
+    trellis
+        .pause_transform("order_rollup")
+        .await
+        .expect("pause the target under test");
+
+    for status in [
+        "waiting_to_backfill",
+        "backfilling",
+        "quarantined",
+        "paused",
+    ] {
+        raw.execute(
+            "update transform_definitions set status = $1 \
+             where split_part(target_table, '.', 2) = 'grand_total'",
+            &[&status],
+        )
+        .await
+        .expect("put the dependent in the status under test");
+
+        let err = trellis
+            .drop_transform("order_rollup")
+            .await
+            .expect_err(&format!("a '{status}' dependent still needs this target"));
+        match err {
+            TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+                subject,
+                dependents,
+            }) => {
+                assert_eq!(subject, "order_rollup");
+                assert_eq!(
+                    dependents,
+                    vec!["grand_total".to_string()],
+                    "a '{status}' dependent is named just as a live one is"
+                );
+            }
+            other => {
+                panic!("expected DependentsBlockDrop for a '{status}' dependent, got {other:?}")
+            }
+        }
+        assert!(
+            table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,
+            "the refused drop wrote nothing, even from inside its own transaction"
+        );
+    }
+
+    // Fully retired — the one state that does not block — and the upstream
+    // drops. Reverse dependency order, exactly as before.
+    trellis
+        .drop_transform("grand_total")
+        .await
+        .expect("the dependent is frozen, so it can be dropped");
+    trellis
+        .drop_transform("order_rollup")
+        .await
+        .expect("with the dependent gone rather than merely not-live, the drop proceeds");
     assert_eq!(
         count(&raw, "select count(*) from transform_definitions").await,
         0,
@@ -732,20 +888,44 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         "precondition: the chunk queue was enumerated"
     );
 
+    // The real dispatch path, not a hand-written mirror of its predicate: a
+    // test that re-spells `claim_chunks`' own `where` clause passes no matter
+    // what that clause becomes. Claim for real first, so "zero after the
+    // pause" is a difference this call can actually see — then release, so the
+    // pause is the only reason the next call comes back empty.
+    let before = chunk_queue::claim_chunks(&raw, "issue-231-worker", 100)
+        .await
+        .expect("claim chunks from a backfilling definition");
+    assert!(
+        !before.is_empty(),
+        "precondition: the real dispatch path hands out chunks while the definition is not frozen"
+    );
+    for chunk in &before {
+        chunk_queue::release_chunk(&raw, chunk.id, "issue-231-worker")
+            .await
+            .expect("release the claim taken to prove dispatch was open");
+    }
+
     trellis
         .pause_transform("order_doubles")
         .await
         .expect("a backfilling definition pauses too — that is what stopping a runaway build is");
-    assert_eq!(
+    let after = chunk_queue::claim_chunks(&raw, "issue-231-worker", 100)
+        .await
+        .expect("claiming against a paused definition is a success that yields nothing");
+    assert!(
+        after.is_empty(),
+        "no chunk of a paused definition is claimable: {after:?}"
+    );
+    assert!(
         count(
             &raw,
-            "select count(*) from backfill_chunks c join transform_definitions d \
-             on d.id = c.definition_id \
-             where d.status <> 'paused' and not c.done and c.claimed_by is null"
+            "select count(*) from backfill_chunks where not done and claimed_by is null"
         )
-        .await,
-        0,
-        "no chunk of a paused definition is claimable"
+        .await
+            > 0,
+        "...and the chunks are still there, unclaimed — the pause withheld them, \
+         it did not consume them"
     );
 
     trellis.drop_transform("order_doubles").await.expect("drop");
@@ -986,13 +1166,156 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
             dependents,
         }) => {
             assert_eq!(subject, "order_doubles");
-            assert_eq!(dependents, vec!["report_view".to_string()]);
+            // Both layers standing on this target, named together (issue
+            // #231): the reader, and the relationship it reads through —
+            // which is itself a registered definition naming the target.
+            assert_eq!(
+                dependents,
+                vec!["report_view".to_string(), "reports.rollup".to_string()]
+            );
         }
         other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
     }
     assert!(
         table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_doubles").await,
         "the refused drop wrote nothing"
+    );
+
+    trellis.shutdown().await.expect("shut the pipeline down");
+}
+
+/// Issue #231: a relationship whose **to**-side is the target blocks that
+/// target's drop *on its own*, with no transform reading through it at all.
+///
+/// The previous guard was reader-scoped while the damage is edge-scoped. A
+/// drop deliberately leaves `relationship` edges alone — they belong to the
+/// declaration, and `drop_relationship` reaps them — so a relationship that
+/// outlives its to-side keeps the dropped target's `schema_nodes` row alive
+/// with nothing left to explain it. `all_source_tables` then keeps naming a
+/// table that no longer exists and every later `reconcile_publication`,
+/// including the running client's own periodic one, fails `42P01`: a
+/// fleet-wide intake wedge, reachable with zero readers in the picture.
+///
+/// Retirement order is therefore relationship-then-target, and the refusal
+/// names the relationship in the `from_table.name` spelling
+/// `drop_relationship` takes.
+#[tokio::test]
+async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 9).await;
+    raw.batch_execute(
+        "create table reports (id bigint primary key, oid bigint); \
+         alter table reports replica identity full; \
+         insert into reports (id, oid) values (1, 1), (2, 2), (3, 3);",
+    )
+    .await
+    .expect("seed the relationship's from-side");
+
+    // Same shape as the reader-blocked case above, and for the same reason: a
+    // relationship's join key has to be an integral column, which rules out an
+    // aggregate's `numeric` group key — so the to-side is a chunked 1-1
+    // target, and reaching `live` needs real drain workers.
+    let definer = define_only(db.dsn()).await;
+    definer
+        .define("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
+        .await
+        .expect("define the upstream target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start the live pipeline");
+    poll_until(
+        Duration::from_secs(60),
+        "the chunked 1-1 target must finish its backfill",
+        async || persisted_status(&raw, "order_doubles").await.as_deref() == Some("live"),
+    )
+    .await;
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_doubles replica identity full"
+    ))
+    .await
+    .expect("replica identity");
+
+    // Declared, and then deliberately left unread: nothing anywhere selects
+    // `rollup.<column>`. This is the whole point — the old guard only looked
+    // for readers.
+    trellis
+        .define_relationship("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
+        .await
+        .expect("a relationship whose to-side is a Trellis-owned target table");
+
+    trellis
+        .pause_transform("order_doubles")
+        .await
+        .expect("pause");
+    let err = trellis
+        .drop_transform("order_doubles")
+        .await
+        .expect_err("a relationship still names this target as its to-side");
+    match err {
+        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+        }) => {
+            assert_eq!(subject, "order_doubles");
+            assert_eq!(
+                dependents,
+                vec!["reports.rollup".to_string()],
+                "the relationship itself is the blocker — there is no reader to name"
+            );
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+    assert!(
+        table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_doubles").await,
+        "the refused drop wrote nothing"
+    );
+
+    // Reverse dependency order: retire the relationship, and the target it
+    // pointed at drops cleanly.
+    trellis
+        .drop_relationship("reports", "rollup")
+        .await
+        .expect("nothing reads it, so it drops");
+    trellis
+        .drop_transform("order_doubles")
+        .await
+        .expect("with no relationship left naming it, the target drops");
+
+    assert!(
+        !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_doubles").await,
+        "the target table went with the definition"
+    );
+    // The wedge this refusal exists to prevent, asserted at its mechanism:
+    // `all_source_tables` seeds from `transform_definitions.source_table` and
+    // then walks **`relationship` edges** outward, so what would make it keep
+    // naming the vanished table is a surviving `relationship` edge on the
+    // dropped target's node — not the node itself, which is unreachable by
+    // that walk once no edge and no definition names it.
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select count(*) from schema_edges e \
+                 join schema_nodes n on n.id in (e.from_node_id, e.to_node_id) \
+                 where e.kind = 'relationship' \
+                   and n.table_name = '{DEFAULT_TARGET_SCHEMA}.order_doubles'"
+            )
+        )
+        .await,
+        0,
+        "no relationship edge survives the target it pointed at, so \
+         `all_source_tables` cannot keep naming a dropped table"
     );
 
     trellis.shutdown().await.expect("shut the pipeline down");

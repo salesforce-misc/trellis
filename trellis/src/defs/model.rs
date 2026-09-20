@@ -94,6 +94,56 @@ pub enum TransformStatus {
 }
 
 impl TransformStatus {
+    /// Every variant, once — the list [`Self::dispatchable`] derives the
+    /// chunk queue's positive allowlist from, so that gate can never drift
+    /// out of step with this enum the way a hand-written `status <> 'paused'`
+    /// denylist did (issue #231).
+    ///
+    /// Adding a variant means adding it here as well as to [`Self::as_str`]
+    /// and [`Self::from_persisted`] (both of which the compiler will already
+    /// stop you on) and to `transform_definitions.status`' `check`
+    /// constraint; `every_variant_is_listed_in_all` below is the reminder.
+    pub const ALL: [TransformStatus; 5] = [
+        TransformStatus::WaitingToBackfill,
+        TransformStatus::Backfilling,
+        TransformStatus::Live,
+        TransformStatus::Quarantined,
+        TransformStatus::Paused,
+    ];
+
+    /// ADR-0014's single **frozen** state, both of its triggers — the one
+    /// predicate every pause/resume/drop precondition and every dispatch gate
+    /// in this crate asks, rather than each naming `paused` (or `paused` and
+    /// `quarantined`) for itself.
+    ///
+    /// A frozen definition is not being maintained: the claim-time fold does
+    /// not write to its target, and [`super::chunk_queue::claim_chunks`] does
+    /// not hand out its backfill chunks. Both follow from this one method, so
+    /// a future third frozen state closes both gates by being named here and
+    /// nowhere else.
+    pub fn is_frozen(self) -> bool {
+        matches!(self, TransformStatus::Paused | TransformStatus::Quarantined)
+    }
+
+    /// The persisted words of every status a definition may still be handed
+    /// *new* work in — i.e. every non-[`Self::is_frozen`] variant, derived
+    /// from [`Self::ALL`] rather than spelled out.
+    ///
+    /// Deliberately an allowlist, and deliberately wider than `live`: a
+    /// definition's durable backfill chunks exist precisely while it is
+    /// `waiting_to_backfill`/`backfilling`, so "only dispatch to a live
+    /// definition" would be wrong for the chunk queue. "Dispatch to anything
+    /// that is not frozen" is the real rule, and stating it positively means a
+    /// status added later has to be *chosen* into dispatch instead of falling
+    /// into it (issue #231).
+    pub fn dispatchable() -> Vec<&'static str> {
+        TransformStatus::ALL
+            .iter()
+            .filter(|status| !status.is_frozen())
+            .map(|status| status.as_str())
+            .collect()
+    }
+
     /// The text this variant is persisted/queried as in
     /// `transform_definitions.status`.
     pub fn as_str(self) -> &'static str {
@@ -278,4 +328,58 @@ pub struct SchemaEdge {
     pub from_node_id: i64,
     pub to_node_id: i64,
     pub kind: EdgeKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransformStatus;
+
+    /// [`TransformStatus::ALL`] is hand-maintained, so this is the guard that
+    /// makes forgetting it loud: the `match` has no wildcard, so adding a
+    /// variant fails to compile here until it is named, and the length
+    /// assertion fails if `ALL` grows without this test being revisited.
+    ///
+    /// The pair is a forcing function, not a proof: naming a new variant in
+    /// the `match` arm alone satisfies the compiler, so a variant can still be
+    /// left out of `ALL`. That residual is deliberately fail-*closed* —
+    /// [`TransformStatus::dispatchable`] is an allowlist built from `ALL`, so
+    /// a variant missing from `ALL` is simply never handed work, which is the
+    /// safe direction. `dispatchable_is_every_unfrozen_status` below pins the
+    /// resulting word list, so the omission surfaces there rather than
+    /// silently re-opening a gate.
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        for status in TransformStatus::ALL {
+            match status {
+                TransformStatus::WaitingToBackfill
+                | TransformStatus::Backfilling
+                | TransformStatus::Live
+                | TransformStatus::Quarantined
+                | TransformStatus::Paused => {}
+            }
+            assert_eq!(
+                TransformStatus::from_persisted(status.as_str()),
+                Some(status),
+                "every listed variant round-trips through its persisted word"
+            );
+        }
+        assert_eq!(
+            TransformStatus::ALL.len(),
+            5,
+            "bump this alongside `ALL` when a status is added"
+        );
+    }
+
+    /// The chunk queue's allowlist is exactly "not frozen" — asserted against
+    /// the words themselves, since that is what the SQL gate binds.
+    #[test]
+    fn dispatchable_is_every_unfrozen_status() {
+        assert_eq!(
+            TransformStatus::dispatchable(),
+            vec!["waiting_to_backfill", "backfilling", "live"],
+            "a frozen definition is handed no new work; everything else is"
+        );
+        assert!(TransformStatus::Paused.is_frozen());
+        assert!(TransformStatus::Quarantined.is_frozen());
+    }
 }

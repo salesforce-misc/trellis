@@ -38,10 +38,13 @@
 //!    it right now. A chunk a worker holds at drop time is released on its own
 //!    heartbeat/TTL, never force-cleared.
 //!
-//! 3. **It does not cascade.** A live definition chaining off the target
-//!    being dropped refuses the drop and is named in the error
+//! 3. **It does not cascade.** A definition chaining off the target being
+//!    dropped refuses the drop and is named in the error
 //!    ([`CatalogError::DependentsBlockDrop`]); the operator retires
-//!    dependents first, in reverse dependency order.
+//!    dependents first, in reverse dependency order. *Any* registered
+//!    dependent blocks, whatever its status — see `drop_transform`'s doc
+//!    comment for why a frozen or mid-backfill one is no safer to strand than
+//!    a live one (issue #231).
 //!
 //! Both verbs are **idempotent and non-transactional with any host
 //! migration** (ADR-0014, "Pause and drop are idempotent"): they run on
@@ -62,7 +65,7 @@
 
 use tokio_postgres::Transaction;
 
-use super::catalog::{CatalogError, definition_by_target, dependents_of, relationship_by_name};
+use super::catalog::{CatalogError, relationship_by_name};
 use super::model::{EdgeKind, TransformStatus};
 use crate::pool::{Pool, quote_ident};
 
@@ -98,7 +101,7 @@ pub(crate) enum DropOutcome {
 /// `target` is the **bare** transform name, matching every other
 /// operator-facing entry point in this crate
 /// ([`crate::staging::quarantine::resume_transform`],
-/// [`crate::Trellis::status`]) — see [`definition_by_target`]'s doc comment
+/// [`crate::Trellis::status`]) — see [`super::catalog::definition_by_target`]'s doc comment
 /// for why that, not the qualified spelling, is the addressing scheme.
 ///
 /// Idempotent: a definition already [`TransformStatus::Paused`] *or*
@@ -128,13 +131,14 @@ pub(crate) async fn pause_transform(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    let Some((id, status)) = locked_status(&txn, target).await? else {
+    let Some(locked) = locked_definition(&txn, target).await? else {
         return Err(CatalogError::TransformNotFound {
             transform: target.to_string(),
         });
     };
+    let (id, status) = (locked.id, locked.status);
 
-    if is_frozen(status) {
+    if status.is_frozen() {
         // Commit rather than roll back: nothing was written, and committing
         // releases the `for update` lock the same way the mutating arm does.
         txn.commit().await?;
@@ -179,80 +183,68 @@ pub(crate) async fn pause_transform(
 /// dropping it. Because the target table is Trellis-owned, dropping it is
 /// Trellis's to do; the source table is the user's and is untouched.
 ///
-/// **Refuses rather than cascades** when a live definition still chains off
-/// this target ([`CatalogError::DependentsBlockDrop`], naming them). The
-/// dependency check runs before anything is written, and it is deliberately
-/// live-only: a dependent that is itself frozen is not deriving from this
-/// target right now, so it does not block — and the operator retiring a chain
-/// works from the leaves inward, which is exactly reverse dependency order.
+/// **Refuses rather than cascades** when a definition still chains off this
+/// target ([`CatalogError::DependentsBlockDrop`], naming them). *Any*
+/// registered dependent blocks, not only a live one (issue #231): the
+/// refusal's question is "is this definition still registered and could it
+/// still need the target?", and every status other than gone answers yes.
+/// A `backfilling`/`waiting_to_backfill` dependent is building *from* the
+/// target right now, so dropping it out from under the build fails it
+/// mid-flight or leaves it holding garbage; a `paused` or `quarantined` one
+/// is worse, because ADR-0014's resume rebuilds by a fresh backfill from
+/// source — take that source away and the dependent can never be resumed at
+/// all. The operator retires a chain from the leaves inward, which is exactly
+/// reverse dependency order.
+///
+/// "Dependent" covers relationships as well as transforms: a `RELATIONSHIP`
+/// whose **to**-side is this target blocks the drop on its own, with no
+/// transform reading through it, because it is a registered definition naming
+/// the target — and because the surviving `relationship` edge would otherwise
+/// strand the target's `schema_nodes` row (see [`dependency_blockers`] for
+/// what that wedges). `drop_relationship` it first.
+///
+/// **Everything — the status precondition, the dependency refusal, and every
+/// write — happens in one transaction, under the target's own `for update`
+/// row lock** (issue #231). The checks used to run on separate pooled
+/// connections before the transaction opened, leaving a window in which a
+/// concurrent `resume` could unfreeze the row, or a concurrent `define`
+/// register a fresh dependent, after the check and before the commit. A
+/// refusal is still write-free: it returns before any statement mutates
+/// anything, and the transaction is rolled back on the way out.
 ///
 /// Idempotent: an unregistered `target` is [`DropOutcome::Absent`], a
 /// success.
 #[tracing::instrument(name = "lifecycle.drop_transform", skip(pool), fields(transform = %target))]
 pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutcome, CatalogError> {
-    let Some(def) = definition_by_target(pool, target).await? else {
-        tracing::info!(transform = %target, "drop is a no-op; no such definition");
-        return Ok(DropOutcome::Absent);
-    };
-
-    if !is_frozen(def.status) {
-        return Err(CatalogError::TransformNotPaused {
-            transform: target.to_string(),
-            status: def.status,
-        });
-    }
-
-    // Before any write. `dependents_of` is keyed on the qualified node name
-    // (issue #74) and filters to `status = 'live'` internally, which is
-    // precisely ADR-0014's refusal condition — so this is the existing
-    // dependency query, not a new one.
-    let mut blockers: Vec<String> = dependents_of(pool, &def.target_table, EdgeKind::Source)
-        .await?
-        .into_iter()
-        .map(|d| d.def.target)
-        .collect();
-
-    // ADR-0014's "chains off the target" is not only the `FROM <target>`
-    // spelling. A `RELATIONSHIP <name> FROM <t>.<col> TO <target>.<col>`
-    // makes every live transform over `<t>` that reads `<name>.<column>` a
-    // reader of this target's rows — and that path leaves no `source` edge
-    // behind ([`EdgeKind::Join`] has no writer yet), so `dependents_of`
-    // above cannot see it. Left unchecked the drop succeeds and that reader
-    // silently derives from a table that no longer exists; worse, the
-    // `relationship` edge this drop deliberately does *not* remove keeps the
-    // target's `schema_nodes` row alive, so [`super::all_source_tables`]
-    // keeps naming the vanished table and every later
-    // `reconcile_publication` — including the running client's own periodic
-    // one — fails `42P01`, wedging intake fleet-wide.
-    for (from_table, name) in relationships_pointing_at(pool, target).await? {
-        blockers.extend(live_relationship_readers(pool, &from_table, &name).await?);
-    }
-
-    if !blockers.is_empty() {
-        blockers.sort();
-        blockers.dedup();
-        return Err(CatalogError::DependentsBlockDrop {
-            subject: target.to_string(),
-            dependents: blockers,
-        });
-    }
-
-    let qualified = def.target_table.clone();
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // Re-read under `for update` and re-check: the dependency and status
-    // checks above ran outside this transaction, and pause/drop are
-    // explicitly not transactional with a host migration, so a concurrent
-    // resume could have unfrozen the row in between. Losing that race must
-    // not silently drop a live definition.
-    let Some((id, status)) = locked_status(&txn, target).await? else {
+    // Read under `for update` and check *here*, not on a pooled connection
+    // before this transaction opened: pause/drop are explicitly not
+    // transactional with a host migration, so a concurrent resume could
+    // otherwise unfreeze the row between a pre-check and this commit. Losing
+    // that race must not silently drop a live definition.
+    let Some(locked) = locked_definition(&txn, target).await? else {
+        tracing::info!(transform = %target, "drop is a no-op; no such definition");
         return Ok(DropOutcome::Absent);
     };
-    if !is_frozen(status) {
+    let (id, status, qualified) = (locked.id, locked.status, locked.target_table);
+
+    if !status.is_frozen() {
         return Err(CatalogError::TransformNotPaused {
             transform: target.to_string(),
             status,
+        });
+    }
+
+    // Before any write, and inside the same transaction as the writes, so a
+    // `define` that registers a new dependent cannot interleave between the
+    // refusal check and the commit (issue #231).
+    let blockers = dependency_blockers(&txn, target, &qualified, id).await?;
+    if !blockers.is_empty() {
+        return Err(CatalogError::DependentsBlockDrop {
+            subject: target.to_string(),
+            dependents: blockers,
         });
     }
 
@@ -364,9 +356,12 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 /// `<rel>.<column>` head resolves against.
 ///
 /// **Refuses rather than cascades**, exactly like [`drop_transform`]: any
-/// *live* transform whose text still references this relationship blocks the
-/// drop and is named in [`CatalogError::DependentsBlockDrop`]. Dependents are
-/// found by re-parsing each live definition's persisted text and asking
+/// registered transform whose text still references this relationship blocks
+/// the drop and is named in [`CatalogError::DependentsBlockDrop`] — whatever
+/// its status, for the reasons [`drop_transform`]'s own doc comment gives
+/// (issue #231), and checked inside the same transaction as the writes for
+/// the same reason. Dependents are found by re-parsing each definition's
+/// persisted text and asking
 /// [`super::eval::relationship_references`] what it reads — the same
 /// resolution path [`super::catalog::resolve_relationships`] uses to enrich a
 /// field, rather than a second, driftable notion of "uses this relationship".
@@ -401,16 +396,18 @@ pub(crate) async fn drop_relationship(
         return Ok(DropOutcome::Absent);
     };
 
-    let dependents = live_relationship_readers(pool, from_table, name).await?;
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+
+    // Inside the transaction that does the removal, so a `define` of a fresh
+    // reader cannot interleave between the check and the commit (issue #231).
+    let dependents = relationship_readers(&txn, from_table, name, None).await?;
     if !dependents.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
             subject: format!("{from_table}.{name}"),
             dependents,
         });
     }
-
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
 
     let projection: Option<String> = txn
         .query_opt(
@@ -466,6 +463,103 @@ pub(crate) async fn drop_relationship(
     Ok(DropOutcome::Dropped)
 }
 
+/// Every still-registered definition that chains off the bare-named `target`
+/// — ADR-0014's refusal set, gathered on `txn` so [`drop_transform`] can
+/// run it inside the very transaction that does the removal (issue #231).
+///
+/// `qualified_target` is the target's `"schema.table"` identity (the key
+/// `schema_nodes` is on since issue #74); `definition_id` is the target's own
+/// `transform_definitions.id`, excluded from the result so a definition whose
+/// source node and target node happen to be the same row cannot block its own
+/// drop — previously impossible to hit only because the check was live-only
+/// and a drop's subject is always frozen.
+///
+/// Returns blocker names sorted and deduplicated, in the same two spellings
+/// [`CatalogError::DependentsBlockDrop`]'s `subject` uses: a bare transform
+/// name, or `from_table.relationship_name` for a relationship. A definition
+/// reachable both by a `source` edge and through a relationship is one
+/// blocker, named once.
+async fn dependency_blockers(
+    txn: &Transaction<'_>,
+    target: &str,
+    qualified_target: &str,
+    definition_id: i64,
+) -> Result<Vec<String>, CatalogError> {
+    let mut blockers = source_edge_dependents(txn, qualified_target, definition_id).await?;
+
+    // ADR-0014's "chains off the target" is not only the `FROM <target>`
+    // spelling. A `RELATIONSHIP <name> FROM <t>.<col> TO <target>.<col>`
+    // names this target in its own declaration, and there are *two* distinct
+    // dependents hiding behind that one edge.
+    //
+    // 1. **The relationship itself**, whether or not anything reads through
+    //    it. It is a registered definition naming the target, so the same
+    //    rule the rest of this function applies — any dependent still
+    //    defined, in any status, blocks — makes it a blocker in its own
+    //    right. This is not a nicety: the drop deliberately leaves
+    //    `relationship` edges alone (they belong to the declaration, and
+    //    `drop_relationship` reaps them), so a relationship surviving its
+    //    to-side keeps the target's `schema_nodes` row alive with nothing
+    //    left to explain it. [`super::all_source_tables`] then keeps naming
+    //    a table that no longer exists, and every later
+    //    `reconcile_publication` — including the running client's own
+    //    periodic one — fails `42P01`, wedging intake fleet-wide. Refusing
+    //    is what keeps that unreachable; the reader check below never did,
+    //    because the damage is edge-scoped and that check is reader-scoped.
+    //
+    // 2. **Every transform reading `<name>.<column>`**, which is a reader of
+    //    this target's rows by a path that leaves no `source` edge behind
+    //    ([`EdgeKind::Join`] has no writer yet), so `source_edge_dependents`
+    //    above cannot see it. Named in addition to the relationship rather
+    //    than instead of it, so the refusal shows the operator the whole
+    //    subgraph still standing on this target rather than one layer of it
+    //    at a time.
+    for (from_table, name) in relationships_pointing_at(txn, target).await? {
+        blockers.push(format!("{from_table}.{name}"));
+        blockers.extend(relationship_readers(txn, &from_table, &name, Some(target)).await?);
+    }
+
+    blockers.sort();
+    blockers.dedup();
+    Ok(blockers)
+}
+
+/// The bare target names of every definition reached by a `source` edge out
+/// of `qualified_target`'s schema node — i.e. everything defined
+/// `FROM <target>`.
+///
+/// The same graph walk [`super::catalog::dependents_of`] does, deliberately
+/// *without* its `t.status = 'live'` filter (issue #231): that filter is
+/// right for the claim-time fold, which must not write a CDC delta into a
+/// target whose baseline isn't settled, and wrong for a drop, which is asking
+/// the different question of whether anything still *needs* the target. It is
+/// a separate query rather than a parameter on `dependents_of` because the
+/// two want different answers and only this one wants names alone — no
+/// parse, no `source_columns` fan-out.
+async fn source_edge_dependents(
+    txn: &Transaction<'_>,
+    qualified_target: &str,
+    definition_id: i64,
+) -> Result<Vec<String>, CatalogError> {
+    let rows = txn
+        .query(
+            "select split_part(t.target_table, '.', 2) \
+             from schema_nodes from_node \
+             join schema_edges se on se.from_node_id = from_node.id and se.kind = $2 \
+             join schema_nodes to_node on to_node.id = se.to_node_id \
+             join transform_definitions t on t.target_table = to_node.table_name \
+             where from_node.table_name = $1 and t.id <> $3 \
+             order by t.id",
+            &[
+                &qualified_target,
+                &EdgeKind::Source.as_str(),
+                &definition_id,
+            ],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
 /// Every `(from_table, name)` relationship whose **to**-side is the bare
 /// table `target` — the relationships through which a transform over some
 /// other source can be reading `target`'s rows.
@@ -476,11 +570,10 @@ pub(crate) async fn drop_relationship(
 /// declaration's own columns stay as written), so this matches bare — the
 /// same spelling `drop_relationship` addresses them by.
 async fn relationships_pointing_at(
-    pool: &Pool,
+    txn: &Transaction<'_>,
     target: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
-    let client = pool.get().await?;
-    let rows = client
+    let rows = txn
         .query(
             "select from_table, name from relationship_definitions \
              where to_table = $1 order by id",
@@ -490,24 +583,32 @@ async fn relationships_pointing_at(
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
-/// The bare target names of every **live** transform that still reads the
-/// relationship `name` declared on `from_table`.
+/// The bare target names of every registered transform that still reads the
+/// relationship `name` declared on `from_table` — every status, not only
+/// `live` (issue #231: a frozen reader still needs the relationship the day
+/// it resumes, and resuming rebuilds from source).
 ///
 /// Scoped to definitions whose own source *is* `from_table`: a relationship
 /// name is only resolvable from a definition over its from-table (that is
 /// what makes the name per-from-table unique in the first place), so a
 /// same-named relationship on a different from-table is a different
 /// relationship and must not be counted as a dependent here.
-async fn live_relationship_readers(
-    pool: &Pool,
+///
+/// `exclude` drops one bare target name from the result — the definition
+/// being dropped itself, when [`drop_transform`] asks this about a
+/// relationship pointing at its own target. Without it a definition that
+/// reads a relationship whose to-side is its own target would block its own
+/// drop, which the previous live-only filter hid (a drop's subject is always
+/// frozen, so it never matched).
+async fn relationship_readers(
+    txn: &Transaction<'_>,
     from_table: &str,
     name: &str,
+    exclude: Option<&str>,
 ) -> Result<Vec<String>, CatalogError> {
-    let client = pool.get().await?;
-    let rows = client
+    let rows = txn
         .query(
-            "select definition_text from transform_definitions \
-             where status = 'live' order by id",
+            "select definition_text from transform_definitions order by id",
             &[],
         )
         .await?;
@@ -516,7 +617,7 @@ async fn live_relationship_readers(
     for row in rows {
         let text: String = row.get(0);
         let def = super::parse(&text)?;
-        if def.source != from_table {
+        if def.source != from_table || exclude == Some(def.target.as_str()) {
             continue;
         }
         if super::eval::relationship_references(&def)
@@ -529,38 +630,42 @@ async fn live_relationship_readers(
     Ok(readers)
 }
 
-/// ADR-0014's single frozen state, both triggers. The one predicate every
-/// pause/resume/drop precondition in this crate asks.
-fn is_frozen(status: TransformStatus) -> bool {
-    matches!(
-        status,
-        TransformStatus::Paused | TransformStatus::Quarantined
-    )
+/// The row-locked identity of the bare-named `target`: its id, its status,
+/// and its persisted qualified `"schema.table"`.
+///
+/// `for update` + `split_part(target_table, '.', 2)` is the same shape
+/// [`crate::staging::quarantine::resume_transform`] uses, so a pause, a
+/// resume and a drop racing each other on one definition serialize on its row
+/// rather than interleaving. The qualified name comes back from *this* read
+/// rather than an earlier unlocked one so every fact a drop acts on is read
+/// under the lock it holds.
+struct LockedDefinition {
+    id: i64,
+    status: TransformStatus,
+    target_table: String,
 }
 
-/// `(id, status)` for the bare-named `target`, row-locked for the rest of the
-/// transaction — the same `for update` + `split_part(target_table, '.', 2)`
-/// shape [`crate::staging::quarantine::resume_transform`] uses, so a pause, a
-/// resume and a drop racing each other on one definition serialize on its row
-/// rather than interleaving.
-async fn locked_status(
+async fn locked_definition(
     txn: &Transaction<'_>,
     target: &str,
-) -> Result<Option<(i64, TransformStatus)>, CatalogError> {
+) -> Result<Option<LockedDefinition>, CatalogError> {
     let row = txn
         .query_opt(
-            "select id, status from transform_definitions \
+            "select id, status, target_table from transform_definitions \
              where split_part(target_table, '.', 2) = $1 for update",
             &[&target],
         )
         .await?;
     Ok(row.map(|row| {
-        let id: i64 = row.get(0);
         let status_text: String = row.get(1);
         let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
             panic!("transform_definitions.status held unrecognized value '{status_text}'")
         });
-        (id, status)
+        LockedDefinition {
+            id: row.get(0),
+            status,
+            target_table: row.get(2),
+        }
     }))
 }
 
