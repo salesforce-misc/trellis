@@ -173,14 +173,25 @@ impl Pool {
 /// `('2024-01-01'::date)::text` renders `01/01/2024`, and nothing is
 /// actually wrong.
 ///
-/// The two pinned here cover what issue #109's typed literals can produce
-/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`).
-/// **Every future type family in epic #123 hits this same wall and should
-/// extend this one constant** rather than pinning a GUC at its own call
-/// site: `timestamptz` needs `TimeZone`, `interval` needs `IntervalStyle`,
-/// and `real`/`double precision` need `extra_float_digits`. Keeping them in
-/// a single list is also what lets the non-pooled connect sites below stay
-/// in step with the pooled one — they each interpolate this same text.
+/// The three pinned here cover what issue #109's typed literals can produce
+/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`) and
+/// what issue #112's float split added (`real`/`double precision` under
+/// `extra_float_digits`). **Every future type family in epic #123 hits this
+/// same wall and should extend this one constant** rather than pinning a
+/// GUC at its own call site: `timestamptz` needs `TimeZone` and `interval`
+/// needs `IntervalStyle`. Keeping them in a single list is also what lets
+/// the non-pooled connect sites below stay in step with the pooled one —
+/// they each interpolate this same text.
+///
+/// `extra_float_digits` deserves a word, because `1` is already Postgres
+/// 12+'s default and pinning a default can look like a no-op. It isn't: the
+/// GUC is settable per-database and per-role, and the *old* default (`0`,
+/// pre-12) means "round to `FLT_DIG`/`DBL_DIG` significant digits", which
+/// loses information — `0.1::float8 + 0.2::float8` renders as `0.3` under
+/// `0` and `0.30000000000000004` under `1`. A value that renders lossily on
+/// one connection and exactly on another cannot round-trip through the
+/// text-carried staging ring, and [`crate::float::render`] reproduces the
+/// `>= 1` spelling specifically.
 ///
 /// Note these are *output*-side settings. Input is a separate question and
 /// is handled separately: `crate::defs::typed_literal` requires a literal's
@@ -188,7 +199,7 @@ impl Pool {
 /// `DateStyle` (leading-4-digit-year ISO is unambiguous), so a definition
 /// installed against one server stays correct if read on another.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str =
-    "set datestyle to 'ISO, YMD'; set bytea_output to 'hex'";
+    "set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; set extra_float_digits to 1";
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.

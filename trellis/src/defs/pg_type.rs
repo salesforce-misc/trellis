@@ -27,6 +27,7 @@
 use std::fmt;
 
 use super::ast::ValueType;
+use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
@@ -242,15 +243,16 @@ pub fn value_type_for_oid(type_oid: u32) -> ValueType {
     match type_oid {
         oid::BOOL => ValueType::Boolean,
         oid::UUID => ValueType::Uuid,
-        // Issue #111: the exact integer types are no longer collapsed into
-        // the arbitrary-precision `Numeric` bucket alongside
-        // `numeric`/`real`/`double precision`. The two float types still
-        // are — splitting IEEE binary floats out is #112's job, and it has
-        // its own (NaN/±0) design questions this issue doesn't touch.
+        // Issues #111 and #112: the six types that used to share one
+        // `ValueType::Numeric` bucket are now three families. `numeric` —
+        // and only `numeric` — is the arbitrary-precision decimal the
+        // bucket was always named after.
         oid::INT2 => ValueType::Integer(IntWidth::Int2),
         oid::INT4 => ValueType::Integer(IntWidth::Int4),
         oid::INT8 => ValueType::Integer(IntWidth::Int8),
-        oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8 => ValueType::Numeric,
+        oid::FLOAT4 => ValueType::Float(FloatWidth::Float4),
+        oid::FLOAT8 => ValueType::Float(FloatWidth::Float8),
+        oid::NUMERIC => ValueType::Numeric,
         oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME => ValueType::Text,
         oid::OID => ValueType::Other(PgType::Oid),
         oid::BYTEA => ValueType::Other(PgType::Bytea),
@@ -299,7 +301,16 @@ mod tests {
             ValueType::Integer(IntWidth::Int8)
         );
         assert_eq!(value_type_for_oid(oid::NUMERIC), ValueType::Numeric);
-        assert_eq!(value_type_for_oid(oid::FLOAT8), ValueType::Numeric);
+        // Issue #112: `real`/`double precision` are their own family now,
+        // no longer aliases of the arbitrary-precision decimal.
+        assert_eq!(
+            value_type_for_oid(oid::FLOAT4),
+            ValueType::Float(FloatWidth::Float4)
+        );
+        assert_eq!(
+            value_type_for_oid(oid::FLOAT8),
+            ValueType::Float(FloatWidth::Float8)
+        );
         assert_eq!(
             value_type_for_oid(oid::BYTEA),
             ValueType::Other(PgType::Bytea)

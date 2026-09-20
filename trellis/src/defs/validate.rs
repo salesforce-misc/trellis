@@ -109,11 +109,11 @@ pub enum ValidationError {
     /// and the SQL oracle.
     InvalidTypedLiteral {
         field: String,
-        pg_type: super::pg_type::PgType,
+        value_type: ValueType,
         text: String,
         detail: String,
     },
-    /// A hand-built [`super::ast::Expr::TypedLiteral`] names a [`super::pg_type::PgType`]
+    /// A hand-built [`super::ast::Expr::TypedLiteral`] names a [`ValueType`]
     /// outside [`super::typed_literal::TYPED_LITERALS`]'s allowlist. The
     /// parser can't produce one — it only builds the node from that same
     /// table — so this is the validator's defense-in-depth against an AST
@@ -121,7 +121,7 @@ pub enum ValidationError {
     /// [`super::eval::EvalError::Cycle`].
     UnsupportedLiteralType {
         field: String,
-        pg_type: super::pg_type::PgType,
+        value_type: ValueType,
     },
     /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
     /// column that isn't a real source column.
@@ -412,18 +412,18 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::InvalidTypedLiteral {
                 field,
-                pg_type,
+                value_type,
                 text,
                 detail,
             } => write!(
                 f,
-                "calculated field '{field}': {pg_type} literal '{text}' is not in canonical \
+                "calculated field '{field}': {value_type} literal '{text}' is not in canonical \
                  form: {detail}"
             ),
-            ValidationError::UnsupportedLiteralType { field, pg_type } => write!(
+            ValidationError::UnsupportedLiteralType { field, value_type } => write!(
                 f,
-                "calculated field '{field}': '{pg_type}' is not a type a literal can be spelled \
-                 as (see docs/type-support.md)"
+                "calculated field '{field}': '{value_type}' is not a type a literal can be \
+                 spelled as (see docs/type-support.md)"
             ),
             ValidationError::UnresolvedGroupByColumn { column } => write!(
                 f,
@@ -1041,13 +1041,32 @@ fn reject_unsupported_group_by_key_type(
         // distinct under `::text` matching, which is exactly why `numeric`
         // is *rejected* as a relationship join key and as a primary key
         // (#107). Tightening the `GROUP BY` gate to match belongs with the
-        // typed key index (#110) and the float/`numeric` split (#112), not
-        // here — see the note on issue #111.
+        // typed key index (#110), not here — see the note on issue #111.
         ValueType::Integer(_)
         | ValueType::Numeric
         | ValueType::Text
         | ValueType::Boolean
         | ValueType::Uuid => Ok(()),
+        // Issue #112: `real`/`double precision` are rejected outright, and
+        // this is a deliberate *tightening* — before the float split they
+        // reached here as `ValueType::Numeric` and were waved through.
+        //
+        // Postgres's own float `=` is perfectly well-defined as a grouping
+        // predicate (it is a total order: `NaN = NaN` is true, `-0 = 0` is
+        // true), so the problem is not the type — it is that this path
+        // still matches keys by raw `::text`, and float text is not stable
+        // under that equality. `-0` and `0` are one value with two
+        // renderings, so a text-keyed `GROUP BY` would split one Postgres
+        // group into two target rows, and the ADR-0013 self-check would
+        // (correctly) report a divergence against a server-side `GROUP BY`.
+        // Admitting floats here is #110's typed key index to grant, by
+        // comparing decoded values through `crate::float::compare`; until
+        // then, rejecting is the honest answer and `numeric` is the
+        // steer-to. See `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+        ValueType::Float(_) => Err(ValidationError::UnsupportedGroupByKeyType {
+            column: column.to_string(),
+            value_type,
+        }),
         // `oid` is the one `Other` family admitted as a key (issue #111):
         // Postgres renders it as canonical unsigned decimal, so it is
         // text-stable in exactly the way `interval`/`timestamptz`/`bytea`
@@ -1160,7 +1179,7 @@ fn infer_expr(
         // value-level twin of this rule and must agree with it.
         Expr::NumberLiteral(text) => Ok(number_literal_type(text)),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
-        Expr::TypedLiteral { pg_type, text } => {
+        Expr::TypedLiteral { value_type, text } => {
             // Checked here, not in the parser, for the same reason
             // `regexp_count`'s pattern is (see `validate_regexp_pattern`):
             // this runs on every path into the catalog, including a
@@ -1169,19 +1188,19 @@ fn infer_expr(
             // `super::typed_literal` for why the bar is *canonical* form
             // rather than merely "Postgres would parse it".
             let spec = super::typed_literal::lookup_typed_literal(
-                &pg_type.sql_type_name().to_ascii_uppercase(),
+                &super::ddl::pg_type_name(*value_type).to_ascii_uppercase(),
             )
             .ok_or_else(|| ValidationError::UnsupportedLiteralType {
                 field: field_name.to_string(),
-                pg_type: *pg_type,
+                value_type: *value_type,
             })?;
             (spec.canonical)(text).map_err(|detail| ValidationError::InvalidTypedLiteral {
                 field: field_name.to_string(),
-                pg_type: *pg_type,
+                value_type: *value_type,
                 text: text.clone(),
                 detail: detail.to_string(),
             })?;
-            Ok(super::typed_literal::value_type(*pg_type))
+            Ok(spec.value_type)
         }
         Expr::RelationshipPath { rel, column } => {
             // A `<rel>.<column>` enrichment's type is the *to-side* column's
@@ -1332,7 +1351,13 @@ fn infer_expr(
                 // argument list stays an exact match: all four of those take
                 // `Text`, and Postgres would not coerce an integer into one.
                 let admissible = if is_aggregate && *expected == ValueType::Numeric {
-                    arg_t.is_exact_numeric_family()
+                    // Issues #111/#112: a `Numeric`-declared *aggregate*
+                    // argument means "any numeric type", floats included —
+                    // Postgres has a `sum`/`avg`/`min`/`max` for `real` and
+                    // `double precision` just as it does for the exact
+                    // types, and `registry::aggregate_result_type` knows
+                    // what each one returns.
+                    arg_t.is_numeric_family()
                 } else {
                     arg_t == *expected
                 };
@@ -1391,10 +1416,22 @@ fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
     if a == b {
         return Some(a);
     }
-    if !a.is_exact_numeric_family() || !b.is_exact_numeric_family() {
+    if !a.is_numeric_family() || !b.is_numeric_family() {
         return None;
     }
     Some(match (a, b) {
+        // Issue #112. `COALESCE` resolves through Postgres's
+        // `select_common_type`, which is *not* the same algorithm operator
+        // overload resolution uses, and the difference is visible: a live
+        // server types `coalesce(1::real, 1::numeric)` (and
+        // `coalesce(1::numeric, 1::real)`, and both orders of
+        // `real`/`integer`) as **`real`**, while `1::real + 1::numeric` is
+        // `double precision`. So a float wins over every exact type here
+        // without being widened, and only a genuine `double precision`
+        // operand produces `double precision`.
+        (ValueType::Float(x), ValueType::Float(y)) => ValueType::Float(x.wider(y)),
+        (ValueType::Float(x), _) => ValueType::Float(x),
+        (_, ValueType::Float(y)) => ValueType::Float(y),
         (ValueType::Integer(x), ValueType::Integer(y)) => ValueType::Integer(x.wider(y)),
         _ => ValueType::Numeric,
     })

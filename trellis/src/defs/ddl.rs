@@ -75,6 +75,10 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
         // width Postgres would give the same expression, not the `numeric`
         // every integer used to collapse into.
         ValueType::Integer(width) => width.pg_name(),
+        // Issue #112: likewise a derived float column is declared `real` or
+        // `double precision`, the type Postgres gives the same expression —
+        // not the `numeric` both used to collapse into.
+        ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",

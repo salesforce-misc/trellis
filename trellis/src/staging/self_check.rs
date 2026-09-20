@@ -802,7 +802,7 @@ fn render_leaf(expr: &Expr) -> Result<String, String> {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::RelationshipPath { rel, column } => {
             return Err(format!(
                 "references relationship path '{rel}.{column}' — self_check doesn't audit a \

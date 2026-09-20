@@ -13,6 +13,7 @@
 use std::fmt;
 
 use super::pg_type::PgType;
+use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
 /// A parsed transform definition, ready for the validator (issue #23) and
@@ -183,17 +184,24 @@ pub enum Expr {
     /// `'2024-01-01'::date` twice.
     ///
     /// This is the one way a calculated field can *produce* a
-    /// [`ValueType::Other`] value rather than merely pass one through, which
-    /// is what promotes those families from "ingest only" to
-    /// `docs/type-support.md`'s **computed 1-1 target** role.
+    /// [`ValueType::Other`] or [`ValueType::Float`] value rather than merely
+    /// pass one through, which is what promotes those types from "ingest
+    /// only" to `docs/type-support.md`'s **computed 1-1 target** role.
     ///
-    /// `pg_type` is restricted to [`super::typed_literal::TYPED_LITERALS`]'s
-    /// allowlist — not every [`PgType`] the OID registry recognizes — and
-    /// `text` is the literal's *raw source text* (quotes stripped, `''`
-    /// unescaped), required by [`super::validate`] to already be in that
-    /// family's canonical Postgres output spelling. See
+    /// `value_type` is restricted to [`super::typed_literal::TYPED_LITERALS`]'s
+    /// allowlist — not every type the OID registry recognizes — and `text`
+    /// is the literal's *raw source text* (quotes stripped, `''` unescaped),
+    /// required by [`super::validate`] to already be in that type's
+    /// canonical Postgres output spelling. See
     /// [`super::typed_literal::TYPED_LITERALS`] for why both restrictions exist.
-    TypedLiteral { pg_type: PgType, text: String },
+    ///
+    /// Issue #109 typed this field as a [`PgType`], since the allowlist then
+    /// held only passthrough families. Issue #112 widened it to a full
+    /// [`ValueType`] so `REAL '1.5'` / `CAST('1.5' AS double precision)` can
+    /// produce a first-class [`ValueType::Float`] — floats need this grammar
+    /// because Postgres gives them no bare literal syntax at all
+    /// (`pg_typeof(1.5)` is `numeric`).
+    TypedLiteral { value_type: ValueType, text: String },
     /// A `<rel>.<column>` relationship-path reference (issue #25, ADR-0006).
     /// `rel` is the head's **relationship name**, not a table/alias —
     /// resolving whether it's an actually-declared relationship, and its
@@ -255,12 +263,25 @@ pub enum Expr {
 /// `Other(PgType)` shape — rather than becoming three sibling variants, and
 /// why `oid` deliberately stays an `Other(PgType::Oid)` instead of joining
 /// this family.
+///
+/// [`ValueType::Float`] (issue #112) is the second promotion and finishes
+/// the job: `real`/`double precision` were the last two types still sharing
+/// [`ValueType::Numeric`] with `numeric` itself, despite being fixed-width
+/// *binary* floats with their own arithmetic (inexact, non-associative,
+/// overflowing), their own special values (`NaN`/`±Infinity`) and their own
+/// deliberately-non-IEEE comparison order. See [`crate::float`] for the full
+/// rationale, including why `NaN = NaN` is true here and why ±0's text
+/// instability is what keeps floats off the key roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     Numeric,
     /// An exact integer of a known Postgres width. Match `Integer(_)` unless
     /// the width genuinely matters (range/overflow, DDL rendering).
     Integer(IntWidth),
+    /// An IEEE binary float of a known Postgres width. Match `Float(_)`
+    /// unless the width genuinely matters (rounding grid, overflow, DDL
+    /// rendering).
+    Float(FloatWidth),
     Text,
     Boolean,
     Uuid,
@@ -283,6 +304,23 @@ impl ValueType {
     pub fn is_exact_numeric_family(self) -> bool {
         matches!(self, ValueType::Numeric | ValueType::Integer(_))
     }
+
+    /// Whether this is *any* numeric type — [`Self::is_exact_numeric_family`]
+    /// widened with [`ValueType::Float`] (issue #112).
+    ///
+    /// This is the admissibility set for `+`, `>` and the four aggregates,
+    /// because Postgres admits a float operand everywhere it admits an
+    /// exact one. The two predicates are deliberately separate rather than
+    /// one: the *exact* family is the set that is closed under arbitrary
+    /// precision (so `int + numeric` cannot overflow and `sum(int8)` is
+    /// `numeric`), while a float operand pulls the result out of that
+    /// family entirely — `real + numeric` is `double precision`, not
+    /// `numeric`. Anything asking "can these be added" wants this one;
+    /// anything asking "does the arbitrary-precision path apply" wants the
+    /// other.
+    pub fn is_numeric_family(self) -> bool {
+        self.is_exact_numeric_family() || matches!(self, ValueType::Float(_))
+    }
 }
 
 impl fmt::Display for ValueType {
@@ -290,6 +328,7 @@ impl fmt::Display for ValueType {
         match self {
             ValueType::Numeric => write!(f, "numeric"),
             ValueType::Integer(width) => write!(f, "{width}"),
+            ValueType::Float(width) => write!(f, "{width}"),
             ValueType::Text => write!(f, "text"),
             ValueType::Boolean => write!(f, "boolean"),
             ValueType::Uuid => write!(f, "uuid"),

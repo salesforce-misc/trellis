@@ -101,6 +101,7 @@
 
 use super::ast::ValueType;
 use super::pg_type::PgType;
+use crate::float::{self, FloatWidth};
 
 /// One type keyword the typed-literal grammar accepts, and the check its
 /// literal text must pass.
@@ -111,14 +112,25 @@ pub struct TypedLiteralSpec {
     /// [`super::parser`] against an already-uppercased identifier, so
     /// `date '...'`, `Date '...'` and `DATE '...'` are all the same.
     ///
-    /// Always equal to the uppercase of [`PgType::sql_type_name`], so the
-    /// spelling a user writes is the spelling the oracle renders back — the
-    /// `type_keyword_matches_pg_type` test pins that.
+    /// Always equal to the uppercase of [`super::ddl::pg_type_name`] for
+    /// [`Self::value_type`], so the spelling a user writes is the spelling
+    /// the oracle renders back — the `type_keyword_matches_value_type` test
+    /// pins that. `DOUBLE PRECISION` is the one two-word keyword; see
+    /// [`super::parser`], which rejoins the pair before looking it up.
     pub keyword: &'static str,
-    /// The family this literal produces, which becomes the field's
-    /// [`ValueType::Other`] and hence its target column's Postgres type
+    /// The type this literal produces, which becomes the field's inferred
+    /// [`ValueType`] and hence its target column's Postgres type
     /// (`super::ddl::pg_type_name`).
-    pub pg_type: PgType,
+    ///
+    /// Issue #109 declared this a [`PgType`], because every family in the
+    /// allowlist then was a passthrough `ValueType::Other`. Issue #112
+    /// widened it to a full [`ValueType`] — exactly the follow-up this
+    /// module's "which families are in the allowlist" note predicted —
+    /// because `real`/`double precision` are a first-class
+    /// [`ValueType::Float`] *and* have no bare literal syntax of their own
+    /// (`pg_typeof(1.5)` is `numeric`, not `double precision`), so they are
+    /// the first type that both needs this grammar and isn't an `Other`.
+    pub value_type: ValueType,
     /// Checks the literal's text is in this family's canonical Postgres
     /// output spelling, returning a human-readable description of the
     /// expected shape on failure. See this module's doc comment for why the
@@ -168,12 +180,17 @@ pub struct TypedLiteralSpec {
 ///   `integer` and a bare `3000000000` is `bigint`, exactly as
 ///   `pg_typeof(5)` reports, so `INTEGER '5'` would be a second spelling of
 ///   something already spellable. A `smallint` constant is the one gap — it
-///   has no bare spelling in Postgres either — and closing it would mean
-///   widening [`super::ast::Expr::TypedLiteral`] from a [`PgType`] to a
-///   full [`ValueType`]; that is noted as a follow-up on #111 rather than
-///   done here.
+///   has no bare spelling in Postgres either. Issue #112 did the widening
+///   that gap was waiting on ([`TypedLiteralSpec::value_type`] is a full
+///   [`ValueType`] now), so closing it is a one-row change plus a canonical
+///   checker; it is left to a #111 follow-up rather than smuggled in here.
 ///
-/// `oid` (#111) *is* in the allowlist below.
+/// `oid` (#111) and `real`/`double precision` (#112) *are* in the allowlist
+/// below. The floats are there out of necessity rather than convenience:
+/// unlike the integers, a float constant has **no** bare spelling in
+/// Postgres at all — `select pg_typeof(1.5)` is `numeric` and
+/// `pg_typeof(1.5e0)` is `numeric` too, so without these two rows a
+/// calculated field could not produce a float constant by any syntax.
 /// * **`money`, `json`, `xml`, `tsvector`, `tsquery`** — excluded from the
 ///   whole epic by `docs/type-support.md` (locale-dependent text I/O, or no
 ///   useful immutable equality), so they can never earn a row here.
@@ -182,17 +199,17 @@ pub struct TypedLiteralSpec {
 pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
     TypedLiteralSpec {
         keyword: "DATE",
-        pg_type: PgType::Date,
+        value_type: ValueType::Other(PgType::Date),
         canonical: canonical_date,
     },
     TypedLiteralSpec {
         keyword: "TIMESTAMP",
-        pg_type: PgType::Timestamp,
+        value_type: ValueType::Other(PgType::Timestamp),
         canonical: canonical_timestamp,
     },
     TypedLiteralSpec {
         keyword: "BYTEA",
-        pg_type: PgType::Bytea,
+        value_type: ValueType::Other(PgType::Bytea),
         canonical: canonical_bytea,
     },
     // Issue #111. `oid` clears both bars this module sets easily: `oidin`
@@ -201,8 +218,23 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
     // which needs no normalizer to check.
     TypedLiteralSpec {
         keyword: "OID",
-        pg_type: PgType::Oid,
+        value_type: ValueType::Other(PgType::Oid),
         canonical: canonical_oid,
+    },
+    // Issue #112. `float4in`/`float8in` and `float4out`/`float8out` are all
+    // `IMMUTABLE` (checked against `pg_proc.provolatile`), and the canonical
+    // form is whatever `float4out`/`float8out` emits — which
+    // `crate::float::render` reproduces exactly, so the checkers below are
+    // simply `crate::float::parse`, the round-trip test itself.
+    TypedLiteralSpec {
+        keyword: "REAL",
+        value_type: ValueType::Float(FloatWidth::Float4),
+        canonical: canonical_float4,
+    },
+    TypedLiteralSpec {
+        keyword: "DOUBLE PRECISION",
+        value_type: ValueType::Float(FloatWidth::Float8),
+        canonical: canonical_float8,
     },
 ];
 
@@ -211,15 +243,6 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
 /// [`super::registry::lookup_function`].
 pub fn lookup_typed_literal(keyword: &str) -> Option<&'static TypedLiteralSpec> {
     TYPED_LITERALS.iter().find(|spec| spec.keyword == keyword)
-}
-
-/// The [`ValueType`] a typed literal of `pg_type` carries. Always
-/// [`ValueType::Other`] today: the allowlist holds only families that have
-/// no first-class [`ValueType`] variant, which is the whole point — a family
-/// that *does* have one (`Numeric`, `Text`, ...) already has literal syntax
-/// of its own and needs nothing here.
-pub fn value_type(pg_type: PgType) -> ValueType {
-    ValueType::Other(pg_type)
 }
 
 /// Renders a typed literal back to Postgres SQL, for every renderer that
@@ -241,12 +264,34 @@ pub fn value_type(pg_type: PgType) -> ValueType {
 /// need no escaping: `standard_conforming_strings` has been `on` by default
 /// since Postgres 9.1, so `'\x0102'` is six literal characters — which is
 /// exactly what a canonical `bytea` literal has to be.
-pub fn render_sql(pg_type: PgType, text: &str) -> String {
+pub fn render_sql(value_type: ValueType, text: &str) -> String {
     format!(
         "'{}'::{}",
         text.replace('\'', "''"),
-        pg_type.sql_type_name()
+        super::ddl::pg_type_name(value_type)
     )
+}
+
+/// `real`'s canonical `float4out` rendering. Delegates to
+/// [`crate::float::parse`], whose contract *is* "accepts exactly what
+/// [`crate::float::render`] emits" — so there is one definition of canonical
+/// float text in this crate rather than a parser here and a renderer there.
+fn canonical_float4(text: &str) -> Result<(), &'static str> {
+    canonical_float(text, FloatWidth::Float4)
+}
+
+/// `double precision`'s canonical `float8out` rendering — see
+/// [`canonical_float4`].
+fn canonical_float8(text: &str) -> Result<(), &'static str> {
+    canonical_float(text, FloatWidth::Float8)
+}
+
+fn canonical_float(text: &str, width: FloatWidth) -> Result<(), &'static str> {
+    const SHAPE: &str = "a value in the shortest round-tripping decimal form \
+         `float4out`/`float8out` emits for this width (no `+` sign, no \
+         trailing zeros, no `E`, exponent written as e.g. `1e+30`), or one \
+         of `NaN`, `Infinity`, `-Infinity`";
+    float::parse(text, width).map(|_| ()).map_err(|_| SHAPE)
 }
 
 /// Plain unsigned decimal in `0 ..= 4294967295`, the spelling `oid_out`
@@ -423,26 +468,34 @@ mod tests {
     use super::*;
 
     /// Every allowlisted keyword must be the uppercase of the Postgres type
-    /// keyword the oracle renders back (`PgType::sql_type_name`), or a
+    /// keyword the oracle renders back (`ddl::pg_type_name`), or a
     /// definition would parse under one spelling and render under another.
     #[test]
-    fn type_keyword_matches_pg_type() {
+    fn type_keyword_matches_value_type() {
         for spec in TYPED_LITERALS {
             assert_eq!(
                 spec.keyword,
-                spec.pg_type.sql_type_name().to_ascii_uppercase(),
+                super::super::ddl::pg_type_name(spec.value_type).to_ascii_uppercase(),
                 "{} must be spelled as its own pg type keyword",
                 spec.keyword
             );
         }
     }
 
-    /// The allowlist may only hold families with no first-class
-    /// [`ValueType`] variant — see [`value_type`].
+    /// The allowlist may only hold types that genuinely have no bare
+    /// literal syntax of their own in this grammar — every passthrough
+    /// [`ValueType::Other`] family (issue #109) plus the two floats (issue
+    /// #112, whose bare spelling `1.5` is `numeric` in Postgres). A type
+    /// with a bare spelling (`Numeric`, `Text`, `Integer`) must never gain a
+    /// row, or one constant would have two syntaxes.
     #[test]
-    fn every_allowlisted_family_is_an_other_value_type() {
+    fn every_allowlisted_type_lacks_a_bare_literal_syntax() {
         for spec in TYPED_LITERALS {
-            assert_eq!(value_type(spec.pg_type), ValueType::Other(spec.pg_type));
+            assert!(
+                matches!(spec.value_type, ValueType::Other(_) | ValueType::Float(_)),
+                "{} has a bare literal syntax and must not be allowlisted",
+                spec.keyword
+            );
         }
     }
 
@@ -459,7 +512,9 @@ mod tests {
             PgType::Unrecognized,
         ] {
             assert!(
-                !TYPED_LITERALS.iter().any(|spec| spec.pg_type == excluded),
+                !TYPED_LITERALS
+                    .iter()
+                    .any(|spec| spec.value_type == ValueType::Other(excluded)),
                 "{excluded} is excluded by docs/type-support.md and must not be spellable"
             );
         }
@@ -468,8 +523,8 @@ mod tests {
     #[test]
     fn lookup_is_by_canonical_uppercase_keyword() {
         assert_eq!(
-            lookup_typed_literal("DATE").map(|spec| spec.pg_type),
-            Some(PgType::Date)
+            lookup_typed_literal("DATE").map(|spec| spec.value_type),
+            Some(ValueType::Other(PgType::Date))
         );
         assert!(lookup_typed_literal("date").is_none());
         assert!(lookup_typed_literal("TIMESTAMPTZ").is_none());

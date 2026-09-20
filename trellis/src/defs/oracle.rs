@@ -428,7 +428,7 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::RelationshipPath { rel, column } => panic!(
             "render_expr_sql called on an unresolved relationship path '{rel}.{column}' \
              — the validator (#23) should have rejected this before reaching the oracle \
@@ -483,7 +483,7 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
         Expr::Column(name) => format!("{source_sql}.{}", quote_ident(name)),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::RelationshipPath { rel, column } => {
             format!("{}.{}", quote_ident(rel), quote_ident(column))
         }
@@ -784,7 +784,7 @@ pub(crate) fn render_rel_expr_sql(
         Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         // A to-one enrichment reads the referenced column off the to-side table
         // the LEFT JOIN brought in, aliased by the relationship name.
         Expr::RelationshipPath { rel, column } => {

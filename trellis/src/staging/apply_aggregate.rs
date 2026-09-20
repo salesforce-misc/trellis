@@ -265,7 +265,16 @@ pub(super) fn classify_fields(
                 }
             }
             Expr::FunctionCall { name, args } if args.len() == 1 => {
-                match invertibility::classify(name, AggregateArg::Column(ValueType::Numeric)) {
+                // Issue #112: the field's own inferred type, not a
+                // hardcoded `Numeric`. A float `SUM`/`AVG` is *not*
+                // invertible (float addition has no exact inverse, and
+                // `NaN`/`Infinity` absorb), so passing `Numeric` here would
+                // put it on the delta path and let it drift from a
+                // server-side `sum()`. `defs::backfill::classify_field`
+                // makes the same call for the same reason, and the two must
+                // agree or a directly-built target and a ring-built one
+                // would differ.
+                match invertibility::classify(name, AggregateArg::Column(value_type)) {
                     Some(v) if v.is_invertible() && name == "SUM" => AggFieldKind::Sum,
                     Some(v) if v.is_invertible() && name == "AVG" => AggFieldKind::Avg,
                     _ => AggFieldKind::RecomputeOnly,

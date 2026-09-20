@@ -339,10 +339,10 @@ fn substitute_field_aliases(
             charge_budget(budget, 1)?;
             Ok(Expr::StringLiteral(text.clone()))
         }
-        Expr::TypedLiteral { pg_type, text } => {
+        Expr::TypedLiteral { value_type, text } => {
             charge_budget(budget, 1)?;
             Ok(Expr::TypedLiteral {
-                pg_type: *pg_type,
+                value_type: *value_type,
                 text: text.clone(),
             })
         }
@@ -772,6 +772,11 @@ fn pk_range_where(pk_ident: &str, pk_cast: &str, lo: &Option<String>) -> String 
 /// `staging::apply_aggregate::AggFieldKind`, kept in lockstep with
 /// `classify_fields` there (both route through [`super::invertibility::classify`]
 /// so a field lands on the same strategy either way).
+///
+/// Issue #112 note: `RecomputeOnly` is no longer reachable only for
+/// `MIN`/`MAX`. A float `SUM`/`AVG` lands here too — float addition has no
+/// exact inverse — which is why [`classify_field`] must be told the field's
+/// type rather than assuming `numeric`.
 enum FieldKind {
     Sum,
     Avg,
@@ -779,7 +784,24 @@ enum FieldKind {
     RecomputeOnly,
 }
 
-fn classify_field(expr: &Expr) -> FieldKind {
+/// Classifies one aggregate field, given the [`ValueType`] the validator
+/// inferred for it.
+///
+/// `value_type` is the field's **result** type, not its argument's, and that
+/// is sufficient — every aggregate in
+/// [`super::registry::AGGREGATE_FUNCTION_SPECS`] maps a float argument to a
+/// float result and an exact argument to an exact one
+/// ([`super::registry::aggregate_result_type`]; pinned by that module's
+/// `aggregate_results_stay_in_their_argument_s_family` test), so the two
+/// agree on the only distinction the invertibility gate draws.
+///
+/// Passing a hardcoded `ValueType::Numeric` here — which this did before
+/// issue #112 — would classify `SUM(<float column>)` as invertible and put
+/// it on the delta path, where float addition's non-associativity and
+/// `NaN`/`Infinity` absorption would silently drift from a server-side
+/// `sum()`. The same hazard #111's review found in the gate itself, one
+/// layer up.
+fn classify_field(expr: &Expr, value_type: ValueType) -> FieldKind {
     match expr {
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             match classify("COUNT", AggregateArg::Count(CountArg::Star)) {
@@ -788,7 +810,7 @@ fn classify_field(expr: &Expr) -> FieldKind {
             }
         }
         Expr::FunctionCall { name, args } if args.len() == 1 => {
-            match classify(name, AggregateArg::Column(ValueType::Numeric)) {
+            match classify(name, AggregateArg::Column(value_type)) {
                 Some(v) if v.is_invertible() && name == "SUM" => FieldKind::Sum,
                 Some(v) if v.is_invertible() && name == "AVG" => FieldKind::Avg,
                 _ => FieldKind::RecomputeOnly,
@@ -967,6 +989,26 @@ async fn backfill_aggregate(
         }
     };
 
+    // Every field's inferred result type, so `classify_field` can tell a
+    // float `SUM` (recompute-only) from an exact one (delta-able) — issue
+    // #112. Inferred here rather than threaded in because this is the same
+    // call `staging::apply_aggregate::classify_fields` makes for the same
+    // purpose, and the two paths must agree.
+    // Inference cannot actually fail here — this path only runs for a
+    // definition `validate` already accepted — so a failure declines the
+    // direct build (`Unsupported`, which the caller falls back to the ring
+    // path for) rather than guessing `numeric` and misclassifying a float
+    // aggregate.
+    let field_types = super::validate::infer_field_types(def, source_columns, &relationships)
+        .map_err(|e| {
+            BackfillError::Unsupported(format!(
+                "cannot infer field types for '{}' in the direct aggregate build: {e}",
+                def.target
+            ))
+        })?;
+    let field_value_type =
+        |name: &str| -> ValueType { field_types.get(name).copied().unwrap_or(ValueType::Numeric) };
+
     let group_idents: Vec<String> = group_by
         .iter()
         .map(|k| quote_ident(k.target_column_name()))
@@ -1004,7 +1046,7 @@ async fn backfill_aggregate(
             return None;
         }
         let expr = &substituted[&f.name];
-        match (classify_field(expr), expr) {
+        match (classify_field(expr, field_value_type(&f.name)), expr) {
             (FieldKind::Sum | FieldKind::Avg, Expr::FunctionCall { args, .. }) => {
                 args.first().map(|arg| (f.name.as_str(), arg))
             }
@@ -1027,7 +1069,7 @@ async fn backfill_aggregate(
         }
         let col = quote_ident(&field.name);
         let expr = &substituted[&field.name];
-        match classify_field(expr) {
+        match classify_field(expr, field_value_type(&field.name)) {
             FieldKind::Sum => {
                 let arg = render_field(agg_arg_expr(expr));
                 insert_cols.push(col);
@@ -1341,8 +1383,8 @@ fn render_rel_field_direct(
         Expr::Column(name) => Some(format!("{}.{}", quote_ident(source), quote_ident(name))),
         Expr::NumberLiteral(text) => Some(format!("{text}::numeric")),
         Expr::StringLiteral(text) => Some(format!("'{}'::text", text.replace('\'', "''"))),
-        Expr::TypedLiteral { pg_type, text } => {
-            Some(super::typed_literal::render_sql(*pg_type, text))
+        Expr::TypedLiteral { value_type, text } => {
+            Some(super::typed_literal::render_sql(*value_type, text))
         }
         Expr::RelationshipPath { .. } => None,
         Expr::BinaryOp { op, lhs, rhs } => {

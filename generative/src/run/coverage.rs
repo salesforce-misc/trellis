@@ -308,6 +308,7 @@ fn value_type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
         ValueType::Integer(width) => width.pg_name(),
+        ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",

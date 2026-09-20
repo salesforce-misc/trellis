@@ -199,17 +199,16 @@ fn the_typed_literal_and_cast_spellings_parse_to_one_ast() {
     .expect("CAST spelling parses");
 
     assert_eq!(typed, cast);
-    for ((field, (_, _, text, _)), expected_type) in
-        typed
-            .fields
-            .iter()
-            .zip(CASES)
-            .zip([PgType::Date, PgType::Timestamp, PgType::Bytea])
+    for ((field, (_, _, text, _)), expected_type) in typed
+        .fields
+        .iter()
+        .zip(CASES)
+        .zip([PgType::Date, PgType::Timestamp, PgType::Bytea].map(ValueType::Other))
     {
         assert_eq!(
             field.expr,
             Expr::TypedLiteral {
-                pg_type: expected_type,
+                value_type: expected_type,
                 text: text.to_string(),
             }
         );
@@ -240,7 +239,7 @@ fn type_keywords_are_case_insensitive_and_do_not_shadow_a_column_named_date() {
     assert_eq!(
         def.fields[1].expr,
         Expr::TypedLiteral {
-            pg_type: PgType::Date,
+            value_type: ValueType::Other(PgType::Date),
             text: "2024-01-01".to_string(),
         }
     );

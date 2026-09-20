@@ -40,6 +40,8 @@ pub(super) fn pg_type_name(value_type: ValueType) -> &'static str {
         // Issue #111: an exact integer renders as its own Postgres width,
         // mirroring `defs::ddl::pg_type_name`.
         ValueType::Integer(width) => width.pg_name(),
+        // Issue #112: likewise `real`/`double precision`.
+        ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
@@ -96,9 +98,9 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         // same node, so either would round-trip; the typed-literal form is
         // the shorter one and keeps the generated definition text closer to
         // how the docs spell it.
-        Expr::TypedLiteral { pg_type, text } => format!(
+        Expr::TypedLiteral { value_type, text } => format!(
             "{} '{}'",
-            pg_type.sql_type_name().to_ascii_uppercase(),
+            pg_type_name(*value_type).to_ascii_uppercase(),
             text.replace('\'', "''")
         ),
         Expr::BinaryOp { op, lhs, rhs } => {

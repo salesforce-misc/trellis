@@ -28,6 +28,7 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
         .map(|t| match t {
             ValueType::Numeric => "numeric",
             ValueType::Integer(width) => width.pg_name(),
+            ValueType::Float(width) => width.pg_name(),
             ValueType::Text => "text",
             ValueType::Boolean => "boolean",
             ValueType::Uuid => "uuid",

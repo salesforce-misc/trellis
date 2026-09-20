@@ -25,6 +25,7 @@ use std::fmt;
 
 use regex::Regex;
 
+use crate::float::{self, FloatError, FloatWidth};
 use crate::integer::{self, IntWidth, IntegerError};
 use crate::numeric::{Numeric, NumericParseError};
 
@@ -183,14 +184,49 @@ impl RelationshipContext {
 /// operation could reproduce Postgres's `22003` without it. It holds a real
 /// `i64` — not text, and not a [`Numeric`] — so arithmetic on it is checked
 /// rather than arbitrary-precision.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// [`Value::Float`] (issue #112) is the same shape for the binary floats,
+/// holding a real `f64` (narrowed onto `real`'s grid when its width says so
+/// — see [`FloatWidth::round`]) rather than a decimal. It is why this enum
+/// hand-writes [`PartialEq`] instead of deriving it: `f64`'s `==` is IEEE's,
+/// and Postgres's float equality deliberately is not (`NaN = NaN` is true,
+/// `-0 = 0` is true). See [`crate::float`].
+#[derive(Debug, Clone)]
 pub enum Value {
     Numeric(Numeric),
     Integer(IntWidth, i64),
+    Float(FloatWidth, f64),
     Text(String),
     Boolean(bool),
     Uuid(String),
     Other(PgType, String),
+}
+
+/// Postgres's equality, not Rust's derived one. The only variant that
+/// differs is [`Value::Float`], and it differs in both directions: two
+/// `NaN`s are **equal** (IEEE says they aren't) and `-0.0` equals `0.0`
+/// (IEEE agrees, but a derived `PartialEq` on the `f64` would too, so only
+/// the `NaN` half is a real change).
+///
+/// This matters beyond tests. Every "did this value change?" comparison in
+/// the engine runs through here; under IEEE semantics a `NaN`-valued field
+/// would compare unequal to itself forever, so a converged target row would
+/// look perpetually dirty. Routing through [`crate::float::equal`] — the
+/// same function `>` and the aggregate folds use — keeps one definition of
+/// float equality in the crate.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Numeric(a), Value::Numeric(b)) => a == b,
+            (Value::Integer(aw, a), Value::Integer(bw, b)) => aw == bw && a == b,
+            (Value::Float(aw, a), Value::Float(bw, b)) => aw == bw && float::equal(*a, *b),
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Other(at, a), Value::Other(bt, b)) => at == bt && a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -202,6 +238,7 @@ impl Value {
         match self {
             Value::Numeric(_) => ValueType::Numeric,
             Value::Integer(width, _) => ValueType::Integer(*width),
+            Value::Float(width, _) => ValueType::Float(*width),
             Value::Text(_) => ValueType::Text,
             Value::Boolean(_) => ValueType::Boolean,
             Value::Uuid(_) => ValueType::Uuid,
@@ -221,6 +258,13 @@ impl fmt::Display for Value {
             // join/primary-key/`GROUP BY` paths byte-for-byte — see
             // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
             Value::Integer(_, n) => write!(f, "{n}"),
+            // Issue #112: `crate::float::render` reproduces `float4out`/
+            // `float8out` under `extra_float_digits >= 1` exactly, so a
+            // float value's text here is byte-identical to what Postgres
+            // would have written for the same value — which is what lets it
+            // survive the round-trip through the text-carried staging ring
+            // and back through a `::real`/`::double precision` cast.
+            Value::Float(width, n) => f.write_str(&float::render(*n, *width)),
             Value::Text(s) => write!(f, "{s}"),
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Uuid(u) => write!(f, "{u}"),
@@ -260,6 +304,18 @@ pub enum EvalError {
     /// definition overflows for this data and needs a human, while every
     /// other column on the same target keeps flowing.
     IntegerOutOfRange { field: String, source: IntegerError },
+    /// A binary-float (`real`/`double precision`) operation overflowed its
+    /// width's finite range, or a column's text didn't decode as a
+    /// canonical value of its declared width (issue #112).
+    ///
+    /// [`EvalError::IntegerOutOfRange`]'s float twin, and not
+    /// defense-in-depth for the same reason: `select 3.4e38::float4 +
+    /// 3.4e38::float4` raises `22003 value out of range: overflow` on a real
+    /// server, so Trellis must raise there too rather than quietly returning
+    /// `Infinity`. Note what is deliberately *not* here: `NaN` and
+    /// `Infinity` arriving as data, or arising from `'Infinity' + 1`, are
+    /// ordinary values in Postgres and stay ordinary values here.
+    FloatOutOfRange { field: String, source: FloatError },
     /// A calculated field was re-entered while still being resolved on the
     /// current recursion path. The validator (#23) is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
@@ -304,8 +360,9 @@ impl EvalError {
     /// type's own doc comment) — reaching one of those means something
     /// upstream didn't hold, not that the caller supplied bad input.
     ///
-    /// `IntegerOutOfRange` (issue #111) is data-dependent rather than an
-    /// engine-invariant breach, but it still reports [`ErrorCode::Internal`],
+    /// `IntegerOutOfRange` (issue #111) and `FloatOutOfRange` (issue #112)
+    /// are data-dependent rather than engine-invariant breaches, but still
+    /// report [`ErrorCode::Internal`],
     /// which ADR-0008 decision 3 designates as the catch-all "anything
     /// else". Minting a new [`ErrorCode`] variant for it would be a breaking
     /// change to a public, deliberately coarse enum, for a condition a
@@ -330,6 +387,7 @@ impl EvalError {
             | EvalError::InvalidNumber { field, .. }
             | EvalError::InvalidBoolean { field, .. }
             | EvalError::IntegerOutOfRange { field, .. }
+            | EvalError::FloatOutOfRange { field, .. }
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
             | EvalError::AggregateRequiredForToMany { field, .. } => field,
@@ -361,6 +419,9 @@ impl fmt::Display for EvalError {
             EvalError::IntegerOutOfRange { field, source } => {
                 write!(f, "calculated field '{field}': {source}")
             }
+            EvalError::FloatOutOfRange { field, source } => {
+                write!(f, "calculated field '{field}': {source}")
+            }
             EvalError::Cycle(field) => write!(
                 f,
                 "calculated field '{field}' is part of a cyclic reference"
@@ -390,6 +451,7 @@ impl std::error::Error for EvalError {
         match self {
             EvalError::InvalidNumber { source, .. } => Some(source),
             EvalError::IntegerOutOfRange { source, .. } => Some(source),
+            EvalError::FloatOutOfRange { source, .. } => Some(source),
             EvalError::MissingColumn { .. }
             | EvalError::InvalidBoolean { .. }
             | EvalError::Cycle(_)
@@ -681,7 +743,9 @@ fn eval_expr(
         // `Value::Other` does for a CDC-decoded column. That is only sound
         // because `validate` has already required the text to be in the
         // family's canonical Postgres spelling — see `super::typed_literal`.
-        Expr::TypedLiteral { pg_type, text } => Ok(Some(Value::Other(*pg_type, text.clone()))),
+        Expr::TypedLiteral { value_type, text } => {
+            typed_literal_value(*value_type, text, field_name).map(Some)
+        }
         Expr::RelationshipPath { rel, column } => {
             // To-one resolution (issue #28): find the relationship, read the
             // from-row's join key, look up the single to-side row by that key,
@@ -1056,7 +1120,9 @@ fn eval_aggregate_expr(
         // `Value::Other` does for a CDC-decoded column. That is only sound
         // because `validate` has already required the text to be in the
         // family's canonical Postgres spelling — see `super::typed_literal`.
-        Expr::TypedLiteral { pg_type, text } => Ok(Some(Value::Other(*pg_type, text.clone()))),
+        Expr::TypedLiteral { value_type, text } => {
+            typed_literal_value(*value_type, text, field_name).map(Some)
+        }
         Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
             field: field_name.to_string(),
             rel: rel.clone(),
@@ -1256,6 +1322,31 @@ fn fold_aggregate(
 ///   `numeric`. Both keep going through [`Numeric`], unchanged from before,
 ///   which is what keeps `staging::apply_aggregate`'s `numeric`-partial
 ///   delta model exactly as correct for them as it already was.
+///
+/// # Float arguments (issue #112)
+///
+/// Checked first, and they dominate: if *any* value in the group is a
+/// [`Value::Float`], the whole fold runs in binary floating point, because
+/// that is what Postgres's own aggregate would have done (a mixed group can
+/// only arise through `COALESCE`, whose result Postgres types as the float
+/// — `coalesce(1::real, 1::numeric)` is `real`). Per
+/// [`super::registry::aggregate_result_type`]:
+///
+/// * `SUM`/`MIN`/`MAX` keep the argument's width; `AVG` is always `double
+///   precision`, even over a `real` column.
+/// * `MIN`/`MAX` order by [`crate::float::compare`], so `max` over a group
+///   containing `NaN` is `NaN` and `min` over `{NaN, 1}` is `1` — matching
+///   `select max(v), min(v) from (values ('NaN'::float8),(1::float8)) t(v)`
+///   on a live server, which is `NaN` and `1`.
+/// * `SUM` can raise [`EvalError::FloatOutOfRange`] (Postgres's
+///   `float8pl` overflow check applies to the aggregate's running sum too),
+///   but never for a `NaN`/`Infinity` input — those propagate as values.
+///
+/// Note what this fold does *not* claim: that it agrees digit-for-digit
+/// with a server-side `sum()` over the same rows in a different order. It
+/// cannot — float addition isn't associative — which is precisely why
+/// `super::invertibility` routes float `SUM`/`AVG` to the recompute path
+/// rather than the delta path.
 fn reduce_numeric_aggregate(
     name: &str,
     values: Vec<Value>,
@@ -1263,6 +1354,57 @@ fn reduce_numeric_aggregate(
 ) -> Result<Option<Value>, EvalError> {
     if values.is_empty() {
         return Ok(None);
+    }
+
+    // Issue #112: a float anywhere in the group makes the whole fold a
+    // float fold, at the widest float width present — the same
+    // widest-wins reasoning as the integer fold below, and the same
+    // `COALESCE`-mixed-shapes hazard it exists for.
+    let float_width = values
+        .iter()
+        .fold(None, |acc: Option<FloatWidth>, v| match v {
+            Value::Float(width, _) => Some(match acc {
+                Some(seen) => seen.wider(*width),
+                None => *width,
+            }),
+            _ => acc,
+        });
+    if let Some(width) = float_width {
+        let floats: Vec<f64> = values.iter().cloned().filter_map(as_float).collect();
+        if floats.is_empty() {
+            return Ok(None);
+        }
+        let reduce = |ord: std::cmp::Ordering| {
+            floats
+                .iter()
+                .copied()
+                .reduce(|a, b| if float::compare(b, a) == ord { b } else { a })
+                .expect("checked non-empty above")
+        };
+        return Ok(Some(match name {
+            "MIN" => Value::Float(width, reduce(std::cmp::Ordering::Less)),
+            "MAX" => Value::Float(width, reduce(std::cmp::Ordering::Greater)),
+            "SUM" => {
+                let mut acc = 0.0f64;
+                for n in floats {
+                    let (next, _) = float::checked_add(acc, width, n, width).map_err(|source| {
+                        EvalError::FloatOutOfRange {
+                            field: field_name.to_string(),
+                            source,
+                        }
+                    })?;
+                    acc = next;
+                }
+                Value::Float(width, acc)
+            }
+            // `avg(real)` is `double precision` in Postgres, not `real`.
+            "AVG" => {
+                let count = floats.len() as f64;
+                let sum: f64 = floats.iter().sum();
+                Value::Float(FloatWidth::Float8, sum / count)
+            }
+            _ => unreachable!("reduce_numeric_aggregate is only called for SUM/MIN/MAX/AVG"),
+        }));
     }
 
     // The integer fold applies only when **every** value is an exact
@@ -1369,7 +1511,7 @@ fn reduce_numeric_aggregate(
 /// `STRICT` (any `NULL` operand yields `NULL`), matched by the same `None`
 /// fallback.
 ///
-/// # Mixed operands (issue #111)
+/// # Mixed operands (issues #111, #112)
 ///
 /// The dispatch mirrors [`super::registry::operator_result_type`] exactly,
 /// because it must: `Integer op Integer` runs Postgres's *bounded* integer
@@ -1380,6 +1522,19 @@ fn reduce_numeric_aggregate(
 /// result type — and therefore about its target column's declared type — or
 /// make Trellis and a server-side backfill of the same expression disagree
 /// about whether it errors at all.
+///
+/// A [`Value::Float`] operand takes priority over both, on either side,
+/// because Postgres has no operator that mixes a float with an exact type:
+/// it casts both operands to `double precision` and runs `float8pl`. So
+/// `Float op anything` is the binary-float path, `Float op Float` is that
+/// path at the wider of the two widths, and only an all-exact pair reaches
+/// the integer/`numeric` arms below.
+///
+/// `>` on floats routes through [`crate::float::compare`], **not** `f64`'s
+/// `PartialOrd` — Postgres's float order is total (`NaN` above everything,
+/// `NaN = NaN`), and `f64::partial_cmp` returns `None` on a `NaN` operand,
+/// which would silently collapse to a `false` predicate instead of the
+/// answer Postgres gives (`'NaN'::float8 > 'Infinity'::float8` is `t`).
 fn apply_operator(
     op: Operator,
     lhs: Option<Value>,
@@ -1391,6 +1546,17 @@ fn apply_operator(
     };
     Ok(match op {
         Operator::Add => match (lhs, rhs) {
+            (Value::Float(aw, a), Value::Float(bw, b)) => {
+                Some(float_add(a, aw, b, bw, field_name)?)
+            }
+            (Value::Float(aw, a), rhs) => match as_float(rhs) {
+                Some(b) => Some(float_add(a, aw, b, FloatWidth::Float8, field_name)?),
+                None => None,
+            },
+            (lhs, Value::Float(bw, b)) => match as_float(lhs) {
+                Some(a) => Some(float_add(a, FloatWidth::Float8, b, bw, field_name)?),
+                None => None,
+            },
             (Value::Integer(aw, a), Value::Integer(bw, b)) => {
                 let (sum, width) = integer::checked_add(a, aw, b, bw).map_err(|source| {
                     EvalError::IntegerOutOfRange {
@@ -1406,6 +1572,13 @@ fn apply_operator(
             },
         },
         Operator::GreaterThan => match (lhs, rhs) {
+            (Value::Float(_, a), Value::Float(_, b)) => Some(Value::Boolean(
+                float::compare(a, b) == std::cmp::Ordering::Greater,
+            )),
+            (Value::Float(_, a), rhs) => as_float(rhs)
+                .map(|b| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
+            (lhs, Value::Float(_, b)) => as_float(lhs)
+                .map(|a| Value::Boolean(float::compare(a, b) == std::cmp::Ordering::Greater)),
             (Value::Integer(_, a), Value::Integer(_, b)) => Some(Value::Boolean(a > b)),
             (lhs, rhs) => match (as_numeric(lhs), as_numeric(rhs)) {
                 (Some(a), Some(b)) => {
@@ -1432,6 +1605,42 @@ fn as_numeric(value: Value) -> Option<Numeric> {
         Value::Integer(_, n) => Numeric::parse(&n.to_string()).ok(),
         _ => None,
     }
+}
+
+/// [`as_numeric`]'s float twin (issue #112): a value as an `f64`, for the
+/// mixed-operand case Postgres resolves by casting **both** sides to
+/// `double precision`. `None` for any value outside the numeric family
+/// (defense-in-depth against a validator bug, as above).
+///
+/// A `numeric` goes through its decimal text, which is what Postgres's own
+/// `numeric_float8` cast does (`float8in(numeric_out(n))`), so a value too
+/// large for `float8` becomes `Infinity` there exactly as it does here.
+fn as_float(value: Value) -> Option<f64> {
+    match value {
+        Value::Float(_, n) => Some(n),
+        Value::Integer(_, n) => Some(n as f64),
+        Value::Numeric(n) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// `a + b` on binary floats, attributing an overflow to `field_name` — the
+/// thin wrapper that keeps [`apply_operator`]'s four float arms from each
+/// repeating the error mapping.
+fn float_add(
+    a: f64,
+    a_width: FloatWidth,
+    b: f64,
+    b_width: FloatWidth,
+    field_name: &str,
+) -> Result<Value, EvalError> {
+    let (sum, width) = float::checked_add(a, a_width, b, b_width).map_err(|source| {
+        EvalError::FloatOutOfRange {
+            field: field_name.to_string(),
+            source,
+        }
+    })?;
+    Ok(Value::Float(width, sum))
 }
 
 /// Applies a registered function to its already-evaluated arguments (issue
@@ -1532,6 +1741,30 @@ fn regexp_count(text: &str, pattern: &str, regex_cache: &mut RegexCache) -> Opti
     Some(count)
 }
 
+/// The [`Value`] an [`Expr::TypedLiteral`] evaluates to.
+///
+/// Issue #109's allowlist held only passthrough families, so this was a
+/// one-liner producing [`Value::Other`]. Issue #112 added `real`/`double
+/// precision`, which are a real [`ValueType::Float`] and must decode to a
+/// real `f64` — a `REAL '1.5'` carried as verbatim text would not have
+/// float arithmetic, float ordering, or a float target column.
+///
+/// The literal's text was already checked to be in canonical form by
+/// [`super::validate`] (whose float checker *is* [`crate::float::parse`]),
+/// so the decode below cannot fail on any definition that went through the
+/// validator; the error path is defense-in-depth for a hand-built AST, the
+/// same posture the rest of this module takes.
+fn typed_literal_value(
+    value_type: ValueType,
+    text: &str,
+    field_name: &str,
+) -> Result<Value, EvalError> {
+    match value_type {
+        ValueType::Other(pg_type) => Ok(Value::Other(pg_type, text.to_string())),
+        other => parse_value(field_name, other, text),
+    }
+}
+
 fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Value, EvalError> {
     match value_type {
         ValueType::Numeric => parse_number(field_name, text).map(Value::Numeric),
@@ -1543,6 +1776,19 @@ fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Va
         ValueType::Integer(width) => integer::parse(text, width)
             .map(|value| Value::Integer(width, value))
             .map_err(|source| EvalError::IntegerOutOfRange {
+                field: field_name.to_string(),
+                source,
+            }),
+        // Issue #112: likewise a float column's text decodes to a real
+        // `f64` on that width's grid. `float::parse` accepts exactly what
+        // `float4out`/`float8out` emit — `NaN`/`Infinity`/`-Infinity`
+        // included, since those are values a `real` column really holds —
+        // and nothing else, so a spelling that could not have come out of a
+        // column of this type is a named error rather than a silently
+        // re-rendered near-miss.
+        ValueType::Float(width) => float::parse(text, width)
+            .map(|value| Value::Float(width, value))
+            .map_err(|source| EvalError::FloatOutOfRange {
                 field: field_name.to_string(),
                 source,
             }),

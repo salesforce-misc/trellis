@@ -143,6 +143,34 @@ impl Parser {
         }
     }
 
+    /// The token `n` positions ahead of the cursor (`peek_at(0)` is
+    /// [`Self::peek`]), clamped to the trailing `Eof` — two-token lookahead
+    /// exists solely for `DOUBLE PRECISION`, the grammar's only multi-word
+    /// type keyword (issue #112).
+    fn peek_at(&self, n: usize) -> &Token {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[i]
+    }
+
+    /// Consumes the second half of a two-word type keyword, if `first` is
+    /// the first half of one, and returns the canonical uppercased keyword
+    /// to look up in [`super::typed_literal::TYPED_LITERALS`].
+    ///
+    /// `DOUBLE PRECISION` (issue #112) is the only such keyword: it is
+    /// Postgres's own `format_type` spelling of `float8`, and
+    /// `TypedLiteralSpec::keyword` is pinned to that spelling so the
+    /// spelling a definition writes is the spelling the oracle renders back
+    /// (`type_keyword_matches_value_type`). The lexer produces two
+    /// `Ident`s for it, so it is rejoined here rather than taught to the
+    /// lexer, which has no notion of type names at all.
+    fn take_type_keyword(&mut self, first: &str) -> String {
+        if first == "DOUBLE" && self.peek_is_keyword("PRECISION") {
+            self.advance();
+            return "DOUBLE PRECISION".to_string();
+        }
+        first.to_string()
+    }
+
     fn peek_is_keyword(&self, kw: &str) -> bool {
         matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case(kw))
     }
@@ -481,7 +509,14 @@ impl Parser {
                 // or `(` respectively, never by a string. So a source column
                 // genuinely named `date` still parses as a column in
                 // `SELECT date AS d` — only `date '...'` is a literal.
-                if let Token::String(_) = self.peek() {
+                // `DOUBLE PRECISION '1.5'` puts an identifier between the
+                // type keyword and the string, so the one-token check below
+                // needs a second position for it (issue #112).
+                let is_two_word_type_literal = upper == "DOUBLE"
+                    && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("PRECISION"))
+                    && matches!(self.peek_at(1), Token::String(_));
+
+                if is_two_word_type_literal || matches!(self.peek(), Token::String(_)) {
                     // An identifier directly followed by a string literal is
                     // a typed-literal attempt and nothing else: everywhere
                     // else an identifier appears in this grammar it's
@@ -492,14 +527,15 @@ impl Parser {
                     // same purpose-built error the `CAST` spelling gives,
                     // rather than falling through to a confusing "expected
                     // AS, found string 'x'" about a column it never was.
-                    let Some(spec) = lookup_typed_literal(&upper) else {
+                    let keyword = self.take_type_keyword(&upper);
+                    let Some(spec) = lookup_typed_literal(&keyword) else {
                         return Err(ParseError::UnsupportedLiteralType { name });
                     };
                     let Token::String(text) = self.advance() else {
                         unreachable!("peeked a string literal");
                     };
                     return Ok(Expr::TypedLiteral {
-                        pg_type: spec.pg_type,
+                        value_type: spec.value_type,
                         text,
                     });
                 }
@@ -665,13 +701,15 @@ impl Parser {
         };
         self.expect_keyword("AS")?;
         let type_name = self.expect_ident()?;
+        // `CAST('1.5' AS double precision)` — see `take_type_keyword`.
+        let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
         self.expect_symbol(')')?;
 
-        let Some(spec) = lookup_typed_literal(&type_name.to_ascii_uppercase()) else {
-            return Err(ParseError::UnsupportedLiteralType { name: type_name });
+        let Some(spec) = lookup_typed_literal(&keyword) else {
+            return Err(ParseError::UnsupportedLiteralType { name: keyword });
         };
         Ok(Expr::TypedLiteral {
-            pg_type: spec.pg_type,
+            value_type: spec.value_type,
             text,
         })
     }
