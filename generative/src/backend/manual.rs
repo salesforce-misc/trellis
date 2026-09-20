@@ -323,8 +323,11 @@ impl ManualBackend {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        raw.batch_execute(&format!("set search_path to {}, public", config.schema()))
-            .await?;
+        raw.batch_execute(&format!(
+            "set search_path to {}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'",
+            config.schema()
+        ))
+        .await?;
 
         Ok(Self {
             dsn,

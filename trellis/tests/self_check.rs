@@ -44,7 +44,7 @@ async fn connect_raw(dsn: &str) -> Client {
         let _ = connection.await;
     });
     client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
         .await
         .expect("set search_path");
     client
@@ -128,6 +128,132 @@ async fn converged_target_reports_no_divergence() {
         report.next_after, None,
         "neither side hit the limit, so this page reached the end of the keyspace"
     );
+
+    running.shutdown().await.expect("shutdown running");
+}
+
+/// Issue #109's typed literals, through the production audit path.
+///
+/// `self_check` is the one place a *production* SQL renderer
+/// (`staging::self_check::render_leaf`) turns a calculated-field expression
+/// back into text, then diffs its `::text` rendering against the persisted
+/// target column byte-for-byte with no normalization whatsoever
+/// (`compare_once`). This test is what covers that renderer's typed-literal
+/// arm end-to-end: it proves the rendered SQL is valid Postgres, that it
+/// means the same thing as the value the engine actually persisted, and that
+/// the audit therefore reports `Converged` rather than tripping over a shape
+/// it doesn't understand.
+///
+/// What it deliberately does **not** prove is the canonical-form rule
+/// `defs::typed_literal` imposes. Both legs of `compare_once` are rendered
+/// by Postgres, in the same session, with `date_out` applied to each — so a
+/// non-canonical literal would be normalized identically on both sides and
+/// cancel out. The comparisons that genuinely depend on canonical form are
+/// the ones where a *Rust*-produced string meets a Postgres-produced one:
+/// the generative suite's `evaluator_vs_sql` leg, and
+/// `defs_typed_literals.rs`'s own
+/// `evaluator_and_sql_oracle_agree_on_every_literal`.
+///
+/// Goes through the public `define` front door, so it also pins that the
+/// whole grammar addition is reachable by an ordinary embedder and not just
+/// by the engine-internal `parse`/`install_definition` pair.
+#[tokio::test]
+async fn a_converged_target_of_typed_literals_reports_no_divergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect definer");
+    definer
+        .define(
+            "TRANSFORM widget_stamps FROM widgets \
+             SELECT DATE '2024-01-01' AS effective_on, \
+                    TIMESTAMP '2024-03-05 12:34:56.5' AS recorded_at, \
+                    CAST('\\x0102ff' AS bytea) AS tag",
+        )
+        .await
+        .expect("define a target whose every field is a typed literal");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running");
+
+    let raw = connect_raw(db.dsn()).await;
+    raw.execute(
+        "insert into widgets (id, price) values (1, 10), (2, 20)",
+        &[],
+    )
+    .await
+    .expect("insert source rows");
+
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, GENEROUS_TIMEOUT)
+        .await
+        .expect("await_converged");
+
+    // The target's columns really are their own Postgres types, not text —
+    // the "computed 1-1 target" role, asserted here through the same public
+    // path an embedder would use to build it.
+    for (column, expected) in [
+        ("effective_on", "date"),
+        ("recorded_at", "timestamp without time zone"),
+        ("tag", "bytea"),
+    ] {
+        let data_type: String = raw
+            .query_one(
+                "select data_type from information_schema.columns \
+                 where table_name = 'widget_stamps' and column_name = $1",
+                &[&column],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("introspect {column}: {e}"))
+            .get(0);
+        assert_eq!(
+            data_type, expected,
+            "{column} must be a real {expected} column"
+        );
+    }
+
+    let report = running
+        .self_check(
+            "widget_stamps",
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check");
+
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "a target built entirely from typed literals must audit clean, got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 2);
 
     running.shutdown().await.expect("shutdown running");
 }

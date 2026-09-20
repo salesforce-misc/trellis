@@ -1385,7 +1385,10 @@ pub(super) fn substitute_relationship_path(
                 substitute_relationship_path(arg, rel_name, synthetic_columns);
             }
         }
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
         Expr::RelationshipPath { .. } => {}
     }
 }
@@ -3105,8 +3108,9 @@ mod tests {
         });
         client
             .batch_execute(&format!(
-                "set search_path to {}, public",
-                crate::config::DEFAULT_SCHEMA
+                "set search_path to {}, public; {}",
+                crate::config::DEFAULT_SCHEMA,
+                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
             ))
             .await
             .expect("set search_path");

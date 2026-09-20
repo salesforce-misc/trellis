@@ -49,6 +49,19 @@ pub enum ParseError {
     /// clause 4) had more than the two `<schema>.<table>` components this
     /// grammar accepts — e.g. `a.b.c`.
     TooManyQualifiedNameParts { reference: String },
+    /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
+    /// string literal (issue #109) — i.e. a request for a **general** cast
+    /// rather than a typed literal. See [`super::typed_literal`] for why the
+    /// coercion lattice a general cast implies is each type family's own
+    /// epic child, not this grammar's.
+    UnsupportedCast { found: String },
+    /// A `CAST(<literal> AS <type>)` or `<type> '<literal>'` naming a type
+    /// that isn't in [`super::typed_literal::TYPED_LITERALS`]'s allowlist.
+    UnsupportedLiteralType { name: String },
+    /// Postgres's `<expr>::<type>` cast sugar, which this grammar doesn't
+    /// accept (issue #109) — rejected by name so the message can point at
+    /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
+    UnsupportedCastOperator,
 }
 
 impl ParseError {
@@ -113,6 +126,29 @@ impl fmt::Display for ParseError {
                 "'{reference}' is not a valid table reference: only a bare <table> or a \
                  qualified <schema>.<table> is supported (issue #76), not a third '.'-separated \
                  part"
+            ),
+            ParseError::UnsupportedCast { found } => write!(
+                f,
+                "CAST is only supported over a single-quoted literal — \
+                 CAST('<literal>' AS <type>), equivalently <type> '<literal>' — found {found}. \
+                 General casts between expression types are not implemented: each type family's \
+                 coercions are decided by its own issue (#113 temporal, #114 bytea, #115 jsonb), \
+                 since most interesting pairs are not immutable (ADR-0004)"
+            ),
+            ParseError::UnsupportedLiteralType { name } => write!(
+                f,
+                "'{name}' is not a type a literal can be spelled as: only {} are supported \
+                 (see docs/type-support.md and docs/decisions/0004-transform-definition-grammar.md)",
+                crate::defs::typed_literal::TYPED_LITERALS
+                    .iter()
+                    .map(|spec| spec.keyword)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ParseError::UnsupportedCastOperator => write!(
+                f,
+                "the '::' cast operator is not supported: write a typed literal as \
+                 <type> '<literal>' (e.g. DATE '2024-01-01') or CAST('<literal>' AS <type>)"
             ),
         }
     }

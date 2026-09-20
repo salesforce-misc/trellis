@@ -257,8 +257,11 @@ impl SubprocessBackend {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        raw.batch_execute(&format!("set search_path to {}, public", config.schema()))
-            .await?;
+        raw.batch_execute(&format!(
+            "set search_path to {}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'",
+            config.schema()
+        ))
+        .await?;
 
         let scratch_dir = std::env::temp_dir().join(format!(
             "trellis-subprocess-backend-{}-{}",

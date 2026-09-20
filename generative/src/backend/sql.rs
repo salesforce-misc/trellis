@@ -88,6 +88,16 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         Expr::Column(name) => name.clone(),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
+        // Issue #109's typed literal, rendered in the `<type> '<text>'`
+        // spelling rather than `CAST(... AS ...)`. Both re-parse to this
+        // same node, so either would round-trip; the typed-literal form is
+        // the shorter one and keeps the generated definition text closer to
+        // how the docs spell it.
+        Expr::TypedLiteral { pg_type, text } => format!(
+            "{} '{}'",
+            pg_type.sql_type_name().to_ascii_uppercase(),
+            text.replace('\'', "''")
+        ),
         Expr::BinaryOp { op, lhs, rhs } => {
             format!(
                 "({}) {} ({})",

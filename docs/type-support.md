@@ -75,11 +75,11 @@ per-type capability, so it's omitted from the aggregate cells.
 | `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ⚠️ MIN/MAX | landed in #79 |
 | `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | 🎯 MIN/MAX/`string_agg` | requires deterministic collation |
 | `char(n)` `citext` | ✅ | ⚠️ | ❌ padding/case | ❌ | ⚠️ passthrough | — | hazard is padding/case, not volatility |
-| `bytea` | ✅ (hex text) | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ⚠️ MIN/MAX | `bytea_output` GUC affects text render |
-| `date` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | |
-| `timestamp` `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | tz text render is TZ-dependent |
+| `bytea` | ✅ (hex text) | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109) | ⚠️ MIN/MAX | `bytea_output` GUC affects text render; literal must be canonical lowercase hex |
+| `date` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109) | 🎯 MIN/MAX | `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
+| `timestamp` `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109), `timestamptz` 🎯 | 🎯 MIN/MAX | tz text render is TZ-dependent, so only plain `timestamp` can be spelled |
 | `time` `timetz` `interval` | ✅ | 🎯 | 🎯 | ⚠️ | 🎯 | 🎯 MIN/MAX; `SUM(interval)` | interval eq well-defined; fidelity is the risk |
-| `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`) |
+| `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 needs a canonicalizer | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`); `jsonb_out` re-sorts keys, so a literal needs #115's value model |
 | `inet` `cidr` `macaddr` `macaddr8` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | ⚠️ MIN/MAX | |
 | enum types | ✅ | 🎯 | 🎯 | 🎯 | ⚠️ | 🎯 MIN/MAX | order fixed at type creation |
 | `bit` `bit varying` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | 🎯 `bit_and`/`bit_or` | |
@@ -113,7 +113,14 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 ## Cross-cutting concerns
 
 * **Casts / coercion lattice** — computing a new type needs literal and `CAST`
-  grammar (numeric + quoted-text literals only today); own epic child.
+  grammar. **Landed for literals (#109):** `DATE '2024-01-01'` and the
+  equivalent `CAST('2024-01-01' AS date)` both produce a real typed constant,
+  over an allowlist (`date`, `timestamp`, `bytea`) whose literal text must be
+  in Postgres's canonical output spelling — see
+  [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-issue-109).
+  Still open: a **general** coercion lattice (`CAST(<expr> AS <type>)` over a
+  non-literal), which each type family's own child decides, since most pairs
+  are not immutable.
 * **Typed key index** — replacing the raw-`::text` match unlocks
   `timestamp`/`bytea`/`date`/`numeric`/… as safe keys; the single
   highest-leverage child for the key roles.

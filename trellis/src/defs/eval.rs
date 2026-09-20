@@ -523,7 +523,10 @@ fn collect_relationship_refs(expr: &Expr, out: &mut Vec<(String, String)>) {
                 collect_relationship_refs(arg, out);
             }
         }
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -625,6 +628,12 @@ fn eval_expr(
             parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
         }
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
+        // Issue #109: a typed literal evaluates to its own family-tagged
+        // value, carrying the literal source text verbatim exactly as
+        // `Value::Other` does for a CDC-decoded column. That is only sound
+        // because `validate` has already required the text to be in the
+        // family's canonical Postgres spelling — see `super::typed_literal`.
+        Expr::TypedLiteral { pg_type, text } => Ok(Some(Value::Other(*pg_type, text.clone()))),
         Expr::RelationshipPath { rel, column } => {
             // To-one resolution (issue #28): find the relationship, read the
             // from-row's join key, look up the single to-side row by that key,
@@ -995,6 +1004,12 @@ fn eval_aggregate_expr(
             parse_number(field_name, text).map(|n| Some(Value::Numeric(n)))
         }
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
+        // Issue #109: a typed literal evaluates to its own family-tagged
+        // value, carrying the literal source text verbatim exactly as
+        // `Value::Other` does for a CDC-decoded column. That is only sound
+        // because `validate` has already required the text to be in the
+        // family's canonical Postgres spelling — see `super::typed_literal`.
+        Expr::TypedLiteral { pg_type, text } => Ok(Some(Value::Other(*pg_type, text.clone()))),
         Expr::RelationshipPath { rel, column } => Err(EvalError::UnsupportedRelationshipPath {
             field: field_name.to_string(),
             rel: rel.clone(),

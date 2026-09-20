@@ -18,7 +18,10 @@
 //!   aggregate definition, a non-grouping-key column must be wrapped in
 //!   exactly one of `SUM`/`MIN`/`MAX`/`AVG` (Numeric-only), or a field may be
 //!   the row-counting `COUNT(*)` (no column argument; `COUNT(<column>)` is
-//!   not implemented).
+//!   not implemented). Issue #109 adds **typed literals** — `DATE
+//!   '2024-01-01'` / `CAST('2024-01-01' AS date)` — the one way an
+//!   expression can *produce* a [`ast::ValueType::Other`] value rather than
+//!   merely pass one through; see [`typed_literal`].
 //! - **Partial-data predicate**: a trivially-true predicate only.
 //!
 //! Everything else is rejected at parse time with an error naming the
@@ -39,6 +42,7 @@ pub mod oracle;
 mod parser;
 pub mod pg_type;
 pub mod registry;
+pub mod typed_literal;
 pub mod validate;
 
 // This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened

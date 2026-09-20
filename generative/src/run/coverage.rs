@@ -207,7 +207,10 @@ impl Coverage {
                 };
                 *self.relationship_shapes.entry(name).or_insert(0) += 1;
             }
-            Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+            Expr::Column(_)
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => {}
             Expr::BinaryOp { lhs, rhs, .. } => {
                 self.record_relationship_shapes(lhs, def, by_name, false);
                 self.record_relationship_shapes(rhs, def, by_name, false);
@@ -242,6 +245,10 @@ impl Coverage {
             }
             Expr::StringLiteral(_) => {
                 self.expr_shapes.insert("StringLiteral");
+                1
+            }
+            Expr::TypedLiteral { .. } => {
+                self.expr_shapes.insert("TypedLiteral");
                 1
             }
             Expr::RelationshipPath { .. } => {

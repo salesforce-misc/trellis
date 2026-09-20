@@ -923,8 +923,9 @@ async fn connect_plain(
     });
     client
         .batch_execute(&format!(
-            "set search_path to {}, public",
-            quote_ident(schema)
+            "set search_path to {}, public; {}",
+            quote_ident(schema),
+            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
         ))
         .await?;
     Ok(client)
@@ -1356,8 +1357,9 @@ async fn wake_listener(
 
     client
         .batch_execute(&format!(
-            "set search_path to {}, public; listen {}",
+            "set search_path to {}, public; {}; listen {}",
             quote_ident(schema),
+            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS,
             quote_ident(channel)
         ))
         .await?;

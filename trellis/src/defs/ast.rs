@@ -173,6 +173,26 @@ pub enum Expr {
     NumberLiteral(String),
     /// A single-quoted string literal (issue #63).
     StringLiteral(String),
+    /// A **typed literal** (issue #109): a constant of a Postgres type that
+    /// has no literal syntax of its own in this grammar, spelled either
+    /// `<type> '<text>'` (Postgres's typed-literal form — `DATE '2024-01-01'`)
+    /// or `CAST('<text>' AS <type>)`. Both spellings build *this* node,
+    /// because Postgres itself folds them to the same constant: `explain
+    /// (verbose) select cast('2024-01-01' as date), date '2024-01-01'` prints
+    /// `'2024-01-01'::date` twice.
+    ///
+    /// This is the one way a calculated field can *produce* a
+    /// [`ValueType::Other`] value rather than merely pass one through, which
+    /// is what promotes those families from "ingest only" to
+    /// `docs/type-support.md`'s **computed 1-1 target** role.
+    ///
+    /// `pg_type` is restricted to [`super::typed_literal::TYPED_LITERALS`]'s
+    /// allowlist — not every [`PgType`] the OID registry recognizes — and
+    /// `text` is the literal's *raw source text* (quotes stripped, `''`
+    /// unescaped), required by [`super::validate`] to already be in that
+    /// family's canonical Postgres output spelling. See
+    /// [`super::typed_literal::TYPED_LITERALS`] for why both restrictions exist.
+    TypedLiteral { pg_type: PgType, text: String },
     /// A `<rel>.<column>` relationship-path reference (issue #25, ADR-0006).
     /// `rel` is the head's **relationship name**, not a table/alias —
     /// resolving whether it's an actually-declared relationship, and its

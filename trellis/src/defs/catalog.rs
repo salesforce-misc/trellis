@@ -4175,7 +4175,7 @@ fn expr_references_column(
                 rel_to_table,
             )
         }),
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => false,
     }
 }
 

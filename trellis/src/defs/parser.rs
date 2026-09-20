@@ -27,8 +27,11 @@
 //! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
 //! `<rel>.<column>` relationship-path references (issue #25, ADR-0006) —
 //! whose head is a relationship name, resolved and cardinality-checked by
-//! later issues, not this parser. `<predicate>` accepts only the literal
-//! `TRUE`.
+//! later issues, not this parser. Issue #109 adds **typed literals**, spelled
+//! either `<type> '<text>'` or `CAST('<text>' AS <type>)` — see
+//! [`super::typed_literal`] for the allowlisted types, why both spellings
+//! build one AST node, and why `<expr>::<type>` and general casts are
+//! rejected. `<predicate>` accepts only the literal `TRUE`.
 //!
 //! A second, standalone statement form (ADR-0006, issue #24) declares a
 //! named relationship rather than a transform:
@@ -50,6 +53,7 @@ use super::registry::{
     AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, lookup_aggregate_function, lookup_function,
     lookup_operator, operator_spec,
 };
+use super::typed_literal::lookup_typed_literal;
 
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
 
@@ -468,6 +472,38 @@ impl Parser {
                     return Err(ParseError::NonImmutableConstruct { name });
                 }
 
+                // A typed literal's `<type> '<text>'` spelling (issue #109).
+                // Checked before the `.`/`(` branches below and gated on the
+                // *next* token being a string literal, which makes it
+                // unambiguous against every other use of an identifier here:
+                // a column reference, a relationship-path head and a
+                // function name are each followed by end-of-expression, `.`
+                // or `(` respectively, never by a string. So a source column
+                // genuinely named `date` still parses as a column in
+                // `SELECT date AS d` — only `date '...'` is a literal.
+                if let Token::String(_) = self.peek() {
+                    // An identifier directly followed by a string literal is
+                    // a typed-literal attempt and nothing else: everywhere
+                    // else an identifier appears in this grammar it's
+                    // followed by an identifier (`x AS y`), a `.`
+                    // (relationship path), a `(` (function call), an
+                    // operator symbol, or end-of-expression — never a
+                    // string. So an unallowlisted type keyword here gets the
+                    // same purpose-built error the `CAST` spelling gives,
+                    // rather than falling through to a confusing "expected
+                    // AS, found string 'x'" about a column it never was.
+                    let Some(spec) = lookup_typed_literal(&upper) else {
+                        return Err(ParseError::UnsupportedLiteralType { name });
+                    };
+                    let Token::String(text) = self.advance() else {
+                        unreachable!("peeked a string literal");
+                    };
+                    return Ok(Expr::TypedLiteral {
+                        pg_type: spec.pg_type,
+                        text,
+                    });
+                }
+
                 if self.peek_is_symbol('.') {
                     self.advance();
                     let column = self.expect_ident()?;
@@ -476,6 +512,16 @@ impl Parser {
 
                 if self.peek_is_symbol('(') {
                     self.advance();
+
+                    // `CAST('<literal>' AS <type>)` (issue #109) — standard
+                    // SQL's spelling of the same constant the `<type>
+                    // '<literal>'` form above builds, and the same node,
+                    // because Postgres folds both to one `Const`. Handled
+                    // ahead of the registry lookups because its `AS` keyword
+                    // makes it not a `parse_call_args` argument list at all.
+                    if upper == "CAST" {
+                        return self.parse_cast_body();
+                    }
 
                     if AGGREGATE_FUNCTIONS.contains(&upper.as_str()) {
                         if !self.is_aggregate {
@@ -587,6 +633,47 @@ impl Parser {
                 found: other.describe(),
             }),
         }
+    }
+
+    /// Parses the remainder of a `CAST(...)` — `'<literal>' AS <type>)`,
+    /// with `CAST` and its `(` already consumed — into the same
+    /// [`Expr::TypedLiteral`] the `<type> '<literal>'` spelling builds.
+    ///
+    /// Only a single-quoted literal is accepted as the operand. A general
+    /// `CAST(<expr> AS <type>)` is rejected by name
+    /// ([`ParseError::UnsupportedCast`]) rather than parsed-then-refused
+    /// later, so the message can explain that a coercion lattice belongs to
+    /// each type family's own issue — see [`super::typed_literal`]'s module
+    /// doc comment for the reasoning.
+    fn parse_cast_body(&mut self) -> Result<Expr, ParseError> {
+        let text = match self.advance() {
+            Token::String(text) => text,
+            Token::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    expected: "a single-quoted literal".to_string(),
+                });
+            }
+            other => {
+                // Consume the rest of the call so a rejected general cast
+                // doesn't desync the parse into a second, confusing error —
+                // the same courtesy `skip_balanced_parens` does for an
+                // unsupported function call.
+                let found = other.describe();
+                self.skip_balanced_parens()?;
+                return Err(ParseError::UnsupportedCast { found });
+            }
+        };
+        self.expect_keyword("AS")?;
+        let type_name = self.expect_ident()?;
+        self.expect_symbol(')')?;
+
+        let Some(spec) = lookup_typed_literal(&type_name.to_ascii_uppercase()) else {
+            return Err(ParseError::UnsupportedLiteralType { name: type_name });
+        };
+        Ok(Expr::TypedLiteral {
+            pg_type: spec.pg_type,
+            text,
+        })
     }
 
     /// Parses a call's comma-separated argument list up to and including the

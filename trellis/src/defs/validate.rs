@@ -98,6 +98,29 @@ pub enum ValidationError {
         pattern: String,
         error: String,
     },
+    /// A typed literal's text (issue #109) isn't in its family's **canonical**
+    /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
+    /// `BYTEA '\xAB'`. See [`super::typed_literal`]'s module doc comment for
+    /// why the bar is canonical form rather than "Postgres would parse it":
+    /// in short, immutability (`date_in` is `STABLE` precisely because of
+    /// `'today'`) and text round-trip identity between the Rust evaluator
+    /// and the SQL oracle.
+    InvalidTypedLiteral {
+        field: String,
+        pg_type: super::pg_type::PgType,
+        text: String,
+        detail: String,
+    },
+    /// A hand-built [`super::ast::Expr::TypedLiteral`] names a [`super::pg_type::PgType`]
+    /// outside [`super::typed_literal::TYPED_LITERALS`]'s allowlist. The
+    /// parser can't produce one — it only builds the node from that same
+    /// table — so this is the validator's defense-in-depth against an AST
+    /// assembled directly, in the same spirit as
+    /// [`super::eval::EvalError::Cycle`].
+    UnsupportedLiteralType {
+        field: String,
+        pg_type: super::pg_type::PgType,
+    },
     /// An [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY` names a
     /// column that isn't a real source column.
     UnresolvedGroupByColumn { column: String },
@@ -384,6 +407,21 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}': regexp_count's pattern '{pattern}' is not a valid \
                  regular expression: {error}"
+            ),
+            ValidationError::InvalidTypedLiteral {
+                field,
+                pg_type,
+                text,
+                detail,
+            } => write!(
+                f,
+                "calculated field '{field}': {pg_type} literal '{text}' is not in canonical \
+                 form: {detail}"
+            ),
+            ValidationError::UnsupportedLiteralType { field, pg_type } => write!(
+                f,
+                "calculated field '{field}': '{pg_type}' is not a type a literal can be spelled \
+                 as (see docs/type-support.md)"
             ),
             ValidationError::UnresolvedGroupByColumn { column } => write!(
                 f,
@@ -774,7 +812,10 @@ fn validate_relationship_refs(
     in_aggregate: bool,
 ) -> Result<(), ValidationError> {
     match expr {
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::RelationshipPath { rel, column } => {
             let Some(resolved) = relationships.get(rel) else {
                 return Err(ValidationError::UnknownRelationship {
@@ -868,7 +909,7 @@ fn validate_aggregate_field_expr(
             }
             Ok(())
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
         Expr::RelationshipPath { rel, column } => {
             let Some(resolved) = relationships.get(rel) else {
                 // Unknown name: `validate_relationship_refs` reports it.
@@ -950,7 +991,7 @@ fn expr_is_group_by_key_passthrough(expr: &Expr, key: &GroupByKey) -> bool {
 fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         // Not a source-column reference by name — its type is resolved from
         // relationship metadata by `infer_expr`, and its cardinality rules by
         // `validate_relationship_refs`, when they walk the same expression.
@@ -1089,6 +1130,29 @@ fn infer_expr(
         }
         Expr::NumberLiteral(_) => Ok(ValueType::Numeric),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
+        Expr::TypedLiteral { pg_type, text } => {
+            // Checked here, not in the parser, for the same reason
+            // `regexp_count`'s pattern is (see `validate_regexp_pattern`):
+            // this runs on every path into the catalog, including a
+            // hand-built AST that never went through `parse`, so a literal
+            // can't reach the evaluator un-checked. See
+            // `super::typed_literal` for why the bar is *canonical* form
+            // rather than merely "Postgres would parse it".
+            let spec = super::typed_literal::lookup_typed_literal(
+                &pg_type.sql_type_name().to_ascii_uppercase(),
+            )
+            .ok_or_else(|| ValidationError::UnsupportedLiteralType {
+                field: field_name.to_string(),
+                pg_type: *pg_type,
+            })?;
+            (spec.canonical)(text).map_err(|detail| ValidationError::InvalidTypedLiteral {
+                field: field_name.to_string(),
+                pg_type: *pg_type,
+                text: text.clone(),
+                detail: detail.to_string(),
+            })?;
+            Ok(super::typed_literal::value_type(*pg_type))
+        }
         Expr::RelationshipPath { rel, column } => {
             // A `<rel>.<column>` enrichment's type is the *to-side* column's
             // type, resolved by the caller into `relationships`. The

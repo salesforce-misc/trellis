@@ -44,7 +44,7 @@ async fn connect_raw(dsn: &str) -> Client {
         let _ = connection.await;
     });
     client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
         .await
         .expect("set search_path");
     client

@@ -1047,7 +1047,8 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
     });
     raw_client
         .batch_execute(&format!(
-            "set search_path to {}, public",
+            "set search_path to {}, public; \
+             set datestyle to 'ISO, YMD'; set bytea_output to 'hex'",
             trellis::config::DEFAULT_SCHEMA
         ))
         .await

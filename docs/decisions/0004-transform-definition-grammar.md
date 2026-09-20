@@ -73,6 +73,56 @@ with these four). Values carry one of four types — `Numeric`, `Text`, `Boolean
 return types are type-checked at definition time. `<predicate>` accepts only the
 literal `TRUE` for now; the partial-data predicate is otherwise deferred.
 
+### Typed literals (issue #109)
+
+A calculated field can also *spell* a constant of a type that has no literal
+syntax of its own, which is what lets it **produce** — rather than merely pass
+through — a value of that type (`docs/type-support.md`'s "computed 1-1 target"
+role). Two spellings, one AST node:
+
+```text
+DATE '2024-01-01'
+CAST('2024-01-01' AS date)
+```
+
+Both are valid, unambiguous Postgres, and Postgres folds them to the *same*
+constant (`EXPLAIN (VERBOSE)` prints `'2024-01-01'::date` for each), so the
+SQL-rendering oracle can render our node back to text that means exactly what
+we evaluated. Accepted types are an allowlist — today `date`, `timestamp`,
+`bytea` — in `trellis/src/defs/typed_literal.rs`, which is also where each
+family's reasoning lives.
+
+Deliberately out:
+
+* **`<expr>::<type>`** — Postgres-only sugar, and a postfix operator in a
+  parser whose precedence table this ADR already flags as delicate. It buys
+  nothing over `CAST`. Rejected by name, pointing at the two spellings above.
+* **General `CAST(<expr> AS <type>)`** — a coercion lattice, not a literal.
+  Every (source, target) pair needs its own volatility verdict and evaluator
+  arm, and most interesting pairs aren't immutable (`timestamptz` → `date`
+  reads `TimeZone`). Each type family's own issue decides its own pairs;
+  rejected here by name.
+
+The literal's text must be in that family's **canonical Postgres output
+spelling** — `DATE '2024-1-5'` is refused even though Postgres parses it. This
+is a safe subset in the same style as `COALESCE`'s gaps below, and both halves
+of the ADR's bar drive it:
+
+* **Immutability.** `pg_proc` marks `date_in` and `timestamp_in` `STABLE`, not
+  `IMMUTABLE` — an intuition worth checking, since `jsonb_in`/`byteain` beside
+  them *are* immutable. The reason is the relative spellings they accept
+  (`DATE 'today'`, `TIMESTAMP 'now'`). Admitting only absolute ISO-8601
+  removes exactly that surface.
+* **Cross-check agreement.** A computed value travels as text, and the
+  generative suite compares the Rust evaluator's text against Postgres's
+  rendering byte-for-byte. Requiring canonical form makes the two renderers
+  agree by construction instead of needing a per-family normalizer.
+
+`jsonb` is the family this second rule holds back: `jsonb_out` re-sorts object
+keys by length then bytes, collapses duplicates, and renormalizes numbers, so
+checking a literal is canonical means implementing a real `jsonb` value model
+— #115's job, which needs one anyway for `jsonb_agg`.
+
 `COALESCE(<expr>, ...)` is accepted (issue #64) — first non-`NULL` argument, or
 `NULL` if all are. It's immutable, but *variadic*, so it isn't a registry
 function: the parser special-cases it (at least one argument, as Postgres does)

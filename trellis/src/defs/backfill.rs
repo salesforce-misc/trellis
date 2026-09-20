@@ -236,7 +236,10 @@ pub(crate) fn uses_relationships(def: &TransformDef) -> bool {
             Expr::RelationshipPath { .. } => true,
             Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
             Expr::FunctionCall { args, .. } => args.iter().any(walk),
-            Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+            Expr::Column(_)
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => false,
         }
     }
     def.fields.iter().any(|f| walk(&f.expr))
@@ -336,6 +339,13 @@ fn substitute_field_aliases(
             charge_budget(budget, 1)?;
             Ok(Expr::StringLiteral(text.clone()))
         }
+        Expr::TypedLiteral { pg_type, text } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::TypedLiteral {
+                pg_type: *pg_type,
+                text: text.clone(),
+            })
+        }
         Expr::RelationshipPath { rel, column } => {
             charge_budget(budget, 1)?;
             Ok(Expr::RelationshipPath {
@@ -406,7 +416,10 @@ fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
 /// Total number of nodes in `expr`'s tree.
 fn node_count(expr: &Expr) -> usize {
     match expr {
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => 1,
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => 1,
         Expr::RelationshipPath { .. } => 1,
         Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
         Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
@@ -1277,7 +1290,10 @@ fn agg_leaf_parts(name: &str, args: &[Expr]) -> Option<(String, String)> {
 /// [`BackfillError::Unsupported`], routing the whole definition to the ring.
 fn collect_agg_leaves(expr: &Expr, leaves: &mut BTreeSet<AggLeaf>) -> Result<(), BackfillError> {
     match expr {
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Ok(()),
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::RelationshipPath { .. } => Err(BackfillError::Unsupported(
             "a bare to-one relationship lookup, or a relationship reference nested inside a \
              larger expression"
@@ -1325,6 +1341,9 @@ fn render_rel_field_direct(
         Expr::Column(name) => Some(format!("{}.{}", quote_ident(source), quote_ident(name))),
         Expr::NumberLiteral(text) => Some(format!("{text}::numeric")),
         Expr::StringLiteral(text) => Some(format!("'{}'::text", text.replace('\'', "''"))),
+        Expr::TypedLiteral { pg_type, text } => {
+            Some(super::typed_literal::render_sql(*pg_type, text))
+        }
         Expr::RelationshipPath { .. } => None,
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {

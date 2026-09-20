@@ -27,6 +27,7 @@ use super::ast::{GroupByKey, KeySpace, RelationshipDef, TransformDef, ValueType}
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 #[cfg(any(test, feature = "test-util"))]
 use super::registry::lookup_aggregate_function;
+use super::typed_literal;
 
 /// Why a from-scratch recompute failed.
 #[derive(Debug)]
@@ -392,7 +393,7 @@ fn collect_columns(
                 out.insert(name.clone());
             }
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         // Not a source-column reference by name — a path's columns live on
         // the *to-side* table, which [`recompute`]/[`recompute_aggregate`]'s
         // source SELECT doesn't read. Those two evaluator-driven recomputes
@@ -427,6 +428,7 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         Expr::RelationshipPath { rel, column } => panic!(
             "render_expr_sql called on an unresolved relationship path '{rel}.{column}' \
              — the validator (#23) should have rejected this before reaching the oracle \
@@ -481,6 +483,7 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
         Expr::Column(name) => format!("{source_sql}.{}", quote_ident(name)),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         Expr::RelationshipPath { rel, column } => {
             format!("{}.{}", quote_ident(rel), quote_ident(column))
         }
@@ -626,7 +629,10 @@ fn collect_rel_names<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
         Expr::RelationshipPath { rel, .. } => {
             out.insert(rel.as_str());
         }
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_rel_names(lhs, out);
             collect_rel_names(rhs, out);
@@ -756,7 +762,10 @@ fn collect_to_one_rels<'a>(expr: &'a Expr, out: &mut BTreeSet<&'a str>) {
             collect_to_one_rels(lhs, out);
             collect_to_one_rels(rhs, out);
         }
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -775,6 +784,7 @@ pub(crate) fn render_rel_expr_sql(
         Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         // A to-one enrichment reads the referenced column off the to-side table
         // the LEFT JOIN brought in, aliased by the relationship name.
         Expr::RelationshipPath { rel, column } => {

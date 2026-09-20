@@ -883,8 +883,9 @@ impl Trellis {
         // Mirrors `client::connect_plain`'s own bootstrap.
         client
             .batch_execute(&format!(
-                "set search_path to {}, public",
-                crate::pool::quote_ident(self.config.schema())
+                "set search_path to {}, public; {}",
+                crate::pool::quote_ident(self.config.schema()),
+                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
             ))
             .await?;
         let result =

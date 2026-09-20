@@ -83,6 +83,7 @@ use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::Definition;
+use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 
@@ -801,6 +802,7 @@ fn render_leaf(expr: &Expr) -> Result<String, String> {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => format!("{text}::numeric"),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         Expr::RelationshipPath { rel, column } => {
             return Err(format!(
                 "references relationship path '{rel}.{column}' — self_check doesn't audit a \

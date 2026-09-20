@@ -41,7 +41,7 @@ async fn connect_raw(dsn: &str) -> Client {
         let _ = connection.await;
     });
     client
-        .batch_execute("set search_path to trellis, public")
+        .batch_execute("set search_path to trellis, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'")
         .await
         .expect("set search_path");
     client

@@ -50,9 +50,15 @@ pub mod defs {
     /// Function/operator/aggregate registries: the source of truth the oracle
     /// consults instead of hardcoding the engine's accepted spellings.
     pub use crate::defs::registry;
+    /// Issue #109's typed-literal allowlist and its shared SQL renderer. The
+    /// suite's own `render_expr` has to spell an `Expr::TypedLiteral` back
+    /// out — both as definition source text and as oracle SQL — and must do
+    /// it from the engine's table rather than a second, drifting copy, for
+    /// the same reason `registry` is reachable here.
+    pub use crate::defs::typed_literal;
 
     pub use crate::defs::{
-        CatalogError, DdlError, TransformStatus, ValueType, backfill_definition,
+        CatalogError, DdlError, PgType, TransformStatus, ValueType, backfill_definition,
         create_aggregate_target_table, create_definition_without_backfill, create_relationship,
         create_target_table, install_definition, parse, qualified_target_table,
         require_single_column_pk, source_primary_key,

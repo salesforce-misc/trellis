@@ -381,8 +381,9 @@ async fn open_daemon_connection(dsn: &str, schema: &str) -> Result<Client, tokio
     });
     client
         .batch_execute(&format!(
-            "set search_path to {}, public",
-            crate::pool::quote_ident(schema)
+            "set search_path to {}, public; {}",
+            crate::pool::quote_ident(schema),
+            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
         ))
         .await?;
     Ok(client)

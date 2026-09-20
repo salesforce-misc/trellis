@@ -112,7 +112,7 @@ const CHUNK_SIZE: i32 = 100;
 
 async fn run_campaign(client: &Client, design: &str, runs: i32) -> FuzzResult {
     client
-        .batch_execute("set search_path to m, public; delete from stats;")
+        .batch_execute("set search_path to m, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; delete from stats;")
         .await
         .expect("reset stats before campaign");
 

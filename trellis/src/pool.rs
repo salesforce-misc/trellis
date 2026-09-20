@@ -17,7 +17,10 @@
 //! runs exactly once per physical connection, before it's ever handed to a
 //! caller, which is where `synchronous_commit = on` will need to be enforced
 //! for the staging ring to make its durability guarantees.
-//! Nothing beyond `search_path` is enforced here yet.
+//! Beyond `search_path`, the hook also pins the output GUCs that make a
+//! value's text rendering depend on the value alone rather than on the
+//! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]); nothing else
+//! is enforced here yet.
 
 use crate::config::Config;
 use crate::error::Error;
@@ -135,6 +138,58 @@ impl Pool {
     }
 }
 
+/// The GUCs that make a value's **text rendering** a function of the value
+/// alone rather than of the session it's read on.
+///
+/// On the **output** side every one of these is already what a stock server
+/// produces, so this changes nothing an unconfigured Postgres does — it makes
+/// a guarantee Trellis was previously *assuming* into one it actually
+/// enforces. A server, database or role with `ALTER ... SET datestyle`
+/// applied (or `PGDATESTYLE` in the environment) silently breaks that
+/// assumption today.
+///
+/// One caveat, because the claim above is not quite "these are the boot
+/// values": `DateStyle`'s boot value is `ISO, MDY`, and the second field is
+/// an *input* field-order preference that has no effect on output at all.
+/// Pinning `YMD` rather than `MDY` therefore does change one thing on a
+/// stock server — how an *ambiguous* all-numeric date literal typed into a
+/// session is read (`'01/02/2024'::date` is 2024-01-02 under `MDY` and an
+/// out-of-range error under `YMD`). That is deliberate and safe here: every
+/// date text Trellis itself puts into SQL is canonical leading-4-digit ISO
+/// (see the input note below), which parses identically under either field
+/// order, and application SQL runs on the application's own connections,
+/// not on these. `YMD` is chosen so that an ambiguous spelling *fails loudly*
+/// on an engine connection instead of being silently reinterpreted.
+///
+/// Why Trellis needs it, concretely: a computed value travels through the
+/// engine as **text** ([`crate::defs::eval::Value`]), and correctness is
+/// established by comparing two independently-authored renderings of it —
+/// the Rust evaluator's and Postgres's own (ADR-0013's continuous
+/// cross-check; `docs/generative-test-suite.md`). For a
+/// [`crate::defs::ValueType::Other`] value that comparison is **byte-exact**
+/// (the generative suite's `Comparison::Exact`), so any GUC that changes how
+/// Postgres spells a value turns a perfectly converged target into a
+/// reported divergence. Under `DateStyle = 'SQL, MDY'`, for instance,
+/// `('2024-01-01'::date)::text` renders `01/01/2024`, and nothing is
+/// actually wrong.
+///
+/// The two pinned here cover what issue #109's typed literals can produce
+/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`).
+/// **Every future type family in epic #123 hits this same wall and should
+/// extend this one constant** rather than pinning a GUC at its own call
+/// site: `timestamptz` needs `TimeZone`, `interval` needs `IntervalStyle`,
+/// and `real`/`double precision` need `extra_float_digits`. Keeping them in
+/// a single list is also what lets the non-pooled connect sites below stay
+/// in step with the pooled one — they each interpolate this same text.
+///
+/// Note these are *output*-side settings. Input is a separate question and
+/// is handled separately: `crate::defs::typed_literal` requires a literal's
+/// text to be in a spelling that parses to the same value under **any**
+/// `DateStyle` (leading-4-digit-year ISO is unambiguous), so a definition
+/// installed against one server stays correct if read on another.
+pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str =
+    "set datestyle to 'ISO, YMD'; set bytea_output to 'hex'";
+
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
 ///
@@ -143,8 +198,9 @@ impl Pool {
 /// (so unqualified reads/writes against a transform target table resolve
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
-/// depends on it today). Beyond `search_path`, this is the seam intake will
-/// use to enforce `synchronous_commit = on`.
+/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]. Beyond
+/// those, this is the seam intake will use to enforce
+/// `synchronous_commit = on`.
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -152,7 +208,7 @@ async fn session_bootstrap(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(&format!(
-            "set search_path to {}, {}, public",
+            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}",
             quote_ident(schema),
             quote_ident(target_schema)
         ))

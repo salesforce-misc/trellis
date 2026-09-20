@@ -98,7 +98,9 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
                 collect_column_types(arg, source, out);
             }
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        // A literal carries no *source column* type — including issue
+        // #109's typed literal, whose type is its own, not a column's.
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         // Issue #34: a relationship path's column lives on another table
         // entirely, so there is no type to collect from `source`. The one
         // caller feeds this a `build_program` program — a single table, one

@@ -94,6 +94,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
             continue;
         }
 
+        // Postgres's `<expr>::<type>` cast sugar (issue #109). Caught here,
+        // at the character the user actually typed, so it gets a message
+        // naming the two spellings this grammar *does* accept rather than
+        // the lexer's generic "unexpected character ':'". See
+        // `super::typed_literal` for why `::` isn't one of them.
+        if c == ':' {
+            return Err(ParseError::UnsupportedCastOperator);
+        }
+
         if SYMBOLS.contains(&c) {
             tokens.push(Token::Symbol(c));
             i += 1;

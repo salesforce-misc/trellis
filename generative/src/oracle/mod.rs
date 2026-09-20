@@ -42,6 +42,7 @@ use trellis::Pool;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::oracle::{OracleError, recompute, recompute_aggregate};
 use trellis::dev::defs::registry;
+use trellis::dev::defs::typed_literal;
 use trellis::numeric::Numeric;
 
 use crate::model::{Cardinality, Program, Relationship, Table, group_key};
@@ -310,6 +311,7 @@ fn render_expr(expr: &Expr) -> String {
         Expr::Column(name) => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -406,7 +408,10 @@ fn uses_relationships(def: &TransformDef) -> bool {
 fn expr_reads_relationship(expr: &Expr) -> bool {
     match expr {
         Expr::RelationshipPath { .. } => true,
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => false,
         Expr::BinaryOp { lhs, rhs, .. } => {
             expr_reads_relationship(lhs) || expr_reads_relationship(rhs)
         }
@@ -430,7 +435,10 @@ fn collect_join_rels<'a>(expr: &'a Expr, rels: &RelIndex<'_>, out: &mut BTreeSet
                 out.insert(rel.as_str());
             }
         }
-        Expr::Column(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_join_rels(lhs, rels, out);
             collect_join_rels(rhs, rels, out);
@@ -475,6 +483,7 @@ fn render_rel_expr(expr: &Expr, source: &str, rels: &RelIndex<'_>) -> String {
         Expr::Column(name) => format!("{}.{}", quote_ident(source), quote_ident(name)),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::TypedLiteral { pg_type, text } => typed_literal::render_sql(*pg_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = match op {
                 Operator::Add => "+",
@@ -998,6 +1007,7 @@ fn field_value_type(
         }),
         Expr::NumberLiteral(_) => ValueType::Numeric,
         Expr::StringLiteral(_) => ValueType::Text,
+        Expr::TypedLiteral { pg_type, .. } => typed_literal::value_type(*pg_type),
         Expr::BinaryOp { op, .. } => registry::operator_spec(*op).return_type,
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             field_value_type(&args[0], source_columns, rels)
