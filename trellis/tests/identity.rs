@@ -1,7 +1,7 @@
-//! Integration tests for instance identity (issue #28): multiple instances
-//! sharing a database without interfering, clean re-attach, and refusal of
-//! incompatible/foreign schemas. Run against a real, ephemeral Postgres
-//! instance via `testkit::TestCluster`.
+//! Integration tests for instance identity (`docs/instance-identity.md`):
+//! multiple instances sharing a database without interfering, clean
+//! re-attach, and refusal of incompatible/foreign schemas. Run against a
+//! real, ephemeral Postgres instance via `testkit::TestCluster`.
 
 use testkit::TestCluster;
 use trellis::{Config, Error, Pool, migrate};
