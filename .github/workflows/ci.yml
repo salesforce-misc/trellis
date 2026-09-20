@@ -57,7 +57,7 @@ jobs:
 
       - name: Test generative (fast lane)
         # generative/README.md's fast/deep split: skip every proptest
-        # property (all 9 are named with a `property_` prefix precisely so
+        # property (all 10 are named with a `property_` prefix precisely so
         # they can be skipped as a group, not by a hand-maintained name
         # list -- generative/tests/meta.rs enforces the prefix on every
         # `proptest!` block so a future property can't silently dodge this
@@ -66,5 +66,5 @@ jobs:
         # One property (`property_convergence_holds_for_trivial_programs`)
         # gets an in-repo nightly deep run at a much higher case count -- see
         # nightly.yml; a separate, out-of-repo nightly calibrates case counts
-        # across all 9.
+        # across all 10.
         run: cargo test -p generative -- --skip property_

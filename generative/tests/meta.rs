@@ -69,7 +69,7 @@ async fn a_backend_that_cannot_stand_up_is_reported_unusable() {
 
 /// Self-enforcing half of the fast/deep CI split (issue #172):
 /// `.github/workflows/ci.yml`'s fast lane skips every proptest property with
-/// `cargo test -p generative -- --skip property_`, relying on all 9
+/// `cargo test -p generative -- --skip property_`, relying on all 10
 /// properties being named with a `property_` prefix rather than a
 /// hand-maintained name list. This scans every `generative/tests/*.rs`
 /// source file, finds each `proptest! { ... }` block, and asserts every `fn`
