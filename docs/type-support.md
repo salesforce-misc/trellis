@@ -52,7 +52,7 @@ climb it left-to-right:
    from the source's replica identity and present in the old-image for
    updates/deletes. Gated to the join-key-safe allowlist
    (`is_text_stable_join_key_type`) — an unsafe single-column PK
-   (`numeric`/`timestamp`/`timestamptz`/`interval`/`bytea`, which `::text`-matching
+   (`numeric`/`timestamptz`/`interval`/`bytea`, which `::text`-matching
    would silently mismatch) is rejected at define time with
    `DdlError::UnsupportedPrimaryKeyType` (#107). The typed key index
    (below) later unlocks all of those, `interval` included: it compares
@@ -96,8 +96,8 @@ per-type capability, so it's omitted from the aggregate cells.
 | `bytea` | ✅ (hex text) | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109) | ⚠️ MIN/MAX | `bytea_output` GUC affects text render; literal must be canonical lowercase hex |
 | `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
 | `time` `timetz` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#113) | ✅ MIN/MAX | `time_out`/`timetz_out` are the block's only IMMUTABLE output functions; `timetz`'s `=` is identity on `(time, zone)` |
-| `timestamp` | ✅ | 🎯 | 🎯 #248 | 🎯 #248 | ✅ literal (#109) | 🎯 MIN/MAX | bijective under `::text`, but `to_jsonb` (the live-row reads) spells it `2024-06-15T12:34:56`. Two renderers, one value (#113) |
-| `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | the `to_jsonb` split *plus* a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246) |
+| `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113/#248 — bijective under `::text`, and `to_jsonb` (the live-row reads) now renders it the same way (#248 replaced `to_jsonb(t.*)` with an explicit per-column `jsonb_build_object`) |
+| `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | #248 fixed the `to_jsonb` split, but a *second*, independent defect remains: a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246, still open) |
 | `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
 | `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 needs a canonicalizer | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`); `jsonb_out` re-sorts keys, so a literal needs #115's value model |
 | `inet` `cidr` `macaddr` `macaddr8` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | ⚠️ MIN/MAX | |
@@ -133,11 +133,11 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   while `interval_out` prints the three stored fields, so one value has
   many renderings. Not a volatility problem and not a GUC problem: a
   structural one, and the same class as float `-0`/`0`.
-* **`timestamp`** — nothing about the *type* is at issue: `timestamp_out`
-  is a bijection under the pinned `DateStyle`. What blocks it is that
-  Trellis has a second renderer (`to_jsonb`, in the live-row reads) that
-  spells it differently. Immutability is not the gate here; renderer
-  agreement is (#113, #248).
+* **`timestamp`** — nothing about the *type* was ever at issue:
+  `timestamp_out` is a bijection under the pinned `DateStyle`. What used to
+  block it was that Trellis had a *second* internal renderer (`to_jsonb`, in
+  the live-row reads) that spelled it differently; immutability was never
+  the gate, renderer agreement was (#113, fixed by #248).
 * **`jsonb_agg`** — marked `STABLE` in Postgres; whether Trellis's own
   deterministic reimplementation may treat it as immutable is an open question.
 * **`xml`/`tsvector`/`tsquery`** — no useful immutable equality/ordering; niche.
@@ -147,8 +147,9 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **Casts / coercion lattice** — computing a new type needs literal and `CAST`
   grammar. **Landed for literals (#109):** `DATE '2024-01-01'` and the
   equivalent `CAST('2024-01-01' AS date)` both produce a real typed constant,
-  over an allowlist (`date`, `timestamp`, `bytea`, and `oid` since #111)
-  whose literal text must be
+  over an allowlist (`date`, `timestamp`, `bytea`, and `oid` since #111) —
+  independent of #248's key-role fix, since a typed literal is always
+  rendered via `::text`, never via `to_jsonb` — whose literal text must be
   in Postgres's canonical output spelling — see
   [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-issue-109).
   Still open: a **general** coercion lattice (`CAST(<expr> AS <type>)` over a
@@ -169,9 +170,10 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   `numeric`/`decimal` row) — tightening that is #110's call. #112 tightened
   its own half: floats no longer reach that gate as `ValueType::Numeric`,
   and are refused. #113 removed `date`/`time`/`timetz` from the index's
-  to-do list for the same reason as `oid`, and left `timestamp` on it for a
-  reason the index does not actually address (two *internal* renderers
-  disagreeing) — see below.
+  to-do list for the same reason as `oid`; `timestamp` stayed on it a while
+  longer, for a reason the index does not actually address (two *internal*
+  renderers disagreeing), until #248 fixed the renderer disagreement
+  directly and removed it too — see below.
 * **Exact integer semantics (#111)** — `+` and the aggregates follow
   Postgres's own operator family, including its overflow behaviour: `int4 +
   int4` is `integer` and raises `22003 numeric_value_out_of_range` past the
@@ -215,34 +217,37 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   Float text also depends on a GUC: `extra_float_digits` must be `>= 1` for
   the shortest-round-trip rendering `trellis::float::render` reproduces, so
   it joins `DateStyle`/`bytea_output` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`.
-* **Temporal semantics (#113)** — the temporal block's six families were
-  all marked `🎯 typed index` on the assumption that #110 was the
+* **Temporal semantics (#113, #248)** — the temporal block's six families
+  were all marked `🎯 typed index` on the assumption that #110 was the
   prerequisite for any key role. Asked of a real server, per family, that
   assumption turned out to hold for only some of them — and the reason the
-  others are still refused is *not* the one the marking assumed.
+  others were refused was *not* the one the marking assumed.
 
-  * **`date`, `time` and `timetz` are keys, `GROUP BY` keys and primary
-    keys** — the `oid` reasoning from #111 ("text-stability is a property
-    of the *rendering*, not of the operator set"). `date_out` under the
-    already-pinned `DateStyle = 'ISO, YMD'` is a bijection: the year field
-    widens (`5874897-12-31`), the era is an explicit ` BC` suffix, and
-    `infinity`/`-infinity` have their own spellings. `time_out` and
-    `timetz_out` read **no GUC at all** — they are the only two `IMMUTABLE`
-    output functions in the block (`date_out`, `timestamp_out`,
-    `timestamptz_out` and `interval_out` are all `STABLE`). `timetz` is the
-    counter-intuitive one and it is safe for the opposite of the obvious
-    reason: `select '12:00:00+00'::timetz = '17:30:00+05:30'::timetz` is
-    **false**, because `timetz_cmp` sorts by GMT-equivalent time *and then
-    by zone*, so `=` is identity on the stored `(time, zone)` pair —
-    exactly what `timetz_out` prints.
-  * **Text-stability needs two checks, not one, and `timestamp` fails the
-    second.** Trellis turns a column into text in **two** different ways:
-    per column as `<col>::text`, and — in the live-row reads
-    (`staging::apply`'s `read_live_rows_batch`, `fetch_to_side_rows`,
-    `fetch_relationship_projection_rows`; `staging::quarantine`'s sweep) —
-    a whole row at once via `to_jsonb(t.*)` + `jsonb_each_text`. `to_jsonb`
+  * **`date`, `time`, `timetz` and (since #248) `timestamp` are keys,
+    `GROUP BY` keys and primary keys** — the `oid` reasoning from #111
+    ("text-stability is a property of the *rendering*, not of the operator
+    set"). `date_out` under the already-pinned `DateStyle = 'ISO, YMD'` is a
+    bijection: the year field widens (`5874897-12-31`), the era is an
+    explicit ` BC` suffix, and `infinity`/`-infinity` have their own
+    spellings. `time_out` and `timetz_out` read **no GUC at all** — they are
+    the only two `IMMUTABLE` output functions in the block (`date_out`,
+    `timestamp_out`, `timestamptz_out` and `interval_out` are all `STABLE`).
+    `timetz` is the counter-intuitive one and it is safe for the opposite of
+    the obvious reason: `select '12:00:00+00'::timetz =
+    '17:30:00+05:30'::timetz` is **false**, because `timetz_cmp` sorts by
+    GMT-equivalent time *and then by zone*, so `=` is identity on the stored
+    `(time, zone)` pair — exactly what `timetz_out` prints.
+  * **Text-stability needs two checks, not one, and `timestamp` used to fail
+    the second — issue #248 fixed it.** Trellis used to turn a column into
+    text in **two** different ways: per column as `<col>::text`, and — in
+    the live-row reads (`staging::apply`'s `read_live_rows_batch`,
+    `fetch_to_side_rows`, `fetch_relationship_projection_rows` and its
+    reverse-trigger projection read; `staging::quarantine`'s sweep; and the
+    `RETURNING to_jsonb(t.*)::text` old-image captures issue #196 relies on)
+    — a whole row at once via `to_jsonb(t.*)` + `jsonb_each_text`. `to_jsonb`
     does not call the type's output function for datetimes; it uses
-    `jsonb`'s own ISO-8601 writer. One row, one session, both renderings:
+    `jsonb`'s own ISO-8601 writer. One row, one session, both renderings, as
+    read off a live server *before* #248:
 
     | column | `::text` | `to_jsonb` | |
     |---|---|---|---|
@@ -257,37 +262,48 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     swept too and all agree — this is a datetime quirk of `to_jsonb`, not a
     general property of it.)
 
-    The `T` is not cosmetic: a `timestamp` `GROUP BY` key seeded once
-    through a backfill and once through CDC-then-live-read becomes **two
-    target rows for one Postgres group**. It also reaches `MIN`/`MAX`,
-    because those return an input *verbatim* — a fold over `to_jsonb`-read
-    rows can return the `T`-spelled string where a server-side `min()`
-    returns the space-spelled one, which ADR-0013's byte-exact cross-check
-    reports as a divergence. So `timestamp` and `timestamptz` are deferred
-    from **both** the key roles and `MIN`/`MAX` until the `to_jsonb` sites
-    render consistently with `::text` — tracked as **issue #248**. That is a
-    change to the engine's hottest read paths and no other family needs it,
-    so #113 does not attempt it. `trellis::temporal::is_render_consistent` is the gate, and
+    The `T` was not cosmetic: a `timestamp` `GROUP BY` key seeded once
+    through a backfill and once through CDC-then-live-read became **two
+    target rows for one Postgres group** — reproduced during #113's review
+    (`total = 20` where the correct answer was `15`). It also reached
+    `MIN`/`MAX`, because those return an input *verbatim* — a fold over
+    `to_jsonb`-read rows could return the `T`-spelled string where a
+    server-side `min()` returns the space-spelled one, which ADR-0013's
+    byte-exact cross-check would report as a divergence. **Issue #248**
+    closed this by replacing every `to_jsonb(t.*)` call site above with an
+    explicit per-column `jsonb_build_object('<col>', <col>::text, ...)`
+    (`staging::apply::row_as_text_jsonb_sql`, over each table's live
+    `pg_catalog` column list, or the already-known `pk`/field columns for
+    `apply_target`'s own old-image capture), so every renderer the engine
+    itself uses now agrees on `timestamp`'s text — bare Postgres
+    `to_jsonb(t.*)` still spells it with a `T`, but nothing in Trellis calls
+    it that way any more. `trellis::temporal::is_render_consistent` is the
+    gate, now admitting `timestamp`, and
     `defs_temporal.rs`'s `to_jsonb_and_text_agree_for_every_admitted_key_type`
-    sweeps the **whole** key allowlist so the next family cannot repeat it.
+    sweeps the **whole** key allowlist so a *future* family can't repeat the
+    same gap unnoticed.
 
     Note the shape: one value, two renderers, no arbiter — the same defect
-    as issue #246, one layer in (there it is the pool versus the walsender).
-  * **`timestamptz` has a second, independent blocker, and pinning
-    `TimeZone` is not the fix.** Pinning `TimeZone = 'UTC'` in
-    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make its `::text`
-    rendering a bijection on the instant, and Trellis owning all its own
-    connections means the blast radius on application sessions is nil. It
-    still fails, because logical-decoding output is produced by the output
-    function running in the **walsender**, under the walsender's GUCs, and
-    `pgwire_replication`'s `ReplicationConfig` (v0.4) exposes no way to send
-    startup runtime parameters. Today the two agree by falling back to the
-    same server default; pinning the pool alone would trade that accidental
-    symmetry for a guaranteed asymmetry on every non-UTC server. Tracked as
-    **issue #246**, which also covers the pre-existing exposure for the
-    `DateStyle`/`bytea_output` pins. (Postgres itself honours startup
-    `options` on a replication connection — `PGOPTIONS='-c timezone=UTC'`
-    works with `pg_recvlogical` — so this is a library gap, not a wall.)
+    *shape* as issue #246, one layer in (there it is the pool versus the
+    walsender; here it was `::text` versus `to_jsonb` inside one process).
+    Closing #248 does not touch #246 — different renderer pairs — which is
+    why `timestamptz` needs #246 too, independently (below).
+  * **`timestamptz` has a second, independent blocker that #248 does not
+    touch, and pinning `TimeZone` is not the fix.** Pinning
+    `TimeZone = 'UTC'` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make
+    its `::text` rendering a bijection on the instant, and Trellis owning
+    all its own connections means the blast radius on application sessions
+    is nil. It still fails, because logical-decoding output is produced by
+    the output function running in the **walsender**, under the walsender's
+    GUCs, and `pgwire_replication`'s `ReplicationConfig` (v0.4) exposes no
+    way to send startup runtime parameters. Today the two agree by falling
+    back to the same server default; pinning the pool alone would trade that
+    accidental symmetry for a guaranteed asymmetry on every non-UTC server.
+    Tracked as **issue #246** (still open as of #248 landing), which also
+    covers the pre-existing exposure for the `DateStyle`/`bytea_output`
+    pins. (Postgres itself honours startup `options` on a replication
+    connection — `PGOPTIONS='-c timezone=UTC'` works with `pg_recvlogical`
+    — so this is a library gap, not a wall.)
 
     This gives the rule for adding a fifth GUC to that constant: each one
     currently pinned is **output-identical to a stock server's default**, so
@@ -299,11 +315,11 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `'24 hours'::interval = '1 day'::interval` is **true** while their
     `::text` differs — one value, many renderings, structurally the float
     `-0`/`0` defect with a dense equivalence class instead of a single
-    pathological pair. Unlike `timestamp`'s problem, no renderer
-    reconciliation helps; #110's typed key index would, by comparing
+    pathological pair. Unlike `timestamp`'s old problem, no renderer
+    reconciliation helps here; #110's typed key index would, by comparing
     decoded values.
-  * **`MIN`/`MAX` land for `date`/`time`/`timetz`.** `interval` is refused
-    on a *third*, separate ground: `max(v)` over `{'1 day', '24 hours',
+  * **`MIN`/`MAX` land for `date`/`time`/`timetz`/`timestamp`.** `interval`
+    is refused on a *third*, separate ground: `max(v)` over `{'1 day', '24 hours',
     '2 hours'}` returns `24:00:00` scanning one way and `1 day` the other,
     on a live server, because `interval_larger` is a left fold over a tie
     that is not byte-identical. Postgres's own answer is not a function of

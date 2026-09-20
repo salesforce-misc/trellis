@@ -1,6 +1,9 @@
 //! End-to-end tests for issue #113's temporal types (`date`, `time`,
 //! `timetz`, `timestamp`, `timestamptz`, `interval`) against a real,
-//! ephemeral Postgres via `testkit::TestCluster`.
+//! ephemeral Postgres via `testkit::TestCluster` — including issue #248's
+//! fix, which reconciled `to_jsonb`'s row-body renderer with `::text` and
+//! re-admitted `timestamp` to every key/`MIN`/`MAX` role `date`/`time`/
+//! `timetz` already held.
 //!
 //! # Why these run against a live server
 //!
@@ -17,11 +20,12 @@
 //!    exact property raw-`::text` key matching needs. Demonstrated by
 //!    asking the server to `group by` a spread of values and comparing the
 //!    group count against the distinct-`::text` count.
-//! 2. **The two refusals, demonstrated not asserted.** `interval` is
-//!    refused every key role because `'24 hours' = '1 day'` is **true**
+//! 2. **The two remaining refusals, demonstrated not asserted.** `interval`
+//!    is refused every key role because `'24 hours' = '1 day'` is **true**
 //!    while their `::text` differs; the test reads both facts out of the
 //!    server. `timestamptz` is refused because its rendering moves with
-//!    `TimeZone`, and the test shows that too.
+//!    `TimeZone` on a walsender Trellis cannot pin (issue #246, independent
+//!    of #248), and the test shows that too.
 //! 3. **Comparison order.** `trellis::temporal::compare` must agree with
 //!    each family's own `<`/`=`/`>` over a grid that includes BC years,
 //!    `infinity`, sub-second fractions, `24:00:00`, and `timetz`'s
@@ -37,6 +41,16 @@
 //!    for two different scan orders, so it is not a function of its input
 //!    and ADR-0013's byte-exact recompute cross-check could never settle
 //!    it.
+//! 7. **Issue #248's fix, both directly and end-to-end.**
+//!    `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
+//!    exercises the actual replacement renderer
+//!    (`staging::apply::row_as_text_jsonb_sql`) against `::text`, and
+//!    `a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two`
+//!    reproduces #113's review finding end-to-end through a real drain —
+//!    one Postgres `GROUP BY` group, one target row, seeded partly through
+//!    an image-bearing change and partly through a bare, image-less
+//!    recompute trigger (the shape that used to force
+//!    `staging::apply::read_live_rows_batch`'s now-fixed live refetch).
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_typeof`, plain `select ... group by ...`, plain `::text` —
@@ -677,6 +691,7 @@ async fn temporal_aggregate_result_types_match_pg_typeof() {
         ("d", "date"),
         ("tm", "time without time zone"),
         ("tmtz", "time with time zone"),
+        ("ts", "timestamp without time zone"),
     ] {
         for aggregate in ["min", "max"] {
             let pg =
@@ -703,17 +718,20 @@ async fn temporal_aggregate_result_types_match_pg_typeof() {
         Some(ValueType::Other(PgType::Interval))
     );
 
-    // `timestamp`/`timestamptz` *do* have a Postgres `min`/`max`, but the
-    // registry still refuses them — not because Postgres lacks the
-    // aggregate, but because `MIN`/`MAX` returns an input verbatim and the
-    // engine can hold two spellings of one `timestamp` (see
-    // `to_jsonb_and_text_agree_for_every_admitted_key_type`).
-    for column in ["ts", "tstz"] {
+    // `timestamptz` *does* have a Postgres `min`/`max`, but the registry
+    // still refuses it — not because Postgres lacks the aggregate, but
+    // because `MIN`/`MAX` returns an input verbatim and issue #246 (pool vs.
+    // walsender `TimeZone`, independent of #248) means the engine can still
+    // render two spellings of one `timestamptz`. `timestamp` used to share
+    // this exact refusal for the `to_jsonb`-vs-`::text` reason issue #248
+    // fixed (see `to_jsonb_and_text_agree_for_every_admitted_key_type`), so
+    // it's covered in the accepted loop above instead now.
+    for column in ["tstz"] {
         for aggregate in ["MIN", "MAX"] {
             assert_eq!(
                 trellis::defs::registry::aggregate_result_type(aggregate, source_columns()[column]),
                 None,
-                "{aggregate}({column}) is deferred until the to_jsonb sites agree with ::text"
+                "{aggregate}({column}) is deferred until issue #246 resolves"
             );
         }
     }
@@ -1094,29 +1112,128 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
             *expect_agreement,
             "{pg_type}: ::text = {via_text:?}, to_jsonb = {jsonb:?}"
         );
+    }
 
-        // And a type that renders two ways must not be admitted to any
-        // text-identity role — the assertion that would have caught #113's
-        // first cut admitting `timestamp`.
-        if !expect_agreement {
-            let pg_type_enum = if *pg_type == "timestamp" {
-                PgType::Timestamp
-            } else {
-                PgType::TimestampTz
-            };
-            assert!(
-                !temporal::is_render_consistent(pg_type_enum),
-                "{pg_type} renders two ways, so is_render_consistent must say so"
-            );
-            assert!(
-                !temporal::is_text_stable(pg_type_enum),
-                "{pg_type} renders two ways and must not be an admitted key type"
-            );
-            assert!(
-                !temporal::supports_min_max(pg_type_enum),
-                "{pg_type} renders two ways, so MIN/MAX cannot be byte-reproducible"
-            );
-        }
+    // Raw `to_jsonb(t.*)` still disagrees with `::text` for `timestamp` (see
+    // `c_ts` above, `expect_agreement = false`) — that is a fact about bare
+    // Postgres, unaffected by issue #248, and it will stay true forever.
+    // What #248 changed is that **nothing inside Trellis calls raw
+    // `to_jsonb(t.*)` for a row read any more** (see
+    // `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`,
+    // below, which cross-checks the actual renderer
+    // `staging::apply::row_as_text_jsonb_sql` now uses), so `timestamp` is
+    // admitted here despite this raw-`to_jsonb` disagreement persisting.
+    // `timestamptz` is not admitted, for the entirely separate, still-open
+    // issue #246 reason (pool vs. walsender `TimeZone`, not `to_jsonb` vs.
+    // `::text`). `interval` is admitted here (raw `to_jsonb` agrees with
+    // `::text` for it) but still refused every key role, because it fails
+    // the *other* half of `is_text_stable` — equal values render
+    // differently (`'1 day'` vs `'24 hours'`), which no renderer
+    // reconciliation can fix.
+    assert!(temporal::is_render_consistent(PgType::Timestamp));
+    assert!(temporal::is_text_stable(PgType::Timestamp));
+    assert!(temporal::supports_min_max(PgType::Timestamp));
+
+    assert!(!temporal::is_render_consistent(PgType::TimestampTz));
+    assert!(!temporal::is_text_stable(PgType::TimestampTz));
+    assert!(!temporal::supports_min_max(PgType::TimestampTz));
+
+    assert!(temporal::is_render_consistent(PgType::Interval));
+    assert!(!temporal::is_text_stable(PgType::Interval));
+    assert!(!temporal::supports_min_max(PgType::Interval));
+}
+
+/// Issue #248's actual fix, exercised directly against a live server: the
+/// renderer Trellis now uses in place of `to_jsonb(t.*)` —
+/// `staging::apply::live_row_columns` (the live column list) plus
+/// `staging::apply::row_as_text_jsonb_sql` (the explicit per-column
+/// `jsonb_build_object('<col>', <col>::text, ...)` built from it) — agrees
+/// with `::text` for **every** temporal family, `timestamp` and
+/// `timestamptz` included.
+///
+/// This is the direct counterpart to
+/// `to_jsonb_and_text_agree_for_every_admitted_key_type` above, but it
+/// exercises the actual SQL Trellis's read paths now build, rather than bare
+/// `to_jsonb(t.*)`. It deliberately covers `timestamptz` too, even though
+/// `timestamptz` still holds no key/MIN-MAX role: that refusal is issue
+/// #246 (a *different* renderer pair — the pool vs. the walsender — which
+/// this fix does not and cannot touch), not a residual `to_jsonb`-vs-`::text`
+/// disagreement. Proving the renderer itself is fully reconciled here is
+/// what makes it legible, from the test suite alone, that `timestamptz`'s
+/// continued refusal in `trellis::temporal` is a deliberate, independent
+/// deferral rather than an oversight.
+#[tokio::test]
+async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family() {
+    use trellis::staging::apply;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("c_date", "date", "2024-06-15"),
+        ("c_time", "time", "12:34:56"),
+        ("c_timetz", "timetz", "12:34:56+00"),
+        ("c_ts", "timestamp", "2024-06-15 12:34:56"),
+        ("c_tstz", "timestamptz", "2024-06-15 12:34:56+00"),
+        ("c_iv", "interval", "1 day 2 hours"),
+    ];
+
+    let ddl = COLUMNS
+        .iter()
+        .map(|(name, pg_type, _)| format!("{name} {pg_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = COLUMNS
+        .iter()
+        .map(|(_, _, literal)| format!("'{literal}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .batch_execute(&format!("create table engine_renderer_sweep ({ddl})"))
+        .await
+        .expect("create sweep table");
+    client
+        .batch_execute(&format!(
+            "insert into engine_renderer_sweep values ({values})"
+        ))
+        .await
+        .expect("seed sweep row");
+
+    // The exact call shape `read_live_rows_batch`/`fetch_to_side_rows`/etc.
+    // now use: introspect the live column list, then build the explicit
+    // `jsonb_build_object` from it.
+    let row_columns = apply::live_row_columns(&client, "engine_renderer_sweep")
+        .await
+        .expect("introspect columns");
+    let doc_expr = apply::row_as_text_jsonb_sql("t", &row_columns);
+    let via_engine: HashMap<String, String> = client
+        .query(
+            &format!(
+                "select e.key, e.value from engine_renderer_sweep t \
+                 cross join lateral jsonb_each_text({doc_expr}) e"
+            ),
+            &[],
+        )
+        .await
+        .expect("engine renderer sweep")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+
+    for (name, pg_type, _) in COLUMNS {
+        let via_text: String = client
+            .query_one(
+                &format!("select {name}::text from engine_renderer_sweep"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("::text for {name}: {e}"))
+            .get(0);
+        assert_eq!(
+            via_text, via_engine[*name],
+            "{pg_type}: the engine's own row renderer must agree with ::text (issue #248)"
+        );
     }
 }
 
@@ -1129,9 +1246,10 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
 /// `catalog::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while `timestamptz`
 /// and `interval` are refused.
 ///
-/// This is the headline change of #113, and the split is the point: the
-/// matrix had all six marked `🎯 typed index`, and four of them never
-/// needed the index at all.
+/// This is the headline change of #113 (`date`/`time`/`timetz`) plus #248
+/// (`timestamp`, once its `to_jsonb`-vs-`::text` divergence was fixed), and
+/// the split is the point: the matrix had all six marked `🎯 typed index`,
+/// and four of them never needed the index at all.
 #[tokio::test]
 async fn temporal_join_keys_are_admitted_per_family() {
     let cluster = TestCluster::start();
@@ -1164,6 +1282,13 @@ async fn temporal_join_keys_are_admitted_per_family() {
         ("r_date", "d", "p_date"),
         ("r_tm", "tm", "p_tm"),
         ("r_tmtz", "tmtz", "p_tmtz"),
+        // `timestamp` used to be refused for the #113 review's reason: it is
+        // a bijection under `::text` but `to_jsonb` spelled it with an
+        // ISO-8601 `T`, and the engine used both renderers. Issue #248 fixed
+        // that (see `to_jsonb_and_text_agree_for_every_admitted_key_type`
+        // and `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
+        // below), so `timestamp` now joins the accepted group.
+        ("r_ts", "ts", "p_ts"),
     ] {
         create_relationship(
             &db.pool,
@@ -1174,11 +1299,10 @@ async fn temporal_join_keys_are_admitted_per_family() {
     }
 
     for (name, from_col, to_table, pg_name) in [
-        // `timestamp` is refused for the #113 review's reason: it is a
-        // bijection under `::text` but `to_jsonb` spells it with an
-        // ISO-8601 `T`, and the engine uses both renderers. See
-        // `to_jsonb_and_text_agree_for_every_admitted_key_type` below.
-        ("r_ts", "ts", "p_ts", "timestamp without time zone"),
+        // `timestamptz` is refused for the entirely separate, still-open
+        // issue #246 reason (pool vs. walsender `TimeZone`), not the #248
+        // `to_jsonb`-vs-`::text` divergence `timestamp` used to share with
+        // it.
         ("r_tstz", "tstz", "p_tstz", "timestamp with time zone"),
         ("r_iv", "iv", "p_iv", "interval"),
     ] {
@@ -1230,7 +1354,10 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
     // `format_type` renders this `time(2) with time zone`, which the old
     // `split('(')` truncated to `time`. (`timestamp(3)` above shows the
     // rendering hazard itself; `timetz` is what actually exercises the fix
-    // end-to-end, since `timestamp` is not an admitted key type.)
+    // end-to-end. `timestamp` is an admitted key type since #248, but this
+    // test predates that and there's no need to duplicate coverage here —
+    // `temporal_join_keys_are_admitted_per_family` already covers plain
+    // `timestamp`.)
     client
         .batch_execute(
             "create table p3 (k timetz(2) primary key); \
@@ -1249,7 +1376,7 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
 /// split, and the rejection names the column.
 #[test]
 fn the_group_by_key_gate_follows_the_same_split() {
-    for column in ["d", "tm", "tmtz"] {
+    for column in ["d", "tm", "tmtz", "ts"] {
         let def = parse(&format!(
             "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
         ))
@@ -1258,7 +1385,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
             .unwrap_or_else(|e| panic!("{column} must be accepted as a GROUP BY key: {e}"));
     }
 
-    for column in ["ts", "tstz", "iv"] {
+    for column in ["tstz", "iv"] {
         let def = parse(&format!(
             "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
         ))
@@ -1673,4 +1800,185 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
         Some("1 year 2 mons 3 days 05:05:06"),
         "crew 1's interval sum"
     );
+}
+
+/// Issue #113's review finding, reproduced end-to-end and pinned as a
+/// regression: a `timestamp` `GROUP BY` group whose two source rows reach
+/// the engine through *different* row-decode paths must still fold into
+/// **one** target row, not two.
+///
+/// Before issue #248, `staging::apply::read_live_rows_batch` decoded a
+/// live-refetched row via `to_jsonb(t.*)`, which spells a `timestamp`
+/// `2024-06-15T12:34:56` — a `T` where `::text` (and a real CDC image) renders
+/// a space. `staging::apply_aggregate::derive_group_key` reads a change's
+/// `GROUP BY` column straight off the decoded `Row`, so a group touched once
+/// through an ordinary image-bearing change (space-spelled) and once through
+/// a live refetch (`T`-spelled, pre-#248) staged as *two* distinct group-key
+/// strings for what is, in Postgres, one single group — the `total = 20`
+/// instead of `total = 15` finding from #113's review.
+///
+/// This reproduces exactly that shape:
+///
+/// * Row 1 is staged as an ordinary image-bearing `insert` (a real CDC
+///   image's own shape — its `grp` text is already canonical, space-spelled).
+/// * Row 2 is staged as a bare, image-less `StagedChange::Recompute`
+///   (`op = 'recompute'`, both images `NULL` — the shape backfill/reverse-
+///   propagation/definition-re-derive all use, per `append.rs`'s own doc
+///   comment). `compute()` has no image to decode for it, so it lands in
+///   `live_refetch_indices` and is decoded via
+///   `staging::apply::read_live_rows_batch` — the exact call site issue #248
+///   fixed.
+///
+/// Both rows share the identical `grp` instant. If the two decode paths ever
+/// disagree on its text again, this test fails by finding two rows in
+/// `totals` (or a wrong sum) instead of one row summing both contributions —
+/// and the *only* way to make it pass by accident (rather than by the fix
+/// being correct) would be for Postgres itself to stop distinguishing the
+/// two `to_jsonb` spellings, which is not something this crate controls.
+#[tokio::test]
+async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two() {
+    use tokio_postgres::types::PgLsn;
+    use trellis::defs::{create_aggregate_target_table, create_definition};
+    use trellis::staging::{StagedWatermark, apply, seal};
+
+    const DEF_SQL: &str =
+        "TRANSFORM totals FROM events GROUP BY grp SELECT grp AS grp, SUM(amount) AS total";
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table events ( \
+               id integer primary key, grp timestamp, amount numeric); \
+             alter table events replica identity full",
+        )
+        .await
+        .expect("create source table");
+
+    let columns = HashMap::from([
+        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ("grp".to_string(), ValueType::Other(PgType::Timestamp)),
+        ("amount".to_string(), ValueType::Numeric),
+    ]);
+    let def = parse(DEF_SQL).expect("parse");
+    validate(&def, &columns, &HashMap::new()).expect("validate");
+    create_definition(&db.pool, DEF_SQL, &columns)
+        .await
+        .expect("create definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &columns)
+        .await
+        .expect("create aggregate target table");
+
+    // Both rows name the identical Postgres group: the same `grp` instant,
+    // down to the microsecond.
+    client
+        .batch_execute(
+            "insert into events (id, grp, amount) values \
+               (1, '2024-06-15 12:34:56', 10), \
+               (2, '2024-06-15 12:34:56', 5)",
+        )
+        .await
+        .expect("seed source rows");
+
+    async fn stage_image(client: &Client, segment: &str, key: &str, new_image: &str) {
+        let src_table = format!("{DEFAULT_SCHEMA}.events");
+        client
+            .execute(
+                &format!(
+                    "insert into {segment} \
+                     (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                     values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)"
+                ),
+                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));
+    }
+
+    async fn stage_bare_recompute(client: &Client, segment: &str, key: &str) {
+        let src_table = format!("{DEFAULT_SCHEMA}.events");
+        client
+            .execute(
+                &format!(
+                    "insert into {segment} \
+                     (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                     values ($1, $2, 'recompute', null, null, null, 0)"
+                ),
+                &[&src_table, &key],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
+    }
+
+    async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq)
+            .await
+            .expect("seal phase 2");
+        apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "temporal_worker",
+            1,
+            "trellis_defs_temporal_issue_113_regression",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("drain_once")
+        .expect("drain_once must claim and drain something");
+    }
+
+    // Row 1: an ordinary image-bearing insert, exactly the shape real CDC
+    // produces — canonical, space-spelled `timestamp` text.
+    stage_image(
+        &client,
+        "seg_0",
+        "1",
+        r#"{"grp":"2024-06-15 12:34:56","amount":"10"}"#,
+    )
+    .await;
+    // Row 2: a bare recompute trigger — no image at all — forcing
+    // `read_live_rows_batch`'s live refetch to decode `grp` straight off
+    // Postgres.
+    stage_bare_recompute(&client, "seg_0", "2").await;
+
+    drain_sealed(&mut client, &db.pool).await;
+
+    let rows = client
+        .query("select grp::text, total::text from totals", &[])
+        .await
+        .expect("read totals");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one Postgres GROUP BY group must land as one target row, not two \
+         (issue #113's review finding); got {rows:?}",
+        rows = rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect::<Vec<_>>()
+    );
+    let (got_grp, got_total): (String, String) = (rows[0].get(0), rows[0].get(1));
+    assert_eq!(got_total, "15", "the group's total must be 10 + 5");
+
+    // Cross-check against an independently-authored recompute (ADR-0013):
+    // never against the engine's own renderer.
+    let expected: Vec<(String, String)> = client
+        .query(
+            "select grp::text, sum(amount)::text from events group by grp",
+            &[],
+        )
+        .await
+        .expect("hand-written recompute")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        expected.len(),
+        1,
+        "the source itself has exactly one GROUP BY group"
+    );
+    assert_eq!(expected[0], (got_grp, got_total));
 }

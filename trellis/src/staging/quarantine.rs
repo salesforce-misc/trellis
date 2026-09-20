@@ -1433,12 +1433,20 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let pk_ident = quote_ident(&pk.name);
 
     let client = pool.get().await?;
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `apply::row_as_text_jsonb_sql`'s doc comment for
+    // why: `to_jsonb`'s own ISO-8601 writer renders `timestamp`/`timestamptz`
+    // differently than the `::text` cast this same recompute's evaluator
+    // uses everywhere else, which this rare, operator-driven path is not
+    // exempt from just because it isn't the hot CDC path.
+    let row_columns = apply::live_row_columns(&**client, &def.source_table).await?;
+    let doc_expr = apply::row_as_text_jsonb_sql("t", &row_columns);
     let db_rows = client
         .query(
             &format!(
                 "select {pk_ident}::text as pk_text, e.key, e.value \
                  from {source_ident} t \
-                 cross join lateral jsonb_each_text(to_jsonb(t.*)) e"
+                 cross join lateral jsonb_each_text({doc_expr}) e"
             ),
             &[],
         )

@@ -276,6 +276,25 @@ pub(crate) fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Quotes a plain string as a Postgres string *literal* for safe
+/// interpolation into SQL text — [`quote_ident`]'s counterpart for a value
+/// rather than an identifier (doubling embedded `'` characters, the standard
+/// `standard_conforming_strings = on` escaping every connection this crate
+/// opens already uses).
+///
+/// Issue #248: a column name can't be bound as an ordinary query parameter
+/// (it isn't a value), but it still needs to appear as a `jsonb_build_object`
+/// *key* — a text literal, not a bare identifier — when
+/// `staging::apply`/`staging::quarantine` build an explicit per-column
+/// `jsonb_build_object('<col>', <col>::text, ...)` in place of `to_jsonb(t.*)`
+/// (see `staging::apply::row_as_text_jsonb_sql`). The column names it quotes
+/// there come from live `pg_catalog` introspection, not end-user input, but
+/// they're quoted defensively anyway, matching [`quote_ident`]'s own stance
+/// on `config.schema`.
+pub(crate) fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +303,12 @@ mod tests {
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("trellis"), "\"trellis\"");
         assert_eq!(quote_ident("weird\"schema"), "\"weird\"\"schema\"");
+    }
+
+    #[test]
+    fn quote_literal_escapes_embedded_quotes() {
+        assert_eq!(quote_literal("created_at"), "'created_at'");
+        assert_eq!(quote_literal("weird'column"), "'weird''column'");
     }
 
     #[test]

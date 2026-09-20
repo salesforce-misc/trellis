@@ -2550,10 +2550,11 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// `crate::float::compare`, not a new encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
-/// `timestamp`, `timestamptz` and `interval` (issue #113; see the temporal
-/// block below for the three distinct reasons those stayed off),
-/// `boolean`, `bytea`, `json`/`jsonb`, or any unknown type — is rejected as
-/// a join key.
+/// `timestamptz` and `interval` (issue #113 admitted `timestamp` alongside
+/// `date`/`time`/`timetz` once issue #248 fixed its render-consistency
+/// defect; see the temporal block below for why `timestamptz` and `interval`
+/// stayed off, for two distinct remaining reasons), `boolean`, `bytea`,
+/// `json`/`jsonb`, or any unknown type — is rejected as a join key.
 const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
@@ -2569,11 +2570,11 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "uuid",
     "text",
     "character varying",
-    // Issue #113: three of the six temporal families, on the same
+    // Issue #113: four of the six temporal families, on the same
     // "text-stability is a property of the rendering" reasoning `oid` was
     // admitted under. `docs/type-support.md` had all six marked `🎯 typed
     // index`, assuming #110's typed key index was the prerequisite; for
-    // these three it is not, and the evidence is per-family rather than
+    // these four it is not, and the evidence is per-family rather than
     // per-block — see `crate::temporal`'s module doc for the live queries.
     //
     // `date_out` under the already-pinned `DateStyle = 'ISO, YMD'`
@@ -2592,28 +2593,35 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // the stored `(time, zone)` pair, which is exactly what `timetz_out`
     // prints.
     //
-    // Three deliberate absences, for three different reasons:
+    // `timestamp without time zone` is a bijection under `::text` too, and
+    // it used to be refused anyway: `::text` was not the engine's only
+    // renderer. The live-row reads (`staging::apply`'s
+    // `read_live_rows_batch`/`fetch_to_side_rows`/
+    // `fetch_relationship_projection_rows`, among others) used to build row
+    // bodies with `to_jsonb(t.*)`, which renders a `timestamp` through
+    // `jsonb`'s ISO-8601 writer: `2024-06-15T12:34:56`, not
+    // `2024-06-15 12:34:56`. A key seeded once each way became two target
+    // rows for one Postgres group. Issue #248 fixed that by replacing every
+    // such `to_jsonb(t.*)` call site with an explicit per-column
+    // `jsonb_build_object` rendered the same way `::text` is
+    // (`staging::apply::row_as_text_jsonb_sql`), which is why `timestamp`
+    // now joins `date`/`time`/`timetz` here — see
+    // `crate::temporal::is_render_consistent`.
     //
-    // * `timestamp without time zone` — a bijection under `::text`, but
-    //   `::text` is not the engine's only renderer. The live-row reads
-    //   (`staging::apply`'s `read_live_rows_batch`/`fetch_to_side_rows`/
-    //   `fetch_relationship_projection_rows`) build row bodies with
-    //   `to_jsonb(t.*)`, which renders a `timestamp` through `jsonb`'s
-    //   ISO-8601 writer: `2024-06-15T12:34:56`, not `2024-06-15 12:34:56`.
-    //   A key seeded once each way becomes two target rows for one Postgres
-    //   group. `date`/`time`/`timetz` are byte-identical under both
-    //   renderers, which is why they are here and it is not — see
-    //   `crate::temporal::is_render_consistent`, and issue #248 for the
-    //   unlock.
-    // * `timestamp with time zone` — both of the above, plus a rendering
-    //   that moves with a `TimeZone` Trellis cannot pin on the walsender
-    //   (issue #246).
+    // Two remaining deliberate absences, for two different reasons:
+    //
+    // * `timestamp with time zone` — issue #248 fixed its own two-renderer
+    //   defect the same way it fixed `timestamp`'s, but `timestamptz` has a
+    //   *second*, independent one #248 does not touch: its rendering moves
+    //   with a `TimeZone` Trellis cannot pin on the walsender (issue #246,
+    //   still open).
     // * `interval` — `'24 hours'` and `'1 day'` are one value with two
     //   renderings. The float `-0`/`0` defect; no GUC and no renderer
     //   reconciliation fixes it, though #110's typed key index would.
     "date",
     "time without time zone",
     "time with time zone",
+    "timestamp without time zone",
 ];
 
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,

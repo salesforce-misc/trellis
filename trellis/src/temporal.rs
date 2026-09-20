@@ -41,12 +41,14 @@
 //!   `date`s render identically, because a `date` *is* its day number and
 //!   the rendering is a bijection on it. No GUC other than `DateStyle`
 //!   participates.
-//! * **`timestamp` — a bijection under `::text`, but still refused**, because
-//!   `::text` is not the engine's only renderer. `timestamp_out` under ISO is
-//!   as well-behaved as `date_out` (`HH:MM:SS` plus a trailing-zero-trimmed
-//!   fraction — `12:34:56.1`, never `12:34:56.100000`, which is exactly what
-//!   makes it injective). It fails the *second* requirement instead; see
-//!   "Two renderers, and `timestamp` fails the second one" below.
+//! * **`timestamp` — a bijection under `::text`, and now admitted.**
+//!   `timestamp_out` under ISO is as well-behaved as `date_out` (`HH:MM:SS`
+//!   plus a trailing-zero-trimmed fraction — `12:34:56.1`, never
+//!   `12:34:56.100000`, which is exactly what makes it injective). It used to
+//!   fail the *second* requirement — see "Two renderers, and `timestamp`'s
+//!   issue #248 fix" below — which issue #248 closed by making every
+//!   `to_jsonb`-based row decode in the engine render each column the same
+//!   way `::text` does, rather than pinning `timestamp` down further.
 //! * **`time` — stable, and not even `DateStyle`-dependent.** `time_out`
 //!   emits `HH:MM:SS[.f…]` identically under `ISO`, `SQL`, `Postgres` and
 //!   `German` (verified live). `24:00:00` is a distinct legal value from
@@ -71,17 +73,20 @@
 //!   a text-matched key, with or without #110's typed key index changing
 //!   the story (the index *would* fix it; `IntervalStyle` would not).
 //!
-//! ## Two renderers, and `timestamp` fails the second one
+//! ## Two renderers, and `timestamp`'s issue #248 fix
 //!
 //! Everything above measures one renderer: `<col>::text`. That is necessary
-//! and it is not sufficient, because **Trellis turns columns into text in
-//! two different ways.** Most paths cast per column, but the live-row reads
-//! build a whole row body at once — `to_jsonb(t.*)` followed by
-//! `jsonb_each_text` — in `staging::apply`'s `read_live_rows_batch`,
-//! `fetch_to_side_rows` and `fetch_relationship_projection_rows`, and in
-//! `staging::quarantine`'s column sweep. `to_jsonb` does not call the type's
-//! output function for datetimes; it uses `jsonb`'s own ISO-8601 writer. Read
-//! off a live server, one row, one session, both renderings side by side:
+//! and it used not to be sufficient, because **Trellis used to turn columns
+//! into text in two different ways.** Most paths cast per column, but the
+//! live-row reads used to build a whole row body at once —
+//! `to_jsonb(t.*)` followed by `jsonb_each_text` — in `staging::apply`'s
+//! `read_live_rows_batch`, `fetch_to_side_rows`, `fetch_relationship_projection_rows`
+//! and its reverse-trigger projection read, in `staging::quarantine`'s
+//! column sweep, and in the `RETURNING to_jsonb(t.*)::text` old-image
+//! captures `staging::apply`/`staging::apply_aggregate` use for issue #196.
+//! `to_jsonb` does not call the type's output function for datetimes; it uses
+//! `jsonb`'s own ISO-8601 writer. Read off a live server, one row, one
+//! session, both renderings side by side:
 //!
 //! ```text
 //!  column       ::text                   to_jsonb
@@ -99,22 +104,33 @@
 //!
 //! The `T` is not cosmetic. A `timestamp` `GROUP BY` key seeded once through
 //! a backfill (`::text`) and once through CDC-then-live-read (`to_jsonb`)
-//! becomes **two target rows for one Postgres group**. And it reaches
-//! `MIN`/`MAX` as well as the key roles, because those return one of their
-//! inputs *verbatim*: a fold over to-side rows fetched by `fetch_to_side_rows`
-//! can return the `T`-spelled string where a server-side `min()` returns the
-//! space-spelled one, and ADR-0013's byte-exact cross-check reports that as a
-//! divergence. So [`is_render_consistent`] gates both roles.
+//! used to become **two target rows for one Postgres group** — reproduced
+//! during #113's review: a `timestamp` group key seeded both ways yielded
+//! `total = 20` where the correct answer is `15`. It also used to reach
+//! `MIN`/`MAX`, because those return one of their inputs *verbatim*: a fold
+//! over to-side rows fetched by `fetch_to_side_rows` could return the
+//! `T`-spelled string where a server-side `min()` returns the space-spelled
+//! one, which ADR-0013's byte-exact cross-check would report as a
+//! divergence.
 //!
-//! `date`, `time` and `timetz` are unaffected and ship with their full key
-//! and `MIN`/`MAX` roles. `timestamp` and `timestamptz` are deferred until
-//! the `to_jsonb` sites render consistently with `::text` — **issue #248**,
-//! deliberately not attempted here, since those are the engine's hottest and
-//! most safety-critical read paths and no other family needs them touched.
+//! **Issue #248 fixed this** by replacing every `to_jsonb(t.*)` call site
+//! above with an explicit per-column `jsonb_build_object('<col>',
+//! <col>::text, ...)` (`staging::apply::row_as_text_jsonb_sql`, over each
+//! table's live `pg_catalog` column list, or — for `apply_target`'s old-image
+//! capture — the target's own known `pk` + field columns), so every code path
+//! Trellis itself uses to turn a row into text now renders `timestamp`
+//! exactly the way `::text` does. Postgres's own bare `to_jsonb(t.*)` still
+//! spells a raw timestamp with a `T` (that is a Postgres builtin, not
+//! something this crate can or needs to change) — the fix is that nothing in
+//! the engine calls it that way anymore. `date`, `time`, `timetz` and now
+//! `timestamp` ship with their full key and `MIN`/`MAX` roles.
+//! `timestamptz` remains deferred, for the independent reason below.
 //!
-//! Note the shape of this is issue #246's, one layer in: one value, two
-//! renderers, no arbiter. There it is the pool versus the walsender; here it
-//! is `::text` versus `to_jsonb` inside a single process.
+//! Note the shape of this defect was issue #246's, one layer in: one value,
+//! two renderers, no arbiter. There it is the pool versus the walsender; here
+//! it was `::text` versus `to_jsonb` inside a single process. Closing #248
+//! does not touch #246 at all — they are different renderer pairs — which is
+//! exactly why `timestamptz` still needs #246 separately (see below).
 //!
 //! ## Why `timestamptz` is still refused
 //!
@@ -148,6 +164,14 @@
 //! replication transport that can pin session GUCs (then `TimeZone` joins
 //! the constant and `timestamptz` becomes stable exactly like `date` did),
 //! or #110's typed key index.
+//!
+//! This is tracked as **issue #246** (walsender/pool GUC-pinning gap),
+//! deliberately kept separate from #248: closing #248 made `timestamp`'s
+//! *internal* two-renderer problem go away, but `timestamptz`'s problem is a
+//! *different* two-renderer pair (the pool vs. the walsender) that #248's fix
+//! cannot touch at all. #246 is still open and undecided as of #248 landing
+//! — `timestamptz` stays refused here until it resolves one way or the
+//! other, not because of any remaining doubt about #248's own fix.
 //!
 //! Note the same asymmetry is a pre-existing, latent hazard for `DateStyle`
 //! and `bytea_output`. It does not bite there because the pinned values
@@ -275,16 +299,19 @@ pub const fn is_temporal(pg_type: PgType) -> bool {
 /// the same bijection on every renderer inside the engine** — the property
 /// a raw-`::text`-matched key role actually requires.
 ///
-/// Both halves are load-bearing and the second one is the trap. The first
-/// half (`a::text = b::text` agrees with the type's own `=`) is what this
-/// module's doc comment establishes per family, and by that measure `date`,
-/// `timestamp`, `time` and `timetz` all pass. The second half — that every
-/// code path which turns a column into text produces *that same* string —
-/// is what `timestamp` fails, and it is why it is absent below.
+/// Both halves are load-bearing and the second one used to be the trap. The
+/// first half (`a::text = b::text` agrees with the type's own `=`) is what
+/// this module's doc comment establishes per family, and by that measure
+/// `date`, `timestamp`, `time` and `timetz` all pass. The second half — that
+/// every code path which turns a column into text produces *that same*
+/// string — is what `timestamp` used to fail, before issue #248 made every
+/// internal renderer agree; it's why `timestamp` is now present below
+/// alongside `date`/`time`/`timetz`, and why `timestamptz` still is not (it
+/// fails the second half for the separate, still-open issue #246 reason).
 ///
-/// See "Two renderers, and `timestamp` fails the second one" in this
-/// module's doc comment. `is_render_consistent` is the predicate for the
-/// second half alone; this one is the conjunction, and the
+/// See "Two renderers, and `timestamp`'s issue #248 fix" in this module's
+/// doc comment. `is_render_consistent` is the predicate for the second half
+/// alone; this one is the conjunction, and the
 /// `admission_is_exactly_the_conjunction_of_both_halves` test pins that it
 /// stays one.
 pub const fn is_text_stable(pg_type: PgType) -> bool {
@@ -309,14 +336,16 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 
 /// Half two: every renderer the engine uses agrees on `pg_type`'s text.
 ///
-/// Trellis has **two** internal renderers, not one. Most paths use
-/// `<col>::text`, but the live-row reads build a whole row body at once with
-/// `to_jsonb(t.*)` plus `jsonb_each_text` — `staging::apply`'s
-/// `read_live_rows_batch`, `fetch_to_side_rows` and
-/// `fetch_relationship_projection_rows`, and `staging::quarantine`'s column
-/// sweep. `to_jsonb` renders a `timestamp` through `jsonb`'s own
-/// ISO-8601 datetime writer, not through `timestamp_out`, and the two
-/// disagree (read off a live server):
+/// Trellis used to have **two** internal renderers, not one. Most paths use
+/// `<col>::text`, but the live-row reads used to build a whole row body at
+/// once with `to_jsonb(t.*)` plus `jsonb_each_text` — `staging::apply`'s
+/// `read_live_rows_batch`, `fetch_to_side_rows`,
+/// `fetch_relationship_projection_rows` and its reverse-trigger projection
+/// read, `staging::quarantine`'s column sweep, and the
+/// `RETURNING to_jsonb(t.*)::text` old-image captures issue #196 relies on.
+/// `to_jsonb` renders a `timestamp` through `jsonb`'s own ISO-8601 datetime
+/// writer, not through `timestamp_out`, and the two used to disagree (read
+/// off a live server):
 ///
 /// ```text
 ///  column     ::text                        to_jsonb
@@ -328,10 +357,10 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 ///  timestamptz 2024-06-15 12:34:56+00       2024-06-15T12:34:56+00:00  DIFFERS
 /// ```
 ///
-/// The `T` separator is not cosmetic. A `timestamp` key seeded once through
+/// The `T` separator was not cosmetic. A `timestamp` key seeded once through
 /// a backfill (`::text`) and once through CDC-then-live-read (`to_jsonb`)
-/// lands as two distinct target rows for one Postgres group, and a
-/// `MIN`/`MAX` fold — which returns one of its inputs *verbatim* — can
+/// used to land as two distinct target rows for one Postgres group, and a
+/// `MIN`/`MAX` fold — which returns one of its inputs *verbatim* — could
 /// return the `T`-spelled string where a server-side `min()` returns the
 /// space-spelled one, which ADR-0013's byte-exact cross-check reports as a
 /// divergence. So this predicate gates the `MIN`/`MAX` role as well as the
@@ -339,15 +368,18 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 ///
 /// This is the same *shape* of defect as issue #246 (deterministic-output
 /// GUCs pinned on the pool but not the walsender): one value, two renderers,
-/// no arbiter. Reconciling the `to_jsonb` sites with `::text` is the unlock
-/// for `timestamp` and is tracked as **issue #248**; it is deliberately not
-/// attempted here, since those are the engine's hottest and most
-/// safety-critical read paths and every other temporal family ships without
-/// touching them.
+/// no arbiter. **Issue #248 reconciled the `to_jsonb` sites with `::text`**
+/// (`staging::apply::row_as_text_jsonb_sql`, an explicit per-column
+/// `jsonb_build_object` in place of `to_jsonb(t.*)`), which is why
+/// `timestamp` is admitted here now. `timestamptz` is not: it fails this
+/// predicate for the *separate*, still-open #246 reason documented above
+/// (`is_render_consistent`'s two-renderer framing applies to it twice —
+/// `to_jsonb` vs. `::text`, now fixed, and pool vs. walsender, not fixed) —
+/// see "Why `timestamptz` is still refused" in this module's doc comment.
 pub const fn is_render_consistent(pg_type: PgType) -> bool {
     matches!(
         pg_type,
-        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Interval
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Interval | PgType::Timestamp
     )
 }
 
@@ -362,12 +394,20 @@ pub const fn is_render_consistent(pg_type: PgType) -> bool {
 ///   `max(interval)` returns different text for different scan orders of
 ///   the same rows — see this module's doc comment for the live
 ///   demonstration.
-/// * **`timestamp`/`timestamptz`** fail the byte-reproducibility half, via
-///   [`is_render_consistent`]: `MIN`/`MAX` returns an input verbatim, and an
-///   input that arrived through a `to_jsonb` live-row read is spelled with
-///   an ISO-8601 `T` that a server-side `min()` never emits.
+/// * **`timestamptz`** fails the byte-reproducibility half, via
+///   [`is_render_consistent`]: `MIN`/`MAX` returns an input verbatim, and its
+///   rendering still moves between the pool and the walsender (issue #246).
+///
+/// `timestamp` used to fail the same byte-reproducibility half — a
+/// `to_jsonb`-sourced input was spelled with an ISO-8601 `T` a server-side
+/// `min()` never emits — until issue #248 made every internal renderer agree
+/// with `::text`, which is why it's admitted here alongside `date`/`time`/
+/// `timetz` now.
 pub const fn supports_min_max(pg_type: PgType) -> bool {
-    matches!(pg_type, PgType::Date | PgType::Time | PgType::TimeTz)
+    matches!(
+        pg_type,
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp
+    )
 }
 
 /// A temporal value's position in its family's total order, as a pair so
@@ -1210,7 +1250,8 @@ mod tests {
         }
         assert!(!is_temporal(PgType::Jsonb));
 
-        // Three refusals, three distinct reasons.
+        // Two remaining refusals, two distinct reasons; `timestamp` is no
+        // longer one of them (issue #248).
         //
         // `interval` fails half one (equal values, two renderings) but
         // passes half two — `to_jsonb` and `::text` agree on it — which is
@@ -1220,21 +1261,30 @@ mod tests {
         assert!(!is_text_stable(PgType::Interval));
         assert!(!supports_min_max(PgType::Interval));
 
-        // `timestamp` is the inverse shape and the #113 review's finding:
-        // a perfectly good bijection under `::text`, refused purely because
-        // `to_jsonb` spells it differently.
+        // `timestamp` is the #113 review's finding, now closed by #248: a
+        // perfectly good bijection under `::text`, and — since #248 made
+        // every internal renderer agree with `::text` — also render-
+        // consistent now, so it clears both halves like `date`/`time`/
+        // `timetz`.
         assert!(is_bijective_under_text(PgType::Timestamp));
-        assert!(!is_render_consistent(PgType::Timestamp));
-        assert!(!is_text_stable(PgType::Timestamp));
-        assert!(!supports_min_max(PgType::Timestamp));
+        assert!(is_render_consistent(PgType::Timestamp));
+        assert!(is_text_stable(PgType::Timestamp));
+        assert!(supports_min_max(PgType::Timestamp));
 
-        // `timestamptz` fails both halves.
+        // `timestamptz` fails both halves — the second for a *different*
+        // reason than `timestamp` used to (issue #246, still open, not
+        // touched by #248).
         assert!(!is_bijective_under_text(PgType::TimestampTz));
         assert!(!is_render_consistent(PgType::TimestampTz));
         assert!(!is_text_stable(PgType::TimestampTz));
         assert!(!supports_min_max(PgType::TimestampTz));
 
-        for pg_type in [PgType::Date, PgType::Time, PgType::TimeTz] {
+        for pg_type in [
+            PgType::Date,
+            PgType::Time,
+            PgType::TimeTz,
+            PgType::Timestamp,
+        ] {
             assert!(is_text_stable(pg_type), "{pg_type}");
             assert!(supports_min_max(pg_type), "{pg_type}");
         }
@@ -1263,15 +1313,19 @@ mod tests {
     }
 
     /// `to_jsonb`'s ISO-8601 `T` spelling is deliberately **not** accepted
-    /// as canonical `timestamp` text.
+    /// as canonical `timestamp` text — revisited, as directed, now that
+    /// issue #248 reconciles the `to_jsonb` sites and re-admits `timestamp`.
     ///
-    /// Pinned so the deferral stays coherent: as long as the engine can
-    /// produce two spellings of one `timestamp`, the parser recognising only
-    /// one of them is the honest position, and a `MIN`/`MAX` fold silently
-    /// dropping the other is prevented by `supports_min_max` refusing the
-    /// family outright rather than by this parser being lenient. Whoever
-    /// reconciles the `to_jsonb` sites and re-admits `timestamp` should
-    /// revisit this test, not work around it.
+    /// Still pinned, and still correctly so: issue #248 fixed this by making
+    /// every *internal* renderer stop calling `to_jsonb(t.*)` and spell
+    /// `timestamp` the `::text` way instead, not by teaching this parser to
+    /// also accept the `T` spelling. So after #248, the engine genuinely
+    /// never produces the `T` form for a `timestamp` any more (bare Postgres
+    /// `to_jsonb(t.*)` still would, but nothing in Trellis calls it that way)
+    /// — a stricter parser that still rejects it is the correct, honest
+    /// position, and this test is exactly what would catch a regression that
+    /// reintroduced a `to_jsonb`-shaped read path without this module
+    /// noticing.
     #[test]
     fn the_to_jsonb_timestamp_spelling_is_not_canonical_text() {
         assert!(order_key(PgType::Timestamp, "2024-06-15T12:34:56").is_err());

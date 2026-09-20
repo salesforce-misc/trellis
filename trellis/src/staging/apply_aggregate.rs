@@ -127,7 +127,8 @@
 //! source is itself an aggregate target, and when **that** target's group
 //! goes extinct, [`super::apply::apply_and_mark_drained_many`]'s Phase 3
 //! (`delete_group_row`/`apply_forced_groups_bulk`'s own `DELETE ...
-//! RETURNING to_jsonb(t.*)`) captures the deleted row's exact pre-delete
+//! RETURNING` — an explicit per-column `jsonb_build_object`, issue #248, not
+//! `to_jsonb(t.*)`) captures the deleted row's exact pre-delete
 //! image before it's gone, and downstream propagation (step 4) stages that
 //! as a real image-bearing delete (`StagedChange::Cdc`, `old_image: Some(..)`,
 //! `new_image: None`) instead of an image-less `Recompute`. Once staged that
@@ -144,7 +145,8 @@
 //! [`KeySpace::OneToOne`] target, and deleting *that* target's row is the
 //! same shape of "the prior state is knowable at delete time, but was being
 //! thrown away." `super::apply::apply_target`'s own delete statement now
-//! carries the identical `RETURNING to_jsonb(t.*)::text` capture, threaded
+//! carries the identical shape of `RETURNING` capture (issue #248's explicit
+//! per-column `jsonb_build_object`, not `to_jsonb(t.*)`), threaded
 //! through the same `super::apply::ChangedKey` slot (a module-private type
 //! alias, so deliberately not an intra-doc link), so step 4 stages the
 //! same image-bearing `StagedChange::Cdc` for a deleted 1-1 row — reaching
@@ -167,7 +169,9 @@ use crate::defs::oracle;
 use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
-use super::apply::{ApplyError, substitute_relationship_path};
+use super::apply::{
+    ApplyError, live_row_columns, row_as_text_jsonb_sql, substitute_relationship_path,
+};
 use super::fold::FoldedChange;
 
 // ---------------------------------------------------------------------
@@ -1299,8 +1303,12 @@ pub(super) fn diff_contributions(
 /// own live refetch, so no image needs to ride along.
 ///
 /// `deleted` additionally carries the group's target row exactly as it stood
-/// the instant before this call deleted it (`to_jsonb(t.*)::text`, the same
-/// server-side encoding a real CDC delete's pre-image would carry) — issue
+/// the instant before this call deleted it — an explicit per-column
+/// `jsonb_build_object(..., <col>::text, ...)::text` ([`delete_group_row`]'s
+/// doc comment; issue #248, not the `to_jsonb(t.*)::text` this used before),
+/// so every column, `timestamp`/`timestamptz` included, is encoded the same
+/// way a real CDC delete's pre-image is: by each column's own output
+/// function, not `to_jsonb`'s separate ISO-8601 writer — issue
 /// #180's fix: an extinct group's *key* alone is not enough for a chained
 /// downstream aggregate to know what to subtract, because by the time that
 /// downstream chain's own live refetch runs, the row is genuinely gone (see
@@ -1443,13 +1451,27 @@ async fn probe_group_exists(
 }
 
 /// Deletes this group's target row, if it still has one, returning its
-/// pre-delete image (`to_jsonb(t.*)::text`, `None` iff there was no row to
-/// delete) — issue #180: the caller (`apply_aggregate_target`) threads this
-/// through as the extinct group's `AggregateApplyResult::deleted` entry, so
-/// a chained downstream aggregate's `Recompute` can carry a real old image
-/// instead of asking a live refetch to find a row that, by construction
-/// (`probe_group_exists` already found no surviving source row for this
-/// group), is genuinely gone.
+/// pre-delete image (`None` iff there was no row to delete) — issue #180: the
+/// caller (`apply_aggregate_target`) threads this through as the extinct
+/// group's `AggregateApplyResult::deleted` entry, so a chained downstream
+/// aggregate's `Recompute` can carry a real old image instead of asking a
+/// live refetch to find a row that, by construction (`probe_group_exists`
+/// already found no surviving source row for this group), is genuinely gone.
+///
+/// Issue #248: the image is an explicit per-column `jsonb_build_object(...,
+/// <col>::text, ...)`, not `to_jsonb(t.*)` — see
+/// `apply::row_as_text_jsonb_sql`'s doc comment for why (`to_jsonb`'s own
+/// ISO-8601 writer disagrees with the `timestamp`/`timestamptz` output
+/// function every other `::text` cast in this crate uses). The column list is
+/// this target's live `pg_catalog` columns ([`live_row_columns`]), not
+/// reconstructed from `group_by`/the calling `AggregateTargetPlan`'s own
+/// field list: an aggregate target's hidden `SUM`/`AVG` partial columns
+/// (issue #48's `__<field>_sum`/`__<field>_count`) are assembled by
+/// `apply_forced_groups_bulk`'s own dedup logic when it builds `insert_cols`,
+/// and re-deriving that same dedup here, a second time, purely to name
+/// columns for this `RETURNING`, would be a second place that shape can
+/// drift from `ddl::create_aggregate_target_table`'s actual DDL — introspecting
+/// the live table directly can't drift, by construction.
 async fn delete_group_row(
     txn: &Transaction<'_>,
     target: &str,
@@ -1462,11 +1484,13 @@ async fn delete_group_row(
     // identity by the time this is called (reviewer follow-up to issue #74)
     // — quoted component-independently via
     // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`. `t`
-    // aliases the target for `to_jsonb(t.*)` below; `where_sql`'s own column
+    // aliases the target for `old_image_expr` below; `where_sql`'s own column
     // references stay unqualified, which still resolves correctly since `t`
     // is the sole table in scope.
+    let row_columns = live_row_columns(txn, target).await?;
+    let old_image_expr = row_as_text_jsonb_sql("t", &row_columns);
     let sql = format!(
-        "delete from {} as t where {where_sql} returning to_jsonb(t.*)::text as old_image",
+        "delete from {} as t where {where_sql} returning {old_image_expr}::text as old_image",
         ddl::qualified_target_table_ident(target)
     );
     let rows = txn.query(&sql, &group_where_params(values)).await?;
@@ -2246,18 +2270,22 @@ async fn apply_forced_groups_bulk(
 
     // 3. Extinct groups: touched, but no surviving source row — delete their
     // target rows in one statement, `ord` telling us which we removed. Issue
-    // #180: also returns each deleted row's pre-delete image
-    // (`to_jsonb(t.*)`), the bulk-path counterpart to
-    // [`delete_group_row`]'s own per-group `RETURNING` — see
+    // #180: also returns each deleted row's pre-delete image, the bulk-path
+    // counterpart to [`delete_group_row`]'s own per-group `RETURNING` — see
     // [`AggregateApplyResult::deleted`]'s doc comment for why a downstream
-    // chain needs this rather than a bare key.
+    // chain needs this rather than a bare key. Issue #248: an explicit
+    // per-column `jsonb_build_object` over this target's live columns, not
+    // `to_jsonb(t.*)` — see [`delete_group_row`]'s doc comment for why (same
+    // reasoning, same live-introspected column list, applies here too).
     let mut deleted = Vec::new();
     if !extinct_ords.is_empty() {
         let ord_param = arity + 1;
+        let row_columns = live_row_columns(txn, target).await?;
+        let old_image_expr = row_as_text_jsonb_sql("t", &row_columns);
         let delete_sql = format!(
             "delete from {target_ident} t using {} \
              where {} and k.ord = any(${ord_param}::bigint[]) \
-             returning k.ord::bigint, to_jsonb(t.*)::text as old_image",
+             returning k.ord::bigint, {old_image_expr}::text as old_image",
             keyset_unnest(&plan.group_by_types, 1, true),
             keyset_match(&plan.group_by, "t", &null_safe),
         );

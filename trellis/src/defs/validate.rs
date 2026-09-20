@@ -1080,17 +1080,21 @@ fn reject_unsupported_group_by_key_type(
         // verdict rather than by a list repeated here — see that module's
         // doc comment for the live evidence, and
         // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` for the relationship/PK
-        // half of the same decision.
+        // half of the same decision. `timestamp` joined this arm for real
+        // once issue #248 fixed its render-consistency defect (it used to
+        // fall through to the reject arm below despite being named here,
+        // exactly like `timestamptz` still does).
         //
         // The two temporal families this still rejects are rejected for
         // genuinely different reasons, which is why `is_text_stable` is
         // per-family and not "temporal or not": `timestamptz`'s rendering
         // is `TimeZone`-dependent and half of it is produced by a walsender
-        // Trellis cannot pin (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`),
-        // while `interval` has no canonical rendering at all — `'24 hours'`
-        // and `'1 day'` are `=` and render differently, so a text-matched
-        // `GROUP BY` would split one Postgres group in two, exactly as a
-        // float `-0`/`0` key would.
+        // Trellis cannot pin (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`,
+        // issue #246, still open and independent of #248), while `interval`
+        // has no canonical rendering at all — `'24 hours'` and `'1 day'` are
+        // `=` and render differently, so a text-matched `GROUP BY` would
+        // split one Postgres group in two, exactly as a float `-0`/`0` key
+        // would.
         ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),

@@ -41,7 +41,7 @@ use crate::defs::eval::{
 use crate::defs::model::{RelationshipCardinality, RelationshipDefinition};
 use crate::defs::validate::{self, ValidationError};
 use crate::error_code::{self, ErrorCode};
-use crate::pool::{Pool, quote_ident};
+use crate::pool::{Pool, quote_ident, quote_literal};
 
 use super::append::{self, StagedChange};
 use super::apply_aggregate::{self, AggregateTargetPlan};
@@ -598,9 +598,13 @@ async fn read_live_rows_batch(
         .collect();
     let join_cond = live_rows_join_cond(&pk_idents, &u_cols, &null_safe);
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
+    let row_columns = live_row_columns(&**client, source_table).await?;
+    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
     let sql = format!(
         "select m.k, e.key, e.value \
-         from (select {k_expr} as k, to_jsonb(t.*) as doc from {} t \
+         from (select {k_expr} as k, {doc_expr} as doc from {} t \
                join unnest({}) as u({}) on {join_cond}) m \
          cross join lateral jsonb_each_text(m.doc) e",
         ddl::qualified_source_table(source_table),
@@ -705,6 +709,68 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
         Some(ty) => format!("{col_ident} = any($1::text[]::{ty}[])"),
         None => format!("{col_ident}::text = any($1::text[])"),
     }
+}
+
+/// The live, `attnum`-ordered column names of `table` — the same
+/// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
+/// [`key_column_pg_type`] already use, but the whole live column list rather
+/// than a caller-supplied subset. `table` may be either the bare/qualified
+/// form `to_regclass` parses unquoted (e.g. `key_column_pg_type`'s own
+/// `table` argument) or an already `quote_ident`-quoted `"schema"."table"`
+/// string (e.g. [`ddl::qualified_relationship_projection_table`]'s output):
+/// `to_regclass` parses a quoted-identifier bind parameter exactly the way
+/// the SQL parser would parse the same text in a `FROM` clause, so either
+/// shape resolves to the right relation.
+///
+/// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
+/// this to build an explicit per-column `jsonb_build_object` (see
+/// [`row_as_text_jsonb_sql`]) instead — `to_jsonb` renders a `timestamp`/
+/// `timestamptz` column with its own ISO-8601 writer rather than calling the
+/// column's real output function, so it disagrees with every other `<col>::
+/// text` cast in Trellis specifically for those two types. That divergence
+/// is invisible until the two renderings of one value are compared as raw
+/// text — a join/`GROUP BY`/primary-key key, or a `MIN`/`MAX` fold that
+/// returns one of its inputs verbatim — at which point it reads as *two*
+/// distinct keys/values for one underlying row.
+pub async fn live_row_columns(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let rows = client
+        .query(
+            "select a.attname::text \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attnum > 0 \
+               and not a.attisdropped \
+             order by a.attnum",
+            &[&table],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// `to_jsonb(<alias>.*)`'s replacement (issue #248): an explicit
+/// `jsonb_build_object('<col>', <alias>."<col>"::text, ...)` over `columns`,
+/// so every value lands the same way an ordinary `<col>::text` cast would —
+/// including `timestamp`/`timestamptz`, where `to_jsonb`'s own writer
+/// disagrees with the type's real output function (a space where `::text`
+/// renders one, `to_jsonb` renders a `T`). Downstream, every caller of this
+/// SQL fragment still decodes the result via `jsonb_each_text`, whose key for
+/// each pair is exactly the quoted literal given here — the *raw* column
+/// name, matching the key `to_jsonb(t.*)` itself would have produced, so no
+/// downstream field lookup needs to change.
+///
+/// `columns` is expected non-empty in practice (every table this crate reads
+/// has a primary key, so [`live_row_columns`] never returns an empty list for
+/// a real relation) — an empty slice still renders valid SQL
+/// (`jsonb_build_object()`), just an empty object, rather than panicking.
+pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
+    let pairs: Vec<String> = columns
+        .iter()
+        .map(|col| format!("{}, {alias}.{}::text", quote_literal(col), quote_ident(col)))
+        .collect();
+    format!("jsonb_build_object({})", pairs.join(", "))
 }
 
 /// Issue #173 phase 3: what a to-side (parent) event implies about the
@@ -1844,11 +1910,21 @@ async fn from_side_rows_for_trigger_txn(
             });
         }
     };
+    if join_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment. Fetched
+    // once, outside the loop below: `from_table`'s live column list doesn't
+    // change per join key, so there's no reason to re-introspect it once per
+    // iteration.
+    let row_columns = live_row_columns(txn, from_table).await?;
+    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
     let mut rows: HashMap<String, Row> = HashMap::new();
     for join_key in join_keys {
         let sql = format!(
             "select m.k, e.key, e.value \
-             from (select {pk} as k, to_jsonb(t.*) as doc from {tbl} t \
+             from (select {pk} as k, {doc_expr} as doc from {tbl} t \
                    where {col}::text = $1) m \
              cross join lateral jsonb_each_text(m.doc) e",
             pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
@@ -2672,11 +2748,15 @@ async fn fetch_to_side_rows(
     let tbl_ident = quote_ident(to_table);
     let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    let row_columns = live_row_columns(&**client, to_table).await?;
+    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
     let sql = format!(
         "select m.jk, m.rn, e.key, e.value \
          from (select {col_ident}::text as jk, \
                       row_number() over () as rn, \
-                      to_jsonb(t.*) as doc \
+                      {doc_expr} as doc \
                from {tbl_ident} t \
                where {filter}) m \
          cross join lateral jsonb_each_text(m.doc) e",
@@ -2725,7 +2805,13 @@ async fn fetch_to_side_rows(
 /// agree, and `to_table` is a plain bare/qualified table name `to_regclass`
 /// resolves directly — unlike `qualified_projection`, which arrives here
 /// already `quote_ident`-quoted for direct interpolation, not in the shape
-/// `to_regclass` expects as a bind parameter.
+/// `to_regclass` expects for *this* lookup (`to_table`/`key_col` is a
+/// same-named-column shortcut, not a general rule about quoted input:
+/// [`live_row_columns`], just below, binds `qualified_projection` itself as
+/// a `to_regclass` parameter to read the projection's own live columns, and
+/// that works fine — `to_regclass` parses an already-quoted qualified name
+/// exactly like the SQL parser would parse the same text in a `FROM`
+/// clause).
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
     qualified_projection: &str,
@@ -2740,10 +2826,14 @@ async fn fetch_relationship_projection_rows(
     let key_ident = quote_ident(key_col);
     let pg_type = key_column_pg_type(pool, to_table, key_col).await?;
     let filter = key_array_filter(&format!("p.{key_ident}"), pg_type.as_deref());
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(p.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    let row_columns = live_row_columns(&**client, qualified_projection).await?;
+    let doc_expr = row_as_text_jsonb_sql("p", &row_columns);
     let sql = format!(
         "select p.{key_ident}::text as jk, e.key, e.value \
          from {qualified_projection} p \
-         cross join lateral jsonb_each_text(to_jsonb(p.*)) e \
+         cross join lateral jsonb_each_text({doc_expr}) e \
          where {filter}"
     );
     let db_rows = client.query(&sql, &[&join_keys]).await?;
@@ -5278,8 +5368,11 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
 
 /// One row [`apply_target`]'s delete statement actually removed: its key,
 /// paired with the pre-delete image captured by that statement's own
-/// `RETURNING ... to_jsonb(t.*)::text` (issue #196) — the 1-1-target
-/// counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s tuple.
+/// `RETURNING ...` (issue #196) — an explicit per-column
+/// `jsonb_build_object(..., <col>::text, ...)::text`, not `to_jsonb(t.*)::text`
+/// (issue #248: see `row_as_text_jsonb_sql`'s doc comment for why) — the
+/// 1-1-target counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s
+/// tuple.
 type TargetDeletedKey = (String, String);
 
 /// Every key in one target's [`ChangedKey`] accumulator that this batch
@@ -5301,9 +5394,10 @@ fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashS
 /// deleted (as opposed to every key this batch merely *proposed* — the
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing). Issue #196: each deleted key
-/// is paired with its pre-delete image (`RETURNING ... to_jsonb(t.*)::text`,
-/// the same encoding `apply_aggregate::delete_group_row`'s issue #180 fix
-/// captures for an extinct aggregate group), so `apply_and_mark_drained_many`
+/// is paired with its pre-delete image (`RETURNING ...`, an explicit
+/// per-column `jsonb_build_object` per issue #248 — see [`TargetDeletedKey`]'s
+/// doc comment — the same shape `apply_aggregate::delete_group_row`'s issue
+/// #180 fix captures for an extinct aggregate group), so `apply_and_mark_drained_many`
 /// can stage a real image-bearing delete for a deleted 1-1 target row
 /// instead of an image-less `Recompute` — see [`ChangedKey`]'s doc comment.
 ///
@@ -5358,6 +5452,18 @@ async fn apply_target(
     // and `ddl::qualified_target_table_ident`'s.
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
+
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)`, for the delete `RETURNING` below — see
+    // `row_as_text_jsonb_sql`'s doc comment for why. This target's full
+    // column set is exactly `pk` plus `field_names` (`ddl::create_target_table`'s
+    // own DDL never declares any other column), so — unlike the read paths
+    // above, which read tables this function doesn't control the shape of —
+    // no live `pg_catalog` introspection is needed here.
+    let old_image_columns: Vec<String> = std::iter::once(plan.pk.name.clone())
+        .chain(plan.field_names.iter().cloned())
+        .collect();
+    let old_image_expr = row_as_text_jsonb_sql("t", &old_image_columns);
 
     // Issue #205: `write.pk_text`/`delete.pk_text` is this target's shared
     // key-contract text, not necessarily a raw PK value yet — decode each
@@ -5515,7 +5621,9 @@ async fn apply_target(
         .filter(|k| !write_keys.contains(k))
         .collect();
     if !delete_keys.is_empty() {
-        // Issue #196: `as t` + `to_jsonb(t.*)::text` captures each deleted
+        // Issue #196: `as t` + `old_image_expr` (an explicit per-column
+        // `jsonb_build_object`, issue #248 — not `to_jsonb(t.*)`, see
+        // `row_as_text_jsonb_sql`'s doc comment) captures each deleted
         // row's exact pre-delete state, the same `apply_aggregate`'s
         // `delete_group_row` does for an extinct aggregate group (issue
         // #180) — see this function's own doc comment and `ChangedKey`'s for
@@ -5527,7 +5635,7 @@ async fn apply_target(
                 &format!(
                     "delete from {target_ident} as t \
                      where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {pk_ident}::text as pk, to_jsonb(t.*)::text as old_image"
+                     returning {pk_ident}::text as pk, {old_image_expr}::text as old_image"
                 ),
                 &[&delete_keys],
             )
@@ -5837,7 +5945,8 @@ pub async fn apply_and_mark_drained_many(
         // different producer" gap issue #180 fixed for extinct aggregate
         // groups, left unthreaded for this producer at the time. `deleted`
         // now carries each row's pre-delete image straight from
-        // `apply_target`'s own `RETURNING to_jsonb(t.*)::text`, so it stages
+        // `apply_target`'s own `RETURNING` (an explicit per-column
+        // `jsonb_build_object`, issue #248), so it stages
         // the same way 3b's extinct-group `deleted` entries do below —
         // `Some(old_image)`, letting a chained downstream aggregate subtract
         // this row's last-known contribution (`accumulate_changes`'s
