@@ -1088,7 +1088,12 @@ impl Trellis {
             source_tables,
             ..Default::default()
         };
-        Client::start(config.dsn(), client_options).map_err(TrellisError::Client)
+        // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
+        // the latter threw this `Config`'s schema away and re-resolved one
+        // from the process environment, so a `Trellis` explicitly configured
+        // into a named schema ran its background client against the *default*
+        // instance's staging ring instead. See `Client::start_with_config`.
+        Client::start_with_config(config.clone(), client_options).map_err(TrellisError::Client)
     }
 
     /// Introspects `source_table`'s column names and types for the definition

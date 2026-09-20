@@ -379,3 +379,55 @@ async fn a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it
         "a new producer should acquire the singleton after the first disconnects"
     );
 }
+
+/// Issue #234, the direct engine-level counterpart of
+/// `a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it`:
+/// the singleton is scoped to one **Trellis instance**, not to the database.
+///
+/// Postgres advisory locks are keyed by `(database, key)` — a session's
+/// `search_path` does not enter into the lock tag — so while the key was a
+/// single global constant, two instances sharing one database (the topology
+/// `docs/instance-identity.md` explicitly promises: "several Trellis
+/// instances can coexist in one cluster — even one database — each isolated
+/// within its own schema") could never both run a producer. The second one
+/// was refused with `ProducerAlreadyRunning`, citing a producer that was not
+/// its own. `staging::session::producer_singleton_lock_key` now derives the
+/// key from the schema; this is the regression pin.
+///
+/// The two sessions are both held live simultaneously and only dropped at the
+/// end, so this really is "two producers at once", not two in sequence.
+#[tokio::test]
+async fn two_instances_in_one_database_each_hold_their_own_producer_singleton() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    // Neither of these is `DEFAULT_SCHEMA`, and neither schema needs to
+    // exist: `ProducerSession::connect` only pins `search_path` to it (a
+    // `search_path` naming a missing schema is legal in Postgres) and takes
+    // the lock. Nothing here appends, so no ring objects are needed — this
+    // test is about the guard, not the ring.
+    let first = trellis::staging::ProducerSession::connect(db.dsn(), "trellis_instance_one")
+        .await
+        .expect("the first instance's producer should be granted its own singleton");
+    let second = trellis::staging::ProducerSession::connect(db.dsn(), "trellis_instance_two")
+        .await
+        .expect(
+            "a second Trellis instance in the same database, in its own schema, must be able to \
+             run its own producer concurrently — the singleton is per instance, not per database",
+        );
+
+    // And the guard still bites *within* one instance: a third session in
+    // the first instance's own schema is still refused, so scoping the key
+    // did not weaken the singleton into a no-op.
+    let third = trellis::staging::ProducerSession::connect(db.dsn(), "trellis_instance_one").await;
+    match third {
+        Err(StagingError::ProducerAlreadyRunning) => {}
+        other => panic!(
+            "a second producer in the *same* instance schema must still be refused, got {:?}",
+            other.map(|_| "Ok")
+        ),
+    }
+
+    drop(first);
+    drop(second);
+}

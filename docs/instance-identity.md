@@ -73,3 +73,45 @@ the same new schema (the loser's insert becomes a no-op, not a unique-violation)
 
 `trellis::identity::Identity::resolved` reports the identity (schema + format
 version) this build would attach as, without touching the database.
+
+## What "coexisting instances" actually requires
+
+The named schema is necessary but not sufficient. Anything an instance treats
+as privately its own has to be scoped by that schema too, or two instances in
+one database will collide on it even though every table they own is separate.
+Issue #234's two-instance generative property
+(`generative/tests/two_instance_noise.rs`) runs two instances side by side in
+one database to keep this honest; it found two real gaps, both since closed:
+
+* **The producer singleton is keyed by schema.** Postgres advisory locks are
+  keyed by `(database, key)` — a session's `search_path` is not part of the
+  lock tag. So the "exactly one CDC intake producer" guard
+  (`staging::session`) must derive its key from the instance schema, as
+  `staging::session::producer_singleton_lock_key` now does; a global constant
+  made the guard fire across instances.
+* **A configured schema must be carried, not re-resolved.**
+  `Client::start_with_config` takes the caller's already-resolved `Config`.
+  Its DSN-only sibling `Client::start` resolves the schema from the process
+  environment, which makes the instance identity a property of the *process* —
+  fine for a one-instance process, wrong for anything holding a `Config` (like
+  `Trellis`) and impossible for two instances in one process.
+
+Two things remain the operator's responsibility, not the engine's:
+
+* **Distinct replication slot and publication names** per instance
+  (`ClientOptions::slot`/`publication`). A slot name is unique cluster-wide;
+  a publication name is unique per database. Neither is schema-qualified.
+* **Distinct transform target schemas** (`Config::target_schema`) if the two
+  instances materialize similarly-named targets. Target tables are
+  application data, deliberately outside the instance schema (see
+  `DEFAULT_TARGET_SCHEMA`), so nothing keeps two instances' targets apart
+  automatically.
+
+One behaviour to expect rather than debug: convergence latency is coupled
+across co-tenant instances. `staging::watermark_token` is
+`pg_current_wal_lsn()`, a cluster-wide LSN, so "has this instance converged?"
+is asked against WAL the instance's own publication filters out. Confirming
+past that WAL waits for a keepalive, whose persist is throttled to
+`intake::KEEPALIVE_PERSIST_INTERVAL`. A busy neighbour therefore adds up to
+that interval to an instance's observed convergence time. Correctness is
+unaffected.

@@ -302,8 +302,50 @@ impl Client {
     /// background thread has finished setup (publication/slot/snapshot
     /// handshake, if `staging_worker`) and every worker task is spawned, or
     /// until setup fails.
+    ///
+    /// The instance schema is resolved from the process environment
+    /// (`TRELLIS_SCHEMA`, defaulting to [`crate::config::DEFAULT_SCHEMA`]) via
+    /// [`Config::from_dsn`]. A caller that already holds a [`Config`] — or
+    /// that needs two clients in one process to run in two different schemas
+    /// — must use [`Client::start_with_config`] instead; see its doc comment.
     pub fn start(dsn: impl Into<String>, options: ClientOptions) -> Result<Client, ClientError> {
-        let dsn = dsn.into();
+        Self::start_with_config(Config::from_dsn(dsn.into())?, options)
+    }
+
+    /// [`Client::start`]'s instance-aware form (issue #234): starts a client
+    /// against an already-resolved [`Config`], so the client runs in *that*
+    /// config's schema (`docs/instance-identity.md`) rather than whatever a
+    /// process-global `TRELLIS_SCHEMA` happens to say.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Client::start`] used to take only a DSN and resolve its own `Config`
+    /// from the process environment. That made the instance schema a property
+    /// of the *process*, not of the client, with two consequences:
+    ///
+    /// * [`crate::Trellis`] is constructed from an explicit `Config` and
+    ///   handed its own `config.dsn()` to `Client::start` — so a `Trellis`
+    ///   built with `Config::with_schema(dsn, "some_schema")` silently ran
+    ///   its background client in `TRELLIS_SCHEMA`/[`crate::config::DEFAULT_SCHEMA`]
+    ///   instead, against a different instance's staging ring entirely. The
+    ///   schema was accepted, validated, and then dropped on the floor.
+    /// * Two Trellis instances could not coexist *in one process* at all,
+    ///   even though `docs/instance-identity.md` describes exactly that
+    ///   topology for one cluster — one process-global environment variable
+    ///   cannot carry two different schemas.
+    ///
+    /// Found by `generative/tests/two_instance_noise.rs` (issue #234's
+    /// two-instance side-by-side property), which is also its regression
+    /// coverage.
+    ///
+    /// Blocks (synchronously) until the background thread has finished setup
+    /// and every worker task is spawned, or until setup fails — same
+    /// contract as [`Client::start`].
+    pub fn start_with_config(
+        config: Config,
+        options: ClientOptions,
+    ) -> Result<Client, ClientError> {
+        let dsn = config.dsn().to_string();
         if options.staging_worker && options.source_tables.is_empty() {
             return Err(ClientError::NoSourceTables);
         }
@@ -324,7 +366,7 @@ impl Client {
                         return;
                     }
                 };
-                runtime.block_on(run(dsn, options, shutdown_rx, ready_tx));
+                runtime.block_on(run(dsn, config, options, shutdown_rx, ready_tx));
             })
             .map_err(ClientError::Spawn)?;
 
@@ -388,17 +430,15 @@ impl fmt::Debug for Client {
 /// for shutdown before stopping them.
 async fn run(
     dsn: String,
+    // Issue #234: resolved by the caller ([`Client::start_with_config`]) and
+    // passed in, rather than re-resolved from the process environment here —
+    // see that constructor's doc comment for the two bugs the old
+    // `Config::from_dsn(dsn)` on this line caused.
+    config: Config,
     options: ClientOptions,
     mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
-    let config = match Config::from_dsn(dsn.clone()) {
-        Ok(config) => config,
-        Err(err) => {
-            let _ = ready_tx.send(Err(err.into()));
-            return;
-        }
-    };
     let pool = match Pool::new(&config) {
         Ok(pool) => pool,
         Err(err) => {

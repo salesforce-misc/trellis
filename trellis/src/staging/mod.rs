@@ -132,7 +132,7 @@ pub use quarantine::{
 #[cfg(any(test, feature = "internals"))]
 pub use seal::{SealOutcome, fenced_rows};
 #[cfg(any(test, feature = "internals"))]
-pub use session::PRODUCER_SINGLETON_LOCK_KEY;
+pub use session::producer_singleton_lock_key;
 #[cfg(any(test, feature = "internals"))]
 pub use state::SegmentState;
 #[cfg(any(test, feature = "internals"))]
