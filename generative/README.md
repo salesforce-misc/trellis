@@ -37,8 +37,8 @@ not a suite problem, and is out of scope for this crate to fix; see the git
 history for `generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for
 the full measurement writeup.
 
-Because paying that cost 9 times over on every push/PR would be expensive,
-the crate's 9 proptest properties are all named with a `property_` prefix
+Because paying that cost 10 times over on every push/PR would be expensive,
+the crate's 10 proptest properties are all named with a `property_` prefix
 (enforced by a self-check in `tests/meta.rs` that scans every `proptest! {
 ... }` block in `tests/*.rs` and fails the build if any `#[test] fn` inside
 one lacks the prefix — a future property added without it breaks CI rather
@@ -46,7 +46,7 @@ than silently skipping the split below). That prefix is the actual fast/deep
 split, wired into two workflows:
 
 - **`.github/workflows/ci.yml`'s "Test generative (fast lane)" step (every
-  push/PR):** `cargo test -p generative -- --skip property_` — skips all 9
+  push/PR):** `cargo test -p generative -- --skip property_` — skips all 10
   properties at once, by prefix, and runs everything else in the crate (the
   lib, `coverage`, `meta`, `oracle`, `backend_seam`, `backfill`, and every
   hand-built pin/regression test) at each target's own default case count.
@@ -59,7 +59,7 @@ split, wired into two workflows:
   — `cargo test -p generative --test convergence
   property_convergence_holds_for_trivial_programs`. This is the crate's most
   exercised property (see the design doc's property list) and the only one
-  given an in-repo deep run today; the other 8 are not deep-run anywhere in
+  given an in-repo deep run today; the other 9 are not deep-run anywhere in
   this repo's CI config. The property's
   `FileFailurePersistence::SourceParallel` config (see
   `tests/convergence.rs`'s `proptest_config`) already writes any failing case
@@ -67,7 +67,7 @@ split, wired into two workflows:
   on the next run — commit that file if a deep run ever produces one, so the
   failure becomes a real, replayable regression the fast lane picks up too.
 
-**Case-count calibration across all 9 properties is not this repo's job.** A
+**Case-count calibration across all 10 properties is not this repo's job.** A
 separate, out-of-repo nightly (run by the maintainer, not part of any
 workflow file here) covers that; don't go looking for it in
 `.github/workflows/` — it isn't there.

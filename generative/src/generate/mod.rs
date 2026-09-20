@@ -3207,10 +3207,16 @@ mod strategy {
     /// [`trivial_program_with`], restricted to `KeySpace::OneToOne`
     /// definitions only (every def drawn via [`build_program_multi_with_derived`],
     /// which — like [`build_program_multi`] — never draws `DefShape::Aggregate`).
-    /// Exists solely for [`program_with_client_restart`] below — see that
-    /// function's doc comment for why a restart-carrying program is scoped
-    /// away from `Aggregate` definitions specifically.
-    fn trivial_one_to_one_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
+    /// Built for [`program_with_client_restart`] below (see that function's
+    /// doc comment for why a restart-carrying program is scoped away from
+    /// `Aggregate` definitions specifically) and reused, `pub`, by
+    /// `generative/tests/self_check_cross_check.rs`'s swept
+    /// out-of-band-tampering property (issue #237): `self_check`
+    /// (`trellis/src/staging/self_check.rs`) only audits a `OneToOne` target
+    /// this issue (`SelfCheckError::UnsupportedKeySpace`), so that property
+    /// needs the same `Aggregate`-free restriction this strategy already
+    /// enforces, for the same underlying reason.
+    pub fn trivial_one_to_one_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
                 let table_count = tables.len();
@@ -3331,8 +3337,8 @@ mod strategy {
 #[cfg(feature = "proptest")]
 pub use strategy::{
     bulk_insert_program, checkpoint_plan_for, noise_plan_for, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, trivial_program,
-    trivial_program_with,
+    program_with_mid_stream_def_install, program_with_scale_out, trivial_one_to_one_program_with,
+    trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
