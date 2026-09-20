@@ -433,6 +433,20 @@ fn corruption_literal(
             "corruption_literal: trivial_one_to_one_program_with never attaches an \
              Other({pg_type}) field to a OneToOne def — extend this helper if that changes"
         ),
+        // #111/#112 split Integer/Float out of Numeric after this property was
+        // written; trivial_one_to_one_program_with still only ever attaches
+        // Numeric/Boolean/Text/Uuid to a OneToOne field (see this function's
+        // and corrupted_field_value_type's doc comments), so these two stay
+        // unreached in practice — extend this helper if that generator ever
+        // widens to emit an exact-integer or floating-point column.
+        ValueType::Integer(width) => panic!(
+            "corruption_literal: trivial_one_to_one_program_with never attaches an \
+             Integer({width:?}) field to a OneToOne def — extend this helper if that changes"
+        ),
+        ValueType::Float(width) => panic!(
+            "corruption_literal: trivial_one_to_one_program_with never attaches a \
+             Float({width:?}) field to a OneToOne def — extend this helper if that changes"
+        ),
     };
     if current.as_deref() == Some(a_text) {
         (b_sql, b_text)
