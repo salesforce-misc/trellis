@@ -41,10 +41,12 @@
 //!   `date`s render identically, because a `date` *is* its day number and
 //!   the rendering is a bijection on it. No GUC other than `DateStyle`
 //!   participates.
-//! * **`timestamp` — stable.** Same, plus `HH:MM:SS` and a trailing-zero-
-//!   trimmed fractional part (`12:34:56.1`, never `12:34:56.100000`).
-//!   Trimming is what makes it a bijection: `'12:34:56.1'` and
-//!   `'12:34:56.100000'` are one value and render as one string.
+//! * **`timestamp` — a bijection under `::text`, but still refused**, because
+//!   `::text` is not the engine's only renderer. `timestamp_out` under ISO is
+//!   as well-behaved as `date_out` (`HH:MM:SS` plus a trailing-zero-trimmed
+//!   fraction — `12:34:56.1`, never `12:34:56.100000`, which is exactly what
+//!   makes it injective). It fails the *second* requirement instead; see
+//!   "Two renderers, and `timestamp` fails the second one" below.
 //! * **`time` — stable, and not even `DateStyle`-dependent.** `time_out`
 //!   emits `HH:MM:SS[.f…]` identically under `ISO`, `SQL`, `Postgres` and
 //!   `German` (verified live). `24:00:00` is a distinct legal value from
@@ -57,6 +59,7 @@
 //!   makes `=` exactly identity on the stored `(time, zone)` pair — which
 //!   is precisely what `timetz_out` renders. Bijective, therefore stable.
 //! * **`timestamptz` — NOT stable, and pinning `TimeZone` does not fix it.**
+//!   It also fails the two-renderer test below, so it is refused twice over.
 //!   See "Why `timestamptz` is still refused" below.
 //! * **`interval` — NOT stable, and no GUC can make it so.**
 //!   `select '24 hours'::interval = '1 day'::interval` is **true**
@@ -67,6 +70,51 @@
 //!   dense rather than a single pathological pair. `interval` can never be
 //!   a text-matched key, with or without #110's typed key index changing
 //!   the story (the index *would* fix it; `IntervalStyle` would not).
+//!
+//! ## Two renderers, and `timestamp` fails the second one
+//!
+//! Everything above measures one renderer: `<col>::text`. That is necessary
+//! and it is not sufficient, because **Trellis turns columns into text in
+//! two different ways.** Most paths cast per column, but the live-row reads
+//! build a whole row body at once — `to_jsonb(t.*)` followed by
+//! `jsonb_each_text` — in `staging::apply`'s `read_live_rows_batch`,
+//! `fetch_to_side_rows` and `fetch_relationship_projection_rows`, and in
+//! `staging::quarantine`'s column sweep. `to_jsonb` does not call the type's
+//! output function for datetimes; it uses `jsonb`'s own ISO-8601 writer. Read
+//! off a live server, one row, one session, both renderings side by side:
+//!
+//! ```text
+//!  column       ::text                   to_jsonb
+//!  date         2024-06-15               2024-06-15                   same
+//!  time         12:34:56                 12:34:56                     same
+//!  timetz       12:34:56+00              12:34:56+00                  same
+//!  interval     1 day 02:00:00           1 day 02:00:00               same
+//!  timestamp    2024-06-15 12:34:56      2024-06-15T12:34:56          DIFFERS
+//!  timestamptz  2024-06-15 12:34:56+00   2024-06-15T12:34:56+00:00    DIFFERS
+//! ```
+//!
+//! (`numeric`, the integer widths, `uuid`, `bytea` and the floats were swept
+//! too and all agree — this is a datetime-specific quirk of `to_jsonb`, not a
+//! general property of it.)
+//!
+//! The `T` is not cosmetic. A `timestamp` `GROUP BY` key seeded once through
+//! a backfill (`::text`) and once through CDC-then-live-read (`to_jsonb`)
+//! becomes **two target rows for one Postgres group**. And it reaches
+//! `MIN`/`MAX` as well as the key roles, because those return one of their
+//! inputs *verbatim*: a fold over to-side rows fetched by `fetch_to_side_rows`
+//! can return the `T`-spelled string where a server-side `min()` returns the
+//! space-spelled one, and ADR-0013's byte-exact cross-check reports that as a
+//! divergence. So [`is_render_consistent`] gates both roles.
+//!
+//! `date`, `time` and `timetz` are unaffected and ship with their full key
+//! and `MIN`/`MAX` roles. `timestamp` and `timestamptz` are deferred until
+//! the `to_jsonb` sites render consistently with `::text` — **issue #248**,
+//! deliberately not attempted here, since those are the engine's hottest and
+//! most safety-critical read paths and no other family needs them touched.
+//!
+//! Note the shape of this is issue #246's, one layer in: one value, two
+//! renderers, no arbiter. There it is the pool versus the walsender; here it
+//! is `::text` versus `to_jsonb` inside a single process.
 //!
 //! ## Why `timestamptz` is still refused
 //!
@@ -223,41 +271,103 @@ pub const fn is_temporal(pg_type: PgType) -> bool {
     )
 }
 
-/// Whether `pg_type`'s canonical text rendering is a bijection on its
-/// values — i.e. whether `a::text = b::text` agrees with the type's own `=`
-/// for every value, which is what a raw-`::text`-matched key role requires.
+/// Whether `pg_type`'s text rendering is a bijection on its values **and is
+/// the same bijection on every renderer inside the engine** — the property
+/// a raw-`::text`-matched key role actually requires.
 ///
-/// See this module's doc comment for the per-family evidence. `interval` is
-/// `false` because equal intervals can render differently (`'1 day'` vs
-/// `'24 hours'`); `timestamptz` is `false` because its rendering depends on
-/// a `TimeZone` Trellis cannot pin on the walsender that produces half of
-/// it.
+/// Both halves are load-bearing and the second one is the trap. The first
+/// half (`a::text = b::text` agrees with the type's own `=`) is what this
+/// module's doc comment establishes per family, and by that measure `date`,
+/// `timestamp`, `time` and `timetz` all pass. The second half — that every
+/// code path which turns a column into text produces *that same* string —
+/// is what `timestamp` fails, and it is why it is absent below.
+///
+/// See "Two renderers, and `timestamp` fails the second one" in this
+/// module's doc comment. `is_render_consistent` is the predicate for the
+/// second half alone; this one is the conjunction, and the
+/// `admission_is_exactly_the_conjunction_of_both_halves` test pins that it
+/// stays one.
 pub const fn is_text_stable(pg_type: PgType) -> bool {
+    is_bijective_under_text(pg_type) && is_render_consistent(pg_type)
+}
+
+/// Half one: `a::text = b::text` agrees with `pg_type`'s own `=` for every
+/// value, so a single renderer's output can stand in for the value.
+///
+/// `interval` is the only temporal family that fails this outright — equal
+/// intervals can render differently (`'1 day'` vs `'24 hours'`), which no
+/// GUC and no second renderer can repair. `timestamptz` fails it only
+/// across sessions (`TimeZone`), which is a different failure and is
+/// recorded on [`is_render_consistent`] instead, since the mechanism there
+/// is likewise "two renderers disagree".
+const fn is_bijective_under_text(pg_type: PgType) -> bool {
     matches!(
         pg_type,
         PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp
     )
 }
 
-/// Whether `MIN`/`MAX` over `pg_type` is a function of its input multiset,
-/// and therefore verifiable against an independently-authored SQL recompute
-/// (ADR-0013).
+/// Half two: every renderer the engine uses agrees on `pg_type`'s text.
 ///
-/// True for every temporal family whose `=` is identity on the rendering —
-/// which, unlike [`is_text_stable`], includes `timestamptz`: a tie there is
-/// still between two values that any *single* session renders identically,
-/// and `MIN`/`MAX` returns an input verbatim rather than a re-rendering, so
-/// the walsender/pool `TimeZone` asymmetry that blocks the key role does not
-/// make the aggregate order-dependent.
+/// Trellis has **two** internal renderers, not one. Most paths use
+/// `<col>::text`, but the live-row reads build a whole row body at once with
+/// `to_jsonb(t.*)` plus `jsonb_each_text` — `staging::apply`'s
+/// `read_live_rows_batch`, `fetch_to_side_rows` and
+/// `fetch_relationship_projection_rows`, and `staging::quarantine`'s column
+/// sweep. `to_jsonb` renders a `timestamp` through `jsonb`'s own
+/// ISO-8601 datetime writer, not through `timestamp_out`, and the two
+/// disagree (read off a live server):
 ///
-/// False for `interval` alone — see this module's doc comment for the live
-/// demonstration that Postgres's own `max(interval)` returns different text
-/// for different scan orders of the same rows.
-pub const fn supports_min_max(pg_type: PgType) -> bool {
+/// ```text
+///  column     ::text                        to_jsonb
+///  date       2024-06-15                    2024-06-15          same
+///  time       12:34:56                      12:34:56            same
+///  timetz     12:34:56+00                   12:34:56+00         same
+///  interval   1 day 02:00:00                1 day 02:00:00      same
+///  timestamp  2024-06-15 12:34:56           2024-06-15T12:34:56   DIFFERS
+///  timestamptz 2024-06-15 12:34:56+00       2024-06-15T12:34:56+00:00  DIFFERS
+/// ```
+///
+/// The `T` separator is not cosmetic. A `timestamp` key seeded once through
+/// a backfill (`::text`) and once through CDC-then-live-read (`to_jsonb`)
+/// lands as two distinct target rows for one Postgres group, and a
+/// `MIN`/`MAX` fold — which returns one of its inputs *verbatim* — can
+/// return the `T`-spelled string where a server-side `min()` returns the
+/// space-spelled one, which ADR-0013's byte-exact cross-check reports as a
+/// divergence. So this predicate gates the `MIN`/`MAX` role as well as the
+/// key roles, not just the key roles.
+///
+/// This is the same *shape* of defect as issue #246 (deterministic-output
+/// GUCs pinned on the pool but not the walsender): one value, two renderers,
+/// no arbiter. Reconciling the `to_jsonb` sites with `::text` is the unlock
+/// for `timestamp` and is tracked as **issue #248**; it is deliberately not
+/// attempted here, since those are the engine's hottest and most
+/// safety-critical read paths and every other temporal family ships without
+/// touching them.
+pub const fn is_render_consistent(pg_type: PgType) -> bool {
     matches!(
         pg_type,
-        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Interval
     )
+}
+
+/// Whether `MIN`/`MAX` over `pg_type` is a function of its input multiset,
+/// *and* is byte-reproducible against an independently-authored SQL
+/// recompute (ADR-0013).
+///
+/// Two independent ways to fail, and the temporal block has one family for
+/// each:
+///
+/// * **`interval`** fails the "function of its input" half. Postgres's own
+///   `max(interval)` returns different text for different scan orders of
+///   the same rows — see this module's doc comment for the live
+///   demonstration.
+/// * **`timestamp`/`timestamptz`** fail the byte-reproducibility half, via
+///   [`is_render_consistent`]: `MIN`/`MAX` returns an input verbatim, and an
+///   input that arrived through a `to_jsonb` live-row read is spelled with
+///   an ISO-8601 `T` that a server-side `min()` never emits.
+pub const fn supports_min_max(pg_type: PgType) -> bool {
+    matches!(pg_type, PgType::Date | PgType::Time | PgType::TimeTz)
 }
 
 /// A temporal value's position in its family's total order, as a pair so
@@ -1100,20 +1210,73 @@ mod tests {
         }
         assert!(!is_temporal(PgType::Jsonb));
 
-        // `interval` and `timestamptz` are the two refusals, for two
-        // different reasons — and `timestamptz` keeps `MIN`/`MAX`.
+        // Three refusals, three distinct reasons.
+        //
+        // `interval` fails half one (equal values, two renderings) but
+        // passes half two — `to_jsonb` and `::text` agree on it — which is
+        // why it can still hold non-key roles like `SUM`.
+        assert!(!is_bijective_under_text(PgType::Interval));
+        assert!(is_render_consistent(PgType::Interval));
         assert!(!is_text_stable(PgType::Interval));
-        assert!(!is_text_stable(PgType::TimestampTz));
         assert!(!supports_min_max(PgType::Interval));
-        assert!(supports_min_max(PgType::TimestampTz));
+
+        // `timestamp` is the inverse shape and the #113 review's finding:
+        // a perfectly good bijection under `::text`, refused purely because
+        // `to_jsonb` spells it differently.
+        assert!(is_bijective_under_text(PgType::Timestamp));
+        assert!(!is_render_consistent(PgType::Timestamp));
+        assert!(!is_text_stable(PgType::Timestamp));
+        assert!(!supports_min_max(PgType::Timestamp));
+
+        // `timestamptz` fails both halves.
+        assert!(!is_bijective_under_text(PgType::TimestampTz));
+        assert!(!is_render_consistent(PgType::TimestampTz));
+        assert!(!is_text_stable(PgType::TimestampTz));
+        assert!(!supports_min_max(PgType::TimestampTz));
+
+        for pg_type in [PgType::Date, PgType::Time, PgType::TimeTz] {
+            assert!(is_text_stable(pg_type), "{pg_type}");
+            assert!(supports_min_max(pg_type), "{pg_type}");
+        }
+    }
+
+    /// [`is_text_stable`] must stay the conjunction of its two halves
+    /// rather than becoming a third hand-maintained list — the #113 review
+    /// found the key roles admitted on half one alone, and a list that can
+    /// disagree with its own stated rule is how that happened.
+    #[test]
+    fn admission_is_exactly_the_conjunction_of_both_halves() {
         for pg_type in [
             PgType::Date,
             PgType::Time,
             PgType::TimeTz,
             PgType::Timestamp,
+            PgType::TimestampTz,
+            PgType::Interval,
         ] {
-            assert!(is_text_stable(pg_type), "{pg_type}");
-            assert!(supports_min_max(pg_type), "{pg_type}");
+            assert_eq!(
+                is_text_stable(pg_type),
+                is_bijective_under_text(pg_type) && is_render_consistent(pg_type),
+                "{pg_type}"
+            );
         }
+    }
+
+    /// `to_jsonb`'s ISO-8601 `T` spelling is deliberately **not** accepted
+    /// as canonical `timestamp` text.
+    ///
+    /// Pinned so the deferral stays coherent: as long as the engine can
+    /// produce two spellings of one `timestamp`, the parser recognising only
+    /// one of them is the honest position, and a `MIN`/`MAX` fold silently
+    /// dropping the other is prevented by `supports_min_max` refusing the
+    /// family outright rather than by this parser being lenient. Whoever
+    /// reconciles the `to_jsonb` sites and re-admits `timestamp` should
+    /// revisit this test, not work around it.
+    #[test]
+    fn the_to_jsonb_timestamp_spelling_is_not_canonical_text() {
+        assert!(order_key(PgType::Timestamp, "2024-06-15T12:34:56").is_err());
+        assert!(order_key(PgType::Timestamp, "2024-06-15 12:34:56").is_ok());
+        assert!(order_key(PgType::TimestampTz, "2024-06-15T12:34:56+00:00").is_err());
+        assert!(order_key(PgType::TimestampTz, "2024-06-15 12:34:56+00").is_ok());
     }
 }

@@ -287,17 +287,23 @@ async fn the_text_stability_verdict_is_the_server_s_not_this_crate_s() {
             "{sql_name}: Postgres makes {by_value} value groups and {by_text} text groups"
         );
 
-        // `timestamptz` is the one family that is bijective here and still
-        // refused, and that is the whole shape of #113's `TimeZone`
-        // finding: its defect is *cross*-session, not within-session. A
-        // single reader groups it perfectly; it is the second renderer —
-        // the walsender, whose `TimeZone` Trellis cannot pin — that
-        // disagrees. See `timestamptz_text_moves_with_the_session_timezone`
-        // below and `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`.
+        // Bijective-under-`::text` is necessary and **not sufficient**, and
+        // `timestamp`/`timestamptz` are both bijective here and still
+        // refused. That is the shape of the whole finding: a single reader
+        // groups them perfectly: it is the *second* renderer that
+        // disagrees. For `timestamp` that second renderer is `to_jsonb`
+        // (see `to_jsonb_and_text_agree_for_every_admitted_key_type`); for
+        // `timestamptz` it is additionally the walsender, whose `TimeZone`
+        // Trellis cannot pin (`timestamptz_text_moves_with_the_session_timezone`,
+        // `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, issue #246).
+        //
+        // So admission is the conjunction, and this asserts the conjunction
+        // rather than re-listing the outcome.
         assert_eq!(
             temporal::is_text_stable(*pg_type),
-            bijective && *pg_type != PgType::TimestampTz,
-            "{sql_name}: is_text_stable disagrees with the server (bijective = {bijective})"
+            bijective && temporal::is_render_consistent(*pg_type),
+            "{sql_name}: is_text_stable must be bijectivity AND renderer agreement \
+             (bijective = {bijective})"
         );
     }
 }
@@ -669,8 +675,6 @@ async fn temporal_aggregate_result_types_match_pg_typeof() {
 
     for (column, sql_name) in [
         ("d", "date"),
-        ("ts", "timestamp without time zone"),
-        ("tstz", "timestamp with time zone"),
         ("tm", "time without time zone"),
         ("tmtz", "time with time zone"),
     ] {
@@ -698,6 +702,21 @@ async fn temporal_aggregate_result_types_match_pg_typeof() {
         trellis::defs::registry::aggregate_result_type("SUM", ValueType::Other(PgType::Interval)),
         Some(ValueType::Other(PgType::Interval))
     );
+
+    // `timestamp`/`timestamptz` *do* have a Postgres `min`/`max`, but the
+    // registry still refuses them — not because Postgres lacks the
+    // aggregate, but because `MIN`/`MAX` returns an input verbatim and the
+    // engine can hold two spellings of one `timestamp` (see
+    // `to_jsonb_and_text_agree_for_every_admitted_key_type`).
+    for column in ["ts", "tstz"] {
+        for aggregate in ["MIN", "MAX"] {
+            assert_eq!(
+                trellis::defs::registry::aggregate_result_type(aggregate, source_columns()[column]),
+                None,
+                "{aggregate}({column}) is deferred until the to_jsonb sites agree with ::text"
+            );
+        }
+    }
 
     // Postgres has no `sum`/`avg` over the other five, and no `avg` over
     // `interval` either — so neither does the registry.
@@ -909,15 +928,17 @@ async fn the_sum_interval_fold_matches_a_server_side_sum() {
     }
 }
 
-/// `SUM(interval)` is **invertible** while `SUM(<float>)` is not, and the
-/// difference is algebraic, not "exact decimal vs not": interval addition
-/// is exact, commutative and associative with an exact inverse, so a delta
-/// and a recompute agree by construction.
+/// Interval addition really is exact, commutative and associative *on
+/// finite, in-range values* — unlike float addition, which fails all three.
+/// And `SUM(interval)` is still **recompute-only**, because that monoid is
+/// partial and a delta cannot represent the gaps.
 ///
-/// Pinned against the server for the property that actually matters — that
-/// subtracting a member recovers the sum of the rest, exactly.
+/// Both halves are pinned here against the server, because the first half
+/// is what makes the second half surprising: this is not "interval is like
+/// float", it is "interval is exact but its arithmetic can *raise*, in
+/// ways that depend on accumulation order a delta does not control".
 #[tokio::test]
-async fn sum_interval_has_an_exact_inverse_which_is_why_it_is_delta_able() {
+async fn sum_interval_is_exact_on_finite_values_but_still_recompute_only() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
@@ -946,15 +967,157 @@ async fn sum_interval_has_an_exact_inverse_which_is_why_it_is_delta_able() {
         "sum(interval) is order-independent, unlike sum(float)"
     );
 
+    // ...and yet `SUM(interval)` is still **recompute-only**, because the
+    // monoid is partial. Both gaps, from the same server:
+    //
+    //   select sum(v) from (values ('infinity'::interval),('-infinity')) t(v)
+    //     -> ERROR: interval out of range
+    //   select sum(v) from (select v from ovf order by id)       -> ERROR
+    //   select sum(v) from (select v from ovf order by id desc)  -> ok
+    //     (ovf = {'2147483647 days', '1 days', '-1 days'})
+    //
+    // A delta accumulates in arrival order and computes a deletion as
+    // `+ (-x)`, so it can raise on a group whose true sum is perfectly
+    // well-defined — and since the delta replays identically on retry,
+    // that is a drain that never progresses, not a quarantine. A
+    // recompute lets Postgres fold the group in one pass and raises
+    // exactly when a server-side `sum()` would.
+    let mixed = client
+        .query_one(
+            "select sum(v)::text from (values ('infinity'::interval),('-infinity')) t(v)",
+            &[],
+        )
+        .await;
+    assert!(
+        mixed.is_err(),
+        "infinity + -infinity must be an error, which is the case a delta cannot survive"
+    );
+
     let verdict = trellis::defs::invertibility::classify(
         "SUM",
         trellis::defs::invertibility::AggregateArg::Column(ValueType::Other(PgType::Interval)),
     )
     .expect("SUM(interval) must classify");
     assert!(
-        verdict.is_invertible(),
-        "SUM(interval) belongs on the delta path"
+        !verdict.is_invertible(),
+        "SUM(interval) belongs on the recompute path, alongside float SUM/AVG"
     );
+}
+
+/// **The guard for the #113 review's finding.** Every type Trellis admits
+/// as a key must render *identically* under both of the engine's two
+/// renderers — the per-column `<col>::text` most paths use, and the
+/// whole-row `to_jsonb(t.*)`/`jsonb_each_text` the live-row reads use
+/// (`staging::apply`'s `read_live_rows_batch`, `fetch_to_side_rows`,
+/// `fetch_relationship_projection_rows`; `staging::quarantine`'s sweep).
+///
+/// A type that disagrees is one value with two spellings, and a key seeded
+/// once through a backfill and once through CDC-then-live-read lands as two
+/// target rows for one Postgres group. `timestamp` disagrees — `to_jsonb`
+/// writes an ISO-8601 `T` — which is why it is not admitted despite being a
+/// perfectly good bijection under `::text` alone.
+///
+/// This sweeps the *whole* allowlist rather than the temporal families, so
+/// it also guards the types #111/#112 and earlier issues admitted, and will
+/// fail for any family a future issue adds without checking.
+#[tokio::test]
+async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // Column name -> (declared type, a literal). Every currently-admitted
+    // key type, plus the four refused temporal families as controls.
+    const COLUMNS: &[(&str, &str, &str, bool)] = &[
+        ("c_int2", "smallint", "42", true),
+        ("c_int4", "integer", "42", true),
+        ("c_int8", "bigint", "42", true),
+        ("c_oid", "oid", "42", true),
+        (
+            "c_uuid",
+            "uuid",
+            "00000000-0000-0000-0000-000000000001",
+            true,
+        ),
+        ("c_text", "text", "hello", true),
+        ("c_varchar", "character varying(16)", "hello", true),
+        ("c_date", "date", "2024-06-15", true),
+        ("c_time", "time", "12:34:56", true),
+        ("c_timetz", "timetz", "12:34:56+00", true),
+        // Controls: admitted for no key role, and the reason shows up here.
+        ("c_ts", "timestamp", "2024-06-15 12:34:56", false),
+        ("c_tstz", "timestamptz", "2024-06-15 12:34:56+00", false),
+        // `interval` agrees under both renderers — its refusal is about
+        // equal values rendering differently, a different defect entirely.
+        ("c_iv", "interval", "1 day 2 hours", true),
+    ];
+
+    let ddl = COLUMNS
+        .iter()
+        .map(|(name, pg_type, _, _)| format!("{name} {pg_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = COLUMNS
+        .iter()
+        .map(|(_, _, literal, _)| format!("'{literal}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .batch_execute(&format!("create table renderers ({ddl})"))
+        .await
+        .expect("create sweep table");
+    client
+        .batch_execute(&format!("insert into renderers values ({values})"))
+        .await
+        .expect("seed sweep row");
+
+    let via_jsonb: HashMap<String, String> = client
+        .query(
+            "select e.key, e.value from renderers              cross join lateral jsonb_each_text(to_jsonb(renderers.*)) e",
+            &[],
+        )
+        .await
+        .expect("to_jsonb sweep")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+
+    for (name, pg_type, _, expect_agreement) in COLUMNS {
+        let via_text: String = client
+            .query_one(&format!("select {name}::text from renderers"), &[])
+            .await
+            .unwrap_or_else(|e| panic!("::text for {name}: {e}"))
+            .get(0);
+        let jsonb = &via_jsonb[*name];
+        assert_eq!(
+            via_text == *jsonb,
+            *expect_agreement,
+            "{pg_type}: ::text = {via_text:?}, to_jsonb = {jsonb:?}"
+        );
+
+        // And a type that renders two ways must not be admitted to any
+        // text-identity role — the assertion that would have caught #113's
+        // first cut admitting `timestamp`.
+        if !expect_agreement {
+            let pg_type_enum = if *pg_type == "timestamp" {
+                PgType::Timestamp
+            } else {
+                PgType::TimestampTz
+            };
+            assert!(
+                !temporal::is_render_consistent(pg_type_enum),
+                "{pg_type} renders two ways, so is_render_consistent must say so"
+            );
+            assert!(
+                !temporal::is_text_stable(pg_type_enum),
+                "{pg_type} renders two ways and must not be an admitted key type"
+            );
+            assert!(
+                !temporal::supports_min_max(pg_type_enum),
+                "{pg_type} renders two ways, so MIN/MAX cannot be byte-reproducible"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -999,7 +1162,6 @@ async fn temporal_join_keys_are_admitted_per_family() {
 
     for (name, from_col, to_table) in [
         ("r_date", "d", "p_date"),
-        ("r_ts", "ts", "p_ts"),
         ("r_tm", "tm", "p_tm"),
         ("r_tmtz", "tmtz", "p_tmtz"),
     ] {
@@ -1012,6 +1174,11 @@ async fn temporal_join_keys_are_admitted_per_family() {
     }
 
     for (name, from_col, to_table, pg_name) in [
+        // `timestamp` is refused for the #113 review's reason: it is a
+        // bijection under `::text` but `to_jsonb` spells it with an
+        // ISO-8601 `T`, and the engine uses both renderers. See
+        // `to_jsonb_and_text_agree_for_every_admitted_key_type` below.
+        ("r_ts", "ts", "p_ts", "timestamp without time zone"),
         ("r_tstz", "tstz", "p_tstz", "timestamp with time zone"),
         ("r_iv", "iv", "p_iv", "interval"),
     ] {
@@ -1059,10 +1226,15 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
         "format_type puts the modifier inside the name, which is the whole hazard"
     );
 
+    // The *admitted* family with the same modifier-inside-the-name shape:
+    // `format_type` renders this `time(2) with time zone`, which the old
+    // `split('(')` truncated to `time`. (`timestamp(3)` above shows the
+    // rendering hazard itself; `timetz` is what actually exercises the fix
+    // end-to-end, since `timestamp` is not an admitted key type.)
     client
         .batch_execute(
-            "create table p3 (k timestamp(3) primary key); \
-             create table c3 (id bigint primary key, k timestamp(3)); \
+            "create table p3 (k timetz(2) primary key); \
+             create table c3 (id bigint primary key, k timetz(2)); \
              alter table c3 replica identity full; \
              alter table p3 replica identity full",
         )
@@ -1070,14 +1242,14 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
         .expect("create modified-precision tables");
     create_relationship(&db.pool, "RELATIONSHIP r3 FROM c3.k TO p3.k")
         .await
-        .expect("a timestamp(3) join key must be accepted");
+        .expect("a timetz(2) join key must be accepted");
 }
 
 /// The `GROUP BY` key gate follows the same four-accepted/two-refused
 /// split, and the rejection names the column.
 #[test]
 fn the_group_by_key_gate_follows_the_same_split() {
-    for column in ["d", "ts", "tm", "tmtz"] {
+    for column in ["d", "tm", "tmtz"] {
         let def = parse(&format!(
             "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
         ))
@@ -1086,7 +1258,7 @@ fn the_group_by_key_gate_follows_the_same_split() {
             .unwrap_or_else(|e| panic!("{column} must be accepted as a GROUP BY key: {e}"));
     }
 
-    for column in ["tstz", "iv"] {
+    for column in ["ts", "tstz", "iv"] {
         let def = parse(&format!(
             "TRANSFORM t FROM s GROUP BY {column} SELECT {column} AS k, SUM(n) AS total"
         ))
@@ -1125,6 +1297,13 @@ async fn time_and_timetz_literals_are_canonical_only() {
         "TIMETZ '13:45:00+00'",
         "TIMETZ '13:45:00.5-05:30'",
         "TIMETZ '13:45:00+05:30:15'",
+        // A zero *minutes* field with a non-zero seconds field IS canonical
+        // — `timetz_out` drops only a trailing all-zero tail, so
+        // `'12:00:00+05:00:30'` prints as itself (#113 review).
+        "TIMETZ '13:45:00+05:00:30'",
+        "TIMETZ '13:45:00+00:00:30'",
+        "TIMETZ '13:45:00-00:00:30'",
+        "TIMETZ '13:45:00+15:59:59'",
         "CAST('13:45:00+00' AS timetz)",
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {good} AS x"))
@@ -1176,6 +1355,7 @@ async fn time_and_timetz_literals_are_canonical_only() {
         // round-trip; and the offset is capped at 15:59:59.
         "TIMETZ '13:45:00+00:00'",
         "TIMETZ '13:45:00+05:30:00'",
+        "TIMETZ '13:45:00+05:00:00'",
         "TIMETZ '13:45:00+16'",
     ] {
         let parsed = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"));
@@ -1238,26 +1418,24 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 // 7. The live delta path
 // ---------------------------------------------------------------------
 
-/// `SUM(interval)` and `MAX(date)` maintained end-to-end through the ring's
-/// **incremental delta path**, checked against an independently-authored
-/// `SELECT ... GROUP BY` over the live source (ADR-0013 — not
-/// `defs::render_aggregate_select_sql`, which is the engine's own
-/// renderer).
+/// `SUM(interval)` and `MAX(date)` maintained end-to-end through the ring,
+/// checked against an independently-authored `SELECT ... GROUP BY` over the
+/// live source (ADR-0013 — not `defs::render_aggregate_select_sql`, which is
+/// the engine's own renderer).
 ///
-/// This is the test that actually exercises `staging::apply_aggregate`'s
-/// interval threading: a `SUM(interval)` field's running partial is an
-/// `interval` column accumulated by Postgres's own `sum(interval)` over
-/// `unnest($n::text[]::interval[])`, not the `::numeric[]` every other
-/// `SUM` uses (`sum_accumulator_type`). Getting that wrong is not a subtly
-/// wrong number — `'1 day'::text::numeric` is a hard type error — but
-/// getting the *identity element* wrong (`0` instead of `'0'::interval`) is
-/// exactly as fatal and just as invisible until a real delta runs.
+/// Both fields are recompute-only, which is the point: `SUM(interval)` goes
+/// through `probe_recompute_fields_bulk`'s server-side
+/// `(sum(<col>))::text`, so the value Trellis writes is Postgres's own
+/// `sum(interval)` over the group in one pass. That is what makes the
+/// infinity and overflow cases in
+/// `sum_interval_is_exact_on_finite_values_but_still_recompute_only`
+/// unreachable here: there is no accumulation order for them to depend on.
 ///
-/// `MAX(date)` rides along to cover the recompute-only half of the same
-/// batch, and the insert/update/delete/grain-migration sequence is the same
-/// shape `apply_aggregate.rs`'s own oracle test uses.
+/// The insert/update/delete/grain-migration sequence is the same shape
+/// `apply_aggregate.rs`'s own oracle test uses; the update and delete are
+/// what force a group's value to fall as well as rise.
 #[tokio::test]
-async fn sum_interval_and_max_date_are_maintained_through_the_live_delta_path() {
+async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
     use tokio_postgres::types::PgLsn;
     use trellis::defs::{create_aggregate_target_table, create_definition};
     use trellis::staging::{StagedWatermark, apply, seal};

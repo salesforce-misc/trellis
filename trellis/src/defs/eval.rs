@@ -1628,17 +1628,27 @@ fn reduce_temporal_aggregate(
             } else {
                 std::cmp::Ordering::Greater
             };
-            let winner = texts
+            // Non-canonical text is dropped *before* the fold, not inside
+            // it. Handling it inside — "a `None` comparison keeps the
+            // accumulator" — reads correct but is not: `reduce` seeds the
+            // accumulator with the first element, so an unparseable *first*
+            // value never loses a comparison and silently wins the whole
+            // fold. Filtering first makes every comparison below a real
+            // one, which also lets the tie arm say exactly what it means.
+            let comparable: Vec<String> = texts
+                .into_iter()
+                .filter(|text| crate::temporal::order_key(pg_type, text).is_ok())
+                .collect();
+            if comparable.is_empty() {
+                return Ok(None);
+            }
+            let winner = comparable
                 .into_iter()
                 .reduce(|a, b| match crate::temporal::compare(pg_type, &b, &a) {
-                    Some(ordering) if ordering == keep => b,
                     // A tie keeps the incoming value, matching Postgres's
-                    // left fold. An *unparseable* value keeps the
-                    // accumulator rather than silently winning, which is
-                    // the same "leave it out of the fold" posture the
-                    // caller's filter takes.
-                    Some(_) => a,
-                    None => a,
+                    // `date_smaller`-family left fold.
+                    Some(ordering) if ordering == keep => b,
+                    _ => a,
                 })
                 .expect("checked non-empty above");
             Ok(Some(Value::Other(pg_type, winner)))

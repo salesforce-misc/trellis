@@ -164,7 +164,6 @@ use crate::defs::ddl::{self, avg_sum_column};
 use crate::defs::eval::{self, RegexCache, Row};
 use crate::defs::invertibility::{self, AggregateArg, CountArg};
 use crate::defs::oracle;
-use crate::defs::pg_type::PgType;
 use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
@@ -1580,44 +1579,8 @@ async fn probe_count_star(
 /// growing that type for a single caller — matching this module's existing
 /// "text in, typed cast in SQL" convention (`super::apply`'s own doc
 /// comment) rather than a new one.
-fn sum_array_expr(param: usize, value_type: ValueType) -> String {
-    let (pg_type, zero) = (sum_accumulator_type(value_type), sum_identity(value_type));
-    format!("(select coalesce(sum(v), {zero}) from unnest(${param}::text[]::{pg_type}[]) v)")
-}
-
-/// The Postgres type a `SUM` field's delta arithmetic runs in, and the
-/// identity element an empty delta array collapses to (issue #113).
-///
-/// Everything except `interval` accumulates in `numeric`, exactly as it did
-/// before this issue: an integer `SUM` is a `bigint` column fed by a
-/// `numeric` delta, and a `numeric` one is `numeric` throughout. `interval`
-/// cannot borrow that — `'1 day'::text::numeric` is a type error, not a
-/// silently wrong number — so it accumulates in `interval`, which is also
-/// what makes the running partial Postgres's own `sum(interval)` rather
-/// than anything this crate reimplements.
-///
-/// Keyed on `interval` specifically rather than on "is it a
-/// `ValueType::Other`" so that a future family admitted to `SUM` has to
-/// make its own decision here, and rather than on the field's declared
-/// type in general so that the numeric branch's behaviour is provably
-/// unchanged. Note `AVG` shares these call sites: its result type is always
-/// `numeric` on the delta path (`AVG(interval)` is not an aggregate
-/// Postgres has, and float `AVG` is recompute-only), so it always takes the
-/// `numeric` branch.
-fn sum_accumulator_type(value_type: ValueType) -> &'static str {
-    match value_type {
-        ValueType::Other(PgType::Interval) => "interval",
-        _ => "numeric",
-    }
-}
-
-/// See [`sum_accumulator_type`]. `interval` has no bare literal spelling —
-/// `0` is an `integer` — so its identity has to carry its own cast.
-fn sum_identity(value_type: ValueType) -> &'static str {
-    match value_type {
-        ValueType::Other(PgType::Interval) => "'0'::interval",
-        _ => "0",
-    }
+fn sum_array_expr(param: usize) -> String {
+    format!("(select coalesce(sum(v), 0) from unnest(${param}::text[]::numeric[]) v)")
 }
 
 /// Builds and runs one group's combined ordered-lock-free upsert (Phase 3
@@ -1644,12 +1607,8 @@ fn sum_identity(value_type: ValueType) -> &'static str {
 /// needs must complete, into vectors that are never touched again, before
 /// any of them may be borrowed.
 enum ColumnPlan {
-    // Issue #113: `SUM`'s two arms carry the field's `ValueType` because
-    // `SUM(interval)` accumulates in `interval` rather than `numeric` (see
-    // `sum_accumulator_type`). `AVG`'s do not need it — its delta-path
-    // result type is always `numeric`.
-    SumDelta(String, usize, ValueType),
-    SumForced(String, usize, ValueType),
+    SumDelta(String, usize),
+    SumForced(String, usize),
     AvgDelta(String, usize),
     AvgForced(String, usize),
     CountDelta(String, usize),
@@ -1702,7 +1661,6 @@ async fn upsert_group(
                     columns.push(ColumnPlan::SumForced(
                         field.name.clone(),
                         sum_count_probed.len() - 1,
-                        field.value_type,
                     ));
                 } else {
                     let accum = group.field_accum.get(&field.name).expect("checked above");
@@ -1710,7 +1668,6 @@ async fn upsert_group(
                     columns.push(ColumnPlan::SumDelta(
                         field.name.clone(),
                         count_deltas.len() - 1,
-                        field.value_type,
                     ));
                 }
             }
@@ -1795,7 +1752,7 @@ async fn upsert_group(
 
     for column in &columns {
         match column {
-            ColumnPlan::SumDelta(name, count_idx, value_type) => {
+            ColumnPlan::SumDelta(name, count_idx) => {
                 let accum = &group.field_accum[name];
                 let count_col_name = plan.count_column_names[name].clone();
                 let count_col = quote_ident(&count_col_name);
@@ -1808,8 +1765,8 @@ async fn upsert_group(
                 next += 2;
                 let sum_delta = format!(
                     "({} - {})",
-                    sum_array_expr(add_param, *value_type),
-                    sum_array_expr(sub_param, *value_type)
+                    sum_array_expr(add_param),
+                    sum_array_expr(sub_param)
                 );
 
                 let count_param = next;
@@ -1828,10 +1785,7 @@ async fn upsert_group(
 
                 let update_count =
                     format!("coalesce({target_ident}.{count_col}, 0) + {count_delta}");
-                let update_sum_raw = format!(
-                    "coalesce({target_ident}.{col}, {}) + {sum_delta}",
-                    sum_identity(*value_type)
-                );
+                let update_sum_raw = format!("coalesce({target_ident}.{col}, 0) + {sum_delta}");
                 let update_sum =
                     format!("case when ({update_count}) = 0 then null else ({update_sum_raw}) end");
 
@@ -1845,11 +1799,11 @@ async fn upsert_group(
 
                 update_sets.push(format!("{col} = {update_sum}"));
             }
-            ColumnPlan::SumForced(name, idx, value_type) => {
+            ColumnPlan::SumForced(name, idx) => {
                 let count_col_name = plan.count_column_names[name].clone();
                 let count_col = quote_ident(&count_col_name);
                 let col = quote_ident(name);
-                let sum_expr = format!("${next}::text::{}", sum_accumulator_type(*value_type));
+                let sum_expr = format!("${next}::text::numeric");
                 let count_expr = format!("${}::bigint", next + 1);
                 params.push(&sum_count_probed[*idx].0);
                 params.push(&sum_count_probed[*idx].1);
@@ -1878,12 +1832,8 @@ async fn upsert_group(
                 next += 2;
                 let sum_delta = format!(
                     "({} - {})",
-                    // `AVG`'s running-sum partial is always `numeric` on
-                    // the delta path: `AVG(interval)` is not a Postgres
-                    // aggregate, and float `AVG` is recompute-only, so no
-                    // other accumulator type can reach here (issue #113).
-                    sum_array_expr(add_param, ValueType::Numeric),
-                    sum_array_expr(sub_param, ValueType::Numeric)
+                    sum_array_expr(add_param),
+                    sum_array_expr(sub_param)
                 );
 
                 let count_param = next;
@@ -2427,9 +2377,8 @@ fn array_literal(values: &[String]) -> String {
 /// (produced by [`array_literal`], one per touched group) rather than a
 /// single top-level bind parameter: `(select coalesce(sum(v), 0) from
 /// unnest(<col_ref>::text[]::numeric[]) v)`.
-fn array_literal_sum_expr(col_ref: &str, value_type: ValueType) -> String {
-    let (pg_type, zero) = (sum_accumulator_type(value_type), sum_identity(value_type));
-    format!("(select coalesce(sum(v), {zero}) from unnest({col_ref}::text[]::{pg_type}[]) v)")
+fn array_literal_sum_expr(col_ref: &str) -> String {
+    format!("(select coalesce(sum(v), 0) from unnest({col_ref}::text[]::numeric[]) v)")
 }
 
 /// One extra `unnest(...)` array parameter for [`delta_carrier_unnest`],
@@ -2679,8 +2628,8 @@ fn build_delta_carriers(
                 let active = format!("k.{active_name}");
                 let sum_delta = format!(
                     "({} - {})",
-                    array_literal_sum_expr(&format!("k.{adds_name}"), field.value_type),
-                    array_literal_sum_expr(&format!("k.{subs_name}"), field.value_type),
+                    array_literal_sum_expr(&format!("k.{adds_name}")),
+                    array_literal_sum_expr(&format!("k.{subs_name}")),
                 );
                 let count_delta_ref = format!("k.{count_delta_name}");
 
@@ -2697,10 +2646,7 @@ fn build_delta_carriers(
 
                     let update_count =
                         format!("coalesce({target_ident}.{count_col}, 0) + {count_delta_ref}");
-                    let update_sum_raw = format!(
-                        "coalesce({target_ident}.{col}, {}) + {sum_delta}",
-                        sum_identity(field.value_type)
-                    );
+                    let update_sum_raw = format!("coalesce({target_ident}.{col}, 0) + {sum_delta}");
                     let update_sum = format!(
                         "case when ({update_count}) = 0 then null else ({update_sum_raw}) end"
                     );

@@ -434,8 +434,7 @@ impl fmt::Display for ValidationError {
                 "GROUP BY key '{column}' is a {value_type} column, a type Trellis can only pass \
                  through today: GROUP BY keys are matched by their text rendering, which doesn't \
                  agree with this type's own equality (see docs/type-support.md). Supported GROUP \
-                 BY key types are numeric, text, boolean, uuid, oid, date, timestamp, time and \
-                 timetz"
+                 BY key types are numeric, text, boolean, uuid, oid, date, time and timetz"
             ),
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
@@ -534,7 +533,8 @@ impl fmt::Display for ValidationError {
                 "relationship '{name}' joins on {table}.{column} ({pg_type}), a type whose \
                  equality isn't text-stable, so the engine (which compares join keys as text) \
                  would silently diverge from the Postgres oracle's typed join; supported join \
-                 key types are integer, bigint, smallint, uuid, text, and character varying"
+                 key types are {}",
+                super::catalog::supported_join_key_types()
             ),
             ValidationError::RelationshipToManyRequiresReplicaIdentity {
                 name,

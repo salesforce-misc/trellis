@@ -2550,9 +2550,10 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// `crate::float::compare`, not a new encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
-/// `timestamptz` and `interval` (issue #113; see the temporal block below
-/// for why those two alone stayed off), `boolean`, `bytea`, `json`/`jsonb`,
-/// or any unknown type — is rejected as a join key.
+/// `timestamp`, `timestamptz` and `interval` (issue #113; see the temporal
+/// block below for the three distinct reasons those stayed off),
+/// `boolean`, `bytea`, `json`/`jsonb`, or any unknown type — is rejected as
+/// a join key.
 const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
@@ -2568,22 +2569,20 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "uuid",
     "text",
     "character varying",
-    // Issue #113: four of the six temporal families, on the same
+    // Issue #113: three of the six temporal families, on the same
     // "text-stability is a property of the rendering" reasoning `oid` was
     // admitted under. `docs/type-support.md` had all six marked `🎯 typed
     // index`, assuming #110's typed key index was the prerequisite; for
-    // these four it is not, and the evidence is per-family rather than
+    // these three it is not, and the evidence is per-family rather than
     // per-block — see `crate::temporal`'s module doc for the live queries.
     //
-    // `date_out`/`timestamp_out` under the already-pinned `DateStyle =
-    // 'ISO, YMD'` (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) are
-    // bijections on their values: the year field widens (`5874897-12-31`),
-    // the era is an explicit ` BC` suffix, `infinity`/`-infinity` have
-    // their own spellings, and the fractional seconds are trailing-zero
-    // trimmed so one value has exactly one rendering. `time_out` and
-    // `timetz_out` need no GUC at all — verified identical under `ISO`,
-    // `SQL`, `Postgres` and `German` `DateStyle`s and under three session
-    // `TimeZone`s.
+    // `date_out` under the already-pinned `DateStyle = 'ISO, YMD'`
+    // (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) is a bijection on its
+    // values: the year field widens (`5874897-12-31`), the era is an
+    // explicit ` BC` suffix, and `infinity`/`-infinity` have their own
+    // spellings. `time_out` and `timetz_out` need no GUC at all — verified
+    // identical under `ISO`, `SQL`, `Postgres` and `German` `DateStyle`s
+    // and under three session `TimeZone`s.
     //
     // `timetz` is the one to double-take on, and it is safe for a reason
     // opposite to the obvious one: its `=` is *narrower* than "same instant
@@ -2593,17 +2592,41 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // the stored `(time, zone)` pair, which is exactly what `timetz_out`
     // prints.
     //
-    // Deliberately absent, and these are the two that genuinely cannot be
-    // here: `timestamp with time zone`, whose rendering is `TimeZone`-
-    // dependent and whose *other* renderer is the walsender Trellis cannot
-    // pin (see `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`), and
-    // `interval`, where `'24 hours'` and `'1 day'` are one value with two
-    // renderings — the float `-0`/`0` defect, and no GUC fixes it.
+    // Three deliberate absences, for three different reasons:
+    //
+    // * `timestamp without time zone` — a bijection under `::text`, but
+    //   `::text` is not the engine's only renderer. The live-row reads
+    //   (`staging::apply`'s `read_live_rows_batch`/`fetch_to_side_rows`/
+    //   `fetch_relationship_projection_rows`) build row bodies with
+    //   `to_jsonb(t.*)`, which renders a `timestamp` through `jsonb`'s
+    //   ISO-8601 writer: `2024-06-15T12:34:56`, not `2024-06-15 12:34:56`.
+    //   A key seeded once each way becomes two target rows for one Postgres
+    //   group. `date`/`time`/`timetz` are byte-identical under both
+    //   renderers, which is why they are here and it is not — see
+    //   `crate::temporal::is_render_consistent`, and issue #248 for the
+    //   unlock.
+    // * `timestamp with time zone` — both of the above, plus a rendering
+    //   that moves with a `TimeZone` Trellis cannot pin on the walsender
+    //   (issue #246).
+    // * `interval` — `'24 hours'` and `'1 day'` are one value with two
+    //   renderings. The float `-0`/`0` defect; no GUC and no renderer
+    //   reconciliation fixes it, though #110's typed key index would.
     "date",
-    "timestamp without time zone",
     "time without time zone",
     "time with time zone",
 ];
+
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,
+/// so the "supported join key types are ..." list in
+/// [`ValidationError::RelationshipUnsupportedJoinKeyType`]'s `Display`
+/// cannot drift out of step with the allowlist it describes.
+///
+/// It had drifted: the message still named only the pre-#111 six long
+/// after `oid` and the temporal families were admitted, which is exactly
+/// the failure mode a hand-maintained second copy has.
+pub(crate) fn supported_join_key_types() -> String {
+    TEXT_STABLE_JOIN_KEY_TYPES.join(", ")
+}
 
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
 /// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of

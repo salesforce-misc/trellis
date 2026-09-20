@@ -500,19 +500,48 @@ fn canonical_timetz(text: &str) -> Result<(), &'static str> {
     if hours > 15 {
         return Err(TIMETZ_SHAPE);
     }
-    // Each optional field must be present *and non-zero*, because
-    // `timetz_out` drops a zero one — and a seconds field cannot appear
-    // without a minutes field.
-    for field in fields {
-        let value = Some(field)
-            .filter(|field| field.len() == 2)
-            .and_then(parse_fixed)
-            .ok_or(TIMETZ_SHAPE)?;
-        if value == 0 || value > 59 {
-            return Err(TIMETZ_SHAPE);
-        }
+    // `timetz_out` emits the *shortest* offset that still names the value,
+    // dropping a trailing all-zero tail — and only a trailing one. Read off
+    // a live server:
+    //
+    //   +05:00:00 -> +05        +05:30:00 -> +05:30
+    //   +05:00:30 -> +05:00:30  +00:00:30 -> +00:00:30
+    //
+    // So a zero *minutes* field is canonical whenever the seconds field is
+    // non-zero — `+05:00:30` is exactly what Postgres prints, and rejecting
+    // it (as this did before the #113 review) refuses a literal the user
+    // could read straight out of a `select`. The rule is therefore about
+    // the *tail*, not about each field independently: seconds may appear
+    // only if non-zero, and minutes only if minutes or seconds is.
+    let minutes = match fields.next() {
+        Some(field) => Some(zone_field(field)?),
+        None => None,
+    };
+    let seconds = match fields.next() {
+        Some(field) => Some(zone_field(field)?),
+        None => None,
+    };
+    if fields.next().is_some() {
+        return Err(TIMETZ_SHAPE);
+    }
+    if seconds == Some(0) {
+        return Err(TIMETZ_SHAPE);
+    }
+    if minutes == Some(0) && seconds.is_none() {
+        return Err(TIMETZ_SHAPE);
     }
     Ok(())
+}
+
+/// One two-digit `00..=59` field of a `timetz` UTC offset.
+fn zone_field(field: &str) -> Result<u32, &'static str> {
+    match Some(field)
+        .filter(|field| field.len() == 2)
+        .and_then(parse_fixed)
+    {
+        Some(value) if value <= 59 => Ok(value),
+        _ => Err(TIMETZ_SHAPE),
+    }
 }
 
 /// The shared `HH:MM:SS[.F[FFFFF]]` clock reading of [`canonical_time`] and

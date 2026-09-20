@@ -52,12 +52,14 @@ climb it left-to-right:
    from the source's replica identity and present in the old-image for
    updates/deletes. Gated to the join-key-safe allowlist
    (`is_text_stable_join_key_type`) — an unsafe single-column PK
-   (`numeric`/`timestamptz`/`interval`/`bytea`, which `::text`-matching
+   (`numeric`/`timestamp`/`timestamptz`/`interval`/`bytea`, which `::text`-matching
    would silently mismatch) is rejected at define time with
-   `DdlError::UnsupportedPrimaryKeyType` (#107). The typed key index (below)
-   later unlocks most of those; `interval` it cannot, since the defect is
-   the rendering having no canonical form rather than the matching being
-   textual.
+   `DdlError::UnsupportedPrimaryKeyType` (#107). The typed key index
+   (below) later unlocks all of those, `interval` included: it compares
+   *decoded values*, so a rendering that is ambiguous (`'1 day'` vs
+   `'24 hours'`) or merely inconsistent between two renderers stops
+   mattering. What the index does not help with is a value whose *ordering*
+   is undefined, and no type here has that problem.
 5. **Computed 1-1 target** — a scalar calculated field *produces* this type
    (distinct from passthrough). Needs an immutable evaluator arm **and** grammar
    to spell a literal/cast of the type.
@@ -92,11 +94,11 @@ per-type capability, so it's omitted from the aggregate cells.
 | `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | 🎯 MIN/MAX/`string_agg` | requires deterministic collation |
 | `char(n)` `citext` | ✅ | ⚠️ | ❌ padding/case | ❌ | ⚠️ passthrough | — | hazard is padding/case, not volatility |
 | `bytea` | ✅ (hex text) | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109) | ⚠️ MIN/MAX | `bytea_output` GUC affects text render; literal must be canonical lowercase hex |
-| `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE. Key roles landed in #113 — no typed index needed |
-| `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | same as `date` (#113); `DateStyle` is the only GUC in play and it is pinned |
-| `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ MIN/MAX | text render is `TimeZone`-dependent **and Trellis renders it on a walsender it cannot pin** (#113) — see below |
+| `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
 | `time` `timetz` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#113) | ✅ MIN/MAX | `time_out`/`timetz_out` are the block's only IMMUTABLE output functions; `timetz`'s `=` is identity on `(time, zone)` |
-| `interval` | ✅ | 🎯 | ❌ two spellings | ❌ | 🎯 | ✅ `SUM` (invertible); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently — no GUC fixes it, and it makes Postgres's own `max` scan-order dependent (#113) |
+| `timestamp` | ✅ | 🎯 | 🎯 #248 | 🎯 #248 | ✅ literal (#109) | 🎯 MIN/MAX | bijective under `::text`, but `to_jsonb` (the live-row reads) spells it `2024-06-15T12:34:56`. Two renderers, one value (#113) |
+| `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | the `to_jsonb` split *plus* a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246) |
+| `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
 | `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 needs a canonicalizer | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`); `jsonb_out` re-sorts keys, so a literal needs #115's value model |
 | `inet` `cidr` `macaddr` `macaddr8` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | ⚠️ MIN/MAX | |
 | enum types | ✅ | 🎯 | 🎯 | 🎯 | ⚠️ | 🎯 MIN/MAX | order fixed at type creation |
@@ -131,6 +133,11 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   while `interval_out` prints the three stored fields, so one value has
   many renderings. Not a volatility problem and not a GUC problem: a
   structural one, and the same class as float `-0`/`0`.
+* **`timestamp`** — nothing about the *type* is at issue: `timestamp_out`
+  is a bijection under the pinned `DateStyle`. What blocks it is that
+  Trellis has a second renderer (`to_jsonb`, in the live-row reads) that
+  spells it differently. Immutability is not the gate here; renderer
+  agreement is (#113, #248).
 * **`jsonb_agg`** — marked `STABLE` in Postgres; whether Trellis's own
   deterministic reimplementation may treat it as immutable is an open question.
 * **`xml`/`tsvector`/`tsquery`** — no useful immutable equality/ordering; niche.
@@ -161,8 +168,10 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   still lets a genuinely unsafe `numeric` key through (see the
   `numeric`/`decimal` row) — tightening that is #110's call. #112 tightened
   its own half: floats no longer reach that gate as `ValueType::Numeric`,
-  and are refused. #113 removed four more families from the index's
-  to-do list for the same reason as `oid` — see below.
+  and are refused. #113 removed `date`/`time`/`timetz` from the index's
+  to-do list for the same reason as `oid`, and left `timestamp` on it for a
+  reason the index does not actually address (two *internal* renderers
+  disagreeing) — see below.
 * **Exact integer semantics (#111)** — `+` and the aggregates follow
   Postgres's own operator family, including its overflow behaviour: `int4 +
   int4` is `integer` and raises `22003 numeric_value_out_of_range` past the
@@ -209,80 +218,128 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **Temporal semantics (#113)** — the temporal block's six families were
   all marked `🎯 typed index` on the assumption that #110 was the
   prerequisite for any key role. Asked of a real server, per family, that
-  turned out to be true for only one of them:
+  assumption turned out to hold for only some of them — and the reason the
+  others are still refused is *not* the one the marking assumed.
 
-  * **`date`, `timestamp`, `time`, `timetz` are text-stable and are now
-    keys, `GROUP BY` keys and primary keys** — the same `oid` reasoning
-    from #111 ("text-stability is a property of the *rendering*, not of the
-    operator set"). `date_out`/`timestamp_out` under the already-pinned
-    `DateStyle = 'ISO, YMD'` are bijections: the year field widens
-    (`5874897-12-31`), the era is an explicit ` BC` suffix,
-    `infinity`/`-infinity` have their own spellings, and fractional seconds
-    are trailing-zero trimmed. `time_out` and `timetz_out` read **no GUC at
-    all** — they are the only two `IMMUTABLE` output functions in the block
-    (`date_out`, `timestamp_out`, `timestamptz_out` and `interval_out` are
-    all `STABLE`). `timetz` is the counter-intuitive one and it is safe for
-    the opposite of the obvious reason: `select '12:00:00+00'::timetz =
-    '17:30:00+05:30'::timetz` is **false**, because `timetz_cmp` sorts by
-    GMT-equivalent time *and then by zone*, so `=` is identity on the
-    stored `(time, zone)` pair — exactly what `timetz_out` prints.
-  * **`timestamptz` stays off the key roles, and pinning `TimeZone` is not
-    the fix.** Pinning `TimeZone = 'UTC'` in
-    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make its rendering a
-    bijection on the instant, and Trellis owning all its own connections
-    means the blast radius on application sessions is nil. It still fails,
-    because **Trellis renders `timestamptz` on two backends and only
-    controls one**: logical-decoding output is produced by the type's
-    output function running in the *walsender*, under the walsender's GUCs
-    (verified by peeking one slot from two sessions with different
-    `timezone` settings and getting two wall clocks for one instant), and
-    `pgwire_replication::ReplicationConfig` offers no way to send startup
-    runtime parameters or `SET` on that connection. Today the two renderers
-    agree by accident — both fall back to the server default. Pinning the
-    pool alone would trade that accidental symmetry for a guaranteed
-    asymmetry on every non-UTC server. The unlocks, in order of preference:
-    a replication transport that can pin session GUCs, or #110's index.
+  * **`date`, `time` and `timetz` are keys, `GROUP BY` keys and primary
+    keys** — the `oid` reasoning from #111 ("text-stability is a property
+    of the *rendering*, not of the operator set"). `date_out` under the
+    already-pinned `DateStyle = 'ISO, YMD'` is a bijection: the year field
+    widens (`5874897-12-31`), the era is an explicit ` BC` suffix, and
+    `infinity`/`-infinity` have their own spellings. `time_out` and
+    `timetz_out` read **no GUC at all** — they are the only two `IMMUTABLE`
+    output functions in the block (`date_out`, `timestamp_out`,
+    `timestamptz_out` and `interval_out` are all `STABLE`). `timetz` is the
+    counter-intuitive one and it is safe for the opposite of the obvious
+    reason: `select '12:00:00+00'::timetz = '17:30:00+05:30'::timetz` is
+    **false**, because `timetz_cmp` sorts by GMT-equivalent time *and then
+    by zone*, so `=` is identity on the stored `(time, zone)` pair —
+    exactly what `timetz_out` prints.
+  * **Text-stability needs two checks, not one, and `timestamp` fails the
+    second.** Trellis turns a column into text in **two** different ways:
+    per column as `<col>::text`, and — in the live-row reads
+    (`staging::apply`'s `read_live_rows_batch`, `fetch_to_side_rows`,
+    `fetch_relationship_projection_rows`; `staging::quarantine`'s sweep) —
+    a whole row at once via `to_jsonb(t.*)` + `jsonb_each_text`. `to_jsonb`
+    does not call the type's output function for datetimes; it uses
+    `jsonb`'s own ISO-8601 writer. One row, one session, both renderings:
 
-    This is also the rule for adding any future GUC to that constant: each
-    one currently pinned is **output-identical to a stock server's
-    default**, so the unpinned walsender agrees unless an operator has
-    deliberately reconfigured the server. `TimeZone` has no such stock
-    value; `IntervalStyle` does (`postgres`), which is why #113 added that
-    one and not this one.
-  * **`interval` can never be a text-matched key, index or no index.**
+    | column | `::text` | `to_jsonb` | |
+    |---|---|---|---|
+    | `date` | `2024-06-15` | `2024-06-15` | same |
+    | `time` | `12:34:56` | `12:34:56` | same |
+    | `timetz` | `12:34:56+00` | `12:34:56+00` | same |
+    | `interval` | `1 day 02:00:00` | `1 day 02:00:00` | same |
+    | `timestamp` | `2024-06-15 12:34:56` | `2024-06-15T12:34:56` | **differs** |
+    | `timestamptz` | `2024-06-15 12:34:56+00` | `2024-06-15T12:34:56+00:00` | **differs** |
+
+    (`numeric`, the integer widths, `uuid`, `bytea` and the floats were
+    swept too and all agree — this is a datetime quirk of `to_jsonb`, not a
+    general property of it.)
+
+    The `T` is not cosmetic: a `timestamp` `GROUP BY` key seeded once
+    through a backfill and once through CDC-then-live-read becomes **two
+    target rows for one Postgres group**. It also reaches `MIN`/`MAX`,
+    because those return an input *verbatim* — a fold over `to_jsonb`-read
+    rows can return the `T`-spelled string where a server-side `min()`
+    returns the space-spelled one, which ADR-0013's byte-exact cross-check
+    reports as a divergence. So `timestamp` and `timestamptz` are deferred
+    from **both** the key roles and `MIN`/`MAX` until the `to_jsonb` sites
+    render consistently with `::text` — tracked as **issue #248**. That is a
+    change to the engine's hottest read paths and no other family needs it,
+    so #113 does not attempt it. `trellis::temporal::is_render_consistent` is the gate, and
+    `defs_temporal.rs`'s `to_jsonb_and_text_agree_for_every_admitted_key_type`
+    sweeps the **whole** key allowlist so the next family cannot repeat it.
+
+    Note the shape: one value, two renderers, no arbiter — the same defect
+    as issue #246, one layer in (there it is the pool versus the walsender).
+  * **`timestamptz` has a second, independent blocker, and pinning
+    `TimeZone` is not the fix.** Pinning `TimeZone = 'UTC'` in
+    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make its `::text`
+    rendering a bijection on the instant, and Trellis owning all its own
+    connections means the blast radius on application sessions is nil. It
+    still fails, because logical-decoding output is produced by the output
+    function running in the **walsender**, under the walsender's GUCs, and
+    `pgwire_replication`'s `ReplicationConfig` (v0.4) exposes no way to send
+    startup runtime parameters. Today the two agree by falling back to the
+    same server default; pinning the pool alone would trade that accidental
+    symmetry for a guaranteed asymmetry on every non-UTC server. Tracked as
+    **issue #246**, which also covers the pre-existing exposure for the
+    `DateStyle`/`bytea_output` pins. (Postgres itself honours startup
+    `options` on a replication connection — `PGOPTIONS='-c timezone=UTC'`
+    works with `pg_recvlogical` — so this is a library gap, not a wall.)
+
+    This gives the rule for adding a fifth GUC to that constant: each one
+    currently pinned is **output-identical to a stock server's default**, so
+    the unpinned walsender agrees unless an operator deliberately
+    reconfigured the server. `TimeZone` has no such stock value;
+    `IntervalStyle` does (`postgres`), which is why #113 added that one and
+    not this one.
+  * **`interval` can never be a text-matched key.**
     `'24 hours'::interval = '1 day'::interval` is **true** while their
     `::text` differs — one value, many renderings, structurally the float
     `-0`/`0` defect with a dense equivalence class instead of a single
-    pathological pair. (#110's typed key index *would* fix it, by comparing
-    decoded values; no GUC can.)
-  * **`MIN`/`MAX` land for the five text-bijective families, and are
-    refused for `interval`.** The refusal is a fidelity call, not a
-    difficulty one: `max(v)` over `{'1 day', '24 hours', '2 hours'}`
-    returns `24:00:00` scanning one way and `1 day` scanning the other, on
-    a live server, because `interval_larger` is a left fold over a tie that
-    is *not* byte-identical. Postgres's own answer is therefore not a
-    function of its input multiset, and ADR-0013 establishes correctness by
-    byte-exact comparison against an independently-authored recompute — a
-    bar this aggregate cannot clear no matter what Trellis computes. Note
-    `timestamptz` *does* keep `MIN`/`MAX` despite losing the key roles: a
-    tie there is between values any single session renders identically, and
-    the aggregate returns an input verbatim rather than re-rendering it.
-  * **`SUM(interval)` lands and is invertible** — the opposite verdict from
-    #112's `SUM(<float>)`, and the gate's question is algebraic rather than
-    "is it exact decimal". An `interval` is three independent signed
-    integers (`months: i32`, `days: i32`, `micros: i64`) and `interval_pl`
-    adds them fieldwise with overflow checks, applying no justification, so
-    addition is exact, commutative and associative with an exact inverse.
-    `sum(v)` over the multiset above is `1 day 26:00:00` in either scan
-    order. The delta path accumulates in SQL (`::interval[]`, identity
-    `'0'::interval`), so the running partial is Postgres's own
-    `sum(interval)`.
+    pathological pair. Unlike `timestamp`'s problem, no renderer
+    reconciliation helps; #110's typed key index would, by comparing
+    decoded values.
+  * **`MIN`/`MAX` land for `date`/`time`/`timetz`.** `interval` is refused
+    on a *third*, separate ground: `max(v)` over `{'1 day', '24 hours',
+    '2 hours'}` returns `24:00:00` scanning one way and `1 day` the other,
+    on a live server, because `interval_larger` is a left fold over a tie
+    that is not byte-identical. Postgres's own answer is not a function of
+    its input multiset, so ADR-0013's byte-exact recompute cross-check can
+    never settle it, whatever Trellis computes.
+  * **`SUM(interval)` lands, and is recompute-only** — same destination as
+    #112's float `SUM`/`AVG`, arrived at from the opposite direction. On
+    finite, in-range values interval addition *is* exact, commutative and
+    associative with an exact inverse (three independent integer fields,
+    added fieldwise by `interval_pl`, no justification — `'1 mon' + '30
+    days'` is `1 mon 30 days`, not `2 mons`). But the monoid is **partial**,
+    and a delta cannot represent the gaps:
+
+    * `'infinity'::interval` is a legitimate value (PG 17+). `infinity + 1
+      day` is `infinity`; `infinity + -infinity` **raises**. A group holding
+      `{infinity, 1 day}` whose infinity row is deleted has a well-defined
+      true sum of `1 day`, but the delta computes `infinity + (-infinity)`
+      and raises — and replays identically on every retry, so it is a drain
+      that never progresses, not a quarantine.
+    * Overflow is scan-order dependent *on the server itself*: `sum(v)` over
+      `{'2147483647 days', '1 days', '-1 days'}` raises ascending and
+      returns `2147483647 days` descending.
+
+    Recompute-only removes both: `probe_recompute_fields_bulk` renders
+    `(sum(<col>))::text` and lets Postgres fold the group in one pass, so
+    Trellis raises exactly when a server-side `sum()` over the same rows
+    would. Where #112's floats are *total but inexact*, interval is *exact
+    but partial* — either way there is no inverse to delta with.
   * **Literals:** `TIME`/`TIMETZ` join the allowlist; `TIMESTAMPTZ` and
     `INTERVAL` do not. `INTERVAL`'s blocker is on the *input* side and is
     its own: `interval_in` reads `IntervalStyle`, so `'-1 2:03:04'` is
     `-1 days +02:03:04` under `postgres` and a different value under
     `sql_standard` — a definition installed against one server would not
-    stay correct read on another.
+    stay correct read on another. (A `timetz` offset literal is canonical
+    when its trailing all-zero tail is dropped and only then:
+    `+05:00:30` is what `timetz_out` prints, while `+05:30:00` is not.)
   * `crate::temporal` owns the comparison order, the `interval` value model
     and `interval_out`'s rendering; unlike #111/#112 it mints **no new
     `ValueType` variant**, because every role added here is a function of

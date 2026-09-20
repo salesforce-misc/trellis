@@ -81,7 +81,6 @@
 //!   not chosen to offer. Never approximate an inverse.
 
 use super::ast::ValueType;
-use super::pg_type::PgType;
 
 /// Whether an aggregate measure's new value can be derived from its old
 /// value plus a folded change (invertible → delta-able), or whether it must
@@ -204,30 +203,47 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
         ("SUM", AggregateArg::Column(ValueType::Numeric | ValueType::Integer(_))) => {
             Some(Verdict::invertible(&[]))
         }
-        // Issue #113: `SUM(interval)` is invertible, and it is worth being
-        // explicit that this is the *opposite* verdict from #112's
-        // `SUM(<float>)` even though both arguments are non-`Numeric` — the
-        // gate's question is algebraic, not "is it an exact decimal".
+        // Issue #113: `SUM(interval)` is **recompute-only**, landing in the
+        // same arm as `SUM(<float>)` below — and the reasoning is worth
+        // spelling out, because interval addition looks invertible and on
+        // the ordinary values it is.
         //
         // A Postgres `interval` is three independent signed integers
         // (`months: i32`, `days: i32`, `micros: i64`) and `interval_pl`
-        // adds them fieldwise with overflow checks, applying no
-        // justification. Interval addition is therefore exact, commutative
-        // and associative, with exact subtraction as its inverse — every
-        // property float addition lacks. Checked against a live server
-        // rather than reasoned from the type's shape: `sum(v)` over
-        // `{'1 day', '24 hours', '2 hours'}` is `1 day 26:00:00` in either
-        // scan order, and `('1 mon' + '30 days') - '30 days'` is exactly
-        // `1 mon`.
+        // adds them fieldwise, applying no justification. Over finite,
+        // in-range values that addition really is exact, commutative and
+        // associative with an exact inverse — every property float addition
+        // lacks, and `sum(v)` over `{'1 day', '24 hours', '2 hours'}` is
+        // `1 day 26:00:00` in either scan order on a live server.
         //
-        // The delta path this unlocks accumulates in SQL, not in Rust
-        // (`staging::apply_aggregate`'s `sum_array_expr`), so the running
-        // partial is a real `interval` column summed by Postgres's own
-        // `sum(interval)` — no reimplementation sits between the delta and
-        // the recompute ADR-0013 checks it against.
-        ("SUM", AggregateArg::Column(ValueType::Other(PgType::Interval))) => {
-            Some(Verdict::invertible(&[]))
-        }
+        // The monoid is **partial**, though, and a delta cannot represent
+        // the gaps. Both failures were reproduced against Postgres 17:
+        //
+        // 1. **Infinities do not subtract.** `'infinity'::interval` is a
+        //    legitimate value (PG 17+), `'infinity' + '1 day'` is
+        //    `infinity`, and `'infinity' + '-infinity'` is `ERROR: interval
+        //    out of range`. A group holding `{infinity, 1 day}` whose
+        //    infinity row is then deleted has a perfectly well-defined true
+        //    sum of `1 day`, but the delta model computes it as
+        //    `infinity + (-infinity)` and raises — and because the delta is
+        //    replayed identically on every retry, that is not a
+        //    quarantine-and-continue, it is a drain that never makes
+        //    progress again.
+        // 2. **Overflow is scan-order dependent.** `sum(v)` over
+        //    `{'2147483647 days', '1 days', '-1 days'}` raises ascending
+        //    and returns `2147483647 days` descending, on the server
+        //    itself. A delta accumulates in whatever order rows happen to
+        //    arrive, so it can raise where the recompute it is checked
+        //    against succeeds.
+        //
+        // Recompute-only removes both: `apply_aggregate`'s
+        // `probe_recompute_fields_bulk` renders `(sum(<col>))::text` and
+        // lets Postgres fold the group in one pass, so the engine raises
+        // exactly when and only when a server-side `sum()` over the same
+        // rows would. This is the same conclusion #112 reached for float
+        // `SUM`/`AVG` by a different route — there the arithmetic is total
+        // but inexact, here it is exact but partial, and either way there
+        // is no inverse to delta with. Never approximate an inverse.
         (
             "SUM",
             AggregateArg::Column(
