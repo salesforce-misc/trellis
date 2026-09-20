@@ -228,7 +228,8 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
 /// to-side column through the same OID registry but (unlike
 /// `Trellis::source_columns`) legitimately keeps them, since a
 /// `<rel>.<column>` enrichment field is a pure text projection
-/// (`jsonb_each_text(to_jsonb(p.*))`), never a typed read.
+/// (`jsonb_each_text(jsonb_build_object(..., <col>::text, ...))` since issue
+/// #248, `to_jsonb(p.*)` before it), never a typed read.
 ///
 /// Pre-#108 those columns typed as `ValueType::Text` via the `_ => Text`
 /// fallthrough, so the target column was created as `text` and the

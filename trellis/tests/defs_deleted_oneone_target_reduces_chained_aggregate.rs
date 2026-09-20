@@ -20,10 +20,12 @@
 //! extinction, just one producer earlier in the chain.
 //!
 //! The fix: `apply_target`'s own delete statement now captures each deleted
-//! row's pre-delete image (`RETURNING ... to_jsonb(t.*)::text`, the same
-//! encoding `apply_aggregate::delete_group_row`'s issue #180 fix uses),
-//! threaded through the same `ChangedKey` slot so step 4 stages a real
-//! image-bearing delete for it.
+//! row's pre-delete image (`RETURNING ...`, an explicit per-column
+//! `jsonb_build_object('<col>', <col>::text, ...)::text` since issue #248 —
+//! `to_jsonb(t.*)::text` before it — the same shape
+//! `apply_aggregate::delete_group_row`'s issue #180 fix uses), threaded
+//! through the same `ChangedKey` slot so step 4 stages a real image-bearing
+//! delete for it.
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 

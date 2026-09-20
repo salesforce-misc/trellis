@@ -750,6 +750,35 @@ pub async fn live_row_columns(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
+/// [`live_row_columns`], memoized per `table` in `cache` — the caching
+/// counterpart Phase 3's reverse-trigger loop needs
+/// (`apply_and_mark_drained_many`'s "3d" step, via
+/// [`stage_reverse_recompute_fallback`] and its `diff_pass` closure).
+///
+/// That loop runs once per distinct touched parent key in the batch, and
+/// every record for one relationship shares the same `from_table` — a wide
+/// reverse-relationship batch can touch many parent keys in one drain, so an
+/// uncached [`live_row_columns`] call per record would be a real per-record
+/// `pg_catalog` round trip this fix did not add before issue #248
+/// introduced the `row_columns` parameter [`from_side_rows_for_trigger_txn`]
+/// now needs. `table`'s column list cannot change mid-transaction (DDL on it
+/// would take a lock this transaction already holds something incompatible
+/// with, for any table this crate reads), so caching it for the lifetime of
+/// one Phase 3 transaction is sound.
+async fn cached_row_columns<'c>(
+    txn: &Transaction<'_>,
+    cache: &'c mut HashMap<String, Vec<String>>,
+    table: &str,
+) -> Result<&'c [String], ApplyError> {
+    if !cache.contains_key(table) {
+        let columns = live_row_columns(txn, table).await?;
+        cache.insert(table.to_string(), columns);
+    }
+    Ok(cache
+        .get(table)
+        .expect("just inserted if it wasn't already present"))
+}
+
 /// `to_jsonb(<alias>.*)`'s replacement (issue #248): an explicit
 /// `jsonb_build_object('<col>', <alias>."<col>"::text, ...)` over `columns`,
 /// so every value lands the same way an ordinary `<col>::text` cast would —
@@ -1874,6 +1903,21 @@ async fn capture_reverse_guard_state(
 /// an old and new key that happen to be equal still issues one query per
 /// slice entry, unchanged from before (the caller's own `seen_keys` dedup is
 /// what collapses the resulting duplicate rows, exactly as it always has).
+///
+/// `row_columns` is `from_table`'s live column list (issue #248's
+/// `row_as_text_jsonb_sql` needs it in place of `to_jsonb(t.*)` — see that
+/// function's doc comment), **resolved by the caller, not here**: this
+/// function is called once per distinct touched parent key in Phase 3's own
+/// `for record in &plan.relationship_reverses` loop
+/// (`apply_and_mark_drained_many`'s "3d" step, both directly from
+/// [`stage_reverse_recompute_fallback`] and from the reverse-delta fast
+/// path's `diff_pass` closure), and `from_table` is invariant across many
+/// records sharing one relationship — introspecting it fresh on every call
+/// would be a real per-record `pg_catalog` round trip on a path that already
+/// fans out with wide reverse-relationship batches (a regression this fix
+/// did not have before issue #248 introduced this parameter). The caller
+/// resolves it once per distinct `from_table`, cached across that whole
+/// loop, and passes the same slice into every call.
 /// [`ReverseTrigger::WholeKeyspace`] is unreachable here, for two independent
 /// reasons. Structurally: both call sites construct [`ReverseTrigger::Keys`]
 /// inline from a single join key they already hold, and no function in this
@@ -1901,6 +1945,7 @@ async fn from_side_rows_for_trigger_txn(
     from_col: &str,
     from_pk: &[PrimaryKeyColumn],
     trigger: &ReverseTrigger<'_>,
+    row_columns: &[String],
 ) -> Result<Vec<(String, Row)>, ApplyError> {
     let join_keys: &[String] = match trigger {
         ReverseTrigger::Keys(join_keys) => join_keys,
@@ -1914,12 +1959,10 @@ async fn from_side_rows_for_trigger_txn(
         return Ok(Vec::new());
     }
     // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment. Fetched
-    // once, outside the loop below: `from_table`'s live column list doesn't
-    // change per join key, so there's no reason to re-introspect it once per
-    // iteration.
-    let row_columns = live_row_columns(txn, from_table).await?;
-    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment.
+    // `row_columns` arrives pre-resolved (see this function's own doc
+    // comment on why it isn't introspected here).
+    let doc_expr = row_as_text_jsonb_sql("t", row_columns);
     let mut rows: HashMap<String, Row> = HashMap::new();
     for join_key in join_keys {
         let sql = format!(
@@ -2538,6 +2581,15 @@ async fn reverse_ordering_still_holds(
 /// forward evaluation already is — which is exactly why issue #135's
 /// fairness escalation (see this module's own design section above) can
 /// lean on it as the always-safe exit from the guard-gated retry loop.
+///
+/// `row_columns` is `shape.from_table`'s live column list, resolved once by
+/// the caller via [`cached_row_columns`] — not re-introspected per call here
+/// — since this function's own caller (the "3d" step's `for record in
+/// &plan.relationship_reverses` loop) runs once per distinct touched parent
+/// key in the batch, and many records touching one relationship all share
+/// this same `from_table`. See [`from_side_rows_for_trigger_txn`]'s doc
+/// comment for why that function takes the same parameter rather than
+/// introspecting it itself.
 #[allow(clippy::too_many_arguments)]
 async fn stage_reverse_recompute_fallback(
     txn: &Transaction<'_>,
@@ -2548,6 +2600,7 @@ async fn stage_reverse_recompute_fallback(
     src_changed: Option<std::time::SystemTime>,
     seen_keys: &mut std::collections::HashSet<String>,
     fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    row_columns: &[String],
 ) -> Result<(), ApplyError> {
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
@@ -2557,6 +2610,7 @@ async fn stage_reverse_recompute_fallback(
             &shape.from_col,
             &shape.from_pk,
             &trigger,
+            row_columns,
         )
         .await?;
         for (from_key, _) in from_rows {
@@ -3769,12 +3823,16 @@ mod tests {
 
         let txn = client.transaction().await.expect("open txn");
         let join_keys = vec!["a".to_string()];
+        let row_columns = live_row_columns(&txn, "from_side_fixture")
+            .await
+            .expect("introspect from_side_fixture's columns");
         let mut rows = from_side_rows_for_trigger_txn(
             &txn,
             "from_side_fixture",
             "join_key",
             &from_pk,
             &ReverseTrigger::Keys(&join_keys),
+            &row_columns,
         )
         .await
         .expect("from_side_rows_for_trigger_txn(Keys)");
@@ -3821,12 +3879,16 @@ mod tests {
         let from_pk = seed_reverse_trigger_fixture(&client).await;
 
         let txn = client.transaction().await.expect("open txn");
+        // `WholeKeyspace` errors out before `row_columns` is ever read (see
+        // the function's own early `match trigger`), so an empty slice is
+        // fine here — this test is about the error arm, not the row decode.
         let err = from_side_rows_for_trigger_txn(
             &txn,
             "from_side_fixture",
             "join_key",
             &from_pk,
             &ReverseTrigger::WholeKeyspace,
+            &[],
         )
         .await
         .expect_err("a whole-keyspace trigger must not resolve against full row images");
@@ -6120,10 +6182,27 @@ pub async fn apply_and_mark_drained_many(
     // `MAX_HOP_GEN` below) — appended separately, after this loop, via its
     // own `append::append` call.
     let mut relationship_reverse_deferrals: Vec<StagedChange> = Vec::new();
+    // Issue #248 review follow-up: `from_side_rows_for_trigger_txn` needs
+    // each touched `from_table`'s live column list (`row_as_text_jsonb_sql`,
+    // in place of `to_jsonb(t.*)`), and this loop runs once per distinct
+    // touched parent key in the batch — many records sharing one
+    // relationship all share one `from_table`. Caching per `from_table`
+    // across the *whole* loop (not just within one record) is what keeps
+    // that at one `pg_catalog` round trip per distinct `from_table`, not one
+    // per record, on a path that already fans out with wide
+    // reverse-relationship batches.
+    let mut row_columns_cache: HashMap<String, Vec<String>> = HashMap::new();
     for record in &plan.relationship_reverses {
         let shape = &record.shape;
         let old_key = relationship_key_text(&record.old_row, &shape.to_col);
         let new_key = relationship_key_text(&record.new_row, &shape.to_col);
+        // Resolved once per record from the batch-wide cache above — every
+        // `from_side_rows_for_trigger_txn` call this record makes (via
+        // `diff_pass` below and/or `stage_reverse_recompute_fallback`)
+        // reuses this same slice.
+        let row_columns = cached_row_columns(txn, &mut row_columns_cache, &shape.from_table)
+            .await?
+            .to_vec();
 
         // Issue #132: all four guards, checked together — see
         // `check_reverse_guards`'s own doc comment for the mechanism, the
@@ -6165,6 +6244,7 @@ pub async fn apply_and_mark_drained_many(
                     record.src_changed,
                     &mut seen_keys,
                     &mut relationship_reverse_fallback,
+                    &row_columns,
                 )
                 .await?;
                 apply_projection_advance(
@@ -6326,6 +6406,7 @@ pub async fn apply_and_mark_drained_many(
                     &shape.from_col,
                     &shape.from_pk,
                     &trigger,
+                    &row_columns,
                 )
                 .await?;
                 for (_, from_row) in from_rows {
@@ -6496,6 +6577,7 @@ pub async fn apply_and_mark_drained_many(
                 record.src_changed,
                 &mut seen_keys,
                 &mut relationship_reverse_fallback,
+                &row_columns,
             )
             .await?;
         }
