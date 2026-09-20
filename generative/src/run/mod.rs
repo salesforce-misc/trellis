@@ -18,9 +18,13 @@
 
 mod coverage;
 mod noise;
+mod two_instance;
 
 pub use coverage::Coverage;
 pub use noise::run_convergence_with_noise;
+pub use two_instance::{
+    InstanceLabel, InstanceRun, TwoInstanceError, run_two_instance_convergence,
+};
 
 use std::collections::HashMap;
 use std::fmt;
