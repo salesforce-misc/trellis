@@ -286,3 +286,100 @@ async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
         .get(0);
     assert_eq!(data_type, "text");
 }
+
+/// Issue #234, the missing front-door pin for `Trellis::start_client`'s half
+/// of "a configured schema must be carried, not re-resolved": a `Trellis`
+/// must run its **background client** in its own `Config`'s schema, not in
+/// whatever `TRELLIS_SCHEMA`/`DEFAULT_SCHEMA` the *process* environment
+/// resolves to.
+///
+/// `start_client` used to hand only `config.dsn()` to `Client::start`, which
+/// re-resolved a `Config` from the environment — so a `Trellis` built with
+/// `Config::with_schema(dsn, "…")` read its catalog and answered
+/// `await_converged` out of its configured instance while its staging
+/// worker, intake and drain workers all ran against a *different* instance's
+/// ring. `Client::start_with_config` fixes it; this is the regression pin.
+///
+/// The database is an *isolated* (already-migrated) one, so `DEFAULT_SCHEMA`
+/// exists and a wrongly-resolved client would start up perfectly happily.
+/// What gives the bug away is which ring the write actually flows through:
+/// the configured instance's own `replication_progress`/ring never see it,
+/// so `await_converged` — which asks that instance's own predicate — cannot
+/// return `Ok`, and the target row never appears.
+#[tokio::test]
+async fn the_background_client_runs_in_the_configured_schema_not_the_process_default() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let config =
+        Config::with_schema(db.dsn().to_string(), "instance_x").expect("test schema name is valid");
+    let pool = trellis::Pool::new(&config).expect("build pool for the configured instance");
+    trellis::migrate(&pool, &config)
+        .await
+        .expect("migrate the configured instance's schema");
+
+    // Source table and definition both live in (and are read through) the
+    // configured instance, never the default one.
+    pool.get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let definer = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .expect("connect definer");
+    definer
+        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown definer");
+
+    let running = Trellis::connect(
+        config.clone(),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running trellis in the configured schema");
+
+    pool.get()
+        .await
+        .expect("connection")
+        .execute("insert into widgets (id, price) values (1, 9)", &[])
+        .await
+        .expect("insert source row");
+
+    // Per `Trellis::watermark_token`'s contract: taken after the write's own
+    // commit has already returned.
+    let token = running.watermark_token().await.expect("watermark_token");
+    running
+        .await_converged(token, std::time::Duration::from_secs(30))
+        .await
+        .expect(
+            "the background client must stage and drain through the *configured* instance's \
+             ring — before issue #234 it ran against DEFAULT_SCHEMA's ring instead, leaving this \
+             instance's own convergence predicate permanently unsatisfiable",
+        );
+
+    let price: Option<i32> = pool
+        .get()
+        .await
+        .expect("connection")
+        .query_opt("select price from public.widget_prices where id = 1", &[])
+        .await
+        .expect("read target table")
+        .map(|row| row.get(0));
+    assert_eq!(
+        price,
+        Some(9),
+        "the configured instance's own pipeline must have applied the write, not merely have \
+         flipped a predicate"
+    );
+
+    running.shutdown().await.expect("shutdown running trellis");
+}
