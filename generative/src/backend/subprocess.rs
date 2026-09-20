@@ -9,7 +9,7 @@
 //! in-process (see its own module doc comment) — real, but not the shape a
 //! genuine crash test needs. [`Backend::restart`]'s own doc comment already
 //! flags this: `ManualBackend::restart` is a faithful *simulation* of a
-//! crash (drop the in-process client, start a fresh one), not an actual
+//! crash (tear down the in-process client, start a fresh one), not an actual
 //! `SIGKILL`. `testkit::CrashGuard` — a real subprocess-`SIGKILL` primitive
 //! — has sat unused since it was written for exactly this reason: nothing
 //! in the suite ran the engine as a real OS process for it to supervise.

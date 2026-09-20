@@ -65,18 +65,23 @@ pub trait Backend {
     fn snapshot(&mut self) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send;
 
     /// Simulates an ungraceful crash-and-restart of the backend's primary
-    /// engine client (improvement-plan task E3): drops whatever is currently
-    /// running it and starts a fresh one against the same target. The ring
-    /// is durable Postgres state, not in-memory, so a fresh client is
-    /// expected to pick back up exactly where the crashed one left off: no
-    /// stuck or lost work, no duplicate processing. Each implementation
+    /// engine client (improvement-plan task E3): tears down whatever is
+    /// currently running it and starts a fresh one against the same target.
+    /// The ring is durable Postgres state, not in-memory, so a fresh client
+    /// is expected to pick back up exactly where the crashed one left off:
+    /// no stuck or lost work, no duplicate processing. Each implementation
     /// picks its own faithful stand-in for "the process died": [`ManualBackend`]
-    /// (in-process) just drops and replaces its `trellis::Client` — its own
-    /// `Drop` impl already performs a best-effort, non-graceful shutdown
-    /// signal with no draining (deliberately *not* the graceful
-    /// `shutdown().await` path), so no subprocess/`SIGKILL` machinery is
-    /// needed there. [`SubprocessBackend`] (issue #166) does the real thing:
-    /// `SIGKILL`s the actual OS process and spawns a fresh one.
+    /// (in-process) replaces its `trellis::Client`, awaiting the outgoing
+    /// one's graceful `shutdown()` first (issue #251) rather than just
+    /// dropping it — `Drop`'s shutdown signal is best-effort and doesn't
+    /// join the background thread, so a bare drop-then-restart could race
+    /// the old producer's advisory-lock release against the new producer's
+    /// acquire and spuriously fail with `ProducerAlreadyRunning`; no
+    /// subprocess/`SIGKILL` machinery is needed there either way.
+    /// [`SubprocessBackend`] (issue #166) does the real thing: `SIGKILL`s the
+    /// actual OS process and *waits for it to actually exit* before spawning
+    /// a fresh one — the same "don't just drop, wait for the teardown to
+    /// really finish" discipline, one layer down.
     fn restart(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Starts an additional engine client alongside whatever is already

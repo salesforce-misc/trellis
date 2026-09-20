@@ -811,23 +811,37 @@ impl super::Backend for ManualBackend {
         Ok(snapshot)
     }
 
-    /// Improvement-plan task E3: drops the current primary `trellis::Client`
-    /// (its own `Drop` impl fires here — best-effort shutdown signal, no
-    /// draining, no join: see the `Backend::restart` doc comment) and starts
-    /// a fresh one against the same dsn/options [`ManualBackend::install`]
-    /// remembered. The ring is durable Postgres state untouched by any of
-    /// this, so the new client resumes exactly where the old one left off.
+    /// Improvement-plan task E3: tears down the current primary
+    /// `trellis::Client` and starts a fresh one against the same dsn/options
+    /// [`ManualBackend::install`] remembered. The ring is durable Postgres
+    /// state untouched by any of this, so the new client resumes exactly
+    /// where the old one left off.
+    ///
+    /// Issue #251: this used to just drop the old `Option<Client>` and rely
+    /// on `Client`'s `Drop` impl (a best-effort shutdown signal with no join)
+    /// to tear it down, then immediately start the replacement. `Drop` never
+    /// waits for the background thread to exit, so the old producer's
+    /// `pg_try_advisory_lock`-held session could still be open when the very
+    /// next line's producer tried to acquire that same lock — a real,
+    /// sporadic `ProducerAlreadyRunning` race (see the CI failure this issue
+    /// links). Awaiting `trellis::Client::shutdown` on the outgoing client
+    /// first — which sends the same signal *and* joins the thread — makes
+    /// the old lock's release happen-before the new client's acquire
+    /// attempt, closing the race structurally rather than just narrowing it.
+    /// Matches [`super::SubprocessBackend::restart`]'s own explicit
+    /// `kill`-then-`wait` (never just letting its `CrashGuard` drop) for the
+    /// identical reason.
     async fn restart(&mut self) -> Result<(), ManualBackendError> {
         let options = self
             .client_options
             .clone()
             .ok_or(ManualBackendError::NoClientStarted)?;
-        // Dropping the old value here — before starting the replacement —
-        // is what fires `trellis::Client`'s `Drop` impl (the crash stand-in);
-        // reassigning below wouldn't run it any differently, but doing it as
-        // its own statement keeps the "crash, then restart" sequencing
-        // explicit rather than implicit in the assignment.
-        self.engine_client = None;
+        // Take the old client and await its graceful shutdown — not just
+        // drop it — before starting the replacement, so the old producer's
+        // advisory lock is guaranteed released first (issue #251).
+        if let Some(old_client) = self.engine_client.take() {
+            old_client.shutdown().await?;
+        }
         let client = EngineClient::start_with_config(self.config.clone(), options)?;
         self.engine_client = Some(client);
         Ok(())
