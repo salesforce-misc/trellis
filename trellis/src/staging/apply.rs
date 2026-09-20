@@ -815,6 +815,57 @@ async fn from_side_keys(
     }
 }
 
+/// Resolves a batch's touched to-side join keys (`key_hops`'s keys, each
+/// mapped to the max `hop_gen` that touched it, with `key_src_changed`
+/// carrying the matching earliest `src_changed`) into `rel`'s from-side
+/// rows, and merges each one into `compute`'s shared `reverse_recomputes`
+/// accumulator at `hop + 1`.
+///
+/// Extracted from the to-many reverse branch so issue #244's image-less
+/// to-one trigger handling can reuse it verbatim rather than open-code a
+/// second, drifting copy — the two differ only in *which* changes they
+/// collect keys from, never in how a collected key becomes a from-side
+/// recompute. The accumulator's own `(from_table, from_key)` keying (issue
+/// #79's cross-relationship dedupe) and its `max`/`earliest_src_changed`
+/// merge rules are the shared part, so both callers get them for free.
+async fn accumulate_from_side_recomputes(
+    pool: &Pool,
+    rel: &crate::defs::RelationshipDefinition,
+    key_hops: &HashMap<String, i32>,
+    key_src_changed: &HashMap<String, Option<std::time::SystemTime>>,
+    reverse_recomputes: &mut HashMap<(String, String), (i32, Option<std::time::SystemTime>)>,
+) -> Result<(), ApplyError> {
+    if key_hops.is_empty() {
+        return Ok(());
+    }
+    let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+    let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+    let matches = from_side_keys(
+        pool,
+        &rel.def.from_table,
+        &from_pk,
+        &rel.def.from_col,
+        &ReverseTrigger::Keys(&join_keys),
+    )
+    .await?;
+    for (from_key, join_text) in matches {
+        // `Keys` always reports which key matched — see `from_side_keys`'s
+        // own doc comment.
+        let join_text =
+            join_text.expect("ReverseTrigger::Keys always reports the matched join value");
+        let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
+        let src_changed = key_src_changed.get(&join_text).copied().flatten();
+        reverse_recomputes
+            .entry((rel.def.from_table.clone(), from_key))
+            .and_modify(|(h, sc)| {
+                *h = (*h).max(hop);
+                *sc = earliest_src_changed(*sc, src_changed);
+            })
+            .or_insert((hop, src_changed));
+    }
+    Ok(())
+}
+
 /// One to-one relationship's settled-parent projection keys a batch's
 /// relationship resolution touched (issue #130, epic #127; plan doc §2's
 /// guard (b) precondition — "the generation must be bumped... so a reverse
@@ -4218,35 +4269,91 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                     }
                 }
-                if key_hops.is_empty() {
-                    continue;
-                }
-                let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-                let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
-                let matches = from_side_keys(
+                accumulate_from_side_recomputes(
                     pool,
-                    &rel.def.from_table,
-                    &from_pk,
-                    &rel.def.from_col,
-                    &ReverseTrigger::Keys(&join_keys),
+                    rel,
+                    &key_hops,
+                    &key_src_changed,
+                    &mut reverse_recomputes,
                 )
                 .await?;
-                for (from_key, join_text) in matches {
-                    // `Keys` always reports which key matched — see
-                    // `from_side_keys`'s own doc comment.
-                    let join_text = join_text
-                        .expect("ReverseTrigger::Keys always reports the matched join value");
-                    let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-                    let src_changed = key_src_changed.get(&join_text).copied().flatten();
-                    reverse_recomputes
-                        .entry((rel.def.from_table.clone(), from_key))
-                        .and_modify(|(h, sc)| {
-                            *h = (*h).max(hop);
-                            *sc = earliest_src_changed(*sc, src_changed);
-                        })
-                        .or_insert((hop, src_changed));
-                }
                 continue;
+            }
+
+            // Issue #244: an image-less change — a bare
+            // `StagedChange::Recompute` trigger — is *not* a parent state
+            // transition, and must never become a reverse **delta**.
+            //
+            // Such a trigger asserts only "this key exists as of now" (see
+            // `intake::publication::enumerate_and_append`'s doc comment); it
+            // carries no images at all, and it is staged in quantity by
+            // paths that have nothing to do with the parent changing: a
+            // definition's ring backfill enumeration of its own source
+            // table, forward propagation's chained-target hop, and every
+            // reverse/TRUNCATE-clear fallback (whose from-side table is very
+            // often *also* some other relationship's to-side).
+            //
+            // The delta path below can't represent that. It reads
+            // `rows[i]`, which for an image-less trigger is `compute`'s own
+            // *live re-read* of the row — so the record it would build is
+            // `old_row = None`, `new_row = Some(live row)`, byte-for-byte
+            // the shape of a genuine parent INSERT, and `diff_pass` would
+            // dutifully add the parent's contribution to every matching
+            // from-side row's group a second time, on top of the
+            // contribution already folded in when the parent was really
+            // inserted. That is a silent 2x `SUM` (issue #244's generative
+            // repro: `t4[1].rel_agg` 59 -> 118).
+            //
+            // The right treatment is the one the to-many branch just above
+            // already gives every trigger it sees, image-less included: an
+            // image-less `Recompute` of the matching from-side rows, which
+            // re-derives each affected group from live state and is
+            // therefore idempotent no matter how many times it runs — the
+            // same always-correct fallback `needs_recompute_fallback` and
+            // the guard-rejection paths route to. It costs a hop generation
+            // and a live pass instead of a delta, which is exactly the
+            // trade the fallback exists to make, and it keeps a *genuine*
+            // propagation (a chained to-side target this apply just
+            // rewrote, staged as an image-less hop) reaching its dependents
+            // rather than being dropped.
+            let has_image_less = changes
+                .iter()
+                .any(|change| change.old_image.is_none() && change.new_image.is_none());
+            if has_image_less {
+                let mut key_hops: HashMap<String, i32> = HashMap::new();
+                let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
+                    HashMap::new();
+                for (i, change) in changes.iter().enumerate() {
+                    if change.old_image.is_some() || change.new_image.is_some() {
+                        continue;
+                    }
+                    // Only the live re-read can carry the join key here, by
+                    // construction — there is no image to read one from. A
+                    // re-read that came back empty (the key no longer
+                    // exists) leaves nothing to resolve a from-side row
+                    // through, exactly as the both-images-absent skip below
+                    // always intended.
+                    let Some(row) = &rows[i] else { continue };
+                    let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
+                        continue;
+                    };
+                    key_hops
+                        .entry(join_text.clone())
+                        .and_modify(|h| *h = (*h).max(change.hop_gen))
+                        .or_insert(change.hop_gen);
+                    key_src_changed
+                        .entry(join_text.clone())
+                        .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
+                        .or_insert(change.src_changed);
+                }
+                accumulate_from_side_recomputes(
+                    pool,
+                    rel,
+                    &key_hops,
+                    &key_src_changed,
+                    &mut reverse_recomputes,
+                )
+                .await?;
             }
 
             // Issue #131: to-one. One `ReverseRelationshipShape` per
@@ -4261,15 +4368,24 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 }
             };
             for (i, change) in changes.iter().enumerate() {
-                let old_row = reverse_old_rows[i].clone();
-                let new_row = rows[i].clone();
-                if old_row.is_none() && new_row.is_none() {
-                    // Both decoded images absent — an image-less change to
-                    // the parent's own table (a bare recompute trigger),
-                    // never a real parent state transition. Nothing to
-                    // reverse-apply.
+                // Issue #244: an image-less change (both of the *change's
+                // own* images absent — a bare recompute trigger) is never a
+                // parent state transition, so it never becomes a delta
+                // record; the block just above has already routed it to the
+                // idempotent from-side recompute instead. Tested on
+                // `change.old_image`/`change.new_image`, **not** on the
+                // decoded `old_row`/`new_row` pair this used to test: an
+                // image-less trigger's `rows[i]` is `compute`'s own live
+                // re-read, so the old condition only ever fired for a key
+                // whose live re-read also came back empty — the delta path
+                // saw every still-existing row as a parent INSERT and
+                // double-counted its contribution (see the long comment on
+                // the image-less block above).
+                if change.old_image.is_none() && change.new_image.is_none() {
                     continue;
                 }
+                let old_row = reverse_old_rows[i].clone();
+                let new_row = rows[i].clone();
                 let read_key = relationship_key_text(&old_row, &rel.def.to_col)
                     .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
                 let capture = capture_reverse_guard_state(

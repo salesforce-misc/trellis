@@ -3105,3 +3105,118 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
          null (post 3)"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #244: an image-less `Recompute` on the *to-side* table is not a
+// parent state transition.
+// ---------------------------------------------------------------------
+
+/// Stages one image-less `recompute` trigger into the active ring segment
+/// — the exact row shape `intake::publication::enumerate_and_append` (a
+/// definition's ring backfill), forward propagation's chained-target hop,
+/// and the reverse/TRUNCATE-clear fallbacks all append: no images, no
+/// `lsn`, only "this key exists as of now".
+async fn stage_recompute(client: &Client, src_table: &str, key: &str) {
+    let src_table = qualify_fixture_table(src_table);
+    let table = active_seg_table(client).await;
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, hop_gen) values ($1, $2, 'recompute', 0)"
+            ),
+            &[&src_table, &key],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage recompute {key:?} into {table} failed: {e}"));
+}
+
+/// The oracle: an independently-authored SQL `GROUP BY` over the live base
+/// tables, never the engine's own evaluator (ADR-0013). Deliberately
+/// written as the plain left-join aggregate a human would write by hand for
+/// [`TAG_TOTALS`], so agreeing with it is real evidence rather than a
+/// tautology.
+async fn tag_totals_oracle(client: &Client) -> Totals {
+    client
+        .query(
+            "select pt.tag, count(*)::text, sum(p.word_count)::text \
+             from post_tags pt left join posts p on p.id = pt.post \
+             group by pt.tag",
+            &[],
+        )
+        .await
+        .expect("read the hand-written GROUP BY oracle")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
+        .collect()
+}
+
+/// **Issue #244.** An image-less `StagedChange::Recompute` staged against a
+/// relationship's *to-side* table asserts nothing about that row's state —
+/// it only says "this key exists as of now" (see
+/// `intake::publication::enumerate_and_append`'s doc comment). It is what a
+/// definition's ring backfill enumeration stages for its own source table,
+/// what forward propagation stages for a chained target, and what
+/// TRUNCATE-clear/reverse-fallback stage for a from-side row — and that
+/// from-side row's table is very often *also* some other relationship's
+/// to-side, which is how the generative suite hit this without any
+/// definition being anchored on the parent at all.
+///
+/// Before this issue's fix, `compute`'s to-one reverse loop built a
+/// [`trellis::staging::apply::ApplyPlan`] record for such a change with
+/// `old_row = None` (no pre-image to decode) and `new_row = Some(..)` — the
+/// live re-read `compute` does for every image-less trigger — which is
+/// byte-for-byte the shape of a genuine **parent INSERT**. The reverse
+/// delta path then added the parent's contribution to every matching
+/// from-side row's group a second time, on top of the contribution already
+/// folded in when the parent was first seen: a silent 2x `SUM`.
+///
+/// The `both images absent` skip that was supposed to catch this tested
+/// the *decoded rows*, not the change's own images, so it only ever fired
+/// when the live re-read also came back empty (a row that no longer
+/// exists) — never for the overwhelmingly common case of a row that is
+/// still there.
+#[tokio::test]
+async fn an_image_less_recompute_on_the_to_side_table_is_not_a_parent_insert() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let settled = target_totals(&client).await;
+    assert_eq!(
+        settled,
+        tag_totals_oracle(&client).await,
+        "sanity check: the freshly built target already matches the \
+         hand-written GROUP BY before anything else is staged"
+    );
+
+    // No write to `posts` at all — the base data is untouched. Only the
+    // image-less trigger the backfill/propagation paths stage is added.
+    stage_recompute(&client, "posts", "1").await;
+    stage_recompute(&client, "posts", "2").await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        target_totals(&client).await,
+        tag_totals_oracle(&client).await,
+        "an image-less recompute on the to-side table must be idempotent: \
+         the parent's contribution was already folded in, so re-asserting \
+         that the parent exists must not add it a second time"
+    );
+    assert_eq!(
+        target_totals(&client).await,
+        settled,
+        "and, specifically, nothing about the target may have moved at all"
+    );
+}
