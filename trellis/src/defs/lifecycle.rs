@@ -274,6 +274,23 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     )
     .await?;
 
+    // `backfill_chunks` rides this out on its `on delete cascade`
+    // (`V20__backfill_chunks.sql`) — per-definition work, keyed to the
+    // definition, removed with it. A chunk another worker holds right now is
+    // deleted here too, but that is safe by construction: `finish_chunk`
+    // locks its `transform_definitions` row and raises
+    // `ChunkQueueError::DefinitionNotFound` when it is gone, and the worker's
+    // write targets a table this same transaction is about to drop.
+    //
+    // Deleted *before* the node cleanup below (issue #232): the node reap's
+    // own `not exists (... transform_definitions ...)` guard has to run once
+    // this row is actually gone, or it always finds itself still there and
+    // never reaps the node — every drop would leave an orphaned
+    // `schema_nodes` row behind. Purely an ordering fix; both deletes commit
+    // together in this same transaction either way.
+    txn.execute("delete from transform_definitions where id = $1", &[&id])
+        .await?;
+
     // Edges *into* the target node are the ones this definition owns: its
     // `source` edge from its own source table, plus any `join` edges its
     // relationship-enriched fields added. Edges *out of* the target node
@@ -286,8 +303,11 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
             &[&node_id],
         )
         .await?;
-        // The node itself only goes once nothing at all still names it —
-        // it may well still be some other definition's source.
+        // The node itself only goes once nothing at all still names it — it
+        // may well still be some other definition's source. This has to run
+        // after the `transform_definitions` delete above, or the `not
+        // exists` below always sees the row being dropped and never reaps
+        // the node (issue #232).
         txn.execute(
             "delete from schema_nodes n \
              where n.id = $1 \
@@ -303,16 +323,6 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         )
         .await?;
     }
-
-    // `backfill_chunks` rides this out on its `on delete cascade`
-    // (`V20__backfill_chunks.sql`) — per-definition work, keyed to the
-    // definition, removed with it. A chunk another worker holds right now is
-    // deleted here too, but that is safe by construction: `finish_chunk`
-    // locks its `transform_definitions` row and raises
-    // `ChunkQueueError::DefinitionNotFound` when it is gone, and the worker's
-    // write targets a table this same transaction is about to drop.
-    txn.execute("delete from transform_definitions where id = $1", &[&id])
-        .await?;
 
     // The data goes with the definition, unconditionally (ADR-0014, "Drop
     // always removes the associated data"). The target table is Trellis-owned,

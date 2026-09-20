@@ -34,6 +34,8 @@
 //! - "chains off the target" includes reading it through a relationship, not
 //!   only `FROM <target>`
 //!   (`dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationship`)
+//! - the target's `schema_nodes` row is actually reaped, not merely
+//!   unreachable — issue #232 (`dropping_reaps_the_targets_schema_nodes_row`)
 
 use std::time::Duration;
 
@@ -466,6 +468,62 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         count(&raw, "select count(*) from orders").await,
         6,
         "...nor are its rows"
+    );
+}
+
+/// Issue #232: the node reap inside `drop_transform` decides whether the
+/// target's `schema_nodes` row can go with a `not exists (... from
+/// transform_definitions ...)` guard. That guard used to run *before* the
+/// `transform_definitions` row itself was deleted, so it always found the
+/// about-to-vanish row still there and never reaped the node — every drop
+/// left an orphaned `schema_nodes` row behind. Confirmed benign at the time
+/// (unreachable by `all_source_tables`'s walk, unlike #231's surviving
+/// *edge*), but still worth actually reaping rather than leaving litter.
+#[tokio::test]
+async fn dropping_reaps_the_targets_schema_nodes_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 3).await;
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .await
+        .expect("define");
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select count(*) from schema_nodes \
+                 where table_name = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
+            )
+        )
+        .await,
+        1,
+        "precondition: the target has a schema_nodes row"
+    );
+
+    trellis
+        .pause_transform("order_rollup")
+        .await
+        .expect("pause");
+    trellis
+        .drop_transform("order_rollup")
+        .await
+        .expect("drop a paused definition");
+
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select count(*) from schema_nodes \
+                 where table_name = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
+            )
+        )
+        .await,
+        0,
+        "the target's schema_nodes row is actually reaped, not left orphaned (issue #232)"
     );
 }
 
