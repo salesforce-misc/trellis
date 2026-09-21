@@ -138,10 +138,14 @@ pub enum ValidationError {
     /// matched by its `::text` rendering exactly like those are, so the same
     /// hazards apply and then some: `interval`'s native `=` holds
     /// `'1 day' = '24 hours'` while their renderings differ (two groups
-    /// where Postgres's own `GROUP BY` has one), `timestamptz`/`bytea`
-    /// render under session GUCs, `money` under `lc_monetary`, and `json`
+    /// where Postgres's own `GROUP BY` has one), `timestamptz` renders under
+    /// the session's `TimeZone`, `money` under `lc_monetary`, and `json`
     /// has no `=` at all, so its key column can't even take the unique index
-    /// the aggregate target needs.
+    /// the aggregate target needs. `bytea` (issue #114) used to be another
+    /// name on this list; it turned out not to belong there — `byteaout`
+    /// under the pinned `bytea_output = 'hex'` is a bijection with no
+    /// session-GUC dependence at all, so it is admitted below alongside
+    /// `oid` rather than refused here.
     ///
     /// Nothing could reach this before #108 — an `Other`-typed column was
     /// dropped from the validator's view entirely — so this gate only
@@ -1068,13 +1072,23 @@ fn reject_unsupported_group_by_key_type(
             column: column.to_string(),
             value_type,
         }),
-        // `oid` is the one `Other` family admitted as a key (issue #111):
+        // `oid` is one `Other` family admitted as a key (issue #111):
         // Postgres renders it as canonical unsigned decimal, so it is
-        // text-stable in exactly the way `interval`/`timestamptz`/`bytea`
+        // text-stable in exactly the way `interval`/`timestamptz`
         // are not. It stays an `Other` rather than joining
         // `ValueType::Integer` because Postgres gives it no arithmetic at
         // all — see `pg_type::PgType::Oid`.
         ValueType::Other(PgType::Oid) => Ok(()),
+        // `bytea` is the other (issue #114), on the same "text-stability is
+        // a property of the rendering, not the operator set" reasoning:
+        // `byteaout` under the pinned `bytea_output = 'hex'` is a bijection
+        // on every byte string, with no session-GUC dependence at all (see
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
+        // evidence). Unlike the temporal families it needs no per-value
+        // predicate here — every `bytea` value clears the bar, not just a
+        // subset — so it is a plain admit rather than a call into a sibling
+        // module.
+        ValueType::Other(PgType::Bytea) => Ok(()),
         // Issue #113: `date`, `timestamp`, `time` and `timetz` join `oid`
         // on the same grounds, gated by `crate::temporal`'s own per-family
         // verdict rather than by a list repeated here — see that module's

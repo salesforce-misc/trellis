@@ -339,6 +339,24 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // ADR-0013's byte-exact recompute cross-check could never settle it.
     // `sum` over the other five is refused because Postgres simply has no
     // such aggregate: there is no `sum(timestamp)`.
+    //
+    // Issue #114: `bytea` reaches this same `Other` arm and falls all the
+    // way through to `None` for `MIN`/`MAX` too, but for a *third* reason
+    // distinct from both temporal refusals above — not a scan-order defect,
+    // not a missing-aggregate-for-this-name gap. `bytea` has a full btree
+    // opclass (`ORDER BY`/`<`/`>` all work, and are IMMUTABLE), but Postgres
+    // simply never wired a `min(bytea)`/`max(bytea)` aggregate to it: `select
+    // min(v) from (values ('\x00'::bytea)) t(v)` is `ERROR: function
+    // min(bytea) does not exist` on a live server, and `pg_proc` has no
+    // `min`/`max` row whose sole argument type is `bytea`. ADR-0004 admits
+    // only a subset of Postgres's own grammar, so a `MIN`/`MAX(bytea)`
+    // definition has nothing to be a subset *of* — there is no server-side
+    // aggregate this crate could even be asked to reproduce. `bytea`'s join,
+    // primary-key and `GROUP BY` key roles do not depend on this at all
+    // (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`, `validate::
+    // reject_unsupported_group_by_key_type`) — they only need equality,
+    // which `bytea` has and which is a separate question from whether an
+    // aggregate exists.
     if let ValueType::Other(pg_type) = arg {
         return match name {
             "MIN" | "MAX" if crate::temporal::supports_min_max(pg_type) => Some(arg),

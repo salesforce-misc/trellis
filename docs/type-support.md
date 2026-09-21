@@ -40,10 +40,12 @@ climb it left-to-right:
    join keys and 1-1 primary keys gate on that allowlist by pg type name; a
    `GROUP BY` key gates on its `ValueType` instead
    (`validate::UnsupportedGroupByKeyType`), rejecting every
-   `ValueType::Other` family **except `oid`** — `::text` matching disagrees
-   with those types' own `=` (`'1 day'::interval = '24 hours'`,
-   `timestamptz`/`bytea` under session GUCs), and `json` has no `=` at all,
-   whereas `oid_out` is canonical unsigned decimal (#111). #112 tightened
+   `ValueType::Other` family **except `oid` and `bytea`** — `::text` matching
+   disagrees with those types' own `=` (`'1 day'::interval = '24 hours'`,
+   `timestamptz` under the session's `TimeZone`), and `json` has no `=` at
+   all, whereas `oid_out` is canonical unsigned decimal (#111) and
+   `byteaout` under the pinned `bytea_output = 'hex'` is a bijection with no
+   session-GUC dependence at all (#114). #112 tightened
    the same gate for `real`/`double precision`, which used to slip through
    as `ValueType::Numeric`: `-0` and `0` are `=` in Postgres but render as
    `'-0'` and `'0'`, so a `::text`-matched float key splits one Postgres
@@ -52,14 +54,17 @@ climb it left-to-right:
    from the source's replica identity and present in the old-image for
    updates/deletes. Gated to the join-key-safe allowlist
    (`is_text_stable_join_key_type`) — an unsafe single-column PK
-   (`numeric`/`timestamptz`/`interval`/`bytea`, which `::text`-matching
+   (`numeric`/`timestamptz`/`interval`, which `::text`-matching
    would silently mismatch) is rejected at define time with
    `DdlError::UnsupportedPrimaryKeyType` (#107). The typed key index
-   (below) later unlocks all of those, `interval` included: it compares
+   (below) later unlocks those: it compares
    *decoded values*, so a rendering that is ambiguous (`'1 day'` vs
    `'24 hours'`) or merely inconsistent between two renderers stops
    mattering. What the index does not help with is a value whose *ordering*
-   is undefined, and no type here has that problem.
+   is undefined, and no type here has that problem. `bytea` (#114) needed
+   neither the allowlist wait nor the index: its rendering was already a
+   bijection once `bytea_output` was pinned, so it went straight onto the
+   allowlist alongside `oid`.
 5. **Computed 1-1 target** — a scalar calculated field *produces* this type
    (distinct from passthrough). Needs an immutable evaluator arm **and** grammar
    to spell a literal/cast of the type.
@@ -93,7 +98,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ⚠️ MIN/MAX | landed in #79 |
 | `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | 🎯 MIN/MAX/`string_agg` | requires deterministic collation |
 | `char(n)` `citext` | ✅ | ⚠️ | ❌ padding/case | ❌ | ⚠️ passthrough | — | hazard is padding/case, not volatility |
-| `bytea` | ✅ (hex text) | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#109) | ⚠️ MIN/MAX | `bytea_output` GUC affects text render; literal must be canonical lowercase hex |
+| `bytea` | ✅ (hex text) | 🎯 | ✅ | ✅ | ✅ literal (#109) | ❌ no such Postgres aggregate | `bytea_output` pinned to `hex`, whose rendering is a bijection (#114); literal must be canonical lowercase hex; Postgres has no `min(bytea)`/`max(bytea)` despite `bytea` having a full btree opclass |
 | `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
 | `time` `timetz` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#113) | ✅ MIN/MAX | `time_out`/`timetz_out` are the block's only IMMUTABLE output functions; `timetz`'s `=` is identity on `(time, zone)` |
 | `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113/#248 — bijective under `::text`, and `to_jsonb` (the live-row reads) now renders it the same way (#248 replaced `to_jsonb(t.*)` with an explicit per-column `jsonb_build_object`) |
@@ -123,11 +128,18 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **`text`/`varchar`/`char`** — Postgres marks these comparisons IMMUTABLE
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
   a normalized stored form); `char(n)`'s hazard is blank-padding, not volatility.
-* **`timestamptz`/`bytea`** — value comparison immutable, but *text rendering*
-  is GUC-dependent (`TimeZone`, `bytea_output`). `bytea_output` is pinned;
-  `TimeZone` deliberately is not (#113, below), so for `timestamptz` a
+* **`timestamptz`** — value comparison immutable, but *text rendering*
+  is GUC-dependent (`TimeZone`). `TimeZone` deliberately is not pinned
+  (#113, below), so for `timestamptz` a
   **typed key index** — comparing decoded values, not text — is the real
   unlock.
+* **`bytea`** — looked like it belonged in the bullet above (its text
+  rendering is also GUC-dependent, on `bytea_output`), and #114 found that
+  assumption wrong on closer inspection: `bytea_output` *is* pinned (to
+  `hex`), and unlike `TimeZone` that pin is enough on its own — `byteaout`
+  under `hex` is a bijection with no second axis of variation the way
+  `timestamptz_out` has (`TimeZone` *and* the walsender/pool split, #246).
+  No typed key index needed; see "Bytea semantics" below.
 * **`interval`** — `interval_cmp` is immutable and perfectly well-defined,
   but it compares *total spans* (30 days to a month, 24 hours to a day)
   while `interval_out` prints the three stored fields, so one value has
@@ -156,7 +168,7 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   non-literal), which each type family's own child decides, since most pairs
   are not immutable.
 * **Typed key index** — replacing the raw-`::text` match unlocks
-  `timestamptz`/`bytea`/`numeric`/`real`/`double precision`/… as safe keys;
+  `timestamptz`/`numeric`/`real`/`double precision`/… as safe keys;
   the single
   highest-leverage child for the key roles. Note what it is *not* needed
   for: the exact integer types and `oid` render canonically (`-`, then
@@ -361,6 +373,61 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     `ValueType` variant**, because every role added here is a function of
     the family alone, which `PgType` already carries. Cross-checked against
     a live server in `trellis/tests/defs_temporal.rs`.
+* **Bytea semantics (#114)** — the epic's own scope note for this issue
+  ("text/wire rendering depends on the `bytea_output` GUC -> key role needs
+  decoded comparison") predicted the same `timestamptz`/`interval` shape
+  #110's typed key index exists for. Asked of a live server, per #111's
+  playbook rather than assumed from the note, that prediction was wrong:
+
+  * **`byteaout` under the pinned `bytea_output = 'hex'` is a bijection, with
+    no second renderer and no second GUC to go wrong.** Every distinct byte
+    string has exactly one canonical spelling — `\x` followed by an even
+    number of lowercase hex digits — and every such spelling names exactly
+    one byte string. There is no `bytea` analogue of float's `-0`/`0` or
+    interval's `'1 day'`/`'24 hours'`: a positional, fixed-width-per-byte
+    encoding structurally cannot produce two spellings of one value the way
+    a variable-width or field-based one can. Verified live across a grid
+    spanning the empty value (`\x`, distinct from `NULL`), embedded `NUL`
+    bytes, and the full `0x00..=0xff` byte range: `count(distinct v)` and
+    `count(distinct v::text)` agree exactly, and `ORDER BY v` and
+    `ORDER BY v::text` produce the identical row order — ASCII orders hex
+    digits `'0'..'9' < 'a'..'f'` in exactly the order their nibble values
+    need, so lexicographic *text* comparison already reproduces `bytea`'s
+    own `bytea_cmp` (`trellis/tests/defs_bytea.rs`).
+  * **The render-consistency half — `to_jsonb` versus `::text` — already
+    agreed for `bytea`, both before and after #248.** `to_jsonb`'s special
+    ISO-8601 datetime writer is what broke `timestamp`/`timestamptz`;
+    `bytea` was never routed through it — `to_jsonb` calls a value's own
+    output function for every non-numeric, non-datetime scalar type, so
+    `to_jsonb(bytea_col)` and `bytea_col::text` were always the same string.
+    `staging::apply::row_as_text_jsonb_sql` (#248's fix) now builds every
+    row read as an explicit per-column `<col>::text`, which was already
+    `bytea`'s only renderer — so #114 needed no renderer-reconciliation work
+    at all, unlike #113/#248.
+  * **No typed key index needed.** `bytea` went straight onto
+    `catalog::TEXT_STABLE_JOIN_KEY_TYPES` and the `GROUP BY` key admit list
+    alongside `oid`, the same way four of the six temporal families did in
+    #113 — #110's typed key index was never the prerequisite the epic's
+    framing assumed.
+  * **`MIN`/`MAX(bytea)` is `❌`, not `⚠️`, and not because of any rendering
+    hazard.** `bytea` has a full btree opclass — `<`/`>`/`=`/`ORDER BY` all
+    work and are `IMMUTABLE` — but Postgres never wired a
+    `min(bytea)`/`max(bytea)` aggregate to it: `select min(v) from (values
+    ('\x00'::bytea)) t(v)` is `ERROR: function min(bytea) does not exist` on
+    a live Postgres 17, and no `pg_proc` row named `min`/`max` takes a lone
+    `bytea` argument. ADR-0004 admits a subset of Postgres's own grammar;
+    `MIN`/`MAX(bytea)` has no server-side construct to be a subset of, so
+    `registry::aggregate_result_type` returns `None` for it and the
+    validator reports the ordinary `FunctionArgTypeMismatch` any
+    aggregate/type mismatch gets — no new error variant needed. This is
+    independent of the join/PK/`GROUP BY` key roles, which only need
+    equality and hold it regardless.
+  * `bytea` mints **no new `ValueType` variant**, for the same reason the
+    temporal families didn't (#113's module doc): every role it gained here
+    is a function of the family alone, which `PgType::Bytea` already
+    carries, and it needs no value model beyond the hex text it already
+    passes through end to end. Cross-checked against a live server in
+    `trellis/tests/defs_bytea.rs`.
 * **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
   `string_agg`, `jsonb_agg`) need an incremental-delta design or a
   group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.

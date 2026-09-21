@@ -41,9 +41,13 @@
 //! be [text-stable](super::catalog::is_text_stable_join_key_type) — the same
 //! allowlist a relationship join key is held to (issue #28) — since every
 //! consumer of this key compares it via `::text` casts just like a join key;
-//! an unsafe type (e.g. `numeric`, `timestamptz`, `bytea`) is rejected at
+//! an unsafe type (e.g. `numeric`, `timestamptz`, `interval`) is rejected at
 //! definition time rather than risking a silent missed/duplicated target row
-//! later (issue #107). Every calculated field is typed per its inferred
+//! later (issue #107). `bytea` used to be another example here; issue #114
+//! found its `::text` rendering is in fact a bijection once `bytea_output`
+//! is pinned, so it is on the allowlist now rather than off it.
+//!
+//! Every calculated field is typed per its inferred
 //! [`super::ast::ValueType`] (issue #63 widened this from a blanket
 //! `numeric` to `numeric`/`text`/`boolean`, reusing
 //! [`super::validate::infer_field_types`] rather than a second type-inference

@@ -2553,8 +2553,29 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// `timestamptz` and `interval` (issue #113 admitted `timestamp` alongside
 /// `date`/`time`/`timetz` once issue #248 fixed its render-consistency
 /// defect; see the temporal block below for why `timestamptz` and `interval`
-/// stayed off, for two distinct remaining reasons), `boolean`, `bytea`,
+/// stayed off, for two distinct remaining reasons), `boolean`,
 /// `json`/`jsonb`, or any unknown type — is rejected as a join key.
+///
+/// `bytea` (issue #114) joins the list below on the same "text-stability is
+/// a property of the rendering" reasoning `oid` and four of the six temporal
+/// families were admitted under — `docs/type-support.md` had it marked
+/// `🎯 typed index`, and that turned out to be exactly the wrong prediction
+/// again. `byteaout` under the already-pinned `bytea_output = 'hex'`
+/// (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) is a bijection: every
+/// distinct byte string has exactly one canonical `\x`-prefixed, lowercase,
+/// even-length hex spelling, and every such spelling names exactly one byte
+/// string — there is no `bytea` analogue of float's `-0`/`0` or interval's
+/// `'1 day'`/`'24 hours'`, because a fixed-width positional encoding cannot
+/// produce two spellings of the same value. Verified on a live server: a
+/// grid spanning the empty value, embedded `NUL` bytes, and every byte value
+/// from `0x00` to `0xff` produces exactly as many distinct `::text` groups as
+/// distinct values (`defs_bytea.rs`'s
+/// `bytea_text_rendering_is_a_bijection_under_hex_output`). The issue's own
+/// scope note ("key role needs decoded comparison") assumed #110's typed key
+/// index was the prerequisite the way #113's temporal block once assumed it
+/// for the whole family; asked of a live server per #111's playbook, it is
+/// not — pinning `bytea_output` alone already makes raw `::text` matching
+/// agree with `bytea`'s native `=` for every value.
 const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
@@ -2622,6 +2643,11 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "time without time zone",
     "time with time zone",
     "timestamp without time zone",
+    // Issue #114: `byteaout` under the pinned `bytea_output = 'hex'` is a
+    // bijection on its values — see the doc comment above for the live
+    // evidence. `bytea` has no length/precision modifier, so
+    // `base_type_name` never has anything to strip for it.
+    "bytea",
 ];
 
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,
