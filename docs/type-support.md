@@ -763,16 +763,37 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     this live; `defs::invertibility`'s own unit tests pin the pure-code
     classification.
   * **A mismatched-length `bit varying` argument is a genuine,
-    data-dependent runtime failure, not defense-in-depth.** A per-column
-    `bit(n)` argument can never trigger it (every row shares the column's
-    one fixed length), but Postgres itself refuses to fold two differently
-    sized `bit varying` values together (`cannot AND bit strings of
-    different sizes`) rather than padding/truncating either one, and the
-    evaluator (`defs::eval::reduce_bit_aggregate`) must reproduce that
-    refusal exactly (`EvalError::BitStringLengthMismatch`) rather than
-    silently pick a length — per ADR-0003 it pauses the offending
-    `(transform, column)` pair, the same treatment `SUM(interval)`'s
-    `IntervalOutOfRange` gets for its own data-dependent, not-a-bug failure.
+    data-dependent runtime failure the evaluator must reproduce exactly,
+    not silently paper over — but that branch is exercised by the
+    evaluator's test/oracle path, not the live apply pipeline.** A
+    per-column `bit(n)` argument can never trigger it (every row shares
+    the column's one fixed length), but Postgres itself refuses to fold
+    two differently sized `bit varying` values together (`cannot AND bit
+    strings of different sizes`) rather than padding/truncating either
+    one, and the evaluator (`defs::eval::reduce_bit_aggregate`) reproduces
+    that refusal as `EvalError::BitStringLengthMismatch` rather than
+    silently picking a length. In the live pipeline this specific Rust
+    variant never actually fires: `bit_and`/`bit_or` are always
+    `RecomputeOnly`, so `staging::apply_aggregate` folds a group's real
+    written value by pushing the rendered aggregate expression straight to
+    Postgres (`probe_recompute_fields_bulk`), which raises *its own*
+    native error — surfacing as `ApplyError::Db`, not this variant — and
+    the one production caller of the Rust evaluator itself
+    (`row_contribution`) only ever hands it a single row per call, never
+    the ≥2-value group this branch needs to compare. The variant correctly
+    reproduces Postgres's own refusal and is exercised by `defs::eval`'s
+    own unit tests and by the test-only `defs::oracle::recompute_aggregate`
+    cross-check (which *does* call the evaluator over a whole multi-row
+    group) — just not reachable from a live apply today. It is also,
+    unlike `SUM(interval)`'s `IntervalOutOfRange`, never a candidate for
+    ADR-0003's column-level pause fuse even in principle: that fuse only
+    ever activates for `KeySpace::OneToOne` definitions
+    (`staging::quarantine`'s own scope note, pre-existing and unrelated to
+    this issue), and `bit_and`/`bit_or` only ever appear in a
+    `KeySpace::Aggregate` (`GROUP BY`) definition. A real occurrence of
+    Postgres's native error routes through the ordinary row-level fuse
+    instead, the same as any other aggregate's data-dependent runtime
+    failure in a `GROUP BY` context — not a bit-string-specific concern.
   * `bit`/`bit varying` mint **no new `ValueType` variant** — both
     `PgType::Bit`/`PgType::VarBit` already existed as passthrough types
     since #108, and every role gained here is a function of the family
