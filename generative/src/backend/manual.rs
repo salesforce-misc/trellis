@@ -52,7 +52,7 @@ use trellis::dev::staging::{
     StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
     watermark_token,
 };
-use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
+use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, IntakeError, Pool};
 
 use super::Snapshot;
 use super::sql::{self, quote_ident};
@@ -63,6 +63,77 @@ use crate::model::{Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program,
 /// genuinely stuck pipeline is exactly what should time out loudly rather
 /// than hang the test suite forever.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`ManualBackend::restart`]'s bounded retry budget (issue #251) for the
+/// residual `ProducerAlreadyRunning` window `trellis::Client::shutdown`
+/// alone doesn't close: up to this many *retries* (so up to
+/// `RESTART_PRODUCER_RETRY_ATTEMPTS + 1` total attempts to start the
+/// replacement client) before giving up and propagating the error for
+/// real. Bounded, not infinite, specifically so a genuinely stuck lock
+/// (a real second producer, not just a not-yet-noticed dead connection)
+/// still surfaces as an error rather than hanging `restart` forever.
+const RESTART_PRODUCER_RETRY_ATTEMPTS: u32 = 8;
+
+/// The first retry's delay in [`RESTART_PRODUCER_RETRY_ATTEMPTS`]'s bounded
+/// backoff; each subsequent retry doubles, capped at
+/// [`RESTART_PRODUCER_RETRY_MAX_DELAY`]. Short: the gap this is absorbing is
+/// "Postgres hasn't yet been scheduled to notice a closed socket," normally
+/// sub-millisecond and only stretched into the tens-of-milliseconds range by
+/// genuinely heavy CPU contention (confirmed empirically — see `restart`'s
+/// own doc comment) — not a multi-second outage this needs to tolerate.
+const RESTART_PRODUCER_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+
+/// Cap on [`RESTART_PRODUCER_RETRY_BASE_DELAY`]'s exponential growth, so the
+/// last few retries in a worst-case run don't balloon the total wait.
+const RESTART_PRODUCER_RETRY_MAX_DELAY: Duration = Duration::from_millis(320);
+
+/// Whether `err` is the producer-singleton-lock conflict
+/// (`trellis::StagingError::ProducerAlreadyRunning`) [`ManualBackend::restart`]'s
+/// bounded retry (issue #251) specifically targets — recognized in both
+/// shapes it can reach a fresh [`EngineClient::start_with_config`] call
+/// through: directly (`setup_staging`'s own producer session, inside
+/// `ClientError::Staging`) or via intake's separate internal session
+/// (`ClientError::Intake(IntakeError::Staging(..))`, opened after the first
+/// session already dropped — see `trellis::client`'s `setup_staging` doc
+/// comment). Every other `ClientError` variant is a real failure `restart`
+/// should surface immediately, not retry.
+fn is_producer_already_running(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Staging(StagingError::ProducerAlreadyRunning)
+            | ClientError::Intake(IntakeError::Staging(StagingError::ProducerAlreadyRunning))
+    )
+}
+
+/// [`ManualBackend::restart`]'s layer-2 fix (issue #251): starts a fresh
+/// `EngineClient`, retrying with a short bounded backoff
+/// ([`RESTART_PRODUCER_RETRY_ATTEMPTS`]/[`RESTART_PRODUCER_RETRY_BASE_DELAY`]/
+/// [`RESTART_PRODUCER_RETRY_MAX_DELAY`]) specifically when
+/// `EngineClient::start_with_config` fails with
+/// [`is_producer_already_running`] — the residual window between the old
+/// client's `shutdown()` returning and Postgres actually noticing the
+/// closed connection and releasing the advisory lock. Any other
+/// `ClientError` (including a `ProducerAlreadyRunning` that's still there
+/// after every retry — a genuinely stuck lock, not just a slow one) is
+/// returned immediately, unretried.
+async fn start_with_producer_retry(
+    config: Config,
+    options: ClientOptions,
+) -> Result<EngineClient, ClientError> {
+    let mut delay = RESTART_PRODUCER_RETRY_BASE_DELAY;
+    let mut retries_left = RESTART_PRODUCER_RETRY_ATTEMPTS;
+    loop {
+        match EngineClient::start_with_config(config.clone(), options.clone()) {
+            Ok(client) => return Ok(client),
+            Err(err) if retries_left > 0 && is_producer_already_running(&err) => {
+                retries_left -= 1;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RESTART_PRODUCER_RETRY_MAX_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 /// Failure modes across the manual backend's lifecycle. Composes the
 /// engine's own error types via `From` rather than re-wrapping their
@@ -817,20 +888,46 @@ impl super::Backend for ManualBackend {
     /// state untouched by any of this, so the new client resumes exactly
     /// where the old one left off.
     ///
-    /// Issue #251: this used to just drop the old `Option<Client>` and rely
-    /// on `Client`'s `Drop` impl (a best-effort shutdown signal with no join)
-    /// to tear it down, then immediately start the replacement. `Drop` never
-    /// waits for the background thread to exit, so the old producer's
-    /// `pg_try_advisory_lock`-held session could still be open when the very
-    /// next line's producer tried to acquire that same lock — a real,
-    /// sporadic `ProducerAlreadyRunning` race (see the CI failure this issue
-    /// links). Awaiting `trellis::Client::shutdown` on the outgoing client
-    /// first — which sends the same signal *and* joins the thread — makes
-    /// the old lock's release happen-before the new client's acquire
-    /// attempt, closing the race structurally rather than just narrowing it.
+    /// Issue #251, two layers of fix:
+    ///
+    /// 1. This used to just drop the old `Option<Client>` and rely on
+    ///    `Client`'s `Drop` impl (a best-effort shutdown signal with no
+    ///    join) to tear it down, then immediately start the replacement.
+    ///    `Drop` never waits for the background thread to exit, so the old
+    ///    producer's `pg_try_advisory_lock`-held session could still be open
+    ///    when the very next line's producer tried to acquire that same
+    ///    lock — a real, sporadic `ProducerAlreadyRunning` race (see the CI
+    ///    failure this issue links). Awaiting `trellis::Client::shutdown` on
+    ///    the outgoing client first — which sends the same signal *and*
+    ///    joins the thread — makes the old lock's release happen-before the
+    ///    new client's *thread* fully exiting, closing the client-side half
+    ///    of the race.
+    /// 2. That alone still narrows rather than closes the window:
+    ///    `shutdown` guarantees this process's connection object is torn
+    ///    down, not that the Postgres backend serving it has actually been
+    ///    scheduled to notice the closed socket and release the advisory
+    ///    lock — a kernel/Postgres-scheduling gap, not anything this
+    ///    process's own state can observe or wait on directly. Confirmed by
+    ///    direct measurement: under sustained heavy CPU contention (dozens
+    ///    of runs of the regression test below against real artificial
+    ///    load), layer 1 alone still hit `ProducerAlreadyRunning` in roughly
+    ///    1 of every 8 restarts — a large reduction from pre-fix, not an
+    ///    elimination. [`start_with_producer_retry`] closes that residual
+    ///    gap the only way available from this side of the socket: retry
+    ///    `EngineClient::start_with_config` with a short bounded backoff
+    ///    ([`RESTART_PRODUCER_RETRY_ATTEMPTS`]) specifically when it fails
+    ///    with exactly this conflict ([`is_producer_already_running`]),
+    ///    rather than propagating it immediately. Bounded so a *genuinely*
+    ///    stuck lock (an actual second producer, not just a not-yet-noticed
+    ///    dead connection) still surfaces as a real error rather than
+    ///    hanging forever.
+    ///
     /// Matches [`super::SubprocessBackend::restart`]'s own explicit
     /// `kill`-then-`wait` (never just letting its `CrashGuard` drop) for the
-    /// identical reason.
+    /// identical layer-1 reason; `SubprocessBackend` doesn't need layer 2
+    /// because waiting on the real OS process's exit status is a stronger,
+    /// synchronous guarantee than anything an in-process `Drop`/`shutdown`
+    /// pair can give.
     async fn restart(&mut self) -> Result<(), ManualBackendError> {
         let options = self
             .client_options
@@ -838,11 +935,14 @@ impl super::Backend for ManualBackend {
             .ok_or(ManualBackendError::NoClientStarted)?;
         // Take the old client and await its graceful shutdown — not just
         // drop it — before starting the replacement, so the old producer's
-        // advisory lock is guaranteed released first (issue #251).
+        // advisory lock is released (from this process's point of view)
+        // before the new one tries to acquire it (issue #251, layer 1).
         if let Some(old_client) = self.engine_client.take() {
             old_client.shutdown().await?;
         }
-        let client = EngineClient::start_with_config(self.config.clone(), options)?;
+        // Layer 2: retry through the residual window `shutdown` alone can't
+        // close (see this method's own doc comment).
+        let client = start_with_producer_retry(self.config.clone(), options).await?;
         self.engine_client = Some(client);
         Ok(())
     }

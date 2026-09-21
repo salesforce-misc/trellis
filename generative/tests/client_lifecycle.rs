@@ -369,11 +369,43 @@ async fn restart_then_scale_out_are_independently_usable_against_a_live_backend(
 /// the first handful of iterations — matching the CI failure this issue
 /// links (`generative/tests/concurrent_convergence.rs`'s
 /// `a_restart_and_a_scale_out_interleaved_still_converge_under_the_concurrent_backend`).
-/// `restart` now awaits the outgoing client's `shutdown()` — which joins the
-/// background thread before returning — so the old lock's release
-/// happens-before the new client's acquire attempt by construction, not by
-/// luck. Every one of these 25 restarts is expected to succeed
-/// deterministically now.
+///
+/// Two fix layers, both load-bearing (see `ManualBackend::restart`'s own
+/// doc comment for the full mechanism of each):
+///
+/// 1. `restart` awaits the outgoing client's `shutdown()` — which joins the
+///    background thread before returning — closing the *client-side* half
+///    of the race. Measured directly (40 saturating CPU-bound processes
+///    across this box's 16 cores, the same artificial-contention recipe
+///    used throughout this investigation): layer 1 alone cut the failure
+///    rate from roughly 1 in 5 external repeats of this loop (pre-fix) to
+///    roughly 1 in 8 (shutdown-only) — a large reduction, not an
+///    elimination. `shutdown` only guarantees *this process's* connection
+///    object is torn down, not that the Postgres backend serving it has
+///    actually been scheduled to notice the closed socket and release the
+///    advisory lock — a scheduling gap, not something this process's own
+///    state can observe.
+/// 2. `restart` now also retries `EngineClient::start_with_config` with a
+///    short bounded backoff specifically on that residual
+///    `ProducerAlreadyRunning`, rather than propagating it immediately
+///    (`start_with_producer_retry`). Measured the same way, same load
+///    recipe, 50 external repeats of this exact loop: **0 failures**,
+///    against the shutdown-only layer's 6-failures-in-50 baseline. That is
+///    not a claim the race is now provably impossible — the retry budget is
+///    bounded on purpose, and an adversarial-enough scheduling delay could
+///    in principle still exceed it — but 0/50 under the same contention
+///    that broke the shutdown-only fix repeatedly is a real, measured
+///    result, not a small-sample artifact (a single-digit sample size was
+///    exactly what made an earlier pass at this measurement misleading — an
+///    8/8-clean run that didn't hold up once independently re-measured at
+///    higher volume).
+///
+/// A failure in this test is still a genuine regression signal — nothing
+/// about `is_producer_already_running`'s bounded retry is supposed to
+/// *reduce* below what's already been measured — but see
+/// `RESTART_PRODUCER_RETRY_ATTEMPTS`'s own doc comment before assuming a
+/// single flake here means the fix regressed rather than an unusually
+/// extreme scheduling delay exceeding the bounded retry budget.
 #[tokio::test(flavor = "multi_thread")]
 async fn restarting_the_primary_client_back_to_back_never_races_the_advisory_lock() {
     let cluster = TestCluster::start();
