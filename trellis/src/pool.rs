@@ -306,6 +306,12 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] that doesn't parse the way this
 /// function expects fails loudly in CI instead of silently shipping a
 /// walsender that pins something other than what it meant to.
+///
+/// Escaping here only covers spaces (`' '` -> `'\ '`); it does not escape a
+/// literal backslash in a value, so a future GUC value containing one would
+/// be mangled by `pg_split_opts`'s own backslash-as-escape-character rule.
+/// None of today's values contain a backslash, so this is a latent gap, not
+/// a live bug — worth fixing if that ever changes.
 pub(crate) fn deterministic_text_output_options() -> String {
     DETERMINISTIC_TEXT_OUTPUT_GUCS
         .split(';')
