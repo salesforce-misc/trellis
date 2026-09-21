@@ -1975,12 +1975,15 @@ pub(crate) async fn resolve_relationships(
         // Issue #117: a to-side enum column now needs a connection to
         // classify (see `pg_type::value_type_for_oid`'s own doc comment) —
         // acquired once per relationship here rather than per column, since
-        // a relationship's enrichment columns are typically few and this
-        // avoids re-acquiring a pooled connection in the loop below.
+        // a relationship's enrichment columns are typically few. Also now
+        // the connection `column_type_oid` itself queries on (review fix:
+        // it used to independently `pool.get()` per column, which meant
+        // holding two connections from this same pool at once for the
+        // whole loop below — see `column_type_oid`'s own doc comment).
         let client = pool.get().await?;
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
-            let type_oid = column_type_oid(pool, &query_to_table, &to_table, &column).await?;
+            let type_oid = column_type_oid(&**client, &query_to_table, &to_table, &column).await?;
             column_types.insert(
                 column,
                 super::pg_type::value_type_for_oid(&client, type_oid).await?,
@@ -2405,13 +2408,22 @@ async fn defer_if_fence_unsettled(
 /// `(...)` modifier-stripping) entirely, since a type's OID doesn't vary
 /// with `numeric(10,2)` vs. `numeric`'s modifier the way its `format_type`
 /// text does.
+///
+/// Takes an already-acquired `client` rather than a `Pool` (issue #117
+/// review): [`resolve_relationships`] now also needs a connection for
+/// [`super::pg_type::value_type_for_oid`] and acquires one once per
+/// relationship for that; this used to independently call `pool.get()`
+/// per column on top of that, holding *two* connections from the same pool
+/// at once for the whole inner loop — exactly the "classic pool-exhaustion
+/// deadlock" [`source_primary_key_in_txn`]'s own doc comment warns about
+/// elsewhere in this crate, just not inside an explicit transaction here.
+/// Reusing the caller's client removes the second checkout entirely.
 async fn column_type_oid(
-    pool: &Pool,
+    client: &impl GenericClient,
     query_table: &str,
     display_table: &str,
     column: &str,
 ) -> Result<u32, CatalogError> {
-    let client = pool.get().await?;
     let row = client
         .query_opt(
             "select a.atttypid
