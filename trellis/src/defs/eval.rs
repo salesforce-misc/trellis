@@ -421,6 +421,55 @@ pub enum EvalError {
         rel: String,
         column: String,
     },
+    /// A `MIN`/`MAX(enum)` fold ([`reduce_enum_aggregate`]) was handed a
+    /// group with more than one *distinct* value (issue #117).
+    ///
+    /// Not defense-in-depth, and worth stating precisely why, the same way
+    /// [`EvalError::BitStringLengthMismatch`]'s own doc comment does for its
+    /// structurally identical situation. An enum value's ordering is a
+    /// live, per-type, schema-defined fact (`pg_enum.enumsortorder`,
+    /// creation-position order, not alphabetical) — not a fixed, universal
+    /// property of the family the way `date`/`inet`/`bytea` ordering is, so
+    /// this pure, synchronous, DB-less evaluator has no way to answer "which
+    /// of these two distinct labels sorts first" correctly without a
+    /// connection it structurally never has here. A single-distinct-value
+    /// group (the overwhelmingly common shape this variant is *not* raised
+    /// for) needs no ordering at all — `MIN`/`MAX` of one repeated value is
+    /// that value — so this only ever fires on a genuine multi-value tie
+    /// this evaluator cannot break honestly. Guessing (e.g. falling back to
+    /// a lexicographic `Ord` on the label text) would be exactly the
+    /// "silent, wrong-order fold" issue #117 was written to rule out.
+    ///
+    /// **Reachability mirrors `BitStringLengthMismatch` almost exactly.**
+    /// `MIN`/`MAX` are always [`super::invertibility::Invertibility::RecomputeOnly`]
+    /// for every argument type (`super::invertibility::classify`'s own
+    /// unconditional `MIN`/`MAX` arm), so a `KeySpace::Aggregate` field's
+    /// own `MIN`/`MAX(enum)` never folds a multi-row group through this
+    /// evaluator in production at all — `staging::apply_aggregate` always
+    /// resolves its written value with a live server-side `min()`/`max()`
+    /// push-down instead, which answers the real creation-order question
+    /// this evaluator cannot. The evaluator's own production caller for a
+    /// `KeySpace::Aggregate` field (`staging::apply_aggregate::row_contribution`)
+    /// only ever passes a single-row slice per call, which can never
+    /// disagree with itself on ordering either. The one shape that *can*
+    /// genuinely reach this variant in production — a `KeySpace::OneToOne`
+    /// field's `MIN`/`MAX` wrapping a to-many relationship path
+    /// (`eval_to_many_aggregate`, issue #29), which has no live-SQL
+    /// fallback the way `KeySpace::Aggregate` does — is refused earlier, at
+    /// validation time
+    /// ([`super::validate::ValidationError::EnumAggregateOverToManyRelationshipUnsupported`]),
+    /// specifically so it can never reach here with a real multi-value
+    /// group either. In practice this variant is exercised only by this
+    /// module's own unit tests and by the test-only
+    /// `defs::oracle::recompute_aggregate` cross-check, the same as
+    /// `BitStringLengthMismatch` — see that variant's own doc comment for
+    /// why that is not a lesser guarantee, just a narrower one than
+    /// `IntegerOutOfRange`'s genuinely data-dependent reachability.
+    EnumOrderingUnavailable {
+        field: String,
+        function: &'static str,
+        pg_type: &'static str,
+    },
 }
 
 impl EvalError {
@@ -463,7 +512,8 @@ impl EvalError {
             | EvalError::BitStringLengthMismatch { field, .. }
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
-            | EvalError::AggregateRequiredForToMany { field, .. } => field,
+            | EvalError::AggregateRequiredForToMany { field, .. }
+            | EvalError::EnumOrderingUnavailable { field, .. } => field,
             EvalError::Cycle(field) => field,
         }
     }
@@ -528,6 +578,16 @@ impl fmt::Display for EvalError {
                  '{rel}.{column}' without an aggregate; a to-many relationship must be \
                  aggregate-wrapped"
             ),
+            EvalError::EnumOrderingUnavailable {
+                field,
+                function,
+                pg_type,
+            } => write!(
+                f,
+                "calculated field '{field}': {function}({pg_type}) over more than one \
+                 distinct value cannot be resolved without a live connection to determine \
+                 the type's creation-order comparison"
+            ),
         }
     }
 }
@@ -545,7 +605,8 @@ impl std::error::Error for EvalError {
             | EvalError::Cycle(_)
             | EvalError::UnsupportedRelationshipPath { .. }
             | EvalError::UnknownRelationship { .. }
-            | EvalError::AggregateRequiredForToMany { .. } => None,
+            | EvalError::AggregateRequiredForToMany { .. }
+            | EvalError::EnumOrderingUnavailable { .. } => None,
         }
     }
 }
@@ -1592,6 +1653,13 @@ fn reduce_numeric_aggregate(
         return reduce_netaddr_aggregate(name, values);
     }
 
+    // Issue #117: `min`/`max(enum)` fold on the same "own family, own
+    // terms" grounds as `inet`'s arm just above, with one genuine
+    // difference — see `reduce_enum_aggregate`'s own doc comment.
+    if let Value::Other(PgType::Enum(_), _) = &values[0] {
+        return reduce_enum_aggregate(name, values, field_name);
+    }
+
     // Issue #119: `bool_and`/`bool_or` are the one aggregate pair whose
     // group folds `Value::Boolean` rather than the numeric family — same
     // early-return shape as the temporal arm above, and for the same
@@ -1954,6 +2022,63 @@ fn reduce_netaddr_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Val
                 })
                 .expect("checked non-empty above");
             Ok(Some(Value::Other(PgType::Inet, winner)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Folds a group of `Value::Other(PgType::Enum(_), _)`s for `MIN`/`MAX`
+/// (issue #117) — [`reduce_numeric_aggregate`]'s early-return arm for enum
+/// types, the same shape [`reduce_netaddr_aggregate`]/[`reduce_temporal_aggregate`]
+/// are for their own families, with one genuine, structural difference from
+/// every sibling reducer in this module.
+///
+/// Every other family this module folds `MIN`/`MAX` over — `date`/`time`/
+/// `interval`, `inet`, the exact-numeric/float families — has an ordering
+/// that is a *fixed, universal* property of the family itself, reproducible
+/// in pure Rust with no connection (`crate::temporal`'s/`crate::netaddr`'s/
+/// `crate::float`'s own comparison functions). An enum's ordering is not:
+/// it is a *live, per-type, schema-defined* fact
+/// (`pg_enum.enumsortorder`, set by creation order and mutable afterward via
+/// `ALTER TYPE ... ADD VALUE`), so there is no `crate::pg_enum::compare` this
+/// function could call the way its siblings do. Rather than guess (a
+/// lexicographic fallback on the label text would be exactly the "silent,
+/// wrong-order fold" issue #117 exists to rule out — see
+/// `EvalError::EnumOrderingUnavailable`'s own doc comment), this function
+/// answers only the one case it *can* answer honestly without a connection:
+/// a group whose values are all textually identical needs no ordering at
+/// all (`MIN`/`MAX` of one repeated value is that value, regardless of what
+/// order the type's other, absent-from-this-group labels would sort in).
+/// Any group with more than one distinct value raises
+/// [`EvalError::EnumOrderingUnavailable`] — see that variant's own doc
+/// comment for exactly which production paths can and cannot reach that
+/// case (in short: never the real one, `staging::apply_aggregate`'s own
+/// `KeySpace::Aggregate` `MIN`/`MAX` handling, which always asks Postgres
+/// directly instead of calling this function over a multi-row group).
+fn reduce_enum_aggregate(
+    name: &str,
+    values: Vec<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
+    let mut texts = values.into_iter().filter_map(|value| match value {
+        Value::Other(pg_type @ PgType::Enum(_), text) => Some((pg_type, text)),
+        _ => None,
+    });
+    let Some((pg_type, first)) = texts.next() else {
+        return Ok(None);
+    };
+    match name {
+        "MIN" | "MAX" => {
+            for (_, text) in texts {
+                if text != first {
+                    return Err(EvalError::EnumOrderingUnavailable {
+                        field: field_name.to_string(),
+                        function: if name == "MIN" { "MIN" } else { "MAX" },
+                        pg_type: pg_type.enum_qualified_name().unwrap_or("enum"),
+                    });
+                }
+            }
+            Ok(Some(Value::Other(pg_type, first)))
         }
         _ => Ok(None),
     }
@@ -3613,5 +3738,74 @@ mod tests {
             matches!(err, EvalError::UnknownRelationship { .. }),
             "got {err:?}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #117: reduce_enum_aggregate
+    // -------------------------------------------------------------
+
+    fn priority_enum() -> PgType {
+        PgType::Enum("enum:public.priority_enum")
+    }
+
+    /// A group whose values are all the same label needs no ordering
+    /// knowledge at all — `MIN`/`MAX` of one repeated value is that value,
+    /// regardless of what order the type's *other*, absent-from-this-group
+    /// labels would sort in. No live connection is needed or used.
+    #[test]
+    fn a_single_distinct_value_enum_group_folds_with_no_live_connection() {
+        let pg_type = priority_enum();
+        let values = vec![
+            Value::Other(pg_type, "medium".to_string()),
+            Value::Other(pg_type, "medium".to_string()),
+            Value::Other(pg_type, "medium".to_string()),
+        ];
+        for name in ["MIN", "MAX"] {
+            let out = reduce_enum_aggregate(name, values.clone(), "out").unwrap();
+            assert_eq!(out, Some(Value::Other(pg_type, "medium".to_string())));
+        }
+    }
+
+    /// An empty group (every row filtered out upstream) folds to `NULL`,
+    /// matching every other aggregate's "zero non-NULL values is NULL" rule
+    /// — checked directly since this function's own empty-check runs before
+    /// its distinct-value check.
+    #[test]
+    fn an_empty_enum_group_folds_to_null() {
+        assert_eq!(reduce_enum_aggregate("MIN", vec![], "out").unwrap(), None);
+    }
+
+    /// The core guard this issue exists for: a genuine multi-distinct-value
+    /// group cannot be resolved without knowing the type's live
+    /// creation-order comparison, which this pure, DB-less evaluator has no
+    /// way to ask for — so it refuses rather than fall back to any implicit
+    /// `Ord` on the label text (which would silently be alphabetical, not
+    /// creation-order, and wrong).
+    #[test]
+    fn a_multi_distinct_value_enum_group_refuses_rather_than_guess() {
+        let pg_type = priority_enum();
+        // Chosen so a lexicographic ("high" < "low" < "medium") and a
+        // creation-order ("low" < "medium" < "high", say) comparison would
+        // disagree — not that it matters, since this must refuse either way
+        // rather than silently pick one.
+        let values = vec![
+            Value::Other(pg_type, "medium".to_string()),
+            Value::Other(pg_type, "low".to_string()),
+            Value::Other(pg_type, "high".to_string()),
+        ];
+        for name in ["MIN", "MAX"] {
+            let err = reduce_enum_aggregate(name, values.clone(), "out").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EvalError::EnumOrderingUnavailable {
+                        ref field,
+                        function,
+                        pg_type: "public.priority_enum",
+                    } if field == "out" && function == name
+                ),
+                "got {err:?}"
+            );
+        }
     }
 }

@@ -150,20 +150,28 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
 }
 
 /// Issue #108 review regression: a source column whose Postgres type the OID
-/// registry can't place at all — an enum, whose OID is assigned per
-/// `CREATE TYPE` rather than being a fixed builtin constant, like arrays,
-/// ranges, composites, domains and `citext` — must stay out of the
-/// validator's type map, exactly as the pre-#108 `pg_value_type` dropped it.
+/// registry can't place at all — an array, range, composite, domain, or
+/// `citext` — must stay out of the validator's type map, exactly as the
+/// pre-#108 `pg_value_type` dropped it.
 ///
 /// Classifying it as `ValueType::Other(PgType::Unrecognized)` and admitting
 /// it was strictly worse than dropping it: `PgType::name`'s `"unrecognized"`
 /// token is not a Postgres type, so it leaked into generated DDL and casts.
-/// `GROUP BY <enum column>` failed at `create table` with a raw
-/// `type "unrecognized" does not exist` (SQLSTATE 42704) instead of a named
-/// validation error, and a bare enum passthrough `define()`d *successfully*
-/// only to fail later in `apply_target`'s `$n::text::<type>` cast — a
-/// runtime pipeline failure in place of a define-time rejection. Both must
-/// be the clean [`ValidationError::UnresolvedColumn`] instead.
+/// `GROUP BY <col>` failed at `create table` with a raw `type "unrecognized"
+/// does not exist` (SQLSTATE 42704) instead of a named validation error, and
+/// a bare passthrough `define()`d *successfully* only to fail later in
+/// `apply_target`'s `$n::text::<type>` cast — a runtime pipeline failure in
+/// place of a define-time rejection. Both must be the clean
+/// [`ValidationError::UnresolvedColumn`] instead.
+///
+/// Issue #117 promoted enum types out of this bucket (they gained their own
+/// `PgType::Enum` classification and key/`GROUP BY`/`MIN`/`MAX` roles — see
+/// `trellis/tests/defs_enum.rs`), so this regression pin moved to an array
+/// column, which — like a range, composite, domain, or `citext` — is still
+/// genuinely `PgType::Unrecognized` today (`docs/type-support.md` defers
+/// these to #122). The original regression this test guards is about the
+/// *fallback* behavior for whatever is still unrecognized, not about enums
+/// specifically, so swapping the concrete example preserves its intent.
 #[tokio::test]
 async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view() {
     let cluster = TestCluster::start();
@@ -173,8 +181,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
         .await
         .expect("get connection")
         .batch_execute(
-            "create type mood as enum ('sad', 'ok', 'happy');
-             create table people (id integer primary key, m mood not null, n numeric)",
+            "create table people (id integer primary key, m integer[] not null, n numeric)",
         )
         .await
         .expect("seed source table");
@@ -187,7 +194,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
     let passthrough = trellis
         .define("TRANSFORM people_calc FROM people SELECT m AS m")
         .await
-        .expect_err("an enum passthrough must be rejected at define time, not at apply time");
+        .expect_err("an array passthrough must be rejected at define time, not at apply time");
     let rendered = passthrough.to_string();
     assert!(
         rendered.contains("m") && !rendered.contains("unrecognized"),
@@ -197,7 +204,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
     let grouped = trellis
         .define("TRANSFORM mood_totals FROM people GROUP BY m SELECT SUM(n) AS total")
         .await
-        .expect_err("an enum GROUP BY key must be rejected at define time");
+        .expect_err("an array GROUP BY key must be rejected at define time");
     let rendered = grouped.to_string();
     assert!(
         !rendered.contains("unrecognized"),
@@ -237,8 +244,73 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
 /// `PgType::name` into DDL broke that outright — `create table ... (mood
 /// unrecognized)`. `PgType::sql_type_name` restores the `text` rendering for
 /// exactly this case.
+///
+/// Issue #117 promoted enum types out of `PgType::Unrecognized` (an enum
+/// to-side enrichment column now keeps its own real type, `USER-DEFINED` per
+/// `information_schema.columns.data_type`, not `text` — see
+/// `trellis/tests/defs_enum.rs`), so this regression pin moved to an array
+/// column, which — like a range, composite, domain, or `citext` — is still
+/// genuinely `PgType::Unrecognized` and so still exercises the fallback this
+/// test guards.
 #[tokio::test]
 async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute(
+            "create table authors (id integer primary key, m integer[] not null);
+             create table posts (id integer primary key, author_id integer);
+             alter table authors replica identity full;
+             alter table posts replica identity full;",
+        )
+        .await
+        .expect("seed tables");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP author FROM posts.author_id TO authors.id",
+    )
+    .await
+    .expect("to-one relationship should be stored");
+
+    trellis
+        .define("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
+        .await
+        .expect("an array to-side enrichment column must keep working as a text projection");
+
+    let data_type: String = db
+        .pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "select data_type from information_schema.columns \
+             where table_name = 'posts_calc' and column_name = 'mood'",
+            &[],
+        )
+        .await
+        .expect("introspect target column")
+        .get(0);
+    assert_eq!(data_type, "text");
+}
+
+/// The enum counterpart of the array-based regression above: since issue
+/// #117, an enum to-side enrichment column keeps its own real Postgres
+/// type — `USER-DEFINED` per `information_schema.columns.data_type`,
+/// reported that way for any user-defined type — not `text`, because
+/// `catalog::resolve_relationships` now classifies it via
+/// `pg_type::value_type_for_oid`'s enum-aware lookup rather than falling
+/// through to `Other(Unrecognized)`.
+#[tokio::test]
+async fn an_enum_to_side_enrichment_column_keeps_its_own_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     db.pool
@@ -270,7 +342,7 @@ async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
     trellis
         .define("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
         .await
-        .expect("an enum to-side enrichment column must keep working as a text projection");
+        .expect("an enum to-side enrichment column must be recognized (issue #117)");
 
     let data_type: String = db
         .pool
@@ -285,7 +357,10 @@ async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
         .await
         .expect("introspect target column")
         .get(0);
-    assert_eq!(data_type, "text");
+    assert_eq!(
+        data_type, "USER-DEFINED",
+        "an enum to-side enrichment column must keep its own real type, not collapse to text"
+    );
 }
 
 /// Issue #234, the missing front-door pin for `Trellis::start_client`'s half

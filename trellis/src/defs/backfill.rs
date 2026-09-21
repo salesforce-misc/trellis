@@ -1021,7 +1021,7 @@ async fn backfill_aggregate(
         .iter()
         .map(|k| render_field(&k.as_expr()))
         .collect();
-    let group_casts: Vec<&'static str> = group_by
+    let group_casts: Vec<std::borrow::Cow<'static, str>> = group_by
         .iter()
         .map(|k| ddl::pg_type_name(group_by_value_type(k)))
         .collect();

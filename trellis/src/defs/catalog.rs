@@ -96,6 +96,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
+use tokio_postgres::GenericClient;
 
 use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
 use super::backfill::{self, BackfillError};
@@ -1602,7 +1603,7 @@ pub async fn create_relationship(
         column_type_in_txn(&txn, &qualified_from, &def.from_table, &def.from_col).await?;
     let to_type = column_type_in_txn(&txn, &qualified_to, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
-    assert_join_key_type_supported(&def, &from_type, &to_type)?;
+    assert_join_key_type_supported(&txn, &def, &from_type, &to_type).await?;
 
     let already_declared: bool = txn
         .query_one(
@@ -1971,10 +1972,19 @@ pub(crate) async fn resolve_relationships(
         // nonexistent to-table still reports its own precise error out of
         // `column_type_oid` below, not this resolution's.
         let query_to_table = resolve_relationship_endpoint(pool, &to_table).await?;
+        // Issue #117: a to-side enum column now needs a connection to
+        // classify (see `pg_type::value_type_for_oid`'s own doc comment) —
+        // acquired once per relationship here rather than per column, since
+        // a relationship's enrichment columns are typically few and this
+        // avoids re-acquiring a pooled connection in the loop below.
+        let client = pool.get().await?;
         let mut column_types = HashMap::with_capacity(columns.len());
         for column in columns {
             let type_oid = column_type_oid(pool, &query_to_table, &to_table, &column).await?;
-            column_types.insert(column, super::pg_type::value_type_for_oid(type_oid));
+            column_types.insert(
+                column,
+                super::pg_type::value_type_for_oid(&client, type_oid).await?,
+            );
         }
         resolved.insert(
             rel,
@@ -2817,8 +2827,53 @@ pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
     TEXT_STABLE_JOIN_KEY_TYPES.contains(&base.as_ref())
 }
 
+/// The dynamic counterpart to [`TEXT_STABLE_JOIN_KEY_TYPES`]/
+/// [`is_text_stable_join_key_type`], for issue #117's enum types: `pg_type`
+/// (a `format_type` rendering, the same string [`is_text_stable_join_key_type`]
+/// tests) cannot be enumerated in a fixed list the way every other family
+/// here can, because `CREATE TYPE ... AS ENUM` mints an arbitrary,
+/// per-schema type with a dynamically-assigned OID — there is no fixed set
+/// of enum type names to write down ahead of time. `to_regtype` resolves
+/// `pg_type` the same way Postgres itself would resolve any other type name
+/// reference (honoring `search_path`/schema-qualification), returning `NULL`
+/// rather than erroring for anything it can't resolve as a bare type name —
+/// including a modifier-bearing rendering like `numeric(10,2)` or an array
+/// type like `text[]`, neither of which is a bare name `to_regtype` accepts
+/// — so a `false` result here is always safe: it only ever means "not a
+/// live enum type", never a hard error, for any input the static allowlist
+/// above already rejects.
+///
+/// Admitting the result is safe on the same "text-stability is a property
+/// of the rendering, not of a fixed list" grounds #111/#114/#118 each
+/// established for their own families: `enumout` (what `<col>::text` calls
+/// — verified live against `pg_cast`, `trellis/tests/defs_enum.rs`) renders
+/// each value as its own label text verbatim, with no separator, no
+/// escaping, and no GUC dependence. Unlike `bytea`'s hex encoding or
+/// `bit`'s fixed alphabet, an enum value's identity *is* its label text (a
+/// `pg_enum` row keyed by OID, `enumlabel` the payload) — there is no
+/// deeper representation for two distinct values to collide under, so this
+/// is a bijection by construction, not merely by the absence of a
+/// discovered counterexample.
+pub(crate) async fn is_enum_type_name(
+    client: &impl GenericClient,
+    pg_type: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let base = base_type_name(pg_type);
+    let row = client
+        .query_one(
+            "select coalesce( \
+                 (select typtype = 'e' from pg_catalog.pg_type where oid = to_regtype($1)), \
+                 false \
+             )",
+            &[&base.as_ref()],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// Rejects `def` if either endpoint's join key type isn't
-/// [`text-stable`](is_text_stable_join_key_type) — issue #28 review, hardened
+/// [`text-stable`](is_text_stable_join_key_type) (or, issue #117, a live
+/// enum type — [`is_enum_type_name`]) — issue #28 review, hardened
 /// per review of #27/#28 (a numeric-only blocklist missed `character(n)`,
 /// `citext`, and `timestamptz`, which also diverge under the engine's
 /// `::text`-equality join vs. the Postgres oracle's native typed `=`). Checks
@@ -2826,7 +2881,8 @@ pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
 /// match to stand in for the other: `character` and `character varying`
 /// share a family but only one is on this allowlist, so a from/to pair could
 /// straddle the line.
-fn assert_join_key_type_supported(
+async fn assert_join_key_type_supported(
+    txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
     from_type: &str,
     to_type: &str,
@@ -2835,7 +2891,7 @@ fn assert_join_key_type_supported(
         (&def.from_table, &def.from_col, from_type),
         (&def.to_table, &def.to_col, to_type),
     ] {
-        if !is_text_stable_join_key_type(pg_type) {
+        if !is_text_stable_join_key_type(pg_type) && !is_enum_type_name(txn, pg_type).await? {
             return Err(ValidationError::RelationshipUnsupportedJoinKeyType {
                 name: def.name.clone(),
                 table: table.clone(),

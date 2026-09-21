@@ -112,7 +112,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `inet` | ✅ | 🎯 | ✅ `GROUP BY` only; ❌ relationship/PK | ❌ | ✅ | ✅ MIN/MAX (own type) | second `::text` renderer (`network_show`) disagrees with `inet_out` on bare host addresses — the `boolean` shape (#116) |
 | `cidr` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ MIN/MAX | `cidr_out`/`::text` never diverge, unlike `inet`; `min`/`max(cidr)` only reachable via Postgres's own implicit upcast to `inet`, which would change the result's type (#116) |
 | `macaddr` `macaddr8` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ no such Postgres aggregate | no `pg_cast` `::text` override, unlike `inet`/`cidr`; `bytea`'s "opclass but no aggregate" finding repeats exactly (#116) |
-| enum types | ✅ | 🎯 | 🎯 | 🎯 | ⚠️ | 🎯 MIN/MAX | order fixed at type creation |
+| enum types | ✅ | 🎯 | ✅ | ✅ | ⚠️ | ✅ MIN/MAX (recompute-only; ⚠️ to-many relationship wrap) | order fixed at type creation, not alphabetical (#117) |
 | `bit` | ✅ | 🎯 | ✅ relationship/PK; ❌ `GROUP BY` | ✅ | ❌ | — (widens to `bit varying`, below) | fixed-length; bare default typmod `bit(1)` truncates any *new* column/cast Trellis would declare from `ValueType` alone — safe only where a role reuses an already-existing column's own concrete type (#118) |
 | `bit varying` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ `bit_and`/`bit_or` (recompute-only) | unconstrained bare default, no DDL trap; `bit_and`/`bit_or` accept a `bit` **or** `bit varying` argument but always declare/return `bit varying` (#118) |
 | array types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ `array_agg` (order-sensitive) | deferred; large design |
@@ -917,5 +917,174 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   other argument type remains unadmitted, since only the `jsonb`-argument
   case has been shown to exclude the GUC-dependent hazard its `STABLE`
   marking is really about.
-</content>
-</invoke>
+* **Enum semantics (#117)** — every type family before this one is a single,
+  universal Postgres builtin: `bytea` is always OID 17, its rendering rules
+  are the same on every installation, and `PgType`'s own module doc could
+  reasonably declare itself "unit-variant-only, no OID/name payload". `CREATE
+  TYPE ... AS ENUM` breaks that assumption outright — it mints an arbitrary,
+  per-schema type with a dynamically-assigned OID, a database can hold
+  arbitrarily many of them, and the epic's own framing ("verify `PgType`/
+  `ValueType::Other` already distinguish two different enum types") turned
+  out to name a real, previously-nonexistent gap rather than a hypothetical
+  one: before this issue, every enum column collapsed into the one
+  undifferentiated `PgType::Unrecognized` bucket, indistinguishable from an
+  array, a range, a domain, or `citext`.
+
+  * **`PgType::Enum(&'static str)` is the one variant here with a payload** —
+    an interned copy of the type's own persisted token
+    (`"enum:<schema>.<typname>"`), so two distinct enum types are two
+    distinct `PgType`s (and hence two distinct `ValueType`s), never
+    conflated, while `PgType`/`ValueType` both stay `Copy` (interning trades
+    a heap allocation per *distinct* enum type this process ever classifies
+    — typically a handful, for the lifetime of a long-running service — for
+    keeping every other call site's existing Copy-by-value assumptions
+    intact, rather than threading `Clone`/`.clone()` through the wide
+    surface both types already have). The identity is the type's
+    **schema-qualified name**, not its OID: `ALTER TYPE ... ADD VALUE` never
+    changes a type's OID (only `DROP TYPE`/`CREATE TYPE` do), so OID
+    stability was never the concern — the real one is that Postgres does
+    **not** guarantee a user-defined type's OID survives a `pg_dump`/
+    `pg_restore` cycle, an ordinary operational event, the way it guarantees
+    a *name* survives. A restart silently remapping a persisted OID to a
+    *different* enum type would be a strictly worse failure mode than
+    anything `ALTER TYPE` can cause, so the name — the same identity
+    ADR-0007 already uses for every table this crate tracks — is what's
+    persisted (`catalog::encode_value_type`/`decode_value_type` needed **no
+    changes at all** for this: `PgType::name()` already returns the exact
+    persisted token generically for every variant, `Enum` included).
+  * **`enumout` (what `<col>::text` calls) is a bijection, and the reasoning
+    is stronger than any earlier family's, not just similarly-shaped.**
+    `select castfunc from pg_cast where castsource = '<an enum type>'::regtype
+    and casttarget = 'text'::regtype` returns no rows on a live Postgres 17
+    (`trellis/tests/defs_enum.rs`, contrasted live against `boolean`'s own
+    dedicated cast as the control) — unlike `boolean` (#119) or `inet`
+    (#116), there is no second renderer to begin with. And unlike `bytea`'s
+    hex encoding or `bit`'s fixed alphabet, an enum value's identity *is*
+    its label text: a `pg_enum` row keyed by OID, `enumlabel` the payload —
+    there is no deeper representation for two distinct values to collide
+    under, so this is a bijection by construction, not merely by the
+    absence of a discovered counterexample. `to_jsonb` agrees with `::text`
+    too (checked live; not a datetime family, so unaffected by `to_jsonb`'s
+    special-cased writer).
+  * **Both key roles land, each via a genuinely new mechanism this epic
+    hadn't needed before: a *dynamic* admission check, not a static
+    allowlist entry.** Every earlier family joined
+    `catalog::TEXT_STABLE_JOIN_KEY_TYPES` (relationship/primary key) and
+    `validate::reject_unsupported_group_by_key_type` (`GROUP BY` key) by
+    literal type name — impossible for enums, since there is no fixed list
+    of "every enum type" to write down. The relationship/primary-key role
+    gains `catalog::is_enum_type_name`, a live `to_regtype`-based probe run
+    only when the static allowlist misses (`to_regtype` resolves a bare type
+    name exactly the way Postgres itself would, honoring `search_path`, and
+    returns `NULL` — never an error — for anything it can't place, so a
+    `false` result here is always safe for every input the allowlist already
+    rejects). The `GROUP BY` role's gate, keyed on `ValueType` rather than a
+    raw string, just gains a plain `Other(PgType::Enum(_)) => Ok(())` arm —
+    and unlike fixed-length `bit`'s `bit(1)` DDL trap, there is no DDL hazard
+    to weigh here at all: an enum type's bare name already names its
+    complete, exact value domain, so `ddl::create_aggregate_target_table`
+    declaring a `GROUP BY` key's column from bare `ValueType` alone can never
+    lose precision the way a bare `bit` column declaration can. Two distinct
+    enum types are still never comparable as a relationship join, exactly
+    like `uuid` against `bigint` (`assert_comparable_types`'s `type_family`
+    check), pinned live in `trellis/tests/defs_enum.rs`.
+  * **`MIN`/`MAX` land, keep the argument's own concrete enum type
+    (`pg_typeof`, not assumed), and honor *creation-order* comparison, not
+    alphabetical** — `anyenum` has a full btree opclass ordered by
+    `pg_enum.enumsortorder`, the same "own family, own terms" shape `inet`'s
+    `MIN`/`MAX` landed under (#116). Demonstrated live with label spellings
+    chosen so creation order and alphabetical order disagree outright
+    (`trellis/tests/defs_enum.rs`), both for a bare `min`/`max` probe and for
+    a full `GROUP BY` definition's live-apply result compared against an
+    independently-authored server-side recompute.
+  * **The type-versioning question this issue's own scope note raised is
+    answered concretely, not by assumption: Trellis caches nothing
+    enum-shaped, so there is nothing for `ALTER TYPE ... ADD VALUE` to make
+    stale.** `defs::invertibility::classify` has classified `MIN`/`MAX` as
+    `Invertibility::RecomputeOnly` for *every* argument type since before
+    this issue existed — issue #11's original, unconditional-on-type gate
+    rule, not something #117 had to add. A `RecomputeOnly` field's written
+    value is never accumulated from a running state; `staging::apply_aggregate`
+    always resolves it by pushing a real `min()`/`max()` down to Postgres
+    itself (`probe_recompute_fields_bulk`), which necessarily evaluates
+    under the type's *current* `pg_enum` shape at the moment it runs. There
+    is no persistent Trellis-side knowledge of an enum's value set or order
+    anywhere in the engine to invalidate in the first place — verified, not
+    just argued from the classification: `trellis/tests/defs_enum.rs`'s
+    `alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_cached`
+    runs an `ALTER TYPE ... ADD VALUE ... BEFORE <the current minimum>`
+    *between* two drains of the same live definition and confirms the second
+    drain's answer reflects the new creation order immediately, with no
+    special handling, cache-bust, or type-versioning machinery anywhere in
+    the change.
+  * **The one place this family is not like every earlier one: its ordering
+    is not a fixed, universal property of the family the way `date`/`inet`
+    ordering is — it is a live, per-type, schema-defined fact.** Every
+    earlier `MIN`/`MAX`-supporting family has a pure-Rust comparison function
+    (`crate::temporal`'s, `crate::netaddr`'s, `crate::float`'s) the
+    evaluator's own DB-less fold (`defs::eval::reduce_numeric_aggregate` and
+    its per-family early-return arms) can call with no connection, because
+    each one's order is knowable from the family alone. An enum's order is
+    knowable only from a live `pg_enum` read of *that specific type*, which
+    this evaluator structurally never has — it is a pure, synchronous
+    function, by design, so that its one production caller
+    (`staging::apply_aggregate::row_contribution`) never pays a per-row
+    database round trip. `defs::eval::reduce_enum_aggregate` answers only
+    what it safely can without one (a single-distinct-value group needs no
+    ordering at all — `MIN`/`MAX` of one repeated value is that value) and
+    raises a named `EvalError::EnumOrderingUnavailable` for a genuine
+    multi-distinct-value tie rather than fall back to any implicit `Ord` on
+    the label text, which would silently be alphabetical and wrong.
+
+    This has exactly one real consequence, found and closed rather than
+    left as a latent gap: a `KeySpace::OneToOne` field's `MIN`/`MAX` wrapping
+    a **to-many** relationship path (`eval::eval_to_many_aggregate`, issue
+    #29's to-many relationship enrichment) folds a real multi-row group
+    through this same evaluator with **no live-Postgres fallback the way a
+    `KeySpace::Aggregate` field's own `MIN`/`MAX` always has** — that shape
+    is refused at validation time
+    (`ValidationError::EnumAggregateOverToManyRelationshipUnsupported`)
+    rather than left to fail (or, worse, silently sort alphabetically) at
+    apply time. Every other shape — a `KeySpace::Aggregate` field's own
+    `MIN`/`MAX(enum)`, or a to-*one* relationship path aggregated inside a
+    `GROUP BY` (issue #94's shape, which resolves to one value per row, never
+    a multi-row fold) — is unaffected, pinned in `defs::validate`'s own unit
+    tests. This mirrors a pre-existing, narrower-consequence instance of the
+    identical structural shape `bit_and`/`bit_or`'s own `EvalError::
+    BitStringLengthMismatch` doc comment already describes for that pair (a
+    to-many `BIT_AND(rel.col)`/`BOOL_AND(rel.col)` also reaches this same
+    evaluator path with no live fallback) — those two stayed unguarded
+    because a wrong bit-string fold and a wrong enum-ordering fold are not
+    the same risk: `bit_and`/`bool_and` are *universal, order-independent*
+    per-position folds (their Rust implementation cannot silently disagree
+    with Postgres regardless of row order), so there was nothing there for a
+    guard to prevent. Enum ordering is the one shape in this whole epic where
+    the pure evaluator can be asked a question only a live connection can
+    answer honestly, which is why it is the one place that needed a new
+    refusal rather than just a new fold.
+  * `PgType::Enum` is the epic's first variant to mint **a new payload**, not
+    a new `ValueType` variant — every role gained here is still a function
+    of `Other(PgType::Enum(_))` alone, the same "no new `ValueType`" pattern
+    every `Other`-routed family before it followed, just with a family that,
+    for the first time, needs its own identity to do it. Typed-literal
+    ("computed 1-1 target") grammar stays `⚠️`, deliberately not attempted:
+    every existing `typed_literal::TYPED_LITERALS` row is keyed by one fixed,
+    universal keyword (`DATE`, `BYTEA`, ...); an enum type's "keyword" is a
+    dynamic, per-schema identifier chosen by whoever ran `CREATE TYPE`, which
+    is a grammar change (accepting an arbitrary identifier as a typed-literal
+    prefix) no existing row needs and this issue does not attempt
+    speculatively. Cross-checked against a live server in
+    `trellis/tests/defs_enum.rs`.
+  * **Out-of-scope observation, not attempted:** a `DROP TYPE` on an enum a
+    live definition still references has no graceful-refusal/quarantine
+    path in this issue, deliberately — checked for precedent first, per the
+    epic's own "don't invent new machinery without one" convention.
+    `value_type_for_oid`'s live `pg_type`/`pg_namespace` lookup simply stops
+    finding the OID and falls back to `PgType::Unrecognized`, same as an
+    OID that was never a builtin or an enum in the first place; there is no
+    existing mechanism anywhere in this crate that notices a referenced
+    *table* disappearing out from under a still-live definition either (a
+    dropped source table just fails its next introspection with an
+    ordinary "not found"), so an enum-specific one would be new machinery
+    for a class of problem this issue's scope is type *support*, not
+    schema-drift detection in general.

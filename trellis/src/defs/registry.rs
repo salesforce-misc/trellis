@@ -459,6 +459,24 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
             // from `cidr` — a type-changing aggregate no other family in
             // this epic has needed, and this issue declines to introduce
             // speculatively.
+            // Issue #117: `min(enum)`/`max(enum)` are real Postgres
+            // aggregates — `anyenum` has a full btree opclass
+            // (`enum_cmp`/`enum_lt`/...), ordered by each value's creation
+            // position (`pg_enum.enumsortorder`), not alphabetically — and
+            // `pg_typeof(min(v))` keeps the argument's own concrete enum
+            // type, the same "own family, own terms" shape `inet`'s MIN/MAX
+            // landed under (#116). Mirroring `arg` back unchanged is
+            // therefore correct here exactly as it is for every other
+            // family in this match. See `defs::eval::reduce_enum_aggregate`
+            // for the one real wrinkle this family has that none of the
+            // others do: creation-order isn't a fixed, universal fact about
+            // the *family* the way date/inet ordering is, it's a per-type,
+            // schema-defined, live-mutable fact — so the pure evaluator
+            // fold this arm's admission enables cannot always answer it
+            // without a live connection, and refuses rather than guess (a
+            // naive lexicographic fallback here would be a silent,
+            // wrong-order bug this variant exists to rule out).
+            "MIN" | "MAX" if matches!(pg_type, PgType::Enum(_)) => Some(arg),
             "MIN" | "MAX"
                 if crate::temporal::supports_min_max(pg_type)
                     || crate::netaddr::supports_min_max(pg_type) =>

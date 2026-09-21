@@ -2932,7 +2932,13 @@ pub(crate) async fn to_column_types(
     for row in rows {
         let name: String = row.get(0);
         let type_oid: u32 = row.get(1);
-        types.insert(name, crate::defs::pg_type::value_type_for_oid(type_oid));
+        // Issue #117: also recognizes a user-defined enum type, reaching
+        // for `client` only when `type_oid` isn't a fixed builtin — see
+        // `pg_type::value_type_for_oid`'s own doc comment.
+        types.insert(
+            name,
+            crate::defs::pg_type::value_type_for_oid(&client, type_oid).await?,
+        );
     }
     Ok(types)
 }
@@ -5567,7 +5573,7 @@ async fn apply_target(
     )
     .await?;
 
-    let field_pg_types: Vec<&str> = plan
+    let field_pg_types: Vec<Cow<'static, str>> = plan
         .field_types
         .iter()
         .map(|t| ddl::pg_type_name(*t))

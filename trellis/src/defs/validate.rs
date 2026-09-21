@@ -326,6 +326,34 @@ pub enum ValidationError {
     /// their caller already created the physical target table, this is the
     /// only check that a bogus explicit schema ever gets.
     QualifiedTargetTableNotFound { schema: String, table: String },
+    /// A `KeySpace::OneToOne` field's `MIN`/`MAX` wraps a **to-many**
+    /// relationship path over an enum-typed column (issue #117,
+    /// `super::eval`'s to-many relationship enrichment, issue #29). Refused,
+    /// unlike every other admitted `MIN`/`MAX(enum)` shape: this specific
+    /// combination folds through the pure, synchronous, DB-less evaluator
+    /// (`eval::eval_to_many_aggregate` -> `eval::reduce_numeric_aggregate`)
+    /// with no live-Postgres fallback the way a `KeySpace::Aggregate`
+    /// field's own `MIN`/`MAX` always has (it is
+    /// `Invertibility::RecomputeOnly`, so `staging::apply_aggregate` always
+    /// resolves its written value with a real server-side `min()`/`max()`
+    /// push-down, never by folding a multi-row group through this
+    /// evaluator — see `defs::invertibility`'s own doc comment). An enum's
+    /// creation-order comparison is a live, per-type, schema-defined fact
+    /// (`pg_enum.enumsortorder`), not a universal property of the family
+    /// the way `date`/`inet` ordering is, so the evaluator has no way to
+    /// answer it correctly without a connection it structurally never has
+    /// here — refusing at validation time is what keeps a naive
+    /// lexicographic fallback from ever silently computing the wrong
+    /// answer (see `eval::reduce_enum_aggregate`'s own doc comment for the
+    /// runtime-side twin of this guard). Every other `MIN`/`MAX(enum)`
+    /// shape — a `KeySpace::Aggregate` field, or a to-*one* relationship
+    /// path (which resolves to one value per row, never a multi-row fold)
+    /// — is unaffected.
+    EnumAggregateOverToManyRelationshipUnsupported {
+        field: String,
+        function: String,
+        rel: String,
+    },
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -565,6 +593,18 @@ impl fmt::Display for ValidationError {
                  table named '{table}'; an explicit schema.table spelling resolves to that exact \
                  relation, not the configured target schema (ADR-0007), so this is checked as \
                  written"
+            ),
+            ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
+                field,
+                function,
+                rel,
+            } => write!(
+                f,
+                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
+                 relationship is not supported for an enum-typed column — its creation-order \
+                 comparison cannot be resolved without a live connection this fold has no way \
+                 to reach (issue #117); a GROUP BY definition's own {function}(<enum column>) \
+                 is unaffected"
             ),
         }
     }
@@ -1244,6 +1284,28 @@ fn reject_unsupported_group_by_key_type(
         // unlock is #110's typed key index, same as `numeric`/`real`/
         // `double precision`/`timestamptz` above — not a jsonb-specific
         // mechanism.
+        // Issue #117: an enum type is safe here on *both* of this gate's two
+        // independent hazard axes, unlike `bit`'s split above.
+        //
+        // Text-stability: `enumout` (what `<col>::text` calls — no `pg_cast`
+        // override the way `boolean` has, verified live in
+        // `defs_enum.rs`) renders each value as its own label text
+        // verbatim; an enum value's identity *is* that label (a `pg_enum`
+        // row keyed by OID), so there is no deeper representation for two
+        // distinct values to collide under — see `catalog::is_enum_type_name`'s
+        // own doc comment for the fuller version of this same reasoning
+        // (the relationship/PK key roles' dynamic counterpart of this
+        // static gate).
+        //
+        // DDL typmod: unlike fixed-length `bit`'s `bit(1)` narrowing
+        // default, a bare enum type name has no narrower "default" to fall
+        // back to at all — the type itself already names the complete,
+        // exact value domain (there is no such thing as an "unconstrained"
+        // vs. "narrowed" enum the way there is a `bit`/`bit(n)` split), so
+        // `ddl::create_aggregate_target_table` declaring a `GROUP BY` key's
+        // column as bare `pg_type_name(Other(Enum(_)))` can never lose
+        // precision the way a bare `bit` column declaration can.
+        ValueType::Other(PgType::Enum(_)) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -1575,6 +1637,31 @@ fn infer_expr(
                 && let Some(&arg_t) = arg_types.first()
                 && let Some(result) = super::registry::aggregate_result_type(name, arg_t)
             {
+                // Issue #117: `MIN`/`MAX(enum)` is refused specifically when
+                // it wraps a *to-many* relationship path — see
+                // `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
+                // own doc comment for the full reasoning (no live-SQL
+                // fallback exists for this one shape, unlike a
+                // `KeySpace::Aggregate` field's own `MIN`/`MAX`). A to-*one*
+                // path resolves to a single value per row — never a
+                // multi-row fold — so it is unaffected, matched by
+                // `RelationshipCardinality::ToMany` specifically rather than
+                // "any `RelationshipPath` argument".
+                if matches!(name.as_str(), "MIN" | "MAX")
+                    && matches!(result, ValueType::Other(PgType::Enum(_)))
+                    && let Expr::RelationshipPath { rel, .. } = &args[0]
+                    && relationships
+                        .get(rel)
+                        .is_some_and(|r| r.cardinality == RelationshipCardinality::ToMany)
+                {
+                    return Err(
+                        ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
+                            field: field_name.to_string(),
+                            function: name.clone(),
+                            rel: rel.clone(),
+                        },
+                    );
+                }
                 return Ok(result);
             }
             Ok(spec.return_type)
@@ -2405,6 +2492,133 @@ mod tests {
                 column: "word_count".to_string(),
             }
         );
+    }
+
+    /// Issue #117: a `KeySpace::OneToOne` field's `MIN`/`MAX` over an
+    /// enum-typed column reached through a **to-many** relationship path is
+    /// refused, even though the identical shape over a `Numeric` column
+    /// (`a_to_many_relationship_path_in_an_aggregate_definition_is_rejected`'s
+    /// sibling case, minus the `KeySpace::Aggregate`-only
+    /// `RelationshipPathInAggregate` rule that doesn't apply to a plain 1-1
+    /// definition at all) is perfectly valid issue #29 grammar. See
+    /// `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
+    /// own doc comment for why: this specific combination folds through the
+    /// pure, DB-less evaluator with no live-Postgres fallback, and an
+    /// enum's creation-order comparison cannot be answered without one.
+    #[test]
+    fn min_max_enum_over_a_to_many_relationship_is_refused() {
+        let priority = ValueType::Other(PgType::Enum("enum:public.priority_enum"));
+        let d = def(vec![FieldDef {
+            name: "worst".to_string(),
+            expr: Expr::FunctionCall {
+                name: "MAX".to_string(),
+                args: vec![Expr::RelationshipPath {
+                    rel: "items".to_string(),
+                    column: "priority".to_string(),
+                }],
+            },
+        }]);
+        let source_columns = HashMap::new();
+        let relationships = HashMap::from([(
+            "items".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToMany,
+                to_table: "items".to_string(),
+                to_col: "order_id".to_string(),
+                column_types: HashMap::from([("priority".to_string(), priority)]),
+            },
+        )]);
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
+                field: "worst".to_string(),
+                function: "MAX".to_string(),
+                rel: "items".to_string(),
+            }
+        );
+    }
+
+    /// The identical shape over a to-*one* relationship, inside a
+    /// `KeySpace::Aggregate` (GROUP BY) definition — issue #94's headline
+    /// shape (`a_to_one_relationship_path_aggregated_in_a_group_by_is_accepted`),
+    /// now with an enum-typed column — is unaffected by this issue's new
+    /// guard: it resolves to exactly one related value per source row,
+    /// never a multi-row fold, so there is no ordering question the
+    /// evaluator needs to answer at all. (A `KeySpace::OneToOne` definition
+    /// has no equivalent shape to test here: ADR-0006 never allows a to-one
+    /// path to be aggregate-wrapped there at all —
+    /// `ValidationError::RelationshipToOneWrappedInAggregate` — regardless
+    /// of this issue.)
+    #[test]
+    fn min_max_enum_over_a_to_one_relationship_in_a_group_by_is_accepted() {
+        let priority = ValueType::Other(PgType::Enum("enum:public.priority_enum"));
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "worst".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "MAX".to_string(),
+                        args: vec![Expr::RelationshipPath {
+                            rel: "assignee".to_string(),
+                            column: "priority".to_string(),
+                        }],
+                    },
+                },
+            ],
+        );
+        let source_columns = numeric_columns(&["tag", "assignee"]);
+        let relationships = HashMap::from([(
+            "assignee".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToOne,
+                to_table: "assignees".to_string(),
+                to_col: "id".to_string(),
+                column_types: HashMap::from([("priority".to_string(), priority)]),
+            },
+        )]);
+        assert_eq!(validate(&d, &source_columns, &relationships), Ok(()));
+    }
+
+    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<enum column>)`
+    /// — no relationship at all — is unaffected by this issue's new guard,
+    /// which only ever fires for a *to-many relationship path* argument.
+    /// This is the shape that is always
+    /// [`super::invertibility::Invertibility::RecomputeOnly`] and therefore
+    /// always resolved by a live server-side `min()`/`max()` push-down, per
+    /// `ValidationError::EnumAggregateOverToManyRelationshipUnsupported`'s
+    /// own doc comment.
+    #[test]
+    fn min_max_enum_over_a_plain_group_by_column_is_accepted() {
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "worst".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "MAX".to_string(),
+                        args: vec![col("priority")],
+                    },
+                },
+            ],
+        );
+        let source_columns = HashMap::from([
+            ("tag".to_string(), ValueType::Numeric),
+            (
+                "priority".to_string(),
+                ValueType::Other(PgType::Enum("enum:public.priority_enum")),
+            ),
+        ]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
     }
 
     /// A resolved *to-one* relationship whose column is read by `rel.column`.

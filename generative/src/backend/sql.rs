@@ -34,17 +34,26 @@ pub(super) fn quote_ident(ident: &str) -> String {
 }
 
 /// The Postgres type name a [`ValueType`] casts to.
-pub(super) fn pg_type_name(value_type: ValueType) -> &'static str {
+///
+/// Returns [`std::borrow::Cow`] rather than a bare `&'static str` since
+/// issue #117, mirroring `defs::ddl::pg_type_name`'s own signature change:
+/// every family but [`trellis::dev::defs::PgType::Enum`] still
+/// renders a fixed keyword and stays `Cow::Borrowed` — the generator itself
+/// never emits an `Other`-typed column at all (see `generate::Column`'s doc
+/// comment), so the owned-`Cow` branch is unreachable here in practice, but
+/// this stays parity-complete with the real `defs::ddl::pg_type_name` rather
+/// than silently drifting out of sync with it.
+pub(super) fn pg_type_name(value_type: ValueType) -> std::borrow::Cow<'static, str> {
     match value_type {
-        ValueType::Numeric => "numeric",
+        ValueType::Numeric => "numeric".into(),
         // Issue #111: an exact integer renders as its own Postgres width,
         // mirroring `defs::ddl::pg_type_name`.
-        ValueType::Integer(width) => width.pg_name(),
+        ValueType::Integer(width) => width.pg_name().into(),
         // Issue #112: likewise `real`/`double precision`.
-        ValueType::Float(width) => width.pg_name(),
-        ValueType::Text => "text",
-        ValueType::Boolean => "boolean",
-        ValueType::Uuid => "uuid",
+        ValueType::Float(width) => width.pg_name().into(),
+        ValueType::Text => "text".into(),
+        ValueType::Boolean => "boolean".into(),
+        ValueType::Uuid => "uuid".into(),
         // Issue #108: the generator itself never emits an `Other`-typed
         // column (see `generate::Column`'s doc comment), but this mirrors
         // `defs::ddl::pg_type_name` for exhaustiveness/parity.
@@ -171,7 +180,7 @@ pub(super) fn column_pg_type(
     tables: &HashMap<String, Table>,
     table: &str,
     column: &str,
-) -> &'static str {
+) -> std::borrow::Cow<'static, str> {
     pg_type_name(
         tables
             .get(table)
@@ -218,10 +227,10 @@ pub(super) async fn create_source_table(
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
         if column.name == table.pk_col {
-            sql.push_str(pg_type_name(column.value_type));
+            sql.push_str(&pg_type_name(column.value_type));
             sql.push_str(" primary key");
         } else {
-            sql.push_str(pg_type_name(column.value_type));
+            sql.push_str(&pg_type_name(column.value_type));
             if table.unique_cols.iter().any(|c| c == &column.name) {
                 sql.push_str(" unique");
             }

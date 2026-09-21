@@ -72,20 +72,26 @@ use super::validate::ValidationError;
 /// [`create_aggregate_target_table`] rather than duplicated. `pub(crate)`
 /// so `staging::apply_aggregate` (issue #11) can render the same casts for
 /// its own group-key/probe SQL without a second type-name table.
-pub(crate) fn pg_type_name(value_type: ValueType) -> &'static str {
+///
+/// Returns [`Cow`] rather than a bare `&'static str` since issue #117: every
+/// family but one renders a fixed keyword and stays `Cow::Borrowed`, exactly
+/// as before that issue: [`PgType::Enum`] is the one family whose rendering
+/// is a function of *which* enum type a given column is — see
+/// [`PgType::sql_type_name`]'s own doc comment.
+pub(crate) fn pg_type_name(value_type: ValueType) -> Cow<'static, str> {
     match value_type {
-        ValueType::Numeric => "numeric",
+        ValueType::Numeric => Cow::Borrowed("numeric"),
         // Issue #111: a derived exact-integer column is declared with the
         // width Postgres would give the same expression, not the `numeric`
         // every integer used to collapse into.
-        ValueType::Integer(width) => width.pg_name(),
+        ValueType::Integer(width) => Cow::Borrowed(width.pg_name()),
         // Issue #112: likewise a derived float column is declared `real` or
         // `double precision`, the type Postgres gives the same expression —
         // not the `numeric` both used to collapse into.
-        ValueType::Float(width) => width.pg_name(),
-        ValueType::Text => "text",
-        ValueType::Boolean => "boolean",
-        ValueType::Uuid => "uuid",
+        ValueType::Float(width) => Cow::Borrowed(width.pg_name()),
+        ValueType::Text => Cow::Borrowed("text"),
+        ValueType::Boolean => Cow::Borrowed("boolean"),
+        ValueType::Uuid => Cow::Borrowed("uuid"),
         // Issue #108: a passthrough-only `Other` family still needs a real
         // column type when it *is* rendered into DDL/cast SQL (e.g. a
         // `SELECT jsonb_col AS jsonb_col` passthrough field) —
@@ -496,7 +502,14 @@ pub(crate) async fn source_primary_key_in_txn(
         let name: String = row.get(0);
         let data_type: String = row.get(1);
         let nullable: bool = row.get(2);
-        if !super::catalog::is_text_stable_join_key_type(&data_type) {
+        // Issue #117: a live enum type joins the static allowlist above via
+        // the same dynamic `to_regtype`-based check `assert_join_key_type_supported`
+        // uses for the relationship join-key role — see
+        // `catalog::is_enum_type_name`'s own doc comment for why admitting
+        // it is safe.
+        if !super::catalog::is_text_stable_join_key_type(&data_type)
+            && !super::catalog::is_enum_type_name(client, &data_type).await?
+        {
             return Err(DdlError::UnsupportedPrimaryKeyType {
                 source_table: source_table.to_string(),
                 column: name,
