@@ -1047,11 +1047,55 @@ fn reject_unsupported_group_by_key_type(
         // is *rejected* as a relationship join key and as a primary key
         // (#107). Tightening the `GROUP BY` gate to match belongs with the
         // typed key index (#110), not here — see the note on issue #111.
-        ValueType::Integer(_)
-        | ValueType::Numeric
-        | ValueType::Text
-        | ValueType::Boolean
-        | ValueType::Uuid => Ok(()),
+        ValueType::Integer(_) | ValueType::Numeric | ValueType::Text | ValueType::Uuid => Ok(()),
+        // Issue #119: `boolean` was already admitted here (this arm
+        // predates the issue), and it is genuinely safe, but not for the
+        // reason every other admission on this function is — this is the
+        // one type where the *raw-text* premise the function's own error
+        // message states ("GROUP BY keys are matched by their text
+        // rendering") is not actually what happens underneath.
+        //
+        // `boolean` is the only type with a `pg_cast`-registered `::text`
+        // function distinct from its output function (`pg_catalog.text
+        // (boolean)` renders `'true'`/`'false'`; `boolout` — what CDC
+        // decodes and what `intake::extract_key` stores verbatim — renders
+        // `'t'`/`'f'`), so a `GROUP BY` key genuinely does have two
+        // possible spellings depending on which code path produced it. See
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment for the live
+        // `pg_cast` evidence and why that divergence is exactly why
+        // `boolean` is *not* on that allowlist (the join/primary-key role
+        // really does raw-text `{col}::text = $1` matching in places).
+        //
+        // What saves the *final SQL* half of the `GROUP BY` role is that
+        // `staging::apply_aggregate` never does raw-text matching against
+        // the database: every keyset match (`keyset_unnest`) binds the
+        // group key as a `$1::text[]::{ty}[]` array, so whichever spelling
+        // a key arrived in gets parsed back through `boolin` — a permissive
+        // *input* function that accepts both `'t'`/`'f'` and `'true'`/
+        // `'false'` — before ever being compared, natively, against the
+        // live column. Two renderings of one value always resolve to the
+        // same physical target row.
+        //
+        // That alone was not the whole story, and issue #119's review
+        // found the second half live: before this arm's write, resolving
+        // to the same *row* was not the same as resolving to the same
+        // *value* for it. `staging::apply_aggregate::accumulate_changes`
+        // buckets a batch's touched rows into in-memory `GroupPlan`s keyed
+        // by `derive_group_key`'s own `text` — a bare Rust `HashMap` key,
+        // compared byte-for-byte with no database (and so no `boolin`) in
+        // the loop at all. An image-bearing CDC row keyed `'t'` and a bare
+        // recompute's live-read row keyed `'true'` used to land in *two*
+        // separate `GroupPlan`s that both then independently wrote to the
+        // one row the SQL layer correctly resolved them to — silently
+        // corrupting its value (a delta add stacked on an unrelated forced
+        // recompute) rather than visibly splitting it into two rows the way
+        // #248's pre-fix `timestamp` did. `derive_group_key` now runs each
+        // part through `canonicalize_group_key_part` before folding it into
+        // that dedup key (a no-op for every type but `Boolean`), closing
+        // the gap at its actual source. `trellis/tests/defs_boolean.rs`'s
+        // `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
+        // reproduces the corruption end-to-end and pins the fix.
+        ValueType::Boolean => Ok(()),
         // Issue #112: `real`/`double precision` are rejected outright, and
         // this is a deliberate *tightening* — before the float split they
         // reached here as `ValueType::Numeric` and were waved through.

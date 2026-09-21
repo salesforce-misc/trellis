@@ -2648,6 +2648,63 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // evidence. `bytea` has no length/precision modifier, so
     // `base_type_name` never has anything to strip for it.
     "bytea",
+    // Issue #119: `boolean` is deliberately *not* here, and the reason is
+    // new — every other admission/refusal on this list turns on whether
+    // `<type>_out` (the type's own output function, what CDC/`pgoutput`
+    // sends and what `<col>::text` normally reduces to) is a bijection.
+    // `boolout` *is* one (`'t'`/`'f'`, nothing else). The problem is that
+    // `<col>::text` does not call `boolout` at all: `select castfunc::regproc
+    // from pg_cast where castsource = 'boolean'::regtype and casttarget =
+    // 'text'::regtype` names `pg_catalog.text(boolean)`, a *second*,
+    // dedicated cast function Postgres ships only for `boolean`, which
+    // renders the SQL-standard `'true'`/`'false'` instead of `boolout`'s
+    // `'t'`/`'f'`. Checked against every other type on this list
+    // (`smallint`/`integer`/`bigint`/`oid`/`uuid`/`text`/`character
+    // varying`/the four temporal families/`bytea`) and none has a
+    // `pg_cast` row for `text` at all — their `::text` *is* their output
+    // function, which is exactly why raw-text matching has been sound for
+    // all of them. `boolean` is the only type on the block with a second,
+    // independent renderer, and it is silent: nothing here fails to type
+    // or parse, two spellings of one value just stop comparing equal.
+    //
+    // That is live-load-bearing, not theoretical: `intake::pgoutput`'s
+    // tuple decoder stores a CDC-decoded column's wire text *verbatim*
+    // (`ColumnValue::Text`, straight off the server's `boolout` call), and
+    // `intake::extract_key` builds a relationship/primary-key's staged
+    // `key` text directly from that — `'t'`/`'f'`. Every *bulk* key lookup
+    // in `staging::apply` (`key_array_filter`, issue #125) casts the
+    // *bound parameter* to the column's native type
+    // (`col = any($1::text[]::boolean[])`), which calls `boolin` — an
+    // input function far more permissive than `boolout` is strict, so it
+    // parses `'t'`/`'f'` and `'true'`/`'false'` alike back to the same
+    // native value and the divergence never surfaces there. But several
+    // *scalar* single-key lookups (`staging::apply::check_reverse_guards`
+    // and its siblings) still render the older, unindexed
+    // `{key}::text = $1` form directly — comparing a live column's
+    // `pg_catalog.text(boolean)` rendering (`'true'`/`'false'`) against a
+    // CDC-derived `key` built from `boolout` (`'t'`/`'f'`) — and those two
+    // strings are simply not equal. Admitting `boolean` here today would
+    // silently mismatch exactly the shape #248 fixed for `timestamp`
+    // (one value, two renderers, no arbiter), just from a different
+    // renderer pair no earlier type-family issue (#111–#114) had reason to
+    // find, since `boolean` is the only type with this second cast.
+    //
+    // The `GROUP BY` key role does *not* have this problem at the final SQL
+    // layer — see `validate::reject_unsupported_group_by_key_type`'s own
+    // `Boolean` arm — because `staging::apply_aggregate`'s keyset match
+    // always goes through exactly the same native-array-cast pattern
+    // `key_array_filter` uses (`unnest($1::text[]::boolean[], ...)`), never
+    // a bare `col::text` comparison, so it never touches `pg_catalog.text
+    // (boolean)` at all. (That role *did* have a second, in-memory-only
+    // instance of this same defect, in `accumulate_changes`'s own
+    // pre-database `GroupPlan` bucketing — fixed by
+    // `apply_aggregate::canonicalize_group_key_part`, not by anything on
+    // this list; see that function's doc comment.) Extending the SQL-layer
+    // native-array-cast pattern to the remaining scalar lookup sites (or
+    // #110's typed key index, which would subsume it) is what would let
+    // `boolean` join this list; until then it stays off. See
+    // `trellis/tests/defs_boolean.rs` for the live evidence and
+    // `docs/type-support.md`'s "Boolean semantics" section.
 ];
 
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,

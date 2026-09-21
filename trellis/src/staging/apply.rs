@@ -6423,10 +6423,12 @@ pub async fn apply_and_mark_drained_many(
                     let (old_values, old_group_key) = apply_aggregate::derive_group_key(
                         &old_augmented,
                         &agg_shape.group_by_row_columns,
+                        &target_plan.group_by_types,
                     );
                     let (new_values, new_group_key) = apply_aggregate::derive_group_key(
                         &new_augmented,
                         &agg_shape.group_by_row_columns,
+                        &target_plan.group_by_types,
                     );
                     let old_contrib = apply_aggregate::row_contribution(
                         &agg_shape.contribution_def,

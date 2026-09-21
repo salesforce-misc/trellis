@@ -276,10 +276,54 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
             Some(Verdict::recompute_only())
         }
 
+        // Issue #119: `bool_and`/`bool_or` are **recompute-only**, for
+        // exactly `MIN`/`MAX`'s reason, not `SUM`/`AVG`'s. Postgres's own
+        // fold looks tempting to delta the same way `SUM` is: `bool_and` is
+        // `AND` across the group, `bool_or` is `OR`, and both are
+        // commutative, associative, and total over `{true, false}` — no
+        // `NaN`/overflow/partial-monoid trap the float or interval `SUM`
+        // stories have.
+        //
+        // The trap is deletion, and it is the same one `MIN`/`MAX` have: a
+        // running `Invertibility::Invertible` model here would only ever
+        // carry the aggregate's *current visible value* — one bit — as its
+        // state (`SUM`/`COUNT`/`AVG`'s own invertible arms above need
+        // nothing more than the running sum/count either). One bit is not
+        // enough to invert a delete. Concretely: a group folds to
+        // `bool_and = false` because it holds `{false, true, true}`; delete
+        // the one `false` row and the true new value is `true` — but delete
+        // one of the *other* two rows instead and the true new value is
+        // still `false`. Both deletions look identical to a delta model
+        // that only has "the old aggregate was `false`" to go on — exactly
+        // [`Invertibility::RecomputeOnly`]'s doc comment's "a deleted row
+        // might have held the current min/max, and there's no way to
+        // recover the next-best value from the aggregate's current state
+        // alone," verbatim, with `false`/`true` in place of a min/max
+        // candidate.
+        //
+        // A design that tracked hidden `true`-count/`false`-count partials
+        // (this *would* be genuinely invertible — `bool_and` is exactly
+        // "false-count `== 0`", decrementable on delete) is real and was
+        // considered, but it is a new composite-aggregate shape this
+        // module's [`PartialField`] enum was never built for (`AVG`'s
+        // `Sum`/`Count` partials are counting the *fold*, not one bit's
+        // occurrences per value) and would need matching new plumbing in
+        // `staging::apply_aggregate`'s carrier/probe machinery — a
+        // deliberately larger change this issue's scope (wire the two
+        // aggregates up, per the epic's own framing) does not take on
+        // speculatively. Recompute-only costs nothing incremental here
+        // regardless: [`super::registry::aggregate_result_type`] makes
+        // `bool_and`/`bool_or` reach `staging::apply_aggregate`'s ordinary
+        // `AggFieldKind::RecomputeOnly` fallback with no further wiring, the
+        // same free ride `SUM(interval)` and float `SUM`/`AVG` get.
+        ("BOOL_AND", AggregateArg::Column(_)) | ("BOOL_OR", AggregateArg::Column(_)) => {
+            Some(Verdict::recompute_only())
+        }
+
         // Shapes the grammar could never produce: COUNT with a column-typed
         // arg description, or a non-COUNT aggregate with a `*` arg.
         ("COUNT", AggregateArg::Column(_)) => None,
-        ("SUM" | "AVG" | "MIN" | "MAX", AggregateArg::Count(_)) => None,
+        ("SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR", AggregateArg::Count(_)) => None,
 
         _ => None,
     }
@@ -395,6 +439,19 @@ mod tests {
         for ty in [ValueType::Text, ValueType::Boolean] {
             let verdict = classify("AVG", AggregateArg::Column(ty)).unwrap();
             assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
+        }
+    }
+
+    /// Issue #119: `bool_and`/`bool_or` are recompute-only regardless of
+    /// argument type, the same way `MIN`/`MAX` are — this module's gate
+    /// answers "if this call were valid, is it delta-able?", and it is not,
+    /// independent of what a hand-built AST might pass as the argument.
+    #[test]
+    fn bool_and_and_bool_or_are_always_recompute_only() {
+        for name in ["BOOL_AND", "BOOL_OR"] {
+            let verdict = classify(name, AggregateArg::Column(ValueType::Boolean)).unwrap();
+            assert_eq!(verdict.invertibility, Invertibility::RecomputeOnly);
+            assert_eq!(verdict.partials, &[] as &[PartialField]);
         }
     }
 

@@ -632,9 +632,79 @@ impl AggregateTargetPlan {
 /// bare value is `NULL_KEY_SENTINEL` for `NULL` vs. `""` for a real empty
 /// string, exactly as the composite case's own per-part encoding is.
 ///
+/// Issue #119: normalizes one `GROUP BY` key **part**'s text before it feeds
+/// [`derive_group_key`]'s `text` — the in-memory dedup key `accumulate_changes`
+/// uses as `plan.groups`' `HashMap` key — to a single canonical spelling per
+/// logical value, for the one [`ValueType`] this crate admits anywhere with
+/// two disagreeing renderers.
+///
+/// This is *not* the same hazard [`ddl::encode_key_part`] handles just above
+/// (a `NULL`/empty-string ambiguity in the *encoding*) — it is two different
+/// non-`NULL` **strings for one value**: `boolout` (what CDC/`pgoutput`
+/// decodes, verbatim, into `Row` — see `intake::pgoutput`'s tuple decoder)
+/// spells a boolean `'t'`/`'f'`; `staging::apply::row_as_text_jsonb_sql`'s
+/// `<col>::text` — what a bare, image-less recompute's live refetch decodes
+/// into the very same `Row` shape — calls a *different*, dedicated Postgres
+/// cast function (`pg_catalog.text(boolean)`, `catalog::
+/// TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment has the live `pg_cast`
+/// evidence) that spells it `'true'`/`'false'` instead. No other type this
+/// crate reads anywhere has two disagreeing renderers, so this is a no-op
+/// for everything but `Boolean`.
+///
+/// Left unnormalized, one Postgres `GROUP BY` group touched once via each
+/// path in the same drain batch silently **fragments into two `GroupPlan`s**
+/// that each independently write to what the *database* correctly resolves
+/// as the same target row (`keyset_unnest`'s `$1::text[]::boolean[]` cast
+/// parses either spelling back to the same value via the permissive `boolin`
+/// before ever comparing — see `validate::reject_unsupported_group_by_key_type`'s
+/// `Boolean` arm) — but the two `GroupPlan`s know nothing of each other, so
+/// whichever writes second corrupts the first's contribution instead of
+/// replacing it (a delta add on top of an unrelated forced recompute, or
+/// vice versa). That is worse than issue #248's "two target rows" symptom:
+/// it is silent, wrong-but-plausible arithmetic in *one* row, not a visibly
+/// duplicated one. `defs_boolean.rs`'s
+/// `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
+/// reproduces the corruption end-to-end without this fix and pins the
+/// correct total with it.
+///
+/// Only the dedup `text` this function feeds is touched — `values` (bound,
+/// unmodified, straight into every SQL statement `keyset_unnest` builds)
+/// stays exactly as read, since the native-typed cast already reconciles
+/// either spelling there. Nothing decodes the dedup `text` back into a
+/// value within this crate for `Boolean` specifically: chaining a second
+/// definition onto a `Boolean`-keyed aggregate target — the one case where
+/// this key text *does* leak out, staged as a downstream primary key (see
+/// this function's own doc comment) — is unreachable in the first place,
+/// because `ddl::source_primary_key` refuses a `boolean` single-column
+/// primary key exactly as it refuses one on any ordinary source table (this
+/// function's target table is no exception); normalizing here is therefore
+/// safe for `Boolean`, not just correct.
+fn canonicalize_group_key_part(value_type: ValueType, text: Option<&str>) -> Option<String> {
+    match (value_type, text) {
+        (ValueType::Boolean, Some(t)) => Some(
+            match t {
+                "t" | "true" | "TRUE" | "True" => "t",
+                "f" | "false" | "FALSE" | "False" => "f",
+                // Defense-in-depth: `parse_value` would itself reject this
+                // text as an invalid boolean before it ever reached here.
+                // Passed through verbatim rather than guessed at, so a
+                // corrupt/unexpected spelling still fails loudly downstream
+                // instead of being silently coerced to one arm here.
+                other => other,
+            }
+            .to_string(),
+        ),
+        (_, text) => text.map(str::to_string),
+    }
+}
+
 /// `pub(super)`: issue #131's reverse-delta apply path derives a live
 /// from-side row's group key the same way this batch-driven caller does.
-pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<String>>, String) {
+pub(super) fn derive_group_key(
+    row: &Row,
+    group_by: &[String],
+    group_by_types: &[ValueType],
+) -> (Vec<Option<String>>, String) {
     let values: Vec<Option<String>> = group_by
         .iter()
         .map(|c| row.get(c).cloned().flatten())
@@ -649,7 +719,18 @@ pub(super) fn derive_group_key(row: &Row, group_by: &[String]) -> (Vec<Option<St
     // equal to `group_by`'s, which is what `ddl::split_pk_key` checks on the
     // other end, while keeping a `NULL` component distinguishable from a
     // real empty string.
-    let text = ddl::join_pk_key(values.iter().map(|v| ddl::encode_key_part(v.as_deref())));
+    //
+    // Issue #119: each part is first run through
+    // `canonicalize_group_key_part`, a no-op for every `ValueType` but
+    // `Boolean` — see that function's doc comment for why this dedup key
+    // specifically (not `values`, which stays untouched) needs it.
+    let text = ddl::join_pk_key(
+        values
+            .iter()
+            .zip(group_by_types)
+            .map(|(v, ty)| canonicalize_group_key_part(*ty, v.as_deref()))
+            .map(|v| ddl::encode_key_part(v.as_deref()).into_owned()),
+    );
     (values, text)
 }
 
@@ -1076,7 +1157,8 @@ pub(super) fn accumulate_changes(
                 // relationship-path key, has no such column at all).
                 let augmented =
                     augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
-                let (values, key) = derive_group_key(&augmented, &group_by_cols);
+                let (values, key) =
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
                 let group = plan
                     .groups
                     .entry(key)
@@ -1093,7 +1175,8 @@ pub(super) fn accumulate_changes(
             (None, Some(new_row)) => {
                 let augmented =
                     augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic);
-                let (values, key) = derive_group_key(&augmented, &group_by_cols);
+                let (values, key) =
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 let group = plan
                     .groups
@@ -1107,7 +1190,8 @@ pub(super) fn accumulate_changes(
             (Some(old_row), None) => {
                 let augmented =
                     augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic);
-                let (values, key) = derive_group_key(&augmented, &group_by_cols);
+                let (values, key) =
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 let group = plan
                     .groups
@@ -1123,8 +1207,10 @@ pub(super) fn accumulate_changes(
                     augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic);
                 let new_augmented =
                     augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic);
-                let (old_values, old_key) = derive_group_key(&old_augmented, &group_by_cols);
-                let (new_values, new_key) = derive_group_key(&new_augmented, &group_by_cols);
+                let (old_values, old_key) =
+                    derive_group_key(&old_augmented, &group_by_cols, &plan.group_by_types);
+                let (new_values, new_key) =
+                    derive_group_key(&new_augmented, &group_by_cols, &plan.group_by_types);
                 let old_contrib = forward_row_contribution(&shape, &old_augmented, regex_cache)?;
                 let new_contrib = forward_row_contribution(&shape, &new_augmented, regex_cache)?;
 
@@ -3143,6 +3229,7 @@ mod tests {
         let (values, key) = derive_group_key(
             &row(&[("warehouse", Some("w1")), ("sku", Some("a"))]),
             &group_by,
+            &[ValueType::Text, ValueType::Text],
         );
         assert_eq!(
             values,
@@ -3194,6 +3281,7 @@ mod tests {
         let (_, key) = derive_group_key(
             &row(&[("warehouse", Some("w1\u{1f}extra")), ("sku", Some("a"))]),
             &group_by,
+            &[ValueType::Text, ValueType::Text],
         );
         assert_ne!(
             key, "w1\u{1f}extra\u{1f}a",
@@ -3226,6 +3314,7 @@ mod tests {
         let (_, both) = derive_group_key(
             &row(&[("warehouse", None), ("sku", Some("\u{1}\u{1f}\u{1e}\u{1}"))]),
             &group_by,
+            &[ValueType::Text, ValueType::Text],
         );
         assert_eq!(
             ddl::split_pk_key(&pk, "stock_totals", &both)
@@ -3245,7 +3334,11 @@ mod tests {
     #[test]
     fn derive_group_key_leaves_a_single_column_group_unencoded() {
         let group_by = vec!["order_id".to_string()];
-        let (_, key) = derive_group_key(&row(&[("order_id", Some("10"))]), &group_by);
+        let (_, key) = derive_group_key(
+            &row(&[("order_id", Some("10"))]),
+            &group_by,
+            &[ValueType::Text],
+        );
         assert_eq!(key, "10");
     }
 
@@ -3258,11 +3351,18 @@ mod tests {
     #[test]
     fn derive_group_key_keeps_a_null_components_place_in_a_composite_key() {
         let group_by = vec!["warehouse".to_string(), "sku".to_string()];
-        let (values, key) =
-            derive_group_key(&row(&[("warehouse", None), ("sku", Some("a"))]), &group_by);
+        let (values, key) = derive_group_key(
+            &row(&[("warehouse", None), ("sku", Some("a"))]),
+            &group_by,
+            &[ValueType::Text, ValueType::Text],
+        );
         assert_eq!(values, vec![None, Some("a".to_string())]);
         assert_eq!(key, "\u{1}\u{1f}a");
-        let (_, other) = derive_group_key(&row(&[("sku", Some("a"))]), &group_by);
+        let (_, other) = derive_group_key(
+            &row(&[("sku", Some("a"))]),
+            &group_by,
+            &[ValueType::Text, ValueType::Text],
+        );
         assert_eq!(
             other, key,
             "an absent column folds to the same NULL-sentinel part"
@@ -3273,6 +3373,7 @@ mod tests {
         let (_, empty_string_key) = derive_group_key(
             &row(&[("warehouse", Some("")), ("sku", Some("a"))]),
             &group_by,
+            &[ValueType::Text, ValueType::Text],
         );
         assert_eq!(empty_string_key, "\u{1f}a");
         assert_ne!(
@@ -3326,11 +3427,13 @@ mod tests {
     #[test]
     fn derive_group_key_encodes_a_null_single_column_group_distinctly_from_empty_string() {
         let group_by = vec!["sku".to_string()];
-        let (values, null_key) = derive_group_key(&row(&[("sku", None)]), &group_by);
+        let (values, null_key) =
+            derive_group_key(&row(&[("sku", None)]), &group_by, &[ValueType::Text]);
         assert_eq!(values, vec![None]);
         assert_eq!(null_key, "\u{1}");
 
-        let (_, empty_key) = derive_group_key(&row(&[("sku", Some(""))]), &group_by);
+        let (_, empty_key) =
+            derive_group_key(&row(&[("sku", Some(""))]), &group_by, &[ValueType::Text]);
         assert_eq!(empty_key, "");
         assert_ne!(null_key, empty_key);
 
@@ -3357,6 +3460,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("")]
         );
+    }
+
+    /// Issue #119's own regression: `boolout` (what CDC decodes into `Row`)
+    /// and `pg_catalog.text(boolean)` (what a live-refetch's `<col>::text`
+    /// decodes into the very same `Row` shape) spell one boolean value two
+    /// different ways — `'t'`/`'f'` vs `'true'`/`'false'`. Before
+    /// `canonicalize_group_key_part`, those produced two different
+    /// `derive_group_key` `text` keys for what is one Postgres `GROUP BY`
+    /// group, silently fragmenting `accumulate_changes`'s `plan.groups` into
+    /// two independent `GroupPlan`s that both write the same target row —
+    /// see `trellis/tests/defs_boolean.rs`'s
+    /// `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
+    /// for the live, end-to-end reproduction this unit test pins the root
+    /// cause of.
+    #[test]
+    fn derive_group_key_normalizes_every_boolean_spelling_to_the_same_dedup_key() {
+        let group_by = vec!["flag".to_string()];
+        let types = [ValueType::Boolean];
+        let terse_true = derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types).1;
+        let sql_true = derive_group_key(&row(&[("flag", Some("true"))]), &group_by, &types).1;
+        let terse_false = derive_group_key(&row(&[("flag", Some("f"))]), &group_by, &types).1;
+        let sql_false = derive_group_key(&row(&[("flag", Some("false"))]), &group_by, &types).1;
+        assert_eq!(
+            terse_true, sql_true,
+            "'t' and 'true' must dedup to the same GroupPlan"
+        );
+        assert_eq!(
+            terse_false, sql_false,
+            "'f' and 'false' must dedup to the same GroupPlan"
+        );
+        assert_ne!(
+            terse_true, terse_false,
+            "true and false must still be different groups"
+        );
+
+        // `values` — what every SQL statement actually binds — is
+        // deliberately left untouched; only the dedup `text` is normalized.
+        let (values, _) = derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types);
+        assert_eq!(values, vec![Some("t".to_string())]);
     }
 
     /// The bulk-recompute path's extinct-group `DELETE` (step 3 of

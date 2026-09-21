@@ -235,7 +235,8 @@ pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
 /// Aggregate function names, called out specifically so a rejection can
 /// explain that they need an aggregate key-space (`GROUP BY`), not that
 /// they're simply unknown.
-pub const AGGREGATE_FUNCTIONS: &[&str] = &["SUM", "COUNT", "AVG", "MIN", "MAX"];
+pub const AGGREGATE_FUNCTIONS: &[&str] =
+    &["SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR"];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
 /// may call in a calculated field (issue #11's groundwork), plus `COUNT`
@@ -270,6 +271,29 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         name: "COUNT",
         arg_types: &[],
         return_type: ValueType::Numeric,
+    },
+    // Issue #119: `bool_and`/`bool_or` are Postgres's row-wise `AND`/`OR`
+    // folds — `true` iff every/any non-NULL value in the group is `true`,
+    // `NULL` over an all-NULL or empty group, exactly like `SUM`/`MIN`/
+    // `MAX`/`AVG`'s "aggregate of zero non-NULL values is NULL" rule.
+    // Unlike those four, `Boolean` is declared directly rather than
+    // `Numeric`: `boolean` is not in the numeric family
+    // (`ValueType::is_numeric_family`) and there is no widening/mixed-type
+    // story to model the way there is for integers/floats (Postgres has
+    // exactly one `boolean`, no widths), so admissibility is a plain exact
+    // match on the declared arg type (`validate`'s `is_aggregate &&
+    // *expected == ValueType::Numeric` widen-check never triggers), and
+    // [`aggregate_result_type`]'s own `Boolean` arm below is what supplies
+    // the result type the same way it does for every other aggregate.
+    FunctionSpec {
+        name: "BOOL_AND",
+        arg_types: &[ValueType::Boolean],
+        return_type: ValueType::Boolean,
+    },
+    FunctionSpec {
+        name: "BOOL_OR",
+        arg_types: &[ValueType::Boolean],
+        return_type: ValueType::Boolean,
     },
 ];
 
@@ -361,6 +385,17 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
         return match name {
             "MIN" | "MAX" if crate::temporal::supports_min_max(pg_type) => Some(arg),
             "SUM" if pg_type == PgType::Interval => Some(arg),
+            _ => None,
+        };
+    }
+    // Issue #119: `bool_and`/`bool_or` are the only aggregates whose
+    // argument is `ValueType::Boolean`, which — like the `Other` temporal/
+    // bytea families above — is not in the numeric family, so it is routed
+    // before the numeric-family gate below rather than falling into it and
+    // returning `None` for every boolean argument.
+    if let ValueType::Boolean = arg {
+        return match name {
+            "BOOL_AND" | "BOOL_OR" => Some(ValueType::Boolean),
             _ => None,
         };
     }

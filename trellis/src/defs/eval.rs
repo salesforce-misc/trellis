@@ -1370,6 +1370,13 @@ fn fold_aggregate(
 /// cannot — float addition isn't associative — which is precisely why
 /// `super::invertibility` routes float `SUM`/`AVG` to the recompute path
 /// rather than the delta path.
+///
+/// # Boolean arguments (issue #119)
+///
+/// `bool_and`/`bool_or` fold [`Value::Boolean`] rather than a numeric type
+/// at all, and are dispatched to [`reduce_boolean_aggregate`] even earlier
+/// than the temporal early-return above — see that function's own doc
+/// comment.
 fn reduce_numeric_aggregate(
     name: &str,
     values: Vec<Value>,
@@ -1390,6 +1397,17 @@ fn reduce_numeric_aggregate(
         && crate::temporal::is_temporal(*pg_type)
     {
         return reduce_temporal_aggregate(name, *pg_type, values, field_name);
+    }
+
+    // Issue #119: `bool_and`/`bool_or` are the one aggregate pair whose
+    // group folds `Value::Boolean` rather than the numeric family — same
+    // early-return shape as the temporal arm above, and for the same
+    // reason: `Boolean` cannot mix with anything else through `COALESCE`
+    // either (`validate`'s `common_numeric_type` only unifies inside the
+    // numeric family), so a boolean fold's values are all one family by
+    // construction.
+    if let Value::Boolean(_) = &values[0] {
+        return reduce_boolean_aggregate(name, values);
     }
 
     // Issue #112: a float anywhere in the group makes the whole fold a
@@ -1680,6 +1698,53 @@ fn reduce_temporal_aggregate(
         // validator rejects the definition before this point.
         _ => Ok(None),
     }
+}
+
+/// Folds a group of `Value::Boolean`s for `bool_and`/`bool_or` (issue #119)
+/// — [`reduce_numeric_aggregate`]'s early-return arm for
+/// [`ValueType::Boolean`](super::ast::ValueType::Boolean), the same shape
+/// [`reduce_temporal_aggregate`] is for the temporal families.
+///
+/// Matches Postgres's own `NULL` handling for these two: a `NULL` row is
+/// skipped (already true by the time `values` reaches here — the per-row
+/// `None` filter lives in [`fold_aggregate`]/[`eval_to_many_aggregate`],
+/// same as every other aggregate), and an all-`NULL` or empty group folds to
+/// `NULL` — the empty-`values` check at the top of
+/// [`reduce_numeric_aggregate`] already covers that, since this function is
+/// only ever reached with at least one value.
+///
+/// `bool_and` is Postgres's row-wise `AND`, `bool_or` its row-wise `OR` —
+/// both commutative, associative and total over `{true, false}`, so a plain
+/// `Iterator::all`/`any` reproduces the server's fold exactly regardless of
+/// row order; unlike `SUM`/`AVG`'s numeric arms there is no overflow,
+/// rounding or order-dependence to reproduce. `super::invertibility`'s
+/// `BOOL_AND`/`BOOL_OR` arm is `RecomputeOnly` even so — a delete cannot
+/// invert a fold whose only maintained state is its own current one-bit
+/// result — so this function is reached only via
+/// `staging::apply_aggregate`'s `RecomputeOnly` probe path (a `(bool_and(
+/// <col>))::text` rendered and run server-side) and via `defs::backfill`'s
+/// plain recompute, never via a delta; the two must and do agree because
+/// both ultimately ask Postgres the same question over the same rows.
+fn reduce_boolean_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
+    // Defense-in-depth, as everywhere else in this module: a non-Boolean
+    // value here would mean a hand-built AST bypassed the validator's own
+    // argument check.
+    let bools: Vec<bool> = values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::Boolean(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    if bools.is_empty() {
+        return Ok(None);
+    }
+    let result = match name {
+        "BOOL_AND" => bools.into_iter().all(|b| b),
+        "BOOL_OR" => bools.into_iter().any(|b| b),
+        _ => unreachable!("reduce_boolean_aggregate is only called for BOOL_AND/BOOL_OR"),
+    };
+    Ok(Some(Value::Boolean(result)))
 }
 
 /// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]
@@ -2707,6 +2772,115 @@ mod tests {
         // text written is identical either way, which is what the target
         // column's `::numeric` cast consumes.
         assert_eq!(result["total"].as_ref().unwrap().to_string(), "0");
+    }
+
+    // --- bool_and/bool_or (issue #119) ---
+
+    /// `id` stays `Numeric` (the group key), `flag` is `Boolean` — mirrors
+    /// `numeric_types`, but for the one aggregate pair (`BOOL_AND`/
+    /// `BOOL_OR`) whose argument isn't in the numeric family.
+    fn id_and_boolean_flag_types() -> HashMap<String, ValueType> {
+        HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("flag".to_string(), ValueType::Boolean),
+        ])
+    }
+
+    #[test]
+    fn parse_boolean_accepts_both_the_terse_and_sql_standard_spellings() {
+        // Issue #119's live finding: `boolout` (what CDC/`pgoutput` decodes,
+        // and what a bare column fetch renders) spells a boolean `'t'`/`'f'`,
+        // while `<col>::text` — a *different*, dedicated Postgres cast
+        // function only `boolean` has — spells it `'true'`/`'false'`. The
+        // evaluator's own row-text parser must accept both, the same way
+        // Postgres's own `boolin` does, or a definition fed CDC-sourced rows
+        // would work while the same definition fed a live-recompute's rows
+        // would not (or vice versa).
+        for (text, expected) in [
+            ("t", true),
+            ("f", false),
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("FALSE", false),
+        ] {
+            assert_eq!(
+                parse_boolean("flag", text).unwrap(),
+                expected,
+                "parse_boolean({text:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_and_and_bool_or_fold_a_mixed_group() {
+        let d = aggregate_def(
+            &["id"],
+            vec![
+                FieldDef {
+                    name: "id".to_string(),
+                    expr: col("id"),
+                },
+                FieldDef {
+                    name: "all_true".to_string(),
+                    expr: call("BOOL_AND", vec![col("flag")]),
+                },
+                FieldDef {
+                    name: "any_true".to_string(),
+                    expr: call("BOOL_OR", vec![col("flag")]),
+                },
+            ],
+        );
+        // One `NULL` row mixed in — Postgres skips it, matching every other
+        // aggregate's "aggregate of non-NULL values" rule.
+        let rows = vec![
+            row(&[("id", Some("1")), ("flag", Some("true"))]),
+            row(&[("id", Some("1")), ("flag", None)]),
+            row(&[("id", Some("1")), ("flag", Some("false"))]),
+        ];
+        let result = evaluate_aggregate(
+            &d,
+            &rows,
+            &id_and_boolean_flag_types(),
+            &mut RegexCache::new(),
+        )
+        .unwrap();
+        assert_eq!(result["all_true"], Some(Value::Boolean(false)));
+        assert_eq!(result["any_true"], Some(Value::Boolean(true)));
+    }
+
+    #[test]
+    fn bool_and_and_bool_or_over_an_all_null_group_are_null() {
+        let d = aggregate_def(
+            &["id"],
+            vec![
+                FieldDef {
+                    name: "id".to_string(),
+                    expr: col("id"),
+                },
+                FieldDef {
+                    name: "all_true".to_string(),
+                    expr: call("BOOL_AND", vec![col("flag")]),
+                },
+                FieldDef {
+                    name: "any_true".to_string(),
+                    expr: call("BOOL_OR", vec![col("flag")]),
+                },
+            ],
+        );
+        let rows = vec![
+            row(&[("id", Some("1")), ("flag", None)]),
+            row(&[("id", Some("1")), ("flag", None)]),
+        ];
+        let result = evaluate_aggregate(
+            &d,
+            &rows,
+            &id_and_boolean_flag_types(),
+            &mut RegexCache::new(),
+        )
+        .unwrap();
+        assert_eq!(result["all_true"], None);
+        assert_eq!(result["any_true"], None);
     }
 
     // --- to-one relationship path resolution (issue #28) ---

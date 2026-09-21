@@ -94,7 +94,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `oid` | ✅ | 🎯 | ✅ | ✅ | ✅ | — | key + literal roles (#111); no arithmetic — Postgres has no `oid + oid` |
 | `numeric` `decimal` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ | ✅ | rejected as PK today; `1.0`≠`1.00` under text match |
 | `real` `double precision` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ | ✅ SUM/AVG/MIN/MAX (recompute-only) | typed binary float, Postgres's non-IEEE order (#112); `-0`≠`'-0'` under text match keeps it off the key roles |
-| `boolean` | ✅ | 🎯 | 🎯 | ⚠️ (rare) | ✅ | 🎯 `bool_and`/`bool_or` | value type exists |
+| `boolean` | ✅ | 🎯 | ✅ `GROUP BY` only; ⚠️ relationship/PK | ⚠️ (rare) | ✅ | ✅ `bool_and`/`bool_or` (recompute-only) | `ValueType::Boolean` predates #119; has a second `::text` renderer no other admitted type does (#119) |
 | `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ⚠️ MIN/MAX | landed in #79 |
 | `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | 🎯 MIN/MAX/`string_agg` | requires deterministic collation |
 | `char(n)` `citext` | ✅ | ⚠️ | ❌ padding/case | ❌ | ⚠️ passthrough | — | hazard is padding/case, not volatility |
@@ -428,6 +428,112 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     carries, and it needs no value model beyond the hex text it already
     passes through end to end. Cross-checked against a live server in
     `trellis/tests/defs_bytea.rs`.
+* **Boolean semantics (#119)** — the epic's scope note read `boolean` as the
+  simplest case left: `boolout` renders exactly two values (`'t'`/`'f'`), an
+  obvious bijection, so on the "text-stability is a property of the
+  rendering" reasoning #111/#113/#114 each confirmed for their own families,
+  it looked like a straight allowlist addition. Asked of a live server, that
+  reasoning turned out to have an unstated assumption none of the previous
+  four type-family issues had reason to test: that a type's `::text` cast
+  *is* its output function. For every type this epic had touched so far,
+  that assumption holds. `boolean` is the one exception:
+
+  * **`boolean` has two independent, disagreeing renderers**, verified
+    against `pg_cast` rather than assumed: `select castfunc::regproc from
+    pg_cast where castsource = 'boolean'::regtype and casttarget =
+    'text'::regtype` names `pg_catalog.text(boolean)`, a *second*, dedicated
+    cast function Postgres ships only for `boolean` (`'true'`/`'false'`),
+    distinct from `boolout` (`'t'`/`'f'`, what CDC/`pgoutput` decodes and
+    what `intake::extract_key` stores verbatim). Every other type swept —
+    `smallint`/`integer`/`bigint`/`oid`/`uuid`/`text`/the temporal
+    families/`bytea` — has no `pg_cast` row for `text` at all; their `::text`
+    *is* their output function. This is a structurally new defect shape for
+    the epic: not a GUC dependence (`timestamptz`, `bytea`'s ruled-out
+    prediction), not a rendering-vs-equality mismatch (`interval`, float
+    `-0`/`0`), but a second, wholly independent cast function that silently
+    disagrees with the first.
+  * **The join/primary-key role stays refused, and this is why `boolean` is
+    *not* added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.** `intake::
+    extract_key` builds a CDC-derived key's text from the wire tuple
+    verbatim (`boolout`'s `'t'`/`'f'`), and several of `staging::apply`'s
+    scalar single-key lookups (`check_reverse_guards` and its siblings)
+    still compare that against a live column's `{col}::text` rendering
+    (`pg_catalog.text(boolean)`'s `'true'`/`'false'`) — two different
+    strings for one value, never matching. Issue #125's bulk `key_array_filter`
+    already sidesteps this for its own lookups (it casts the *bound array*
+    to the column's native type, so `boolin` — permissive enough to accept
+    both spellings — reconciles them before comparing), but the remaining
+    scalar sites do not. Admitting `boolean` today would repeat #248's "one
+    value, two renderers, no arbiter" defect shape, from a renderer pair no
+    earlier lane had reason to find. Extending `key_array_filter`'s pattern
+    to every scalar lookup (or #110's typed key index, which would subsume
+    it) is the prerequisite; until then the join/PK-key cells stay
+    unchecked. `trellis/tests/defs_boolean.rs`'s
+    `boolean_is_refused_as_a_relationship_join_key_and_primary_key` pins the
+    refusal as deliberate, not an oversight.
+  * **The `GROUP BY` key role's *final SQL* comparison was already safe**
+    (`validate::reject_unsupported_group_by_key_type` admitted
+    `ValueType::Boolean` before this issue existed), because
+    `staging::apply_aggregate`'s keyset match always binds the group key as
+    a native-typed array (`$1::text[]::boolean[]`), the same `boolin`
+    reconciliation `key_array_filter` uses. That was necessary but not
+    sufficient: review for this issue found a **second, genuinely live**
+    instance of the same defect shape one layer earlier, entirely in
+    memory. `staging::apply_aggregate::accumulate_changes` buckets one
+    drain batch's touched rows into `GroupPlan`s keyed by
+    `derive_group_key`'s own `text` — a bare Rust `HashMap` key compared
+    byte-for-byte, with no database (and so no `boolin`) anywhere in that
+    comparison. A row that arrived with CDC's `'t'` spelling and a row that
+    arrived via a bare recompute's live-read `'true'` spelling used to land
+    in *two* separate `GroupPlan`s that both then independently wrote to
+    the one physical row the SQL layer correctly resolved them to —
+    corrupting its value (a delta add stacked on an unrelated forced
+    recompute, observed live as `total = 25` where the correct answer was
+    `15`) rather than visibly splitting it into two rows the way #248's
+    pre-fix `timestamp` did. That is a worse failure mode than #248's,
+    precisely because it is silent. `apply_aggregate::
+    canonicalize_group_key_part` — a no-op for every `ValueType` but
+    `Boolean` — now normalizes each `GROUP BY` part's text before it folds
+    into that dedup key, closing the gap at its source rather than only at
+    the SQL boundary. `trellis/tests/defs_boolean.rs`'s
+    `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
+    reproduces the corruption end-to-end and pins the fix; a matching
+    no-DB unit test
+    (`derive_group_key_normalizes_every_boolean_spelling_to_the_same_dedup_key`)
+    pins the root cause directly.
+  * **`bool_and`/`bool_or` are recompute-only**, on `MIN`/`MAX`'s reasoning,
+    not `SUM`'s. Both are total, commutative, associative folds over
+    `{true, false}` with no overflow/rounding/partial-monoid hazard — the
+    kind of shape that looks delta-able the way `SUM` is. The trap is
+    deletion: the only state an invertible model here could maintain is the
+    aggregate's own current one-bit value, and that is not enough to invert
+    a delete. Concretely, two different single-row deletions from the same
+    `{false, true, true}` group (`bool_and = false`) land at two different
+    true answers — delete the `false` row and the group becomes `true`;
+    delete either `true` row instead and it stays `false` — so "the old
+    aggregate was `false`" alone cannot tell a delta model which case it is
+    in. This is `Invertibility::RecomputeOnly`'s own "a deleted row might
+    have held the current min/max, and there's no way to recover the
+    next-best value from the aggregate's current state alone," verbatim,
+    with `true`/`false` standing in for a min/max candidate. A design
+    tracking hidden true-count/false-count partials *would* be genuinely
+    invertible (`bool_and` is exactly "false-count `== 0`", decrementable on
+    delete) but needs a new composite-aggregate shape `defs::invertibility::
+    PartialField` was never built for, plus matching `staging::
+    apply_aggregate` carrier/probe plumbing — considered and deferred as a
+    speculative expansion beyond this issue's scope, not attempted.
+    Recompute-only costs nothing extra to wire up: `registry::
+    aggregate_result_type` routes `bool_and`/`bool_or` straight into
+    `staging::apply_aggregate`'s ordinary `AggFieldKind::RecomputeOnly`
+    fallback, the same free ride float `SUM`/`AVG` and `SUM(interval)` get.
+    Live-verified in `trellis/tests/defs_boolean.rs`, including the
+    concrete two-deletions demonstration
+    (`bool_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone`).
+  * `boolean` mints **no new `ValueType` variant** — `ValueType::Boolean`
+    already existed as a computed-target type before this issue (the
+    epic's own framing), and every role gained here is a function of the
+    type alone. Cross-checked against a live server in
+    `trellis/tests/defs_boolean.rs`.
 * **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
   `string_agg`, `jsonb_agg`) need an incremental-delta design or a
   group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.
