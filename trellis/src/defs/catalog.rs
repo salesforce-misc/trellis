@@ -2648,6 +2648,40 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // evidence. `bytea` has no length/precision modifier, so
     // `base_type_name` never has anything to strip for it.
     "bytea",
+    // Issue #116: `cidr`/`macaddr`/`macaddr8` join the list; `inet` — despite
+    // sharing `cidr`'s `pg_cast` row — deliberately does not. Full account in
+    // `crate::netaddr`'s module doc, condensed here:
+    //
+    // `macaddr`/`macaddr8` have no `pg_cast` row for `text` at all (checked
+    // the same way #119 checked `boolean`'s), so their `::text` *is*
+    // `macaddr_out`/`macaddr8_out`, and both are bijections — every accepted
+    // input spelling (colon/hyphen/dot-grouped/bare hex) normalizes on
+    // output to one canonical lowercase colon-separated form.
+    //
+    // `inet` and `cidr` share one `pg_cast` row (`pg_catalog.text(inet)`,
+    // `prosrc = network_show`, reused for `cidr` because its on-disk
+    // representation *is* an `inet` with host bits forced to zero) — but
+    // whether that second renderer actually diverges from the type's own
+    // output function is a per-type fact, not a per-row one. `cidr_out`
+    // never omits the netmask (a `cidr` value's whole point is that the
+    // network prefix matters), so `cidr_out(v)::text = v::text` holds for
+    // every value — verified live across a v4/v6 grid including the
+    // host-bits-zero-only values `cidr_in` accepts. `inet_out` — what
+    // CDC/`pgoutput` decodes, what `intake::extract_key` stores verbatim —
+    // *does* diverge from `network_show`: it omits the `/prefixlen` suffix
+    // exactly when the stored netmask covers the whole address
+    // (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`; via the
+    // cast, `192.168.1.5/32`), the identical "one value, two renderers, no
+    // arbiter" shape `boolean` has above — and `staging::apply::
+    // check_reverse_guards` and its scalar siblings still do raw
+    // `{col}::text = $1` matching, so `inet` would silently mismatch exactly
+    // the way `boolean` would. `inet` is refused here for that reason;
+    // its `GROUP BY` key role is still admitted, the same split `boolean`
+    // got — see `validate::reject_unsupported_group_by_key_type`'s `Inet`
+    // arm and `crate::netaddr::canonicalize_group_key_text`.
+    "cidr",
+    "macaddr",
+    "macaddr8",
     // Issue #119: `boolean` is deliberately *not* here, and the reason is
     // new — every other admission/refusal on this list turns on whether
     // `<type>_out` (the type's own output function, what CDC/`pgoutput`

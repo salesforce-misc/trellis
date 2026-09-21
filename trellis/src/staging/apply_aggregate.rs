@@ -166,6 +166,7 @@ use crate::defs::ddl::{self, avg_sum_column};
 use crate::defs::eval::{self, RegexCache, Row};
 use crate::defs::invertibility::{self, AggregateArg, CountArg};
 use crate::defs::oracle;
+use crate::defs::pg_type::PgType;
 use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
@@ -694,6 +695,19 @@ fn canonicalize_group_key_part(value_type: ValueType, text: Option<&str>) -> Opt
             }
             .to_string(),
         ),
+        // Issue #116: `inet`'s counterpart to the `Boolean` arm above, for
+        // the identical reason — `inet_out` (CDC) and `<col>::text`/
+        // `network_show` (this engine's own live reads, post-#248) spell a
+        // bare-host `inet` value two different ways
+        // (`crate::netaddr`'s module doc has the live grid), and this
+        // function's whole job is closing that gap before it reaches
+        // `derive_group_key`'s in-memory dedup key. See
+        // `validate::reject_unsupported_group_by_key_type`'s `Inet` arm for
+        // why that makes the `GROUP BY` key role safe despite `inet` staying
+        // off `catalog::TEXT_STABLE_JOIN_KEY_TYPES`.
+        (ValueType::Other(PgType::Inet), Some(t)) => {
+            Some(crate::netaddr::canonicalize_group_key_text(t))
+        }
         (_, text) => text.map(str::to_string),
     }
 }

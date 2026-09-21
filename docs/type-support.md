@@ -105,7 +105,9 @@ per-type capability, so it's omitted from the aggregate cells.
 | `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | #248 fixed the `to_jsonb` split, but a *second*, independent defect remains: a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246, still open) |
 | `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
 | `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 needs a canonicalizer | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`); `jsonb_out` re-sorts keys, so a literal needs #115's value model |
-| `inet` `cidr` `macaddr` `macaddr8` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | ⚠️ MIN/MAX | |
+| `inet` | ✅ | 🎯 | ✅ `GROUP BY` only; ❌ relationship/PK | ❌ | ✅ | ✅ MIN/MAX (own type) | second `::text` renderer (`network_show`) disagrees with `inet_out` on bare host addresses — the `boolean` shape (#116) |
+| `cidr` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ MIN/MAX | `cidr_out`/`::text` never diverge, unlike `inet`; `min`/`max(cidr)` only reachable via Postgres's own implicit upcast to `inet`, which would change the result's type (#116) |
+| `macaddr` `macaddr8` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ no such Postgres aggregate | no `pg_cast` `::text` override, unlike `inet`/`cidr`; `bytea`'s "opclass but no aggregate" finding repeats exactly (#116) |
 | enum types | ✅ | 🎯 | 🎯 | 🎯 | ⚠️ | 🎯 MIN/MAX | order fixed at type creation |
 | `bit` `bit varying` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | 🎯 `bit_and`/`bit_or` | |
 | array types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ `array_agg` (order-sensitive) | deferred; large design |
@@ -534,6 +536,123 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     epic's own framing), and every role gained here is a function of the
     type alone. Cross-checked against a live server in
     `trellis/tests/defs_boolean.rs`.
+* **Network-address semantics (#116)** — the epic's scope note grouped
+  `inet`/`cidr`/`macaddr`/`macaddr8` as one family and marked `MIN`/`MAX`
+  `⚠️` across the board. Asked of a live server per family, per #111–#119's
+  playbook, they land three different ways — the epic's most differentiated
+  outcome yet, and the first issue since #119 to find a *second* type with
+  boolean's exact hazard shape:
+
+  * **`pg_cast`, checked for all four, not assumed.** `select
+    castfunc::regproc from pg_cast where castsource in ('inet', 'cidr',
+    'macaddr', 'macaddr8')::regtype[] and casttarget = 'text'::regtype`
+    names `pg_catalog.text(inet)` (`prosrc = network_show`) for **both**
+    `inet` and `cidr` — Postgres reuses one cast function because `cidr`'s
+    on-disk representation *is* an `inet` with host bits forced to zero —
+    and no row at all for `macaddr`/`macaddr8`, whose `::text` is therefore
+    `macaddr_out`/`macaddr8_out` directly, already bijective (every accepted
+    input spelling — colon/hyphen/dot-grouped/bare hex — normalizes to one
+    canonical lowercase colon-separated output). They join
+    `catalog::TEXT_STABLE_JOIN_KEY_TYPES` the way `bytea`/`oid` did.
+  * **Sharing a `pg_cast` row does not mean sharing its divergence — that
+    turned out to be a per-type fact, checked live rather than inferred from
+    the row.** `inet_out` (what CDC/`pgoutput` decodes, what
+    `intake::extract_key` stores verbatim) omits the `/prefixlen` suffix
+    exactly when the stored netmask covers the whole address
+    (`'192.168.1.5'::inet::text` via `inet_out` is `192.168.1.5`), while
+    `network_show` — the shared cast, what `<col>::text` and hence
+    `staging::apply::row_as_text_jsonb_sql`'s live reads call — always
+    prints it explicitly (`192.168.1.5/32`). `cidr_out` never omits the
+    netmask in the first place (a `cidr` value's entire point is that the
+    network prefix is significant), so `cidr_out(v)::text = v::text` holds
+    unconditionally — verified live across a v4/v6 grid including the
+    host-bits-zero-only values `cidr_in` alone accepts. `inet` repeats
+    `boolean`'s exact defect shape (#119) — one value, two renderers, no
+    arbiter, `staging::apply::check_reverse_guards` and its scalar siblings
+    still doing raw `{col}::text = $1` matching — and is refused as a
+    relationship/primary key for the identical reason. `cidr` is not, and
+    joins the allowlist cleanly.
+  * **`inet`'s `GROUP BY` key role is nonetheless admitted — the same split
+    `boolean` got, for the same mechanical reason.**
+    `staging::apply_aggregate`'s keyset match never does raw-text
+    comparison; it casts the *bound array* to the column's native type
+    (`$1::text[]::inet[]`), and `inet_in` is permissive enough to parse both
+    spellings back to the identical stored value
+    (`'192.168.1.5'::inet = '192.168.1.5/32'::inet` is `true`, verified
+    live). That reconciles the SQL half automatically but not
+    `staging::apply_aggregate::accumulate_changes`'s in-memory `GroupPlan`
+    bucketing, which compares `derive_group_key`'s text byte-for-byte with
+    no database in the loop — `boolean`'s exact live bug shape. This issue
+    adds an `inet` arm to `apply_aggregate::canonicalize_group_key_part`
+    (backed by `crate::netaddr::canonicalize_group_key_text`) alongside
+    `boolean`'s, closing the gap the same way #119 did, and
+    `trellis/tests/defs_netaddr.rs`'s
+    `an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
+    reproduces the shape end-to-end and pins the fix, the same way
+    `defs_boolean.rs`'s equivalent test does for `boolean`.
+  * **`MIN`/`MAX` diverge three ways, none of them the epic's original
+    `⚠️` guess.** `inet` has a real `min(inet)`/`max(inet)` that keeps its
+    own type (`pg_typeof(min(v))` is `inet`, verified live) — the epic's
+    `min`/`max`-keeps-argument-type rule holds, and `crate::netaddr::compare`
+    reproduces `network_cmp`'s three-level tie-break (cross-family by
+    `family`, same-family by the shared prefix up to the smaller netmask,
+    then by netmask length, then by the full address) closely enough that
+    the Rust-side fold matches a server-side `min`/`max` byte-for-byte
+    across a grid exercising every tier
+    (`trellis/tests/defs_netaddr.rs`'s
+    `inet_min_max_keeps_its_type_and_the_fold_matches_a_server_side_aggregate`).
+    `cidr` has **no** `min(cidr)`/`max(cidr)` of its own — only Postgres's
+    own implicit upcast to `inet` reaches one (`castcontext = 'i'` in
+    `pg_cast`), and `pg_typeof(min(cidr_col))` is demonstrably `inet`, not
+    `cidr` — a genuinely new shape none of the epic's other `MIN`/`MAX`
+    refusals have: the aggregate exists, but only for a *different* type
+    than the column's own. Admitting it would mean
+    `registry::aggregate_result_type` silently changing a `cidr` computed
+    field's declared type to `inet`, which this issue declines rather than
+    invent speculatively — `❌`, not `⚠️`, by the same "no construct to be
+    a subset of" reasoning #114 used for `bytea`, applied one type up.
+    `macaddr`/`macaddr8` repeat `bytea`'s finding outright: a full,
+    `IMMUTABLE` btree opclass each (`macaddr_ops`/`macaddr8_ops`), but no
+    `min`/`max` aggregate wired to either — `select min(v) from (values
+    ('08:00:2b:01:02:03'::macaddr)) t(v)` is `ERROR: function min(macaddr)
+    does not exist` on a live Postgres 17, and no `pg_proc` row names
+    `min`/`max` over a lone `macaddr`/`macaddr8` argument.
+    `registry::aggregate_result_type` returns `None` for both.
+  * **`to_jsonb` agrees with `::text` for `cidr`/`macaddr`/`macaddr8`, and
+    disagrees for `inet`.** `to_jsonb` calls a value's own output function
+    for every non-numeric, non-datetime scalar type — the same fact #114
+    established for `bytea` — so for `inet` it renders through `inet_out`,
+    not through `pg_cast`'s `network_show` override, and inherits `inet_out`'s
+    host-address elision the same way `inet_out` itself does. This is
+    `to_jsonb`-versus-`inet_out` agreement, not a *third* renderer: the real
+    conflict remains `inet_out` (⟵ CDC) versus `<col>::text` (⟵ everything
+    the engine itself renders, since issue #248's
+    `staging::apply::row_as_text_jsonb_sql` replaced every bare
+    `to_jsonb(t.*)` row-body read with an explicit `<col>::text`, so nothing
+    in the engine actually calls bare `to_jsonb` for a row body any more).
+  * **Typed literals land for all four**, unlike the epic's earlier
+    "each waits for its own child" placeholder in `defs::typed_literal`.
+    `inet_in`/`cidr_in`/`macaddr_in`/`macaddr8_in` and their `_out`
+    counterparts are all `IMMUTABLE` (`pg_proc.provolatile`), clearing the
+    same bar `date`/`oid`/`bytea`/the floats did. The canonical-form checker
+    for each accepts exactly the spelling that type's actual live renderer
+    emits — `network_show`'s always-explicit-netmask form for `INET`/`CIDR`
+    (not `inet_out`'s elided one), and `macaddr_out`/`macaddr8_out`'s one
+    lowercase colon-grouped spelling for the other two. `INET`/`CIDR`
+    additionally round-trip through Rust's own `std::net::IpAddr` parser for
+    the address part, which agrees with Postgres's rendering on every value
+    tried live except the deprecated IPv4-compatible form (`::192.168.1.1`,
+    distinct from the IPv4-*mapped* `::ffff:192.168.1.1`, which does agree)
+    — the checker rejects that one form outright rather than risk silently
+    mis-canonicalizing it, the same "reject rather than guess" posture every
+    other canonical checker in `defs::typed_literal` takes.
+  * `inet`/`cidr`/`macaddr`/`macaddr8` mint **no new `ValueType` variant** —
+    every role gained here is a function of the family alone, which
+    `PgType` already carries, the same reasoning `crate::temporal`'s and
+    `bytea`'s module docs give for their own families. `crate::netaddr` owns
+    the ordering (`inet`'s `MIN`/`MAX`), the `GROUP BY` canonicalization, and
+    the four typed-literal checkers. Cross-checked against a live server in
+    `trellis/tests/defs_netaddr.rs`.
 * **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
   `string_agg`, `jsonb_agg`) need an incremental-delta design or a
   group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.

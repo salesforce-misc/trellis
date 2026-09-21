@@ -1154,6 +1154,38 @@ fn reject_unsupported_group_by_key_type(
         // split one Postgres group in two, exactly as a float `-0`/`0` key
         // would.
         ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
+        // Issue #116: `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
+        // each is on `catalog::TEXT_STABLE_JOIN_KEY_TYPES` (see that
+        // constant's doc comment for the live `pg_cast`/renderer evidence),
+        // and unlike the temporal families every value of each clears the
+        // bar, not just a subset, so a plain admit is enough here too.
+        ValueType::Other(PgType::Cidr | PgType::MacAddr | PgType::MacAddr8) => Ok(()),
+        // `inet` is admitted here despite being deliberately *absent* from
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` — the same split issue #119
+        // gave `boolean`, for the same mechanical reason.
+        //
+        // `inet_out` (what CDC decodes, what `intake::extract_key` stores
+        // verbatim) and `network_show` (`<col>::text` — what this engine's
+        // own live reads use, post-#248) disagree on a bare-host `inet`
+        // value's spelling (`192.168.1.5` vs `192.168.1.5/32` — see
+        // `crate::netaddr`'s module doc for the live grid), the identical
+        // "one value, two renderers" shape that keeps `inet` off the
+        // join/primary-key allowlist. That divergence does not reach the
+        // `GROUP BY` role's *final SQL*, because `staging::apply_aggregate`'s
+        // keyset match never does raw-text comparison — it casts the *bound
+        // array* to the column's native type (`$1::text[]::inet[]`), and
+        // `inet_in` is permissive enough to parse both spellings back to the
+        // identical stored value (`'192.168.1.5'::inet =
+        // '192.168.1.5/32'::inet` is `true`, verified live). What it does
+        // reach is `staging::apply_aggregate::accumulate_changes`'s
+        // in-memory `GroupPlan` bucketing, which compares `derive_group_key`'s
+        // text byte-for-byte with no database (and so no `inet_in`) anywhere
+        // in the loop — `boolean`'s exact live bug shape (#119's review).
+        // `apply_aggregate::canonicalize_group_key_part`'s `Inet` arm (via
+        // `crate::netaddr::canonicalize_group_key_text`) closes that gap the
+        // same way it does for `Boolean`, which is what makes this an honest
+        // `Ok(())` rather than a still-open hazard.
+        ValueType::Other(PgType::Inet) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,

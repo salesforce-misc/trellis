@@ -186,8 +186,19 @@ pub struct TypedLiteralSpec {
 ///   Trellis does not do. (`interval`'s *output* side is fine: #113 pins
 ///   `IntervalStyle` and `crate::temporal::Interval::render` reproduces the
 ///   `postgres` spelling exactly, which is what `SUM(interval)` needs.)
-/// * **`inet`, `cidr`, `macaddr`, `macaddr8`, `bit`, `varbit`** — each
-///   waits for its own child (#116, #118).
+/// * **`bit`, `varbit`** — wait for their own child (#118).
+///
+/// `inet`, `cidr`, `macaddr` and `macaddr8` (issue #116) *are* in the
+/// allowlist below now, each clearing both bars: `inet_in`/`cidr_in`/
+/// `macaddr_in`/`macaddr8_in` and their `_out` counterparts are all
+/// `IMMUTABLE` (checked against `pg_proc.provolatile`, the same check
+/// `crate::netaddr`'s module doc runs for the key/aggregate roles), and each
+/// checker below accepts exactly the one spelling the type's *actual*
+/// canonical renderer emits — `network_show` (`<col>::text`) for `inet`/
+/// `cidr`, not `inet_out`'s host-elided form (`crate::netaddr::
+/// canonical_inet`/`canonical_cidr`), and `macaddr_out`/`macaddr8_out`'s one
+/// lowercase colon-grouped spelling for the other two
+/// (`crate::netaddr::canonical_macaddr`/`canonical_macaddr8`).
 /// * **`smallint`, `integer`, `bigint`** — these *do* have literal syntax of
 ///   their own since issue #111, and it is Postgres's own: a bare `5` is
 ///   `integer` and a bare `3000000000` is `bigint`, exactly as
@@ -269,6 +280,34 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "DOUBLE PRECISION",
         value_type: ValueType::Float(FloatWidth::Float8),
         canonical: canonical_float8,
+    },
+    // Issue #116. Canonical form is `network_show`'s (`<col>::text`'s)
+    // always-explicit-netmask spelling, not `inet_out`'s host-elided one —
+    // see `crate::netaddr`'s module doc for why those two differ and which
+    // one every other renderer this engine uses actually produces.
+    TypedLiteralSpec {
+        keyword: "INET",
+        value_type: ValueType::Other(PgType::Inet),
+        canonical: crate::netaddr::canonical_inet,
+    },
+    // `cidr_out` and the `network_show` cast agree unconditionally (a `cidr`
+    // value's whole point is that the netmask matters, so neither renderer
+    // ever elides it) — the extra bar over `INET` is `cidr_in`'s own
+    // host-bits-must-be-zero requirement.
+    TypedLiteralSpec {
+        keyword: "CIDR",
+        value_type: ValueType::Other(PgType::Cidr),
+        canonical: crate::netaddr::canonical_cidr,
+    },
+    TypedLiteralSpec {
+        keyword: "MACADDR",
+        value_type: ValueType::Other(PgType::MacAddr),
+        canonical: crate::netaddr::canonical_macaddr,
+    },
+    TypedLiteralSpec {
+        keyword: "MACADDR8",
+        value_type: ValueType::Other(PgType::MacAddr8),
+        canonical: crate::netaddr::canonical_macaddr8,
     },
 ];
 

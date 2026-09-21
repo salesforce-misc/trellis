@@ -383,7 +383,24 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // aggregate exists.
     if let ValueType::Other(pg_type) = arg {
         return match name {
-            "MIN" | "MAX" if crate::temporal::supports_min_max(pg_type) => Some(arg),
+            // Issue #116: `inet` joins the temporal `MIN`/`MAX` families —
+            // `min(inet)`/`max(inet)` are real Postgres aggregates that keep
+            // their argument's own type (`pg_typeof(min(v))` is `inet`,
+            // verified live). `cidr`/`macaddr`/`macaddr8` all fall through to
+            // `None` here, each for its own reason (see `crate::netaddr`'s
+            // module doc): `macaddr`/`macaddr8` have no `min`/`max`
+            // aggregate at all (the `bytea` finding, #114); `cidr`'s only
+            // reachable `min`/`max` is Postgres's own implicit upcast to
+            // `inet`, which would silently change the result's type away
+            // from `cidr` — a type-changing aggregate no other family in
+            // this epic has needed, and this issue declines to introduce
+            // speculatively.
+            "MIN" | "MAX"
+                if crate::temporal::supports_min_max(pg_type)
+                    || crate::netaddr::supports_min_max(pg_type) =>
+            {
+                Some(arg)
+            }
             "SUM" if pg_type == PgType::Interval => Some(arg),
             _ => None,
         };

@@ -116,6 +116,13 @@ pub mod staging;
 pub(crate) mod temporal;
 #[cfg(feature = "internals")]
 pub mod temporal;
+// `netaddr` (issue #116) sits here for the same reason `temporal` does: its
+// public signatures name `defs::pg_type::PgType`, itself crate-private
+// above.
+#[cfg(not(feature = "internals"))]
+pub(crate) mod netaddr;
+#[cfg(feature = "internals")]
+pub mod netaddr;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod dev;

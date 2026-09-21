@@ -1399,6 +1399,15 @@ fn reduce_numeric_aggregate(
         return reduce_temporal_aggregate(name, *pg_type, values, field_name);
     }
 
+    // Issue #116: `inet`'s `MIN`/`MAX` fold on the same "own family, own
+    // terms" grounds as the temporal arm just above — `registry::
+    // aggregate_result_type` is the only place that admits `Other(PgType::
+    // Inet)` into an aggregate at all, and only for `MIN`/`MAX`, so
+    // `reduce_netaddr_aggregate` never needs a `SUM`/`AVG` arm.
+    if let Value::Other(PgType::Inet, _) = &values[0] {
+        return reduce_netaddr_aggregate(name, values);
+    }
+
     // Issue #119: `bool_and`/`bool_or` are the one aggregate pair whose
     // group folds `Value::Boolean` rather than the numeric family — same
     // early-return shape as the temporal arm above, and for the same
@@ -1696,6 +1705,63 @@ fn reduce_temporal_aggregate(
         // `AVG` over a temporal type is not an aggregate Postgres has, so
         // `registry::aggregate_result_type` never admits it and the
         // validator rejects the definition before this point.
+        _ => Ok(None),
+    }
+}
+
+/// Folds a group of `Value::Other(PgType::Inet, _)`s for `MIN`/`MAX` (issue
+/// #116) — [`reduce_numeric_aggregate`]'s early-return arm for `inet`, the
+/// same shape [`reduce_temporal_aggregate`] is for the temporal families.
+/// `crate::netaddr::compare` reproduces `network_cmp`'s ordering exactly
+/// (see that module's doc comment for the live cross-checks), so this
+/// function's own fold is otherwise identical to the temporal one: seed from
+/// the first value, keep the incoming value on a tie (Postgres's
+/// `network_larger`-family left fold, `cmp(arg1, arg2) < 0 ? arg1 : arg2`
+/// mirrored the same way #112's float fold and #113's temporal fold both
+/// are), drop any value whose text fails to parse before folding rather than
+/// inside the fold (so an unparseable *first* value can't silently win by
+/// never losing a comparison).
+///
+/// Only `MIN`/`MAX` ever reach here — `registry::aggregate_result_type`
+/// never admits `Other(PgType::Inet)` into `SUM`/`AVG` (there is no such
+/// Postgres aggregate), so the `_ => Ok(None)` arm below is unreachable
+/// through the validator, kept only as the same defense-in-depth every
+/// sibling reducer in this module keeps.
+fn reduce_netaddr_aggregate(name: &str, values: Vec<Value>) -> Result<Option<Value>, EvalError> {
+    let texts: Vec<String> = values
+        .into_iter()
+        .filter_map(|value| match value {
+            Value::Other(PgType::Inet, text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    if texts.is_empty() {
+        return Ok(None);
+    }
+
+    match name {
+        "MIN" | "MAX" => {
+            let keep = if name == "MIN" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+            let comparable: Vec<String> = texts
+                .into_iter()
+                .filter(|text| crate::netaddr::compare(text, text).is_some())
+                .collect();
+            if comparable.is_empty() {
+                return Ok(None);
+            }
+            let winner = comparable
+                .into_iter()
+                .reduce(|a, b| match crate::netaddr::compare(&b, &a) {
+                    Some(ordering) if ordering == keep => b,
+                    _ => a,
+                })
+                .expect("checked non-empty above");
+            Ok(Some(Value::Other(PgType::Inet, winner)))
+        }
         _ => Ok(None),
     }
 }
