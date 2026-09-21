@@ -236,7 +236,16 @@ pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
 /// explain that they need an aggregate key-space (`GROUP BY`), not that
 /// they're simply unknown.
 pub const AGGREGATE_FUNCTIONS: &[&str] = &[
-    "SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "BIT_AND", "BIT_OR",
+    "SUM",
+    "COUNT",
+    "AVG",
+    "MIN",
+    "MAX",
+    "BOOL_AND",
+    "BOOL_OR",
+    "BIT_AND",
+    "BIT_OR",
+    "JSONB_AGG",
 ];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
@@ -330,6 +339,25 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         name: "BIT_OR",
         arg_types: &[ValueType::Other(PgType::Bit)],
         return_type: ValueType::Other(PgType::VarBit),
+    },
+    // Issue #115: `jsonb_agg` is `STABLE` in Postgres (`pg_proc.provolatile`),
+    // not because it is order-sensitive (`array_agg`/`string_agg` are
+    // equally order-sensitive and are `IMMUTABLE`) but because it is
+    // polymorphic and, for *some* argument types (`timestamptz`, `money`),
+    // its row-to-`jsonb` conversion reads a session GUC — see
+    // `crate::jsonb`'s module doc for the live `pg_proc`/`TimeZone`/
+    // `lc_monetary` evidence. Pinning the argument to `jsonb` itself (rather
+    // than accepting it polymorphically the way Postgres's own grammar
+    // does) excludes that hazard outright: converting an already-`jsonb`
+    // value is the identity, with no GUC read at all. This is the one
+    // aggregate spec in this table whose argument type is a passthrough
+    // `Other` family rather than `Numeric`/`Boolean` — the same shape
+    // `BIT_AND`/`BIT_OR` already established, just with an exact (not
+    // widened) argument/result pair, the same as `BOOL_AND`/`BOOL_OR`.
+    FunctionSpec {
+        name: "JSONB_AGG",
+        arg_types: &[ValueType::Other(PgType::Jsonb)],
+        return_type: ValueType::Other(PgType::Jsonb),
     },
 ];
 
@@ -479,6 +507,12 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
             "BIT_AND" | "BIT_OR" if matches!(pg_type, PgType::Bit | PgType::VarBit) => {
                 Some(ValueType::Other(PgType::VarBit))
             }
+            // Issue #115: unlike `BIT_AND`/`BIT_OR`'s deliberate widening,
+            // `JSONB_AGG` mirrors its argument's own family straight back —
+            // there is no DDL-typmod trap here the way fixed-length `bit`
+            // has (`PgType::Jsonb` carries no modifier at all), so nothing
+            // forces a different declared family the way it does there.
+            "JSONB_AGG" if pg_type == PgType::Jsonb => Some(ValueType::Other(PgType::Jsonb)),
             _ => None,
         };
     }

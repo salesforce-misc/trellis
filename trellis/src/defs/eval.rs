@@ -1037,14 +1037,42 @@ fn eval_to_many_aggregate(
         return Ok(Some(Value::Numeric(int_numeric(count))));
     }
 
-    // SUM/MIN/MAX/AVG: read `column` off each related row, skipping NULLs (and,
-    // defense-in-depth, any non-Numeric value a hand-built AST slipped past the
-    // validator's Numeric-only check), then fold. All-NULL / empty => NULL.
     let value_type = reldata
         .to_columns
         .get(column)
         .copied()
         .unwrap_or(ValueType::Numeric);
+
+    // Issue #115: `jsonb_agg(<rel>.<column>)` folds *rows*, not non-NULL
+    // values — unlike every aggregate below, a `NULL` related row still
+    // contributes a JSON `null` element (`jsonb_agg`'s transition function
+    // is not `STRICT`; see `crate::jsonb`'s module doc), and only a
+    // genuinely empty related set folds to SQL `NULL`. Handled as its own
+    // early return rather than folding into the shared NULL-skipping loop
+    // just below, since that loop's "skip a NULL row" behavior is exactly
+    // what this aggregate must not do.
+    if name == "JSONB_AGG" {
+        let mut row_values: Vec<Option<Value>> = Vec::with_capacity(related.len());
+        for row in related {
+            match row.get(column) {
+                Some(Some(text)) => {
+                    row_values.push(Some(parse_value(field_name, value_type, text)?));
+                }
+                Some(None) => row_values.push(None),
+                None => {
+                    return Err(EvalError::MissingColumn {
+                        field: field_name.to_string(),
+                        column: column.to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(fold_jsonb_agg(row_values));
+    }
+
+    // SUM/MIN/MAX/AVG: read `column` off each related row, skipping NULLs (and,
+    // defense-in-depth, any non-Numeric value a hand-built AST slipped past the
+    // validator's Numeric-only check), then fold. All-NULL / empty => NULL.
     let mut values: Vec<Value> = Vec::new();
     for row in related {
         match row.get(column) {
@@ -1352,11 +1380,41 @@ fn fold_aggregate(
     fields_by_name: &HashMap<&str, &FieldDef>,
     regex_cache: &mut RegexCache,
 ) -> Result<Option<Value>, EvalError> {
-    let mut values: Vec<Value> = Vec::new();
     // The aggregate path does not wire relationships (issue #29 handles a
     // to-many relationship's aggregate-wrapped enrichment); a bare path in an
     // aggregate argument therefore errors as unknown, defense-in-depth.
     let relationships = RelationshipContext::default();
+
+    // Issue #115: `JSONB_AGG` folds *rows*, not non-NULL values — see
+    // `eval_to_many_aggregate`'s matching branch and `crate::jsonb`'s module
+    // doc for why `jsonb_agg`'s transition function is not `STRICT`. Handled
+    // as its own early return so the shared NULL-skipping loop below never
+    // sees it (`rows` here is a `GROUP BY` group, always non-empty — see
+    // `evaluate_aggregate`'s own assertion — so this never folds to `NULL`
+    // the way the to-many relationship path's genuinely-empty `related` set
+    // can).
+    if name == "JSONB_AGG" {
+        let mut row_values: Vec<Option<Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut per_row_cache = HashMap::new();
+            let mut per_row_in_progress = HashSet::new();
+            let value = eval_expr(
+                arg_expr,
+                field_name,
+                row,
+                source_columns,
+                &relationships,
+                fields_by_name,
+                &mut per_row_cache,
+                &mut per_row_in_progress,
+                regex_cache,
+            )?;
+            row_values.push(value);
+        }
+        return Ok(fold_jsonb_agg(row_values));
+    }
+
+    let mut values: Vec<Value> = Vec::new();
     for row in rows {
         let mut per_row_cache = HashMap::new();
         let mut per_row_in_progress = HashSet::new();
@@ -1389,6 +1447,61 @@ fn fold_aggregate(
     }
 
     reduce_numeric_aggregate(name, values, field_name)
+}
+
+/// Folds `JSONB_AGG` over a group's **per-row** values (`None` for a `NULL`
+/// row), building the `jsonb` array `jsonb_agg` itself would — see this
+/// module's two call sites ([`fold_aggregate`], [`eval_to_many_aggregate`])
+/// and `crate::jsonb`'s module doc for why a `NULL` row is folded in as a
+/// JSON `null` element rather than skipped, unlike every other aggregate in
+/// this crate.
+///
+/// Only a genuinely **empty** `row_values` (zero rows, not "every row
+/// `NULL`") folds to `None` (SQL `NULL`) — Postgres's own `jsonb_agg` over
+/// zero rows is `NULL`, but over one `NULL` row is the one-element array
+/// `[null]` (verified live), a *rows*-counted rule rather than every other
+/// aggregate's *non-NULL-values*-counted one.
+///
+/// Each element's text is inserted verbatim: a `Value::Other(PgType::Jsonb,
+/// _)` already carries `jsonb_out`'s own canonical text (decoded off a CDC
+/// row, or checked canonical by [`crate::jsonb::canonical_jsonb`] for a
+/// typed literal — see `super::typed_literal`), so no re-canonicalization is
+/// needed to assemble the enclosing array.
+///
+/// Element **order** here is simply `row_values`' own order — this
+/// evaluator never reorders a group's rows — but that is not a promise that
+/// a *server-side* recompute of the same group will agree on order between
+/// two separate calls (`crate::jsonb`'s module doc's "`jsonb_agg`'s residual
+/// ordering caveat"). `JSONB_AGG` is always
+/// [`super::invertibility::Invertibility::RecomputeOnly`], so this function
+/// exists for the oracle/self-check cross-validation path and the to-many
+/// relationship path, not the production apply pipeline's own recompute
+/// (which asks Postgres directly — `staging::apply_aggregate`'s
+/// `probe_recompute_fields_bulk`).
+fn fold_jsonb_agg(row_values: Vec<Option<Value>>) -> Option<Value> {
+    if row_values.is_empty() {
+        return None;
+    }
+    let mut text = String::from("[");
+    for (i, value) in row_values.iter().enumerate() {
+        if i > 0 {
+            text.push_str(", ");
+        }
+        match value {
+            Some(Value::Other(PgType::Jsonb, element)) => text.push_str(element),
+            // Defense-in-depth: the validator/registry gate `JSONB_AGG`'s
+            // argument to exactly `Other(PgType::Jsonb)` (an exact-match
+            // check, the same shape `BOOL_AND`'s fixed `Boolean` argument
+            // gets), so a hand-built AST is the only way to reach here with
+            // anything else — render it as `null` rather than panicking,
+            // the same "never trust a hand-built AST past the type it
+            // claims" posture the rest of this module takes.
+            Some(_) => text.push_str("null"),
+            None => text.push_str("null"),
+        }
+    }
+    text.push(']');
+    Some(Value::Other(PgType::Jsonb, text))
 }
 
 /// Reduces the collected non-`NULL` exact-numeric values of

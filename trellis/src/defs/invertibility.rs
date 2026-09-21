@@ -359,11 +359,28 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
             Some(Verdict::recompute_only())
         }
 
+        // Issue #115: `jsonb_agg` is **recompute-only**, on `MIN`/`MAX`'s
+        // reasoning rather than `SUM`'s — a running "invertible" model here
+        // could only ever be the aggregate's own current folded array, and
+        // there is no way to subtract one deleted row's contribution back
+        // out of it (unlike `SUM`, whose running total *is* enough state to
+        // invert a delete). This is the same structural trap `bool_and`/
+        // `bit_and` hit, one level up: the state a delta model would need to
+        // keep is the *input multiset itself*, not a summary of it, which is
+        // exactly what `RecomputeOnly` already means. See `crate::jsonb`'s
+        // module doc for why `jsonb_agg` is safe to admit at all despite its
+        // `STABLE` marking (restricting the argument to `jsonb` itself
+        // excludes the GUC-dependent hazard that marking is really about),
+        // and for the residual, non-corrupting ordering caveat this
+        // `RecomputeOnly` routing does *not* resolve (tracked toward #120).
+        ("JSONB_AGG", AggregateArg::Column(_)) => Some(Verdict::recompute_only()),
+
         // Shapes the grammar could never produce: COUNT with a column-typed
         // arg description, or a non-COUNT aggregate with a `*` arg.
         ("COUNT", AggregateArg::Column(_)) => None,
         (
-            "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR" | "BIT_AND" | "BIT_OR",
+            "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR" | "BIT_AND" | "BIT_OR"
+            | "JSONB_AGG",
             AggregateArg::Count(_),
         ) => None,
 

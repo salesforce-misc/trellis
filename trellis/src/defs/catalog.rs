@@ -2770,6 +2770,24 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm.
     "bit",
     "bit varying",
+    // Issue #115: `jsonb` is deliberately **absent**, and — unlike
+    // `boolean`/`inet` — not because of a second, disagreeing `::text`
+    // renderer: `select castfunc from pg_cast where castsource =
+    // 'jsonb'::regtype and casttarget = 'text'::regtype` returns no rows,
+    // so `::text` is `jsonb_out` directly, and `jsonb_out` genuinely
+    // canonicalizes object key order (`{"b":1,"a":2}` and `{"a":2,"b":1}`
+    // both render `{"a": 2, "b": 1}`). The hazard is one level deeper: an
+    // embedded JSON *number* preserves its literal input scale the way
+    // `numeric` itself does, so `'{"a":1}'::jsonb` and
+    // `'{"a":1.0}'::jsonb` are `=` (verified live) but render as
+    // `{"a": 1}` and `{"a": 1.0}` — one value, two renderings, the same
+    // equivalence-class shape `real`/`double precision`'s `-0`/`0` and
+    // `interval`'s `'1 day'`/`'24 hours'` have. See `crate::jsonb`'s
+    // module doc for the full live evidence and `trellis/tests/
+    // defs_jsonb.rs`. The unlock is #110's typed key index, exactly as it
+    // is for `numeric`/`real`/`double precision`/`timestamptz` above —
+    // `jsonb` needs no jsonb-specific mechanism, just the same one every
+    // other numeric-bearing family here is waiting on.
 ];
 
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,

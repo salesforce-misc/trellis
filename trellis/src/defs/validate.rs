@@ -1229,6 +1229,21 @@ fn reject_unsupported_group_by_key_type(
         // escape hatch to reach for. `trellis/tests/defs_bit.rs` pins both
         // halves of this split live.
         ValueType::Other(PgType::VarBit) => Ok(()),
+        // Issue #115: `jsonb` falls through to the reject arm below like
+        // every other unlisted `Other` family, and — unlike `bit`/`oid`/
+        // `bytea` — this is *not* a rendering-vs-key-order gap that turned
+        // out to be already closed. `jsonb_out` genuinely does
+        // canonicalize object key order (verified live), but that is
+        // independent of a second, real hazard: an embedded JSON number
+        // preserves its literal input scale (`numeric`'s own rendering),
+        // so `'{"a":1}'::jsonb` and `'{"a":1.0}'::jsonb` are `=` but
+        // `::text`-distinct — the same equivalence-class defect `real`/
+        // `double precision`'s `-0`/`0` and `interval`'s `'1 day'`/
+        // `'24 hours'` have, discovered one type deeper. See
+        // `crate::jsonb`'s module doc for the full live evidence. The
+        // unlock is #110's typed key index, same as `numeric`/`real`/
+        // `double precision`/`timestamptz` above — not a jsonb-specific
+        // mechanism.
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -1968,6 +1983,12 @@ mod tests {
             PgType::Interval,
             PgType::TimestampTz,
             PgType::Json,
+            // Issue #115: `jsonb` genuinely has canonical, sorted key
+            // order (unlike `interval`/`timestamptz`'s outright rendering
+            // hazards), but an embedded number's scale is not
+            // renormalized — see `crate::jsonb`'s module doc and
+            // `reject_unsupported_group_by_key_type`'s own `Jsonb` note.
+            PgType::Jsonb,
             PgType::Bit,
         ] {
             let d = aggregate_def(

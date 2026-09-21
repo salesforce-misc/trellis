@@ -123,6 +123,13 @@ pub mod temporal;
 pub(crate) mod netaddr;
 #[cfg(feature = "internals")]
 pub mod netaddr;
+// `jsonb` (issue #115) sits here for the same reason `temporal`/`netaddr`
+// do: its public signatures name `defs::pg_type::PgType`, itself
+// crate-private above.
+#[cfg(not(feature = "internals"))]
+pub(crate) mod jsonb;
+#[cfg(feature = "internals")]
+pub mod jsonb;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod dev;

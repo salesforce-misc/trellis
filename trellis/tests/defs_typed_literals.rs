@@ -48,9 +48,10 @@ use trellis::staging::apply;
 // The families that exercise this shared mechanism, each with a canonical
 // literal and the Postgres text it must round-trip to. `date` and
 // `timestamp` are the temporal cases (#113) issue #109 itself proved the
-// mechanism against, `bytea` the binary one (#114), and `bit varying` the
-// bit-string one (#118, added once #109's mechanism already existed);
-// `jsonb` and fixed-length `bit` are deliberately absent — see
+// mechanism against, `bytea` the binary one (#114), `bit varying` the
+// bit-string one (#118), and `jsonb` (#115) the first case whose canonical
+// form needs a real recursive checker rather than a fixed-shape one;
+// fixed-length `bit` is deliberately absent — see
 // `defs::typed_literal::TYPED_LITERALS`.
 // ---------------------------------------------------------------------
 
@@ -69,6 +70,15 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     // its bare default typmod is `bit(1)`, a truncation trap `bit varying`'s
     // unconstrained default doesn't have).
     ("v", "VARBIT", "101", "bit varying"),
+    // Issue #115: exercises a nested object/array, sorted keys and a
+    // decimal-scale-preserving number all in one literal — see
+    // `crate::jsonb::canonical_jsonb`.
+    (
+        "j",
+        "JSONB",
+        "{\"a\": 1.50, \"c\": [1, 2], \"bb\": null}",
+        "jsonb",
+    ),
 ];
 
 /// `SELECT id AS id, DATE '...' AS d, TIMESTAMP '...' AS ts, BYTEA '...' AS b`,
@@ -212,6 +222,7 @@ fn the_typed_literal_and_cast_spellings_parse_to_one_ast() {
             PgType::Timestamp,
             PgType::Bytea,
             PgType::VarBit,
+            PgType::Jsonb,
         ]
         .map(ValueType::Other),
     ) {
@@ -271,6 +282,11 @@ fn non_canonical_literals_are_rejected_by_the_validator() {
         "BYTEA '\\xAB'",
         "BYTEA '\\x0'",
         "CAST('today' AS date)",
+        // Issue #115: exponent notation (`jsonb_out` never emits one) and
+        // missing canonical whitespace (`jsonb_out` always separates with
+        // `": "`, never a bare `":"`) are both non-canonical.
+        "JSONB '1e2'",
+        "JSONB '{\"a\":1}'",
     ] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {bad} AS x"))
             .unwrap_or_else(|e| panic!("{bad} should parse (it's a validate-time error): {e}"));
@@ -285,14 +301,17 @@ fn non_canonical_literals_are_rejected_by_the_validator() {
 
 /// A type outside the allowlist is rejected by name, so the message can say
 /// *which* families are spellable rather than reporting a generic parse
-/// failure. `jsonb` and `timestamptz` are the interesting ones: both are
-/// real Postgres types the OID registry already knows, held back for the
-/// reasons `defs::typed_literal::TYPED_LITERALS` documents.
+/// failure. `timestamptz` is the interesting one: a real Postgres type the
+/// OID registry already knows, held back for the reasons
+/// `defs::typed_literal::TYPED_LITERALS` documents. `jsonb` used to be a
+/// case here too, before issue #115 gave it a canonical-form checker
+/// (`crate::jsonb::canonical_jsonb`) and moved it into the allowlist — its
+/// coverage now lives in `CASES` above (every `CASES`-driven test in this
+/// file) and in `non_canonical_literals_are_rejected_by_the_validator`'s
+/// `JSONB` cases.
 #[test]
 fn types_outside_the_allowlist_are_rejected_at_parse_time() {
     for bad in [
-        "JSONB '{\"a\": 1}'",
-        "CAST('{\"a\": 1}' AS jsonb)",
         "CAST('2024-01-01 00:00:00+00' AS timestamptz)",
         "CAST('1 day' AS interval)",
         "CAST('1' AS money)",

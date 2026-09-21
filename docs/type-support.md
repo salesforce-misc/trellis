@@ -108,7 +108,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113/#248 — bijective under `::text`, and `to_jsonb` (the live-row reads) now renders it the same way (#248 replaced `to_jsonb(t.*)` with an explicit per-column `jsonb_build_object`) |
 | `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | #248 fixed the `to_jsonb` split, but a *second*, independent defect remains: a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246, still open) |
 | `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
-| `jsonb` | ✅ | 🎯 | ⚠️ typed index | ⚠️ | 🎯 needs a canonicalizer | ⚠️ `jsonb_agg` STABLE in PG | `json` excluded (no `=`); `jsonb_out` re-sorts keys, so a literal needs #115's value model |
+| `jsonb` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#115) | ✅ `jsonb_agg` (recompute-only, `jsonb` argument only) | `json` excluded (no `=`); key order canonicalizes but embedded-number scale doesn't — #110's typed key index is the unlock, like `numeric`/`real`/`timestamptz` |
 | `inet` | ✅ | 🎯 | ✅ `GROUP BY` only; ❌ relationship/PK | ❌ | ✅ | ✅ MIN/MAX (own type) | second `::text` renderer (`network_show`) disagrees with `inet_out` on bare host addresses — the `boolean` shape (#116) |
 | `cidr` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ MIN/MAX | `cidr_out`/`::text` never diverge, unlike `inet`; `min`/`max(cidr)` only reachable via Postgres's own implicit upcast to `inet`, which would change the result's type (#116) |
 | `macaddr` `macaddr8` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ no such Postgres aggregate | no `pg_cast` `::text` override, unlike `inet`/`cidr`; `bytea`'s "opclass but no aggregate" finding repeats exactly (#116) |
@@ -157,8 +157,17 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   block it was that Trellis had a *second* internal renderer (`to_jsonb`, in
   the live-row reads) that spelled it differently; immutability was never
   the gate, renderer agreement was (#113, fixed by #248).
-* **`jsonb_agg`** — marked `STABLE` in Postgres; whether Trellis's own
-  deterministic reimplementation may treat it as immutable is an open question.
+* **`jsonb_agg`** — marked `STABLE` in Postgres, and #115 root-caused why:
+  not order-sensitivity (`array_agg`/`string_agg` are equally order-sensitive
+  and are `IMMUTABLE`), but that it is polymorphic and, for some argument
+  types (`timestamptz`, `money`), its row-to-`jsonb` conversion reads a
+  session GUC. Restricting `JSONB_AGG`'s argument to `jsonb` itself (this
+  crate's own grammar, narrower than Postgres's polymorphic one) excludes
+  that hazard outright — see "jsonb semantics (#115)" below.
+* **`jsonb`** — `jsonb_in`/`jsonb_out` are genuinely `IMMUTABLE`, and unlike
+  `boolean`/`inet` there is no second `pg_cast` renderer. The residual
+  hazard is structural, not a volatility one: see "jsonb semantics (#115)"
+  below.
 * **`xml`/`tsvector`/`tsquery`** — no useful immutable equality/ordering; niche.
 
 ## Cross-cutting concerns
@@ -801,8 +810,112 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     widening from one family to the other — see above). Cross-checked
     against a live server in `trellis/tests/defs_bit.rs` and
     `trellis/tests/defs_typed_literals.rs`.
-* **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
-  `string_agg`, `jsonb_agg`) need an incremental-delta design or a
-  group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.
+* **jsonb semantics (#115)** — the epic's own scope note framed this issue
+  around one open question ("`jsonb_agg` is `STABLE` — may Trellis treat it
+  as immutable?") and one excluded sibling (`json`, no `=`). Asked of a live
+  server, per #111–#119's playbook, the real shape has three independent
+  parts, only one of which the scope note anticipated:
+
+  * **`pg_cast`, checked rather than assumed: `jsonb` has no second
+    renderer.** `select castfunc from pg_cast where castsource =
+    'jsonb'::regtype and casttarget = 'text'::regtype` returns no rows —
+    `::text` is `jsonb_out` directly, unlike `boolean`/`inet`. `jsonb_in`/
+    `jsonb_out` are both `IMMUTABLE` (`pg_proc.provolatile`).
+  * **Key order is genuinely canonicalized, but that is a different fact
+    from text-stability, and the gap between them is a fresh hazard
+    shape.** `jsonb_out` sorts object keys by `(byte length, then bytes)`
+    and collapses duplicates, so two spellings of one key *set* always
+    converge under `::text` (verified live, including a non-ASCII key:
+    `"e"` sorts before `"é"` — 1 UTF-8 byte against 2). That looked, at
+    first, like it might be the whole story — until checking whether an
+    embedded *number*'s rendering is equally canonicalized. It is not:
+    `'{"a": 1}'::jsonb = '{"a": 1.0}'::jsonb` is `true` (verified live) but
+    the two render as `{"a": 1}` and `{"a": 1.0}` — one value, two
+    renderings, structurally the same equivalence-class defect `real`/
+    `double precision`'s `-0`/`0` and `interval`'s `'1 day'`/`'24 hours'`
+    have, just discovered one type deeper (`jsonb` stores a number through
+    `numeric`'s own scale-preserving representation). This is why `jsonb`
+    is **not** added to `catalog::TEXT_STABLE_JOIN_KEY_TYPES` or admitted
+    by `validate::reject_unsupported_group_by_key_type` despite clearing
+    the `pg_cast`/key-order bars every earlier family's admission turned
+    on — the unlock is #110's typed key index, the same one `numeric`/
+    `real`/`double precision`/`timestamptz` are already waiting on, not a
+    new mechanism. `crate::jsonb`'s module doc and `trellis/tests/
+    defs_jsonb.rs`'s `key_order_is_canonicalized_but_embedded_number_scale_is_not`
+    pin both halves live.
+  * **The typed-literal ("computed 1-1 target") role lands, and needed only
+    a checker, not the `jsonb_in`/`jsonb_out` reimplementation an earlier
+    draft of this doc predicted.** `crate::jsonb::canonical_jsonb` is a
+    small recursive-descent validator that rejects a non-canonical spelling
+    outright (exponent notation, an out-of-order/duplicate object key, a
+    non-canonical string escape like `\/` or `é` for a literal
+    non-ASCII character) rather than normalizing it — the same "reject
+    rather than guess" posture every other checker in `defs::typed_literal`
+    takes, and one that sidesteps ever having to reproduce `numeric`'s
+    scale-tracking arithmetic. `trellis/tests/defs_typed_literals.rs`'s
+    shared `CASES` table carries a `JSONB` row exercising a nested
+    object/array, sorted keys and a decimal-scale-preserving number in one
+    literal.
+  * **`jsonb_agg`'s `STABLE` marking is root-caused, and the root cause is
+    not order-sensitivity.** `select proname, provolatile from pg_proc
+    where proname in ('array_agg', 'string_agg', 'jsonb_agg')` shows
+    `array_agg`/`string_agg` as `IMMUTABLE` and only `jsonb_agg` as
+    `STABLE` — despite all three being equally order-sensitive without an
+    internal `ORDER BY`, so Postgres itself does not consider that grounds
+    for `STABLE`. The real reason, verified live: `jsonb_agg` is
+    polymorphic (`anyelement`) and its row-to-`jsonb` conversion is the
+    same machinery `to_jsonb()` uses, which for *some* argument types reads
+    a session GUC — `jsonb_agg(timestamptz_col)` changes under `TimeZone`,
+    `jsonb_agg(money_col)` changes under `lc_monetary`. Postgres cannot
+    declare a polymorphic function's volatility per instantiation, so the
+    whole function is marked `STABLE` to cover those argument types. This
+    is `defs::typed_literal`'s own `date_in`/`timestamp_in` precedent
+    exactly: `STABLE` because of a *specific, excludable* hazard, not
+    genuine non-determinism in every call. **`JSONB_AGG`'s argument is
+    restricted to `jsonb` itself** (narrower than Postgres's own
+    polymorphic grammar) — converting an already-`jsonb` value is the
+    identity, with no GUC read at all (verified live: `jsonb_agg` over a
+    `jsonb` column is unaffected by `TimeZone`), so the hazardous
+    instantiations are never reached. What is left is the ordinary
+    ordering concern every order-sensitive aggregate has: without an
+    `ORDER BY` inside the aggregate call (a grammar extension this issue
+    does not add), two recomputes of one group are not *guaranteed* to
+    agree on element order, though the *set* of elements is always
+    correct — a materially different, non-corrupting kind of hazard from
+    `MIN`/`MAX(interval)`'s scan-order divergence. `JSONB_AGG` is
+    `Invertibility::RecomputeOnly`, the same resting place `array_agg`/
+    `string_agg` are tracked toward by #120; this issue does not attempt
+    that broader design, only wires `JSONB_AGG` onto the `RecomputeOnly`
+    fallback every other non-invertible aggregate already gets for free.
+  * **`jsonb_agg` is the one aggregate in the whole registry whose
+    transition function is not `STRICT`.** Every other aggregate here
+    skips a `NULL` row and folds an all-`NULL`/empty group to `NULL`.
+    `jsonb_agg` instead folds a `NULL` row in as a JSON `null` *element*
+    (`jsonb_agg(v) = '["a", null, "b"]'` over rows `{'"a"', NULL, '"b"'}`,
+    verified live) — only a genuinely *empty* row set (zero rows, not
+    "every row `NULL`") folds to SQL `NULL`. `defs::eval`'s `JSONB_AGG`
+    fold path (`fold_jsonb_agg`) threads each row's `Option<Value>` through
+    as an element instead of filtering `None` out first, the one place in
+    the evaluator that does.
+  * **`MIN`/`MAX(jsonb)` — not attempted.** Out of this issue's explicit
+    scope (key, computed-target and `jsonb_agg` roles only); `crate::
+    jsonb`'s module doc notes the spot check that a `jsonb` btree opclass
+    exists, but a comparator reproducing `jsonb_cmp`'s type-then-structure
+    ordering byte-for-byte is real, deferred scope, the same size of
+    undertaking `crate::netaddr`/`crate::temporal`'s own `MIN`/`MAX` work
+    was.
+  * `jsonb` mints **no new `ValueType` variant** — `PgType::Jsonb` already
+    existed as a passthrough type since #108, and every role gained here is
+    a function of the family alone. Cross-checked against a live server in
+    `trellis/tests/defs_jsonb.rs` and `trellis/tests/defs_typed_literals.rs`.
+* **Aggregate maintenance** — `array_agg`/`string_agg` are `IMMUTABLE` in
+  Postgres (not `STABLE`, contrary to an earlier draft of this epic's
+  scope note — see "jsonb semantics (#115)" above) and still need an
+  incremental-delta design or a group-recompute fallback, plus an
+  `ORDER BY`-inside-aggregate grammar decision (#120). `jsonb_agg` over a
+  `jsonb` argument has landed (#115, recompute-only); `jsonb_agg` over any
+  other argument type remains unadmitted, since only the `jsonb`-argument
+  case has been shown to exclude the GUC-dependent hazard its `STABLE`
+  marking is really about.
 </content>
 </invoke>

@@ -151,17 +151,6 @@ pub struct TypedLiteralSpec {
 ///
 /// Families held back, and why:
 ///
-/// * **`jsonb`** (#115) — `jsonb_in`/`jsonb_out` are genuinely `IMMUTABLE`,
-///   so the volatility bar is met, but the *canonical form* bar is not
-///   reachable here. Postgres stores `jsonb` parsed, not as text, and
-///   `jsonb_out` re-renders it: object keys are re-sorted by length and then
-///   bytewise (`{"a":1,"bb":2,"c":3}` renders as `{"a": 1, "c": 3, "bb":
-///   2}`), duplicate keys collapse to the last, and numbers are renormalized
-///   (`1e3` renders as `1000`). Checking a literal is already in that form
-///   means implementing `jsonb_in` + `jsonb_out` in Rust — a real `jsonb`
-///   value model, which is #115's job and which it needs anyway for
-///   `jsonb_agg`. Adding `jsonb` here afterwards is one row in this table
-///   plus that canonicalizer.
 /// * **`timestamptz`** (#113) — value comparison is immutable but *text
 ///   rendering* is not: `timestamptz_out` formats in the session's `TimeZone`,
 ///   so the same stored instant reaches the evaluator as different text on
@@ -199,6 +188,18 @@ pub struct TypedLiteralSpec {
 ///   hazard recurring in the aggregate-target role, and
 ///   `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm for
 ///   the `GROUP BY` key role's version of it.
+///
+/// `jsonb` (issue #115) *is* in the allowlist below now, despite an earlier
+/// version of this doc comment predicting otherwise. `jsonb_in`/`jsonb_out`
+/// are `IMMUTABLE` (`pg_proc.provolatile`), clearing bar 1 as before. Bar 2
+/// (canonical form) turns out to need only a *checker*, not the
+/// `jsonb_in`/`jsonb_out` reimplementation the earlier prediction assumed:
+/// [`crate::jsonb::canonical_jsonb`] rejects a non-canonical spelling
+/// outright (exponent notation, an out-of-order/duplicate object key, a
+/// non-canonical string escape) rather than normalizing it, which sidesteps
+/// ever having to reproduce `numeric`'s scale-tracking arithmetic — see that
+/// module's doc comment for the full live evidence, including the
+/// `jsonb_agg`/key-role findings this same investigation produced.
 ///
 /// `inet`, `cidr`, `macaddr` and `macaddr8` (issue #116) *are* in the
 /// allowlist below now, each clearing both bars: `inet_in`/`cidr_in`/
@@ -333,6 +334,15 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "VARBIT",
         value_type: ValueType::Other(PgType::VarBit),
         canonical: canonical_varbit,
+    },
+    // Issue #115. `jsonb_in`/`jsonb_out` are `IMMUTABLE`, and
+    // [`crate::jsonb::canonical_jsonb`] is the canonical-form checker — see
+    // this module's "which families are in the allowlist" note and
+    // `crate::jsonb`'s own module doc for the live evidence.
+    TypedLiteralSpec {
+        keyword: "JSONB",
+        value_type: ValueType::Other(PgType::Jsonb),
+        canonical: crate::jsonb::canonical_jsonb,
     },
 ];
 
