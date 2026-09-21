@@ -491,7 +491,20 @@ pub struct IntakeConfig {
 }
 
 impl IntakeConfig {
+    /// Builds the transport config for the replication connection —
+    /// including, as of issue #246, the same output-GUC pins the pool
+    /// applies at [`crate::pool::session_bootstrap`]. Before
+    /// `pgwire-replication` 0.4.1 the walsender had no way to receive a
+    /// startup `options` parameter at all, so `DateStyle`/`bytea_output`/
+    /// `extra_float_digits`/`IntervalStyle` (and, now, `TimeZone`) could
+    /// silently render CDC-decoded text differently from the pool's on any
+    /// server whose GUCs had been customized away from stock defaults — see
+    /// [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]'s doc comment for the
+    /// full history. `with_options` sends exactly the same startup `options`
+    /// parameter `libpq`'s `options`/`PGOPTIONS` would on a normal
+    /// connection, which PostgreSQL honors on a replication connection too.
     fn replication_config(&self) -> pgwire_replication::ReplicationConfig {
+        let options = crate::pool::deterministic_text_output_options();
         if self.host.starts_with('/') {
             pgwire_replication::ReplicationConfig::unix(
                 self.host.clone(),
@@ -502,6 +515,7 @@ impl IntakeConfig {
                 self.slot.clone(),
                 self.publication.clone(),
             )
+            .with_options(options)
         } else {
             pgwire_replication::ReplicationConfig::new(
                 self.host.clone(),
@@ -512,6 +526,7 @@ impl IntakeConfig {
                 self.publication.clone(),
             )
             .with_port(self.port)
+            .with_options(options)
         }
     }
 }

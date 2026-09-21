@@ -173,48 +173,70 @@ impl Pool {
 /// `('2024-01-01'::date)::text` renders `01/01/2024`, and nothing is
 /// actually wrong.
 ///
-/// The four pinned here cover what issue #109's typed literals can produce
-/// (`date`/`timestamp` under `DateStyle`, `bytea` under `bytea_output`),
-/// what issue #112's float split added (`real`/`double precision` under
-/// `extra_float_digits`), and what issue #113's temporal families added
-/// (`interval` under `IntervalStyle`). **Every future type family in epic
-/// #123 hits this same wall and should extend this one constant** rather
-/// than pinning a GUC at its own call site. Keeping them in a single list
-/// is also what lets the non-pooled connect sites below stay in step with
-/// the pooled one — they each interpolate this same text.
+/// The first four pinned here cover what issue #109's typed literals can
+/// produce (`date`/`timestamp` under `DateStyle`, `bytea` under
+/// `bytea_output`), what issue #112's float split added (`real`/`double
+/// precision` under `extra_float_digits`), and what issue #113's temporal
+/// families added (`interval` under `IntervalStyle`). **Every future type
+/// family in epic #123 hits this same wall and should extend this one
+/// constant** rather than pinning a GUC at its own call site. Keeping them
+/// in a single list is also what lets the non-pooled connect sites below,
+/// and — since issue #246 — the walsender's own startup `options` (see
+/// [`deterministic_text_output_options`]), stay in step with the pooled
+/// connection: every one of them derives from or interpolates this same
+/// text, so a sixth GUC added here is automatically pinned everywhere else
+/// too, with nothing to remember to update in a second place.
 ///
-/// # `TimeZone` is deliberately *not* here (issue #113)
+/// # `TimeZone` joined this constant once the walsender could be pinned (issue #246)
 ///
 /// `timestamptz_out` renders in the session's `TimeZone`, so pinning it to
-/// `'UTC'` looks like the obvious way to give `timestamptz` the same
-/// text-stability `DateStyle` gave `date`/`timestamp`, and would unlock its
-/// key roles. Issue #113 investigated exactly that and declined it, for a
-/// reason that survives "but Trellis owns all its own connections":
+/// `'UTC'` is the obvious way to give `timestamptz` the same text-stability
+/// `DateStyle` gave `date`/`timestamp` — and issue #113 confirmed that
+/// alone would work (Trellis owns every connection it opens, so "blast
+/// radius on other sessions" was never the objection). It nonetheless
+/// declined the pin, for a reason that survives that argument:
 ///
-/// **Trellis renders `timestamptz` on two backends and only controls one.**
-/// The CDC half of a value's life is rendered by the type's output function
-/// running in the **walsender**, under the walsender's GUCs — verified live
-/// by peeking one slot from two sessions with different `timezone` settings
-/// and getting two different wall clocks for one instant, on a server whose
-/// own default was a third zone. `pgwire_replication::ReplicationConfig`
-/// (v0.4) offers no way to send startup runtime parameters or to `SET` on
-/// the replication connection, so the walsender keeps the
-/// server/database/role default no matter what this constant says.
+/// **Trellis renders `timestamptz` on two backends, and issue #113 could
+/// only control one.** The CDC half of a value's life is rendered by the
+/// type's output function running in the **walsender**, under the
+/// walsender's GUCs — verified live by peeking one slot from two sessions
+/// with different `timezone` settings and getting two different wall
+/// clocks for one instant, on a server whose own default was a third zone.
+/// `pgwire_replication::ReplicationConfig` v0.4 offered no way to send
+/// startup runtime parameters or to `SET` on the replication connection, so
+/// the walsender kept the server/database/role default no matter what this
+/// constant said, and pinning `'UTC'` here alone would have traded the two
+/// renderers' *accidental* agreement (both falling back to the same server
+/// default) for a *guaranteed* disagreement on every server whose default
+/// is not UTC — strictly worse than the status quo.
 ///
-/// Today the two renderers agree by accident — both fall back to that same
-/// server default. Pinning `'UTC'` here alone would trade that accidental
-/// symmetry for a *guaranteed* asymmetry on every server whose default is
-/// not UTC. That is strictly worse, so `timestamptz` keeps its `🎯 typed
-/// index` cells in `docs/type-support.md` and this constant stays at four.
+/// Issue #246 closed that gap: `pgwire-replication` 0.4.1 added
+/// `ReplicationConfig::with_options`, which sends the same startup
+/// `options` parameter `libpq`'s `options`/`PGOPTIONS` already send on a
+/// normal connection, and PostgreSQL honors it on a replication connection
+/// too. [`crate::intake::IntakeConfig::replication_config`] now passes
+/// [`deterministic_text_output_options`] — this same constant, reparsed
+/// into the `-c name=value` shape `options` expects — so the walsender pins
+/// every one of these GUCs exactly like the pool does, and `TimeZone` can
+/// finally join them without introducing the asymmetry #113 declined.
+/// [`crate::temporal::is_bijective_under_text`]/
+/// [`crate::temporal::is_render_consistent`] pick the story up from here —
+/// `timestamptz` is admitted to the key/`MIN`/`MAX` roles as of this issue.
 ///
-/// The same asymmetry is latent for the three that *are* pinned, and the
-/// reason it does not bite is worth stating because it is also the rule for
-/// adding a fifth: each pinned value is **output-identical to a stock
-/// server's default** (`ISO` output, `hex`, shortest-round-trip floats,
-/// `postgres` interval style), so the unpinned walsender agrees with the
-/// pinned pool unless an operator has deliberately reconfigured the server.
-/// `TimeZone` has no such stock value to pin to. Pin only GUCs that pass
-/// that test, until the replication transport can be pinned too.
+/// The same asymmetry was latent for the four pinned before `TimeZone`, and
+/// the reason it did not bite is worth restating because it *was* the rule
+/// for adding a fifth, back when only the pool could be pinned: each
+/// pinned value was **output-identical to a stock server's default** (`ISO`
+/// output, `hex`, shortest-round-trip floats, `postgres` interval style),
+/// so the unpinned walsender agreed with the pinned pool unless an operator
+/// had deliberately reconfigured the server — `TimeZone` was the one value
+/// here with no such stock default to lean on, which is exactly why it
+/// waited for the walsender to become pinnable too rather than joining
+/// under that older, weaker rule. Now that the walsender is genuinely
+/// pinned rather than merely agreeing by accident, that rule is retired:
+/// any future GUC extending this constant is pinned symmetrically on both
+/// backends by construction, and does not need to pass an
+/// output-identical-to-stock-defaults test first.
 ///
 /// `extra_float_digits` deserves a word, because `1` is already Postgres
 /// 12+'s default and pinning a default can look like a no-op. It isn't: the
@@ -239,8 +261,71 @@ impl Pool {
 /// `crate::temporal::Interval::render` reproduces the `postgres` spelling
 /// specifically, which is both Postgres's default and what an interval
 /// `SUM` has to write back.
+///
+/// `TimeZone` joined the other four for issue #246, once the walsender
+/// could be pinned too (see the "`TimeZone` joined this constant" section
+/// above) — `timestamptz_out` renders in `'UTC'` on every connection
+/// Trellis opens, pool and walsender alike, making it a bijection on the
+/// instant exactly the way `DateStyle` makes `date_out` a bijection on the
+/// day number.
+///
+/// [`deterministic_text_output_options`] parses this string back into the
+/// `-c name=value` shape `pgwire_replication::ReplicationConfig::with_options`
+/// expects, so both forms come from one source of truth — see that
+/// function's own doc comment for why it parses rather than hand-duplicating
+/// a second `-c`-shaped list here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
-     set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'";
+     set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
+     set timezone to 'UTC'";
+
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], reparsed into the Postgres startup
+/// `options` parameter's `-c name=value -c name2=value2 ...` shape —
+/// exactly what `libpq`'s own `options` connection parameter (or
+/// `PGOPTIONS`) sends, and what PostgreSQL honors on a **replication**
+/// connection too, not just a normal one.
+///
+/// This exists so [`crate::intake::IntakeConfig::replication_config`] can
+/// pin the walsender to the same GUCs [`session_bootstrap`] pins the pool
+/// to, **without hand-duplicating the GUC list into a second hardcoded
+/// place** — issue #246 is precisely the bug that a second, independently
+/// maintained list invites: add a GUC to one, forget the other, and the
+/// pool/walsender renderings silently diverge again. Parsing
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]'s own `set X to 'Y'; ...` text instead
+/// means a GUC added to that constant is automatically pinned on the
+/// walsender the next time this function runs — there is no second list to
+/// forget.
+///
+/// Each `set <guc> to <value>;` clause becomes one `-c <guc>=<value>` token.
+/// Postgres's own `options` parser (`pg_split_opts`) splits on whitespace
+/// and treats a backslash as an escape for the following character, so any
+/// space *within* a value (`'ISO, YMD'`'s) is backslash-escaped rather than
+/// passed through raw — a bare space there would otherwise be read as a
+/// second, malformed `-c` token instead of part of this one's value.
+/// [`with_options_matches_a_hand_written_expectation`] pins the exact
+/// output for the constant as it stands today, so a future edit to
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] that doesn't parse the way this
+/// function expects fails loudly in CI instead of silently shipping a
+/// walsender that pins something other than what it meant to.
+pub(crate) fn deterministic_text_output_options() -> String {
+    DETERMINISTIC_TEXT_OUTPUT_GUCS
+        .split(';')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(|clause| {
+            let rest = clause.strip_prefix("set ").unwrap_or_else(|| {
+                panic!(
+                    "DETERMINISTIC_TEXT_OUTPUT_GUCS clause {clause:?} does not start with \"set \""
+                )
+            });
+            let (name, value) = rest.split_once(" to ").unwrap_or_else(|| {
+                panic!("DETERMINISTIC_TEXT_OUTPUT_GUCS clause {clause:?} has no \" to \"")
+            });
+            let value = value.trim().trim_matches('\'');
+            format!("-c {name}={}", value.replace(' ', "\\ "))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller.
@@ -309,6 +394,42 @@ mod tests {
     fn quote_literal_escapes_embedded_quotes() {
         assert_eq!(quote_literal("created_at"), "'created_at'");
         assert_eq!(quote_literal("weird'column"), "'weird''column'");
+    }
+
+    /// Pins the exact `-c ...` string [`deterministic_text_output_options`]
+    /// produces from today's [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] — a change to
+    /// either one that the parser doesn't expect (a new clause shape, a
+    /// value containing a character the space-escaping doesn't handle) fails
+    /// this test loudly instead of shipping a walsender silently pinned to
+    /// something other than what [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] says.
+    #[test]
+    fn with_options_matches_a_hand_written_expectation() {
+        assert_eq!(
+            deterministic_text_output_options(),
+            "-c datestyle=ISO,\\ YMD -c bytea_output=hex -c extra_float_digits=1 \
+             -c intervalstyle=postgres -c timezone=UTC"
+        );
+    }
+
+    /// The two representations can never silently drift apart: this walks
+    /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]'s own clause count and asserts
+    /// [`deterministic_text_output_options`] produced exactly one `-c` token
+    /// per clause — a change that adds a sixth GUC to the SQL string but
+    /// breaks the parser (rather than merely producing the wrong value,
+    /// which the test above would already catch) still fails here.
+    #[test]
+    fn every_pinned_guc_produces_exactly_one_option_token() {
+        let clause_count = DETERMINISTIC_TEXT_OUTPUT_GUCS
+            .split(';')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .count();
+        let token_count = deterministic_text_output_options().split(" -c ").count();
+        assert_eq!(clause_count, token_count);
+        assert_eq!(
+            clause_count, 5,
+            "expected five pinned GUCs as of issue #246"
+        );
     }
 
     #[test]

@@ -734,6 +734,11 @@ async fn a_composite_primary_key_source_is_rejected_at_create_time_not_quarantin
 /// *absence* of the old halt, mirroring
 /// `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`
 /// immediately above.
+///
+/// `numeric` is the unsafe type here — `timestamptz` used to be this test's
+/// example, but issue #246 (pinning `TimeZone` on the walsender the same way
+/// `DateStyle` was already pinned on the pool) made it a text-stable primary
+/// key type, so it no longer demonstrates this rejection.
 #[tokio::test]
 async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_quarantined_or_halted()
  {
@@ -742,9 +747,9 @@ async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_q
     let client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute("create table events (occurred_at timestamptz primary key, payload text)")
+        .batch_execute("create table events (occurred_at numeric primary key, payload text)")
         .await
-        .expect("create source table with a timestamptz primary key");
+        .expect("create source table with a numeric primary key");
 
     let before = trellis::staging::halting_stop_stats(&db.pool)
         .await

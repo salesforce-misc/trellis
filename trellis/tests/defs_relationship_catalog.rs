@@ -459,11 +459,16 @@ async fn a_character_n_join_key_is_rejected() {
     assert!(missing.is_none());
 }
 
-/// Companion to `a_character_n_join_key_is_rejected`: `timestamptz` renders to
-/// a session-`TimeZone`-dependent `::text`, so it is not a text-stable join
-/// key and is rejected.
+/// `timestamptz` used to be this test's rejection example, a companion to
+/// `a_character_n_join_key_is_rejected`: `timestamptz_out` renders under the
+/// session's `TimeZone`, and until issue #246 pinned `TimeZone` identically
+/// on every connection Trellis opens (including the walsender) its `::text`
+/// was not text-stable. It is a text-stable join key now
+/// (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), so this asserts the opposite —
+/// acceptance, mirroring `compatible_integer_widths_are_accepted`'s setup
+/// (a real primary key plus `REPLICA IDENTITY FULL` on both sides).
 #[tokio::test]
-async fn a_timestamptz_join_key_is_rejected() {
+async fn a_timestamptz_join_key_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_table_with_typed_column(
@@ -473,24 +478,28 @@ async fn a_timestamptz_join_key_is_rejected() {
         "timestamp with time zone",
     )
     .await;
-    create_table_with_typed_column(&db.pool, "products", "id", "timestamp with time zone").await;
+    set_replica_identity_full(&db.pool, "order_line_items").await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table products (id timestamptz primary key); \
+             alter table products replica identity full",
+        )
+        .await
+        .expect("create products with a timestamptz pk");
+    drop(client);
 
-    let err = create_relationship(
+    create_relationship(
         &db.pool,
         "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
     )
     .await
-    .unwrap_err();
+    .expect("timestamptz is a text-stable join key as of issue #246");
 
-    assert!(matches!(
-        &err,
-        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType { .. })
-    ));
-
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let found = relationship_by_name(&db.pool, "order_line_items", "product")
         .await
         .expect("read query");
-    assert!(missing.is_none());
+    assert!(found.is_some());
 }
 
 /// Issue #41: a to-many relationship whose to-side has only the default (PK)

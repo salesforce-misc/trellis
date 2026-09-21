@@ -138,14 +138,16 @@ pub enum ValidationError {
     /// matched by its `::text` rendering exactly like those are, so the same
     /// hazards apply and then some: `interval`'s native `=` holds
     /// `'1 day' = '24 hours'` while their renderings differ (two groups
-    /// where Postgres's own `GROUP BY` has one), `timestamptz` renders under
-    /// the session's `TimeZone`, `money` under `lc_monetary`, and `json`
-    /// has no `=` at all, so its key column can't even take the unique index
-    /// the aggregate target needs. `bytea` (issue #114) used to be another
-    /// name on this list; it turned out not to belong there — `byteaout`
-    /// under the pinned `bytea_output = 'hex'` is a bijection with no
-    /// session-GUC dependence at all, so it is admitted below alongside
-    /// `oid` rather than refused here.
+    /// where Postgres's own `GROUP BY` has one), `money` renders under
+    /// `lc_monetary`, and `json` has no `=` at all, so its key column can't
+    /// even take the unique index the aggregate target needs. `bytea`
+    /// (issue #114) used to be another name on this list; it turned out not
+    /// to belong there — `byteaout` under the pinned `bytea_output = 'hex'`
+    /// is a bijection with no session-GUC dependence at all, so it is
+    /// admitted below alongside `oid`, and `timestamptz` (issue #246) is a
+    /// second former name here now admitted the same way, once `TimeZone`
+    /// was pinned identically on every connection Trellis opens rather than
+    /// varying by session.
     ///
     /// Nothing could reach this before #108 — an `Other`-typed column was
     /// dropped from the validator's view entirely — so this gate only
@@ -276,10 +278,10 @@ pub enum ValidationError {
     /// staging reverse-lookup, and oracle all join by raw `::text` equality,
     /// but the oracle SELECT joins by native `=`, so a non-text-stable key
     /// (`numeric`/`real`/`double precision` — `1.0` vs `1.00`; `character(n)`
-    /// — blank-padding; `citext` — case; `timestamptz` — session TimeZone)
-    /// would render a real LEFT JOIN match as a false-miss NULL in the
-    /// engine. Rejected at definition time rather than silently diverging
-    /// from the Postgres oracle.
+    /// — blank-padding; `citext` — case; `interval` — `'1 day'` vs
+    /// `'24 hours'`) would render a real LEFT JOIN match as a false-miss NULL
+    /// in the engine. Rejected at definition time rather than silently
+    /// diverging from the Postgres oracle.
     RelationshipUnsupportedJoinKeyType {
         name: String,
         table: String,
@@ -1158,10 +1160,9 @@ fn reject_unsupported_group_by_key_type(
         }),
         // `oid` is one `Other` family admitted as a key (issue #111):
         // Postgres renders it as canonical unsigned decimal, so it is
-        // text-stable in exactly the way `interval`/`timestamptz`
-        // are not. It stays an `Other` rather than joining
-        // `ValueType::Integer` because Postgres gives it no arithmetic at
-        // all — see `pg_type::PgType::Oid`.
+        // text-stable in exactly the way `interval` is not. It stays an
+        // `Other` rather than joining `ValueType::Integer` because Postgres
+        // gives it no arithmetic at all — see `pg_type::PgType::Oid`.
         ValueType::Other(PgType::Oid) => Ok(()),
         // `bytea` is the other (issue #114), on the same "text-stability is
         // a property of the rendering, not the operator set" reasoning:
@@ -1173,26 +1174,25 @@ fn reject_unsupported_group_by_key_type(
         // subset — so it is a plain admit rather than a call into a sibling
         // module.
         ValueType::Other(PgType::Bytea) => Ok(()),
-        // Issue #113: `date`, `timestamp`, `time` and `timetz` join `oid`
-        // on the same grounds, gated by `crate::temporal`'s own per-family
-        // verdict rather than by a list repeated here — see that module's
-        // doc comment for the live evidence, and
-        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES` for the relationship/PK
-        // half of the same decision. `timestamp` joined this arm for real
-        // once issue #248 fixed its render-consistency defect (it used to
-        // fall through to the reject arm below despite being named here,
-        // exactly like `timestamptz` still does).
+        // Issue #113: `date`, `timestamp`, `time`, `timetz` and (issue #246)
+        // `timestamptz` join `oid` on the same grounds, gated by
+        // `crate::temporal`'s own per-family verdict rather than by a list
+        // repeated here — see that module's doc comment for the live
+        // evidence, and `catalog::TEXT_STABLE_JOIN_KEY_TYPES` for the
+        // relationship/PK half of the same decision. `timestamp` joined this
+        // arm for real once issue #248 fixed its render-consistency defect
+        // (it used to fall through to the reject arm below despite being
+        // named here); `timestamptz` needed both #248's fix *and* #246's —
+        // its rendering is `TimeZone`-dependent, and half of it used to be
+        // produced by a walsender Trellis could not pin
+        // (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`) until issue #246
+        // wired `pgwire_replication::ReplicationConfig::with_options`.
         //
-        // The two temporal families this still rejects are rejected for
-        // genuinely different reasons, which is why `is_text_stable` is
-        // per-family and not "temporal or not": `timestamptz`'s rendering
-        // is `TimeZone`-dependent and half of it is produced by a walsender
-        // Trellis cannot pin (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`,
-        // issue #246, still open and independent of #248), while `interval`
-        // has no canonical rendering at all — `'24 hours'` and `'1 day'` are
-        // `=` and render differently, so a text-matched `GROUP BY` would
-        // split one Postgres group in two, exactly as a float `-0`/`0` key
-        // would.
+        // `interval` is the one temporal family still rejected here, for a
+        // reason no GUC or renderer reconciliation touches: it has no
+        // canonical rendering at all — `'24 hours'` and `'1 day'` are `=`
+        // and render differently, so a text-matched `GROUP BY` would split
+        // one Postgres group in two, exactly as a float `-0`/`0` key would.
         ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
         // Issue #116: `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
         // each is on `catalog::TEXT_STABLE_JOIN_KEY_TYPES` (see that
@@ -2065,10 +2065,12 @@ mod tests {
         // Issue #118: `PgType::Bit` (fixed-length) is deliberately in this
         // refusal list even though `PgType::VarBit` right next to it is
         // admitted — see this function's own `VarBit` arm for the DDL-only
-        // reason (not a text-rendering one) the two split.
+        // reason (not a text-rendering one) the two split. `PgType::TimestampTz`
+        // used to be here too, until issue #246 pinned `TimeZone` on the
+        // walsender the way `DateStyle` was already pinned on the pool —
+        // see `defs_temporal.rs`'s live coverage for its new admitted status.
         for pg_type in [
             PgType::Interval,
-            PgType::TimestampTz,
             PgType::Json,
             // Issue #115: `jsonb` genuinely has canonical, sorted key
             // order (unlike `interval`/`timestamptz`'s outright rendering

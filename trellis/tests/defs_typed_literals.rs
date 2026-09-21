@@ -582,10 +582,12 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
 /// ones the engine opens itself — and then asserts the engine still reads
 /// canonical text. It fails without `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`.
 ///
-/// Every future type family in epic #123 hits the same wall (`timestamptz`
-/// under `TimeZone`, `interval` under `IntervalStyle`, floats under
-/// `extra_float_digits`); extending that one constant and this one test's
-/// hostile-GUC list is the intended way to cover them.
+/// Every type family in epic #123 hits the same wall — `interval` under
+/// `IntervalStyle`, floats under `extra_float_digits`, and (issue #246)
+/// `timestamptz` under `TimeZone`, all now pinned in
+/// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` — and a future family will hit it
+/// too; extending that one constant and this one test's hostile-GUC list is
+/// the intended way to cover them.
 #[tokio::test]
 async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_reads() {
     let cluster = TestCluster::start();

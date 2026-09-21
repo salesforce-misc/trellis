@@ -41,11 +41,14 @@
 //! be [text-stable](super::catalog::is_text_stable_join_key_type) — the same
 //! allowlist a relationship join key is held to (issue #28) — since every
 //! consumer of this key compares it via `::text` casts just like a join key;
-//! an unsafe type (e.g. `numeric`, `timestamptz`, `interval`) is rejected at
+//! an unsafe type (e.g. `numeric`, `interval`) is rejected at
 //! definition time rather than risking a silent missed/duplicated target row
-//! later (issue #107). `bytea` used to be another example here; issue #114
-//! found its `::text` rendering is in fact a bijection once `bytea_output`
-//! is pinned, so it is on the allowlist now rather than off it.
+//! later (issue #107). `bytea` and `timestamptz` used to be other examples
+//! here; issue #114 found `bytea`'s `::text` rendering is in fact a
+//! bijection once `bytea_output` is pinned, and issue #246 pinned
+//! `timestamptz`'s `TimeZone` on the walsender the same way `DateStyle` was
+//! already pinned on the pool, so both are on the allowlist now rather than
+//! off it.
 //!
 //! Every calculated field is typed per its inferred
 //! [`super::ast::ValueType`] (issue #63 widened this from a blanket
@@ -198,12 +201,11 @@ pub enum DdlError {
     /// (`staging::apply`, `staging::backfill`) compares this primary key via
     /// `::text` casts, exactly like a relationship join key — so a
     /// non-text-stable type (`numeric`/`real`/`double precision`: `1.0` vs
-    /// `1.00`; `timestamp`/`timestamptz`/`date`/`time`: session-TimeZone- or
-    /// style-dependent rendering; `bytea`: `bytea_output`-dependent
-    /// rendering; `boolean`, `json`/`jsonb`; or any unknown type) would let
-    /// logically-identical keys rendered two different ways silently fail to
-    /// match, missing or duplicating target rows with no error. Rejected at
-    /// definition time instead, mirroring
+    /// `1.00`; `interval`: `'1 day'` vs `'24 hours'`; `boolean`,
+    /// `json`/`jsonb`; or any unknown type) would let logically-identical
+    /// keys rendered two different ways silently fail to match, missing or
+    /// duplicating target rows with no error. Rejected at definition time
+    /// instead, mirroring
     /// [`ValidationError::RelationshipUnsupportedJoinKeyType`]'s treatment of
     /// the same class of type for relationship join keys.
     UnsupportedPrimaryKeyType {

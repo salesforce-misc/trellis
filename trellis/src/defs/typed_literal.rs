@@ -151,16 +151,33 @@ pub struct TypedLiteralSpec {
 ///
 /// Families held back, and why:
 ///
-/// * **`timestamptz`** (#113) — value comparison is immutable but *text
-///   rendering* is not: `timestamptz_out` formats in the session's `TimeZone`,
-///   so the same stored instant reaches the evaluator as different text on
-///   two connections. Issue #113 investigated pinning `TimeZone` to `'UTC'`
-///   alongside `DateStyle` and declined it, because Trellis renders
-///   `timestamptz` on a second backend it cannot pin — the walsender — so
-///   the pin would guarantee a disagreement it currently only risks. See
-///   [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]. Until that changes
-///   (or #110's typed key index lands), a `timestamptz` constant has no
-///   spelling whose round-trip this module can promise.
+/// * **`jsonb`** (#115) — `jsonb_in`/`jsonb_out` are genuinely `IMMUTABLE`,
+///   so the volatility bar is met, but the *canonical form* bar is not
+///   reachable here. Postgres stores `jsonb` parsed, not as text, and
+///   `jsonb_out` re-renders it: object keys are re-sorted by length and then
+///   bytewise (`{"a":1,"bb":2,"c":3}` renders as `{"a": 1, "c": 3, "bb":
+///   2}`), duplicate keys collapse to the last, and numbers are renormalized
+///   (`1e3` renders as `1000`). Checking a literal is already in that form
+///   means implementing `jsonb_in` + `jsonb_out` in Rust — a real `jsonb`
+///   value model, which is #115's job and which it needs anyway for
+///   `jsonb_agg`. Adding `jsonb` here afterwards is one row in this table
+///   plus that canonicalizer.
+/// * **`timestamptz`** (#113, #246) — value comparison is immutable, and
+///   *text rendering* now is too: issue #246 pins `TimeZone = 'UTC'` on
+///   every connection Trellis opens, pool and walsender alike (see
+///   [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]), which is what let
+///   `timestamptz` join the join/`GROUP BY`/primary-key and `MIN`/`MAX`
+///   roles (`crate::temporal::is_bijective_under_text`/
+///   `is_render_consistent`). It is *not* in this table yet regardless: a
+///   typed literal here additionally needs its own canonical-form checker
+///   (this module's narrower "one spelling, checked without a live
+///   connection" bar — see `canonical_time`/`canonical_timetz` for what
+///   that looks like for a sibling family), which #246 did not write. Adding
+///   one is a natural follow-up, not a reopened investigation — `timetz`'s
+///   playbook (require a fully-numeric offset, canonicalize the way
+///   `timestamptz_out` does under the now-pinned `TimeZone`) is the
+///   template — but it is new code this module doesn't have today, so it
+///   stays out of #246's scope.
 /// * **`interval`** (#113) — the one temporal family that stays out, and
 ///   for an *input*-side reason the other five don't have: `interval_in`
 ///   reads `IntervalStyle`, so the same literal text parses to different

@@ -8,8 +8,8 @@ use trellis::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::defs::{
-    DdlError, PgType, create_aggregate_target_table, create_target_table, require_single_column_pk,
-    source_primary_key,
+    DdlError, PgType, PrimaryKeyColumn, create_aggregate_target_table, create_target_table,
+    require_single_column_pk, source_primary_key,
 };
 
 fn order_totals_def() -> TransformDef {
@@ -1152,11 +1152,20 @@ async fn require_single_column_pk_rejects_a_composite_primary_key() {
 /// type must be rejected exactly like a relationship join key of the same
 /// type already is (`assert_join_key_type_supported`) — 1-1 apply/backfill
 /// compare the primary key via `::text` casts throughout, so e.g. a
-/// `timestamptz` PK's `::text` rendering is session-`TimeZone`-dependent and
-/// could silently fail to match a logically identical key rendered under a
-/// different `TimeZone`, missing or duplicating target rows with no error.
+/// `numeric` PK's `::text` rendering could disagree with another `::text`
+/// rendering of the numerically equal value, missing or duplicating target
+/// rows with no error.
+///
+/// `timestamptz` used to be this test's example — its `::text` rendering is
+/// session-`TimeZone`-dependent, and until issue #246 pinned `TimeZone`
+/// identically on every connection Trellis opens (including the walsender)
+/// that made it exactly as unsafe as `numeric`. It is a *safe* primary-key
+/// type now (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
+/// [`a_source_table_with_a_timestamptz_primary_key_is_accepted`] below
+/// proves — `numeric` (this test) takes over as the "still genuinely
+/// unsafe" example.
 #[tokio::test]
-async fn a_source_table_with_a_timestamptz_primary_key_is_rejected() {
+async fn a_source_table_with_a_timestamptz_primary_key_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");
@@ -1166,24 +1175,24 @@ async fn a_source_table_with_a_timestamptz_primary_key_is_rejected() {
         .await
         .expect("seed source table with a timestamptz primary key");
 
-    let err = source_primary_key(&db.pool, "events").await.unwrap_err();
-    match err {
-        DdlError::UnsupportedPrimaryKeyType {
-            source_table,
-            column,
-            pg_type,
-        } => {
-            assert_eq!(source_table, "events");
-            assert_eq!(column, "occurred_at");
-            assert_eq!(pg_type, "timestamp with time zone");
-        }
-        other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
-    }
+    let pk = source_primary_key(&db.pool, "events")
+        .await
+        .expect("timestamptz is a text-stable primary key type as of issue #246");
+    assert_eq!(
+        pk,
+        vec![PrimaryKeyColumn {
+            name: "occurred_at".to_string(),
+            data_type: "timestamp with time zone".to_string(),
+            nullable: false,
+        }]
+    );
 }
 
 /// Issue #107, `numeric` variant: `1.0::text` != `1.00::text` even though the
-/// two values are numerically equal, so a `numeric` primary key is exactly as
-/// unsafe under `::text` comparison as a `timestamptz` one.
+/// two values are numerically equal, so a `numeric` primary key is unsafe
+/// under `::text` comparison, and no GUC pin (unlike `timestamptz`'s
+/// `TimeZone`, issue #246) fixes it — it is a structural defect of the
+/// rendering, not a session-configuration one.
 #[tokio::test]
 async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
     let cluster = TestCluster::start();

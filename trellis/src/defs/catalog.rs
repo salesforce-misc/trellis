@@ -2572,11 +2572,12 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// `crate::float::compare`, not a new encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
-/// `timestamptz` and `interval` (issue #113 admitted `timestamp` alongside
-/// `date`/`time`/`timetz` once issue #248 fixed its render-consistency
-/// defect; see the temporal block below for why `timestamptz` and `interval`
-/// stayed off, for two distinct remaining reasons), `boolean`,
-/// `json`/`jsonb`, or any unknown type — is rejected as a join key.
+/// `interval` (issue #113 admitted `timestamp` alongside `date`/`time`/
+/// `timetz` once issue #248 fixed its render-consistency defect, and
+/// `timestamptz` joined them too once issue #246 fixed the *walsender's*
+/// own render-consistency gap; see the temporal block below for why
+/// `interval` alone stays off), `boolean`, `json`/`jsonb`, or any unknown
+/// type — is rejected as a join key.
 ///
 /// `bytea` (issue #114) joins the list below on the same "text-stability is
 /// a property of the rendering" reasoning `oid` and four of the six temporal
@@ -2651,13 +2652,8 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // now joins `date`/`time`/`timetz` here — see
     // `crate::temporal::is_render_consistent`.
     //
-    // Two remaining deliberate absences, for two different reasons:
+    // One remaining deliberate absence:
     //
-    // * `timestamp with time zone` — issue #248 fixed its own two-renderer
-    //   defect the same way it fixed `timestamp`'s, but `timestamptz` has a
-    //   *second*, independent one #248 does not touch: its rendering moves
-    //   with a `TimeZone` Trellis cannot pin on the walsender (issue #246,
-    //   still open).
     // * `interval` — `'24 hours'` and `'1 day'` are one value with two
     //   renderings. The float `-0`/`0` defect; no GUC and no renderer
     //   reconciliation fixes it, though #110's typed key index would.
@@ -2665,6 +2661,25 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "time without time zone",
     "time with time zone",
     "timestamp without time zone",
+    // Issue #246: `timestamp with time zone` joins the four above.
+    // `timestamptz_out` renders the stored instant in the session's
+    // `TimeZone`, so it needed two independent fixes before it could be
+    // text-stable — issue #248's `to_jsonb`/`::text` reconciliation (which
+    // it shares with `timestamp`) and, separately, `TimeZone` itself being
+    // pinned identically on *every* connection Trellis opens, including the
+    // walsender. `pgwire-replication` 0.4 had no way to send startup
+    // parameters on a replication connection, so before #246 pinning
+    // `TimeZone` on the pool alone would have guaranteed a pool/walsender
+    // disagreement on any non-UTC server — worse than the accidental
+    // agreement the two renderers had by both falling back to the server
+    // default. `pgwire-replication` 0.4.1's `ReplicationConfig::with_options`
+    // closes that: `crate::intake::IntakeConfig::replication_config` now
+    // pins the walsender to `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`
+    // (which now includes `TimeZone = 'UTC'`) the same way the pool always
+    // has, so `timestamptz_out` is a genuine bijection on the instant on
+    // both backends. See `crate::temporal::is_bijective_under_text`/
+    // `is_render_consistent` for the per-family verdict this list mirrors.
+    "timestamp with time zone",
     // Issue #114: `byteaout` under the pinned `bytea_output = 'hex'` is a
     // bijection on its values — see the doc comment above for the live
     // evidence. `bytea` has no length/precision modifier, so

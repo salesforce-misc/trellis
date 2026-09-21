@@ -42,8 +42,8 @@ climb it left-to-right:
    (`validate::UnsupportedGroupByKeyType`), rejecting every
    `ValueType::Other` family **except `oid`, `bytea`, `bit varying`, and the
    text-stable temporal families** — `::text` matching
-   disagrees with the rejected types' own `=` (`'1 day'::interval = '24 hours'`,
-   `timestamptz` under the session's `TimeZone`), and `json` has no `=` at
+   disagrees with the rejected `interval`'s own `=`
+   (`'1 day'::interval = '24 hours'`), and `json` has no `=` at
    all, whereas `oid_out` is canonical unsigned decimal (#111),
    `byteaout` under the pinned `bytea_output = 'hex'` is a bijection with no
    session-GUC dependence at all (#114), and `varbit_out`'s bare
@@ -106,7 +106,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
 | `time` `timetz` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#113) | ✅ MIN/MAX | `time_out`/`timetz_out` are the block's only IMMUTABLE output functions; `timetz`'s `=` is identity on `(time, zone)` |
 | `timestamp` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113/#248 — bijective under `::text`, and `to_jsonb` (the live-row reads) now renders it the same way (#248 replaced `to_jsonb(t.*)` with an explicit per-column `jsonb_build_object`) |
-| `timestamptz` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | 🎯 MIN/MAX | #248 fixed the `to_jsonb` split, but a *second*, independent defect remains: a `TimeZone`-dependent render on a walsender Trellis cannot pin (#113, #246, still open) |
+| `timestamptz` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ MIN/MAX | key roles landed in #246 — #248 fixed the `to_jsonb` split (shared with `timestamp`), and #246 pinned `TimeZone` on the walsender too (`pgwire-replication` 0.4.1's `ReplicationConfig::with_options`), closing the pool-vs-walsender render gap `TimeZone` alone couldn't close before. No typed literal yet — a separate, smaller gap (see "Cross-cutting concerns" below) |
 | `interval` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | 🎯 | ✅ `SUM` (recompute-only); ❌ MIN/MAX | `'24 hours' = '1 day'` but they render differently, so no *text* match works; #110 comparing decoded values would. `max` is scan-order dependent even on the server (#113) |
 | `jsonb` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ literal (#115) | ✅ `jsonb_agg` (recompute-only, `jsonb` argument only) | `json` excluded (no `=`); key order canonicalizes but embedded-number scale doesn't — #110's typed key index is the unlock, like `numeric`/`real`/`timestamptz` |
 | `inet` | ✅ | 🎯 | ✅ `GROUP BY` only; ❌ relationship/PK | ❌ | ✅ | ✅ MIN/MAX (own type) | second `::text` renderer (`network_show`) disagrees with `inet_out` on bare host addresses — the `boolean` shape (#116) |
@@ -135,17 +135,19 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 * **`text`/`varchar`/`char`** — Postgres marks these comparisons IMMUTABLE
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
   a normalized stored form); `char(n)`'s hazard is blank-padding, not volatility.
-* **`timestamptz`** — value comparison immutable, but *text rendering*
-  is GUC-dependent (`TimeZone`). `TimeZone` deliberately is not pinned
-  (#113, below), so for `timestamptz` a
-  **typed key index** — comparing decoded values, not text — is the real
-  unlock.
+* **`timestamptz`** — value comparison immutable, and *text rendering* now
+  is too: it is GUC-dependent (`TimeZone`), and issue #246 pins `TimeZone`
+  to `'UTC'` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` on **every**
+  connection Trellis opens, pool and walsender alike (see "Two renderers,
+  and the walsender" below). No typed key index needed — `timestamptz_out`
+  under a fixed `TimeZone` is a bijection on the instant, exactly the
+  argument #113 made before declining the pin for the *other* reason
+  covered below.
 * **`bytea`** — looked like it belonged in the bullet above (its text
   rendering is also GUC-dependent, on `bytea_output`), and #114 found that
   assumption wrong on closer inspection: `bytea_output` *is* pinned (to
-  `hex`), and unlike `TimeZone` that pin is enough on its own — `byteaout`
-  under `hex` is a bijection with no second axis of variation the way
-  `timestamptz_out` has (`TimeZone` *and* the walsender/pool split, #246).
+  `hex`), and — like `TimeZone` since #246 — that pin is enough on its own:
+  `byteaout` under `hex` is a bijection with no second axis of variation.
   No typed key index needed; see "Bytea semantics" below.
 * **`interval`** — `interval_cmp` is immutable and perfectly well-defined,
   but it compares *total spans* (30 days to a month, 24 hours to a day)
@@ -184,8 +186,9 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   non-literal), which each type family's own child decides, since most pairs
   are not immutable.
 * **Typed key index** — replacing the raw-`::text` match unlocks
-  `timestamptz`/`numeric`/`real`/`double precision`/… as safe keys;
-  the single
+  `numeric`/`real`/`double precision`/`interval`/… as safe keys (`timestamptz`
+  no longer needs it — issue #246 unlocked it a different way, by pinning
+  `TimeZone` on both renderers instead); the single
   highest-leverage child for the key roles. Note what it is *not* needed
   for: the exact integer types and `oid` render canonically (`-`, then
   digits — no `+`, no leading zeros, no padding, no session GUC), so
@@ -314,31 +317,38 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     Note the shape: one value, two renderers, no arbiter — the same defect
     *shape* as issue #246, one layer in (there it is the pool versus the
     walsender; here it was `::text` versus `to_jsonb` inside one process).
-    Closing #248 does not touch #246 — different renderer pairs — which is
-    why `timestamptz` needs #246 too, independently (below).
-  * **`timestamptz` has a second, independent blocker that #248 does not
-    touch, and pinning `TimeZone` is not the fix.** Pinning
-    `TimeZone = 'UTC'` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make
-    its `::text` rendering a bijection on the instant, and Trellis owning
-    all its own connections means the blast radius on application sessions
-    is nil. It still fails, because logical-decoding output is produced by
-    the output function running in the **walsender**, under the walsender's
-    GUCs, and `pgwire_replication`'s `ReplicationConfig` (v0.4) exposes no
-    way to send startup runtime parameters. Today the two agree by falling
-    back to the same server default; pinning the pool alone would trade that
-    accidental symmetry for a guaranteed asymmetry on every non-UTC server.
-    Tracked as **issue #246** (still open as of #248 landing), which also
-    covers the pre-existing exposure for the `DateStyle`/`bytea_output`
-    pins. (Postgres itself honours startup `options` on a replication
+    Closing #248 did not touch #246 — different renderer pairs — which is
+    why `timestamptz` needed #246 too, independently (below).
+  * **`timestamptz` had a second, independent blocker #248 did not touch,
+    which issue #246 closed.** Pinning `TimeZone = 'UTC'` in
+    `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` *would* make its `::text`
+    rendering a bijection on the instant, and Trellis owning all its own
+    connections means the blast radius on application sessions is nil. That
+    alone used not to be enough, because logical-decoding output is produced
+    by the output function running in the **walsender**, under the
+    walsender's GUCs, and `pgwire_replication`'s `ReplicationConfig` v0.4
+    exposed no way to send startup runtime parameters. The two used to agree
+    only by falling back to the same server default; pinning the pool alone
+    would have traded that accidental symmetry for a guaranteed asymmetry on
+    every non-UTC server. **Issue #246 fixed the library gap**:
+    `pgwire-replication` 0.4.1 added `ReplicationConfig::with_options`
+    (Postgres itself already honoured startup `options` on a replication
     connection — `PGOPTIONS='-c timezone=UTC'` works with `pg_recvlogical`
-    — so this is a library gap, not a wall.)
+    — the missing piece was purely the Rust client exposing it), and
+    `intake::IntakeConfig::replication_config` now calls it with
+    `pool::deterministic_text_output_options()` — the same
+    `DETERMINISTIC_TEXT_OUTPUT_GUCS` the pool pins, reparsed into the
+    startup `options` shape, so the two can never hand-drift apart. The
+    walsender now genuinely pins `TimeZone = 'UTC'`, closing the gap for
+    real rather than merely continuing the old accidental agreement.
 
-    This gives the rule for adding a fifth GUC to that constant: each one
-    currently pinned is **output-identical to a stock server's default**, so
-    the unpinned walsender agrees unless an operator deliberately
-    reconfigured the server. `TimeZone` has no such stock value;
-    `IntervalStyle` does (`postgres`), which is why #113 added that one and
-    not this one.
+    This also retired the rule the constant used to live under: back when
+    only the pool could be pinned, a GUC could only join it if it was
+    **output-identical to a stock server's default** (so the *unpinned*
+    walsender would agree by luck) — which is why #113 added `IntervalStyle`
+    (`postgres` is stock-identical) but not `TimeZone` (no stock value to
+    lean on). Now that the walsender is pinned for real via `with_options`,
+    that test no longer applies to a sixth GUC either.
   * **`interval` can never be a text-matched key.**
     `'24 hours'::interval = '1 day'::interval` is **true** while their
     `::text` differs — one value, many renderings, structurally the float
@@ -384,6 +394,15 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     stay correct read on another. (A `timetz` offset literal is canonical
     when its trailing all-zero tail is dropped and only then:
     `+05:00:30` is what `timetz_out` prints, while `+05:30:00` is not.)
+    `TIMESTAMPTZ`'s original blocker — the same walsender/pool `TimeZone`
+    gap that kept it off the key roles — is gone as of issue #246, but it is
+    still absent from the typed-literal allowlist for a narrower, separate
+    reason: a typed literal needs its own canonical-form checker (this
+    module's own, narrower bar — no live connection involved), and #246
+    only wired the connection-level GUC pin, not a new
+    `canonical_timestamptz` checker. Adding one is believed to be a clean
+    follow-up on the `TIMETZ` playbook (require a fully-numeric offset),
+    just not part of #246's own scope.
   * `crate::temporal` owns the comparison order, the `interval` value model
     and `interval_out`'s rendering; unlike #111/#112 it mints **no new
     `ValueType` variant**, because every role added here is a function of

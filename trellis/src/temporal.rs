@@ -31,8 +31,9 @@
 //! of the operator set, and it has to be checked per family against a live
 //! server rather than assumed from the family's name.
 //!
-//! Checked on PostgreSQL 17 with `DateStyle` pinned to `'ISO, YMD'` (which
-//! [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] already does):
+//! Checked on PostgreSQL 17 with `DateStyle` pinned to `'ISO, YMD'` and, as
+//! of issue #246, `TimeZone` pinned to `'UTC'` (both via
+//! [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]):
 //!
 //! * **`date` — stable.** `date_out` under ISO emits `YYYY-MM-DD`, widening
 //!   the year field as needed (`5874897-12-31`), suffixing ` BC`
@@ -60,9 +61,15 @@
 //!   by zone*, so two values are equal only when both fields match. That
 //!   makes `=` exactly identity on the stored `(time, zone)` pair — which
 //!   is precisely what `timetz_out` renders. Bijective, therefore stable.
-//! * **`timestamptz` — NOT stable, and pinning `TimeZone` does not fix it.**
-//!   It also fails the two-renderer test below, so it is refused twice over.
-//!   See "Why `timestamptz` is still refused" below.
+//! * **`timestamptz` — a bijection under `::text` once `TimeZone` is
+//!   pinned, and now admitted.** `timestamptz_out` renders the stored
+//!   instant in the session's `TimeZone`; under a *fixed* `TimeZone` that is
+//!   as injective as `timestamp_out` (the numeric UTC offset in the output
+//!   changes with the instant, so two distinct instants can never collide
+//!   on one wall-clock spelling). It used to fail for two compounding
+//!   reasons — see "Two renderers, and `timestamp`'s issue #248 fix" below
+//!   for the first, and "Why `timestamptz` needed issue #246, separately"
+//!   for the second — both now closed.
 //! * **`interval` — NOT stable, and no GUC can make it so.**
 //!   `select '24 hours'::interval = '1 day'::interval` is **true**
 //!   (`interval_cmp` is `0`) while `'24 hours'::interval::text` is
@@ -122,63 +129,71 @@
 //! exactly the way `::text` does. Postgres's own bare `to_jsonb(t.*)` still
 //! spells a raw timestamp with a `T` (that is a Postgres builtin, not
 //! something this crate can or needs to change) — the fix is that nothing in
-//! the engine calls it that way anymore. `date`, `time`, `timetz` and now
-//! `timestamp` ship with their full key and `MIN`/`MAX` roles.
-//! `timestamptz` remains deferred, for the independent reason below.
+//! the engine calls it that way anymore. `date`, `time`, `timetz` and
+//! `timestamp` shipped with their full key and `MIN`/`MAX` roles from #248;
+//! `timestamptz` needed a second, independent fix on top of this one — see
+//! below.
 //!
 //! Note the shape of this defect was issue #246's, one layer in: one value,
 //! two renderers, no arbiter. There it is the pool versus the walsender; here
 //! it was `::text` versus `to_jsonb` inside a single process. Closing #248
-//! does not touch #246 at all — they are different renderer pairs — which is
-//! exactly why `timestamptz` still needs #246 separately (see below).
+//! did not touch #246 at all — they are different renderer pairs — which is
+//! exactly why `timestamptz` needed #246 separately, addressed next.
 //!
-//! ## Why `timestamptz` is still refused
+//! ## Why `timestamptz` needed issue #246, separately
 //!
 //! `timestamptz_out` renders the stored instant as wall-clock text in the
 //! session's `TimeZone`, so the obvious move is to pin `TimeZone` to
 //! `'UTC'` in [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] the same way
 //! `DateStyle` is pinned, and that *would* make the rendering a bijection
-//! on the instant. Issue #113 investigated it and it does not work, for a
-//! reason that has nothing to do with blast radius on application sessions
-//! (Trellis owns its own connections — `pool::session_bootstrap` runs on
-//! every one):
+//! on the instant. Issue #113 investigated it and found it did not work
+//! *yet*, for a reason that had nothing to do with blast radius on
+//! application sessions (Trellis owns its own connections —
+//! `pool::session_bootstrap` runs on every one):
 //!
-//! **Trellis renders `timestamptz` on two different backends, and only
-//! controls one of them.** Logical-decoding output is produced by the type's
-//! own output function running *in the walsender backend*, under the
-//! walsender's GUCs — verified live: the same slot peeked from a session
-//! with `timezone='UTC'` yields `2024-01-01 12:00:00+00` and from one with
-//! `timezone='Asia/Tokyo'` yields the Tokyo wall clock, on a server whose
-//! own default is `America/New_York`. `pgwire_replication`'s
-//! `ReplicationConfig` (v0.4) exposes no way to send startup runtime
-//! parameters or to issue a `SET` on the replication connection, so the
-//! walsender keeps the server/database/role default.
+//! **Trellis renders `timestamptz` on two different backends, and issue
+//! #113 could only control one of them.** Logical-decoding output is
+//! produced by the type's own output function running *in the walsender
+//! backend*, under the walsender's GUCs — verified live: the same slot
+//! peeked from a session with `timezone='UTC'` yielded `2024-01-01
+//! 12:00:00+00` and from one with `timezone='Asia/Tokyo'` yielded the Tokyo
+//! wall clock, on a server whose own default was `America/New_York`.
+//! `pgwire_replication`'s `ReplicationConfig` v0.4 exposed no way to send
+//! startup runtime parameters or to issue a `SET` on the replication
+//! connection, so the walsender kept the server/database/role default no
+//! matter what the pool pinned.
 //!
-//! Today those two renderers *agree*, by accident: both the pool and the
-//! walsender fall back to the same server default. Pinning `TimeZone` on
-//! the pool alone would replace that accidental symmetry with a guaranteed
-//! asymmetry on every server whose default is not UTC — the CDC-decoded
-//! text of an instant and a target-table read of the same instant would
-//! disagree. That is strictly worse than the status quo, so this issue
-//! declines the pin. The real unlocks are, in order of preference: a
-//! replication transport that can pin session GUCs (then `TimeZone` joins
-//! the constant and `timestamptz` becomes stable exactly like `date` did),
-//! or #110's typed key index.
+//! At the time, those two renderers *agreed* only by accident: both the
+//! pool and the walsender fell back to the same server default. Pinning
+//! `TimeZone` on the pool alone would have replaced that accidental
+//! symmetry with a guaranteed asymmetry on every server whose default is
+//! not UTC — the CDC-decoded text of an instant and a target-table read of
+//! the same instant would disagree. That was strictly worse than the
+//! status quo, so #113 declined the pin and named the unlock: a
+//! replication transport that can pin session GUCs, after which `TimeZone`
+//! joins the constant and `timestamptz` becomes stable exactly like `date`
+//! did.
 //!
-//! This is tracked as **issue #246** (walsender/pool GUC-pinning gap),
-//! deliberately kept separate from #248: closing #248 made `timestamp`'s
-//! *internal* two-renderer problem go away, but `timestamptz`'s problem is a
-//! *different* two-renderer pair (the pool vs. the walsender) that #248's fix
-//! cannot touch at all. #246 is still open and undecided as of #248 landing
-//! — `timestamptz` stays refused here until it resolves one way or the
-//! other, not because of any remaining doubt about #248's own fix.
+//! **Issue #246 is that unlock.** `pgwire-replication` 0.4.1 added
+//! `ReplicationConfig::with_options`, and
+//! `crate::intake::IntakeConfig::replication_config` now calls it with
+//! [`crate::pool::deterministic_text_output_options`] — the same
+//! [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] the pool pins, reparsed
+//! into the startup `options` shape. The walsender now genuinely pins
+//! `TimeZone = 'UTC'`, not merely agrees with it by coincidence, so
+//! `timestamptz` clears both halves the same way `timestamp` does and joins
+//! it in [`is_bijective_under_text`]/[`is_render_consistent`] below.
 //!
-//! Note the same asymmetry is a pre-existing, latent hazard for `DateStyle`
-//! and `bytea_output`. It does not bite there because the pinned values
-//! (`ISO` output, `hex`) are output-identical to a stock server's defaults,
-//! so the walsender agrees with the pool unless an operator has deliberately
-//! reconfigured the server. `TimeZone` has no such stock value to pin to.
-//! `IntervalStyle` does (`postgres`), which is why this issue *does* add it.
+//! Note the same asymmetry was a pre-existing, latent hazard for
+//! `DateStyle` and `bytea_output` even before #246 — it did not bite there
+//! because the pinned values (`ISO` output, `hex`) are output-identical to
+//! a stock server's defaults, so the walsender agreed with the pool unless
+//! an operator had deliberately reconfigured the server. `TimeZone` had no
+//! such stock value to lean on, which is exactly why #113 pinned
+//! `IntervalStyle` (`postgres` is output-identical to stock) but not
+//! `TimeZone`, and why closing #246 — pinning the walsender for real,
+//! rather than finding a fifth output-identical-to-stock value — was the
+//! only way to close this one out.
 //!
 //! # `MIN`/`MAX`, and why `interval` is excluded from them
 //!
@@ -302,12 +317,15 @@ pub const fn is_temporal(pg_type: PgType) -> bool {
 /// Both halves are load-bearing and the second one used to be the trap. The
 /// first half (`a::text = b::text` agrees with the type's own `=`) is what
 /// this module's doc comment establishes per family, and by that measure
-/// `date`, `timestamp`, `time` and `timetz` all pass. The second half — that
-/// every code path which turns a column into text produces *that same*
-/// string — is what `timestamp` used to fail, before issue #248 made every
-/// internal renderer agree; it's why `timestamp` is now present below
-/// alongside `date`/`time`/`timetz`, and why `timestamptz` still is not (it
-/// fails the second half for the separate, still-open issue #246 reason).
+/// `date`, `timestamp`, `time`, `timetz` and — once `TimeZone` is pinned —
+/// `timestamptz` all pass. The second half — that every code path which
+/// turns a column into text produces *that same* string — is what
+/// `timestamp` used to fail, before issue #248 made every internal renderer
+/// agree, and what `timestamptz` used to fail for a second, independent
+/// reason on top of that (issue #246: the pool and the walsender pinned
+/// different GUCs, or — before #246 — the walsender couldn't be pinned at
+/// all). Both issues are now closed, which is why `timestamptz` joins
+/// `date`/`time`/`timetz`/`timestamp` below.
 ///
 /// See "Two renderers, and `timestamp`'s issue #248 fix" in this module's
 /// doc comment. `is_render_consistent` is the predicate for the second half
@@ -323,14 +341,23 @@ pub const fn is_text_stable(pg_type: PgType) -> bool {
 ///
 /// `interval` is the only temporal family that fails this outright — equal
 /// intervals can render differently (`'1 day'` vs `'24 hours'`), which no
-/// GUC and no second renderer can repair. `timestamptz` fails it only
-/// across sessions (`TimeZone`), which is a different failure and is
-/// recorded on [`is_render_consistent`] instead, since the mechanism there
-/// is likewise "two renderers disagree".
+/// GUC and no second renderer can repair. `timestamptz` used to fail this
+/// *across sessions* whenever their `TimeZone`s differed — a different
+/// failure from `interval`'s, structurally "two renderers disagree" rather
+/// than "one value, two spellings" — which is why, back when nothing pinned
+/// `TimeZone` at all, it was recorded on [`is_render_consistent`] instead of
+/// here. Issue #246 pins `TimeZone = 'UTC'` on every connection Trellis
+/// opens (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, now including the
+/// walsender via `with_options` — see that constant's doc comment), which
+/// closes the cross-session gap: `timestamptz_out` under a fixed `TimeZone`
+/// is a bijection on the stored instant, exactly the argument issue #113
+/// made for pinning it and declined only because the walsender couldn't be
+/// pinned along with the pool. `timestamptz` joins the admitted list below
+/// as of issue #246.
 const fn is_bijective_under_text(pg_type: PgType) -> bool {
     matches!(
         pg_type,
-        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz
     )
 }
 
@@ -366,20 +393,27 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 /// divergence. So this predicate gates the `MIN`/`MAX` role as well as the
 /// key roles, not just the key roles.
 ///
-/// This is the same *shape* of defect as issue #246 (deterministic-output
-/// GUCs pinned on the pool but not the walsender): one value, two renderers,
-/// no arbiter. **Issue #248 reconciled the `to_jsonb` sites with `::text`**
-/// (`staging::apply::row_as_text_jsonb_sql`, an explicit per-column
-/// `jsonb_build_object` in place of `to_jsonb(t.*)`), which is why
-/// `timestamp` is admitted here now. `timestamptz` is not: it fails this
-/// predicate for the *separate*, still-open #246 reason documented above
-/// (`is_render_consistent`'s two-renderer framing applies to it twice —
-/// `to_jsonb` vs. `::text`, now fixed, and pool vs. walsender, not fixed) —
-/// see "Why `timestamptz` is still refused" in this module's doc comment.
+/// This is the same *shape* of defect issue #246 fixed one layer out
+/// (deterministic-output GUCs pinned on the pool but not the walsender):
+/// one value, two renderers, no arbiter. **Issue #248 reconciled the
+/// `to_jsonb` sites with `::text`** (`staging::apply::row_as_text_jsonb_sql`,
+/// an explicit per-column `jsonb_build_object` in place of `to_jsonb(t.*)`),
+/// which is why `timestamp` was admitted here first. `timestamptz` used to
+/// fail this predicate *twice over* — `to_jsonb` vs. `::text` (closed by
+/// #248, same as `timestamp`) and pool vs. walsender (closed by #246: the
+/// walsender now pins `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` via
+/// `pgwire_replication::ReplicationConfig::with_options`, so it renders
+/// `timestamptz_out` under the same `TimeZone = 'UTC'` the pool does). Both
+/// closed, so `timestamptz` now joins `date`/`time`/`timetz`/`timestamp`.
 pub const fn is_render_consistent(pg_type: PgType) -> bool {
     matches!(
         pg_type,
-        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Interval | PgType::Timestamp
+        PgType::Date
+            | PgType::Time
+            | PgType::TimeTz
+            | PgType::Interval
+            | PgType::Timestamp
+            | PgType::TimestampTz
     )
 }
 
@@ -387,26 +421,26 @@ pub const fn is_render_consistent(pg_type: PgType) -> bool {
 /// *and* is byte-reproducible against an independently-authored SQL
 /// recompute (ADR-0013).
 ///
-/// Two independent ways to fail, and the temporal block has one family for
-/// each:
+/// `interval` is the one family that still fails this — the "function of
+/// its input" half. Postgres's own `max(interval)` returns different text
+/// for different scan orders of the same rows — see this module's doc
+/// comment for the live demonstration — and no GUC or renderer fix touches
+/// that; it is refused for good, not pending anything.
 ///
-/// * **`interval`** fails the "function of its input" half. Postgres's own
-///   `max(interval)` returns different text for different scan orders of
-///   the same rows — see this module's doc comment for the live
-///   demonstration.
-/// * **`timestamptz`** fails the byte-reproducibility half, via
-///   [`is_render_consistent`]: `MIN`/`MAX` returns an input verbatim, and its
-///   rendering still moves between the pool and the walsender (issue #246).
-///
-/// `timestamp` used to fail the same byte-reproducibility half — a
-/// `to_jsonb`-sourced input was spelled with an ISO-8601 `T` a server-side
-/// `min()` never emits — until issue #248 made every internal renderer agree
-/// with `::text`, which is why it's admitted here alongside `date`/`time`/
-/// `timetz` now.
+/// `timestamp` and `timestamptz` both used to fail the *other* half —
+/// byte-reproducibility against an independently-authored recompute — since
+/// `MIN`/`MAX` return an input **verbatim**, and a `to_jsonb`-sourced input
+/// used to spell an ISO-8601 `T` no server-side `min()` ever emits.
+/// `timestamp`'s fix was issue #248 (every internal renderer now agrees
+/// with `::text`). `timestamptz` needed that fix too, *and* a second one on
+/// top of it: its rendering still moved between the pool and the walsender
+/// even after #248, until issue #246 pinned `TimeZone` on both. Both are
+/// closed now, so `timestamptz` joins `date`/`time`/`timetz`/`timestamp`
+/// here.
 pub const fn supports_min_max(pg_type: PgType) -> bool {
     matches!(
         pg_type,
-        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz
     )
 }
 
@@ -1250,40 +1284,40 @@ mod tests {
         }
         assert!(!is_temporal(PgType::Jsonb));
 
-        // Two remaining refusals, two distinct reasons; `timestamp` is no
-        // longer one of them (issue #248).
-        //
-        // `interval` fails half one (equal values, two renderings) but
-        // passes half two — `to_jsonb` and `::text` agree on it — which is
-        // why it can still hold non-key roles like `SUM`.
+        // `interval` is the one remaining refusal: it fails half one (equal
+        // values, two renderings) but passes half two — `to_jsonb` and
+        // `::text` agree on it — which is why it can still hold non-key
+        // roles like `SUM`.
         assert!(!is_bijective_under_text(PgType::Interval));
         assert!(is_render_consistent(PgType::Interval));
         assert!(!is_text_stable(PgType::Interval));
         assert!(!supports_min_max(PgType::Interval));
 
-        // `timestamp` is the #113 review's finding, now closed by #248: a
+        // `timestamp` is the #113 review's finding, closed by #248: a
         // perfectly good bijection under `::text`, and — since #248 made
         // every internal renderer agree with `::text` — also render-
-        // consistent now, so it clears both halves like `date`/`time`/
-        // `timetz`.
+        // consistent, so it clears both halves like `date`/`time`/`timetz`.
         assert!(is_bijective_under_text(PgType::Timestamp));
         assert!(is_render_consistent(PgType::Timestamp));
         assert!(is_text_stable(PgType::Timestamp));
         assert!(supports_min_max(PgType::Timestamp));
 
-        // `timestamptz` fails both halves — the second for a *different*
-        // reason than `timestamp` used to (issue #246, still open, not
-        // touched by #248).
-        assert!(!is_bijective_under_text(PgType::TimestampTz));
-        assert!(!is_render_consistent(PgType::TimestampTz));
-        assert!(!is_text_stable(PgType::TimestampTz));
-        assert!(!supports_min_max(PgType::TimestampTz));
+        // `timestamptz` used to fail both halves, for two different
+        // reasons — `to_jsonb` (closed by #248, same as `timestamp`) and
+        // pool-vs-walsender `TimeZone` (closed by #246, pinning the
+        // walsender via `pgwire_replication::ReplicationConfig::with_options`).
+        // Both closed, so it now clears both halves too.
+        assert!(is_bijective_under_text(PgType::TimestampTz));
+        assert!(is_render_consistent(PgType::TimestampTz));
+        assert!(is_text_stable(PgType::TimestampTz));
+        assert!(supports_min_max(PgType::TimestampTz));
 
         for pg_type in [
             PgType::Date,
             PgType::Time,
             PgType::TimeTz,
             PgType::Timestamp,
+            PgType::TimestampTz,
         ] {
             assert!(is_text_stable(pg_type), "{pg_type}");
             assert!(supports_min_max(pg_type), "{pg_type}");
