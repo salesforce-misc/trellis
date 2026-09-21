@@ -186,7 +186,19 @@ pub struct TypedLiteralSpec {
 ///   Trellis does not do. (`interval`'s *output* side is fine: #113 pins
 ///   `IntervalStyle` and `crate::temporal::Interval::render` reproduces the
 ///   `postgres` spelling exactly, which is what `SUM(interval)` needs.)
-/// * **`bit`, `varbit`** — wait for their own child (#118).
+/// * **`bit`** (fixed-length) — decided by #118, and permanently excluded,
+///   not merely waiting: Postgres's *default* typmod for a `bit` literal
+///   cast with no explicit length is `bit(1)`, and [`render_sql`] always
+///   emits the bare, unmodified type name — `'101'::bit` truncates to
+///   `'1'` on a live server (`bit_in` applies the default-typmod
+///   coercion), silently discarding data on the very round trip this
+///   module's "why the literal text must be canonical" section demands.
+///   `bit varying` (below) has no such trap: its bare default is genuinely
+///   unconstrained. See `registry::AGGREGATE_FUNCTION_SPECS`'s `BIT_AND`/
+///   `BIT_OR` doc comment for the same bare-`bit`-defaults-to-`bit(1)`
+///   hazard recurring in the aggregate-target role, and
+///   `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm for
+///   the `GROUP BY` key role's version of it.
 ///
 /// `inet`, `cidr`, `macaddr` and `macaddr8` (issue #116) *are* in the
 /// allowlist below now, each clearing both bars: `inet_in`/`cidr_in`/
@@ -308,6 +320,19 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "MACADDR8",
         value_type: ValueType::Other(PgType::MacAddr8),
         canonical: crate::netaddr::canonical_macaddr8,
+    },
+    // Issue #118. `varbit_in`/`varbit_out` are `IMMUTABLE` and read no GUC
+    // (verified against `pg_proc.provolatile`), and `bit varying`'s bare
+    // (no explicit length) default is genuinely unconstrained — unlike
+    // fixed-length `bit`, whose bare default of `bit(1)` is why it is *not*
+    // in this table (see this module's "which families are held back" note
+    // above). `varbit_out`'s canonical form is the bit string's own `'0'`/
+    // `'1'` characters, with no separator or padding beyond its own stored
+    // bits, so the checker below needs no normalizer.
+    TypedLiteralSpec {
+        keyword: "VARBIT",
+        value_type: ValueType::Other(PgType::VarBit),
+        canonical: canonical_varbit,
     },
 ];
 
@@ -477,6 +502,23 @@ fn canonical_bytea(text: &str) -> Result<(), &'static str> {
         return Err(BYTEA_SHAPE);
     }
     Ok(())
+}
+
+/// A run of only `'0'`/`'1'` characters (any length, including empty) — the
+/// spelling `varbit_out` emits (issue #118). Unlike every temporal/`bytea`
+/// checker above, there is no relative/session-dependent spelling to reject
+/// (`varbit_in` is `IMMUTABLE`, not `STABLE`) and no separate "canonical vs.
+/// merely parseable" gap to close: every string of `0`s and `1`s `varbit_in`
+/// accepts is already the exact string `varbit_out` renders back, so this
+/// checker is the round-trip property itself, not an approximation of it.
+fn canonical_varbit(text: &str) -> Result<(), &'static str> {
+    const SHAPE: &str = "expected a canonical bit-varying literal: a run of only `0`/`1` characters \
+         (e.g. '101', or '' for a zero-length value), the spelling `varbit_out` emits";
+    if text.bytes().all(|b| b == b'0' || b == b'1') {
+        Ok(())
+    } else {
+        Err(SHAPE)
+    }
 }
 
 const DATE_SHAPE: &str = "expected a canonical ISO-8601 date literal, `YYYY-MM-DD` \
@@ -863,5 +905,35 @@ mod tests {
                 "{text:?} must not be accepted as a bytea literal"
             );
         }
+    }
+
+    #[test]
+    fn canonical_varbits_are_accepted() {
+        for text in ["", "0", "1", "101", "00000000", "10100101"] {
+            assert!(
+                canonical_varbit(text).is_ok(),
+                "{text:?} should be canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_varbits_are_rejected() {
+        for text in ["2", "01x", "0 1", "b101", "0b101", "-1", "true"] {
+            assert!(
+                canonical_varbit(text).is_err(),
+                "{text:?} must not be accepted as a varbit literal"
+            );
+        }
+    }
+
+    #[test]
+    fn varbit_is_looked_up_by_its_canonical_uppercase_keyword() {
+        assert_eq!(
+            lookup_typed_literal("VARBIT").map(|spec| spec.value_type),
+            Some(ValueType::Other(PgType::VarBit))
+        );
+        assert!(lookup_typed_literal("varbit").is_none());
+        assert!(lookup_typed_literal("BIT").is_none());
     }
 }

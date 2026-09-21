@@ -235,8 +235,9 @@ pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
 /// Aggregate function names, called out specifically so a rejection can
 /// explain that they need an aggregate key-space (`GROUP BY`), not that
 /// they're simply unknown.
-pub const AGGREGATE_FUNCTIONS: &[&str] =
-    &["SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR"];
+pub const AGGREGATE_FUNCTIONS: &[&str] = &[
+    "SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "BIT_AND", "BIT_OR",
+];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
 /// may call in a calculated field (issue #11's groundwork), plus `COUNT`
@@ -294,6 +295,41 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         name: "BOOL_OR",
         arg_types: &[ValueType::Boolean],
         return_type: ValueType::Boolean,
+    },
+    // Issue #118: `bit_and`/`bit_or` are Postgres's per-bit-position `AND`/
+    // `OR` folds over a group's bit strings — `NULL` over an all-NULL or
+    // empty group, exactly like every other aggregate's "aggregate of zero
+    // non-NULL values is NULL" rule. Unlike `bool_and`/`bool_or`, whose
+    // argument is one fixed `ValueType::Boolean`, `bit_and`/`bit_or` accept
+    // *two* distinct `ValueType::Other` families — `PgType::Bit` (Postgres's
+    // own `bit_and(bit)`/`bit_or(bit)`) and `PgType::VarBit` (a `bit
+    // varying` argument implicitly widens to `bit` before the call —
+    // verified live: `pg_aggregate` has exactly one row per name,
+    // `aggfnoid = bit_and(bit)`, and `explain (verbose) select bit_and(v)
+    // from (values ('1010'::varbit)) t(v)` shows `bit_and('1010'::"bit")`).
+    // `arg_types` below names `Other(PgType::Bit)` as a representative
+    // placeholder only — `validate::infer_expr`'s admissibility check for
+    // this pair asks `aggregate_result_type` directly (the same widen-check
+    // shape a `Numeric`-declared aggregate argument already gets), rather
+    // than comparing against this one fixed slot, since neither
+    // `PgType::Bit` alone nor `PgType::VarBit` alone would be the whole
+    // truth.
+    //
+    // `return_type` is deliberately `Other(PgType::VarBit)`, **not**
+    // `Other(PgType::Bit)` even though `bit_and(bit)` is the function
+    // Postgres genuinely calls — see `aggregate_result_type`'s own `BIT_AND`/
+    // `BIT_OR` arm for why the result is always widened to the unconstrained
+    // family rather than mirrored back to the argument's own one, unlike
+    // every other aggregate in this table.
+    FunctionSpec {
+        name: "BIT_AND",
+        arg_types: &[ValueType::Other(PgType::Bit)],
+        return_type: ValueType::Other(PgType::VarBit),
+    },
+    FunctionSpec {
+        name: "BIT_OR",
+        arg_types: &[ValueType::Other(PgType::Bit)],
+        return_type: ValueType::Other(PgType::VarBit),
     },
 ];
 
@@ -402,6 +438,47 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
                 Some(arg)
             }
             "SUM" if pg_type == PgType::Interval => Some(arg),
+            // Issue #118: `bit_and`/`bit_or` accept either bit-string
+            // family (`PgType::Bit` or `PgType::VarBit` — see
+            // `AGGREGATE_FUNCTION_SPECS`'s own `BIT_AND`/`BIT_OR` doc
+            // comment for the live `pg_aggregate`/`pg_cast` evidence that
+            // Postgres only ever actually calls `bit_and(bit)`/`bit_or(bit)`
+            // regardless of which family the argument started as).
+            //
+            // The result is always declared `Other(PgType::VarBit)` here,
+            // deliberately **not** mirrored back to `arg`'s own family the
+            // way every other arm in this function (`MIN`/`MAX`,
+            // `SUM(interval)`) mirrors its argument type — this is the one
+            // place in the registry that widens rather than preserves.
+            // `ValueType`/`PgType` carry no length modifier, and
+            // Postgres's *default* typmod for a **fixed-length** `bit`
+            // column declared with no length is `bit(1)`, not
+            // "unconstrained": a bare `pg_type_name(Other(PgType::Bit))`
+            // target column (what `ddl::create_aggregate_target_table`/
+            // `staging::apply_aggregate` would otherwise declare and cast
+            // through) would only ever be able to hold a *1-bit* result,
+            // failing on the very first apply for any wider group — verified
+            // live (`create table t(x bit); insert into t values ('101')`
+            // raises `bit string length 3 does not match type bit(1)`).
+            // `bit varying` has no such trap: its bare default is genuinely
+            // unconstrained, losslessly holding any width (verified live:
+            // `'10100101'::bit varying` keeps all 8 bits) and rendering
+            // identically to `bit`'s own `bit_out` (`bit_out`/`varbit_out`
+            // both emit the bare `'0'`/`'1'` characters, no type-identifying
+            // wrapper), so retargeting the *declared* result family costs
+            // nothing observable downstream while sidestepping the DDL trap
+            // entirely — the same reasoning
+            // `validate::reject_unsupported_group_by_key_type`'s `VarBit`
+            // arm documents for the `GROUP BY` key role. There is no
+            // equivalent per-column-concrete-type escape hatch for an
+            // aggregate's *result* column the way there is for a
+            // passthrough or a primary key (issue #45's mechanism narrows a
+            // bare source-column reference, not a computed aggregate's
+            // output) — extending one is real, deferred scope, not
+            // attempted here.
+            "BIT_AND" | "BIT_OR" if matches!(pg_type, PgType::Bit | PgType::VarBit) => {
+                Some(ValueType::Other(PgType::VarBit))
+            }
             _ => None,
         };
     }

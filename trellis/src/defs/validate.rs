@@ -1186,6 +1186,49 @@ fn reject_unsupported_group_by_key_type(
         // same way it does for `Boolean`, which is what makes this an honest
         // `Ok(())` rather than a still-open hazard.
         ValueType::Other(PgType::Inet) => Ok(()),
+        // Issue #118: `bit varying` is safe here for a *different* reason
+        // than every arm above it — it isn't about `::text`-vs-native-`=`
+        // rendering agreement at all. `bit`/`varbit` have no `pg_cast`
+        // override the way `boolean` does (verified live; see
+        // `catalog::TEXT_STABLE_JOIN_KEY_TYPES`'s doc comment), so raw-text
+        // matching was never the concern.
+        //
+        // The hazard here is purely a DDL one:
+        // `ddl::create_aggregate_target_table` declares a `GROUP BY` key's
+        // own target column from bare `ValueType` alone
+        // (`ddl::pg_type_name`), with no per-column length carried anywhere
+        // (`PgType::Bit`/`PgType::VarBit` are unit variants — no typmod).
+        // For almost every family admitted above, a bare/unmodified
+        // Postgres type name is a *superset* of any concretely-typed source
+        // column (bare `numeric`, bare `text`: unconstrained, never
+        // narrower). Fixed-length `bit` is the one family on this whole
+        // gate where that assumption is false: Postgres's own default
+        // typmod for a **fixed-length** `bit` column with no length given
+        // is `bit(1)`, not "unconstrained" — verified live (`create table
+        // t(x bit)` then `\d t` shows `x bit(1)`). A `bit(5)` source
+        // column's `GROUP BY` key value would then fail to write into the
+        // `bit(1)` column `pg_type_name(Other(Bit))` creates for it, on the
+        // very first apply (`insert into t values ('101')` against a bare
+        // `x bit` column raises `bit string length 3 does not match type
+        // bit(1)` on a live server) — every group, not an edge case.
+        //
+        // `bit varying`'s bare default has no such trap: `bit varying` with
+        // no length is genuinely unconstrained, losslessly holding any
+        // width (verified live: `'10100101'::bit varying` keeps all 8
+        // bits), so `pg_type_name(Other(VarBit))` is exactly as safe a
+        // brand-new-column type here as bare `numeric`/`text` already are.
+        // Fixed-length `bit` is *not* refused for any text-rendering
+        // reason — it is perfectly safe as a relationship join key or a 1-1
+        // primary key (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), neither of
+        // which ever asks a bare `ValueType` to conjure a new column: a
+        // join key only ever compares against an already-existing column,
+        // and a 1-1 primary key copies the source's own *concrete*
+        // introspected type (`bit(5)`, not bare `bit`) verbatim
+        // (`ddl::source_primary_key`). It is refused *only* here, and only
+        // because this one role's DDL has no concrete-type-introspection
+        // escape hatch to reach for. `trellis/tests/defs_bit.rs` pins both
+        // halves of this split live.
+        ValueType::Other(PgType::VarBit) => Ok(()),
         ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
             column: column.to_string(),
             value_type,
@@ -1475,6 +1518,24 @@ fn infer_expr(
                     // *is* `registry::aggregate_result_type` resolving —
                     // rather than a predicate here that a future family
                     // could teach one of the two and not the other.
+                    super::registry::aggregate_result_type(name, arg_t).is_some()
+                } else if is_aggregate && matches!(name.as_str(), "BIT_AND" | "BIT_OR") {
+                    // Issue #118: `bit_and`/`bit_or` accept *two* distinct
+                    // `ValueType::Other` families (`PgType::Bit` and
+                    // `PgType::VarBit`) — Postgres genuinely has both
+                    // `bit_and(bit)` and an implicit `bit varying -> bit`
+                    // widening that lets a `bit varying` argument reach it
+                    // too (verified live against `pg_aggregate`/
+                    // `pg_cast`). `bool_and`/`bool_or`'s single fixed
+                    // `ValueType::Boolean` `expected` has no such split, so
+                    // its plain exact-match `else` arm below was enough;
+                    // this pair needs the same "ask the registry" widen-check
+                    // the `Numeric` branch above uses, since one static
+                    // `arg_types` slot can't name two acceptable types. The
+                    // `AGGREGATE_FUNCTION_SPECS` row's own `arg_types` entry
+                    // is therefore just a representative placeholder
+                    // (`Other(PgType::Bit)`), never compared against
+                    // directly.
                     super::registry::aggregate_result_type(name, arg_t).is_some()
                 } else {
                     arg_t == *expected
@@ -1899,7 +1960,16 @@ mod tests {
     /// on `catalog::is_text_stable_join_key_type`.
     #[test]
     fn an_other_typed_column_is_rejected_as_an_aggregate_group_by_key() {
-        for pg_type in [PgType::Interval, PgType::TimestampTz, PgType::Json] {
+        // Issue #118: `PgType::Bit` (fixed-length) is deliberately in this
+        // refusal list even though `PgType::VarBit` right next to it is
+        // admitted — see this function's own `VarBit` arm for the DDL-only
+        // reason (not a text-rendering one) the two split.
+        for pg_type in [
+            PgType::Interval,
+            PgType::TimestampTz,
+            PgType::Json,
+            PgType::Bit,
+        ] {
             let d = aggregate_def(
                 &["k"],
                 vec![

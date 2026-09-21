@@ -320,10 +320,52 @@ pub fn classify(function: &str, arg: AggregateArg) -> Option<Verdict> {
             Some(Verdict::recompute_only())
         }
 
+        // Issue #118: `bit_and`/`bit_or` are **recompute-only**, for exactly
+        // `bool_and`/`bool_or`'s reason (`MIN`/`MAX`'s reason, not `SUM`'s),
+        // generalized from two possible per-column values to a bit
+        // string's `2^n`. Both are per-*bit-position* `AND`/`OR` folds —
+        // commutative, associative, total over any fixed-width bit domain,
+        // no overflow/rounding/partial-monoid trap — which looks exactly as
+        // delta-able as `SUM` on first glance, and fails for the same
+        // structural reason `bool_and`/`bool_or` do: the only state a
+        // running `Invertible` model here could maintain is the aggregate's
+        // *current visible value* (the folded bit string itself), and that
+        // is not enough to invert a delete, regardless of how many bits wide
+        // it is — more possible values per column doesn't rescue the
+        // argument, it only makes the concrete counterexample slightly
+        // bigger to write down. Verified live rather than assumed: a
+        // `bit(2)` group `{01, 10, 11}` folds to `bit_and = 00`; deleting the
+        // `01` row leaves `{10, 11}`, `bit_and = 10`; deleting the `10` row
+        // *instead*, from the very same starting group, leaves `{01, 11}`,
+        // `bit_and = 01`. Two different single-row deletions from one
+        // starting aggregate (`00`) land at two different true answers (`10`
+        // vs `01`), and "the old aggregate was `00`" alone cannot tell a
+        // delta model which case it is in — [`Invertibility::RecomputeOnly`]'s
+        // own "a deleted row might have held the current min/max, and
+        // there's no way to recover the next-best value from the
+        // aggregate's current state alone," verbatim, with a bit string
+        // standing in for a min/max candidate. See `bool_and`/`bool_or`'s
+        // own arm above for why a hidden-partials design that *would* be
+        // invertible (a per-bit-position true/false population count,
+        // generalizing bool_and's false-count idea to `n` independent
+        // per-position counters) is real but out of this issue's scope —
+        // the same `PartialField`/`staging::apply_aggregate` plumbing gap,
+        // now `n`-wide instead of one bit. Recompute-only costs nothing
+        // incremental to wire up: `registry::aggregate_result_type` routes
+        // `bit_and`/`bit_or` into `staging::apply_aggregate`'s ordinary
+        // `AggFieldKind::RecomputeOnly` fallback, the same free ride
+        // `bool_and`/`bool_or` and float `SUM`/`AVG` get.
+        ("BIT_AND", AggregateArg::Column(_)) | ("BIT_OR", AggregateArg::Column(_)) => {
+            Some(Verdict::recompute_only())
+        }
+
         // Shapes the grammar could never produce: COUNT with a column-typed
         // arg description, or a non-COUNT aggregate with a `*` arg.
         ("COUNT", AggregateArg::Column(_)) => None,
-        ("SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR", AggregateArg::Count(_)) => None,
+        (
+            "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_AND" | "BOOL_OR" | "BIT_AND" | "BIT_OR",
+            AggregateArg::Count(_),
+        ) => None,
 
         _ => None,
     }

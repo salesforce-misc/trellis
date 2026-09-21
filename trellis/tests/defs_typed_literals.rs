@@ -45,10 +45,12 @@ use trellis::staging::StagedWatermark;
 use trellis::staging::apply;
 
 // ---------------------------------------------------------------------
-// The three families issue #109 proves the mechanism against, each with a
-// canonical literal and the Postgres text it must round-trip to. `date` and
-// `timestamp` are the temporal cases (#113) and `bytea` the binary one
-// (#114) the issue names; `jsonb` is deliberately absent — see
+// The families that exercise this shared mechanism, each with a canonical
+// literal and the Postgres text it must round-trip to. `date` and
+// `timestamp` are the temporal cases (#113) issue #109 itself proved the
+// mechanism against, `bytea` the binary one (#114), and `bit varying` the
+// bit-string one (#118, added once #109's mechanism already existed);
+// `jsonb` and fixed-length `bit` are deliberately absent — see
 // `defs::typed_literal::TYPED_LITERALS`.
 // ---------------------------------------------------------------------
 
@@ -62,6 +64,11 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "timestamp without time zone",
     ),
     ("b", "BYTEA", "\\x0102ff", "bytea"),
+    // Issue #118: `bit varying` joins the allowlist; fixed-length `bit` does
+    // not (see `defs::typed_literal::TYPED_LITERALS`'s doc comment for why —
+    // its bare default typmod is `bit(1)`, a truncation trap `bit varying`'s
+    // unconstrained default doesn't have).
+    ("v", "VARBIT", "101", "bit varying"),
 ];
 
 /// `SELECT id AS id, DATE '...' AS d, TIMESTAMP '...' AS ts, BYTEA '...' AS b`,
@@ -199,12 +206,15 @@ fn the_typed_literal_and_cast_spellings_parse_to_one_ast() {
     .expect("CAST spelling parses");
 
     assert_eq!(typed, cast);
-    for ((field, (_, _, text, _)), expected_type) in typed
-        .fields
-        .iter()
-        .zip(CASES)
-        .zip([PgType::Date, PgType::Timestamp, PgType::Bytea].map(ValueType::Other))
-    {
+    for ((field, (_, _, text, _)), expected_type) in typed.fields.iter().zip(CASES).zip(
+        [
+            PgType::Date,
+            PgType::Timestamp,
+            PgType::Bytea,
+            PgType::VarBit,
+        ]
+        .map(ValueType::Other),
+    ) {
         assert_eq!(
             field.expr,
             Expr::TypedLiteral {

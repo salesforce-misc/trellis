@@ -2739,6 +2739,37 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // `boolean` join this list; until then it stays off. See
     // `trellis/tests/defs_boolean.rs` for the live evidence and
     // `docs/type-support.md`'s "Boolean semantics" section.
+    //
+    // Issue #118: `bit` and `bit varying` join this list on the *original*
+    // "text-stability is a property of the rendering" reasoning `oid`/
+    // `bytea`/four of the six temporal families were admitted under —
+    // checked against `pg_cast`, not assumed, exactly the way #119's review
+    // taught this list to check every family going forward. `select
+    // castfunc::regproc from pg_cast where castsource in
+    // ('bit'::regtype, 'varbit'::regtype) and casttarget = 'text'::regtype`
+    // returns **no rows at all** on a live Postgres 17: unlike `boolean`,
+    // neither bit-string type has a second, dedicated `::text` cast — their
+    // `::text` *is* `bit_out`/`varbit_out`, exactly like every other type on
+    // this list except `boolean`. `bit_out`/`varbit_out` are `IMMUTABLE`,
+    // read no GUC, and render a bit string as its literal `'0'`/`'1'`
+    // characters with no separator, no padding beyond the value's own stored
+    // bits, and no second spelling of any value — a fixed-alphabet,
+    // fixed-width-per-symbol encoding has no `bytea`-hex-style ambiguity to
+    // begin with, so it needs no positional-encoding argument the way
+    // `bytea`'s bijection proof did either.
+    //
+    // Both spellings are admitted *here* — this role never asks a bare
+    // `ValueType` to declare a brand-new column, it only ever compares an
+    // already-existing one (`{col} = any($1::text[]::{ty}[])`, via
+    // `staging::apply`'s `key_column_pg_type`, which introspects the
+    // column's own concrete `format_type` — `bit(5)`, not bare `bit` — so a
+    // fixed-length key's own width is never lost) or, for a 1-1 primary key,
+    // copies the source's concrete introspected type verbatim
+    // (`ddl::source_primary_key`). Fixed-length `bit` is *not* admitted as a
+    // `GROUP BY` key for a completely different, DDL-only reason — see
+    // `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm.
+    "bit",
+    "bit varying",
 ];
 
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] rendered for a user-facing error message,

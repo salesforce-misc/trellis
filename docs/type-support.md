@@ -40,12 +40,16 @@ climb it left-to-right:
    join keys and 1-1 primary keys gate on that allowlist by pg type name; a
    `GROUP BY` key gates on its `ValueType` instead
    (`validate::UnsupportedGroupByKeyType`), rejecting every
-   `ValueType::Other` family **except `oid` and `bytea`** — `::text` matching
-   disagrees with those types' own `=` (`'1 day'::interval = '24 hours'`,
+   `ValueType::Other` family **except `oid`, `bytea`, `bit varying`, and the
+   text-stable temporal families** — `::text` matching
+   disagrees with the rejected types' own `=` (`'1 day'::interval = '24 hours'`,
    `timestamptz` under the session's `TimeZone`), and `json` has no `=` at
-   all, whereas `oid_out` is canonical unsigned decimal (#111) and
+   all, whereas `oid_out` is canonical unsigned decimal (#111),
    `byteaout` under the pinned `bytea_output = 'hex'` is a bijection with no
-   session-GUC dependence at all (#114). #112 tightened
+   session-GUC dependence at all (#114), and `varbit_out`'s bare
+   unconstrained rendering has no analogous hazard either (#118) — unlike
+   fixed-length `bit`, which is refused here for a *different*, DDL-only
+   reason (see "Bit string semantics" below). #112 tightened
    the same gate for `real`/`double precision`, which used to slip through
    as `ValueType::Numeric`: `-0` and `0` are `=` in Postgres but render as
    `'-0'` and `'0'`, so a `::text`-matched float key splits one Postgres
@@ -109,7 +113,8 @@ per-type capability, so it's omitted from the aggregate cells.
 | `cidr` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ MIN/MAX | `cidr_out`/`::text` never diverge, unlike `inet`; `min`/`max(cidr)` only reachable via Postgres's own implicit upcast to `inet`, which would change the result's type (#116) |
 | `macaddr` `macaddr8` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ no such Postgres aggregate | no `pg_cast` `::text` override, unlike `inet`/`cidr`; `bytea`'s "opclass but no aggregate" finding repeats exactly (#116) |
 | enum types | ✅ | 🎯 | 🎯 | 🎯 | ⚠️ | 🎯 MIN/MAX | order fixed at type creation |
-| `bit` `bit varying` | ✅ | 🎯 | 🎯 | 🎯 | 🎯 | 🎯 `bit_and`/`bit_or` | |
+| `bit` | ✅ | 🎯 | ✅ relationship/PK; ❌ `GROUP BY` | ✅ | ❌ | — (widens to `bit varying`, below) | fixed-length; bare default typmod `bit(1)` truncates any *new* column/cast Trellis would declare from `ValueType` alone — safe only where a role reuses an already-existing column's own concrete type (#118) |
+| `bit varying` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ `bit_and`/`bit_or` (recompute-only) | unconstrained bare default, no DDL trap; `bit_and`/`bit_or` accept a `bit` **or** `bit varying` argument but always declare/return `bit varying` (#118) |
 | array types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ `array_agg` (order-sensitive) | deferred; large design |
 | range types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | deferred |
 | composite / row types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | — | deferred |
@@ -653,6 +658,128 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     the ordering (`inet`'s `MIN`/`MAX`), the `GROUP BY` canonicalization, and
     the four typed-literal checkers. Cross-checked against a live server in
     `trellis/tests/defs_netaddr.rs`.
+* **Bit string semantics (#118)** — the epic's scope note treated `bit` and
+  `bit varying` as one family sharing one verdict per role. Asked of a live
+  server, per #111-#114/#119's playbook, that turned out to hold for the
+  *rendering* question and to fail for a completely different reason:
+
+  * **Neither type has a second, disagreeing `::text` renderer — unlike
+    `boolean` (#119), this is the *easy* case.** `select castfunc::regproc
+    from pg_cast where castsource in ('bit'::regtype, 'varbit'::regtype) and
+    casttarget = 'text'::regtype` returns **no rows** on a live Postgres 17:
+    `::text` is `bit_out`/`varbit_out` directly, exactly like `oid`/`bytea`/
+    most of the temporal families. `bit_out`/`varbit_out` are `IMMUTABLE`,
+    read no GUC, and render a bit string as its own `'0'`/`'1'` characters
+    with no separator, no second spelling of any value, and (for
+    fixed-length `bit`) no padding beyond the column's own stored bits — a
+    fixed-alphabet, fixed-width-per-symbol encoding has no `bytea`-hex-style
+    ambiguity to begin with. Both types went straight onto
+    `catalog::TEXT_STABLE_JOIN_KEY_TYPES` and are accepted as relationship
+    join keys and 1-1 primary keys.
+  * **`MIN`/`MAX` do not exist for either type, the same shape #114 found for
+    `bytea`.** `select min(v), max(v) from (values ('101'::bit(3))) t(v)` is
+    `ERROR: function min(bit) does not exist` on a live server (same for
+    `bit varying`), despite both types having a full, `IMMUTABLE` btree
+    opclass. Not a rendering hazard — `registry::aggregate_result_type`
+    returns `None` for `MIN`/`MAX` over either family, and the validator
+    reports the ordinary `FunctionArgTypeMismatch` any aggregate/type
+    mismatch gets, exactly as it does for `bytea`.
+  * **The two types split anyway, on a completely different axis than
+    rendering: DDL typmod, not text stability.** `ValueType`/`PgType::Bit`/
+    `PgType::VarBit` carry no length modifier at all — every role this crate
+    grants a family is a function of the family alone, per #113's own module
+    doc, and that assumption is what breaks here. Postgres's *default*
+    typmod for a bare **fixed-length** `bit` column or cast, with no
+    explicit length given, is `bit(1)` — a genuinely *narrowing* default,
+    unlike every other admitted family's bare/unconstrained one (`numeric`,
+    `text`, and `bit varying` itself). Verified live: `select
+    ('101'::bit)::text` is `'1'` (silently truncated, not an error), and
+    `create table t(x bit); insert into t values ('101')` raises `bit
+    string length 3 does not match type bit(1)` (a table column's
+    assignment cast is stricter than a bare expression cast, but the
+    *narrowing* is the same). `bit varying` has no such trap: its bare
+    default is genuinely unconstrained, losslessly holding any width.
+  * **The split falls exactly on "does this role ask a bare `ValueType` to
+    declare a brand-new column or cast?"** A role that instead reuses an
+    *already-existing* column's own concrete introspected type never hits
+    the trap, regardless of which bit family it is:
+
+    * **Relationship join key / 1-1 primary key — both types, safe.** A
+      join-key lookup (`staging::apply`'s `key_array_filter`) casts the
+      *bound array* to the column's own `format_type`-introspected concrete
+      type (`bit(5)`, not bare `bit`), and a 1-1 primary key
+      (`ddl::source_primary_key`) copies that same concrete type verbatim.
+      Neither ever renders `pg_type_name(Other(PgType::Bit))`'s bare `bit`.
+    * **`GROUP BY` key — only `bit varying`.** `ddl::
+      create_aggregate_target_table` declares a `GROUP BY` key's own target
+      column from bare `ValueType` alone, with no per-column length to
+      reach for — exactly the shape that hits the `bit(1)` trap for
+      fixed-length `bit`, and exactly the shape `bit varying`'s
+      unconstrained bare default is safe under.
+      `validate::reject_unsupported_group_by_key_type` admits
+      `Other(PgType::VarBit)` and refuses `Other(PgType::Bit)`, pinned live
+      in `trellis/tests/defs_bit.rs`'s `varbit_group_by_key_is_admitted`/
+      `fixed_length_bit_group_by_key_is_refused`.
+    * **Computed 1-1 target (typed literal) — only `bit varying`.**
+      `super::typed_literal::TYPED_LITERALS` gains a `VARBIT` row (`select
+      VARBIT '101'`), covered end-to-end by `trellis/tests/
+      defs_typed_literals.rs`'s shared `CASES` table. Fixed-length `bit` is
+      permanently excluded, not merely waiting on a future issue: `render_sql`
+      always emits the bare, unmodified type name, so `'101'::bit` would
+      silently truncate to `'1'` on every write — the same trap as the
+      `GROUP BY` key role, one layer over.
+    * **`bit_and`/`bit_or` — both types accepted as arguments, but the
+      result is always `bit varying`, never mirrored back to `bit`.** Every
+      other aggregate in `registry::aggregate_result_type` (`MIN`/`MAX`,
+      `SUM(interval)`) mirrors its argument's own family back as the result;
+      this is the one aggregate in the whole registry that deliberately
+      does not. Postgres itself only ever calls `bit_and(bit)`/`bit_or(bit)`
+      — a `bit varying` argument implicitly widens to `bit` first (verified
+      live via `pg_aggregate`/`explain (verbose)`) — so mirroring the
+      argument back would declare/cast through bare `pg_type_name(Other(
+      PgType::Bit))` regardless of which family the argument started as,
+      hitting the identical `bit(1)` DDL trap the `GROUP BY` key role
+      avoids by *not* mirroring. Retargeting the declared result family to
+      `Other(PgType::VarBit)` costs nothing observable downstream —
+      `bit_out`/`varbit_out` render identically, so the persisted text is
+      byte-for-byte the same either way — while sidestepping the trap
+      entirely. There is no equivalent per-column-concrete-type escape
+      hatch for an aggregate's *result* column the way there is for a
+      passthrough (issue #45) or a primary key: extending one is real,
+      deferred scope, considered and not attempted here.
+  * **`bit_and`/`bit_or` are recompute-only**, on `bool_and`/`bool_or`'s
+    reasoning (#119) generalized from 2 possible per-column values to
+    `2^n`. Both are per-*bit-position* `AND`/`OR` folds — total, commutative,
+    associative, no overflow/rounding/partial-monoid hazard, which looks as
+    delta-able as `SUM`. The trap is deletion, unchanged by the wider value
+    domain: the only state an invertible model could maintain is the
+    aggregate's own current folded value, and that alone cannot tell two
+    different single-row deletions apart. Concretely, live-verified: a
+    `bit(2)` group `{01, 10, 11}` folds to `bit_and = 00`; deleting the `01`
+    row leaves `bit_and = 10`; deleting the `10` row *instead*, from the
+    same starting group, leaves `bit_and = 01` — two different true answers
+    from one starting aggregate value. `trellis/tests/defs_bit.rs`'s
+    `bit_and_or_deletion_cannot_be_inverted_from_the_aggregate_alone` pins
+    this live; `defs::invertibility`'s own unit tests pin the pure-code
+    classification.
+  * **A mismatched-length `bit varying` argument is a genuine,
+    data-dependent runtime failure, not defense-in-depth.** A per-column
+    `bit(n)` argument can never trigger it (every row shares the column's
+    one fixed length), but Postgres itself refuses to fold two differently
+    sized `bit varying` values together (`cannot AND bit strings of
+    different sizes`) rather than padding/truncating either one, and the
+    evaluator (`defs::eval::reduce_bit_aggregate`) must reproduce that
+    refusal exactly (`EvalError::BitStringLengthMismatch`) rather than
+    silently pick a length — per ADR-0003 it pauses the offending
+    `(transform, column)` pair, the same treatment `SUM(interval)`'s
+    `IntervalOutOfRange` gets for its own data-dependent, not-a-bug failure.
+  * `bit`/`bit varying` mint **no new `ValueType` variant** — both
+    `PgType::Bit`/`PgType::VarBit` already existed as passthrough types
+    since #108, and every role gained here is a function of the family
+    alone (or, for `bit_and`/`bit_or`'s result, a deliberate one-way
+    widening from one family to the other — see above). Cross-checked
+    against a live server in `trellis/tests/defs_bit.rs` and
+    `trellis/tests/defs_typed_literals.rs`.
 * **Aggregate maintenance** — order-sensitive aggregates (`array_agg`,
   `string_agg`, `jsonb_agg`) need an incremental-delta design or a
   group-recompute fallback, and an `ORDER BY`-inside-aggregate grammar decision.
