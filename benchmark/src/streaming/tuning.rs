@@ -95,6 +95,11 @@ pub struct EngineTuning {
     /// ([`ClientOptions::reconcile_interval`]) — see
     /// [`STOCK_RECONCILE_INTERVAL`] for why this is a knob at all.
     pub reconcile_interval: Duration,
+    /// Intake's group-commit batching bounds
+    /// ([`ClientOptions::group_commit`], issue #274). `Some` (matching
+    /// `ClientOptions::default()`) is stock `main`'s shipped, default-on
+    /// behavior; `None` measures the un-grouped escape hatch instead.
+    pub group_commit: Option<trellis::GroupCommitConfig>,
 }
 
 impl Default for EngineTuning {
@@ -111,6 +116,7 @@ impl Default for EngineTuning {
             poll_interval: STOCK_POLL_INTERVAL,
             maintenance_interval: STOCK_MAINTENANCE_INTERVAL,
             reconcile_interval: STOCK_RECONCILE_INTERVAL,
+            group_commit: Some(trellis::GroupCommitConfig::default()),
         }
     }
 }
@@ -136,6 +142,7 @@ impl EngineTuning {
             poll_interval: self.poll_interval,
             maintenance_interval: self.maintenance_interval,
             reconcile_interval: self.reconcile_interval,
+            group_commit: self.group_commit,
             ..Default::default()
         }
     }

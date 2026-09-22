@@ -370,6 +370,7 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -404,6 +405,118 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
     assert_eq!(src_table, format!("{DEFAULT_SCHEMA}.widgets"));
     assert_eq!(key, "1");
     assert_eq!(op, "insert");
+
+    let watermark = confirmed_lsn(&observer, "intake_slot")
+        .await
+        .expect("watermark must have advanced");
+    assert!(
+        watermark > 0,
+        "watermark must have advanced past its seeded value"
+    );
+}
+
+/// Issue #274 ("intake group-commit"): three separate single-row source
+/// transactions, all committed before the consumer ever starts streaming (so
+/// intake decodes their three `Commit`s back to back, well inside a generous
+/// `max_delay`), with `group_commit` configured at a `max_rows` none of them
+/// individually reach. All three must still land, in full and exactly once —
+/// grouping must never drop, duplicate, or reorder a row — and the watermark
+/// must still advance normally. (A `pg_stat_database.xact_commit`-based
+/// "fewer commits than source transactions" assertion was considered and
+/// dropped: it's too noisy to assert reliably inside a fast integration test
+/// — `ProducerSession::connect`'s own setup queries, the per-relation catalog
+/// lookups `handle_xlog_data` makes on a cache miss, and the polling loop
+/// below all add their own uncounted autocommit commits to the same
+/// database-wide counter. The commit-count reduction this feature is *for*
+/// is measured empirically by the benchmark harness instead — see issue
+/// #274's validation table.)
+#[tokio::test]
+async fn group_commit_batches_several_source_transactions_into_fewer_ring_commits() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table widgets (id bigint primary key, payload text not null);
+             create publication intake_pub for table widgets;",
+        )
+        .await
+        .expect("create source table and publication");
+    let slot_row = setup
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create replication slot");
+    let _: String = slot_row.get(0);
+    seed_progress(&setup, "intake_slot", 0).await;
+
+    // Three separate single-row transactions (three implicit-autocommit
+    // `execute` calls, matching this crate's own "one INSERT == one
+    // transaction" convention elsewhere — see
+    // `benchmark/src/streaming/load.rs`), all committed before the consumer
+    // connects, so intake sees three `Commit`s in immediate succession once
+    // it starts streaming.
+    for id in 1..=3i64 {
+        setup
+            .execute(
+                "insert into widgets (id, payload) values ($1, 'hello')",
+                &[&id],
+            )
+            .await
+            .expect("insert source row");
+    }
+
+    let config = intake::IntakeConfig {
+        dsn: db.dsn().to_string(),
+        schema: DEFAULT_SCHEMA.to_string(),
+        host: db.socket_dir().display().to_string(),
+        port: db.port(),
+        user: "postgres".to_string(),
+        password: String::new(),
+        database: db.name().to_string(),
+        slot: "intake_slot".to_string(),
+        publication: "intake_pub".to_string(),
+        wake_channel: "wake".to_string(),
+        spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
+        hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: Some(intake::GroupCommitConfig {
+            max_rows: 1000,
+            max_delay: std::time::Duration::from_millis(50),
+        }),
+    };
+    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+        .await
+        .expect("connect intake");
+
+    tokio::spawn(async move {
+        let _ = consumer.run().await;
+    });
+
+    let observer = connect_raw(db.dsn()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while seg_0_count(&observer).await < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for all three changes to be staged"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let keys: Vec<String> = observer
+        .query("select key from seg_0 order by key", &[])
+        .await
+        .expect("query staged rows")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["1".to_string(), "2".to_string(), "3".to_string()],
+        "grouping must stage every row from every batched transaction, none dropped or duplicated"
+    );
 
     let watermark = confirmed_lsn(&observer, "intake_slot")
         .await
@@ -473,6 +586,7 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -584,6 +698,7 @@ async fn a_composite_key_declared_out_of_physical_column_order_stages_in_declare
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -708,6 +823,7 @@ async fn a_dropped_default_identity_table_still_stages_its_pending_change() {
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -798,6 +914,7 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -911,6 +1028,7 @@ async fn intake_populates_group_key_for_a_from_side_row_with_an_outbound_relatio
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await

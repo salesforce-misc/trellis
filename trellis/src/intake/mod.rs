@@ -488,6 +488,46 @@ pub struct IntakeConfig {
     /// The hard cap on one transaction's total buffered changes (issue #8).
     /// See [`spill::DEFAULT_HARD_CAP`].
     pub hard_cap: usize,
+    /// Issue #274 (epic #269): batches several source transactions into one
+    /// ring transaction instead of one ring transaction per source commit.
+    /// `None` is the un-grouped escape hatch — every source commit opens,
+    /// uses, and commits its own ring transaction exactly as intake did
+    /// before this field existed. See [`GroupCommitConfig`]'s own doc
+    /// comment for the shipped (`Some`) default and why it is the default.
+    pub group_commit: Option<GroupCommitConfig>,
+}
+
+/// Issue #274 (epic #269) "intake group-commit": bounds for batching several
+/// source transactions' changes into one ring transaction instead of one
+/// ring transaction per source commit. A batch flushes (commits) once either
+/// bound is crossed — `max_rows` buffered across the open batch, or
+/// `max_delay` elapsed since the batch's first transaction was buffered —
+/// whichever comes first. The row bound protects memory/lock-hold duration
+/// under a burst of many small transactions; the delay bound keeps a lone
+/// transaction (or the tail of a burst) from waiting indefinitely for enough
+/// siblings to fill the row bound, especially at low source commit rates.
+///
+/// This is the shipped default (see [`Default`] below and
+/// [`crate::ClientOptions::group_commit`]'s own doc comment) — #266's B4
+/// found the un-grouped one-ring-transaction-per-source-commit path walls at
+/// ~17k rows/sec when the source commits one row at a time, which is the
+/// shape closest to real application traffic. `None` (on [`IntakeConfig`]/
+/// [`crate::ClientOptions`]) is kept only as an explicit escape hatch, not
+/// the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupCommitConfig {
+    pub max_rows: usize,
+    pub max_delay: Duration,
+}
+
+impl Default for GroupCommitConfig {
+    /// The issue's own suggested starting point: "~1000 rows / 5 ms bound".
+    fn default() -> Self {
+        Self {
+            max_rows: 1000,
+            max_delay: Duration::from_millis(5),
+        }
+    }
 }
 
 impl IntakeConfig {
@@ -656,6 +696,25 @@ pub struct Intake {
     /// whatever runs guard (a)'s check on the apply/drain side — see
     /// `client.rs`'s own wiring.
     watermark: StagedWatermark,
+    /// Issue #274: `None` means every source commit still opens, uses, and
+    /// commits its own ring transaction exactly as before this field
+    /// existed — see [`Self::commit_transaction`]'s branch.
+    group_commit: Option<GroupCommitConfig>,
+    /// The currently-open group's buffered transactions, each with its own
+    /// `end_lsn`/`changed_at` (needed so [`spill::TxnBuffer::append_only`]
+    /// stamps every row correctly) — only the *last* entry's `end_lsn` is
+    /// used for the group's single watermark advance/ack when it flushes.
+    /// Always empty when `group_commit` is `None`.
+    pending: Vec<(spill::TxnBuffer, PgLsn, SystemTime)>,
+    /// Sum of every buffered `TxnBuffer::len()` in `pending` — checked
+    /// against `GroupCommitConfig::max_rows` on every push so the flush
+    /// decision doesn't need to re-walk `pending` each time.
+    pending_rows: usize,
+    /// Set when `pending` goes from empty to non-empty; cleared (`None`)
+    /// once the group flushes. [`Self::run`] races this against the next
+    /// replication event so a partially-filled batch still flushes promptly
+    /// even if no new source commit arrives to trigger it synchronously.
+    batch_deadline: Option<Instant>,
 }
 
 /// How often a quiet stream's keepalive-driven watermark advance may persist
@@ -767,14 +826,50 @@ impl Intake {
             // rate limit.
             last_keepalive_persist: Instant::now() - KEEPALIVE_PERSIST_INTERVAL,
             watermark,
+            group_commit: config.group_commit,
+            pending: Vec::new(),
+            pending_rows: 0,
+            batch_deadline: None,
         })
     }
 
     /// Runs the consumer loop until the replication stream ends (cleanly,
     /// e.g. after a configured `stop_at_lsn`) or errors.
     pub async fn run(&mut self) -> Result<(), IntakeError> {
-        while let Some(event) = self.replication.recv().await? {
-            self.handle_event(event).await?;
+        loop {
+            // Issue #274: when a group-commit batch is open (`batch_deadline`
+            // is `Some`), race the next replication event against that
+            // deadline so a partially-filled batch still flushes promptly
+            // even if no new source commit arrives to trigger
+            // `commit_transaction`'s own row-bound check. Safe to race:
+            // `pgwire_replication::ReplicationClient::recv` is an
+            // `mpsc::Receiver::recv().await` over a channel a decoupled
+            // background worker task fills (verified directly against this
+            // crate's pinned `pgwire-replication` version:
+            // `ReplicationClient::recv` is `self.rx.recv().await` where `rx`
+            // is a `tokio::sync::mpsc::Receiver` and the worker that feeds it
+            // runs in its own `tokio::spawn`ed task) — dropping this future
+            // on the timer branch's timeout (`tokio::select!`'s default
+            // behavior) never discards an already-decoded event, since
+            // `mpsc::Receiver::recv` is documented cancel-safe: the channel
+            // buffer holds the event for the next call regardless of which
+            // branch of this select won.
+            let event = match self.batch_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        event = self.replication.recv() => event?,
+                        _ = tokio::time::sleep_until(deadline.into()) => {
+                            self.flush_pending_group().await?;
+                            continue;
+                        }
+                    }
+                }
+                None => self.replication.recv().await?,
+            };
+            match event {
+                Some(event) => self.handle_event(event).await?,
+                None => break,
+            }
         }
         Ok(())
     }
@@ -1028,6 +1123,38 @@ impl Intake {
         let lsn = PgLsn::from(end_lsn.as_u64());
         let changed_at = pg_commit_time_to_system_time(commit_time_micros);
 
+        let Some(group_commit) = self.group_commit else {
+            return self
+                .commit_single(buffer, change_count, end_lsn, lsn, changed_at)
+                .await;
+        };
+
+        // Issue #274: buffer this transaction into the open group instead of
+        // committing it alone — the ack/watermark-advance is deferred to the
+        // whole group's own single flush ([`Self::flush_pending_group`]).
+        if self.pending.is_empty() {
+            self.batch_deadline = Some(Instant::now() + group_commit.max_delay);
+        }
+        self.pending_rows += change_count;
+        self.pending.push((buffer, lsn, changed_at));
+
+        if self.pending_rows >= group_commit.max_rows {
+            self.flush_pending_group().await?;
+        }
+        Ok(())
+    }
+
+    /// The original, ungrouped commit path: one ring transaction for exactly
+    /// this one source transaction's buffer. Used directly when
+    /// `group_commit` is `None` (issue #274's escape hatch).
+    async fn commit_single(
+        &mut self,
+        buffer: spill::TxnBuffer,
+        change_count: usize,
+        end_lsn: pgwire_replication::Lsn,
+        lsn: PgLsn,
+        changed_at: SystemTime,
+    ) -> Result<(), IntakeError> {
         let txn = self.session.transaction().await?;
         match buffer
             .stage_and_advance(&txn, &self.slot, &self.wake_channel, lsn, changed_at)
@@ -1066,6 +1193,71 @@ impl Intake {
         Ok(())
     }
 
+    /// Issue #274: commits every buffered transaction in `self.pending` as
+    /// **one** ring transaction — each appends with its own
+    /// `end_lsn`/`changed_at` (append order across transactions doesn't
+    /// matter for correctness; see [`spill::TxnBuffer::append_only`]'s doc
+    /// comment), then the group's single [`advance_watermark_and_notify`]
+    /// call, using the group's *last* transaction's `end_lsn` — exactly the
+    /// LSN a single ungrouped commit of that same last transaction would
+    /// have advanced to, since watermark advance is idempotent/monotonic
+    /// (`advance_watermark_and_notify`'s own "Monotonic guard"). A no-op if
+    /// `pending` is empty (both call sites already check this, but staying
+    /// defensive here costs nothing).
+    async fn flush_pending_group(&mut self) -> Result<(), IntakeError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let group = std::mem::take(&mut self.pending);
+        let group_rows = self.pending_rows;
+        self.pending_rows = 0;
+        self.batch_deadline = None;
+
+        let (_, last_lsn, _) = *group
+            .last()
+            .expect("checked non-empty above, and nothing else drains `pending`");
+
+        let txn = self.session.transaction().await?;
+        let mut result = Ok(());
+        for (buffer, lsn, changed_at) in group {
+            if let Err(err) = buffer.append_only(&txn, lsn, changed_at).await {
+                result = Err(err);
+                break;
+            }
+        }
+        if result.is_ok() {
+            result =
+                advance_watermark_and_notify(&txn, &self.slot, &self.wake_channel, last_lsn).await;
+        }
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                tracing::error!(
+                    slot = %self.slot,
+                    changes = group_rows,
+                    error = %err,
+                    "failed to stage a grouped batch of committed transactions"
+                );
+                return Err(err);
+            }
+        }
+        tracing::debug!(
+            changes = group_rows,
+            "staged a grouped batch of committed transactions"
+        );
+
+        // Same acknowledgment discipline as `commit_single`: strictly after
+        // the commit returned, to the group's last (most recent) end_lsn.
+        self.replication
+            .update_applied_lsn(pgwire_replication::Lsn::from(u64::from(last_lsn)));
+        self.last_confirmed = last_lsn;
+        self.watermark.advance(last_lsn);
+        Ok(())
+    }
+
     /// The quiet-stream watermark advance (issue #8): a stream carrying no
     /// watched changes still needs the watermark to advance on keepalive
     /// frames, with four load-bearing guards — see "The quiet-stream
@@ -1083,6 +1275,26 @@ impl Intake {
         // only buffered here; confirming it would tell the source those
         // changes are durably staged when they are not.
         if self.in_txn {
+            return Ok(());
+        }
+        // Issue #274's own extension of guard (a): a still-open group-commit
+        // batch has *decoded* one or more committed source transactions but
+        // not yet staged them (that only happens at
+        // `flush_pending_group`) — exactly the same hazard `in_txn` guards
+        // against, just spanning several already-committed source
+        // transactions instead of one still-open one. A keepalive's
+        // `wal_end` routinely sits past every pending transaction's own
+        // `end_lsn` (it is decoded from a later WAL position), so without
+        // this guard a keepalive arriving inside the batch's `max_delay`
+        // window could advance both watermarks — in-memory and persisted —
+        // past rows that are still only sitting in `self.pending`, ahead of
+        // `Self::run`'s own flush-on-deadline. Re-verified against the
+        // current `pending`/`batch_deadline` design (not carried over from
+        // any prior reference): `self.last_confirmed`'s own guard (b) below
+        // does *not* catch this on its own, since `last_confirmed` is only
+        // updated by `commit_single`/`flush_pending_group`, so it still sits
+        // behind every pending transaction's LSN while a batch is open.
+        if !self.pending.is_empty() {
             return Ok(());
         }
         let candidate = PgLsn::from(wal_end.as_u64());

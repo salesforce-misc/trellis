@@ -200,6 +200,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         wake_channel: "wake".to_string(),
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
@@ -436,6 +437,7 @@ async fn a_missing_slot_with_prior_confirmed_progress_is_a_loud_startup_error() 
         wake_channel: "wake".to_string(),
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
 
     match intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone()).await {
@@ -496,6 +498,7 @@ async fn connecting_with_no_progress_row_is_a_loud_startup_error() {
         wake_channel: "wake".to_string(),
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
 
     match intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone()).await {
@@ -557,6 +560,7 @@ async fn initial_snapshot_handshake_seeds_the_progress_row_connect_requires() {
         wake_channel: "wake".to_string(),
         spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await

@@ -121,6 +121,18 @@ pub struct ClientOptions {
     /// delivery, and the only wake source if the listener connection itself
     /// couldn't be opened).
     pub poll_interval: Duration,
+    /// Issue #274 (epic #269): batches several source transactions into one
+    /// ring transaction instead of one ring transaction per source commit —
+    /// #266's B4 found the un-grouped path walls at ~17k rows/sec at the
+    /// one-row-per-commit shape closest to real application traffic.
+    /// Defaults to `Some(GroupCommitConfig::default())` (1,000 rows / 5 ms) —
+    /// this is the shipped, default-on behavior. `None` is an explicit
+    /// escape hatch back to the original one-ring-transaction-per-source-commit
+    /// path, kept for callers who need every source commit to land as its
+    /// own ring transaction (e.g. to bound worst-case per-row latency more
+    /// tightly than the batch's `max_delay`, at the cost of this option's
+    /// whole point). See [`intake::GroupCommitConfig`]'s own doc comment.
+    pub group_commit: Option<intake::GroupCommitConfig>,
 }
 
 impl Default for ClientOptions {
@@ -140,6 +152,7 @@ impl Default for ClientOptions {
             hard_cap: intake::spill::DEFAULT_HARD_CAP,
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
+            group_commit: Some(intake::GroupCommitConfig::default()),
         }
     }
 }
@@ -740,6 +753,7 @@ fn build_intake_config(
         wake_channel: options.wake_channel.clone(),
         spill_threshold: options.spill_threshold,
         hard_cap: options.hard_cap,
+        group_commit: options.group_commit,
     })
 }
 

@@ -212,6 +212,7 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         wake_channel: "wake".to_string(),
         spill_threshold: intake::spill::DEFAULT_SPILL_THRESHOLD,
         hard_cap: intake::spill::DEFAULT_HARD_CAP,
+        group_commit: None,
     };
     // `Intake::connect` builds a brand-new replication connection every
     // time — see `IntakeConfig::replication_config` — so, unlike the pool

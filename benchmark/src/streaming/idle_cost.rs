@@ -44,7 +44,7 @@ async fn xact_commit(raw: &RawClient) -> i64 {
     .get(0)
 }
 
-async fn wal_lsn(raw: &RawClient) -> String {
+pub(crate) async fn wal_lsn(raw: &RawClient) -> String {
     raw.query_one("select pg_current_wal_lsn()::text", &[])
         .await
         .expect("read pg_current_wal_lsn")
@@ -54,7 +54,7 @@ async fn wal_lsn(raw: &RawClient) -> String {
 /// WAL bytes written since `start_lsn`. `pg_wal_lsn_diff` returns `numeric`,
 /// which `tokio_postgres` has no built-in `FromSql` for — cast to `bigint`
 /// explicitly (one idle window's WAL delta is nowhere near `i64`'s range).
-async fn wal_bytes_since(raw: &RawClient, start_lsn: &str) -> i64 {
+pub(crate) async fn wal_bytes_since(raw: &RawClient, start_lsn: &str) -> i64 {
     raw.query_one(
         "select pg_wal_lsn_diff(pg_current_wal_lsn(), $1::text::pg_lsn)::bigint",
         &[&start_lsn],

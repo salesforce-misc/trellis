@@ -42,9 +42,15 @@
 //! ```
 //!
 //! All seven accept `--application-threads`, `--poll-interval-ms`,
-//! `--maintenance-interval-ms` and `--reconcile-interval-ms`
-//! ([`streaming::tuning::EngineTuning`], which is also where a later child of
-//! #269 adds a knob of its own). Each prints one JSON line per measurement
+//! `--maintenance-interval-ms`, `--reconcile-interval-ms` and
+//! `--group-commit <max_rows>,<max_delay_ms>|off` (issue #274; the last
+//! defaults to stock `ClientOptions::default()`'s shipped-on group-commit,
+//! `off` measures the un-grouped escape hatch) —
+//! [`streaming::tuning::EngineTuning`], which is also where a later child of
+//! #269 adds a knob of its own. `intake-ceiling` takes its own
+//! `--group-commit` directly (it is deliberately not built from
+//! `EngineTuning` — see [`streaming::intake_ceiling`]'s module doc comment).
+//! Each prints one JSON line per measurement
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal
 //! target — the process exits non-zero on an oracle or cross-check failure,

@@ -141,6 +141,11 @@ pub use app::{
 };
 pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};
+/// Re-exported at the crate root regardless of the `internals` feature —
+/// `ClientOptions::group_commit` (issue #274) names this type in a public
+/// field, so it must be nameable by every embedder, not just
+/// internals-feature tooling.
+pub use intake::GroupCommitConfig;
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;

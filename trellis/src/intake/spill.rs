@@ -141,6 +141,29 @@ impl TxnBuffer {
         end_lsn: PgLsn,
         changed_at: SystemTime,
     ) -> Result<(), IntakeError> {
+        self.append_only(txn, end_lsn, changed_at).await?;
+        super::advance_watermark_and_notify(txn, slot, wake_channel, end_lsn).await
+    }
+
+    /// Just the append half of [`Self::stage_and_advance`] — spilled chunks
+    /// first, then the in-memory tail, both stamped with
+    /// `end_lsn`/`changed_at` — with no watermark advance or notify. Issue
+    /// #274 (intake group-commit): several source transactions' buffers can
+    /// each [`Self::append_only`] into the *same* open `txn` in turn, each
+    /// stamped with its own commit's `end_lsn`/`changed_at` (append order
+    /// across transactions doesn't matter for correctness — the claim-time
+    /// fold coalesces same-key rows regardless of arrival order, same
+    /// argument as this module's own "Cross-chunk coalescing" doc comment
+    /// note), and only the group's single
+    /// [`super::advance_watermark_and_notify`] call — once, with the group's
+    /// *last* transaction's `end_lsn` — needs to follow, after every buffer
+    /// in the group has appended.
+    pub async fn append_only(
+        self,
+        txn: &Transaction<'_>,
+        end_lsn: PgLsn,
+        changed_at: SystemTime,
+    ) -> Result<(), IntakeError> {
         let replay_chunk_size = self.spill_threshold;
         if let Some(spill) = self.spill {
             let mut reader = spill.into_reader()?;
@@ -156,7 +179,7 @@ impl TxnBuffer {
         let mut head = self.head;
         super::stamp_commit_metadata(&mut head, end_lsn, changed_at);
         append::append(txn, &head).await?;
-        super::advance_watermark_and_notify(txn, slot, wake_channel, end_lsn).await
+        Ok(())
     }
 }
 

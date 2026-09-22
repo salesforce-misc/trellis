@@ -20,6 +20,7 @@ use trellis::ClientOptions;
 use trellis::config::DEFAULT_SCHEMA;
 
 use crate::scenario::connect_raw;
+use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
 use crate::streaming::load::run_max_rate_load;
 
 const SOURCE_TABLE: &str = "intake_src";
@@ -76,6 +77,13 @@ pub struct IntakeCeilingResult {
     /// meaning the *generator*, not intake, was the limiter, and this number
     /// is again a floor rather than the engine's ceiling.
     pub generator_bound: bool,
+    /// Issue #274: `pg_current_wal_lsn()` delta over the whole run, divided
+    /// by `rows_offered` — a per-source-row WAL cost, comparable across a
+    /// `group_commit` override and the stock (grouped) default at the same
+    /// `rows_per_commit`. Fewer, larger ring transactions should cut this at
+    /// the 1-row/commit shape, where the un-grouped path pays a full
+    /// transaction commit's WAL overhead (clog/commit record) per source row.
+    pub wal_bytes_per_source_row: f64,
 }
 
 impl IntakeCeilingResult {
@@ -85,7 +93,7 @@ impl IntakeCeilingResult {
              \"offered_duration_secs\":{},\"rows_offered\":{},\
              \"offered_achieved_rows_per_sec\":{:.1},\"ring_rows_appended\":{},\
              \"append_achieved_rows_per_sec\":{:.1},\"append_backlog\":{},\
-             \"generator_bound\":{}}}",
+             \"generator_bound\":{},\"wal_bytes_per_source_row\":{:.2}}}",
             self.rows_per_commit,
             self.offered_duration_secs,
             self.rows_offered,
@@ -94,6 +102,7 @@ impl IntakeCeilingResult {
             self.append_achieved_rows_per_sec,
             self.append_backlog,
             self.generator_bound,
+            self.wal_bytes_per_source_row,
         )
     }
 }
@@ -106,6 +115,7 @@ pub async fn run(
     rows_per_commit: usize,
     offered_duration: Duration,
     catch_up_grace: Duration,
+    group_commit: Option<trellis::GroupCommitConfig>,
 ) -> IntakeCeilingResult {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -120,18 +130,24 @@ pub async fn run(
     // Not built from `EngineTuning`: this scenario's defining property is
     // `application_threads: 0` with no transforms at all, which is not a
     // tuning of the streaming pipeline but the deliberate absence of it.
+    // `group_commit` (issue #274) is threaded through directly for the same
+    // reason — the caller picks `Some(..)`/`None` explicitly rather than
+    // inheriting whatever `ClientOptions::default()` happens to ship, so a
+    // stock-vs-grouped A/B at the same `rows_per_commit` is a single flag.
     let client = trellis::Client::start(
         db.dsn(),
         ClientOptions {
             staging_worker: true,
             application_threads: 0,
             source_tables: vec![format!("public.{SOURCE_TABLE}")],
+            group_commit,
             ..Default::default()
         },
     )
     .expect("client start");
 
     let baseline_ring_rows = total_ring_rows(&raw).await;
+    let wal_lsn_before = wal_lsn(&raw).await;
     let load = run_max_rate_load(&raw, SOURCE_TABLE, 1, rows_per_commit, offered_duration).await;
 
     let deadline = Instant::now() + catch_up_grace;
@@ -142,6 +158,7 @@ pub async fn run(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
+    let wal_bytes = wal_bytes_since(&raw, &wal_lsn_before).await;
 
     client.shutdown().await.expect("client shutdown");
 
@@ -159,5 +176,6 @@ pub async fn run(
         // Within 2%: intake kept up with everything offered, so the offered
         // rate is the binding constraint, not the append path.
         generator_bound: (append_rate - offered_rate).abs() <= offered_rate * 0.02,
+        wal_bytes_per_source_row: wal_bytes as f64 / load.rows_issued as f64,
     }
 }
