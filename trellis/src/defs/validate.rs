@@ -2191,9 +2191,9 @@ mod tests {
     /// with one representative value per type family it actually
     /// classifies — every admitted family alongside every still-refused one
     /// (`interval`, `real`/`double precision`, `jsonb`, `json`, fixed-length
-    /// `bit`, `money`, `xml`, `tsvector`/`tsquery`) — and checks that
-    /// [`supported_group_by_key_types`]'s rendering names exactly the
-    /// families that came back `Ok`. A future admission change to that
+    /// `bit`, `money`, `xml`, `tsvector`/`tsquery`, `unrecognized`) — and
+    /// checks that [`supported_group_by_key_types`]'s rendering names
+    /// exactly the families that came back `Ok`. A future admission change to that
     /// function that isn't mirrored in [`GROUP_BY_KEY_TYPE_NAMES`] fails
     /// here, the same drift guard #111 gave the sibling join-key message.
     #[test]
@@ -2238,6 +2238,13 @@ mod tests {
             ("xml", ValueType::Other(PgType::Xml)),
             ("tsvector", ValueType::Other(PgType::TsVector)),
             ("tsquery", ValueType::Other(PgType::TsQuery)),
+            // `PgType::Unrecognized` is a real reachable `ValueType` (any
+            // builtin OID `pg_type::value_type_for_builtin_oid` doesn't
+            // know), so it belongs here for the same reason as the rest:
+            // with it present, every one of `PgType`'s variants has a row
+            // in this table, and the gate's `Other(_)` catch-all is pinned
+            // as the answer for an unknown type rather than left untested.
+            ("unrecognized", ValueType::Other(PgType::Unrecognized)),
         ];
 
         let mut admitted_names: Vec<&str> = Vec::new();
