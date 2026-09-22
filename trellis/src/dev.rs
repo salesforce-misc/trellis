@@ -60,8 +60,7 @@ pub mod defs {
     pub use crate::defs::{
         CatalogError, DdlError, PgType, TransformStatus, ValueType, backfill_definition,
         create_aggregate_target_table, create_definition_without_backfill, create_relationship,
-        create_target_table, install_definition, parse, qualified_target_table,
-        require_single_column_pk, source_primary_key,
+        create_target_table, install_definition, parse, qualified_target_table, source_primary_key,
     };
 }
 

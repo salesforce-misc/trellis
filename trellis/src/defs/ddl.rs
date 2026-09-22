@@ -26,19 +26,21 @@
 //! key (name and type, introspected live from `pg_catalog` — the one piece
 //! of schema introspection this issue needs, distinct from the general
 //! "introspect the whole source schema" question the catalog module (#23)
-//! left to intake). Only a single-column primary key is supported *by this
-//! 1-1 target-DDL slice and its key-range-chunked direct backfill*
-//! (`defs::backfill::backfill_one_to_one`), matching the 1-1 grammar's
-//! single-source-row assumption and that backfill's own `(lo, hi]` PK-range
-//! walk, which only knows how to order/compare a single scalar column
-//! ([`require_single_column_pk`] is where that narrower requirement is
-//! actually enforced now — see its doc comment). [`source_primary_key`]
-//! itself no longer rejects a composite (multi-column) primary key at all
-//! (issue #126): every other consumer — a relationship's from-side row
-//! identity, the general live-CDC re-fetch (`staging::apply::read_live_rows_batch`),
-//! an aggregate build's source — supports an arbitrary-arity key. A
-//! single-column key's Postgres type (composite or not, every column) must
-//! be [text-stable](super::catalog::is_text_stable_join_key_type) — the same
+//! left to intake), at whatever arity the source declares it: a composite
+//! (multi-column) source primary key mirrors onto the target as a real,
+//! composite `primary key (...)` table constraint (issue #121) — every
+//! consumer of a 1-1 target's own key (this DDL, `defs::backfill`'s
+//! key-range-chunked direct build, `staging::apply`'s live CDC apply,
+//! `staging::quarantine`'s recompute, `staging::self_check`'s divergence
+//! detector) renders and compares it through the shared, arity-generic
+//! key-contract text ([`pk_key_sql_expr`]/[`join_pk_key`]/[`split_pk_key`]),
+//! the same encoding a relationship's from-side row identity and an
+//! aggregate's `GROUP BY` key already used before this issue (issue #126
+//! first lifted [`source_primary_key`]'s own blanket single-column
+//! rejection; this issue finishes the job by removing the single-column
+//! narrowing every 1-1-specific consumer still layered on top of it).
+//! Every key column's Postgres type must be
+//! [text-stable](super::catalog::is_text_stable_join_key_type) — the same
 //! allowlist a relationship join key is held to (issue #28) — since every
 //! consumer of this key compares it via `::text` casts just like a join key;
 //! an unsafe type (e.g. `numeric`, `interval`) is rejected at
@@ -167,19 +169,6 @@ pub struct PrimaryKeyColumn {
 pub enum DdlError {
     /// The source table has no primary key at all.
     NoPrimaryKey { source_table: String },
-    /// The source table's primary key spans more than one column, and this
-    /// particular caller genuinely can't work with more than one — today
-    /// that's only the 1-1 target-DDL slice (whose target table's own
-    /// primary key mirrors the source's, one column, per
-    /// [`create_target_table`]) and its key-range-chunked direct backfill
-    /// (`defs::backfill::backfill_one_to_one`'s `(lo, hi]` walk, which orders
-    /// and compares a single scalar column). Raised by
-    /// [`require_single_column_pk`], never by [`source_primary_key`] itself
-    /// (issue #126 lifted that blanket rejection) — every other consumer of
-    /// a source's primary key (a relationship's from-side row identity, the
-    /// general live-CDC re-fetch, an aggregate build's source) supports an
-    /// arbitrary-arity composite key and never raises this variant.
-    CompositePrimaryKeyUnsupported { source_table: String },
     /// A composite primary-key identity string (U+001F-joined, matching
     /// [`crate::intake::extract_key`]'s own composite-key encoding) split
     /// into a different number of parts than the source table's current
@@ -253,9 +242,9 @@ impl DdlError {
             // The source table's shape doesn't support the 1-1 DDL slice —
             // a rejected definition, same category as any other validation
             // failure.
-            DdlError::NoPrimaryKey { .. }
-            | DdlError::CompositePrimaryKeyUnsupported { .. }
-            | DdlError::UnsupportedPrimaryKeyType { .. } => ErrorCode::Validation,
+            DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. } => {
+                ErrorCode::Validation
+            }
             // Staged-data corruption or a provenance bug, not a rejection of
             // the current call's input — same category as
             // `RelationshipReparse` below.
@@ -277,13 +266,6 @@ impl fmt::Display for DdlError {
             DdlError::NoPrimaryKey { source_table } => {
                 write!(f, "source table '{source_table}' has no primary key")
             }
-            DdlError::CompositePrimaryKeyUnsupported { source_table } => write!(
-                f,
-                "source table '{source_table}' has a composite primary key, which the 1-1 \
-                 target-DDL slice (and its key-range-chunked direct backfill) does not \
-                 support; every other primary-key consumer (relationships, live CDC re-fetch, \
-                 aggregate builds) does"
-            ),
             DdlError::MalformedCompositeKey {
                 source_table,
                 key,
@@ -332,7 +314,6 @@ impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DdlError::NoPrimaryKey { .. }
-            | DdlError::CompositePrimaryKeyUnsupported { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::MalformedCompositeKey { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
@@ -404,10 +385,10 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 /// (`array_position(i.indkey, a.attnum)`, the same ordinal-position
 /// convention [`crate::intake::primary_key_columns`] already uses for the
 /// identical reason) — issue #126 lifted this function's own blanket
-/// rejection of an arity greater than one; [`require_single_column_pk`] is
-/// where a caller that still genuinely needs exactly one column (the 1-1
-/// target-DDL slice) enforces that narrower requirement itself. Also gates
-/// every resolved column's *type*: only
+/// rejection of an arity greater than one, and issue #121 removed the last
+/// caller (the 1-1 target-DDL slice) that still narrowed it back down to one
+/// column, so every consumer now takes the key at whatever arity it has.
+/// Also gates every resolved column's *type*: only
 /// [`super::catalog::is_text_stable_join_key_type`]'s allowlist is accepted,
 /// returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise (issue #107)
 /// — every caller of this function ultimately compares the returned key via
@@ -525,28 +506,6 @@ pub(crate) async fn source_primary_key_in_txn(
         });
     }
     Ok(columns)
-}
-
-/// Narrows a (possibly composite) [`source_primary_key`] result down to the
-/// single column some callers still genuinely require — see
-/// [`DdlError::CompositePrimaryKeyUnsupported`]'s doc comment for exactly
-/// which ones and why. `source_table` is only used for the error message,
-/// mirroring every other [`DdlError`] variant's convention of naming the
-/// table the problem was found on.
-pub fn require_single_column_pk(
-    pk: Vec<PrimaryKeyColumn>,
-    source_table: &str,
-) -> Result<PrimaryKeyColumn, DdlError> {
-    let mut columns = pk.into_iter();
-    let first = columns
-        .next()
-        .expect("source_primary_key never returns an empty Vec: arity 0 is DdlError::NoPrimaryKey");
-    if columns.next().is_some() {
-        return Err(DdlError::CompositePrimaryKeyUnsupported {
-            source_table: source_table.to_string(),
-        });
-    }
-    Ok(first)
 }
 
 /// The separator a composite primary-key identity string joins its column
@@ -1461,7 +1420,7 @@ pub async fn create_target_table(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
     source_columns: &HashMap<String, ValueType>,
     source_table: &str,
 ) -> Result<(), DdlError> {
@@ -1506,11 +1465,14 @@ pub async fn create_target_table(
     };
 
     let mut sql = format!(
-        "create table if not exists {} ({} {} primary key",
+        "create table if not exists {} (",
         qualified_target_table(target_schema, def),
-        quote_ident(&pk.name),
-        pk.data_type,
     );
+    let pk_cols: Vec<String> = pk
+        .iter()
+        .map(|c| format!("{} {}", quote_ident(&c.name), c.data_type))
+        .collect();
+    sql.push_str(&pk_cols.join(", "));
     for field in &def.fields {
         let pg_type = match passthroughs
             .get(field.name.as_str())
@@ -1527,6 +1489,13 @@ pub async fn create_target_table(
         };
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
     }
+    // A table-level `primary key (...)` constraint, not an inline
+    // column-level one — works uniformly for one column or several (issue
+    // #121: a composite source primary key mirrors onto the target as a
+    // real composite primary key, the same way a single-column one already
+    // did before this issue).
+    let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    sql.push_str(&format!(", primary key ({})", pk_names.join(", ")));
     sql.push(')');
 
     let client = pool.get().await?;

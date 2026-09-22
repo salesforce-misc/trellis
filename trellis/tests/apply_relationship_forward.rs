@@ -35,7 +35,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     create_definition, create_relationship, create_target_table, relationship_projection,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -240,13 +240,9 @@ async fn forward_to_one_resolves_from_the_projection_not_live_parent_state() {
     )
     .await
     .expect("create to-one enrichment definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_one_def(),
@@ -333,13 +329,9 @@ async fn forward_apply_bumps_gen_once_per_touched_parent_even_with_two_touching_
     )
     .await
     .expect("create to-one enrichment definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_one_def(),
@@ -443,13 +435,9 @@ async fn forward_apply_re_point_bumps_gen_for_both_old_and_new_parent() {
     )
     .await
     .expect("create to-one enrichment definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_one_def(),
@@ -562,13 +550,9 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
     )
     .await
     .expect("create to-many enrichment definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     let def = TransformDef {
         target: "article_stats".to_string(),
         source: "articles".to_string(),

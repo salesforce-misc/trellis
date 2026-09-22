@@ -477,13 +477,17 @@ mod obligation_matrix {
                 "trellis/tests/defs_backfill_relationship.rs::relationship_build_matches_oracle_including_no_match_and_multi_child",
             ]),
 
-            // --- A composite source primary key (#126, #163, #177) ---
-            (ForwardRead, CompositePrimaryKey) => NotApplicable(
-                "rejected at declare time on every entry point — ddl::require_single_column_pk \
-                 gates install_definition's DDL step and create_definition_inner itself, \
-                 pinned by trellis/tests/defs_catalog.rs::a_one_to_one_transform_against_a_composite_primary_key_source_is_rejected \
-                 and trellis/tests/quarantine.rs::a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted",
-            ),
+            // --- A composite source primary key (#121, #126, #163, #177) ---
+            (ForwardRead, CompositePrimaryKey) => Handled(&[
+                "trellis/tests/one_to_one_composite_primary_key.rs::a_composite_primary_key_transform_converges_inserts_updates_and_deletes \
+                 (issue #121: a 1-1 transform's own source used to be rejected outright at \
+                 declare time when composite-keyed — ddl::require_single_column_pk gated \
+                 install_definition's DDL step and create_definition_inner itself; #121 removed \
+                 that narrowing, so the target's own primary key now mirrors the source's in \
+                 full and this scenario is live)",
+                "trellis/tests/defs_catalog.rs::a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted",
+                "trellis/tests/quarantine.rs::a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt",
+            ]),
             (ReverseDelta, CompositePrimaryKey) => Handled(&[
                 "trellis/tests/defs_relationship_composite_pk.rs::reverse_update_of_the_to_side_row_updates_every_dependent_group",
             ]),

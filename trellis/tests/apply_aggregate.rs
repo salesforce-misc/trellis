@@ -18,7 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
     create_aggregate_target_table, create_definition, create_definition_without_backfill,
-    create_target_table, parse, require_single_column_pk, source_primary_key,
+    create_target_table, parse, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{StagedWatermark, claim, converge, fold};
@@ -2964,18 +2964,16 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
     create_definition_without_backfill(&db.pool, CHAINED_SOURCE, &summary_columns)
         .await
         .expect("create chained definition reading order_summary");
-    let summary_pk = require_single_column_pk(
-        source_primary_key(&db.pool, "order_summary")
-            .await
-            .expect("introspect order_summary's real (single-column) primary key"),
-        "order_summary",
-    )
-    .expect("order_summary's real PK is single-column");
+    let summary_pk = source_primary_key(&db.pool, "order_summary")
+        .await
+        .expect("introspect order_summary's real (single-column) primary key");
     assert_eq!(
-        summary_pk.name, "order_id",
+        summary_pk.len(),
+        1,
         "order_summary's real PK must be its single GROUP BY column"
     );
-    assert_eq!(summary_pk.data_type, "uuid");
+    assert_eq!(summary_pk[0].name, "order_id");
+    assert_eq!(summary_pk[0].data_type, "uuid");
     create_target_table(
         &db.pool,
         &chained_def,

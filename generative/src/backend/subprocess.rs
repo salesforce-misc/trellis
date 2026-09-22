@@ -533,9 +533,7 @@ impl super::Backend for SubprocessBackend {
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {
         use std::collections::BTreeMap;
         use trellis::dev::defs::ast::{KeySpace, ValueType};
-        use trellis::dev::defs::{
-            qualified_target_table, require_single_column_pk, source_primary_key,
-        };
+        use trellis::dev::defs::{qualified_target_table, source_primary_key};
 
         let mut snapshot: Snapshot = BTreeMap::new();
 
@@ -554,13 +552,17 @@ impl super::Backend for SubprocessBackend {
             let qualified = qualified_target_table("public", def);
             let rows = match &def.key_space {
                 KeySpace::OneToOne => {
-                    let pk = require_single_column_pk(
-                        source_primary_key(&self.pool, &def.source).await?,
-                        &def.source,
-                    )?;
+                    // This generative suite never itself constructs a
+                    // composite-PK 1-1 definition, even though `source_primary_key`
+                    // and the engine's own 1-1 target DDL both support one in
+                    // full since issue #121 — narrowed to the first (and,
+                    // for every definition this suite actually generates,
+                    // only) column, matching `sql::read_table`'s single
+                    // `pk_col` contract.
+                    let pk = source_primary_key(&self.pool, &def.source).await?;
                     let target_columns: Vec<crate::model::Column> =
                         std::iter::once(crate::model::Column {
-                            name: pk.name.clone(),
+                            name: pk[0].name.clone(),
                             value_type: ValueType::Numeric,
                         })
                         .chain(def.fields.iter().map(|f| crate::model::Column {
@@ -568,7 +570,7 @@ impl super::Backend for SubprocessBackend {
                             value_type: ValueType::Text,
                         }))
                         .collect();
-                    sql::read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
+                    sql::read_table(&self.raw, &qualified, &pk[0].name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
                     let group_by_names: Vec<String> = group_by

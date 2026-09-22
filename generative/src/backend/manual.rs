@@ -46,7 +46,7 @@ use tokio_postgres::NoTls;
 use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::dev::defs::{
     CatalogError, DdlError, create_relationship, install_definition, qualified_target_table,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 use trellis::dev::staging::{
     StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
@@ -839,18 +839,19 @@ impl super::Backend for ManualBackend {
             let qualified = qualified_target_table(&self.target_schema, def);
             let rows = match &def.key_space {
                 KeySpace::OneToOne => {
-                    // A `KeySpace::OneToOne` target's primary key is always a
-                    // single column (`ddl::require_single_column_pk`'s own
-                    // doc comment) — `source_primary_key` itself now accepts
-                    // an arbitrary-arity source primary key (issue #126), so
-                    // narrow it back down here the same way
-                    // `catalog::install_definition` does at definition time.
-                    let pk = require_single_column_pk(
-                        source_primary_key(&self.pool, &def.source).await?,
-                        &def.source,
-                    )?;
+                    // `source_primary_key` accepts an arbitrary-arity source
+                    // primary key (issue #126), and — since issue #121 — the
+                    // engine's own 1-1 target DDL mirrors a composite key in
+                    // full rather than narrowing it to one column. This
+                    // generative suite, though, never itself constructs a
+                    // composite-PK 1-1 definition (out of this issue's
+                    // scope), and `sql::read_table`'s snapshot reader below
+                    // only takes one `pk_col` name — narrowed to the first
+                    // (and, for every definition this suite actually
+                    // generates, only) column.
+                    let pk = source_primary_key(&self.pool, &def.source).await?;
                     let target_columns: Vec<Column> = std::iter::once(Column {
-                        name: pk.name.clone(),
+                        name: pk[0].name.clone(),
                         value_type: ValueType::Numeric,
                     })
                     .chain(def.fields.iter().map(|f| Column {
@@ -860,7 +861,7 @@ impl super::Backend for ManualBackend {
                         value_type: ValueType::Text,
                     }))
                     .collect();
-                    sql::read_table(&self.raw, &qualified, &pk.name, &target_columns).await?
+                    sql::read_table(&self.raw, &qualified, &pk[0].name, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
                     // The generative suite never constructs a relationship-path

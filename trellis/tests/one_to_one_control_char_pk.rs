@@ -10,7 +10,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::{create_definition, create_target_table, source_primary_key};
+use trellis::defs::{create_definition, create_target_table};
 use trellis::{Client as TrellisClient, ClientOptions};
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -78,13 +78,9 @@ async fn setup(pool: &Pool, raw: &Client) {
     .await
     .expect("create definition");
 
-    let pk = trellis::defs::require_single_column_pk(
-        source_primary_key(pool, "orders")
-            .await
-            .expect("introspect source primary key"),
-        "orders",
-    )
-    .expect("single-column pk");
+    let pk = trellis::defs::source_primary_key(pool, "orders")
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         pool,
         &totals_def(),

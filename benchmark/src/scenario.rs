@@ -31,8 +31,7 @@ use tokio_postgres::{Client as RawClient, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::{
     ValueType, backfill_definition, create_aggregate_target_table,
-    create_definition_without_backfill, create_target_table, parse, require_single_column_pk,
-    source_primary_key,
+    create_definition_without_backfill, create_target_table, parse, source_primary_key,
 };
 
 use crate::generate;
@@ -132,13 +131,9 @@ pub async fn run(name: &str, n: i64, g: i64, ceiling: Duration) -> BenchResult {
     create_definition_without_backfill(&db.pool, calc_source, &posts_columns)
         .await
         .expect("create posts_calc definition");
-    let posts_pk = require_single_column_pk(
-        source_primary_key(&db.pool, "posts")
-            .await
-            .expect("introspect posts primary key"),
-        "posts",
-    )
-    .expect("posts has a single-column primary key");
+    let posts_pk = source_primary_key(&db.pool, "posts")
+        .await
+        .expect("introspect posts primary key");
     create_target_table(
         &db.pool,
         &calc_def,

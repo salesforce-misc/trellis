@@ -375,10 +375,10 @@ pub async fn self_check(
         });
     }
 
-    let pk = ddl::require_single_column_pk(
-        ddl::source_primary_key(pool, &def.source_table).await?,
-        &def.source_table,
-    )?;
+    // Issue #121: this audit now keys on the source's full (possibly
+    // composite) primary key, through the shared key-contract text
+    // (`ddl::pk_key_sql_expr`) rather than a single named column.
+    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
 
     let schema_divergences = check_schema(pool, &def, &pk).await?;
     let paused = paused_columns(pool, &def.def.target).await?;
@@ -526,7 +526,7 @@ enum AwaitOutcome {
 async fn await_then_compare(
     pool: &Pool,
     def: &Definition,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
     scope: &SelfCheckScope,
     paused: &HashSet<String>,
     timeout: Duration,
@@ -556,7 +556,7 @@ async fn await_then_compare(
 async fn compare_once(
     pool: &Pool,
     def: &Definition,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
     scope: &SelfCheckScope,
     paused: &HashSet<String>,
     checked_through: PgLsn,
@@ -579,11 +579,20 @@ async fn compare_once(
         .filter(|f| !paused.contains(&f.name))
         .collect();
 
-    let pk_ident = quote_ident(&pk.name);
+    // Issue #121: `pk_key_expr` is the source/target's shared key-contract
+    // text at whatever arity `pk` has (a bare `{col}::text` at arity 1,
+    // byte-identical to before this issue). Both queries below page and order
+    // by this same text on both sides, so — while that's not necessarily the
+    // key's own *typed* order at arity > 1 — it's the same order on both
+    // sides, which is all a divergence detector that only ever compares the
+    // two sides key-by-key actually needs (this was already true of a plain
+    // `pk::text` order at arity 1, e.g. a numeric key sorting lexicographically
+    // rather than numerically).
+    let pk_key_expr = ddl::pk_key_sql_expr(pk, None);
     let source_ident = ddl::qualified_source_table(&def.source_table);
     let target_ident = ddl::qualified_target_table_ident(&def.target_table);
 
-    let mut recompute_select = vec![format!("{pk_ident}::text")];
+    let mut recompute_select = vec![pk_key_expr.clone()];
     for field in &comparable {
         let leaf = render_leaf(&field.expr).map_err(|detail| SelfCheckError::UnsupportedExpr {
             target: def.def.target.clone(),
@@ -592,18 +601,18 @@ async fn compare_once(
         recompute_select.push(format!("({leaf})::text"));
     }
     let recompute_sql = format!(
-        "select {} from {source_ident} where ($1::text is null or {pk_ident}::text > $1) \
-         order by {pk_ident}::text limit $2",
+        "select {} from {source_ident} where ($1::text is null or {pk_key_expr} > $1) \
+         order by {pk_key_expr} limit $2",
         recompute_select.join(", ")
     );
 
-    let mut persisted_select = vec![format!("{pk_ident}::text")];
+    let mut persisted_select = vec![pk_key_expr.clone()];
     for field in &comparable {
         persisted_select.push(format!("{}::text", quote_ident(&field.name)));
     }
     let persisted_sql = format!(
-        "select {} from {target_ident} where ($1::text is null or {pk_ident}::text > $1) \
-         order by {pk_ident}::text limit $2",
+        "select {} from {target_ident} where ($1::text is null or {pk_key_expr} > $1) \
+         order by {pk_key_expr} limit $2",
         persisted_select.join(", ")
     );
 
@@ -741,7 +750,7 @@ async fn paused_columns(
 async fn check_schema(
     pool: &Pool,
     def: &Definition,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
 ) -> Result<Vec<Divergence>, SelfCheckError> {
     let client = pool.get().await?;
     let rows = client
@@ -754,8 +763,8 @@ async fn check_schema(
         .await?;
     let actual: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
 
-    let mut expected: HashSet<String> = HashSet::with_capacity(def.def.fields.len() + 1);
-    expected.insert(pk.name.clone());
+    let mut expected: HashSet<String> = HashSet::with_capacity(def.def.fields.len() + pk.len());
+    expected.extend(pk.iter().map(|c| c.name.clone()));
     for field in &def.def.fields {
         expected.insert(field.name.clone());
     }

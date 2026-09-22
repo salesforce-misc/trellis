@@ -352,13 +352,9 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
     )
     .await
     .expect("create definition");
-    let pk = trellis::defs::require_single_column_pk(
-        trellis::defs::source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = trellis::defs::source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -493,13 +489,9 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     )
     .await
     .expect("create definition");
-    let pk = trellis::defs::require_single_column_pk(
-        trellis::defs::source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = trellis::defs::source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");

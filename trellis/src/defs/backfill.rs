@@ -75,8 +75,7 @@ use super::ast::{
     group_by_contains,
 };
 use super::ddl::{
-    self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, require_single_column_pk,
-    source_primary_key,
+    self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
 use super::model::RelationshipCardinality;
@@ -197,17 +196,16 @@ pub async fn backfill_definition(
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::OneToOne => {
-            // Issue #126: the 1-1 direct build's PK-range chunking
-            // (`discover_pk_ranges`/`write_one_to_one_range`) only knows how
-            // to order/compare a single scalar column — narrow down here,
-            // same as `catalog::install_definition`'s own DDL call site (in
-            // practice this def's target table already failed DDL for a
-            // composite-PK source before backfill is ever reached, so this
-            // is a defensive re-check, not the primary enforcement point).
-            let pk = require_single_column_pk(
-                source_primary_key(pool, source_table).await?,
-                source_table,
-            )?;
+            // Issue #121: the 1-1 direct build's PK-range chunking
+            // (`discover_pk_ranges`/`write_one_to_one_range`) now orders and
+            // compares the source's full (possibly composite) primary key via
+            // row-value comparison (`(c0, c1, ...) > (v0, v1, ...)`), which
+            // Postgres evaluates lexicographically — matching a plain
+            // `ORDER BY c0, c1, ...` — and which degenerates to a bare scalar
+            // comparison at arity 1 (Postgres parses a single parenthesized
+            // expression as that expression, not a one-element row
+            // constructor), so this is no longer narrowed to a single column.
+            let pk = source_primary_key(pool, source_table).await?;
             if uses_relationships(def) {
                 backfill_relationship_one_to_one(pool, def, target_schema, source_table, &pk).await
             } else {
@@ -489,21 +487,23 @@ pub(crate) fn substituted_field_exprs(
 /// The 1-1 build: walk the source primary key in half-open `(lo, hi]` ranges,
 /// each `INSERT … SELECT … ON CONFLICT DO UPDATE`-ing one bounded chunk.
 ///
-/// Range discovery reads the max PK of the next `BACKFILL_CHUNK_ROWS` source
-/// rows above `lo` (`select max(pk) from (select pk … where pk > lo order by
-/// pk limit N)`); that max becomes `hi`, the chunk covers `pk > lo and pk <=
-/// hi`, and the next `lo` is this `hi`. When the discovery query returns `NULL`
-/// (no rows left above `lo`) the walk stops. Every source row's PK is `> lo`
-/// for exactly one range and `<= hi` for that same range, so the ranges
-/// partition the source exactly once with no gap or overlap — the off-by-one
-/// this structure guards against is exactly what
+/// Range discovery reads the lexicographically-largest key of the next
+/// `BACKFILL_CHUNK_ROWS` source rows above `lo` (see [`discover_pk_ranges`]);
+/// that becomes `hi`, the chunk covers `pk > lo and pk <= hi` (row-value
+/// comparison, issue #121 — a composite key's own declared column order,
+/// matching Postgres's own `ORDER BY c0, c1, ...` and degenerating to a bare
+/// scalar comparison at arity 1), and the next `lo` is this `hi`. When
+/// discovery finds no rows left above `lo` the walk stops. Every source row's
+/// PK is `> lo` for exactly one range and `<= hi` for that same range, so the
+/// ranges partition the source exactly once with no gap or overlap — the
+/// off-by-one this structure guards against is exactly what
 /// `defs_backfill_direct`'s boundary test exercises.
 async fn backfill_one_to_one(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
 ) -> Result<(), BackfillError> {
     // Substitute any cross-field-alias reference (e.g. `total = double_price +
     // tax` where `double_price` is itself a field) with a deep copy of the
@@ -575,15 +575,15 @@ async fn write_one_to_one_range(
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
     substituted: &[Expr],
-    lo: &Option<String>,
-    hi: &str,
+    lo: &Option<Vec<String>>,
+    hi: &[String],
 ) -> Result<(), BackfillError> {
     let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
-    let pk_ident = quote_ident(&pk.name);
-    let pk_cast = pk.data_type.as_str();
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let pk_col_list = pk_idents.join(", ");
 
     // ADR-0003's amendment (column-level quarantine): exclude any column
     // this definition currently has paused from both the computed column
@@ -605,11 +605,15 @@ async fn write_one_to_one_range(
         .map(|(_, expr)| render_expr_sql(expr))
         .collect();
 
-    let insert_cols = std::iter::once(pk_ident.clone())
+    let insert_cols = pk_idents
+        .iter()
+        .cloned()
         .chain(field_idents.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
-    let select_exprs = std::iter::once(pk_ident.clone())
+    let select_exprs = pk_idents
+        .iter()
+        .cloned()
         .chain(field_exprs.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
@@ -621,17 +625,17 @@ async fn write_one_to_one_range(
     // still gets its bare row inserted via the same statement's `insert`
     // half.
     let on_conflict = if field_idents.is_empty() {
-        format!("on conflict ({pk_ident}) do nothing")
+        format!("on conflict ({pk_col_list}) do nothing")
     } else {
         let update_sets = field_idents
             .iter()
             .map(|f| format!("{f} = excluded.{f}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("on conflict ({pk_ident}) do update set {update_sets}")
+        format!("on conflict ({pk_col_list}) do update set {update_sets}")
     };
 
-    let where_clause = pk_range_where(&pk_ident, pk_cast, lo);
+    let where_clause = pk_range_where(&pk_idents, pk, lo);
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
          select {select_exprs} from {source} where {where_clause} \
@@ -639,10 +643,18 @@ async fn write_one_to_one_range(
     );
     match lo {
         None => {
-            client.execute(&insert_sql, &[&hi]).await?;
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                hi.iter().map(|v| v as _).collect();
+            client.execute(&insert_sql, &params).await?;
         }
         Some(lo) => {
-            client.execute(&insert_sql, &[lo, &hi]).await?;
+            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                lo.iter().map(|v| v as _).collect();
+            params.extend(
+                hi.iter()
+                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)),
+            );
+            client.execute(&insert_sql, &params).await?;
         }
     }
     Ok(())
@@ -662,10 +674,22 @@ pub(crate) async fn plan_one_to_one_chunks(
     source_table: &str,
 ) -> Result<Vec<(Option<String>, String)>, BackfillError> {
     let _ = substitute_all_fields(def)?;
-    let pk = require_single_column_pk(source_primary_key(pool, source_table).await?, source_table)?;
+    let pk = source_primary_key(pool, source_table).await?;
     let source = ddl::qualified_source_table(source_table);
     let client = pool.get().await?;
-    discover_pk_ranges(&client, &source, &pk).await
+    let ranges = discover_pk_ranges(&client, &source, &pk).await?;
+    // `backfill_chunks.lo`/`.hi` (V20__backfill_chunks.sql) are each a single
+    // `text` column — issue #121 reuses this crate's existing composite-key
+    // identity text ([`ddl::join_pk_key`], the same encoding
+    // `crate::intake::extract_key`/`ddl::pk_key_sql_expr` already use
+    // everywhere else) to fold a multi-column bound into that one column
+    // rather than widening the schema, and degenerates to the bound's own
+    // single value, verbatim, at arity 1 (byte-identical to before this
+    // issue). [`execute_one_to_one_chunk`] decodes it back the same way.
+    Ok(ranges
+        .into_iter()
+        .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+        .collect())
 }
 
 /// Executes exactly one previously-[`plan_one_to_one_chunks`]-enumerated
@@ -683,9 +707,23 @@ pub(crate) async fn execute_one_to_one_chunk(
     lo: Option<&str>,
     hi: &str,
 ) -> Result<(), BackfillError> {
-    let pk = require_single_column_pk(source_primary_key(pool, source_table).await?, source_table)?;
+    let pk = source_primary_key(pool, source_table).await?;
     let substituted = substitute_all_fields(def)?;
     let client = pool.get().await?;
+    // The exact inverse of [`plan_one_to_one_chunks`]'s encode: a genuine
+    // primary-key column (every real `PRIMARY KEY`, at any arity) is never
+    // `NULL`, so every part decodes to `Some` here in practice — propagated
+    // as a typed [`ddl::DdlError::MalformedCompositeKey`] via `From`, rather
+    // than assumed, should stale/corrupt `backfill_chunks` data ever say
+    // otherwise.
+    let decode = |text: &str| -> Result<Vec<String>, BackfillError> {
+        Ok(ddl::split_pk_key(&pk, source_table, text)?
+            .into_iter()
+            .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
+            .collect())
+    };
+    let lo = lo.map(decode).transpose()?;
+    let hi = decode(hi)?;
     write_one_to_one_range(
         &client,
         def,
@@ -693,78 +731,152 @@ pub(crate) async fn execute_one_to_one_chunk(
         source_table,
         &pk,
         &substituted,
-        &lo.map(|s| s.to_string()),
-        hi,
+        &lo,
+        &hi,
     )
     .await
 }
 
 /// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
-/// in order (the first range's `lo` is `None`, meaning "`pk <= hi`"). Each `hi`
-/// is the max PK of the next `BACKFILL_CHUNK_ROWS` rows above the previous `hi`
-/// (`max()`-over-`LIMIT`); the walk stops when no rows remain above the last
-/// boundary. The ranges partition the source exactly once with no gap or
-/// overlap regardless of gaps in the key values. Shared by both 1-1 builds so
-/// the plain and relationship-enriched paths chunk identically — see
-/// [`backfill_one_to_one`]'s doc comment for the off-by-one this guards against.
-/// `source` is the already-quoted source table identifier.
+/// in order (the first range's `lo` is `None`, meaning "`pk <= hi`"). Each
+/// `hi` is the lexicographically-largest key (in the primary key's own
+/// declared column order — issue #163's convention, same as
+/// [`ddl::pk_key_sql_expr`]) of the next `BACKFILL_CHUNK_ROWS` rows above the
+/// previous `hi`: the inner query orders ascending and takes the page, the
+/// outer query re-sorts descending (`nulls last`, so a `NULL` component —
+/// only reachable when `source` is itself a nullable-`GROUP BY` aggregate
+/// target, never a real `PRIMARY KEY` — sorts as if absent, mirroring a
+/// single-column `max()`'s own null-skipping) and takes the first row —
+/// exactly [`max`](https://www.postgresql.org/docs/current/functions-aggregate.html)'s
+/// answer at arity 1 (Postgres has no `max()` over an anonymous row type, so
+/// this is the composite generalization, issue #121), and byte-identical SQL
+/// at arity 1 to a bare column reference (a one-element parenthesized
+/// expression is not a row constructor). The walk stops when no rows remain
+/// above the last boundary. The ranges partition the source exactly once with
+/// no gap or overlap regardless of gaps in the key values. Shared by both 1-1
+/// builds so the plain and relationship-enriched paths chunk identically —
+/// see [`backfill_one_to_one`]'s doc comment for the off-by-one this guards
+/// against. `source` is the already-quoted source table identifier.
 async fn discover_pk_ranges(
     client: &Client,
     source: &str,
-    pk: &PrimaryKeyColumn,
-) -> Result<Vec<(Option<String>, String)>, BackfillError> {
-    let pk_ident = quote_ident(&pk.name);
-    let pk_cast = pk.data_type.as_str();
+    pk: &[PrimaryKeyColumn],
+) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let col_list = pk_idents.join(", ");
+    // Qualified with the inner subquery's own alias (`s.`), not bare column
+    // names: the outer `select` below casts each column to `::text`, and an
+    // unaliased `<col>::text` output column is named after `<col>` itself
+    // (confirmed live: `select id::text from t` reports its own output
+    // column as `id`, not `text`) — so a *bare* `order by <col>` out here
+    // would resolve to that same-named *output* column instead of the
+    // subquery's input column (Postgres prefers an output-list name over an
+    // input one when both match), silently sorting by the text cast's
+    // lexicographic order instead of the column's own native order
+    // (`'9999' > '50000'` as text, `9999 < 50000` as bigint) — reproduced
+    // live: without this qualification, a 100k-row `bigint`-keyed backfill's
+    // first chunk boundary was wrongly discovered as `9999` instead of
+    // `50000`, silently reprocessing (not skipping — the overwrite upsert
+    // this build uses is idempotent, so this never lost or corrupted a row,
+    // only over-chunked) rows 10000..50000 in both chunks. Qualifying with
+    // `s.` pins the sort to the input column unambiguously, regardless of
+    // what the output side happens to be named.
+    let order_desc = pk_idents
+        .iter()
+        .map(|c| format!("s.{c} desc nulls last"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hi_select = pk_idents
+        .iter()
+        .map(|c| format!("{c}::text"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let mut ranges = Vec::new();
-    let mut lo: Option<String> = None;
+    let mut lo: Option<Vec<String>> = None;
     loop {
-        let hi: Option<String> = match &lo {
+        let row = match &lo {
             None => {
-                let row = client
-                    .query_one(
+                client
+                    .query_opt(
                         &format!(
-                            "select max({pk_ident})::text from \
-                             (select {pk_ident} from {source} \
-                              order by {pk_ident} limit {BACKFILL_CHUNK_ROWS}) s"
+                            "select {hi_select} from \
+                             (select {col_list} from {source} \
+                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                             order by {order_desc} limit 1"
                         ),
                         &[],
                     )
-                    .await?;
-                row.get(0)
+                    .await?
             }
-            Some(lo) => {
-                let row = client
-                    .query_one(
+            Some(lo_vals) => {
+                let where_clause = pk_row_cmp(&pk_idents, pk, ">", 0);
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    lo_vals.iter().map(|v| v as _).collect();
+                client
+                    .query_opt(
                         &format!(
-                            "select max({pk_ident})::text from \
-                             (select {pk_ident} from {source} \
-                              where {pk_ident} > $1::text::{pk_cast} \
-                              order by {pk_ident} limit {BACKFILL_CHUNK_ROWS}) s"
+                            "select {hi_select} from \
+                             (select {col_list} from {source} where {where_clause} \
+                              order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
+                             order by {order_desc} limit 1"
                         ),
-                        &[lo],
+                        &params,
                     )
-                    .await?;
-                row.get(0)
+                    .await?
             }
         };
-        let Some(hi) = hi else {
+        let Some(row) = row else {
             break;
         };
+        let hi: Vec<String> = (0..pk.len()).map(|i| row.get(i)).collect();
         ranges.push((lo.clone(), hi.clone()));
         lo = Some(hi);
     }
     Ok(ranges)
 }
 
-/// The `where` predicate restricting a PK-range chunk to `(lo, hi]`, binding the
-/// bounds as `$1` (and `$2` when `lo` is present). Paired with
-/// [`discover_pk_ranges`]; the caller binds `hi` (first chunk) or `lo, hi`.
-fn pk_range_where(pk_ident: &str, pk_cast: &str, lo: &Option<String>) -> String {
+/// One row-value comparison (`(c0, c1, ...) {op} ($n::text::t0, ...)`) against
+/// `pk`'s own columns, `param_offset` binds ahead of the first one this call
+/// renders — the shared building block [`pk_range_where`] composes into a
+/// full `(lo, hi]` predicate, and [`discover_pk_ranges`]'s lower-bound-only
+/// probe uses directly. Degenerates to a bare scalar comparison at arity 1
+/// (Postgres parses a single parenthesized expression as that expression, not
+/// a one-element row constructor), so this is byte-identical SQL to the
+/// pre-#121 single-column form there.
+fn pk_row_cmp(
+    pk_idents: &[String],
+    pk: &[PrimaryKeyColumn],
+    op: &str,
+    param_offset: usize,
+) -> String {
+    let cols = pk_idents.join(", ");
+    let binds = pk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("${}::text::{}", param_offset + i + 1, c.data_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({cols}) {op} ({binds})")
+}
+
+/// The `where` predicate restricting a PK-range chunk to `(lo, hi]` (issue
+/// #121: row-value comparison over `pk`'s full column list, not a single
+/// scalar), binding the bounds as `$1..$n` (and `$n+1..$2n` when `lo` is
+/// present, `n = pk.len()`). Paired with [`discover_pk_ranges`]; the caller
+/// binds `hi` (first chunk) or `lo, hi`.
+fn pk_range_where(
+    pk_idents: &[String],
+    pk: &[PrimaryKeyColumn],
+    lo: &Option<Vec<String>>,
+) -> String {
     match lo {
-        None => format!("{pk_ident} <= $1::text::{pk_cast}"),
-        Some(_) => {
-            format!("{pk_ident} > $1::text::{pk_cast} and {pk_ident} <= $2::text::{pk_cast}")
-        }
+        None => pk_row_cmp(pk_idents, pk, "<=", 0),
+        Some(_) => format!(
+            "{} and {}",
+            pk_row_cmp(pk_idents, pk, ">", 0),
+            pk_row_cmp(pk_idents, pk, "<=", pk.len()),
+        ),
     }
 }
 
@@ -1489,7 +1601,7 @@ async fn backfill_relationship_one_to_one(
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
-    pk: &PrimaryKeyColumn,
+    pk: &[PrimaryKeyColumn],
 ) -> Result<(), BackfillError> {
     // Resolve every referenced relationship to its endpoints + cardinality the
     // same way the rest of the catalog does (`relationship_by_name`), so this
@@ -1556,9 +1668,12 @@ async fn backfill_relationship_one_to_one(
 
     let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
-    let pk_ident = quote_ident(&pk.name);
-    let pk_cast = pk.data_type.as_str();
-    let pk_qualified = format!("{source}.{pk_ident}");
+    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let pk_col_list = pk_idents.join(", ");
+    let pk_qualified: Vec<String> = pk_idents
+        .iter()
+        .map(|ident| format!("{source}.{ident}"))
+        .collect();
 
     let client = pool.get().await?;
 
@@ -1646,11 +1761,15 @@ async fn backfill_relationship_one_to_one(
         })
         .collect::<Result<_, _>>()?;
 
-    let insert_cols = std::iter::once(pk_ident.clone())
+    let insert_cols = pk_idents
+        .iter()
+        .cloned()
         .chain(field_idents.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
-    let select_exprs = std::iter::once(pk_qualified.clone())
+    let select_exprs = pk_qualified
+        .iter()
+        .cloned()
         .chain(select_field_exprs.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
@@ -1660,14 +1779,14 @@ async fn backfill_relationship_one_to_one(
     // brand-new key still gets its bare row inserted via the same
     // statement's `insert` half.
     let on_conflict = if field_idents.is_empty() {
-        format!("on conflict ({pk_ident}) do nothing")
+        format!("on conflict ({pk_col_list}) do nothing")
     } else {
         let update_sets = field_idents
             .iter()
             .map(|f| format!("{f} = excluded.{f}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("on conflict ({pk_ident}) do update set {update_sets}")
+        format!("on conflict ({pk_col_list}) do update set {update_sets}")
     };
 
     // Each relationship's staging table LEFT JOINed to the source on its join
@@ -1684,7 +1803,7 @@ async fn backfill_relationship_one_to_one(
         .join(" ");
 
     for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
-        let where_clause = pk_range_where(&pk_qualified, pk_cast, &lo);
+        let where_clause = pk_range_where(&pk_qualified, pk, &lo);
         let insert_sql = format!(
             "insert into {target} ({insert_cols}) \
              select {select_exprs} from {source} {joins} where {where_clause} \
@@ -1692,10 +1811,18 @@ async fn backfill_relationship_one_to_one(
         );
         match &lo {
             None => {
-                client.execute(&insert_sql, &[&hi]).await?;
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    hi.iter().map(|v| v as _).collect();
+                client.execute(&insert_sql, &params).await?;
             }
             Some(lo) => {
-                client.execute(&insert_sql, &[lo, &hi]).await?;
+                let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    lo.iter().map(|v| v as _).collect();
+                params.extend(
+                    hi.iter()
+                        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)),
+                );
+                client.execute(&insert_sql, &params).await?;
             }
         }
     }

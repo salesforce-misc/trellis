@@ -621,32 +621,14 @@ pub async fn install_definition(
 
     match &def.key_space {
         KeySpace::OneToOne => {
+            // Issue #121: the 1-1 target table's own primary key mirrors the
+            // source's in full — at whatever arity the source declares it —
+            // rather than narrowing to a single column. `create_target_table`
+            // renders a composite `pk` as a real, multi-column `primary key
+            // (...)` constraint.
             let pk = ddl::source_primary_key(pool, &qualified_source)
                 .await
                 .map_err(CatalogError::Ddl)?;
-            // Issue #126: `source_primary_key` itself now accepts a
-            // composite source primary key, but the 1-1 target table's own
-            // primary key (built just below) still mirrors the source's as
-            // one column — narrow back down here, at the one 1-1-specific
-            // call site, rather than inside `source_primary_key` itself.
-            //
-            // Issue #177: this same arity check now also runs inside
-            // `create_definition_inner` itself, after that function resolves
-            // its own `qualified_source` and runs its cycle/collision checks,
-            // but before its initial backfill enumeration — see that check's
-            // own doc comment for why it's placed there rather than at the
-            // very top, unlike the aggregate replica-identity check beside it.
-            // This function eventually calls `create_definition_inner` too
-            // (below), so a composite source is rejected either way. This
-            // copy stays regardless: it isn't just a redundant fail-fast
-            // guard for a different entry point (contrast
-            // `create_definition_inner`'s aggregate replica-identity check,
-            // which really is that), it's what produces the narrowed
-            // single-column `pk` value `ddl::create_target_table`'s own
-            // signature requires just below — removing this call would mean
-            // restructuring that DDL step, not just deleting a guard.
-            let pk =
-                ddl::require_single_column_pk(pk, &qualified_source).map_err(CatalogError::Ddl)?;
             ddl::create_target_table(
                 pool,
                 &def,
@@ -1333,14 +1315,16 @@ async fn create_definition_inner(
         });
     }
 
-    // Issue #177: a `OneToOne` target's own primary key (built by
-    // `install_definition`'s DDL step, or mirrored implicitly by the
-    // ring-based `staging::apply` machinery for the entry points below that
-    // never run any DDL themselves) is always a single column narrowed down
-    // from the source's own — reject up front, before this transaction's one
-    // remaining side effect below (the initial backfill enumeration, which
-    // actually queries `qualified_source`'s live rows), if the source's
-    // primary key is composite.
+    // Issue #121 (previously issue #177's arity gate): fail fast on a
+    // `OneToOne` source with no primary key at all, or an unsafe-to-key-on
+    // primary key type, before this transaction's one remaining side effect
+    // below (the initial backfill enumeration, which actually queries
+    // `qualified_source`'s live rows) — a composite (multi-column) source
+    // primary key is no longer rejected here: it mirrors onto the target as
+    // a real composite primary key (`ddl::create_target_table`), and every
+    // 1-1 consumer downstream (backfill, live CDC apply, quarantine,
+    // self-check) now renders/compares it through the shared, arity-generic
+    // key-contract text instead of assuming a single scalar column.
     //
     // Checked here — after node/edge resolution and the cycle/collision
     // checks above, not immediately after `qualified_source` resolves, even
@@ -1361,25 +1345,15 @@ async fn create_definition_inner(
     // enumeration just below — the first place this function would
     // otherwise *use* that live relation for real — so a doomed-to-fail 1-1
     // definition never enumerates its source table.
-    //
-    // Without this, [`create_definition`]/[`create_definition_without_backfill`]
-    // — the two ring-path entry points, which never call [`install_definition`]
-    // and so never run its own copy of this same check (see that function's
-    // own call site, just below its `KeySpace::OneToOne` match arm) — let a
-    // composite-PK source reach `staging::apply`'s own `require_single_column_pk`
-    // call deep in the backfill/apply pipeline instead. By that point it's
-    // deep enough in the pipeline that it surfaces as a whole-instance halt
-    // rather than a clean, typed rejection of just this one definition.
     // Run against `txn`, not a second pooled connection (`ddl::source_primary_key`'s
     // own `pool`-taking form): this function is mid-transaction here, so taking
     // another connection would risk a pool-exhaustion deadlock and would read the
     // source relation's shape on a different snapshot than every other check
     // around it — see [`ddl::source_primary_key_in_txn`]'s own doc comment.
     if let KeySpace::OneToOne = &def.key_space {
-        let pk = ddl::source_primary_key_in_txn(&*txn, &qualified_source)
+        ddl::source_primary_key_in_txn(&*txn, &qualified_source)
             .await
             .map_err(CatalogError::Ddl)?;
-        ddl::require_single_column_pk(pk, &qualified_source).map_err(CatalogError::Ddl)?;
     }
 
     // Issue #23: a definition's initial backfill is one enumeration of its

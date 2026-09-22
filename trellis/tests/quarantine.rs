@@ -20,7 +20,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     DdlError, create_aggregate_target_table, create_definition, create_target_table, parse,
-    recompute, require_single_column_pk, source_primary_key,
+    recompute, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
@@ -160,13 +160,9 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     .await
     .expect("create definition");
     let def = order_totals_def();
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -577,13 +573,9 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     )
     .await
     .expect("create order_summary definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &summary_def.def,
@@ -651,32 +643,29 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
     );
 }
 
-/// Scenario: a composite source primary key (`DdlError::CompositePrimaryKeyUnsupported`)
-/// against a `OneToOne` target used to be exactly as structural as the hop
-/// bound below — "this definition can never work against this source's real
-/// schema," not "this row's data is bad" — so it used to halt the instance
-/// rather than get isolated and evicted key by key, because
-/// `create_definition` (the ring-path entry point this test uses, unlike
-/// `install_definition`) never ran the composite-PK arity check at all: it
-/// only ran deep inside `staging::apply`'s own `require_single_column_pk`
-/// call, well after CDC rows had already been staged.
-///
-/// Issue #177 closed that gap: `create_definition_inner` now runs the same
-/// arity check itself, before it enumerates a single source row — so
-/// `create_definition` below now rejects this source synchronously, with a
-/// clean, typed `CatalogError`, and the scenario can no longer reach the
-/// ring/CDC/apply machinery this test used to have to drive at all. See
-/// `defs_catalog.rs`'s
-/// `a_one_to_one_transform_against_a_composite_primary_key_source_is_rejected`
-/// for the test that now pins that rejection directly. This test instead
-/// pins the *absence* of the old halt: no row is persisted, so nothing is
-/// left for a later `drain_once` to ever halt on, and
-/// `halting_stop_stats`/quarantine bookkeeping are both untouched.
+/// Scenario: a composite source primary key used to be exactly as structural
+/// a rejection as the hop bound below (`DdlError::CompositePrimaryKeyUnsupported`,
+/// pre-issue-#121) — "this definition can never work against this source's
+/// real schema," not "this row's data is bad." Issue #121 lifted that
+/// rejection: a `OneToOne` transform against a composite-PK source is now
+/// accepted at create time and drains through the ring exactly like any
+/// other 1-1 definition, so this test's own scenario no longer has anything
+/// to reject — it instead pins the positive replacement: `create_definition`
+/// against a composite-PK source succeeds, a live CDC insert drains cleanly
+/// through the same `staging::apply` path this quarantine-focused test file
+/// exercises for every other scenario, and neither `halting_stop_stats` nor
+/// quarantine bookkeeping ever engages, because there is no failure left to
+/// isolate or halt on. `defs_catalog.rs`'s
+/// `a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted`
+/// and `one_to_one_composite_primary_key.rs`'s end-to-end insert/update/delete
+/// coverage are the more direct pins of this behavior; this test's own value
+/// is narrower — confirming the old halt/quarantine path this file is about
+/// genuinely never engages for this shape any more.
 #[tokio::test]
-async fn a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted() {
+async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -685,41 +674,73 @@ async fn a_composite_primary_key_source_is_rejected_at_create_time_not_quarantin
         )
         .await
         .expect("create source table with a composite primary key");
+    // Seeded before `create_definition` so its own initial backfill
+    // enumeration (`intake::publication::enumerate_and_append`) stages this
+    // row as a `Recompute` into the ring, exercising the same
+    // `staging::apply` drain path (pre-lock/upsert, no-op-suppression, key
+    // decoding) every other scenario in this file drives.
+    client
+        .execute(
+            "insert into order_lines (order_id, line_no, price) values (1, 1, 9.99)",
+            &[],
+        )
+        .await
+        .expect("seed a source row");
 
     let before = trellis::staging::halting_stop_stats(&db.pool)
         .await
         .expect("halting_stop_stats before");
 
     let source_columns = numeric_columns(&["order_id", "line_no", "price"]);
-    let err = create_definition(
+    let transform_text = "TRANSFORM line_totals FROM order_lines SELECT price AS total";
+    create_definition(&db.pool, transform_text, &source_columns)
+        .await
+        .expect("issue #121: a composite-PK source is accepted, not rejected");
+    // `create_definition` is the ring-path entry point (deliberately, not
+    // `install_definition`) — it never runs target-table DDL itself, so the
+    // caller builds the physical target here, matching `seed_order_totals`'s
+    // own convention just above in this file.
+    let def = parse(transform_text).expect("parse the transform");
+    let pk = source_primary_key(&db.pool, "order_lines")
+        .await
+        .expect("introspect the composite source primary key");
+    create_target_table(
         &db.pool,
-        "TRANSFORM line_totals FROM order_lines SELECT price AS total",
+        &def,
+        "public",
+        &pk,
         &source_columns,
+        "order_lines",
     )
     .await
-    .unwrap_err();
+    .expect("create the composite-PK target table");
 
-    match &err {
-        trellis::defs::CatalogError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. }) => {}
-        other => panic!(
-            "expected create_definition to reject this up front with \
-             CompositePrimaryKeyUnsupported, got {other:?}"
-        ),
-    }
+    let seg_seq = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg_seq, "worker").await;
+
+    let total: String = client
+        .query_one(
+            "select total::text from line_totals where order_id = 1 and line_no = 1",
+            &[],
+        )
+        .await
+        .expect("the composite-PK target row was written")
+        .get(0);
+    assert_eq!(total, "9.99");
 
     assert_eq!(
-        key_deaths_count(&client, "order_lines", "1").await,
+        key_deaths_count(&client, "order_lines", "1\u{1f}1").await,
         None,
-        "a create-time rejection must never charge any key a death"
+        "a clean drain must never charge any key a death"
     );
-    assert!(!poison_marker_exists(&client, "order_lines", "1").await);
+    assert!(!poison_marker_exists(&client, "order_lines", "1\u{1f}1").await);
 
     let after = trellis::staging::halting_stop_stats(&db.pool)
         .await
         .expect("halting_stop_stats after");
     assert_eq!(
         after.stop_count, before.stop_count,
-        "a clean create-time rejection must not register as an instance halt"
+        "a clean drain must not register as an instance halt"
     );
 }
 
@@ -732,17 +753,16 @@ async fn a_composite_primary_key_source_is_rejected_at_create_time_not_quarantin
 /// `ddl::source_primary_key`/`require_single_column_pk` at all, so the
 /// rejection only ever surfaced later, deep inside `staging::apply`.
 ///
-/// Issue #177's fix closes this gap too, not just the composite-arity one:
-/// `create_definition_inner`'s new `KeySpace::OneToOne` check calls
-/// `ddl::source_primary_key` itself (the same call `install_definition`
-/// already made), and that function's own type check
+/// Issue #177's fix closes this gap too, not just the composite-arity one
+/// (which issue #121 later removed the rejection for — see this test's
+/// sibling immediately above): `create_definition_inner`'s `KeySpace::OneToOne`
+/// check calls `ddl::source_primary_key` itself (the same call
+/// `install_definition` already made), and that function's own type check
 /// (`is_text_stable_join_key_type`) runs unconditionally as part of fetching
 /// the primary key — there's no way to ask it for "just the columns, skip
-/// the type check," so this scenario is rejected up front now too, by the
-/// very same call that fixes the composite case. This test now pins the
-/// *absence* of the old halt, mirroring
-/// `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`
-/// immediately above.
+/// the type check" — so this scenario is still rejected up front. This test
+/// pins the *absence* of the old halt, the same shape its sibling above
+/// pins for the (now-accepted) composite-arity case.
 ///
 /// `numeric` is the unsafe type here — `timestamptz` used to be this test's
 /// example, but issue #246 (pinning `TimeZone` on the walsender the same way

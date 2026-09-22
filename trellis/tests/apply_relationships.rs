@@ -27,7 +27,7 @@ use trellis::defs::ast::{
 };
 use trellis::defs::{
     create_definition, create_relationship, create_target_table, render_relationship_select_sql,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 use trellis::staging::apply;
 use trellis::staging::{
@@ -350,13 +350,9 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
     )
     .await
     .expect("create to-one enrichment definition through the front door");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_one_def(),

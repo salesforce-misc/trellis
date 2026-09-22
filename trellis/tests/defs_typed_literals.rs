@@ -39,7 +39,7 @@ use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
     PgType, chunk_queue, create_definition, create_target_table, install_definition, parse,
-    recompute, render_expr_sql, require_single_column_pk, source_primary_key, validate,
+    recompute, render_expr_sql, source_primary_key, validate,
 };
 use trellis::staging::StagedWatermark;
 use trellis::staging::apply;
@@ -491,13 +491,9 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
     create_definition(&db.pool, &text, &cols)
         .await
         .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect pk"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect pk");
     create_target_table(&db.pool, &def, "public", &pk, &cols, &def.source)
         .await
         .expect("create target table");
@@ -528,7 +524,7 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
         assert_eq!(&column_pg_type(&client, "t", name).await, expected_pg_type);
     }
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &cols)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &cols)
         .await
         .expect("oracle recompute");
     let select_list = CASES

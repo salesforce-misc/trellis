@@ -15,7 +15,7 @@ use trellis::defs::eval::{
 use trellis::defs::{
     RelationshipCardinality, create_target_table, recompute, recompute_aggregate,
     render_aggregate_select_sql, render_expr_sql, render_relationship_select_sql,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 use trellis::numeric::Numeric;
 
@@ -192,13 +192,9 @@ async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
         .expect("seed source table");
 
     let def = order_totals_def();
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &def,
@@ -297,7 +293,7 @@ async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
     let oracle_result = recompute(
         &db.pool,
         &def,
-        &pk.name,
+        &pk[0].name,
         &numeric_columns(&["price", "tax"]),
     )
     .await

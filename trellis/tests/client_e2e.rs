@@ -25,7 +25,7 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
-    recompute, source_primary_key,
+    recompute,
 };
 use trellis::{Client as TrellisClient, ClientOptions};
 
@@ -103,7 +103,10 @@ fn totals_def() -> TransformDef {
 /// column's value concatenated rather than just its primary key. Returns
 /// the primary key column intake's caller needs for both the target DDL
 /// and the oracle recompute.
-async fn setup_source_and_target(pool: &Pool, raw: &Client) -> trellis::defs::PrimaryKeyColumn {
+async fn setup_source_and_target(
+    pool: &Pool,
+    raw: &Client,
+) -> Vec<trellis::defs::PrimaryKeyColumn> {
     raw.batch_execute("create table orders (id integer primary key, a numeric, b numeric)")
         .await
         .expect("create source table");
@@ -121,13 +124,9 @@ async fn setup_source_and_target(pool: &Pool, raw: &Client) -> trellis::defs::Pr
     .await
     .expect("create definition");
 
-    let pk = trellis::defs::require_single_column_pk(
-        source_primary_key(pool, "orders")
-            .await
-            .expect("introspect source primary key"),
-        "orders",
-    )
-    .expect("single-column pk");
+    let pk = trellis::defs::source_primary_key(pool, "orders")
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         pool,
         &totals_def(),
@@ -430,13 +429,9 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     )
     .await
     .expect("register comments_calc against the new source table");
-    let comments_pk = trellis::defs::require_single_column_pk(
-        trellis::defs::source_primary_key(&db.pool, "comments")
-            .await
-            .expect("introspect comments primary key"),
-        "comments",
-    )
-    .expect("single-column pk");
+    let comments_pk = trellis::defs::source_primary_key(&db.pool, "comments")
+        .await
+        .expect("introspect comments primary key");
     create_target_table(
         &db.pool,
         &comments_calc_def(),
@@ -563,13 +558,9 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
     )
     .await
     .expect("register comments_calc against the explicitly-qualified source");
-    let comments_pk = trellis::defs::require_single_column_pk(
-        trellis::defs::source_primary_key(&db.pool, "custom.comments")
-            .await
-            .expect("introspect custom.comments primary key"),
-        "custom.comments",
-    )
-    .expect("single-column pk");
+    let comments_pk = trellis::defs::source_primary_key(&db.pool, "custom.comments")
+        .await
+        .expect("introspect custom.comments primary key");
     create_target_table(
         &db.pool,
         &comments_calc_custom_schema_def(),
@@ -887,6 +878,115 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     assert_eq!(
         mismatches, 0,
         "the reclaiming drain-only client must have built the target correctly"
+    );
+
+    client.shutdown().await.expect("clean shutdown");
+}
+
+/// Issue #121, regression guard: the direct build's chunk-boundary discovery
+/// (`defs::backfill::discover_pk_ranges`) once had a live bug where an
+/// unqualified `order by <col>` in the boundary-discovery query resolved to
+/// the *output* list's same-named `<col>::text` cast instead of the input
+/// column, sorting lexicographically (`'9999' > '50000'`) instead of
+/// numerically — silently over-chunking a `bigint`-keyed source into extra,
+/// overlapping chunks (invisible to a final-state count/value check, since
+/// the build's overwrite-upsert is idempotent; only the *chunk count* itself
+/// exposed it, exactly as it did here during development). 99999 rows, one
+/// key column (`b`) cycling `1..=3` per value of the other (`a`), forces the
+/// 50k-row chunk boundary to land *inside* an `a`-group rather than on a
+/// clean one — the shape that would silently duplicate work across chunks
+/// under the bug. Asserts the exact chunk count `install_definition`
+/// persists, not just the final built values, since idempotent duplication
+/// is exactly what a final-state-only check can't see.
+#[tokio::test]
+async fn a_composite_key_backfill_chunks_a_boundary_inside_a_group_exactly_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table widgets (a bigint, b bigint, primary key (a, b)); \
+         insert into widgets (a, b) \
+         select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 99999) g",
+    )
+    .await
+    .expect("seed widgets with a composite primary key");
+
+    let widgets_columns = numeric_columns(&["a", "b"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM widgets_calc FROM widgets SELECT a + b AS total",
+        &widgets_columns,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(def.status, TransformStatus::Backfilling);
+
+    let chunk_count: i64 = raw
+        .query_one(
+            "select count(*) from backfill_chunks where definition_id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("count persisted chunks")
+        .get(0);
+    assert_eq!(
+        chunk_count, 2,
+        "99999 rows at 50k rows/chunk must be exactly two chunks, \
+         not silently over-chunked by a boundary-discovery bug"
+    );
+
+    let claimed = chunk_queue::claim_chunks(&raw, "dead-worker", 10)
+        .await
+        .expect("claim_chunks (simulating a crashed worker)");
+    assert_eq!(claimed.len(), 2);
+
+    let options = ClientOptions {
+        staging_worker: false,
+        application_threads: 2,
+        reclaim_ttl: Duration::from_millis(200),
+        maintenance_interval: Duration::from_millis(50),
+        poll_interval: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let client = TrellisClient::start(db.dsn(), options).expect("client start");
+
+    poll_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        "the reclaimed composite-key chunks never finished backfilling",
+        async || {
+            let status: Option<String> = raw
+                .query_opt(
+                    &format!(
+                        "select status from transform_definitions \
+                         where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("read status")
+                .map(|row| row.get(0));
+            status.as_deref() == Some("live")
+        },
+    )
+    .await;
+
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from widgets \
+             left join widgets_calc on widgets_calc.a = widgets.a and widgets_calc.b = widgets.b \
+             where widgets_calc.a is null \
+                or widgets_calc.total is distinct from (widgets.a + widgets.b)::numeric",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "every composite-keyed row must be built exactly once with the right value"
     );
 
     client.shutdown().await.expect("clean shutdown");

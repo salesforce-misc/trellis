@@ -26,9 +26,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::{
-    create_definition, create_target_table, require_single_column_pk, source_primary_key,
-};
+use trellis::defs::{create_definition, create_target_table, source_primary_key};
 use trellis::staging::apply;
 
 fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
@@ -189,13 +187,9 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     )
     .await
     .expect("create chain_totals definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &totals_def.source)
-            .await
-            .expect("introspect source primary key"),
-        &totals_def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &totals_def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &totals_def,
@@ -372,13 +366,9 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
     )
     .await
     .expect("create fanout_a definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def_a.source)
-            .await
-            .expect("introspect source primary key"),
-        &def_a.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def_a.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &def_a,

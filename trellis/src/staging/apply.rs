@@ -3084,7 +3084,7 @@ struct TargetDelete {
 /// for it.
 #[derive(Debug, Clone)]
 struct TargetPlan {
-    pk: PrimaryKeyColumn,
+    pk: Vec<PrimaryKeyColumn>,
     field_names: Vec<String>,
     field_types: Vec<ValueType>,
     writes: Vec<TargetWrite>,
@@ -3121,7 +3121,7 @@ struct TargetPlan {
 /// right merge here.
 #[derive(Debug, Clone)]
 struct ClearPlan {
-    pk: PrimaryKeyColumn,
+    pk: Vec<PrimaryKeyColumn>,
     hop_gen: i32,
     /// Same role as [`TargetPlan::qualified_target`]: the persisted,
     /// fully-qualified target identity this clear's `DELETE FROM` must bind,
@@ -3390,13 +3390,9 @@ mod tests {
         )
         .await
         .expect("create definition");
-        let pk = crate::defs::require_single_column_pk(
-            crate::defs::source_primary_key(&pool, source)
-                .await
-                .expect("introspect source primary key"),
-            source,
-        )
-        .expect("single-column pk");
+        let pk = crate::defs::source_primary_key(&pool, source)
+            .await
+            .expect("introspect source primary key");
         crate::defs::create_target_table(
             &pool,
             &definition.def,
@@ -3998,22 +3994,24 @@ pub struct ApplyPlan {
     /// out of scope for this issue (see `staging::apply_aggregate`'s module
     /// doc comment for the rest of what this issue does cover).
     ///
-    /// Investigated (issue #11 review, corrected during #51/#52 review):
-    /// could a definition actually be *created* reading from an aggregate
-    /// target today, making this skip a live correctness gap rather than a
-    /// moot one? Yes, and the originally-assumed safety net does **not**
-    /// reliably prevent it: `create_definition`'s own primary-key-shape gate
-    /// (issue #177, in `catalog::create_definition_inner`) closes this for a
-    /// `OneToOne` downstream definition — it rejects any source with more
-    /// than one PK column, so a `OneToOne` read of a multi-column-`GROUP BY`
-    /// aggregate target is rejected at create time; a single-column
-    /// `GROUP BY` still produces a genuinely single-column aggregate-target
-    /// PK, so `DdlError::CompositePrimaryKeyUnsupported` never fires for
-    /// that case either. The gate is `OneToOne`-only, though: a downstream
-    /// **`Aggregate`** definition (this field's own real shape, and issue
-    /// #171's actual repro) needs no PK narrowing at all and is untouched by
-    /// it, so a multi-column `GROUP BY` chained into another aggregate
-    /// remains fully creatable and live.
+    /// Investigated (issue #11 review, corrected during #51/#52 review, and
+    /// again by issue #121): could a definition actually be *created*
+    /// reading from an aggregate target today, making this skip a live
+    /// correctness gap rather than a moot one? Yes — and, as of issue #121,
+    /// for *both* downstream key-space shapes, not just one. Issue #177's
+    /// `catalog::create_definition_inner` gate used to reject any `OneToOne`
+    /// definition whose source had more than one primary-key column, which
+    /// closed this specific gap for a `OneToOne` read of a multi-column-
+    /// `GROUP BY` aggregate target (a single-column `GROUP BY` still produced
+    /// a genuinely single-column aggregate-target PK, so that narrower gate
+    /// never actually fired for *this* case either — it was never load-
+    /// bearing here). Issue #121 removed that gate along with the narrowing
+    /// it existed to enforce, so a `OneToOne` definition chained onto a
+    /// multi-column `GROUP BY` aggregate target is now fully creatable and
+    /// live too — the same shape a downstream **`Aggregate`** definition
+    /// (this field's own real shape, and issue #171's actual repro) already
+    /// was, since that shape needs no PK narrowing at all and was never
+    /// touched by #177's gate in the first place.
     /// Previously (**[#103](https://github.com/salesforce-misc/trellis/issues/103)**
     /// for one grouping column,
     /// **[#171](https://github.com/salesforce-misc/trellis/issues/171)** for
@@ -4744,23 +4742,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .unzip()
                 };
 
-                // Issue #126: `pk` is this source's full (possibly
+                // Issue #121/#126: `pk` is this source's full (possibly
                 // composite) primary key, shared with the `KeySpace::Aggregate`
-                // branch above (which needs no single-column narrowing at
-                // all). A `KeySpace::OneToOne` definition can only be created
-                // against a single-column source primary key — issue #177 put
-                // that same `ddl::require_single_column_pk` gate in
-                // `catalog::create_definition_inner`, so it now holds for the
-                // ring-path entry points (`create_definition`/
-                // `create_definition_without_backfill`) too, not just
-                // `install_definition` (see `quarantine.rs`'s
-                // `a_composite_primary_key_source_is_rejected_at_create_time_not_quarantined_or_halted`,
-                // which pins that the create-time rejection is what fires
-                // now). What's left for this narrowing to catch is a source
-                // whose primary key *changed* to composite after its
-                // definition was accepted — still a real, typed halting
-                // error, not an invariant violation.
-                let target_pk = ddl::require_single_column_pk(pk.clone(), qualified_source)?;
+                // branch above — a `KeySpace::OneToOne` target's own primary
+                // key now mirrors the source's in full, at whatever arity it
+                // has, rather than narrowing to one column.
+                let target_pk = pk.clone();
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
@@ -5201,10 +5188,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         });
                 }
                 KeySpace::OneToOne => {
-                    // Issue #126: same narrowing, and the same "can never
-                    // actually fail here" reasoning, as the by-source loop's
-                    // identical `TargetPlan` construction above.
-                    let target_pk = ddl::require_single_column_pk(pk.clone(), &change.src_table)?;
+                    // Issue #121/#126: same full, un-narrowed primary key as
+                    // the by-source loop's identical `TargetPlan` construction
+                    // above.
+                    let target_pk = pk.clone();
                     clears
                         .entry(def.def.target.clone())
                         .and_modify(|existing| {
@@ -5487,52 +5474,119 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] — this
 /// crate's shared key-contract text ([`ddl::pk_key_sql_expr`]/[`ddl::join_pk_key`],
 /// or a source row's own PK straight from CDC/backfill) — back into the real
-/// value [`apply_target`] must treat `key` as, via [`ddl::split_pk_key`]
-/// (issue #205).
+/// value(s) [`apply_target`] must treat `key` as, via [`ddl::split_pk_key`]
+/// (issue #205), at `pk`'s own arity (issue #121: a [`KeySpace::OneToOne`]
+/// target's own primary key mirrors the source's in full, composite or not,
+/// rather than narrowing to one column).
 ///
-/// `pk` is always exactly one column here: a [`KeySpace::OneToOne`] target's
-/// own primary key is narrowed to a single column at definition time
-/// (`catalog::create_definition_inner`'s issue #177 gate, backed by
-/// [`ddl::require_single_column_pk`]), so [`TargetPlan::pk`] is never
-/// composite — unlike [`ddl::split_pk_key`]'s general (possibly
-/// multi-column) contract, there is no arity to worry about here.
-///
-/// For the overwhelmingly common case — [`PrimaryKeyColumn::nullable`] is
-/// `false`, true of every genuine, never-NULL primary key (an intake source
-/// table, or any other real `PRIMARY KEY`) — this is a byte-identical no-op:
-/// [`ddl::split_pk_key`] returns a not-null column's single part unchanged
-/// (see that function's doc comment), so `key` itself comes back out,
-/// `Cow::Borrowed`. It only differs for a [`KeySpace::OneToOne`] definition
-/// chained directly off an aggregate target's own (nullable) grouping-column
-/// PK: `key` may then carry issue #110's `NULL_KEY_SENTINEL`/escape
-/// treatment, which this undoes — `None` means a genuine NULL-keyed group.
-///
-/// A `None` result can never be stored as this target's own primary-key
-/// value: [`ddl::create_target_table`] always declares it a real `primary
-/// key` column, which Postgres makes `NOT NULL` unconditionally, regardless
-/// of whether the *source* column this target's key was narrowed from is
-/// itself nullable. [`apply_target`]'s callers treat `None` as "no
-/// representable row" and skip the key entirely — the same outcome
-/// `defs::backfill::discover_pk_ranges`'s ordered `(lo, hi]` PK-range walk
-/// already, structurally, produces for a NULL-keyed source row: `max()`
-/// ignores `NULL`, and every range's `<=`/`>` bound is `NULL` (unknown) for
-/// a `NULL` operand, so such a row is never selected by any chunk's `WHERE`
-/// and a full backfill never attempts to insert it either. Skipping here
-/// keeps live CDC apply's answer — "this group has no row in the target" —
-/// consistent with backfill's, rather than attempting an insert Postgres's
-/// own `NOT NULL` constraint would reject anyway (a hard per-transaction
-/// error, not a silent one, but one this target shape can never avoid by
-/// definition, so there is nothing more useful decoding to `NULL` could do
-/// here than recognizing exactly this and omitting the row).
-fn decode_target_pk_text<'a>(
-    pk: &PrimaryKeyColumn,
+/// A `None` result (any one part decoding to a genuine `NULL` component —
+/// only reachable for a [`KeySpace::OneToOne`] definition chained directly
+/// off an aggregate target's own nullable grouping-column PK, issue #110's
+/// `NULL_KEY_SENTINEL`/escape treatment) can never be stored as this target's
+/// own primary-key value: [`ddl::create_target_table`] always declares every
+/// primary-key column a real `primary key` column, which Postgres makes `NOT
+/// NULL` unconditionally, regardless of whether the *source* column this
+/// target's key was narrowed from is itself nullable. [`apply_target`]'s
+/// callers treat `None` as "no representable row" and skip the key entirely
+/// — the same outcome `defs::backfill::discover_pk_ranges`'s ordered
+/// `(lo, hi]` PK-range walk already, structurally, produces for a NULL-keyed
+/// source row: every range's `<=`/`>` bound is `NULL` (unknown) for a `NULL`
+/// operand, so such a row is never selected by any chunk's `WHERE` and a full
+/// backfill never attempts to insert it either. Skipping here keeps live CDC
+/// apply's answer — "this group has no row in the target" — consistent with
+/// backfill's, rather than attempting an insert Postgres's own `NOT NULL`
+/// constraint would reject anyway.
+fn decode_target_pk_parts(
+    pk: &[PrimaryKeyColumn],
     target: &str,
-    key: &'a str,
-) -> Result<Option<Cow<'a, str>>, ApplyError> {
-    Ok(ddl::split_pk_key(std::slice::from_ref(pk), target, key)?
+    key: &str,
+) -> Result<Option<Vec<String>>, ApplyError> {
+    Ok(ddl::split_pk_key(pk, target, key)?
         .into_iter()
-        .next()
-        .flatten())
+        .map(|part| part.map(|c| c.into_owned()))
+        .collect())
+}
+
+/// [`decode_target_pk_parts`]'s parts, rejoined into this crate's single
+/// shared key-contract text ([`ddl::join_pk_key`]) — the shape
+/// [`apply_and_mark_drained_many`]'s `hop_gen_of`/`src_changed_of` lookups
+/// need to key on (matching what [`apply_target`]'s own `RETURNING`, built
+/// from [`ddl::pk_key_sql_expr`], produces for the same row). A single part
+/// renders verbatim (no join, matching [`ddl::join_pk_key`]'s own arity-1
+/// exemption).
+fn decode_target_pk_text(
+    pk: &[PrimaryKeyColumn],
+    target: &str,
+    key: &str,
+) -> Result<Option<String>, ApplyError> {
+    Ok(decode_target_pk_parts(pk, target, key)?.map(|parts| join_pk_parts(&parts)))
+}
+
+/// Joins already-[`decode_target_pk_parts`]-decoded parts back into this
+/// crate's single shared key-contract text, the same shape
+/// [`ddl::join_pk_key`] produces — a thin wrapper so every call site spells
+/// the arity-1 short-circuit (`parts[0].clone()`, no join) the same way
+/// rather than each re-deriving it.
+fn join_pk_parts(parts: &[String]) -> String {
+    if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        ddl::join_pk_key(parts.iter().map(|s| s.as_str()))
+    }
+}
+
+/// `c0`, `c1`, … — collision-free column aliases for a keyset `unnest(...)`
+/// relation, one per `pk` column, mirroring `apply_aggregate`'s identically-
+/// shaped `keyset_col` convention for its own `GROUP BY` keyset (kept as its
+/// own small copy here, not shared, since the two modules' keysets differ in
+/// what types they cast to — [`PrimaryKeyColumn::data_type`] here, a
+/// [`ValueType`] there).
+fn pk_keyset_col(i: usize) -> String {
+    format!("c{i}")
+}
+
+/// `unnest($start::text[]::t0[], $start+1::text[]::t1[], …) as k(c0, c1, …)`
+/// — `pk`'s columns as a bound keyset relation, one array bind parameter per
+/// column (so the whole keyset costs `pk.len()` bind parameters regardless of
+/// how many keys it carries, well under Postgres's bind cap). The multi-
+/// column match [`apply_target`] needs once a composite (arity > 1) primary
+/// key means a plain `= any($1::text[]::cast[])` no longer identifies a row
+/// on its own (issue #121) — arity 1 keeps that simpler, pre-existing form
+/// instead (see [`apply_target`]'s own arity branch).
+fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
+    let arrays: Vec<String> = pk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("${}::text[]::{}[]", start + i, c.data_type))
+        .collect();
+    let cols: Vec<String> = (0..pk.len()).map(pk_keyset_col).collect();
+    format!("unnest({}) as k({})", arrays.join(", "), cols.join(", "))
+}
+
+/// `<alias>.<col0> = k.c0 and <alias>.<col1> = k.c1 and …` — matches one row
+/// of `alias` against [`pk_keyset_unnest`]'s bound relation. Always plain
+/// `=` (never `is not distinct from`): a 1-1 target's own primary-key columns
+/// are never nullable (`ddl::create_target_table` always declares them a
+/// real `primary key`, which Postgres makes `NOT NULL` unconditionally),
+/// unlike `apply_aggregate`'s `GROUP BY` keyset match, which does need the
+/// null-safe form for a nullable grouping column.
+fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
+    pk.iter()
+        .enumerate()
+        .map(|(i, c)| format!("{alias}.{} = k.{}", quote_ident(&c.name), pk_keyset_col(i)))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
+/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
+/// own declared column order) so column `j`'s array is every row's `j`th
+/// part — mirrors `apply_aggregate::transpose_group_values`'s identical
+/// shape for its own `GROUP BY` keyset.
+fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> Vec<Vec<&'a str>> {
+    (0..arity)
+        .map(|j| rows.iter().map(|r| r[j].as_str()).collect())
+        .collect()
 }
 
 /// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
@@ -5595,14 +5649,17 @@ fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashS
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
 /// convention doc 05 calls for between concurrent workers writing
-/// overlapping target rows. It binds the whole key set as a single `text[]`
-/// parameter, so — unlike the upsert below — its size never approaches the
-/// bind-parameter cap regardless of batch size. Because this transaction
-/// already holds every lock it needs before the upsert/delete run, chunking
-/// those into multiple statements below doesn't reopen the ordering gap the
-/// pre-lock exists to close: two transactions racing on overlapping keys
-/// still each take every lock, in the same ascending order, before either
-/// writes anything.
+/// overlapping target rows. At arity 1 it binds the whole key set as a
+/// single `text[]` parameter; a composite (arity > 1) key instead binds one
+/// typed array per column and joins the target to that bound keyset (issue
+/// #121, mirroring `apply_aggregate`'s own `GROUP BY` keyset-match idiom) —
+/// either way the parameter count is `O(pk.len())`, not `O(batch size)`, so
+/// — unlike the upsert below — it never approaches the bind-parameter cap
+/// regardless of batch size. Because this transaction already holds every
+/// lock it needs before the upsert/delete run, chunking those into multiple
+/// statements below doesn't reopen the ordering gap the pre-lock exists to
+/// close: two transactions racing on overlapping keys still each take every
+/// lock, in the same ascending order, before either writes anything.
 ///
 /// Issue #56/ADR-0009 decision 3: the finest-grained span in the
 /// propagation tree — one per consuming transform per batch, downstream of
@@ -5634,8 +5691,9 @@ async fn apply_target(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let pk_ident = quote_ident(&plan.pk.name);
-    let pk_cast = plan.pk.data_type.as_str();
+    let arity = plan.pk.len();
+    let pk_idents: Vec<String> = plan.pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let pk_col_list = pk_idents.join(", ");
     // `plan.qualified_target` (issue #73's persisted identity), not a bare
     // `quote_ident(target)` — a target explicitly qualified into a
     // non-default schema (issue #76) isn't necessarily on this connection's
@@ -5651,50 +5709,89 @@ async fn apply_target(
     // own DDL never declares any other column), so — unlike the read paths
     // above, which read tables this function doesn't control the shape of —
     // no live `pg_catalog` introspection is needed here.
-    let old_image_columns: Vec<String> = std::iter::once(plan.pk.name.clone())
+    let old_image_columns: Vec<String> = plan
+        .pk
+        .iter()
+        .map(|c| c.name.clone())
         .chain(plan.field_names.iter().cloned())
         .collect();
     let old_image_expr = row_as_text_jsonb_sql("t", &old_image_columns);
 
-    // Issue #205: `write.pk_text`/`delete.pk_text` is this target's shared
-    // key-contract text, not necessarily a raw PK value yet — decode each
-    // one through `decode_target_pk_text` before treating it as a literal PK
-    // value (or a lock/match key) anywhere below. See that function's doc
-    // comment: `None` (a genuine NULL-keyed group, only reachable for a
-    // `KeySpace::OneToOne` definition chained off a nullable aggregate
-    // grouping key) can never be this target's own stored PK value, so such
-    // a key is simply dropped from every step below, rather than bound as a
-    // literal `NULL_KEY_SENTINEL`/escaped string (the corruption this issue
-    // closes) or as a literal SQL `NULL` (which this target's own `NOT NULL`
-    // primary-key column would just as reliably reject).
-    let decoded_writes: Vec<Option<Cow<'_, str>>> = plan
+    // Issue #205/#121: `write.pk_text`/`delete.pk_text` is this target's
+    // shared key-contract text, not necessarily raw PK value(s) yet — decode
+    // each one through `decode_target_pk_parts` before treating it as a
+    // literal PK value (or a lock/match key) anywhere below. See that
+    // function's doc comment: `None` (a genuine NULL-keyed group, only
+    // reachable for a `KeySpace::OneToOne` definition chained off a nullable
+    // aggregate grouping key) can never be this target's own stored PK
+    // value, so such a key is simply dropped from every step below, rather
+    // than bound as a literal `NULL_KEY_SENTINEL`/escaped string (the
+    // corruption issue #205 closes) or as a literal SQL `NULL` (which this
+    // target's own `NOT NULL` primary-key column(s) would just as reliably
+    // reject).
+    let decoded_writes: Vec<Option<Vec<String>>> = plan
         .writes
         .iter()
-        .map(|w| decode_target_pk_text(&plan.pk, target, &w.pk_text))
+        .map(|w| decode_target_pk_parts(&plan.pk, target, &w.pk_text))
         .collect::<Result<_, _>>()?;
-    let decoded_deletes: Vec<Option<Cow<'_, str>>> = plan
+    let decoded_deletes: Vec<Option<Vec<String>>> = plan
         .deletes
         .iter()
-        .map(|d| decode_target_pk_text(&plan.pk, target, &d.pk_text))
+        .map(|d| decode_target_pk_parts(&plan.pk, target, &d.pk_text))
         .collect::<Result<_, _>>()?;
 
-    let mut lock_keys: Vec<&str> = decoded_writes
+    // Deduplicated lock keys (issue #205's decoded form, so a batch never
+    // locks the same physical row twice under two differently-encoded
+    // spellings of the same key) — the actual lock *order* comes from each
+    // branch's own `order by` below, not from this collection's order, so a
+    // plain dedup is all that's needed here.
+    let mut lock_key_parts: Vec<&Vec<String>> = decoded_writes
         .iter()
         .chain(decoded_deletes.iter())
-        .filter_map(|k| k.as_deref())
+        .filter_map(|k| k.as_ref())
         .collect();
-    lock_keys.sort_unstable();
-    lock_keys.dedup();
+    lock_key_parts.sort_unstable();
+    lock_key_parts.dedup();
 
-    txn.query(
-        &format!(
-            "select {pk_ident} from {target_ident} \
-             where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-             order by {pk_ident} for update"
-        ),
-        &[&lock_keys],
-    )
-    .await?;
+    if arity == 1 {
+        // Byte-identical to before issue #121: a single bound `text[]` array.
+        let pk_ident = &pk_idents[0];
+        let pk_cast = plan.pk[0].data_type.as_str();
+        let lock_keys: Vec<&str> = lock_key_parts.iter().map(|p| p[0].as_str()).collect();
+        txn.query(
+            &format!(
+                "select {pk_ident} from {target_ident} \
+                 where {pk_ident} = any($1::text[]::{pk_cast}[]) \
+                 order by {pk_ident} for update"
+            ),
+            &[&lock_keys],
+        )
+        .await?;
+    } else {
+        // Issue #121: a composite key has no single column an `= any(...)`
+        // array test could name, so the pre-lock instead joins the target to
+        // a bound keyset relation (mirroring `apply_aggregate`'s own
+        // `GROUP BY` keyset-match idiom) and locks only the real table's rows
+        // (`for update of t` — `unnest(...)`'s derived rows aren't real table
+        // rows Postgres could lock).
+        let arrays = transpose_pk_parts(arity, &lock_key_parts);
+        let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+        txn.query(
+            &format!(
+                "select 1 from {target_ident} as t join {} on ({}) \
+                 order by {} for update of t",
+                pk_keyset_unnest(&plan.pk, 1),
+                pk_keyset_match(&plan.pk, "t"),
+                plan.pk
+                    .iter()
+                    .map(|c| format!("t.{}", quote_ident(&c.name)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            &params,
+        )
+        .await?;
+    }
 
     let field_pg_types: Vec<Cow<'static, str>> = plan
         .field_types
@@ -5702,24 +5799,26 @@ async fn apply_target(
         .map(|t| ddl::pg_type_name(*t))
         .collect();
 
-    let col_list = std::iter::once(pk_ident.clone())
+    let col_list = pk_idents
+        .iter()
+        .cloned()
         .chain(field_idents.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
 
     // Only a write whose key actually decoded to a representable (non-NULL)
-    // PK value is a candidate for insertion — see `decode_target_pk_text`'s
+    // PK value is a candidate for insertion — see `decode_target_pk_parts`'s
     // doc comment on why a NULL-decoded write has no row to write at all.
-    let writable: Vec<(&TargetWrite, &str)> = plan
+    let writable: Vec<(&TargetWrite, &Vec<String>)> = plan
         .writes
         .iter()
         .zip(decoded_writes.iter())
-        .filter_map(|(w, k)| k.as_deref().map(|k| (w, k)))
+        .filter_map(|(w, k)| k.as_ref().map(|k| (w, k)))
         .collect();
 
     let mut written = Vec::new();
     if !writable.is_empty() {
-        let cols_per_row = 1 + plan.field_names.len();
+        let cols_per_row = arity + plan.field_names.len();
         let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
 
         // Every one of this target's calculated columns can be paused at
@@ -5734,7 +5833,7 @@ async fn apply_target(
         // (frozen at the column defaults) via the same statement's `insert`
         // half.
         let on_conflict = if field_idents.is_empty() {
-            format!("on conflict ({pk_ident}) do nothing")
+            format!("on conflict ({pk_col_list}) do nothing")
         } else {
             let set_list = field_idents
                 .iter()
@@ -5752,21 +5851,32 @@ async fn apply_target(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "on conflict ({pk_ident}) do update set {set_list} \
+                "on conflict ({pk_col_list}) do update set {set_list} \
                  where ({target_cols}) is distinct from ({excluded_cols})"
             )
         };
+
+        // The composite key's own canonical identity text (issue #121) —
+        // what this statement's `RETURNING` reports as each written row's
+        // key, matching `ddl::pk_key_sql_expr`'s row-identity encoding at any
+        // arity (a bare `{col}::text` at arity 1, byte-identical to before
+        // this issue) so a downstream chained definition's live re-fetch
+        // parses it back the same way.
+        let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, None);
 
         for chunk in writable.chunks(rows_per_chunk) {
             let mut rows_sql = Vec::with_capacity(chunk.len());
             let mut params: Vec<&(dyn ToSql + Sync)> =
                 Vec::with_capacity(chunk.len() * cols_per_row);
-            for (i, (write, pk_text)) in chunk.iter().enumerate() {
+            for (i, (write, pk_parts)) in chunk.iter().enumerate() {
                 let base = i * cols_per_row;
-                let mut row_parts = vec![format!("${}::text::{pk_cast}", base + 1)];
-                params.push(pk_text);
+                let mut row_parts = Vec::with_capacity(cols_per_row);
+                for (j, c) in plan.pk.iter().enumerate() {
+                    row_parts.push(format!("${}::text::{}", base + j + 1, c.data_type));
+                    params.push(&pk_parts[j]);
+                }
                 for (j, pg_type) in field_pg_types.iter().enumerate() {
-                    row_parts.push(format!("${}::text::{pg_type}", base + 2 + j));
+                    row_parts.push(format!("${}::text::{pg_type}", base + arity + j + 1));
                     params.push(&write.values[j]);
                 }
                 rows_sql.push(format!("({})", row_parts.join(", ")));
@@ -5776,7 +5886,7 @@ async fn apply_target(
                 "insert into {target_ident} ({col_list}) \
                  select * from (values {}) as v({col_list}) \
                  {on_conflict} \
-                 returning {pk_ident}::text as pk",
+                 returning {returning_pk_expr} as pk",
                 rows_sql.join(", "),
             );
             let rows = txn.query(&sql, &params).await?;
@@ -5796,41 +5906,73 @@ async fn apply_target(
     // that guarantee — the delete would now run against a snapshot that
     // already includes the write — so it's restored explicitly here
     // instead: never delete a key this same call just wrote. Compared as
-    // decoded keys (issue #205) — the same values actually bound as this
-    // target's real PK, and so the same values `delete_keys` below matches
-    // against.
-    let write_keys: std::collections::HashSet<&str> = writable.iter().map(|(_, k)| *k).collect();
+    // decoded keys (issue #205), joined to one canonical text (issue #121)
+    // so a composite key compares as a whole tuple, not accidentally by its
+    // first column alone.
+    let write_keys: std::collections::HashSet<String> = writable
+        .iter()
+        .map(|(_, parts)| join_pk_parts(parts))
+        .collect();
 
     let mut deleted = Vec::new();
     // A `None`-decoded delete has no matching write (a NULL-keyed group
     // never reaches `writable` either) and no representable row to delete —
-    // see `decode_target_pk_text`'s doc comment — so it's dropped here the
+    // see `decode_target_pk_parts`'s doc comment — so it's dropped here the
     // same way a `None`-decoded write is dropped above.
-    let delete_keys: Vec<&str> = decoded_deletes
+    let delete_key_parts: Vec<&Vec<String>> = decoded_deletes
         .iter()
-        .filter_map(|k| k.as_deref())
-        .filter(|k| !write_keys.contains(k))
+        .filter_map(|k| k.as_ref())
+        .filter(|k| !write_keys.contains(&join_pk_parts(k)))
         .collect();
-    if !delete_keys.is_empty() {
+    if !delete_key_parts.is_empty() {
         // Issue #196: `as t` + `old_image_expr` (an explicit per-column
         // `jsonb_build_object`, issue #248 — not `to_jsonb(t.*)`, see
         // `row_as_text_jsonb_sql`'s doc comment) captures each deleted
         // row's exact pre-delete state, the same `apply_aggregate`'s
         // `delete_group_row` does for an extinct aggregate group (issue
         // #180) — see this function's own doc comment and `ChangedKey`'s for
-        // why a 1-1 target's delete needed this same treatment. `pk_ident`
-        // stays unqualified (no `t.` prefix) since `t` is the sole table in
-        // scope, exactly like `delete_group_row`'s own `where_sql`.
-        let rows = txn
-            .query(
+        // why a 1-1 target's delete needed this same treatment. `t.`-qualified
+        // (issue #121: the composite branch's `exists (...)` subquery below
+        // introduces a second relation into scope, so an unqualified column
+        // reference would become ambiguous) — a no-op qualification at
+        // arity 1, where `t` is still the sole table.
+        let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+        let rows = if arity == 1 {
+            // Byte-identical to before issue #121: `pk_ident` stays
+            // unqualified (no `t.` prefix) since `t` is the sole table in
+            // scope, exactly like `delete_group_row`'s own `where_sql`.
+            let pk_ident = &pk_idents[0];
+            let pk_cast = plan.pk[0].data_type.as_str();
+            let delete_keys: Vec<&str> = delete_key_parts.iter().map(|p| p[0].as_str()).collect();
+            txn.query(
                 &format!(
                     "delete from {target_ident} as t \
                      where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {pk_ident}::text as pk, {old_image_expr}::text as old_image"
+                     returning {returning_pk_expr} as pk, {old_image_expr}::text as old_image"
                 ),
                 &[&delete_keys],
             )
-            .await?;
+            .await?
+        } else {
+            // Issue #121: a composite key has no single column an
+            // `= any(...)` array test could name, so the delete instead
+            // matches any row whose full key tuple appears in a bound
+            // keyset relation (a correlated `exists`, mirroring the
+            // pre-lock's join above).
+            let arrays = transpose_pk_parts(arity, &delete_key_parts);
+            let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+            txn.query(
+                &format!(
+                    "delete from {target_ident} as t \
+                     where exists (select 1 from {} where {}) \
+                     returning {returning_pk_expr} as pk, {old_image_expr}::text as old_image",
+                    pk_keyset_unnest(&plan.pk, 1),
+                    pk_keyset_match(&plan.pk, "t"),
+                ),
+                &params,
+            )
+            .await?
+        };
         deleted.extend(
             rows.into_iter()
                 .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1))),
@@ -6034,11 +6176,16 @@ pub async fn apply_and_mark_drained_many(
     // see this function's doc comment on why "clear, then write" is safe
     // here specifically (single-bucket batch, barrier-drained).
     for (target, clear) in &plan.clears {
-        let pk_ident = quote_ident(&clear.pk.name);
+        // Issue #121: the truncate-cleared key text is this target's shared
+        // key-contract text at whatever arity `clear.pk` has (a bare
+        // `{col}::text` at arity 1, byte-identical to before this issue) —
+        // the same encoding a chained downstream definition's live re-fetch
+        // (`read_live_rows_batch`) already expects.
+        let pk_key_expr = ddl::pk_key_sql_expr(&clear.pk, None);
         let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
         let cleared: Vec<String> = txn
             .query(
-                &format!("delete from {target_ident} returning {pk_ident}::text as pk"),
+                &format!("delete from {target_ident} returning {pk_key_expr} as pk"),
                 &[],
             )
             .await?
@@ -6098,28 +6245,21 @@ pub async fn apply_and_mark_drained_many(
             continue;
         }
 
-        // Issue #205: `written`/`deleted` are keyed by `apply_target`'s
+        // Issue #205/#121: `written`/`deleted` are keyed by `apply_target`'s
         // *decoded* PK text (the value actually stored/matched, per
         // `decode_target_pk_text`), which for a target chained off a
         // nullable grouping key can differ from `target_plan.writes`/
         // `.deletes`' own `pk_text` (the shared key-contract's still-encoded
-        // form). Re-decode here too, so this lookup is keyed the same way —
-        // for every not-null-PK target (the overwhelming majority) decoding
-        // is a no-op and this is byte-identical to a plain `pk_text` key, as
-        // before. A `None` decode is skipped: `apply_target` never returns
-        // such a key in `written`/`deleted` (see that function's own doc
-        // comment), so it would never be looked up anyway.
-        // Keyed by `Cow`, not `String`, so the no-op decode path stays
-        // allocation-free the way the pre-#205 `&str` keys were: a not-null
-        // PK column's decode hands back a `Cow::Borrowed` straight out of
-        // `pk_text` (which outlives this loop), and cloning that for the
-        // second map is a pointer copy, not a heap copy. `Cow<'_, str>:
-        // Borrow<str>` and hashes as its `str`, so the `get(key.as_str())`
-        // lookups below need no wrapping and match a `Cow::Owned` key (a
-        // genuinely decoded one) just the same.
-        let mut hop_gen_of: HashMap<Cow<'_, str>, i32> = HashMap::new();
-        let mut src_changed_of: HashMap<Cow<'_, str>, Option<std::time::SystemTime>> =
-            HashMap::new();
+        // form) — and, for a composite key, is the whole tuple's canonical
+        // joined text, not any one column alone. Re-decode here too, so this
+        // lookup is keyed the same way — for every not-null-PK target (the
+        // overwhelming majority) decoding is a no-op and this is
+        // byte-identical to a plain `pk_text` key, as before. A `None`
+        // decode is skipped: `apply_target` never returns such a key in
+        // `written`/`deleted` (see that function's own doc comment), so it
+        // would never be looked up anyway.
+        let mut hop_gen_of: HashMap<String, i32> = HashMap::new();
+        let mut src_changed_of: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
         for w in &target_plan.writes {
             if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &w.pk_text)? {
                 hop_gen_of.insert(decoded.clone(), w.hop_gen);

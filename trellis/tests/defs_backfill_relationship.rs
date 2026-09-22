@@ -17,7 +17,7 @@ use testkit::TestCluster;
 use trellis::defs::ast::{RelationshipDef, TransformDef};
 use trellis::defs::{
     ValueType, backfill_definition, create_relationship, create_target_table, parse,
-    render_relationship_select_sql, require_single_column_pk, source_primary_key,
+    render_relationship_select_sql, source_primary_key,
 };
 
 /// The definition the target table + backfill are built from. Its primary key
@@ -159,11 +159,7 @@ async fn setup(db: &testkit::TestDatabase) -> TransformDef {
     .expect("create comments relationship");
 
     let def = parse(BUILD_SRC).expect("parse build def");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "authors").await.expect("pk"),
-        "authors",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "authors").await.expect("pk");
     create_target_table(
         &db.pool,
         &def,

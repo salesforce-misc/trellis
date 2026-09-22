@@ -126,20 +126,22 @@ pub fn classify(err: &ApplyError) -> FailureClass {
     match err {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
         ApplyError::HopBoundExceeded { .. } => FailureClass::Halting,
-        // All three of these mean "this definition can never work against
-        // this source's real schema" — a structural, schema-shape diagnosis
+        // Both of these mean "this definition can never work against this
+        // source's real schema" — a structural, schema-shape diagnosis
         // exactly like the hop bound, not a per-row data problem. By the
-        // time any of them reaches here, `compute()` has already ruled out
-        // "the table is simply gone" (`drain_once` special-cases
+        // time either reaches here, `compute()` has already ruled out "the
+        // table is simply gone" (`drain_once` special-cases
         // `ApplyError::SourceTableDropped` before classification ever runs)
-        // — what's left is a real primary key shape or type
-        // `ddl::source_primary_key` cannot use (issue #107 added the type
-        // check alongside the pre-existing arity checks), which every key
-        // touching that source reproduces identically alone. Isolating it
-        // would charge, and eventually evict, every such key one at a time
-        // for a failure none of them individually caused.
+        // — what's left is a real primary key shape (no primary key at all)
+        // or type `ddl::source_primary_key` cannot use (issue #107), which
+        // every key touching that source reproduces identically alone.
+        // Isolating it would charge, and eventually evict, every such key
+        // one at a time for a failure none of them individually caused. A
+        // composite (multi-column) primary key used to be a third such
+        // structural rejection here too, before issue #121 taught every 1-1
+        // consumer to key on the source's full primary key rather than
+        // narrowing it to one column.
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
-        | ApplyError::Ddl(DdlError::CompositePrimaryKeyUnsupported { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
@@ -1711,22 +1713,30 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         });
     }
 
-    // Issue #126: `source_primary_key` now accepts a composite source
-    // primary key, but this resume path's write-back below filters the
-    // *target* table by this same column name/value (`where {pk_ident} =
-    // ...`), which only lines up for a 1-1 target — its primary key column
-    // is copied verbatim from the source's own (`ddl::create_target_table`).
-    // An Aggregate target's primary key is its `GROUP BY` columns, unrelated
-    // to the source's primary key, so this whole function is already only
-    // meaningful for a 1-1 definition regardless of arity; narrowing here
-    // just makes that pre-existing assumption an explicit, typed rejection
-    // instead of a confusing "column does not exist" from the `UPDATE` below.
-    let pk = ddl::require_single_column_pk(
-        ddl::source_primary_key(pool, &def.source_table).await?,
-        &def.source_table,
-    )?;
+    // Issue #121: this resume path's write-back below now keys on the
+    // *target*'s full (possibly composite) primary key, through the shared,
+    // arity-generic key-contract text ([`ddl::pk_key_sql_expr`]) rather than
+    // a single named column — the same generalization every other 1-1
+    // consumer (`staging::apply`, `defs::backfill`, `staging::self_check`)
+    // makes. This is still only meaningful for a 1-1 definition regardless
+    // of arity: an Aggregate target's primary key is its `GROUP BY` columns,
+    // unrelated to the source's primary key.
+    let pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let source_ident = ddl::qualified_source_table(&def.source_table);
-    let pk_ident = quote_ident(&pk.name);
+    let pk_key_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+    // A row belonging to a NULL-keyed group (only reachable when `source` is
+    // itself an aggregate target with a nullable `GROUP BY` column — see the
+    // loop below's own comment) can't be told apart from a real value by
+    // `pk_key_expr` alone: issue #110's NULL-component encoding folds a real
+    // SQL `NULL` into a sentinel *string*, precisely so it round-trips
+    // through this crate's shared key contract, which means it is never
+    // itself a SQL `NULL` for `db_row.get`'s `Option` check to catch. Select
+    // the "any component NULL" test directly instead.
+    let null_check = pk
+        .iter()
+        .map(|c| format!("t.{} is null", quote_ident(&c.name)))
+        .collect::<Vec<_>>()
+        .join(" or ");
 
     let client = pool.get().await?;
     // Issue #248: an explicit per-column `jsonb_build_object`, not
@@ -1740,7 +1750,8 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let db_rows = client
         .query(
             &format!(
-                "select {pk_ident}::text as pk_text, e.key, e.value \
+                "select {pk_key_expr} as pk_text, ({null_check}) as pk_has_null, \
+                 e.key, e.value \
                  from {source_ident} t \
                  cross join lateral jsonb_each_text({doc_expr}) e"
             ),
@@ -1751,23 +1762,24 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let mut order: Vec<String> = Vec::new();
     let mut rows_by_pk: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
-        // Issue #211: unlike this crate's shared key-contract text
-        // (`ddl::pk_key_sql_expr`/`join_pk_key`, which routes a nullable
+        // Issue #211/#121: `pk_text` here is built from this crate's shared
+        // key-contract text (`ddl::pk_key_sql_expr`), which routes a nullable
         // column's part through issue #110's `NULL_KEY_SENTINEL`/escape
-        // treatment before it's ever bound anywhere), `pk_text` here is a
-        // raw, unencoded `{pk_ident}::text` cast straight against `source`'s
-        // own column — there is no sentinel to decode, just a genuine SQL
-        // `NULL` for a source row belonging to a NULL-keyed group. That's
-        // only reachable when `source` is itself an aggregate target: `pk`
-        // (`ddl::source_primary_key`) is that aggregate's `GROUP BY`
-        // grouping-column PK, which `create_aggregate_target_table` declares
-        // `UNIQUE NULLS NOT DISTINCT` rather than a real `PRIMARY KEY`
-        // specifically so it *can* hold NULL (issue #110's whole subject) —
-        // a genuine, never-NULL source primary key can never produce this.
+        // treatment before it's ever bound anywhere — so, unlike a raw
+        // `{col}::text` cast, it is never itself a SQL `NULL`, even for a
+        // source row belonging to a NULL-keyed group. `pk_has_null` (selected
+        // separately, above) is what actually detects that case. A NULL
+        // component is only reachable when `source` is itself an aggregate
+        // target: `pk` (`ddl::source_primary_key`) is that aggregate's
+        // `GROUP BY` grouping-column PK, which `create_aggregate_target_table`
+        // declares `UNIQUE NULLS NOT DISTINCT` rather than a real `PRIMARY
+        // KEY` specifically so it *can* hold NULL (issue #110's whole
+        // subject) — a genuine, never-NULL source primary key can never
+        // produce this.
         //
-        // `def` (this recompute's own target, gated single-column-PK-1-1 by
-        // `require_single_column_pk` above) can never hold a row for that
-        // NULL-keyed group either way: `ddl::create_target_table` always
+        // `def` (this recompute's own target — always a 1-1, regardless of
+        // its primary key's arity) can never hold a row for that NULL-keyed
+        // group either way: `ddl::create_target_table` always
         // declares its own primary key column a real `primary key`, which
         // Postgres makes NOT NULL unconditionally regardless of whether the
         // *source* column this target's key was narrowed from is itself
@@ -1787,17 +1799,18 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         // context this function builds below (`build_relationship_context`,
         // for any definition that reads relationships), and the row loop
         // further down (which walks `order` and issues one `UPDATE ...
-        // where {pk_ident}::text = $2` per entry) never attempts a write for
+        // where {pk_key_expr} = $2` per entry) never attempts a write for
         // it — the same "no representable row" answer a from-scratch
-        // backfill already gives this group, kept consistent here rather
-        // than panicking (the pre-fix behavior: `tokio-postgres` refuses to
-        // convert a SQL `NULL` into a `String`) or attempting a write no
-        // primary-key constraint could ever accept anyway.
-        let Some(pk_text): Option<String> = db_row.get(0) else {
+        // backfill already gives this group, kept consistent here via the
+        // explicit `pk_has_null` test above (see the query's own comment for
+        // why this can't simply check `pk_text` for a SQL `NULL`).
+        let pk_has_null: bool = db_row.get(1);
+        if pk_has_null {
             continue;
-        };
-        let key: String = db_row.get(1);
-        let value: Option<String> = db_row.get(2);
+        }
+        let pk_text: String = db_row.get(0);
+        let key: String = db_row.get(2);
+        let value: Option<String> = db_row.get(3);
         rows_by_pk
             .entry(pk_text.clone())
             .or_insert_with(|| {
@@ -1890,7 +1903,8 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             .execute(
                 &format!(
                     "update {target_ident} set {col_ident} = $1::text::{pg_type} \
-                     where {pk_ident}::text = $2"
+                     where {} = $2",
+                    ddl::pk_key_sql_expr(&pk, None)
                 ),
                 &[&value, pk_text],
             )

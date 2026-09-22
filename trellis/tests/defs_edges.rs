@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::defs::{
     CatalogError, EdgeKind, NodeKind, ValidationError, ValueType, create_definition,
-    create_target_table, dependents_of, node_for_table, parse, persist_edge,
-    require_single_column_pk, resolve_node, source_primary_key, transforms_for_source,
+    create_target_table, dependents_of, node_for_table, parse, persist_edge, resolve_node,
+    source_primary_key, transforms_for_source,
 };
 
 /// Creates a minimal backing relation for a definition's source table
@@ -54,13 +54,9 @@ async fn materialize_chained_target(
     source_columns: &HashMap<String, ValueType>,
 ) {
     let def = parse(dsl).expect("parse dsl for target materialization");
-    let pk = require_single_column_pk(
-        source_primary_key(pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(pool, &def, "public", &pk, source_columns, &def.source)
         .await
         .expect("materialize chained target table");

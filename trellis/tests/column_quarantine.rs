@@ -24,7 +24,7 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{
     TransformStatus, chunk_queue, create_aggregate_target_table, create_definition,
     create_relationship, create_target_table, install_definition, relationship_projection,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 use trellis::staging::StagedWatermark;
 use trellis::staging::apply::{self, ApplyError};
@@ -162,13 +162,9 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
     .await
     .expect("create definition");
     let def = order_totals_def();
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -187,13 +183,9 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
     )
     .await
     .expect("create order_summaries definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &orders_def.source)
-            .await
-            .expect("introspect source primary key"),
-        &orders_def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &orders_def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &summary_def.def,
@@ -659,13 +651,9 @@ async fn resume_column_recomputes_an_explicitly_qualified_target() {
     const DEF_TEXT: &str = "TRANSFORM custom.order_totals FROM orders SELECT price + tax AS total";
     let def = trellis::defs::parse(DEF_TEXT).expect("parse the explicitly-qualified target");
     let source_columns = numeric_columns(&["id", "price", "tax"]);
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "custom", &pk, &source_columns, &def.source)
         .await
         .expect("materialize custom.order_totals ahead of create_definition");
@@ -1308,13 +1296,9 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "calc_src")
-            .await
-            .expect("introspect source primary key"),
-        "calc_src",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "calc_src")
+        .await
+        .expect("introspect source primary key");
     create_target_table(
         &db.pool,
         &calc_def,
@@ -1435,13 +1419,9 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
     .await
     .expect("create sib_b definition");
 
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "shared_src")
-            .await
-            .expect("introspect source primary key"),
-        "shared_src",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "shared_src")
+        .await
+        .expect("introspect source primary key");
     let def_a = TransformDef {
         target: "sib_a".to_string(),
         source: "shared_src".to_string(),
@@ -1884,13 +1864,9 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &article_cat_def,

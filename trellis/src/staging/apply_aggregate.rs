@@ -539,9 +539,11 @@ impl AggregateTargetPlan {
 /// justified by the claim that a composite grouping key's target could never
 /// be chained onto as another definition's source, because
 /// `ddl::source_primary_key` rejected a composite source outright. Issue
-/// #126 lifted that rejection (the rejection now lives in
-/// [`ddl::require_single_column_pk`], which only the genuinely
-/// single-column-only callers invoke), which made the claim false and turned
+/// #126 lifted that rejection (narrowed back down at the one 1-1-specific
+/// call site that still needed a single column, via the now-removed
+/// `ddl::require_single_column_pk` — issue #121 deleted that narrowing too,
+/// once every 1-1 consumer learned to take a source's primary key at
+/// whatever arity it has), which made the claim false and turned
 /// the encoding into a live crash: `written`/`deleted` (via
 /// `apply::apply_and_mark_drained_many`'s downstream-propagation step) stage
 /// a `Recompute` keyed by this string against the aggregate target, and the

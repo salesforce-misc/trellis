@@ -27,8 +27,7 @@ use trellis::defs::ast::{
 };
 use trellis::defs::{
     CatalogError, ValidationError, create_definition, create_relationship, create_target_table,
-    relationship_projection, render_relationship_select_sql, require_single_column_pk,
-    source_primary_key,
+    relationship_projection, render_relationship_select_sql, source_primary_key,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -243,13 +242,9 @@ async fn frontdoor_to_one_enrichment_converges_to_oracle() {
     .await
     .expect("create to-one enrichment definition through the front door");
 
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_one_def(),
@@ -439,13 +434,9 @@ async fn frontdoor_to_many_aggregate_enrichment_converges_to_oracle() {
     .await
     .expect("create to-many enrichment definition through the front door");
 
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "articles")
-            .await
-            .expect("introspect articles pk"),
-        "articles",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
     create_target_table(
         &db.pool,
         &to_many_def(),

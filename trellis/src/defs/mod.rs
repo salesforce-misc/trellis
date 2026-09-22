@@ -67,7 +67,7 @@ pub use catalog::create_definition_without_backfill;
 #[cfg(any(test, feature = "test-util"))]
 pub use ddl::{
     DdlError, create_aggregate_target_table, create_target_table, qualified_target_table,
-    require_single_column_pk, source_primary_key,
+    source_primary_key,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use oracle::{

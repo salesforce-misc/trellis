@@ -9,7 +9,7 @@ use trellis::defs::{
     CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition,
     RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
     create_relationship, create_target_table, edges_from, install_definition, parse,
-    relationship_by_name, require_single_column_pk, source_primary_key,
+    relationship_by_name, source_primary_key,
 };
 
 /// A bare table with an integer primary key named `pk_col` — good enough to
@@ -1239,13 +1239,9 @@ async fn a_relationship_from_a_transform_target_back_to_its_own_source_is_accept
         .expect("valid definition should be stored");
 
     let def = parse(dsl).expect("parse dsl for target materialization");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize chained target table");
@@ -1306,13 +1302,9 @@ async fn an_integer_passthrough_on_a_calculated_table_is_a_valid_join_key() {
         .expect("valid calculated definition should be stored");
 
     let def = parse(dsl).expect("parse dsl for target materialization");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");
@@ -1369,13 +1361,9 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
         .expect("valid calculated definition should be stored");
 
     let def = parse(dsl).expect("parse dsl for target materialization");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("materialize calculated target table");

@@ -17,8 +17,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    PgType, create_definition, create_target_table, recompute, require_single_column_pk,
-    source_primary_key,
+    PgType, create_definition, create_target_table, recompute, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{SegmentState, StagedWatermark, TRUNCATE_SENTINEL_KEY, claim, fold};
@@ -207,13 +206,9 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -273,7 +268,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     assert_eq!(outcome.keys_written, 2, "orders 1 and 2 must be written");
     assert_eq!(outcome.keys_deleted, 1, "order 3 must be deleted");
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
         .await
         .expect("oracle recompute");
     let target_rows = client
@@ -325,13 +320,9 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
         .expect("seed the public.orders decoy and the real custom.orders");
 
     let source_columns = numeric_columns(&["price"]);
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, "custom.orders")
-            .await
-            .expect("introspect custom.orders' primary key"),
-        "custom.orders",
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, "custom.orders")
+        .await
+        .expect("introspect custom.orders' primary key");
     let def =
         trellis::defs::parse("TRANSFORM order_totals FROM custom.orders SELECT price AS total")
             .expect("parse the explicitly-qualified definition");
@@ -429,13 +420,9 @@ async fn explicitly_qualified_target_receives_a_live_cdc_write() {
     let source_columns = numeric_columns(&["id", "price", "tax"]);
     let def_text = "TRANSFORM custom.order_totals FROM orders SELECT price + tax AS total";
     let def = trellis::defs::parse(def_text).expect("parse the explicitly-qualified target");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "custom", &pk, &source_columns, &def.source)
         .await
         .expect("materialize custom.order_totals ahead of create_definition");
@@ -566,13 +553,9 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -630,13 +613,9 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -742,13 +721,9 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -858,13 +833,9 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     )
     .await
     .expect("create widget_costs definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -955,13 +926,9 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1027,13 +994,9 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     )
     .await
     .expect("create order_totals definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create order_totals table");
@@ -1268,13 +1231,9 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     )
     .await
     .expect("create order_totals definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create order_totals table");
@@ -1431,13 +1390,9 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1525,13 +1480,9 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1591,13 +1542,9 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1690,13 +1637,9 @@ async fn a_jsonb_column_passthrough_round_trips_through_compute() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1818,13 +1761,9 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1910,13 +1849,9 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -1978,7 +1913,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         refetch_queries[0]
     );
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
         .await
         .expect("oracle recompute");
     let target_rows = client
@@ -2034,13 +1969,9 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -2068,7 +1999,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
         .get(0);
     assert_eq!(target_count, N);
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
         .await
         .expect("oracle recompute");
     let target_rows = client
@@ -2127,13 +2058,9 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -2245,7 +2172,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         refetch_queries[0]
     );
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
         .await
         .expect("oracle recompute");
     let target_rows = client
@@ -2285,13 +2212,9 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
     )
     .await
     .expect("create definition");
-    let pk = require_single_column_pk(
-        source_primary_key(&db.pool, &def.source)
-            .await
-            .expect("introspect source primary key"),
-        &def.source,
-    )
-    .expect("single-column pk");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
     create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
         .await
         .expect("create target table");
@@ -2384,7 +2307,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
         assert_eq!(segment_state(&client, seg_seq).await, SegmentState::Drained);
     }
 
-    let oracle = recompute(&db.pool, &def, &pk.name, &source_columns)
+    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
         .await
         .expect("oracle recompute");
     let target_rows = client
