@@ -1971,9 +1971,22 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
 /// `SourceTableDropped` reported (issue #267's final fix) and the only spelling
 /// that can be in the ring for this call to have happened at all. Note that a
 /// dropped table is precisely the case [`qualified_src_table`] cannot resolve,
-/// so for a bare wedged row the canonical name usually *is* the raw one here;
-/// the array covers the reverse case, where the ring row is qualified and older
-/// quarantine rows for it are not.
+/// so for a bare wedged row the canonical name usually *is* the raw one here,
+/// and the array is what covers the case where it *is* still resolvable (the
+/// table is gone but `schema_nodes`/`transform_definitions` still name it) and
+/// the quarantine rows are bare while the ring rows are not.
+///
+/// **Known residual, deliberately not widened here:** [`canonical_and_raw`]
+/// derives the canonical name *from* the given one, so it never adds the bare
+/// suffix when handed an already-qualified spelling. A legacy bare quarantine
+/// row for a table `V33__quarantine_canonical_src_table.sql` could not fold
+/// (its bare suffix ambiguous across two schemas, or unresolvable at migration
+/// time) therefore still survives a purge keyed on the qualified ring spelling —
+/// exactly the pre-#283 behavior, since that delete was single-spelling too.
+/// Stripping to the bare suffix here would fix that only by reintroducing the
+/// ambiguity #74/ADR-0007 exists to prevent: a purge of `archive.orders` would
+/// delete a bare `orders` row that may belong to `public.orders`. Tracked as its
+/// own question rather than guessed at.
 pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), ApplyError> {
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;

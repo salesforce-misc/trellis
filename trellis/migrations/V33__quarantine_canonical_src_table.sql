@@ -54,7 +54,15 @@
 --   * Two schemas share a bare suffix (`public.orders` and `archive.orders`):
 --     ambiguous, so the bare row is left exactly as it is. Nothing is merged
 --     into the wrong physical table — the outcome #74/ADR-0007 exists to
---     prevent — and nothing is deleted.
+--     prevent — and nothing is deleted. Note this one case does *not* line up
+--     with the code side: `qualified_src_table` resolves an ambiguous bare name
+--     anyway, via `catalog::resolve_source_schema`'s `search_path` walk, so new
+--     writes land on the `search_path` winner while the un-folded bare rows stay
+--     where they are. That residual split is accepted: folding into a guess at
+--     the `search_path` a row never recorded is the one outcome worse than
+--     leaving it, and an ambiguous bare suffix means the code's own answer is
+--     already session-dependent.
+
 --   * Nothing resolves it at all (a since-dropped source, or the U+001F
 --     `RelationshipReverseDeferred` sentinel, which names no table at all):
 --     left alone too, which matches the code side exactly — those are the same
@@ -117,6 +125,19 @@ where p.src_table = c.bare;
 -- `(src_table, key, seg_seq)` (which holds at most one row), and re-issuing it
 -- from the sequence keeps `release_key`'s `seg_seq asc, held_seq asc` replay
 -- order — batch order first — intact.
+--
+-- **The one place `do nothing` can drop real work, called out rather than
+-- hidden:** unlike the other markers, a `poison_held` row carries a *payload*
+-- (`old_image`/`new_image`/`op`), so where both spellings parked a row for the
+-- same `(key, seg_seq)` the bare row's payload is discarded and the qualified
+-- one survives. That needs one batch to have folded two separate contributions
+-- for one logical key under two spellings — precisely the fold-coalescing gap
+-- issue #267 closed, so it can only come from a pre-#267 ring — and the code
+-- side lands in the same place from here on (`park_batch_contribution`'s own
+-- `on conflict do nothing` now sees both spellings collapse onto one canonical
+-- key). Retaining both is not expressible under this table's primary key, and
+-- re-keying a parked row onto a `seg_seq` it never came from would corrupt
+-- `release_key`'s replay order, which is load-bearing for aggregate deltas.
 insert into poison_held
     (src_table, key, seg_seq, op, lsn, old_image, new_image, origin_lsn,
      src_changed, hop_gen, group_key)
