@@ -133,7 +133,7 @@ async fn the_straddler_is_claimed_exactly_once() {
     // still in-progress, so it must be invisible in S_1.
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
     assert_eq!(outcome.sealed_seg_seq, 1);
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -148,7 +148,7 @@ async fn the_straddler_is_claimed_exactly_once() {
         .await
         .expect("seal phase 1 (segment 2)");
     assert_eq!(outcome2.sealed_seg_seq, 2);
-    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2 (segment 2)");
 
@@ -175,7 +175,7 @@ async fn the_phase_gap_writer_is_claimed_exactly_once() {
     insert_recompute(&phase_gap_writer, "seg_1", "phase-gap").await;
 
     // Only now does phase 2 for segment 1 run.
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -183,7 +183,7 @@ async fn the_phase_gap_writer_is_claimed_exactly_once() {
     let outcome2 = seal::seal_phase1(&mut sealer)
         .await
         .expect("seal phase 1 (segment 2)");
-    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2 (segment 2)");
 
@@ -225,7 +225,7 @@ async fn an_empty_active_segment_still_seals_to_catch_a_stranded_straggler() {
     // committed into its slot beyond genesis — an ordinary, uneventful seal.
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
     assert_eq!(outcome.sealed_seg_seq, 1);
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -252,7 +252,7 @@ async fn an_empty_active_segment_still_seals_to_catch_a_stranded_straggler() {
     // since the flip. The old, unconditional "only seal if non-empty" guard
     // would return `Ok(None)` here and never look back, stranding the
     // straddler for good.
-    let sealed = seal::seal_if_active_nonempty(&mut sealer)
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty");
     assert!(
@@ -288,7 +288,7 @@ async fn an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal()
     // in segment 1's own fence, not a straggler at all.
     insert_recompute(&sealer, "seg_0", "ordinary").await;
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     sealer
@@ -301,7 +301,7 @@ async fn an_empty_active_segment_with_a_fully_fenced_predecessor_does_not_seal()
 
     // The active segment (2) is empty, and segment 1 has nothing unfenced
     // left to catch — sealing now would be pure, unbounded busy-work.
-    let sealed = seal::seal_if_active_nonempty(&mut sealer)
+    let sealed = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty");
     assert!(
@@ -344,7 +344,7 @@ async fn the_high_xid_writer_is_claimed_exactly_once_via_the_xmax_fix() {
     // Phase 2 captures S_1 while the writer — with the highest xid in the
     // system — is still open. Without the autocommit `pg_current_xact_id()`
     // fix, `xmax(S_1)` sits at (at most) the writer's own xid: the trap.
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -363,7 +363,7 @@ async fn the_high_xid_writer_is_claimed_exactly_once_via_the_xmax_fix() {
     let outcome2 = seal::seal_phase1(&mut sealer)
         .await
         .expect("seal phase 1 (segment 2) after the writer settles");
-    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2 (segment 2)");
 
@@ -387,7 +387,7 @@ async fn seal_gate_blocks_until_the_straddler_settles() {
         .expect("insert gated row");
 
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -429,7 +429,7 @@ async fn seal_gate_blocks_when_the_predecessor_fence_is_not_yet_published() {
     }
 
     // Publishing S_1 self-heals the wedge: the same seal now goes through.
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     let outcome2 = seal::seal_phase1(&mut sealer)
@@ -479,7 +479,7 @@ async fn ring_full_runs_retirement_then_retries_once() {
     // a live registry row, leaving segment 4 active in slot 3.
     for _ in 0..3 {
         let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
-        seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+        seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
     }
@@ -510,7 +510,7 @@ async fn ring_full_runs_retirement_then_retries_once() {
         .await
         .expect("truncate seg_0 and seg_1");
 
-    let outcome = seal::seal_if_active_nonempty(&mut sealer)
+    let outcome = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty after marking segment 1 retirable");
     // The active segment (4) is empty, so seal_if_active_nonempty alone
@@ -521,7 +521,7 @@ async fn ring_full_runs_retirement_then_retries_once() {
     );
 
     insert_recompute(&sealer, "seg_3", "ring-full-probe").await;
-    let outcome = seal::seal_if_active_nonempty(&mut sealer)
+    let outcome = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty should retry once after retirement frees slot 0")
         .expect("segment 4 is non-empty and must seal");
@@ -578,7 +578,7 @@ async fn age_gated_recovery_unwedges_a_crashed_seal_without_stomping_a_fresh_one
     let generous = seal::SealConfig {
         age_gate: Duration::from_secs(600),
     };
-    let recovered = seal::recover_stuck_seals(&sealer, &generous)
+    let recovered = seal::recover_stuck_seals(&sealer, &generous, "wake")
         .await
         .expect("recover_stuck_seals (generous gate)");
     assert!(
@@ -596,7 +596,7 @@ async fn age_gated_recovery_unwedges_a_crashed_seal_without_stomping_a_fresh_one
     let tight = seal::SealConfig {
         age_gate: Duration::from_millis(5),
     };
-    let recovered = seal::recover_stuck_seals(&sealer, &tight)
+    let recovered = seal::recover_stuck_seals(&sealer, &tight, "wake")
         .await
         .expect("recover_stuck_seals (tight gate)");
     assert_eq!(recovered, vec![outcome.sealed_seg_seq]);
@@ -608,7 +608,7 @@ async fn age_gated_recovery_unwedges_a_crashed_seal_without_stomping_a_fresh_one
 
     // Recovery is idempotent / scoped to the still-incomplete state: a
     // second pass matches zero rows rather than double-writing the fence.
-    let recovered_again = seal::recover_stuck_seals(&sealer, &tight)
+    let recovered_again = seal::recover_stuck_seals(&sealer, &tight, "wake")
         .await
         .expect("recover_stuck_seals (second pass)");
     assert!(
@@ -639,7 +639,7 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
     insert_truncate(&sealer, "seg_0").await;
 
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
 
@@ -666,7 +666,7 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
     let outcome2 = seal::seal_phase1(&mut sealer)
         .await
         .expect("seal phase 1 (segment 2)");
-    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome2.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2 (segment 2)");
 
@@ -686,5 +686,145 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
     assert!(
         !has_truncate2,
         "has_truncate must not spill over from an earlier segment"
+    );
+}
+
+/// Issue #271: a seal actually completing is the one transition that makes
+/// a segment claimable, so `seal_phase2` now `pg_notify`s `wake_channel` the
+/// instant it publishes the fence. Mirrors
+/// `intake_core.rs`'s `notify_is_only_delivered_after_staged_rows_are_visible`
+/// — the same "notify must not precede the fact it announces" property,
+/// proven the same way: a dedicated `LISTEN` connection must never observe
+/// the notification before a completely separate connection can already see
+/// the fence it announces. `seal_phase2`'s own doc comment explains why this
+/// holds here even though, unlike `intake::advance_watermark_and_notify`,
+/// there is no explicit wrapping `Transaction` to point to: the `update` and
+/// the `pg_notify` are one statement, so Postgres's own single-statement
+/// implicit transaction is what makes the two atomic.
+#[tokio::test]
+async fn seal_notify_is_only_delivered_after_the_fence_is_visible() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    // A dedicated LISTEN connection, driven on its own task so its
+    // `Connection` future keeps polling for asynchronous notifications
+    // rather than being spawned-and-ignored like `connect_raw`.
+    let (listener, mut connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        .await
+        .expect("connect listener");
+
+    // Drive `connection` *before* issuing anything on `listener`: nothing is
+    // flushed or read back until something polls `connection`, so issuing
+    // `batch_execute` first would hang forever.
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
+                    let _ = notify_tx.send(());
+                }
+                Some(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+    });
+
+    listener
+        .batch_execute(&format!(
+            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; listen wake"
+        ))
+        .await
+        .expect("listen");
+
+    let mut sealer = connect_raw(db.dsn()).await;
+    insert_recompute(&sealer, "seg_0", "k1").await;
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    tokio::time::timeout(Duration::from_secs(5), notify_rx.recv())
+        .await
+        .expect("must receive the notification")
+        .expect("channel must not have closed");
+
+    // By the time the listener sees the notification, the fence is already
+    // published and visible on a completely separate connection — no
+    // listener wakes to a segment it can't yet actually fold or claim.
+    let observer = connect_raw(db.dsn()).await;
+    let fence_is_published: bool = observer
+        .query_one(
+            "select fence_snapshot is not null from segments where seg_seq = $1",
+            &[&outcome.sealed_seg_seq],
+        )
+        .await
+        .expect("read segment fence")
+        .get(0);
+    assert!(
+        fence_is_published,
+        "the fence must already be published by the time the notify is observed"
+    );
+}
+
+/// The other half of `seal_phase2`'s new notify discipline: a raced/duplicate
+/// call against an already-fenced segment (`seal_phase2`'s own doc comment:
+/// "a raced call ... matches zero rows — a benign no-op, not an error") must
+/// not send a second notify. Without the `with published as (...) select
+/// pg_notify(...) from published` conditioning, an unconditional `pg_notify`
+/// after the (no-op) `update` would fire every time, including from
+/// `recover_stuck_seals` re-observing a segment a normal seal already
+/// finished — spurious wakes this issue exists to eliminate, not add.
+#[tokio::test]
+async fn seal_notify_does_not_fire_on_a_raced_no_op_seal_phase2() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let (listener, mut connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        .await
+        .expect("connect listener");
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
+                    let _ = notify_tx.send(());
+                }
+                Some(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+    });
+    listener
+        .batch_execute(&format!(
+            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; listen wake"
+        ))
+        .await
+        .expect("listen");
+
+    let mut sealer = connect_raw(db.dsn()).await;
+    insert_recompute(&sealer, "seg_0", "k1").await;
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2 (first, real, publish)");
+
+    // Drain the one notify the real publish above sent.
+    tokio::time::timeout(Duration::from_secs(5), notify_rx.recv())
+        .await
+        .expect("must receive the first notification")
+        .expect("channel must not have closed");
+
+    // A second call against the same already-fenced segment is the benign
+    // no-op described above: its `with` clause matches zero rows, so
+    // `pg_notify` never evaluates.
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2 (second, no-op)");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), notify_rx.recv())
+            .await
+            .is_err(),
+        "a no-op seal_phase2 call must not send a second notify"
     );
 }

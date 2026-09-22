@@ -319,7 +319,7 @@ async fn stage_cdc(
 
 async fn seal_and_drain_one(pool: &trellis::Pool, client: &mut Client) -> i64 {
     let outcome = seal::seal_phase1(client).await.expect("seal 1");
-    seal::seal_phase2(client, outcome.sealed_seg_seq)
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal 2");
     let seg = outcome.sealed_seg_seq;
@@ -387,7 +387,7 @@ async fn spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work() {
 
     // Seal it, so the next change lands in a *different* segment.
     let parent_outcome = seal::seal_phase1(&mut raw).await.expect("seal 1");
-    seal::seal_phase2(&raw, parent_outcome.sealed_seg_seq)
+    seal::seal_phase2(&raw, parent_outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal 2");
     let parent_seg = parent_outcome.sealed_seg_seq;
@@ -409,7 +409,7 @@ async fn spike_a2_a_from_side_insert_drains_before_the_parents_reverse_work() {
     // Seal that one too, so the reverse work the parent batch queues can only
     // land in a segment *after* it.
     let child_outcome = seal::seal_phase1(&mut raw).await.expect("seal 1");
-    seal::seal_phase2(&raw, child_outcome.sealed_seg_seq)
+    seal::seal_phase2(&raw, child_outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal 2");
     let child_seg = child_outcome.sealed_seg_seq;

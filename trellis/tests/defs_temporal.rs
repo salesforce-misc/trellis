@@ -1688,7 +1688,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
 
     async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq)
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         apply::drain_once(
@@ -1928,7 +1928,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
 
     async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq)
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         apply::drain_once(

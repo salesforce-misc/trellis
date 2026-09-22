@@ -62,7 +62,7 @@ async fn insert_many_recompute(client: &Client, table: &str, prefix: &str, n: us
 
 async fn seal_active_segment(client: &mut Client) -> i64 {
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-    seal::seal_phase2(client, outcome.sealed_seg_seq)
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     outcome.sealed_seg_seq

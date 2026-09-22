@@ -620,7 +620,7 @@ async fn a_cdc_apply_produces_a_jsonb_agg_matching_the_live_elements() {
     .await;
 
     let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
-    seal::seal_phase2(&client, outcome.sealed_seg_seq)
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     apply::drain_once(

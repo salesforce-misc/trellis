@@ -80,7 +80,7 @@ fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
 async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-    seal::seal_phase2(client, outcome.sealed_seg_seq)
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     outcome.sealed_seg_seq

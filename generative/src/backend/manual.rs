@@ -590,7 +590,17 @@ impl ManualBackend {
     /// door.
     pub async fn force_seal_active_segment(&mut self) -> Result<i64, ManualBackendError> {
         let outcome = seal_phase1(&mut self.raw).await?;
-        seal_phase2(&self.raw, outcome.sealed_seg_seq).await?;
+        // Issue #271: `seal_phase2` now `pg_notify`s the wake channel the
+        // instant it publishes the fence. Every caller here has always used
+        // `ClientOptions::default()`'s wake channel (never overridden by
+        // this backend), so fall back to that default when no engine client
+        // has started yet to remember its own options.
+        let wake_channel = self
+            .client_options
+            .as_ref()
+            .map(|options| options.wake_channel.clone())
+            .unwrap_or_else(|| ClientOptions::default().wake_channel);
+        seal_phase2(&self.raw, outcome.sealed_seg_seq, &wake_channel).await?;
         Ok(outcome.sealed_seg_seq)
     }
 

@@ -361,7 +361,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     stage_bare_recompute(&client, "2").await;
 
     let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
-    seal::seal_phase2(&client, outcome.sealed_seg_seq)
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     apply::drain_once(
@@ -524,7 +524,7 @@ async fn enum_group_by_min_max_matches_a_server_side_recompute() {
 
     async fn drain_sealed(client: &mut Client, pool: &trellis::Pool) {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq)
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         apply::drain_once(
@@ -658,7 +658,7 @@ async fn alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_ca
 
     async fn drain_sealed(client: &mut Client, pool: &trellis::Pool, worker: &str) {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq)
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         apply::drain_once(

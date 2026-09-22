@@ -25,7 +25,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 async fn seal_and_fence(sealer: &mut Client) -> i64 {
     let outcome = seal::seal_phase1(sealer).await.expect("seal phase 1");
-    seal::seal_phase2(sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     outcome.sealed_seg_seq
@@ -247,7 +247,7 @@ async fn an_unclosed_fence_boundary_blocks_retirement() {
     let mut sealer = connect_raw(db.dsn()).await;
 
     let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
-    seal::seal_phase2(&sealer, outcome.sealed_seg_seq)
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
     // No second seal: segment 1 has no successor, so seal_step2 is null.
@@ -403,7 +403,7 @@ async fn ring_full_self_heals_once_the_oldest_segment_is_retirable() {
         .await
         .expect("truncate retired slots and give segment 4 a row to seal");
 
-    let outcome = seal::seal_if_active_nonempty(&mut sealer)
+    let outcome = seal::seal_if_active_nonempty(&mut sealer, "wake")
         .await
         .expect("seal_if_active_nonempty should retire segment 1 and retry")
         .expect("segment 4 is non-empty and must seal");

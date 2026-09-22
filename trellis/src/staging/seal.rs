@@ -238,7 +238,37 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// The write is scoped `state = 'sealed' and fence_snapshot is null`, so a
 /// raced call (a concurrent recoverer, or a normal completion that beat it)
 /// matches zero rows — a benign no-op, not an error.
-pub async fn seal_phase2(client: &Client, seg_seq: i64) -> Result<(), StagingError> {
+///
+/// `wake_channel` is `pg_notify`'d the instant this call is the one that
+/// actually publishes the fence (issue #271) — this is the one transition
+/// that makes the segment claimable, so it is the edge a drain worker
+/// parked on `wake_channel` actually wants to hear about, not the "rows
+/// landed in the active segment" edge `intake::advance_watermark_and_notify`
+/// and `apply::drain_once`'s downstream-propagation notify already cover.
+///
+/// The `update` and the `pg_notify` are one statement (a `with` clause
+/// feeding the updated row, if any, into `pg_notify`), not two — matching
+/// `advance_watermark_and_notify`'s own "notify must not precede the fact it
+/// announces" discipline, just achieved differently. That function opens an
+/// explicit `Transaction` and issues the mutation and the `pg_notify` as two
+/// statements inside it, relying on the caller's own commit to make both
+/// atomic. This function can't do that: its first two statements (the
+/// `xmax` fix and the snapshot capture, above) must each be *their own*
+/// committed, autocommit statement — running them inside a transaction would
+/// silently reintroduce the trap this function's own doc comment describes.
+/// So instead of widening that transaction, this folds the mutation and the
+/// notify into a single statement, which Postgres itself wraps in one
+/// implicit transaction: `pg_notify` only evaluates for a row the `update`
+/// actually touched, and a NOTIFY queued during a statement/transaction is
+/// only delivered to another backend once that statement's implicit
+/// transaction commits — so a listener can never observe this notify before
+/// the fence it announces is durably visible, and a raced no-op call (the
+/// `with` clause returns zero rows) never notifies at all.
+pub async fn seal_phase2(
+    client: &Client,
+    seg_seq: i64,
+    wake_channel: &str,
+) -> Result<(), StagingError> {
     client.query_one("select pg_current_xact_id()", &[]).await?;
     let fence: String = client
         .query_one("select pg_current_snapshot()::text", &[])
@@ -246,9 +276,13 @@ pub async fn seal_phase2(client: &Client, seg_seq: i64) -> Result<(), StagingErr
         .get(0);
     client
         .execute(
-            "update segments set fence_snapshot = $1::text::pg_snapshot \
-             where seg_seq = $2 and state = 'sealed' and fence_snapshot is null",
-            &[&fence, &seg_seq],
+            "with published as ( \
+                 update segments set fence_snapshot = $1::text::pg_snapshot \
+                 where seg_seq = $2 and state = 'sealed' and fence_snapshot is null \
+                 returning seg_seq \
+             ) \
+             select pg_notify($3, '') from published",
+            &[&fence, &seg_seq, &wake_channel],
         )
         .await?;
     Ok(())
@@ -335,8 +369,17 @@ async fn predecessor_has_unfenced_row(
 /// error — the design doc calls both guards "backpressure, never overwrite,"
 /// and a refused seal here is always a correct, retryable outcome, not a
 /// reason to tear down and reconnect the maintenance loop's connection.
+///
+/// `wake_channel` is threaded straight through to [`seal_phase2`] (issue
+/// #271): a seal that actually completes here is the one transition that
+/// makes a segment claimable, so it is exactly the edge a drain worker
+/// parked on `wake_channel` wants to wake to. A refused seal (`Ok(None)`,
+/// either guard, or a genuinely empty ring) never reaches `seal_phase2` at
+/// all, so it never notifies — there is nothing new for a listener to wake
+/// to.
 pub async fn seal_if_active_nonempty(
     client: &mut Client,
+    wake_channel: &str,
 ) -> Result<Option<SealOutcome>, StagingError> {
     let (active_seq, ring_slot) = active_pointer(client).await?;
     let table = ring_table_name(ring_slot)?;
@@ -361,7 +404,7 @@ pub async fn seal_if_active_nonempty(
         Err(StagingError::SealGateBlocked) => return Ok(None),
         Err(other) => return Err(other),
     };
-    seal_phase2(client, outcome.sealed_seg_seq).await?;
+    seal_phase2(client, outcome.sealed_seg_seq, wake_channel).await?;
     analyze_sealed_slot_best_effort(client, outcome.sealed_ring_slot).await;
     Ok(Some(outcome))
 }
@@ -397,9 +440,16 @@ async fn analyze_sealed_slot_best_effort(client: &Client, ring_slot: i16) {
 /// The age gate is what keeps this from racing every normal seal — without
 /// it, recovery would be a second, unsynchronized writer to the
 /// soon-to-be-published fence.
+///
+/// `wake_channel` is threaded straight through to [`seal_phase2`] (issue
+/// #271), same as [`seal_if_active_nonempty`]: a recovered segment becomes
+/// claimable at exactly the moment its fence is (re)published here, which is
+/// the same edge a normal seal's completion wakes a listener to — recovery
+/// finishing what a crashed seal started is not a different transition.
 pub async fn recover_stuck_seals(
     client: &Client,
     config: &SealConfig,
+    wake_channel: &str,
 ) -> Result<Vec<i64>, StagingError> {
     let age_gate_secs = config.age_gate.as_secs_f64();
     let stuck: Vec<(i64, i16)> = client
@@ -415,7 +465,7 @@ pub async fn recover_stuck_seals(
         .collect();
 
     for &(seg_seq, ring_slot) in &stuck {
-        seal_phase2(client, seg_seq).await?;
+        seal_phase2(client, seg_seq, wake_channel).await?;
         // Mirror the normal seal path: a crash-recovered slot has just
         // stopped growing too, so give condition 3 of the convergence
         // predicate its `origin_lsn` statistics rather than leaving it a

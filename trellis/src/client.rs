@@ -31,8 +31,12 @@
 //!
 //! **Wake channel**: [`ClientOptions::wake_channel`] is the one Postgres
 //! `LISTEN/NOTIFY` channel intake's linchpin (`stage_and_advance`), the
-//! backfill discharge (`run_pending_backfills`), and [`super::staging::apply::drain_once`]'s
-//! own downstream-propagation `pg_notify` all wake — and the same name every
+//! backfill discharge (`run_pending_backfills`), a seal actually completing
+//! (`staging::seal_if_active_nonempty`/`staging::recover_stuck_seals`, issue
+//! #271 — the transition that makes a batch claimable, as opposed to the
+//! others in this list, which fire when rows merely land in the *active*
+//! segment), and [`super::staging::apply::drain_once`]'s own
+//! downstream-propagation `pg_notify` all wake — and the same name every
 //! app-worker task `LISTEN`s on while idle. One name, one channel, shared
 //! by construction rather than by convention.
 
@@ -817,9 +821,13 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         }
 
         if let Some(c) = client.as_mut() {
-            let mut failed = staging::seal_if_active_nonempty(c).await.is_err();
+            let mut failed = staging::seal_if_active_nonempty(c, &wake_channel)
+                .await
+                .is_err();
             if !failed {
-                failed = staging::recover_stuck_seals(c, &seal_config).await.is_err();
+                failed = staging::recover_stuck_seals(c, &seal_config, &wake_channel)
+                    .await
+                    .is_err();
             }
             if !failed {
                 failed = staging::reclaim_stale(c, reclaim_ttl).await.is_err();

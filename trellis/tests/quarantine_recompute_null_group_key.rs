@@ -107,7 +107,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     let watermark = &watermark;
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-        seal::seal_phase2(client, outcome.sealed_seg_seq)
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         while apply::drain_once(

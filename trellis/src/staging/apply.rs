@@ -3436,7 +3436,7 @@ mod tests {
         let seal_outcome = crate::staging::seal::seal_phase1(&mut seal_client)
             .await
             .expect("seal phase 1");
-        crate::staging::seal::seal_phase2(&seal_client, seal_outcome.sealed_seg_seq)
+        crate::staging::seal::seal_phase2(&seal_client, seal_outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
         let seg_seq = seal_outcome.sealed_seg_seq;
