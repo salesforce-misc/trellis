@@ -262,13 +262,18 @@ impl Trellis {
     /// see [`defs::DefinitionRef`] for the reasoning behind each.
     ///
     /// A schema-qualified relationship address (`blog.posts.author`) is
-    /// accepted, but `relationship_definitions` stores from-tables bare — the
-    /// `RELATIONSHIP` grammar has no qualified endpoint spelling to store — so
-    /// the qualifier is checked against the from-table's registered
-    /// fully-qualified identity rather than joining the lookup key. An address
-    /// whose schema doesn't match names no registered relationship, which
-    /// `DROP` treats as its ordinary idempotent no-op (exactly as it treats a
-    /// name that was never declared).
+    /// accepted. `relationship_definitions` stores from-tables bare — the
+    /// `RELATIONSHIP` grammar has no qualified endpoint spelling to store —
+    /// but every relationship also records the schema its from-table actually
+    /// resolved to when it was declared (`from_schema`, issue #285), and the
+    /// qualifier is checked against *that* rather than joining the bare lookup
+    /// key. An address whose schema doesn't match names no registered
+    /// relationship, which `DROP` treats as its ordinary idempotent no-op
+    /// (exactly as it treats a name that was never declared). Checking the
+    /// qualifier against mere `schema_nodes` existence instead — what this did
+    /// before #285 — was satisfied by any registered same-named table in any
+    /// schema, so `DROP RELATIONSHIP shop.posts.author` would drop the
+    /// `author` declared on `blog.posts`.
     ///
     /// # What each statement does
     ///
@@ -416,13 +421,30 @@ impl Trellis {
                 name,
             } => {
                 if let Some(schema) = schema
-                    && !self.table_is_registered_as(&schema, &from_table).await?
+                    && !defs::catalog::relationship_declared_in_schema(
+                        &self.pool,
+                        &schema,
+                        &from_table,
+                        &name,
+                    )
+                    .await
+                    .map_err(TrellisError::Catalog)?
                 {
                     // The qualifier names a different table than the one this
                     // relationship was declared against (or one Trellis has
                     // never seen), so the address names no registered
                     // relationship — a drop's own idempotent no-op, the same
                     // answer a never-declared name gets.
+                    //
+                    // Issue #285: checked against the relationship's *own*
+                    // recorded from-table schema
+                    // (`relationship_definitions.from_schema`), not against
+                    // whether some `schema_nodes` row named
+                    // `schema.from_table` exists — the latter is true for any
+                    // registered same-named table in any schema, so
+                    // `DROP RELATIONSHIP shop.posts.author` used to sail past
+                    // it and drop the `author` actually declared on
+                    // `blog.posts`.
                     return Ok(Applied::Dropped);
                 }
                 defs::lifecycle::drop_relationship(&self.pool, &from_table, &name)
@@ -469,30 +491,6 @@ impl Trellis {
                 .map(|field| field.name.clone())
                 .collect(),
         })
-    }
-
-    /// Whether `table`'s registered fully-qualified identity is
-    /// `<schema>.<table>` — how an explicitly schema-qualified relationship
-    /// address is checked (see [`apply`](Trellis::apply)'s "Addressing").
-    /// `schema_nodes` is the right table to ask: `create_relationship`
-    /// resolves each endpoint to its qualified identity and upserts a node for
-    /// it, so every registered relationship's from-table has a row here.
-    async fn table_is_registered_as(
-        &self,
-        schema: &str,
-        table: &str,
-    ) -> Result<bool, TrellisError> {
-        let qualified = format!("{schema}.{table}");
-        Ok(self
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "select exists(select 1 from schema_nodes where table_name = $1)",
-                &[&qualified],
-            )
-            .await?
-            .get(0))
     }
 
     /// Every registered transform definition, oldest first.

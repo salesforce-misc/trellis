@@ -184,7 +184,10 @@ pub enum DefinitionRef {
     /// relationship catalog stores from-tables bare (the `RELATIONSHIP`
     /// grammar has no schema-qualified endpoint spelling at all), so the
     /// qualifier narrows *which* table the bare name must have resolved to
-    /// rather than joining the lookup key; see [`crate::Trellis::apply`].
+    /// rather than joining the lookup key: it is checked against the schema
+    /// the relationship itself recorded at definition time
+    /// (`relationship_definitions.from_schema`, issue #285), and a mismatch
+    /// names no relationship at all; see [`crate::Trellis::apply`].
     Relationship {
         schema: Option<String>,
         from_table: String,

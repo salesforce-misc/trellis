@@ -1689,14 +1689,40 @@ pub async fn create_relationship(
         });
     }
 
+    // Issue #285: the schema half of `qualified_from` is persisted alongside
+    // the bare `from_table`, so a scoped `DROP RELATIONSHIP
+    // <schema>.<from_table>.<name>` can check its qualifier against the table
+    // *this* relationship was actually declared against (see
+    // [`relationship_declared_in_schema`]) instead of against mere
+    // `schema_nodes` existence, which any registered same-named table in any
+    // schema satisfies. Read off `qualified_from` — the one resolution this
+    // function already trusts for `resolve_node_in_txn`/`reject_if_table_cycle`
+    // and every pg_catalog check above — rather than re-resolving
+    // `def.from_table` a second time, which could disagree with it.
+    //
+    // The `None` arm is unreachable from here:
+    // [`resolve_relationship_endpoint_in_txn`] returns an *unqualified* name
+    // only when `def.from_table` resolves to nothing at all, and that case
+    // always fails `column_type_in_txn` above and returns long before this
+    // insert. Surfaced as the same "from-table doesn't exist" error those
+    // checks would have raised rather than panicking over a state this crate's
+    // own writers cannot produce (same stance as
+    // [`super::lifecycle`]'s `quote_qualified`).
+    let from_schema = qualified_from
+        .split_once('.')
+        .map(|(schema, _)| schema)
+        .ok_or_else(|| CatalogError::SourceTableNotFound(def.from_table.clone()))?;
+
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
-                (name, from_table, from_col, to_table, to_col, definition_text, cardinality)
-             values ($1, $2, $3, $4, $5, $6, $7)
+                (name, from_schema, from_table, from_col, to_table, to_col, definition_text,
+                 cardinality)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
              returning id",
             &[
                 &def.name,
+                &from_schema,
                 &def.from_table,
                 &def.from_col,
                 &def.to_table,
@@ -1741,6 +1767,49 @@ pub async fn create_relationship(
         cardinality,
         warnings,
     })
+}
+
+/// Whether the relationship named `name` on `from_table` was declared against
+/// the `from_table` in `schema` specifically — the check a scoped `DROP
+/// RELATIONSHIP <schema>.<from_table>.<name>` address gets (issue #285).
+///
+/// `false` covers both halves of "this address names no such relationship":
+/// no relationship by that `(from_table, name)` pair at all, and one that
+/// exists but was declared against a same-named table in a *different* schema.
+/// A drop treats either as its own idempotent no-op — see
+/// [`crate::Trellis::apply`]'s drop arm, the one caller.
+///
+/// Compares against `relationship_definitions.from_schema` — the schema the
+/// declaring connection's `search_path` actually resolved `from_table` to,
+/// recorded by [`create_relationship`] — rather than asking whether some
+/// `schema_nodes` row named `schema.from_table` exists. The latter is what
+/// #227 did, and it is satisfied by *any* registered same-named table in any
+/// schema: with `blog.posts` and `shop.posts` both registered and `author`
+/// declared on `blog.posts`, `DROP RELATIONSHIP shop.posts.author` passed that
+/// check and silently dropped `blog.posts`' relationship.
+///
+/// The schema is compared literally, not case-folded or
+/// `search_path`-resolved: `from_schema` holds a real resolved schema name and
+/// the grammar's identifiers are already normalized by the parser, so the two
+/// spellings meet in the same form the rest of this module compares qualified
+/// identities in.
+pub async fn relationship_declared_in_schema(
+    pool: &Pool,
+    schema: &str,
+    from_table: &str,
+    name: &str,
+) -> Result<bool, CatalogError> {
+    let client = pool.get().await?;
+    Ok(client
+        .query_one(
+            "select exists (
+                select 1 from relationship_definitions
+                where from_schema = $1 and from_table = $2 and name = $3
+             )",
+            &[&schema, &from_table, &name],
+        )
+        .await?
+        .get(0))
 }
 
 /// Reads back the relationship named `name` declared on `from_table` — the

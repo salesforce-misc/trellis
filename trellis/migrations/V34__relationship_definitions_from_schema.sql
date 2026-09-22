@@ -1,0 +1,52 @@
+-- Issue #285: a relationship now records the schema its from-table resolved
+-- to at definition time, so `DROP RELATIONSHIP <schema>.<from_table>.<name>`
+-- can check its qualifier against *this relationship's* own from-table rather
+-- than merely against `schema_nodes` existence.
+--
+-- Before this column there was nowhere to resolve the schema half of that
+-- address. #227 introduced `[<schema>.]<from_table>.<relationship_name>`
+-- addressing (per #228's settled grammar) and checked the qualifier by asking
+-- whether *some* `schema_nodes` row named `schema.from_table` exists — which
+-- is true for any registered same-named table in any schema. With both
+-- `blog.posts` and `shop.posts` registered and `author` declared on
+-- `blog.posts`, `DROP RELATIONSHIP shop.posts.author` found `shop.posts`,
+-- treated the qualifier as satisfied, and dropped `blog.posts`' relationship
+-- silently. `DROP` is destructive; the address the caller thought was scoping
+-- the drop was doing nothing.
+--
+-- `from_table`/`to_table` stay bare, and `unique (from_table, name)` stays as
+-- V16 declared it. This column is deliberately *not* part of the lookup key: a
+-- relationship name is unique per bare from-table today, and every reader
+-- (`relationship_by_name`, the fold's `RelationshipPath` resolution,
+-- `relationships_to_table`) addresses one by that bare pair. Widening the key
+-- to `(from_schema, from_table, name)` would let `blog.posts.author` and
+-- `shop.posts.author` coexist and make every one of those bare lookups
+-- ambiguous — a much larger change than closing this drop gap, and not what
+-- #285 asks for. The column records identity for *verification*; it does not
+-- redefine it.
+--
+-- Existing rows: cleared rather than backfilled, following
+-- `V24__schema_nodes_qualified_identity.sql`'s precedent and for the same
+-- reason — Trellis is pre-release (`0.1.0`, no tags, no deployment), and
+-- resolving a pre-existing bare `from_table` to the schema its *declaring*
+-- connection's `search_path` picked needs `search_path`-aware per-row logic
+-- against a live catalog (`resolve_relationship_endpoint_in_txn`), which
+-- belongs in Rust and not in a one-shot SQL migration that would be guessing
+-- at a row's original search_path. A guessed `from_schema` is worse than no
+-- row here: it is exactly the wrong-schema mismatch this column exists to
+-- detect, so a bad guess would either silently permit the drop this issue is
+-- about or permanently refuse a correctly-spelled one.
+--
+-- `cascade` is required: `relationship_projections.relationship_id` references
+-- this table, so a bare `truncate` would fail on that foreign key. Truncating
+-- it too is correct — a projection is a relationship's own derived state and
+-- means nothing without its row. The projection *tables* themselves
+-- (Trellis-owned, in the configured target schema) are left behind rather than
+-- dropped from here; `drop_relationship` is what normally drops one, and a
+-- migration has no business issuing DDL against tables it can only find by
+-- reading the rows it is about to delete. Same pre-release caveat as V24: do
+-- not reuse this as precedent once real deployments exist.
+truncate table relationship_definitions cascade;
+
+alter table relationship_definitions
+    add column from_schema text not null;

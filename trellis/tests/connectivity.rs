@@ -30,7 +30,7 @@ async fn migrate_up_is_idempotent() {
         first_run,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33
+            27, 28, 29, 30, 31, 32, 33, 34
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -75,8 +75,15 @@ async fn migrate_up_is_idempotent() {
         // qualified counterpart, now that all five key on one canonical
         // identity per logical source table instead of on whatever spelling
         // the ring row being diagnosed happened to carry — summing
-        // `key_deaths.deaths`, deduplicating the markers).
-        "expected exactly V1 through V7, V9 through V24, and V26 through V33 to be applied"
+        // `key_deaths.deaths`, deduplicating the markers). Issue #285 added
+        // V34 (`relationship_definitions.from_schema` — the schema a
+        // relationship's from-table actually resolved to when it was declared,
+        // so a scoped `DROP RELATIONSHIP <schema>.<from_table>.<name>` checks
+        // its qualifier against the relationship's own from-table rather than
+        // against mere `schema_nodes` existence, which any registered
+        // same-named table in any schema satisfied; clears pre-existing rows
+        // rather than guessing their schema, per V24's own precedent).
+        "expected exactly V1 through V7, V9 through V24, and V26 through V34 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

@@ -280,12 +280,16 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // poison fuse's `quarantined`). Issue #283 added V33 (folds pre-existing
     // bare-spelled quarantine rows into their qualified counterpart, now that
     // every counter/marker table keys on one canonical identity per logical
-    // source table).
+    // source table). Issue #285 added V34
+    // (`relationship_definitions.from_schema`, the schema a relationship's
+    // from-table resolved to at definition time — what a scoped `DROP
+    // RELATIONSHIP <schema>.<from_table>.<name>` qualifier is now checked
+    // against).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33
+            27, 28, 29, 30, 31, 32, 33, 34
         ]
     );
 }
