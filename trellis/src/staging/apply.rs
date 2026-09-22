@@ -165,7 +165,8 @@ pub enum ApplyError {
     /// rather than the ordinary isolate/evict path.
     SourceTableDropped { source_table: String },
     /// [`super::quarantine::resume_column`] (or, indirectly,
-    /// [`crate::app::Trellis::resume_column`]) was asked to resume a
+    /// a `RESUME TRANSFORM <target>.<column>` statement,
+    /// [`crate::app::Trellis::apply`]) was asked to resume a
     /// `(transform, column)` pair with no currently-paused `column_status`
     /// row — resuming a column that isn't paused is caller error, not a
     /// silent no-op. Also reused for "no such column on this definition at

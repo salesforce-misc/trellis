@@ -56,7 +56,8 @@
 //! resolve to success.
 //!
 //! **Publication shrinkage is the caller's last step, not this module's.**
-//! [`crate::Trellis::drop_transform`] calls
+//! A `DROP TRANSFORM`/`DROP RELATIONSHIP` statement ([`crate::Trellis::apply`])
+//! calls
 //! [`crate::intake::publication::reconcile_publication`] inline once the drop
 //! commits (ADR-0014, "The publication shrinks by reconciliation"). It lives
 //! at the facade rather than here because reconciling needs a concrete

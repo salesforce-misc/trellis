@@ -78,6 +78,140 @@ pub struct RelationshipDef {
     pub to_col: String,
 }
 
+/// One whole statement in Trellis's grammar, as
+/// [`super::parser::parse_statement`] returns it — the single shape
+/// [`crate::Trellis::apply`] dispatches on (issue #227, ADR-0012: "parsing
+/// the statement is where the operation is decided; the facade signature does
+/// not change as operations are added").
+///
+/// Every variant's leading keyword is what distinguishes it, so the parser
+/// needs no lookahead past the first token to choose: `TRANSFORM` /
+/// `RELATIONSHIP` define, `PAUSE` / `RESUME` / `DROP` act on something
+/// already defined. The kind keyword is repeated on the imperative forms
+/// (`PAUSE TRANSFORM x`, not `PAUSE x`) because transforms and relationships
+/// do *not* share a namespace (issue #228, decision 1).
+///
+/// **Pause and resume are transform-only**, which is why they carry a
+/// [`TransformRef`] while `DROP` carries a [`DefinitionRef`] that can name
+/// either kind. A relationship is a reusable *component* of a transform, not
+/// something that does anything on its own — there is no work of its own to
+/// suspend, so there is nothing a pause could mean. (It matches ADR-0014's own
+/// reasoning for having no `pause_relationship`: a relationship carries no
+/// lifecycle status and nothing in the fold gates on one.) Dropping one is a
+/// different matter — a relationship is a definition, and definitions can be
+/// retired — so `DROP RELATIONSHIP` exists. Spelling the distinction in the
+/// types rather than in a runtime check is what keeps the grammar and the
+/// available operations the same set, per ADR-0004's "the accepted language
+/// *is* the spec".
+///
+/// `AMEND` is deliberately absent: it needs its own semantics ADR before it
+/// can be a grammar addition (issue #228, decision 3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    /// `TRANSFORM <target> FROM <source> ... SELECT ...`
+    DefineTransform(TransformDef),
+    /// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>`
+    DefineRelationship(RelationshipDef),
+    /// `PAUSE TRANSFORM <target>[.<column>]` — ADR-0014's operator-driven
+    /// freeze. Idempotent.
+    Pause(TransformRef),
+    /// `RESUME TRANSFORM <target>[.<column>]` — ADR-0014's
+    /// rebuild-by-backfill recovery (*not* a catch-up).
+    Resume(TransformRef),
+    /// `DROP TRANSFORM <target>` /
+    /// `DROP RELATIONSHIP [<schema>.]<from_table>.<name>` — ADR-0014's
+    /// terminal reap. Idempotent; refused if a still-registered dependent
+    /// chains off the subject.
+    Drop(DefinitionRef),
+}
+
+/// What a [`Statement::Pause`]/[`Statement::Resume`] addresses: a registered
+/// transform, whole (`column: None`) or one of its calculated fields.
+///
+/// `target` is the **bare** target-table name, never a `schema.table`
+/// spelling — a dotted address is `<transform>.<column>` (issue #228,
+/// decision 2: [`crate::QuarantineTarget`]'s existing
+/// `"transform"`/`"transform.column"` addressing, folded into this grammar).
+/// That is the one place this grammar's addressing deliberately diverges from
+/// `TRANSFORM`/`FROM`'s own `[<schema>.]<table>` table references: every
+/// operator-facing entry point below the facade
+/// ([`super::lifecycle::pause_transform`],
+/// [`crate::staging::quarantine::resume_transform`],
+/// [`crate::Trellis::status`]) already identifies a transform by its bare
+/// name, and `<transform>.<column>` and `<schema>.<transform>` are the same
+/// token shape — so one of the two readings had to win, and the column reading
+/// is the one the engine can actually resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformRef {
+    pub target: String,
+    pub column: Option<String>,
+}
+
+impl fmt::Display for TransformRef {
+    /// Renders the address back in the spelling the grammar accepts, so an
+    /// error message can name what it was handed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.column {
+            None => write!(f, "{}", self.target),
+            Some(column) => write!(f, "{}.{column}", self.target),
+        }
+    }
+}
+
+/// What a [`Statement::Drop`] addresses — the one statement that can name
+/// either kind of definition.
+///
+/// **The two kinds address differently, on purpose** (issue #228,
+/// decision 1). A transform's identity is its target table, which is unique on
+/// its own, so it is addressed bare. A relationship's name is unique only *per
+/// from-table* (`relationship_definitions`' own unique constraint), so a bare
+/// relationship name doesn't identify anything — the address is always scoped
+/// to the from-table, and a bare one is a parse error
+/// ([`super::error::ParseError::UnscopedRelationshipAddress`]) rather than a
+/// lookup that guesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefinitionRef {
+    /// `TRANSFORM <target>` — the bare target-table name.
+    ///
+    /// No column half, unlike [`TransformRef`]: dropping one calculated field
+    /// is an `ALTER TRANSFORM ... DROP <field>`, a different operation
+    /// entirely (issue #228 decision 2; issues #241/#242), so a column address
+    /// has nothing to parse into here and the parser refuses one.
+    Transform(String),
+    /// `[<schema>.]<from_table>.<relationship_name>`.
+    ///
+    /// `schema` is the optional leading qualifier of the *from-table* — the
+    /// relationship catalog stores from-tables bare (the `RELATIONSHIP`
+    /// grammar has no schema-qualified endpoint spelling at all), so the
+    /// qualifier narrows *which* table the bare name must have resolved to
+    /// rather than joining the lookup key; see [`crate::Trellis::apply`].
+    Relationship {
+        schema: Option<String>,
+        from_table: String,
+        name: String,
+    },
+}
+
+impl fmt::Display for DefinitionRef {
+    /// Renders the address back in the spelling the grammar accepts, so an
+    /// error message can name what it was handed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DefinitionRef::Transform(target) => write!(f, "{target}"),
+            DefinitionRef::Relationship {
+                schema: None,
+                from_table,
+                name,
+            } => write!(f, "{from_table}.{name}"),
+            DefinitionRef::Relationship {
+                schema: Some(schema),
+                from_table,
+                name,
+            } => write!(f, "{schema}.{from_table}.{name}"),
+        }
+    }
+}
+
 /// The target table's primary-key space (see `docs/transforms.md#granularity`).
 ///
 /// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`

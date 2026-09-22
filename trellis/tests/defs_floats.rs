@@ -1196,7 +1196,7 @@ async fn an_incremental_float_aggregate_stays_equal_to_a_hand_written_group_by()
     .await
     .expect("connect definer");
     definer
-        .define(
+        .apply(
             "TRANSFORM t FROM s GROUP BY i \
              SELECT i AS i, SUM(f8) AS total, AVG(f8) AS mean, MAX(f4) AS biggest",
         )

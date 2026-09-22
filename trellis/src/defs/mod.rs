@@ -50,11 +50,11 @@ pub mod validate;
 // doors onto it. Names the engine does not use are split out below and
 // compiled only behind those gates, which is what keeps a plain
 // `cargo build` free of `unused_imports` rather than an `allow`.
-pub use ast::ValueType;
+pub use ast::{DefinitionRef, Statement, TransformRef, ValueType};
 pub use catalog::{CatalogError, all_source_tables, create_relationship, install_definition};
 pub use error::ParseError;
 pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
-pub use parser::parse;
+pub use parser::{parse, parse_statement};
 pub use pg_type::PgType;
 pub use validate::validate;
 
@@ -893,5 +893,323 @@ mod tests {
                 },
             }]
         );
+    }
+}
+
+/// Grammar coverage for [`parse_statement`], the unified statement entry point
+/// issue #227 dispatches [`crate::Trellis::apply`] on (issue #228's settled
+/// grammar). Kept apart from the `tests` module above, which is about the
+/// expression/definition grammar `parse` covers, because what's under test
+/// here is *which statement* a text is — the dispatch decision itself.
+#[cfg(test)]
+mod statement_grammar_tests {
+    use super::*;
+    use ast::{DefinitionRef, Statement, TransformRef};
+    use error::ParseError;
+
+    /// A shorthand for the `PAUSE`/`RESUME` transform address that shows up in
+    /// nearly every case below.
+    fn transform(target: &str, column: Option<&str>) -> TransformRef {
+        TransformRef {
+            target: target.to_string(),
+            column: column.map(str::to_string),
+        }
+    }
+
+    fn relationship(schema: Option<&str>, from_table: &str, name: &str) -> DefinitionRef {
+        DefinitionRef::Relationship {
+            schema: schema.map(str::to_string),
+            from_table: from_table.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    // --- the two defining forms still route through the unified entry point --
+
+    /// `apply`ing a definition must produce exactly what `define` used to
+    /// parse, so folding dispatch inside the parser can't have changed what a
+    /// `TRANSFORM` statement means.
+    #[test]
+    fn a_transform_statement_parses_to_the_same_def_parse_produces() {
+        let text = "TRANSFORM reporting.order_totals FROM sales.orders SELECT a + b AS total";
+        let Statement::DefineTransform(def) = parse_statement(text).unwrap() else {
+            panic!("a TRANSFORM statement must parse as one");
+        };
+        assert_eq!(def, parse(text).unwrap());
+        assert_eq!(def.target, "order_totals");
+        assert_eq!(def.explicit_target_schema, Some("reporting".to_string()));
+    }
+
+    #[test]
+    fn a_relationship_statement_parses_to_the_same_def_parse_relationship_produces() {
+        let text = "RELATIONSHIP product FROM order_line_items.product_id TO products.id";
+        let Statement::DefineRelationship(def) = parse_statement(text).unwrap() else {
+            panic!("a RELATIONSHIP statement must parse as one");
+        };
+        assert_eq!(def, parser::parse_relationship(text).unwrap());
+        assert_eq!(def.name, "product");
+    }
+
+    /// An aggregate definition reaches the same key-space clause through
+    /// `parse_statement` — the dispatch arm delegates rather than
+    /// reimplementing.
+    #[test]
+    fn an_aggregate_transform_statement_keeps_its_key_space() {
+        let Statement::DefineTransform(def) = parse_statement(
+            "TRANSFORM order_totals FROM order_line_items GROUP BY order_id \
+             SELECT order_id AS order_id, SUM(amount) AS total_amount",
+        )
+        .unwrap() else {
+            panic!("a TRANSFORM statement must parse as one");
+        };
+        assert_eq!(
+            def.key_space,
+            ast::KeySpace::Aggregate {
+                group_by: vec![ast::GroupByKey::Column("order_id".to_string())]
+            }
+        );
+    }
+
+    // --- PAUSE / RESUME / DROP TRANSFORM ------------------------------------
+
+    #[test]
+    fn pause_resume_and_drop_a_whole_transform() {
+        assert_eq!(
+            parse_statement("PAUSE TRANSFORM order_totals").unwrap(),
+            Statement::Pause(transform("order_totals", None))
+        );
+        assert_eq!(
+            parse_statement("RESUME TRANSFORM order_totals").unwrap(),
+            Statement::Resume(transform("order_totals", None))
+        );
+        assert_eq!(
+            parse_statement("DROP TRANSFORM order_totals").unwrap(),
+            Statement::Drop(DefinitionRef::Transform("order_totals".to_string()))
+        );
+    }
+
+    /// Decision 2: column-level addressing, folding `QuarantineTarget`'s
+    /// existing `"transform.column"` spelling into this grammar.
+    #[test]
+    fn pause_and_resume_accept_a_column_address() {
+        assert_eq!(
+            parse_statement("PAUSE TRANSFORM order_totals.total").unwrap(),
+            Statement::Pause(transform("order_totals", Some("total")))
+        );
+        assert_eq!(
+            parse_statement("RESUME TRANSFORM order_totals.total").unwrap(),
+            Statement::Resume(transform("order_totals", Some("total")))
+        );
+    }
+
+    /// The addressing fork issue #228 left open: `PAUSE TRANSFORM a.b` is the
+    /// same token shape as a schema-qualified table reference, and this grammar
+    /// reads it as `<transform>.<column>` — the only reading the engine can
+    /// resolve, since a transform's operator-facing identity is its bare target
+    /// name everywhere below the facade.
+    #[test]
+    fn a_dotted_transform_address_is_a_column_not_a_schema() {
+        assert_eq!(
+            parse_statement("PAUSE TRANSFORM reporting.order_totals").unwrap(),
+            Statement::Pause(transform("reporting", Some("order_totals"))),
+        );
+    }
+
+    /// Which is also why a three-part transform address has no reading left,
+    /// and says so rather than reporting a stray token.
+    #[test]
+    fn an_over_qualified_transform_address_is_refused_naming_the_whole_address() {
+        let err = parse_statement("PAUSE TRANSFORM reporting.order_totals.total").unwrap_err();
+        let ParseError::MalformedDefinitionAddress {
+            statement, address, ..
+        } = &err
+        else {
+            panic!("expected a malformed-address error, got {err:?}");
+        };
+        assert_eq!(statement, "PAUSE TRANSFORM");
+        assert_eq!(address, "reporting.order_totals.total");
+        assert!(err.to_string().contains("bare target table"), "{err}");
+    }
+
+    /// Decision 2's other half: `DROP` is whole-definition only.
+    #[test]
+    fn drop_refuses_a_column_address() {
+        let err = parse_statement("DROP TRANSFORM order_totals.total").unwrap_err();
+        let ParseError::MalformedDefinitionAddress {
+            statement, address, ..
+        } = &err
+        else {
+            panic!("expected a malformed-address error, got {err:?}");
+        };
+        assert_eq!(statement, "DROP TRANSFORM");
+        assert_eq!(address, "order_totals.total");
+        assert!(err.to_string().contains("ALTER TRANSFORM"), "{err}");
+    }
+
+    // --- DROP RELATIONSHIP --------------------------------------------------
+
+    /// Decision 1: always scoped to the from-table, optionally schema-qualified.
+    #[test]
+    fn drop_relationship_accepts_both_scoped_spellings() {
+        assert_eq!(
+            parse_statement("DROP RELATIONSHIP posts.author").unwrap(),
+            Statement::Drop(relationship(None, "posts", "author"))
+        );
+        assert_eq!(
+            parse_statement("DROP RELATIONSHIP blog.posts.author").unwrap(),
+            Statement::Drop(relationship(Some("blog"), "posts", "author"))
+        );
+    }
+
+    /// Decision 1's refusal: a bare relationship name identifies nothing,
+    /// since `relationship_definitions` is unique on `(from_table, name)`.
+    #[test]
+    fn drop_relationship_refuses_a_bare_unscoped_name() {
+        let err = parse_statement("DROP RELATIONSHIP author").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::UnscopedRelationshipAddress { address } if address == "author"),
+            "expected an unscoped-address error, got {err:?}"
+        );
+        assert!(err.to_string().contains("posts.author"), "{err}");
+    }
+
+    #[test]
+    fn drop_relationship_refuses_a_four_part_address() {
+        let err = parse_statement("DROP RELATIONSHIP a.b.c.d").unwrap_err();
+        let ParseError::MalformedDefinitionAddress { address, .. } = &err else {
+            panic!("expected a malformed-address error, got {err:?}");
+        };
+        assert_eq!(address, "a.b.c.d");
+    }
+
+    /// **Pausing is transform-only.** A relationship is a reusable component of
+    /// a transform, not something that does work of its own, so there is
+    /// nothing for a pause to suspend — `PAUSE`/`RESUME RELATIONSHIP` is simply
+    /// not a form of this grammar. It must therefore fail the way any other
+    /// misplaced keyword fails: an ordinary
+    /// [`ParseError::UnexpectedToken`] saying `TRANSFORM` was expected, with no
+    /// special case anywhere for the phrase.
+    #[test]
+    fn pause_and_resume_are_transform_only() {
+        for text in [
+            "PAUSE RELATIONSHIP posts.author",
+            "RESUME RELATIONSHIP posts.author",
+            // The same whether or not the address that follows is well-formed:
+            // the keyword is rejected before any address is looked at.
+            "PAUSE RELATIONSHIP author",
+            "RESUME RELATIONSHIP blog.posts.author",
+        ] {
+            let err = parse_statement(text).unwrap_err();
+            let ParseError::UnexpectedToken { expected, found } = &err else {
+                panic!("expected an ordinary unexpected-token error for {text:?}, got {err:?}");
+            };
+            assert_eq!(expected, "'TRANSFORM'");
+            assert_eq!(found, "identifier 'RELATIONSHIP'");
+        }
+    }
+
+    /// The flip side of the rule, pinned so a future refactor can't quietly
+    /// make `DROP` transform-only too: `DROP` is the one verb that takes either
+    /// kind, because a relationship is a definition and definitions can be
+    /// retired. (The accepting cases are
+    /// `drop_relationship_accepts_both_scoped_spellings` above; this is the
+    /// contrast against `PAUSE`/`RESUME`.)
+    #[test]
+    fn drop_is_the_one_verb_that_accepts_either_kind() {
+        assert!(parse_statement("DROP RELATIONSHIP posts.author").is_ok());
+        assert!(parse_statement("DROP TRANSFORM order_totals").is_ok());
+        assert!(parse_statement("PAUSE RELATIONSHIP posts.author").is_err());
+        assert!(parse_statement("RESUME RELATIONSHIP posts.author").is_err());
+    }
+
+    // --- keyword handling and general malformation ---------------------------
+
+    /// Every keyword in this grammar is case-insensitive and lexes as a plain
+    /// identifier; the new ones are no exception.
+    #[test]
+    fn the_new_keywords_are_case_insensitive() {
+        assert_eq!(
+            parse_statement("pause transform order_totals").unwrap(),
+            Statement::Pause(transform("order_totals", None))
+        );
+        assert_eq!(
+            parse_statement("ReSuMe TrAnSfOrM order_totals.total").unwrap(),
+            Statement::Resume(transform("order_totals", Some("total")))
+        );
+        assert_eq!(
+            parse_statement("dRoP rElAtIoNsHiP posts.author").unwrap(),
+            Statement::Drop(relationship(None, "posts", "author"))
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_leading_keyword_names_every_statement_form() {
+        let err = parse_statement("DELETE TRANSFORM order_totals").unwrap_err();
+        let message = err.to_string();
+        for keyword in ["TRANSFORM", "RELATIONSHIP", "PAUSE", "RESUME", "DROP"] {
+            assert!(message.contains(keyword), "{message} is missing {keyword}");
+        }
+    }
+
+    #[test]
+    fn empty_input_asks_for_a_statement_keyword() {
+        let err = parse_statement("   ").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnexpectedEof { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("PAUSE"), "{err}");
+    }
+
+    /// Decision 1: the kind keyword is mandatory on the imperative forms —
+    /// there is no unified namespace to drop it in favour of.
+    #[test]
+    fn the_kind_keyword_is_required_after_the_verb() {
+        // `PAUSE`/`RESUME` only ever take `TRANSFORM`, so that is all their
+        // message names; `DROP` takes either kind and names both.
+        let err = parse_statement("PAUSE order_totals").unwrap_err();
+        assert!(err.to_string().contains("TRANSFORM"), "{err}");
+
+        let err = parse_statement("DROP order_totals").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("TRANSFORM"), "{message}");
+        assert!(message.contains("RELATIONSHIP"), "{message}");
+    }
+
+    #[test]
+    fn a_verb_with_no_address_at_all_is_refused() {
+        assert!(matches!(
+            parse_statement("PAUSE TRANSFORM").unwrap_err(),
+            ParseError::UnexpectedEof { .. }
+        ));
+        assert!(matches!(
+            parse_statement("DROP RELATIONSHIP").unwrap_err(),
+            ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    /// One statement per call, with no `;` terminator (ADR-0004) — a trailing
+    /// token is an error rather than the start of a second statement.
+    #[test]
+    fn trailing_tokens_after_an_address_are_refused() {
+        let err = parse_statement("DROP TRANSFORM order_totals CASCADE").unwrap_err();
+        assert!(
+            matches!(&err, ParseError::UnexpectedToken { expected, .. } if expected == "end of input"),
+            "got {err:?}"
+        );
+    }
+
+    /// Decision 4: the flat imperative won, so the SQL-DDL-flavoured
+    /// alternative is not quietly also accepted.
+    #[test]
+    fn the_alter_flavored_spelling_is_not_accepted() {
+        assert!(parse_statement("ALTER TRANSFORM order_totals PAUSE").is_err());
+    }
+
+    /// Decision 3: `AMEND` is out of scope until it has its own ADR, so it must
+    /// not parse — silently accepting it would be worse than rejecting it.
+    #[test]
+    fn amend_is_not_part_of_this_grammar_yet() {
+        assert!(parse_statement("AMEND TRANSFORM order_totals").is_err());
     }
 }

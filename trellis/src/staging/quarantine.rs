@@ -1160,6 +1160,67 @@ async fn cascade_pause(pool: &Pool, transform: &str, column: &str) -> Result<(),
     Ok(())
 }
 
+/// Pauses one calculated column deliberately — the operator-driven trigger
+/// for the same column-pause state [`trip_column_fuse`] reaches automatically,
+/// exposed through the grammar as `PAUSE TRANSFORM <target>.<column>` (issue
+/// #227; issue #228, decision 2).
+///
+/// ADR-0014's pause is "one state, two triggers", and that is as true at
+/// column granularity as at whole-transform granularity: this writes the same
+/// `column_status` row the fuse writes and runs the same [`cascade_pause`]
+/// over dependent readers, so a paused column freezes at its current value, is
+/// skipped by [`super::apply::compute`]'s evaluation, and is recovered by the
+/// same [`resume_column`] (which re-derives it across every existing row).
+/// Nothing here is a second freezing mechanism.
+///
+/// **`local_fuse` is set even though no fuse tripped.** That column records
+/// "this pair has a reason of its own to stay paused", as opposed to a pause
+/// merely inherited via [`cascade_pause`] — which is exactly true of an
+/// operator pause, and is what stops [`resume_column`] on some *upstream*
+/// column from un-pausing this one out from under the operator who paused it.
+/// The trade-off: `column_status.last_error` is left null, so a reader
+/// ([`crate::Trellis::quarantine_status`]) sees this the same way it sees a
+/// cascaded pause — paused, with no error of its own. That matches the
+/// whole-transform pause, which likewise records the frozen state without
+/// recording who asked for it.
+///
+/// Idempotent, per ADR-0014: pausing an already-paused column (by an earlier
+/// pause, by its own fuse, or purely by cascade) succeeds, upgrading a
+/// cascade-only pause to one with its own reason and re-walking the cascade
+/// (itself idempotent). Pause runs on Trellis's own connections rather than
+/// inside a caller's migration transaction, so a replayed migration has to be
+/// safe to re-run.
+///
+/// Whether `transform` and `column` actually exist is checked by the caller
+/// ([`crate::Trellis::apply`]), which has the catalog reads and the
+/// [`crate::TrellisError`] variants for it — `column_status` has no foreign
+/// key onto either (see `V22__column_status_drops_target_table_fkey.sql`), so
+/// this function would otherwise happily park a row naming nothing.
+#[tracing::instrument(
+    name = "quarantine.pause_column",
+    skip(pool),
+    fields(transform = %transform, column = %column)
+)]
+pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<(), ApplyError> {
+    {
+        let client = pool.get().await?;
+        client
+            .execute(
+                "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
+                 values ($1, $2, now(), true) \
+                 on conflict (transform_table, column_name) do update set local_fuse = true",
+                &[&transform, &column],
+            )
+            .await?;
+    }
+    tracing::info!(
+        transform = %transform,
+        column = %column,
+        "column paused by request; cascading the pause to its dependents"
+    );
+    cascade_pause(pool, transform, column).await
+}
+
 /// Resumes a paused column: clears its counter, recomputes its value across
 /// every existing row ([`recompute_column`]), clears its `column_status` row
 /// and outgoing cascade edges, then un-cascades every dependent this pause
@@ -1329,7 +1390,7 @@ pub async fn resume_column(
 /// **One resume for both of ADR-0014's pause triggers** (issue #142).
 /// `target`'s current status must be either [`TransformStatus::Quarantined`]
 /// (the poison fuse tripped it) or [`TransformStatus::Paused`] (an operator
-/// froze it deliberately via [`crate::Trellis::pause_transform`]) —
+/// froze it deliberately via `PAUSE TRANSFORM` — see [`crate::Trellis::apply`]) —
 /// [`ApplyError::TransformNotPaused`] otherwise, checked before any
 /// mutation, because resuming a transform that isn't frozen at all is caller
 /// error, not a silent no-op, matching [`resume_column`]'s

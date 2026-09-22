@@ -134,7 +134,7 @@ async fn has_live_drain_workers_is_false_for_a_staging_only_connection() {
         .await
         .expect("connect definer");
     definer
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");

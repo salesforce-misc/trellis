@@ -810,12 +810,13 @@ async fn trellis_exposes_the_read_and_resume_methods() {
     );
 
     let resumed = trellis
-        .resume_column("order_totals.total")
+        .apply("RESUME TRANSFORM order_totals.total")
         .await
-        .expect("resume_column");
-    assert_eq!(
-        resumed,
-        vec![("order_totals".to_string(), "total".to_string())]
+        .expect("resume a paused column");
+    assert!(
+        matches!(&resumed, trellis::Applied::Resumed { columns }
+            if columns == &vec![("order_totals".to_string(), "total".to_string())]),
+        "a column resume reports the pairs it resumed, got {resumed:?}"
     );
 
     let status_after = trellis
@@ -824,13 +825,24 @@ async fn trellis_exposes_the_read_and_resume_methods() {
         .expect("quarantine_status after resume");
     assert_eq!(status_after.state, trellis::app::QuarantineState::Live);
 
-    let bare_transform_err = trellis.resume_column("order_totals").await;
+    // Issue #227 replaced `resume_column`'s "a bare address is caller error"
+    // rejection with a grammar that makes the two spellings *different
+    // statements*: `RESUME TRANSFORM <t>.<c>` resumes one column (above),
+    // while `RESUME TRANSFORM <t>` is the whole-transform rebuild. So the bare
+    // form is no longer an addressing error at all — it is the other
+    // operation, judged against that operation's own precondition, which this
+    // still-live transform doesn't meet (only a frozen definition can be
+    // resumed).
+    let bare = trellis.apply("RESUME TRANSFORM order_totals").await;
     assert!(
         matches!(
-            bare_transform_err,
-            Err(trellis::TrellisError::ColumnAddressRequired)
+            bare,
+            Err(trellis::TrellisError::Apply(
+                ApplyError::TransformNotPaused { .. }
+            ))
         ),
-        "resume_column must reject a bare transform address, got {bare_transform_err:?}"
+        "a bare address is the whole-transform resume, refused here because the transform \
+         itself is live — not an ambiguous-address error, got {bare:?}"
     );
 }
 
@@ -873,11 +885,12 @@ fn blocking_trellis_exposes_the_read_and_resume_methods() {
     assert_eq!(sample.len(), DEFAULT_COLUMN_DEATH_THRESHOLD as usize);
 
     let resumed = trellis
-        .resume_column("order_totals.total")
-        .expect("resume_column (sync)");
-    assert_eq!(
-        resumed,
-        vec![("order_totals".to_string(), "total".to_string())]
+        .apply("RESUME TRANSFORM order_totals.total")
+        .expect("resume a paused column (sync)");
+    assert!(
+        matches!(&resumed, trellis::Applied::Resumed { columns }
+            if columns == &vec![("order_totals".to_string(), "total".to_string())]),
+        "a column resume reports the pairs it resumed, got {resumed:?}"
     );
 
     let status_after = trellis
@@ -2059,4 +2072,152 @@ async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
         None,
         "the counter must reset once the fuse trips"
     );
+}
+
+// ---------------------------------------------------------------------
+// (g) The operator-driven half of a column pause — issue #227, ADR-0014's
+//     "one state, two triggers" at column granularity, reached through the
+//     unified `PAUSE TRANSFORM <target>.<column>` grammar rather than by a
+//     fuse tripping.
+// ---------------------------------------------------------------------
+
+/// `PAUSE TRANSFORM <target>.<column>` must reach exactly the state the fuse
+/// reaches — a `column_status` row plus a cascade onto every dependent reader
+/// — so that a deliberately paused column freezes its value and is recovered
+/// by the very same `RESUME`. Anything else would be the second freezing
+/// mechanism ADR-0014 rules out.
+#[tokio::test]
+async fn pausing_a_column_by_statement_reaches_the_fuse_s_own_state_and_cascades() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let orders_def = seed_order_totals(&db, &client).await;
+    seed_order_summaries(&db, &orders_def).await;
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let applied = trellis
+        .apply("PAUSE TRANSFORM order_totals.total")
+        .await
+        .expect("pause a healthy column deliberately");
+    assert!(
+        matches!(applied, trellis::Applied::Paused),
+        "got {applied:?}"
+    );
+
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        Some((true, None)),
+        "an operator pause records its own reason to stay paused (local_fuse), with no \
+         error of its own — nothing failed"
+    );
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        None,
+        "no fuse tripped, so nothing may have been charged against one"
+    );
+    assert!(
+        cascade_edge_exists(
+            &client,
+            "order_summaries",
+            "grand_total",
+            "order_totals",
+            "total"
+        )
+        .await,
+        "a dependent reader must pause too rather than silently consume a frozen value"
+    );
+    assert!(
+        column_status_row(&client, "order_summaries", "grand_total")
+            .await
+            .is_some(),
+        "the cascaded dependent must actually be paused, not only edge-recorded"
+    );
+
+    // ADR-0014's idempotency clause: pause runs outside any host migration
+    // transaction, so a replayed migration has to be safe to re-run.
+    trellis
+        .apply("PAUSE TRANSFORM order_totals.total")
+        .await
+        .expect("pausing an already-paused column is a success");
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        Some((true, None)),
+    );
+
+    // The same grammar's resume un-cascades the dependent along with it: the
+    // dependent's only reason to be paused was this cascade.
+    let resumed = trellis
+        .apply("RESUME TRANSFORM order_totals.total")
+        .await
+        .expect("resume the deliberately-paused column");
+    let trellis::Applied::Resumed { columns } = resumed else {
+        panic!("a RESUME statement must report a resume, got {resumed:?}");
+    };
+    assert_eq!(
+        columns,
+        vec![
+            ("order_totals".to_string(), "total".to_string()),
+            ("order_summaries".to_string(), "grand_total".to_string()),
+        ],
+        "the addressed column first, then the dependent un-cascaded with it"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "total").await,
+        None
+    );
+    assert_eq!(
+        column_status_row(&client, "order_summaries", "grand_total").await,
+        None
+    );
+}
+
+/// Issue #228's decision-5 clause about "addressing something that doesn't
+/// exist": a column address is validated against the definition's own declared
+/// fields before anything is written, because `column_status` has no foreign
+/// key that would catch it — an unchecked pause would park a row naming
+/// nothing and only surface on a later resume.
+#[tokio::test]
+async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_written() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let err = trellis
+        .apply("PAUSE TRANSFORM order_totals.nonesuch")
+        .await
+        .expect_err("a column the definition never declared must be refused");
+    assert_eq!(err.code(), trellis::ErrorCode::NotFound);
+    let message = err.to_string();
+    assert!(
+        message.contains("nonesuch") && message.contains("total"),
+        "the refusal must name both the bad column and the ones that exist: {message}"
+    );
+    assert_eq!(
+        column_status_row(&client, "order_totals", "nonesuch").await,
+        None,
+        "a refused pause must leave no column_status row behind"
+    );
+
+    // And the whole-transform half of the same check: a dotted address whose
+    // *transform* half is unknown. (This is also the shape a caller gets if
+    // they wrote `<schema>.<transform>`, which this grammar reads as
+    // `<transform>.<column>` — see `Trellis::apply`'s "Addressing".)
+    let err = trellis
+        .apply("PAUSE TRANSFORM no_such_transform.total")
+        .await
+        .expect_err("an unknown transform must be refused");
+    assert_eq!(err.code(), trellis::ErrorCode::NotFound);
+    assert!(err.to_string().contains("no_such_transform"), "got {err}");
 }

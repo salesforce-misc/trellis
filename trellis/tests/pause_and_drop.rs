@@ -160,9 +160,11 @@ async fn pausing_twice_is_a_no_op_success() {
 
     let trellis = define_only(db.dsn()).await;
     let def = trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
-        .expect("an aggregate definition builds synchronously");
+        .expect("an aggregate definition builds synchronously")
+        .into_transform()
+        .expect("a TRANSFORM statement registers a transform");
     assert_eq!(
         def.status,
         TransformStatus::Live,
@@ -170,7 +172,7 @@ async fn pausing_twice_is_a_no_op_success() {
     );
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause a live transform");
     assert_eq!(
@@ -180,7 +182,7 @@ async fn pausing_twice_is_a_no_op_success() {
     );
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pausing an already-paused transform is a no-op success, not a conflict");
     assert_eq!(
@@ -206,7 +208,7 @@ async fn pausing_an_unregistered_transform_reports_not_found() {
     let trellis = define_only(db.dsn()).await;
 
     let err = trellis
-        .pause_transform("no_such_transform")
+        .apply("PAUSE TRANSFORM no_such_transform")
         .await
         .expect_err("nothing by that name is registered");
     match err {
@@ -250,11 +252,11 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
 
     let definer = define_only(db.dsn()).await;
     definer
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the transform under test");
     definer
-        .define("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
     definer.shutdown().await.expect("shut the definer down");
@@ -272,7 +274,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     .expect("start the live pipeline");
 
     running
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause one of the two siblings");
 
@@ -367,7 +369,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     );
 
     running
-        .resume_transform("order_rollup")
+        .apply("RESUME TRANSFORM order_rollup")
         .await
         .expect("resume the paused definition");
 
@@ -425,7 +427,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
     assert!(
@@ -443,11 +445,11 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     );
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("drop a paused definition");
 
@@ -488,7 +490,7 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
     assert_eq!(
@@ -505,11 +507,11 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
     );
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("drop a paused definition");
 
@@ -544,7 +546,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     raw.batch_execute(&format!(
@@ -553,17 +555,17 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
     .await
     .expect("a chained aggregate's source needs a full replica identity");
     trellis
-        .define("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
 
     let err = trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect_err("a live definition still derives from this target");
     match err {
@@ -587,13 +589,16 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
 
     // Reverse dependency order: retire the leaf, and the upstream drop is
     // no longer blocked.
-    trellis.pause_transform("grand_total").await.expect("pause");
     trellis
-        .drop_transform("grand_total")
+        .apply("PAUSE TRANSFORM grand_total")
+        .await
+        .expect("pause");
+    trellis
+        .apply("DROP TRANSFORM grand_total")
         .await
         .expect("drop the dependent first");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("with nothing left deriving from it, the upstream drops cleanly");
 
@@ -629,7 +634,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
     raw.batch_execute(&format!(
@@ -638,11 +643,11 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
     .await
     .expect("a chained aggregate's source needs a full replica identity");
     trellis
-        .define("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
+        .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause the target under test");
 
@@ -661,7 +666,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
         .expect("put the dependent in the status under test");
 
         let err = trellis
-            .drop_transform("order_rollup")
+            .apply("DROP TRANSFORM order_rollup")
             .await
             .expect_err(&format!("a '{status}' dependent still needs this target"));
         match err {
@@ -689,11 +694,11 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
     // Fully retired — the one state that does not block — and the upstream
     // drops. Reverse dependency order, exactly as before.
     trellis
-        .drop_transform("grand_total")
+        .apply("DROP TRANSFORM grand_total")
         .await
         .expect("the dependent is frozen, so it can be dropped");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("with the dependent gone rather than merely not-live, the drop proceeds");
     assert_eq!(
@@ -716,24 +721,24 @@ async fn dropping_an_unregistered_definition_is_a_no_op_success() {
     let trellis = define_only(db.dsn()).await;
 
     trellis
-        .drop_transform("never_defined")
+        .apply("DROP TRANSFORM never_defined")
         .await
         .expect("dropping something that was never defined is a success");
 
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("first drop");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("a replayed drop is a no-op success, not a NotFound");
 
@@ -755,12 +760,12 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
 
     let err = trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect_err("a live definition cannot be dropped out from under the fold");
     match err {
@@ -802,11 +807,11 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the definition under test");
     trellis
-        .define("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("a sibling over the same source, which co-owns the poison band");
 
@@ -861,10 +866,13 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
     .expect("seed the per-source fuse gate");
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
-    trellis.drop_transform("order_rollup").await.expect("drop");
+    trellis
+        .apply("DROP TRANSFORM order_rollup")
+        .await
+        .expect("drop");
 
     // Target-owned: gone, and only this target's.
     assert_eq!(
@@ -938,7 +946,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     // before it is built, which is exactly the in-flight backfill state under
     // test here.
     trellis
-        .define("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
     assert!(
@@ -965,7 +973,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     }
 
     trellis
-        .pause_transform("order_doubles")
+        .apply("PAUSE TRANSFORM order_doubles")
         .await
         .expect("a backfilling definition pauses too — that is what stopping a runaway build is");
     let after = chunk_queue::claim_chunks(&raw, "issue-231-worker", 100)
@@ -986,7 +994,10 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
          it did not consume them"
     );
 
-    trellis.drop_transform("order_doubles").await.expect("drop");
+    trellis
+        .apply("DROP TRANSFORM order_doubles")
+        .await
+        .expect("drop");
     assert_eq!(
         count(&raw, "select count(*) from backfill_chunks").await,
         0,
@@ -1016,24 +1027,24 @@ async fn dropping_shrinks_the_publication_to_what_still_derives() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
     trellis
-        .define("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
     trellis
-        .define("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define over the other source");
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("drop one of two readers of `orders`");
 
@@ -1048,9 +1059,12 @@ async fn dropping_shrinks_the_publication_to_what_still_derives() {
         "`orders` stays published: a sibling definition still derives from it"
     );
 
-    trellis.pause_transform("order_echo").await.expect("pause");
     trellis
-        .drop_transform("order_echo")
+        .apply("PAUSE TRANSFORM order_echo")
+        .await
+        .expect("pause");
+    trellis
+        .apply("DROP TRANSFORM order_echo")
         .await
         .expect("drop its last reader");
 
@@ -1101,20 +1115,20 @@ async fn dropping_reconciles_a_publication_that_still_has_to_grow() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
     trellis
-        .define("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
+        .apply("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define over the as-yet-unpublished source");
 
     trellis
-        .pause_transform("order_rollup")
+        .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
-        .drop_transform("order_rollup")
+        .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("the drop's own reconcile must not fail over an unpinned search_path");
 
@@ -1171,7 +1185,7 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
 
     let definer = define_only(db.dsn()).await;
     definer
-        .define("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
     definer.shutdown().await.expect("shut the definer down");
@@ -1202,20 +1216,20 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
     .expect("replica identity");
 
     trellis
-        .define_relationship("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
+        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
         .await
         .expect("a relationship whose to-side is a Trellis-owned target table");
     trellis
-        .define("TRANSFORM report_view FROM reports SELECT rollup.total AS t")
+        .apply("TRANSFORM report_view FROM reports SELECT rollup.total AS t")
         .await
         .expect("a live transform that reads the target through it");
 
     trellis
-        .pause_transform("order_doubles")
+        .apply("PAUSE TRANSFORM order_doubles")
         .await
         .expect("pause");
     let err = trellis
-        .drop_transform("order_doubles")
+        .apply("DROP TRANSFORM order_doubles")
         .await
         .expect_err("a live transform still reads this target through a relationship");
     match err {
@@ -1277,7 +1291,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     // target, and reaching `live` needs real drain workers.
     let definer = define_only(db.dsn()).await;
     definer
-        .define("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
     definer.shutdown().await.expect("shut the definer down");
@@ -1308,16 +1322,16 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     // `rollup.<column>`. This is the whole point — the old guard only looked
     // for readers.
     trellis
-        .define_relationship("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
+        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
         .await
         .expect("a relationship whose to-side is a Trellis-owned target table");
 
     trellis
-        .pause_transform("order_doubles")
+        .apply("PAUSE TRANSFORM order_doubles")
         .await
         .expect("pause");
     let err = trellis
-        .drop_transform("order_doubles")
+        .apply("DROP TRANSFORM order_doubles")
         .await
         .expect_err("a relationship still names this target as its to-side");
     match err {
@@ -1342,11 +1356,11 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     // Reverse dependency order: retire the relationship, and the target it
     // pointed at drops cleanly.
     trellis
-        .drop_relationship("reports", "rollup")
+        .apply("DROP RELATIONSHIP reports.rollup")
         .await
         .expect("nothing reads it, so it drops");
     trellis
-        .drop_transform("order_doubles")
+        .apply("DROP TRANSFORM order_doubles")
         .await
         .expect("with no relationship left naming it, the target drops");
 
@@ -1401,16 +1415,16 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
 
     let trellis = define_only(db.dsn()).await;
     trellis
-        .define_relationship("RELATIONSHIP posts FROM authors.id TO posts.author")
+        .apply("RELATIONSHIP posts FROM authors.id TO posts.author")
         .await
         .expect("declare the relationship");
     trellis
-        .define("TRANSFORM author_stats FROM authors SELECT count(posts.id) AS post_count")
+        .apply("TRANSFORM author_stats FROM authors SELECT count(posts.id) AS post_count")
         .await
         .expect("define a transform that reads it");
 
     let err = trellis
-        .drop_relationship("authors", "posts")
+        .apply("DROP RELATIONSHIP authors.posts")
         .await
         .expect_err("a live transform still reads this relationship");
     match err {
@@ -1425,15 +1439,15 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
     }
 
     trellis
-        .pause_transform("author_stats")
+        .apply("PAUSE TRANSFORM author_stats")
         .await
         .expect("pause");
     trellis
-        .drop_transform("author_stats")
+        .apply("DROP TRANSFORM author_stats")
         .await
         .expect("retire the reader first");
     trellis
-        .drop_relationship("authors", "posts")
+        .apply("DROP RELATIONSHIP authors.posts")
         .await
         .expect("with nothing live reading it, the relationship drops");
 
@@ -1454,7 +1468,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
     );
 
     trellis
-        .drop_relationship("authors", "posts")
+        .apply("DROP RELATIONSHIP authors.posts")
         .await
         .expect("a replayed relationship drop is a no-op success");
 }

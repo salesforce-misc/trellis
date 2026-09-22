@@ -75,7 +75,7 @@ async fn converged_target_reports_no_divergence() {
     .await
     .expect("connect definer");
     definer
-        .define("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
@@ -177,7 +177,7 @@ async fn a_converged_target_of_typed_literals_reports_no_divergence() {
     .await
     .expect("connect definer");
     definer
-        .define(
+        .apply(
             "TRANSFORM widget_stamps FROM widgets \
              SELECT DATE '2024-01-01' AS effective_on, \
                     TIMESTAMP '2024-03-05 12:34:56.5' AS recorded_at, \
@@ -287,7 +287,7 @@ async fn self_check_detects_a_divergence_seeded_by_directly_corrupting_a_target_
     .await
     .expect("connect definer");
     definer
-        .define("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
@@ -383,7 +383,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
     .await
     .expect("connect definer");
     definer
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
@@ -459,7 +459,7 @@ async fn self_check_excludes_a_paused_column_from_the_comparison() {
     .await
     .expect("connect definer");
     definer
-        .define("TRANSFORM widget_view FROM widgets SELECT price AS price, tax AS tax")
+        .apply("TRANSFORM widget_view FROM widgets SELECT price AS price, tax AS tax")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
@@ -557,7 +557,7 @@ async fn a_bounded_page_does_not_invent_a_divergence_from_the_two_sides_ending_a
     .await
     .expect("connect definer");
     definer
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
@@ -673,7 +673,7 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
     .await
     .expect("connect");
     trellis
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
 
@@ -726,7 +726,7 @@ async fn self_check_refuses_an_aggregate_target_rather_than_mis_auditing_it() {
     .await
     .expect("connect");
     trellis
-        .define("TRANSFORM region_counts FROM orders GROUP BY region SELECT region AS region, COUNT(*) AS n")
+        .apply("TRANSFORM region_counts FROM orders GROUP BY region SELECT region AS region, COUNT(*) AS n")
         .await
         .expect("define aggregate transform");
 

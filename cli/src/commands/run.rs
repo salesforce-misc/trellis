@@ -9,7 +9,7 @@
 //! Migrating after that connect would be too late even if it created
 //! definitions — which it doesn't; migrations only create/update schema, not
 //! data. So there is no ordering of "connect once, then migrate" that helps
-//! here: an operator must have already run `trellis define` (against a
+//! here: an operator must have already run `trellis apply` (against a
 //! migrated database) before `run` will do anything useful, and that's a
 //! real prerequisite, not an oversight.
 //!
@@ -58,7 +58,7 @@ Usage: trellis run [--staging|--no-staging] [--drain-threads N]
 
 Runs the live CDC/apply pipeline (staging worker and/or drain workers) until
 interrupted with Ctrl-C. Requires at least one TRANSFORM or RELATIONSHIP
-definition to already be registered (via `trellis define`) against a
+definition to already be registered (via `trellis apply`) against a
 migrated database.
 
 Options:

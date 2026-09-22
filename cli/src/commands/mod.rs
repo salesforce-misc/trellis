@@ -4,6 +4,6 @@
 //! matching module's `parse`/`run`; adding a new subcommand means adding a
 //! module here plus one arm there, not touching anything else.
 
-pub mod define;
+pub mod apply;
 pub mod run;
 pub mod status;

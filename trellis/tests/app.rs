@@ -80,7 +80,7 @@ async fn includes_relationship_to_tables_not_just_direct_anchors() {
     );
 }
 
-/// Issue #108 regression: [`Trellis::define`]'s own source-column
+/// Issue #108 regression: [`Trellis::apply`]'s own source-column
 /// introspection (`Trellis::source_columns`, private) used to classify a
 /// column's type by matching `information_schema.columns.data_type` text
 /// against a small hardcoded list that didn't even include `"uuid"` — so a
@@ -118,7 +118,7 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
         .expect("connect");
 
     trellis
-        .define("TRANSFORM events_calc FROM events SELECT tag AS tag, payload AS payload")
+        .apply("TRANSFORM events_calc FROM events SELECT tag AS tag, payload AS payload")
         .await
         .expect(
             "a uuid/jsonb passthrough must define successfully — pre-#108 the uuid column \
@@ -192,7 +192,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
         .expect("connect");
 
     let passthrough = trellis
-        .define("TRANSFORM people_calc FROM people SELECT m AS m")
+        .apply("TRANSFORM people_calc FROM people SELECT m AS m")
         .await
         .expect_err("an array passthrough must be rejected at define time, not at apply time");
     let rendered = passthrough.to_string();
@@ -202,7 +202,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
     );
 
     let grouped = trellis
-        .define("TRANSFORM mood_totals FROM people GROUP BY m SELECT SUM(n) AS total")
+        .apply("TRANSFORM mood_totals FROM people GROUP BY m SELECT SUM(n) AS total")
         .await
         .expect_err("an array GROUP BY key must be rejected at define time");
     let rendered = grouped.to_string();
@@ -282,7 +282,7 @@ async fn an_unrecognized_to_side_enrichment_column_still_lands_as_text() {
     .expect("to-one relationship should be stored");
 
     trellis
-        .define("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
+        .apply("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
         .await
         .expect("an array to-side enrichment column must keep working as a text projection");
 
@@ -340,7 +340,7 @@ async fn an_enum_to_side_enrichment_column_keeps_its_own_type() {
     .expect("to-one relationship should be stored");
 
     trellis
-        .define("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
+        .apply("TRANSFORM posts_calc FROM posts SELECT author.m AS mood")
         .await
         .expect("an enum to-side enrichment column must be recognized (issue #117)");
 
@@ -407,7 +407,7 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
         .await
         .expect("connect definer");
     definer
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");

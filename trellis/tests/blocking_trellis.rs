@@ -51,8 +51,10 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     trellis.migrate().expect("migrate (sync)");
 
     let def = trellis
-        .define("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
-        .expect("define (sync)");
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
+        .expect("define (sync)")
+        .into_transform()
+        .expect("a TRANSFORM statement registers a transform");
     assert_eq!(def.def.target, "widget_totals");
 
     let defs = trellis.definitions().expect("definitions (sync)");
@@ -124,7 +126,7 @@ fn define_returns_before_backfill_completes() {
     trellis.migrate().expect("migrate (sync)");
 
     trellis
-        .define("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
+        .apply("TRANSFORM widget_totals FROM widgets SELECT price + price AS total")
         .expect("define (sync)");
 
     let status = trellis

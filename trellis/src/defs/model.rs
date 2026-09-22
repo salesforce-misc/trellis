@@ -67,7 +67,7 @@ pub struct Definition {
 ///
 /// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
 /// two triggers of ADR-0014's single "frozen" state: the poison fuse trips
-/// the first, an operator [`pause`](crate::Trellis::pause_transform) sets the
+/// the first, an operator [`PAUSE`](crate::Trellis::apply) sets the
 /// second, and nothing else distinguishes them — both are simply *not*
 /// `live`, which is the one gate the claim-time fold has ever honored (the
 /// `t.status = 'live'` predicate in [`super::catalog::dependents_of`]).

@@ -740,7 +740,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     .await
     .expect("connect definer");
     definer
-        .define(
+        .apply(
             "TRANSFORM t FROM s GROUP BY a2 \
              SELECT a2 AS a2, SUM(a4) AS total, MAX(a8) AS biggest, AVG(a4) AS mean",
         )

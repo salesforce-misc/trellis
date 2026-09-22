@@ -46,7 +46,10 @@
 //! relationship from a calculated field, cardinality validation, and catalog
 //! storage are all separate, later issues.
 
-use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Predicate, RelationshipDef, TransformDef};
+use super::ast::{
+    DefinitionRef, Expr, FieldDef, GroupByKey, KeySpace, Predicate, RelationshipDef, Statement,
+    TransformDef, TransformRef,
+};
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
@@ -56,6 +59,14 @@ use super::registry::{
 use super::typed_literal::lookup_typed_literal;
 
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
+
+/// What [`Parser::parse_statement`] expects to lead a statement, spelled out
+/// in the error a caller sees when it leads with something else — the closest
+/// thing this grammar has to a keyword table, and deliberately only a message
+/// (the parser still recognizes each keyword positionally, via
+/// [`Parser::peek_is_keyword`], the way every other keyword here works).
+const STATEMENT_KEYWORDS: &str =
+    "a statement keyword: TRANSFORM, RELATIONSHIP, PAUSE, RESUME or DROP";
 
 /// Parses a transform definition's source text into a [`TransformDef`].
 ///
@@ -91,6 +102,79 @@ pub fn parse_relationship(input: &str) -> Result<RelationshipDef, ParseError> {
         is_aggregate: false,
     }
     .parse_relationship_def()
+}
+
+/// Parses **any** statement in this grammar into a [`Statement`] — the one
+/// entry point [`crate::Trellis::apply`] uses (issue #227, ADR-0012).
+///
+/// The statement's leading keyword alone decides which form is parsed, so
+/// dispatch lives here rather than in the caller: before this existed, the CLI
+/// sniffed the first whitespace-delimited word itself to choose between
+/// [`parse`] and [`parse_relationship`], and every new statement form would
+/// have grown that external sniffing (and every embedder's copy of it). Here,
+/// a new form is a new arm.
+///
+/// The five forms, in full (issue #228's settled grammar):
+///
+/// ```text
+/// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
+/// RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+///
+/// PAUSE  TRANSFORM <target>[.<column>]
+/// RESUME TRANSFORM <target>[.<column>]
+/// DROP   TRANSFORM <target>
+/// DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
+/// ```
+///
+/// That list is exhaustive — in particular **there is no
+/// `PAUSE`/`RESUME RELATIONSHIP`**: pausing is a transform-only operation,
+/// because a relationship is a reusable component of a transform rather than
+/// something that does work of its own to suspend. `PAUSE RELATIONSHIP x.y` is
+/// therefore just an unrecognized keyword where `TRANSFORM` was expected, no
+/// more special-cased than `PAUSE SELECT` would be. `DROP` takes either kind,
+/// since a relationship is a definition and definitions can be retired.
+///
+/// `PAUSE`/`RESUME`/`DROP` keep the kind keyword (issue #228 decision 1 — the
+/// two kinds don't share a namespace) and are flat imperatives rather than
+/// `ALTER TRANSFORM x PAUSE` (decision 4). They need no lexer changes:
+/// `PAUSE`/`RESUME`/`DROP` lex as plain `Ident`s and are matched
+/// case-insensitively by [`Parser::peek_is_keyword`], exactly like
+/// `TRANSFORM`/`FROM`/`TO` already are.
+///
+/// [`parse`] and [`parse_relationship`] remain as the narrower, single-form
+/// entry points the engine itself uses when it re-parses text it persisted and
+/// already knows the kind of (`catalog::definition_by_target`,
+/// `catalog::relationship_by_name`), where unwrapping a [`Statement`] would be
+/// pure ceremony.
+pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
+    let tokens = lex(input)?;
+    Parser {
+        tokens,
+        pos: 0,
+        is_aggregate: false,
+    }
+    .parse_statement()
+}
+
+/// Which imperative a `PAUSE`/`RESUME`/`DROP` statement leads with. Threaded
+/// into [`Parser::parse_transform_address`] so a malformed address can
+/// name the statement form it was written in (`PAUSE TRANSFORM`, not just
+/// `TRANSFORM`) in its error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Pause,
+    Resume,
+    Drop,
+}
+
+impl Verb {
+    fn keyword(self) -> &'static str {
+        match self {
+            Verb::Pause => "PAUSE",
+            Verb::Resume => "RESUME",
+            Verb::Drop => "DROP",
+        }
+    }
 }
 
 struct Parser {
@@ -250,6 +334,222 @@ impl Parser {
         Err(ParseError::TooManyQualifiedNameParts { reference })
     }
 
+    /// Rejects anything but end-of-input at the cursor — every statement form
+    /// in this grammar accepts exactly one statement, with no `;` terminator
+    /// (ADR-0004).
+    fn expect_eof(&mut self) -> Result<(), ParseError> {
+        match self.advance() {
+            Token::Eof => Ok(()),
+            other => Err(ParseError::UnexpectedToken {
+                expected: "end of input".to_string(),
+                found: other.describe(),
+            }),
+        }
+    }
+
+    /// Dispatches on the statement's leading keyword — see
+    /// [`parse_statement`]'s doc comment for the grammar this covers.
+    ///
+    /// The two defining forms delegate to the same
+    /// [`Self::parse_transform_def`]/[`Self::parse_relationship_def`] the
+    /// narrow entry points use (including their own end-of-input check), so
+    /// `apply`ing a definition can't drift from `parse`ing one.
+    fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        if self.peek_is_keyword("TRANSFORM") {
+            return self.parse_transform_def().map(Statement::DefineTransform);
+        }
+        if self.peek_is_keyword("RELATIONSHIP") {
+            return self
+                .parse_relationship_def()
+                .map(Statement::DefineRelationship);
+        }
+
+        let verb = if self.peek_is_keyword("PAUSE") {
+            Verb::Pause
+        } else if self.peek_is_keyword("RESUME") {
+            Verb::Resume
+        } else if self.peek_is_keyword("DROP") {
+            Verb::Drop
+        } else {
+            let found = self.peek().describe();
+            return Err(match self.peek() {
+                Token::Eof => ParseError::UnexpectedEof {
+                    expected: STATEMENT_KEYWORDS.to_string(),
+                },
+                _ => ParseError::UnexpectedToken {
+                    expected: STATEMENT_KEYWORDS.to_string(),
+                    found,
+                },
+            });
+        };
+        self.advance();
+
+        let statement = match verb {
+            Verb::Pause => Statement::Pause(self.parse_transform_ref(verb)?),
+            Verb::Resume => Statement::Resume(self.parse_transform_ref(verb)?),
+            Verb::Drop => Statement::Drop(self.parse_drop_ref()?),
+        };
+        self.expect_eof()?;
+        Ok(statement)
+    }
+
+    /// Parses the `TRANSFORM <address>` tail of a `PAUSE`/`RESUME` statement.
+    ///
+    /// `TRANSFORM` is the **only** kind keyword these two verbs accept: a
+    /// relationship is a reusable component of a transform, not something that
+    /// does work of its own, so there is nothing a pause could suspend (the
+    /// same reason ADR-0014 gives for having no `pause_relationship`). So
+    /// `PAUSE RELATIONSHIP ...` is not a form this grammar has and declines —
+    /// it is simply not a form this grammar has, and it is rejected by the
+    /// ordinary [`Self::expect_keyword`] path, exactly like any other keyword
+    /// that doesn't belong where it was written. `DROP` is the one verb that
+    /// takes either kind ([`Self::parse_drop_ref`]).
+    fn parse_transform_ref(&mut self, verb: Verb) -> Result<TransformRef, ParseError> {
+        self.expect_keyword("TRANSFORM")?;
+        let (target, column) = self.parse_transform_address(verb)?;
+        Ok(TransformRef { target, column })
+    }
+
+    /// Parses the `TRANSFORM <address>` / `RELATIONSHIP <address>` tail of a
+    /// `DROP` statement — the one verb that can name either kind of
+    /// definition, since a relationship *is* a definition and definitions can
+    /// be retired.
+    ///
+    /// A `<transform>.<column>` address is refused here rather than silently
+    /// ignoring the column half: `DROP` is whole-definition only (issue #228,
+    /// decision 2), and dropping a single calculated field is an
+    /// `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
+    fn parse_drop_ref(&mut self) -> Result<DefinitionRef, ParseError> {
+        if self.peek_is_keyword("TRANSFORM") {
+            self.advance();
+            let (target, column) = self.parse_transform_address(Verb::Drop)?;
+            if let Some(column) = column {
+                return Err(ParseError::MalformedDefinitionAddress {
+                    statement: "DROP TRANSFORM".to_string(),
+                    address: format!("{target}.{column}"),
+                    detail: "DROP removes a whole definition, so it takes a bare <target>; \
+                             dropping one calculated field is an ALTER TRANSFORM operation \
+                             (issues #241/#242), not a DROP"
+                        .to_string(),
+                });
+            }
+            return Ok(DefinitionRef::Transform(target));
+        }
+
+        if self.peek_is_keyword("RELATIONSHIP") {
+            self.advance();
+            let (schema, from_table, name) = self.parse_relationship_address(Verb::Drop)?;
+            return Ok(DefinitionRef::Relationship {
+                schema,
+                from_table,
+                name,
+            });
+        }
+
+        let found = self.peek().describe();
+        Err(match self.peek() {
+            Token::Eof => ParseError::UnexpectedEof {
+                expected: "'TRANSFORM' or 'RELATIONSHIP' after 'DROP'".to_string(),
+            },
+            _ => ParseError::UnexpectedToken {
+                expected: "'TRANSFORM' or 'RELATIONSHIP' after 'DROP'".to_string(),
+                found,
+            },
+        })
+    }
+
+    /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address:
+    /// `<target>` (whole definition) or `<target>.<column>` (one calculated
+    /// field, issue #228 decision 2).
+    ///
+    /// **Deliberately not [`Self::parse_table_ref`].** That helper reads
+    /// `a.b` as `<schema>.<table>`, which is right in `TRANSFORM`/`FROM`
+    /// position and wrong here: a transform's operator-facing identity is its
+    /// *bare* target-table name everywhere below the facade (see
+    /// [`DefinitionRef::Transform`]'s doc comment), and the same `ident '.'
+    /// ident` shape has to mean `<transform>.<column>` in this position for
+    /// decision 2's column addressing to exist at all. A third part is
+    /// refused naming the whole address, the way `parse_table_ref` does for
+    /// its own over-qualified case.
+    fn parse_transform_address(
+        &mut self,
+        verb: Verb,
+    ) -> Result<(String, Option<String>), ParseError> {
+        let target = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            return Ok((target, None));
+        }
+        self.advance();
+        let column = self.expect_ident()?;
+        if !self.peek_is_symbol('.') {
+            return Ok((target, Some(column)));
+        }
+        // Over-qualified: keep consuming so the error names the whole address
+        // rather than bailing mid-way and desyncing the rest of the parse.
+        let mut address = format!("{target}.{column}");
+        while self.peek_is_symbol('.') {
+            self.advance();
+            address.push('.');
+            address.push_str(&self.expect_ident()?);
+        }
+        Err(ParseError::MalformedDefinitionAddress {
+            statement: format!("{} TRANSFORM", verb.keyword()),
+            address,
+            detail: "a transform is addressed by its bare target table, optionally with one \
+                     '.<column>' suffix — there is no schema-qualified spelling here, since a \
+                     dotted address already means <transform>.<column>"
+                .to_string(),
+        })
+    }
+
+    /// Parses a `PAUSE`/`RESUME`/`DROP RELATIONSHIP` address:
+    /// `[<schema>.]<from_table>.<relationship_name>` (issue #228 decision 1).
+    ///
+    /// The last dotted component is always the relationship name; the
+    /// remaining one or two are the from-table's own `[<schema>.]<table>`
+    /// reference. A bare, unscoped name is refused
+    /// ([`ParseError::UnscopedRelationshipAddress`]) — it identifies nothing,
+    /// since `relationship_definitions` is unique on `(from_table, name)`, not
+    /// on `name`. Four or more parts are refused naming the whole address.
+    ///
+    /// **Deliberately not [`Self::parse_table_ref`]** either: that helper
+    /// errors on the third part as over-qualified, which is exactly the
+    /// schema-qualified form this address is *supposed* to accept.
+    fn parse_relationship_address(
+        &mut self,
+        verb: Verb,
+    ) -> Result<(Option<String>, String, String), ParseError> {
+        let mut parts = vec![self.expect_ident()?];
+        while self.peek_is_symbol('.') {
+            self.advance();
+            parts.push(self.expect_ident()?);
+        }
+        match parts.len() {
+            1 => Err(ParseError::UnscopedRelationshipAddress {
+                address: parts.swap_remove(0),
+            }),
+            2 => {
+                let name = parts.pop().expect("two parts");
+                let from_table = parts.pop().expect("two parts");
+                Ok((None, from_table, name))
+            }
+            3 => {
+                let name = parts.pop().expect("three parts");
+                let from_table = parts.pop().expect("three parts");
+                let schema = parts.pop().expect("three parts");
+                Ok((Some(schema), from_table, name))
+            }
+            _ => Err(ParseError::MalformedDefinitionAddress {
+                statement: format!("{} RELATIONSHIP", verb.keyword()),
+                address: parts.join("."),
+                detail: "a relationship is addressed as \
+                         [<schema>.]<from_table>.<relationship_name> — at most three \
+                         '.'-separated parts"
+                    .to_string(),
+            }),
+        }
+    }
+
     fn parse_transform_def(&mut self) -> Result<TransformDef, ParseError> {
         self.expect_keyword("TRANSFORM")?;
         let (target, explicit_target_schema) = self.parse_table_ref()?;
@@ -270,16 +570,7 @@ impl Parser {
         };
 
         self.reject_trailing_key_space_clause()?;
-
-        match self.advance() {
-            Token::Eof => {}
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "end of input".to_string(),
-                    found: other.describe(),
-                });
-            }
-        }
+        self.expect_eof()?;
 
         Ok(TransformDef {
             target,
@@ -309,16 +600,7 @@ impl Parser {
 
         self.expect_keyword("TO")?;
         let (to_table, to_col) = self.expect_table_dot_column()?;
-
-        match self.advance() {
-            Token::Eof => {}
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "end of input".to_string(),
-                    found: other.describe(),
-                });
-            }
-        }
+        self.expect_eof()?;
 
         Ok(RelationshipDef {
             name,

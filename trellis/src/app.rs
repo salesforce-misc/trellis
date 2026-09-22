@@ -25,18 +25,28 @@
 //! match on instead of every internal Rust error variant (`docs/decisions/0008-public-api-design.md`,
 //! decision 3).
 //!
-//! **[`define`](Trellis::define) doesn't block on backfill.** Per
+//! **Every definition-changing operation goes through one entrypoint.**
+//! [`Trellis::apply`] takes a single statement of Trellis's own grammar — the
+//! same grammar the CLI speaks — and the parse decides which operation runs:
+//! define a transform, define a relationship, pause, resume, drop (issue #227;
+//! ADR-0012, ADR-0014). There is deliberately no typed method per operation,
+//! so adding one is a grammar addition rather than new surface every
+//! host-language binding has to mirror. Read paths (status, `self_check`,
+//! quarantine sampling, convergence-await) are unaffected — they stay typed;
+//! only the mutation surface unifies.
+//!
+//! **[`apply`](Trellis::apply)ing a definition doesn't block on backfill.** Per
 //! `docs/decisions/0008-public-api-design.md`'s decision 1 and
 //! [ADR-0007's amendment](../../docs/decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment),
 //! a plain (non-relationship) 1-1 transform's initial backfill runs as a
 //! durable, claimable queue of chunks that running drain
 //! (`application_threads`) workers execute — anywhere in the fleet, not
-//! necessarily on the connection that called `define()`. `define()` itself
+//! necessarily on the connection that called `apply()`. `apply()` itself
 //! returns once the definition is registered and that chunk work is
 //! enumerated/persisted, with [`TransformStatus::Backfilling`]; callers that
 //! need the target actually populated poll [`Trellis::status`] until it
 //! reports [`TransformStatus::Live`] — which requires *some* client in the
-//! fleet to be running with `drain_threads > 0` (a `define`-only connection,
+//! fleet to be running with `drain_threads > 0` (a define-only connection,
 //! with no such client anywhere, leaves the transform queued indefinitely).
 //! A relationship-enriched 1-1 transform (like the `count(posts.id)` example
 //! below) or an aggregate (`GROUP BY`) transform still builds fully
@@ -53,15 +63,15 @@
 //! let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
 //! trellis.migrate().await?;
 //! trellis
-//!     .define_relationship("RELATIONSHIP posts FROM authors.id TO posts.author")
+//!     .apply("RELATIONSHIP posts FROM authors.id TO posts.author")
 //!     .await?;
 //! trellis
-//!     .define("TRANSFORM authors_calc FROM authors SELECT count(posts.id) AS post_count")
+//!     .apply("TRANSFORM authors_calc FROM authors SELECT count(posts.id) AS post_count")
 //!     .await?;
 //!
 //! // Separately, run the live pipeline: staging worker + two drain threads.
 //! // Drain threads are also what finish any queued backfill chunk work, for
-//! // a plain 1-1 transform `define()` returned before fully building.
+//! // a plain 1-1 transform `apply()` returned before fully building.
 //! let running = Trellis::connect(
 //!     Config::resolve(None)?,
 //!     TrellisOptions {
@@ -216,46 +226,273 @@ impl Trellis {
             .map_err(TrellisError::Engine)
     }
 
-    /// Registers a transform definition and creates its target table.
+    /// **The** entrypoint for every definition-changing operation: parse one
+    /// statement of Trellis's own grammar and run whatever it says (issue
+    /// #227; ADR-0012, ADR-0014).
     ///
-    /// Introspects the source table's columns for the validator, then routes
-    /// through [`defs::install_definition`] — the fast direct-build path.
+    /// Parsing decides the operation, so this signature does not change as
+    /// operations are added — a new operation is a grammar addition and a new
+    /// [`Applied`] variant, not a new method every binding has to mirror. That
+    /// is the whole point: text is the simplest thing to carry across an FFI
+    /// boundary (one string in, plain data out), which is why the typed
+    /// `define`/`define_relationship`/`pause_transform`/`resume_transform`/
+    /// `resume_column`/`drop_transform`/`drop_relationship` methods this
+    /// replaces are gone rather than kept alongside it.
     ///
-    /// **Returns before backfill finishes** for a plain (non-relationship)
-    /// 1-1 transform (see this module's doc comment): the returned
-    /// [`Definition`] reports [`TransformStatus::Backfilling`], and the
-    /// target is populated in the background by whichever drain
-    /// (`application_threads`) workers are running in the fleet, not by this
-    /// call. Poll [`Trellis::status`] for [`TransformStatus::Live`] once you
-    /// need the target's contents. A relationship-enriched 1-1 or an
-    /// aggregate (`GROUP BY`) transform still builds synchronously — the
-    /// returned [`Definition`] already reports [`TransformStatus::Live`] for
-    /// those two shapes.
-    pub async fn define(&self, definition_text: &str) -> Result<Definition, TrellisError> {
-        let parsed = defs::parse(definition_text)?;
-        let source_columns = self
-            .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
-            .await?;
-        defs::install_definition(
-            &self.pool,
-            definition_text,
-            &source_columns,
-            self.config.target_schema(),
-        )
-        .await
-        .map_err(TrellisError::Catalog)
+    /// The statements it accepts (see [`defs::parse_statement`] for the full
+    /// grammar, and `docs/transforms.md` for the semantics):
+    ///
+    /// ```text
+    /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
+    /// RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+    ///
+    /// PAUSE  TRANSFORM <target>[.<column>]
+    /// RESUME TRANSFORM <target>[.<column>]
+    /// DROP   TRANSFORM <target>
+    /// DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
+    /// ```
+    ///
+    /// # Addressing
+    ///
+    /// A transform is addressed by its **bare** target-table name, and a
+    /// dotted address means `<transform>.<column>` — not
+    /// `<schema>.<transform>`. A relationship is always addressed **scoped to
+    /// its from-table** (`posts.author`), because its name is unique only
+    /// there. Both follow from how the engine itself identifies a definition;
+    /// see [`defs::DefinitionRef`] for the reasoning behind each.
+    ///
+    /// A schema-qualified relationship address (`blog.posts.author`) is
+    /// accepted, but `relationship_definitions` stores from-tables bare — the
+    /// `RELATIONSHIP` grammar has no qualified endpoint spelling to store — so
+    /// the qualifier is checked against the from-table's registered
+    /// fully-qualified identity rather than joining the lookup key. An address
+    /// whose schema doesn't match names no registered relationship, which
+    /// `DROP` treats as its ordinary idempotent no-op (exactly as it treats a
+    /// name that was never declared).
+    ///
+    /// # What each statement does
+    ///
+    /// `TRANSFORM`/`RELATIONSHIP` register a definition, as the retired
+    /// `define`/`define_relationship` did — including that **a plain 1-1
+    /// transform returns before its backfill finishes** (see this module's doc
+    /// comment): the returned [`Definition`] reports
+    /// [`TransformStatus::Backfilling`] and the target is populated by drain
+    /// workers elsewhere in the fleet. Poll [`Trellis::status`] for
+    /// [`TransformStatus::Live`]. A relationship-enriched 1-1 or an aggregate
+    /// (`GROUP BY`) transform still builds synchronously and comes back
+    /// [`TransformStatus::Live`].
+    ///
+    /// `PAUSE` freezes a definition at its current value (ADR-0014's
+    /// operator-driven half of the pause state whose other half is the poison
+    /// fuse) and is **idempotent** — pausing something already frozen, by
+    /// either trigger, succeeds as a no-op. Pausing a target that was never
+    /// defined is [`CatalogError::TransformNotFound`], since you cannot freeze
+    /// what doesn't exist.
+    ///
+    /// `RESUME` **rebuilds; it does not catch up**. A frozen definition must
+    /// not pin the staging ring, so while it is frozen its share of the change
+    /// stream is drained for its siblings and is not recoverable by replay —
+    /// the recovery is therefore a fresh backfill from source, whose cost
+    /// scales with the data rather than with the length of the pause. A whole
+    /// transform drops back to [`TransformStatus::WaitingToBackfill`]; a single
+    /// column is re-derived across every existing row, and any dependent
+    /// column paused *only* by this one's cascade is resumed with it — those
+    /// pairs come back in [`Applied::Resumed`].
+    ///
+    /// `DROP` is the terminal reap. It requires the definition to be frozen
+    /// first ([`CatalogError::TransformNotPaused`] otherwise — there is no
+    /// live-to-gone edge), **takes the data with it** (the Trellis-owned target
+    /// table is dropped unconditionally; source tables are untouched),
+    /// **refuses rather than cascades** if a still-registered definition
+    /// chains off the subject ([`CatalogError::DependentsBlockDrop`], naming
+    /// the blockers, so a chain is retired from the leaves inward), shrinks the
+    /// replication publication by reconciliation once it commits, and is
+    /// **idempotent** — dropping something already gone succeeds.
+    ///
+    /// # Pause and resume are transform-only
+    ///
+    /// The statement list above is exhaustive, and there is deliberately no
+    /// `PAUSE`/`RESUME RELATIONSHIP`. A relationship is a reusable *component*
+    /// of a transform, not something that does work of its own, so it has
+    /// nothing to suspend — which is also why ADR-0014 gives it no lifecycle
+    /// status and nothing in the fold gates on one. `PAUSE RELATIONSHIP x.y` is
+    /// consequently not a form this grammar knows at all, and fails as an
+    /// ordinary parse error about an unexpected keyword, not a special-cased
+    /// refusal. Retiring a relationship *is* meaningful — it is a definition —
+    /// so `DROP RELATIONSHIP` exists.
+    ///
+    /// `DROP TRANSFORM <target>.<column>` is likewise not a form: dropping one
+    /// calculated field is an `ALTER TRANSFORM ... DROP <field>`, tracked
+    /// separately (issues #241/#242), not a `DROP`.
+    pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
+        match defs::parse_statement(statement_text)? {
+            defs::Statement::DefineTransform(parsed) => {
+                let source_columns = self
+                    .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
+                    .await?;
+                // Hands the *text* on rather than the `TransformDef` just
+                // parsed: `install_definition` persists `definition_text` as
+                // the definition's own record of itself (every later re-parse
+                // reads it back), so the text is the input it needs, not a
+                // redundant re-derivation of it.
+                let definition = defs::install_definition(
+                    &self.pool,
+                    statement_text,
+                    &source_columns,
+                    self.config.target_schema(),
+                )
+                .await
+                .map_err(TrellisError::Catalog)?;
+                Ok(Applied::TransformDefined(definition))
+            }
+            defs::Statement::DefineRelationship(_) => {
+                let relationship = defs::create_relationship(&self.pool, statement_text)
+                    .await
+                    .map_err(TrellisError::Catalog)?;
+                Ok(Applied::RelationshipDefined(relationship))
+            }
+            defs::Statement::Pause(reference) => self.apply_pause(reference).await,
+            defs::Statement::Resume(reference) => self.apply_resume(reference).await,
+            defs::Statement::Drop(reference) => self.apply_drop(reference).await,
+        }
     }
 
-    /// Registers a relationship declaration (ADR-0006) — the standalone
-    /// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` form a later
-    /// [`define`](Trellis::define) can reference in a calculated field.
-    pub async fn define_relationship(
-        &self,
-        definition_text: &str,
-    ) -> Result<RelationshipDefinition, TrellisError> {
-        defs::create_relationship(&self.pool, definition_text)
+    /// [`Statement::Pause`](defs::Statement::Pause)'s half of
+    /// [`apply`](Trellis::apply).
+    async fn apply_pause(&self, reference: defs::TransformRef) -> Result<Applied, TrellisError> {
+        let defs::TransformRef { target, column } = reference;
+        match column {
+            None => defs::lifecycle::pause_transform(&self.pool, &target)
+                .await
+                .map(|_| Applied::Paused)
+                .map_err(TrellisError::Catalog),
+            Some(column) => {
+                // Checked here rather than inside `quarantine::pause_column`:
+                // `column_status` has no foreign key onto either the
+                // definition or its field list, so an unchecked pause would
+                // silently park a row addressing nothing, and a later
+                // `RESUME` of it would be the first sign anything was wrong.
+                self.expect_column_exists(&target, &column).await?;
+                quarantine::pause_column(&self.pool, &target, &column)
+                    .await
+                    .map(|()| Applied::Paused)
+                    .map_err(TrellisError::Apply)
+            }
+        }
+    }
+
+    /// [`Statement::Resume`](defs::Statement::Resume)'s half of
+    /// [`apply`](Trellis::apply).
+    async fn apply_resume(&self, reference: defs::TransformRef) -> Result<Applied, TrellisError> {
+        let defs::TransformRef { target, column } = reference;
+        match column {
+            None => quarantine::resume_transform(&self.pool, &target)
+                .await
+                .map(|()| Applied::Resumed {
+                    columns: Vec::new(),
+                })
+                .map_err(TrellisError::Apply),
+            Some(column) => quarantine::resume_column(&self.pool, &target, &column)
+                .await
+                .map(|columns| Applied::Resumed { columns })
+                .map_err(TrellisError::Apply),
+        }
+    }
+
+    /// [`Statement::Drop`](defs::Statement::Drop)'s half of
+    /// [`apply`](Trellis::apply). Reconciles the publication only on a drop
+    /// that actually removed something — an idempotent no-op changed no
+    /// source-table set, so there is nothing to shrink.
+    async fn apply_drop(&self, reference: defs::DefinitionRef) -> Result<Applied, TrellisError> {
+        let outcome = match reference {
+            defs::DefinitionRef::Transform(target) => {
+                defs::lifecycle::drop_transform(&self.pool, &target)
+                    .await
+                    .map_err(TrellisError::Catalog)?
+            }
+            defs::DefinitionRef::Relationship {
+                schema,
+                from_table,
+                name,
+            } => {
+                if let Some(schema) = schema
+                    && !self.table_is_registered_as(&schema, &from_table).await?
+                {
+                    // The qualifier names a different table than the one this
+                    // relationship was declared against (or one Trellis has
+                    // never seen), so the address names no registered
+                    // relationship — a drop's own idempotent no-op, the same
+                    // answer a never-declared name gets.
+                    return Ok(Applied::Dropped);
+                }
+                defs::lifecycle::drop_relationship(&self.pool, &from_table, &name)
+                    .await
+                    .map_err(TrellisError::Catalog)?
+            }
+        };
+
+        if outcome == defs::lifecycle::DropOutcome::Dropped {
+            self.reconcile_publication_after_drop().await?;
+        }
+        Ok(Applied::Dropped)
+    }
+
+    /// Errors unless `target` is a registered transform *and* `column` is one
+    /// of the calculated fields its definition declares —
+    /// [`TrellisError::TransformNotFound`] or [`TrellisError::ColumnNotFound`]
+    /// respectively (both [`ErrorCode::NotFound`]).
+    ///
+    /// Read from the definition's own persisted text rather than from the
+    /// target table's live columns: the definition is what the pause is
+    /// *about*, and a field it declares is exactly the set
+    /// [`crate::staging::quarantine`]'s pause/resume machinery can act on.
+    async fn expect_column_exists(&self, target: &str, column: &str) -> Result<(), TrellisError> {
+        let definition = defs::catalog::definition_by_target(&self.pool, target)
             .await
-            .map_err(TrellisError::Catalog)
+            .map_err(TrellisError::Catalog)?
+            .ok_or_else(|| TrellisError::TransformNotFound(target.to_string()))?;
+        if definition
+            .def
+            .fields
+            .iter()
+            .any(|field| field.name == column)
+        {
+            return Ok(());
+        }
+        Err(TrellisError::ColumnNotFound {
+            transform: target.to_string(),
+            column: column.to_string(),
+            declared: definition
+                .def
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect(),
+        })
+    }
+
+    /// Whether `table`'s registered fully-qualified identity is
+    /// `<schema>.<table>` — how an explicitly schema-qualified relationship
+    /// address is checked (see [`apply`](Trellis::apply)'s "Addressing").
+    /// `schema_nodes` is the right table to ask: `create_relationship`
+    /// resolves each endpoint to its qualified identity and upserts a node for
+    /// it, so every registered relationship's from-table has a row here.
+    async fn table_is_registered_as(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool, TrellisError> {
+        let qualified = format!("{schema}.{table}");
+        Ok(self
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "select exists(select 1 from schema_nodes where table_name = $1)",
+                &[&qualified],
+            )
+            .await?
+            .get(0))
     }
 
     /// Every registered transform definition, oldest first.
@@ -289,7 +526,7 @@ impl Trellis {
 
     /// One registered transform definition's current [`TransformStatus`]
     /// (issue #55), by target table name — the read a host-language embedder
-    /// polls after [`define`](Trellis::define) returns, per
+    /// polls after [`apply`](Trellis::apply) registers a definition, per
     /// `docs/decisions/0008-public-api-design.md`'s decision 1 ("define, then poll status
     /// until live"). A thin convenience over [`definitions`](Trellis::definitions)
     /// for callers that only want one row rather than the full list.
@@ -663,165 +900,6 @@ impl Trellis {
             .collect())
     }
 
-    /// Resumes a paused column: clears its pause, re-derives its value
-    /// across every existing row, and un-cascades any dependent transform
-    /// that was only paused because of this one (see
-    /// [`crate::staging::quarantine::resume_column`] for the full contract,
-    /// including why a dependent with its own independent reason to stay
-    /// paused is left alone). `target` must address a column
-    /// (`transform.column`) — [`TrellisError::ColumnAddressRequired`] if
-    /// given a bare transform name — a `quarantined` transform's
-    /// whole-transform remedy is [`Trellis::resume_transform`], a different
-    /// operation entirely (drops back to `waiting_to_backfill` and re-runs
-    /// the full backfill — see `docs/transforms.md#status`), not this call.
-    ///
-    /// Returns every `(transform, column)` pair actually resumed —
-    /// `target` itself first, then any dependents whose pause was purely
-    /// this one's cascade.
-    pub async fn resume_column(&self, target: &str) -> Result<Vec<(String, String)>, TrellisError> {
-        match QuarantineTarget::parse(target) {
-            QuarantineTarget::Column(transform, column) => {
-                quarantine::resume_column(&self.pool, &transform, &column)
-                    .await
-                    .map_err(TrellisError::Apply)
-            }
-            QuarantineTarget::Transform(_) => Err(TrellisError::ColumnAddressRequired),
-        }
-    }
-
-    /// Resumes a frozen transform — either trigger (issue #55, issue #142;
-    /// ADR-0003's coarser, transform-wide fuse tier and ADR-0014's operator
-    /// pause share one recovery path, because the state they produce is the
-    /// same state). `target` must be a bare transform's target table, not a
-    /// `transform.column` address — see
-    /// [`crate::staging::quarantine::resume_transform`] for the full
-    /// contract, including why this drops the transform to
-    /// [`TransformStatus::WaitingToBackfill`] and re-runs its backfill
-    /// through the same `xmin`-fence-respecting path a fresh transform's own
-    /// initial backfill uses, rather than a shortcut.
-    ///
-    /// **Resume rebuilds; it does not catch up** (ADR-0014). A frozen
-    /// definition must not pin the staging ring — holding ring segments open
-    /// for it would wedge the ring for every sibling reading the same source
-    /// — so while it is frozen its share of the change stream is drained for
-    /// those siblings and is *not* recoverable by replay. There are no
-    /// buffered changes to apply on the way back, which is why the recovery
-    /// is a fresh backfill from source. The cost of resuming therefore scales
-    /// with the data, not with the length of the pause.
-    pub async fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
-        quarantine::resume_transform(&self.pool, target)
-            .await
-            .map_err(TrellisError::Apply)
-    }
-
-    /// Freezes a transform deliberately (issue #142, ADR-0014) — the
-    /// operator-driven half of the pause state whose other half is the
-    /// poison fuse's auto-pause.
-    ///
-    /// The target stops being written to and holds its current, now-stale
-    /// value: [`TransformStatus::Paused`] fails the one gate every
-    /// claim-time fold dispatch already resolves targets through, so this
-    /// reuses the existing freeze rather than adding a second one. Its share
-    /// of the change stream is drained for its siblings meanwhile, so it
-    /// never pins the staging ring — and [`resume_transform`](Trellis::resume_transform)
-    /// consequently rebuilds by a fresh backfill rather than catching up.
-    ///
-    /// Pausing an already-frozen transform — whether by an earlier pause or
-    /// by the poison fuse — **succeeds as a no-op**. Pause runs on Trellis's
-    /// own connections, not inside a caller's migration transaction, so a
-    /// migration that is replayed or interleaved with a rollback has to be
-    /// safe to re-run; "did the pause land?" resolves to success either way.
-    ///
-    /// A `target` that was never defined is
-    /// [`CatalogError::TransformNotFound`] — unlike
-    /// [`drop_transform`](Trellis::drop_transform), whose absent case *is* the
-    /// outcome its caller wanted.
-    pub async fn pause_transform(&self, target: &str) -> Result<(), TrellisError> {
-        defs::lifecycle::pause_transform(&self.pool, target)
-            .await
-            .map(|_| ())
-            .map_err(TrellisError::Catalog)
-    }
-
-    /// Removes a transform definition (issue #142, ADR-0014) — the terminal
-    /// reap of a paused definition, and the inverse of
-    /// [`define`](Trellis::define).
-    ///
-    /// **Pause it first.** There is no direct live-to-gone edge in the
-    /// lifecycle: a definition that isn't frozen is refused with
-    /// [`CatalogError::TransformNotPaused`]. Quiescing through the pause is
-    /// what lets the removal skip reasoning about a fold still dispatching to
-    /// the target.
-    ///
-    /// **The data goes with it.** Dropping a definition drops its target
-    /// table, unconditionally — there is no option to retire the definition
-    /// while keeping its rows. Keeping derived rows after removing the
-    /// definition that explains them has no use worth naming, and the paused
-    /// state already serves the caller who wants the data to stick around
-    /// unmaintained: leave it paused rather than dropping it. Only the
-    /// Trellis-owned target table is ever dropped; source tables are
-    /// user-owned and untouched.
-    ///
-    /// **Refuses rather than cascades.** If a live definition still chains
-    /// off this target, the drop fails with
-    /// [`CatalogError::DependentsBlockDrop`] naming the blockers, so the
-    /// order to retire them in is explicit. Work from the leaves inward.
-    ///
-    /// **Shrinks the publication inline.** Once the drop commits, the
-    /// replication publication is reconciled against the definitions that
-    /// remain, so a source table leaves replication exactly when nothing
-    /// derives from it any longer — by reconciliation, not by hand-editing,
-    /// and at drop time rather than deferred to a maintenance pass.
-    ///
-    /// Dropping a definition that isn't registered **succeeds as a no-op**,
-    /// for the same replayed-migration reason [`pause_transform`](Trellis::pause_transform)
-    /// is idempotent: "is it already gone?" resolves to success.
-    pub async fn drop_transform(&self, target: &str) -> Result<(), TrellisError> {
-        let outcome = defs::lifecycle::drop_transform(&self.pool, target)
-            .await
-            .map_err(TrellisError::Catalog)?;
-
-        if outcome == defs::lifecycle::DropOutcome::Dropped {
-            self.reconcile_publication_after_drop().await?;
-        }
-        Ok(())
-    }
-
-    /// Removes a relationship declaration (issue #142, ADR-0014) — the
-    /// inverse of [`define_relationship`](Trellis::define_relationship).
-    ///
-    /// Addressed by `(from_table, name)` because a relationship name is
-    /// unique per from-table rather than globally — the same pair a
-    /// calculated field's `<rel>.<column>` head resolves against. Drops the
-    /// Trellis-owned parent projection table the declaration created along
-    /// with it; both endpoint tables are the user's and are untouched.
-    ///
-    /// **Refuses rather than cascades**, like
-    /// [`drop_transform`](Trellis::drop_transform): any live transform whose
-    /// text still references this relationship blocks the drop and is named
-    /// in [`CatalogError::DependentsBlockDrop`].
-    ///
-    /// There is deliberately no `pause_relationship`: a relationship carries
-    /// no lifecycle status and nothing in the fold gates on one, so freezing
-    /// it would mean building the second freezing mechanism ADR-0014 rules
-    /// out. A relationship is dropped outright, once nothing live reads it.
-    ///
-    /// Dropping an unregistered relationship **succeeds as a no-op**.
-    pub async fn drop_relationship(
-        &self,
-        from_table: &str,
-        name: &str,
-    ) -> Result<(), TrellisError> {
-        let outcome = defs::lifecycle::drop_relationship(&self.pool, from_table, name)
-            .await
-            .map_err(TrellisError::Catalog)?;
-
-        if outcome == defs::lifecycle::DropOutcome::Dropped {
-            self.reconcile_publication_after_drop().await?;
-        }
-        Ok(())
-    }
-
     /// Reconciles the replication publication against whatever definitions
     /// are left, immediately after a drop (ADR-0014, "The publication shrinks
     /// by reconciliation").
@@ -1103,14 +1181,14 @@ impl Trellis {
     /// in this round had — fed straight from [`defs::ast::TransformDef::source`],
     /// which also completely ignored
     /// [`defs::ast::TransformDef::explicit_source_schema`] (issue #76).
-    /// So *this*, the very first thing [`Trellis::define`] does with a
+    /// So *this*, the very first thing [`Trellis::apply`] does with a
     /// parsed definition, rejected both an explicitly-qualified `FROM
     /// <schema>.<table>` naming a table outside this connection's
     /// `search_path`, and a bare `FROM <table>` chaining off another
     /// definition's target explicitly qualified into a non-default schema
     /// (issue #76) — before `install_definition`'s own, already-fixed
     /// resolution (`resolve_source_for_install`) was ever reached: this call
-    /// happens first, in [`Trellis::define`], and returns
+    /// happens first, in [`Trellis::apply`], and returns
     /// [`TrellisError::SourceTableNotFound`] eagerly on an empty result, so
     /// `install_definition` was never even called. Now resolves the source
     /// the same way `resolve_source_for_install` does — an explicit schema
@@ -1245,6 +1323,74 @@ pub struct RelationshipSummary {
     pub created_at: SystemTime,
 }
 
+/// What [`Trellis::apply`] did — the one return type every
+/// definition-changing statement shares (issue #227).
+///
+/// One variant per operation, carrying only what that operation has to report
+/// that the caller couldn't already know from the statement it wrote: the
+/// registered [`Definition`]/[`RelationshipDefinition`] for the two defining
+/// forms (an id, and the status a caller then polls), the resumed
+/// `(transform, column)` pairs for a column resume, and nothing at all for a
+/// pause or a drop.
+///
+/// `#[non_exhaustive]`, for the same reason [`ErrorCode`] is: this is a type
+/// the caller is *meant* to match on from outside — eventually from outside
+/// Rust — while the set of operations behind `apply` keeps growing (`AMEND`
+/// next, once it has its own ADR — issue #228, decision 3). A match on it has
+/// to tolerate a variant it doesn't know rather than assume the set is closed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Applied {
+    /// A `TRANSFORM ...` statement registered a transform definition. Reports
+    /// [`TransformStatus::Backfilling`] for a plain 1-1 transform, whose
+    /// backfill runs in the background — see [`Trellis::apply`].
+    TransformDefined(Definition),
+    /// A `RELATIONSHIP ...` statement registered a relationship declaration.
+    RelationshipDefined(RelationshipDefinition),
+    /// A `PAUSE ...` statement froze its subject — or found it already frozen,
+    /// which ADR-0014 makes the same success.
+    Paused,
+    /// A `RESUME ...` statement unfroze its subject.
+    ///
+    /// `columns` holds every `(transform, column)` pair a **column** resume
+    /// actually resumed: the addressed column first, then any dependent whose
+    /// pause was purely this one's cascade (a dependent with an independent
+    /// reason to stay paused is deliberately left alone). Empty for a
+    /// whole-transform resume, which has no per-column result to report — the
+    /// transform drops to [`TransformStatus::WaitingToBackfill`] and rebuilds.
+    Resumed { columns: Vec<(String, String)> },
+    /// A `DROP ...` statement removed its subject — or found it already gone,
+    /// which ADR-0014 makes the same success.
+    Dropped,
+}
+
+impl Applied {
+    /// The [`Definition`] a `TRANSFORM ...` statement registered, or `None`
+    /// for any other outcome.
+    ///
+    /// For the common case where the caller wrote the statement itself and so
+    /// already knows which form it was: `apply(...)?.into_transform().expect(...)`
+    /// reads better than a `match` with an unreachable arm — and much better
+    /// than the `let ... else` that an `#[non_exhaustive]` enum otherwise
+    /// forces on every such call site.
+    pub fn into_transform(self) -> Option<Definition> {
+        match self {
+            Applied::TransformDefined(definition) => Some(definition),
+            _ => None,
+        }
+    }
+
+    /// The [`RelationshipDefinition`] a `RELATIONSHIP ...` statement
+    /// registered, or `None` for any other outcome — see
+    /// [`into_transform`](Applied::into_transform).
+    pub fn into_relationship(self) -> Option<RelationshipDefinition> {
+        match self {
+            Applied::RelationshipDefined(relationship) => Some(relationship),
+            _ => None,
+        }
+    }
+}
+
 /// One poison-quarantine entry, as [`Trellis::poisoned_since`] reports it.
 #[derive(Debug, Clone)]
 pub struct PoisonEntry {
@@ -1329,7 +1475,7 @@ pub enum QuarantineState {
     /// a purely cascaded pause, since it never itself failed).
     ///
     /// At **whole-transform** granularity (issue #142): an operator
-    /// deliberately froze it via [`Trellis::pause_transform`], mirroring
+    /// deliberately froze it via `PAUSE TRANSFORM` ([`Trellis::apply`]), mirroring
     /// [`TransformStatus::Paused`] — the same freeze
     /// [`QuarantineState::Quarantined`] is, reached by the other of
     /// ADR-0014's two triggers.
@@ -1383,7 +1529,7 @@ pub struct PoisonSample {
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
     Parse(ParseError),
-    /// A catalog operation (define/relationship/install) failed.
+    /// A catalog operation (define/relationship/install/pause/drop) failed.
     Catalog(CatalogError),
     /// Starting or stopping the background client failed.
     Client(ClientError),
@@ -1427,10 +1573,17 @@ pub enum TrellisError {
     /// A [`QuarantineTarget`] named a transform (whole or `.column`) that
     /// doesn't exist in `transform_definitions` at all.
     TransformNotFound(String),
-    /// [`Trellis::resume_column`] was given a bare transform address
-    /// (no `.column`) — a `quarantined` transform's whole-transform remedy
-    /// is [`Trellis::resume_transform`], not this call.
-    ColumnAddressRequired,
+    /// A `PAUSE TRANSFORM <target>.<column>` statement named a column that
+    /// isn't one of `transform`'s declared calculated fields (issue #227) —
+    /// most often a typo, or a `<schema>.<transform>` address written where
+    /// this grammar reads `<transform>.<column>` (see [`Trellis::apply`]'s
+    /// "Addressing"). `declared` lists the fields the definition does declare,
+    /// so the message can show what was available.
+    ColumnNotFound {
+        transform: String,
+        column: String,
+        declared: Vec<String>,
+    },
     /// [`Trellis::watermark_token`]/[`Trellis::await_converged`] hit a
     /// failure inside the staging ring's convergence machinery
     /// (`staging::converge`) — most commonly
@@ -1442,7 +1595,7 @@ pub enum TrellisError {
     /// [`SelfCheckError`].
     SelfCheck(SelfCheckError),
     /// Reconciling the replication publication after a
-    /// [`Trellis::drop_transform`]/[`Trellis::drop_relationship`] failed
+    /// `DROP TRANSFORM`/`DROP RELATIONSHIP` ([`Trellis::apply`]) failed
     /// (issue #142). The definition is already gone when this surfaces — the
     /// drop and the reconcile are deliberately not one transaction, since
     /// `alter publication` is its own DDL and the drop must not be held open
@@ -1485,8 +1638,9 @@ impl TrellisError {
             // Caller misuse (wrong calling context), not an engine fault.
             TrellisError::CalledFromAsyncContext => ErrorCode::Validation,
             TrellisError::Apply(err) => err.code(),
-            TrellisError::TransformNotFound(_) => ErrorCode::NotFound,
-            TrellisError::ColumnAddressRequired => ErrorCode::Validation,
+            TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => {
+                ErrorCode::NotFound
+            }
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
             TrellisError::Publication(err) => err.code(),
@@ -1538,10 +1692,18 @@ impl std::fmt::Display for TrellisError {
             TrellisError::TransformNotFound(target) => {
                 write!(f, "no transform named \"{target}\" is registered")
             }
-            TrellisError::ColumnAddressRequired => write!(
+            TrellisError::ColumnNotFound {
+                transform,
+                column,
+                declared,
+            } => write!(
                 f,
-                "resume_column needs a \"transform.column\" address; to resume a whole \
-                 quarantined transform, call resume_transform instead"
+                "transform \"{transform}\" declares no column \"{column}\"; it declares: {}",
+                if declared.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    declared.join(", ")
+                }
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
             TrellisError::SelfCheck(err) => write!(f, "{err}"),
@@ -1570,7 +1732,7 @@ impl std::error::Error for TrellisError {
             | TrellisError::CalledFromAsyncContext => None,
             TrellisError::BlockingSpawn(err) => Some(err),
             TrellisError::Apply(err) => Some(err),
-            TrellisError::TransformNotFound(_) | TrellisError::ColumnAddressRequired => None,
+            TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => None,
             TrellisError::Staging(err) => Some(err),
             TrellisError::SelfCheck(err) => Some(err),
             TrellisError::Publication(err) => Some(err),

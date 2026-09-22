@@ -128,6 +128,10 @@ Every defined transform carries an observable **status**:
 * **`live`** — backfill complete; tracking live changes only. The steady state.
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
   resuming re-runs the backfill, returning it to `waiting_to_backfill`.
+* **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the
+  fuse. The same frozen state `quarantined` is, reached by the other trigger: the
+  target stops being written to and holds its current, now-stale value. Resuming
+  likewise re-runs the backfill from `waiting_to_backfill`.
 
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline.
@@ -136,6 +140,46 @@ A transform can sit in `waiting_to_backfill` while a long-lived cluster
 transaction holds the backfill's fence open — a safe wait, explained with its
 remedy under
 [observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+
+## Changing a definition
+
+Every definition-changing operation is one statement of the same grammar a
+definition itself is written in, run through one entrypoint —
+`Trellis::apply(text)`, or `trellis apply '<statement>'` from a shell:
+
+```text
+TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
+RELATIONSHIP <name> FROM <from_table>.<fk_col> TO <to_table>.<pk_col>
+
+PAUSE  TRANSFORM <target>[.<column>]
+RESUME TRANSFORM <target>[.<column>]
+DROP   TRANSFORM <target>
+DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
+```
+
+**Addressing.** A transform is named by its bare target table, and a dotted
+address means `<transform>.<column>` — pausing or resuming a single calculated
+field rather than the whole definition. A relationship, which only `DROP` names,
+is always scoped to its from-table (`posts.author`, or `blog.posts.author`),
+because a relationship name is unique only there.
+
+**Semantics** are covered by
+[0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md).
+In short: `PAUSE` and `DROP` are idempotent; `RESUME` rebuilds by a fresh
+backfill rather than catching up on changes that happened during the pause;
+`DROP` removes the target table's data along with the definition, and is refused
+— naming the blockers — while another registered definition still chains off the
+subject, so a chain is retired from the leaves inward.
+
+**Pause and resume apply to transforms only.** That list of statements is
+complete — there is no `PAUSE RELATIONSHIP`/`RESUME RELATIONSHIP`. A
+relationship is a reusable *component* of a transform, not something that does
+work of its own, so it has nothing to suspend; pausing the transform that uses
+it is what stops that work. Retiring a relationship is meaningful, though — it
+is a definition — so `DROP RELATIONSHIP` exists.
+
+`DROP TRANSFORM <target>.<column>` is likewise not a statement: removing one
+calculated field is an `ALTER TRANSFORM` operation, not a drop.
 
 ## Scope
 

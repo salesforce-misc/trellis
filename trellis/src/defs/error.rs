@@ -62,6 +62,23 @@ pub enum ParseError {
     /// accept (issue #109) — rejected by name so the message can point at
     /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
     UnsupportedCastOperator,
+    /// A `PAUSE`/`RESUME`/`DROP RELATIONSHIP` naming a relationship without
+    /// the from-table that scopes it (issue #227/#228, decision 1) — e.g.
+    /// `DROP RELATIONSHIP author` instead of `DROP RELATIONSHIP posts.author`.
+    /// A relationship name is unique only per from-table, so a bare one
+    /// doesn't identify anything to act on.
+    UnscopedRelationshipAddress { address: String },
+    /// A `PAUSE`/`RESUME`/`DROP` address whose shape doesn't fit the statement
+    /// it was written in (issue #227/#228): too many `.`-separated parts, or a
+    /// `<transform>.<column>` address under `DROP TRANSFORM`, which is
+    /// whole-definition only. `statement` names the statement form
+    /// (`"DROP TRANSFORM"`), `address` is the address as written, and `detail`
+    /// says what shape *is* accepted there.
+    MalformedDefinitionAddress {
+        statement: String,
+        address: String,
+        detail: String,
+    },
 }
 
 impl ParseError {
@@ -149,6 +166,20 @@ impl fmt::Display for ParseError {
                 f,
                 "the '::' cast operator is not supported: write a typed literal as \
                  <type> '<literal>' (e.g. DATE '2024-01-01') or CAST('<literal>' AS <type>)"
+            ),
+            ParseError::UnscopedRelationshipAddress { address } => write!(
+                f,
+                "'{address}' is not a valid relationship address: a relationship name is unique \
+                 only within its from-table, so it must be scoped as \
+                 [<schema>.]<from_table>.<relationship_name> (e.g. posts.author)"
+            ),
+            ParseError::MalformedDefinitionAddress {
+                statement,
+                address,
+                detail,
+            } => write!(
+                f,
+                "'{address}' is not a valid {statement} address: {detail}"
             ),
         }
     }

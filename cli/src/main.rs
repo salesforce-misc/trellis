@@ -10,7 +10,7 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! Today that's `define`, `run`, and `status`.
+//! Today that's `apply`, `run`, and `status`.
 
 mod commands;
 mod connection;
@@ -21,15 +21,16 @@ const USAGE: &str = "\
 Usage: trellis <COMMAND> [OPTIONS]
 
 Commands:
-  define <GRAMMAR>   Register a TRANSFORM or RELATIONSHIP definition.
+  apply <GRAMMAR>     Run one Trellis statement: TRANSFORM, RELATIONSHIP,
+                       PAUSE, RESUME or DROP. (`define` is a deprecated alias.)
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions/relationships and exit.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
                              or after the subcommand name (e.g. both
-                             `trellis --database-url <URL> define ...` and
-                             `trellis define --database-url <URL> ...`
+                             `trellis --database-url <URL> apply ...` and
+                             `trellis apply --database-url <URL> ...`
                              work). Falls back to TRELLIS_DATABASE_URL, then
                              PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, if
                              omitted.
@@ -76,7 +77,10 @@ fn run(mut args: Vec<String>) -> ExitCode {
 
     let command = args.remove(0);
     match command.as_str() {
-        "define" => run_define(args, database_url),
+        // `define` predates the unified entrypoint (issue #227), when the
+        // CLI had one command per typed facade method. Kept as an alias so an
+        // operator's existing scripts and runbooks don't break over a rename.
+        "apply" | "define" => run_apply(args, database_url),
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
         _ if wants_help(std::slice::from_ref(&command)) => {
@@ -96,16 +100,16 @@ fn wants_help(args: &[String]) -> bool {
     args.iter().any(|a| a == "-h" || a == "--help")
 }
 
-/// Dispatches `trellis define`: handles `-h`/`--help` itself (so it works
+/// Dispatches `trellis apply`: handles `-h`/`--help` itself (so it works
 /// without a database connection), otherwise parses the grammar argument and
 /// runs it against a single-use tokio runtime.
-fn run_define(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+fn run_apply(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     if wants_help(&args) {
-        print!("{}", commands::define::USAGE);
+        print!("{}", commands::apply::USAGE);
         return ExitCode::SUCCESS;
     }
 
-    let parsed = match commands::define::parse(&args) {
+    let parsed = match commands::apply::parse(&args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -121,7 +125,7 @@ fn run_define(args: Vec<String>, database_url: Option<String>) -> ExitCode {
         }
     };
 
-    match runtime.block_on(commands::define::run(parsed, database_url)) {
+    match runtime.block_on(commands::apply::run(parsed, database_url)) {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -215,7 +219,7 @@ mod tests {
     fn wants_help_detects_both_spellings() {
         assert!(wants_help(&["-h".to_string()]));
         assert!(wants_help(&["--help".to_string()]));
-        assert!(!wants_help(&["define".to_string()]));
+        assert!(!wants_help(&["apply".to_string()]));
         assert!(!wants_help(&[]));
     }
 
@@ -236,15 +240,27 @@ mod tests {
     }
 
     #[test]
-    fn define_help_is_success_without_a_database() {
+    fn apply_help_is_success_without_a_database() {
         assert_eq!(
-            run(vec!["define".to_string(), "--help".to_string()]),
+            run(vec!["apply".to_string(), "--help".to_string()]),
             ExitCode::SUCCESS
         );
     }
 
     #[test]
-    fn define_missing_grammar_is_a_failure() {
+    fn apply_missing_grammar_is_a_failure() {
+        assert_eq!(run(vec!["apply".to_string()]), ExitCode::FAILURE);
+    }
+
+    /// `define` is a deprecated alias for `apply` (issue #227) — it must keep
+    /// reaching the same command rather than falling through to
+    /// "unknown command".
+    #[test]
+    fn define_is_still_accepted_as_an_alias() {
+        assert_eq!(
+            run(vec!["define".to_string(), "--help".to_string()]),
+            ExitCode::SUCCESS
+        );
         assert_eq!(run(vec!["define".to_string()]), ExitCode::FAILURE);
     }
 

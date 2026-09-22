@@ -20,7 +20,7 @@ const SHORT_FLAG: &str = "-d";
 /// `args` — rather than only recognizing it before or only after the
 /// subcommand name. That gives an operator the same result whether they
 /// write `trellis --database-url <URL> define <GRAMMAR>` or
-/// `trellis define --database-url <URL> <GRAMMAR>`, without this crate
+/// `trellis apply --database-url <URL> <GRAMMAR>`, without this crate
 /// needing a general per-subcommand flag-parsing framework: callers just run
 /// this once, on the full argv, before splitting off the subcommand name.
 ///

@@ -12,8 +12,8 @@
 //! never needs a runtime of its own.
 //!
 //! **Blocks only on registration, never on backfill** — for the fast path.
-//! [`BlockingTrellis::define`] is exactly as fast (or slow) as
-//! [`Trellis::define`] (see `app`'s module doc): a plain (non-relationship)
+//! [`BlockingTrellis::apply`] is exactly as fast (or slow) as
+//! [`Trellis::apply`] (see `app`'s module doc): a plain (non-relationship)
 //! 1-1 transform's backfill work is enumerated and persisted, not executed,
 //! before it returns. A relationship-enriched 1-1 or an aggregate transform
 //! still builds fully synchronously today, so this wrapper simply blocks
@@ -26,11 +26,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::types::PgLsn;
 
 use crate::app::{
-    DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, RelationshipSummary, Trellis,
-    TrellisError, TrellisOptions,
+    Applied, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, RelationshipSummary,
+    Trellis, TrellisError, TrellisOptions,
 };
 use crate::config::Config;
-use crate::defs::{Definition, RelationshipDefinition, TransformStatus};
+use crate::defs::TransformStatus;
 
 /// One [`BlockingTrellis`] method call, carried over a channel to the
 /// dedicated background thread that owns the real, async [`Trellis`] (see
@@ -39,11 +39,7 @@ use crate::defs::{Definition, RelationshipDefinition, TransformStatus};
 /// background thread's loop.
 enum Job {
     Migrate(oneshot::Sender<Result<(), TrellisError>>),
-    Define(String, oneshot::Sender<Result<Definition, TrellisError>>),
-    DefineRelationship(
-        String,
-        oneshot::Sender<Result<RelationshipDefinition, TrellisError>>,
-    ),
+    Apply(String, oneshot::Sender<Result<Applied, TrellisError>>),
     Definitions(oneshot::Sender<Result<Vec<DefinitionSummary>, TrellisError>>),
     Relationships(oneshot::Sender<Result<Vec<RelationshipSummary>, TrellisError>>),
     RequestBackfill(String, oneshot::Sender<Result<(), TrellisError>>),
@@ -66,14 +62,6 @@ enum Job {
         i64,
         oneshot::Sender<Result<Vec<PoisonSample>, TrellisError>>,
     ),
-    ResumeColumn(
-        String,
-        oneshot::Sender<Result<Vec<(String, String)>, TrellisError>>,
-    ),
-    ResumeTransform(String, oneshot::Sender<Result<(), TrellisError>>),
-    PauseTransform(String, oneshot::Sender<Result<(), TrellisError>>),
-    DropTransform(String, oneshot::Sender<Result<(), TrellisError>>),
-    DropRelationship(String, String, oneshot::Sender<Result<(), TrellisError>>),
     HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
@@ -165,23 +153,17 @@ impl BlockingTrellis {
         crate::metrics::Metrics::new()
     }
 
-    /// Registers a transform definition and creates its target table. See
-    /// [`Trellis::define`] — in particular, this returns before a plain
-    /// (non-relationship) 1-1 transform's backfill finishes; poll
+    /// Runs one statement of Trellis's grammar — define a transform, define a
+    /// relationship, pause, resume, or drop. The single entrypoint for every
+    /// definition-changing operation; see [`Trellis::apply`] for the grammar,
+    /// the addressing rules, and each statement's semantics.
+    ///
+    /// In particular, registering a plain (non-relationship) 1-1 transform
+    /// returns before its backfill finishes; poll
     /// [`BlockingTrellis::status`] for [`TransformStatus::Live`].
-    pub fn define(&self, definition_text: &str) -> Result<Definition, TrellisError> {
-        let definition_text = definition_text.to_string();
-        self.submit(|reply| Job::Define(definition_text, reply))
-    }
-
-    /// Registers a relationship declaration. See
-    /// [`Trellis::define_relationship`].
-    pub fn define_relationship(
-        &self,
-        definition_text: &str,
-    ) -> Result<RelationshipDefinition, TrellisError> {
-        let definition_text = definition_text.to_string();
-        self.submit(|reply| Job::DefineRelationship(definition_text, reply))
+    pub fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
+        let statement_text = statement_text.to_string();
+        self.submit(|reply| Job::Apply(statement_text, reply))
     }
 
     /// Every registered transform definition, oldest first. See
@@ -238,41 +220,6 @@ impl BlockingTrellis {
     ) -> Result<Vec<PoisonSample>, TrellisError> {
         let target = target.to_string();
         self.submit(|reply| Job::SampleQuarantined(target, after, limit, reply))
-    }
-
-    /// Resumes a paused column. See [`Trellis::resume_column`].
-    pub fn resume_column(&self, target: &str) -> Result<Vec<(String, String)>, TrellisError> {
-        let target = target.to_string();
-        self.submit(|reply| Job::ResumeColumn(target, reply))
-    }
-
-    /// Resumes a frozen transform — either trigger — by rebuilding it with a
-    /// fresh backfill. See [`Trellis::resume_transform`].
-    pub fn resume_transform(&self, target: &str) -> Result<(), TrellisError> {
-        let target = target.to_string();
-        self.submit(|reply| Job::ResumeTransform(target, reply))
-    }
-
-    /// Deliberately freezes a transform; idempotent. See
-    /// [`Trellis::pause_transform`].
-    pub fn pause_transform(&self, target: &str) -> Result<(), TrellisError> {
-        let target = target.to_string();
-        self.submit(|reply| Job::PauseTransform(target, reply))
-    }
-
-    /// Removes a paused transform definition and its target table;
-    /// idempotent. See [`Trellis::drop_transform`].
-    pub fn drop_transform(&self, target: &str) -> Result<(), TrellisError> {
-        let target = target.to_string();
-        self.submit(|reply| Job::DropTransform(target, reply))
-    }
-
-    /// Removes a relationship declaration; idempotent. See
-    /// [`Trellis::drop_relationship`].
-    pub fn drop_relationship(&self, from_table: &str, name: &str) -> Result<(), TrellisError> {
-        let from_table = from_table.to_string();
-        let name = name.to_string();
-        self.submit(|reply| Job::DropRelationship(from_table, name, reply))
     }
 
     /// Whether at least one live drain worker is registered anywhere in
@@ -405,11 +352,8 @@ async fn run(
             Job::Migrate(reply) => {
                 let _ = reply.send(trellis.migrate().await);
             }
-            Job::Define(text, reply) => {
-                let _ = reply.send(trellis.define(&text).await);
-            }
-            Job::DefineRelationship(text, reply) => {
-                let _ = reply.send(trellis.define_relationship(&text).await);
+            Job::Apply(text, reply) => {
+                let _ = reply.send(trellis.apply(&text).await);
             }
             Job::Definitions(reply) => {
                 let _ = reply.send(trellis.definitions().await);
@@ -434,21 +378,6 @@ async fn run(
             }
             Job::SampleQuarantined(target, after, limit, reply) => {
                 let _ = reply.send(trellis.sample_quarantined(&target, after, limit).await);
-            }
-            Job::ResumeColumn(target, reply) => {
-                let _ = reply.send(trellis.resume_column(&target).await);
-            }
-            Job::ResumeTransform(target, reply) => {
-                let _ = reply.send(trellis.resume_transform(&target).await);
-            }
-            Job::PauseTransform(target, reply) => {
-                let _ = reply.send(trellis.pause_transform(&target).await);
-            }
-            Job::DropTransform(target, reply) => {
-                let _ = reply.send(trellis.drop_transform(&target).await);
-            }
-            Job::DropRelationship(from_table, name, reply) => {
-                let _ = reply.send(trellis.drop_relationship(&from_table, &name).await);
             }
             Job::HasLiveDrainWorkers(reply) => {
                 let _ = reply.send(trellis.has_live_drain_workers().await);

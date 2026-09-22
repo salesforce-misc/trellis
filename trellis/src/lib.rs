@@ -136,7 +136,7 @@ pub mod dev;
 
 // --- Tier 1: the facade ---------------------------------------------------
 pub use app::{
-    DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState,
+    Applied, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState,
     QuarantineTarget, RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 pub use blocking::BlockingTrellis;

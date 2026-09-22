@@ -24,7 +24,7 @@ same database:
 ```rust
 // A web process: define transforms, never drains anything.
 let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
-trellis.define("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total").await?;
+trellis.apply("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total").await?;
 ```
 
 ```rust
@@ -39,7 +39,7 @@ let worker = Trellis::connect(
 ## The silent-stall hazard (issue #144)
 
 This shape has one sharp edge: **if the dedicated worker process is never
-deployed, or gets scaled to zero, nothing errors.** Every `define()` call
+deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
 still succeeds, every transform still gets registered — it just sits in
 `TransformStatus::WaitingToBackfill` forever, because nothing in the fleet
 is running with `drain_threads > 0` to pick the work up. Read paths against

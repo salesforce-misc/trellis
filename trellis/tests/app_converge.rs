@@ -109,7 +109,7 @@ async fn await_converged_observes_a_real_write_only_after_a_deliberately_delayed
         .await
         .expect("connect definer");
     definer
-        .define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
