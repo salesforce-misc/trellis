@@ -47,7 +47,21 @@ const SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 /// The fold-in sweep's defaults: #266's own ratio list at T3's 400k rows/sec.
 const FOLD_IN_DEFAULT_TARGET_RATE: f64 = 400_000.0;
 const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
-const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(30);
+/// Longer than every other scenario's 30s grace (issue #270 review): at
+/// 400k rows/sec offered against a single-connection generator that tops out
+/// well below that (see `load`'s own doc comment, #276), every ratio starts
+/// the grace window already backlogged, and a low fold-in ratio's target
+/// write count is close to the row count — near the same write load as a 1-1
+/// chain, whose own knee sits at ~210-230k rows/sec. Measured directly: ratio
+/// 1000:1 needs on the order of 90-120s to fully drain and pass its oracle;
+/// 30s reports every ratio as `sustained: false` with `oracle_ok: null`
+/// (unevaluated, not failed — see `check_aggregate_oracle`), which is not a
+/// real reproduction of a T3 measurement. A low ratio (e.g. 10:1, 40,000
+/// groups at this target rate) may still not drain even at 120s — that is
+/// this scenario's own hypothesis under test (throughput should scale with
+/// fold-in ratio), not a harness fault, and is why this raises the grace
+/// rather than lowering the default target rate.
+const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(120);
 
 const INTAKE_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
 const INTAKE_DEFAULT_DURATION: Duration = Duration::from_secs(20);
