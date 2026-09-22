@@ -116,6 +116,22 @@ async fn persisted_status(raw: &Client, target: &str) -> Option<String> {
     .map(|row| row.get(0))
 }
 
+/// `transform_definitions.definition_version` for `target`, read straight
+/// from Postgres — the audit-visible counter `alter_transform` bumps once
+/// per *real* edit and deliberately leaves untouched for an idempotent
+/// no-op clause. Used to verify a no-op claim isn't just "the reported delta
+/// was empty" but "nothing was actually written."
+async fn persisted_definition_version(raw: &Client, target: &str) -> i64 {
+    raw.query_one(
+        "select definition_version from transform_definitions \
+         where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read definition_version")
+    .get(0)
+}
+
 async fn wait_for_live(raw: &Client, target: &str) {
     poll_until(
         Duration::from_secs(60),
@@ -591,6 +607,7 @@ async fn edits_are_idempotent_in_both_directions() {
         .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
         .await
         .expect("add");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
     let applied = trellis
         .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
         .await
@@ -599,12 +616,18 @@ async fn edits_are_idempotent_in_both_directions() {
     assert!(added.is_empty(), "no-op: nothing was actually added again");
     assert!(dropped.is_empty());
     assert!(altered.is_empty());
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-ADD must not bump definition_version — nothing was actually written"
+    );
 
     // ALTER to a new formula, then re-ALTER to the same (now-current) one.
     trellis
         .apply("ALTER TRANSFORM order_calc ALTER double_a AS a + a + a")
         .await
         .expect("alter");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
     let applied = trellis
         .apply("ALTER TRANSFORM order_calc ALTER double_a AS a + a + a")
         .await
@@ -616,12 +639,18 @@ async fn edits_are_idempotent_in_both_directions() {
         altered.is_empty(),
         "no-op: nothing was actually altered again"
     );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-ALTER must not bump definition_version — nothing was actually written"
+    );
 
     // DROP, then re-DROP the same, now-absent field.
     trellis
         .apply("ALTER TRANSFORM order_calc DROP double_a")
         .await
         .expect("drop");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
     let applied = trellis
         .apply("ALTER TRANSFORM order_calc DROP double_a")
         .await
@@ -630,6 +659,11 @@ async fn edits_are_idempotent_in_both_directions() {
     assert!(added.is_empty());
     assert!(dropped.is_empty(), "no-op: it was already gone");
     assert!(altered.is_empty());
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-DROP must not bump definition_version — nothing was actually written"
+    );
 
     trellis.shutdown().await.expect("shutdown");
 }
@@ -868,6 +902,85 @@ async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
         }
         other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
     }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #242's whole point: `column_dependents_any_keyspace` must see a
+/// dependency that only exists through a downstream **aggregate's own
+/// `GROUP BY` key** — not a `SELECT` field — since a `GROUP BY` key is not
+/// itself a [`trellis`]-internal `FieldDef`
+/// (`ast::KeySpace::Aggregate`'s own doc comment) and so is invisible to the
+/// plain field-list loop `column_dependents_via` also runs. Every other
+/// drop-refusal test in this file (and in `pause_and_drop.rs`) exercises a
+/// dependent that reads the column through an ordinary `SELECT` field, which
+/// would still pass even if the `KeySpace::Aggregate { group_by }` branch in
+/// `column_dependents_via` (`catalog.rs`) were deleted outright — this test
+/// exists specifically to fail if that branch regresses.
+#[tokio::test]
+async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
+    ))
+    .await
+    .expect("a chained aggregate's source needs a full replica identity");
+
+    // `order_group` groups directly on `order_calc.a` — not a passthrough
+    // `SELECT` field of its own — so the only edge from `order_group` back
+    // to `order_calc.a` is its `GROUP BY` key.
+    trellis
+        .apply("TRANSFORM order_group FROM order_calc GROUP BY a SELECT count(*) AS n")
+        .await
+        .expect("an aggregate grouping directly on the upstream's column");
+
+    // Dropping `b` — which nothing reads, as a field or a GROUP BY key —
+    // still succeeds.
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("no dependent reads column b, as a field or a GROUP BY key");
+
+    // Dropping `a` — which `order_group` GROUPs BY — is refused, naming
+    // `order_group` and the exact column its own `GROUP BY` key reads.
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc DROP a")
+        .await
+        .expect_err("order_group's GROUP BY key reads exactly this column");
+    match err {
+        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+            column_detail,
+        }) => {
+            assert_eq!(subject, "order_calc.a");
+            assert_eq!(dependents, vec!["order_group".to_string()]);
+            assert_eq!(
+                column_detail,
+                vec!["order_group.a reads order_calc.a".to_string()],
+                "the refusal must be traced to order_group's own GROUP BY key, \
+                 not just \"something reads this table\""
+            );
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+
+    // A refused drop writes nothing: the column is still there.
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(columns.contains("a"));
 
     trellis.shutdown().await.expect("shutdown");
 }

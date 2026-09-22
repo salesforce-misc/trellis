@@ -50,10 +50,9 @@ pub mod validate;
 // doors onto it. Names the engine does not use are split out below and
 // compiled only behind those gates, which is what keeps a plain
 // `cargo build` free of `unused_imports` rather than an `allow`.
-pub use ast::{AlterClause, AlterTransform, DefinitionRef, Statement, TransformRef, ValueType};
+pub use ast::{AlterTransform, DefinitionRef, Statement, TransformRef, ValueType};
 pub use catalog::{
-    AlterOutcome, CatalogError, all_source_tables, alter_transform, create_relationship,
-    install_definition,
+    CatalogError, all_source_tables, alter_transform, create_relationship, install_definition,
 };
 pub use error::ParseError;
 pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
@@ -1228,10 +1227,18 @@ mod statement_grammar_tests {
         );
     }
 
-    /// Decision 4: the flat imperative won, so the SQL-DDL-flavoured
-    /// alternative is not quietly also accepted.
+    /// Decision 4: the flat imperative won for pause/resume/drop, so the
+    /// SQL-DDL-flavoured alternative spelling of *those* is not quietly also
+    /// accepted — `PAUSE` is not one of `ALTER TRANSFORM`'s own `ADD`/`DROP`/
+    /// `ALTER` clause keywords (ADR-0015, issues #241/#242, added after this
+    /// test was first written), so this still refuses, just via that later
+    /// grammar's own "expected a clause keyword" error now rather than
+    /// `ALTER` being entirely unrecognized. `ALTER TRANSFORM` itself is very
+    /// much accepted grammar today — see `statement_grammar_tests` in this
+    /// same module for its own coverage — this test is only about the one
+    /// spelling ADR-0015 still didn't resurrect.
     #[test]
-    fn the_alter_flavored_spelling_is_not_accepted() {
+    fn the_alter_flavored_pause_spelling_is_not_accepted() {
         assert!(parse_statement("ALTER TRANSFORM order_totals PAUSE").is_err());
     }
 
