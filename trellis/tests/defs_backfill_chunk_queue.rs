@@ -226,6 +226,128 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
     );
 }
 
+/// Issue #297: the composite-key counterpart of
+/// `a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
+/// above — same claim/reclaim/re-execute dance, but over a genuinely
+/// composite (`a`, `b`) primary key, so the reclaimed chunk's `lo`/`hi`
+/// bounds round-trip through `ddl::join_pk_key`/`ddl::split_pk_key`'s
+/// composite text encoding (`backfill_chunks.lo`/`.hi` are each a single
+/// `text` column) rather than degenerating to a single scalar value.
+///
+/// A prior version of this coverage (`client_e2e.rs`'s
+/// `a_composite_key_backfill_chunks_a_boundary_inside_a_group_exactly_once`,
+/// from #121) proved this same "a reclaimed composite-key chunk actually
+/// gets backfilled correctly" property by seeding 99999 rows and polling a
+/// real, running `TrellisClient` for up to 20s — which flaked under CI
+/// runner load (#297) despite the property itself needing neither a live
+/// client nor any wall-clock wait: `claim_chunks`/`reclaim_stale_chunks`/
+/// `run_claimed_chunk`/`finish_chunk` are the exact functions a running
+/// client's maintenance loop and app workers call, and driving them directly
+/// here proves the identical reclaim-then-build behavior, deterministically,
+/// in well under a second. (`client_e2e.rs` keeps a much smaller live-client
+/// version of this scenario, to prove the *live client's own background
+/// loops* are wired up to call these functions automatically — a distinct,
+/// narrower concern this test doesn't cover.)
+#[tokio::test]
+async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (a bigint, b bigint, primary key (a, b)); \
+             insert into widgets (a, b) values (1, 1), (1, 2), (2, 1), (2, 2), (3, 1)",
+        )
+        .await
+        .expect("seed widgets with a composite primary key");
+
+    let cols = numeric(&["a", "b"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM widgets_calc FROM widgets SELECT a + b AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(
+        def.status,
+        TransformStatus::Backfilling,
+        "a plain 1-1 definition sits at backfilling until its chunks are claimed and finished"
+    );
+
+    // The dead worker: claims the (only, for this small table) chunk and
+    // does nothing else with it — no execution, no finish, no heartbeat.
+    let claimed = chunk_queue::claim_chunks(&client, "dead-worker", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+    let chunk = &claimed[0];
+
+    let ttl = Duration::from_millis(300);
+    tokio::time::sleep(ttl + Duration::from_millis(150)).await;
+
+    let reclaimed = chunk_queue::reclaim_stale_chunks(&client, ttl)
+        .await
+        .expect("reclaim_stale_chunks");
+    assert_eq!(reclaimed, 1, "the dead worker's stale claim must be freed");
+
+    let re_claimed = chunk_queue::claim_chunks(&client, "fresh-worker", 10)
+        .await
+        .expect("re-claim after reclaim_stale_chunks");
+    assert_eq!(re_claimed.len(), 1);
+    assert_eq!(
+        re_claimed[0].id, chunk.id,
+        "the fresh worker must win exactly the reclaimed chunk"
+    );
+
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &re_claimed[0],
+        "public",
+        "fresh-worker",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run_claimed_chunk");
+    chunk_queue::finish_chunk(&db.pool, &re_claimed[0], "fresh-worker")
+        .await
+        .expect("finish_chunk");
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from widgets \
+             left join widgets_calc on widgets_calc.a = widgets.a and widgets_calc.b = widgets.b \
+             where widgets_calc.a is null \
+                or widgets_calc.total is distinct from (widgets.a + widgets.b)::numeric",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "the reclaiming worker's re-execution must have built the composite-keyed target correctly"
+    );
+
+    let status: String = client
+        .query_one(
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(
+        status, "live",
+        "finishing the one remaining chunk must flip the definition to live"
+    );
+}
+
 /// public-api-design review gap #1: a chunk's entire write must not have to
 /// complete inside `reclaim_ttl` to avoid being falsely reclaimed —
 /// `run_claimed_chunk` must heartbeat the claim out-of-band for the whole

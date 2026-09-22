@@ -883,23 +883,36 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// Issue #121, regression guard: the direct build's chunk-boundary discovery
-/// (`defs::backfill::discover_pk_ranges`) once had a live bug where an
-/// unqualified `order by <col>` in the boundary-discovery query resolved to
-/// the *output* list's same-named `<col>::text` cast instead of the input
-/// column, sorting lexicographically (`'9999' > '50000'`) instead of
-/// numerically — silently over-chunking a `bigint`-keyed source into extra,
-/// overlapping chunks (invisible to a final-state count/value check, since
-/// the build's overwrite-upsert is idempotent; only the *chunk count* itself
-/// exposed it, exactly as it did here during development). 99999 rows, one
-/// key column (`b`) cycling `1..=3` per value of the other (`a`), forces the
-/// 50k-row chunk boundary to land *inside* an `a`-group rather than on a
-/// clean one — the shape that would silently duplicate work across chunks
-/// under the bug. Asserts the exact chunk count `install_definition`
-/// persists, not just the final built values, since idempotent duplication
-/// is exactly what a final-state-only check can't see.
+/// Issue #297 redesign note: this test used to also seed 99999 rows in a
+/// shape deliberately chosen to force `install_definition`'s chunk-boundary
+/// discovery (`defs::backfill::discover_pk_ranges`) to land mid-group, and to
+/// assert the exact persisted `backfill_chunks` count — the issue #121
+/// regression guard for a boundary-discovery bug that once silently
+/// over-chunked a composite-keyed source. That property needs no live client
+/// and no polling at all (`install_definition` returns as soon as chunks are
+/// planned and persisted), so it now lives as a fast, deterministic,
+/// sub-second test:
+/// `defs_install_definition.rs`'s
+/// `install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks`.
+///
+/// What *does* need a live client is the other half of the original test:
+/// that a real, running `TrellisClient`'s own background maintenance loop
+/// (which sweeps `reclaim_stale_chunks`) and application-thread pool (which
+/// claims and drains `backfill_chunks` work) actually notice and correctly
+/// finish a reclaimed composite-key chunk on their own, with no test code
+/// driving them step by step — that's the wiring this test proves, kept as
+/// a small, bounded (not open-ended) integration check per #297.
+/// `defs_backfill_chunk_queue.rs`'s
+/// `a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker`
+/// proves the identical reclaim-then-build behavior against the bare
+/// `chunk_queue` functions directly (no client, no wait), so this test's own
+/// workload only needs to be just large enough to force `install_definition`
+/// to plan more than one chunk — not a realistic-sized or boundary-precise
+/// dataset — since the boundary-discovery correctness itself is someone
+/// else's job now. 50_005 rows (one over the 50_000-row chunk size) is the
+/// minimum that still yields two chunks.
 #[tokio::test]
-async fn a_composite_key_backfill_chunks_a_boundary_inside_a_group_exactly_once() {
+async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -907,7 +920,7 @@ async fn a_composite_key_backfill_chunks_a_boundary_inside_a_group_exactly_once(
     raw.batch_execute(
         "create table widgets (a bigint, b bigint, primary key (a, b)); \
          insert into widgets (a, b) \
-         select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 99999) g",
+         select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 50005) g",
     )
     .await
     .expect("seed widgets with a composite primary key");
@@ -933,8 +946,9 @@ async fn a_composite_key_backfill_chunks_a_boundary_inside_a_group_exactly_once(
         .get(0);
     assert_eq!(
         chunk_count, 2,
-        "99999 rows at 50k rows/chunk must be exactly two chunks, \
-         not silently over-chunked by a boundary-discovery bug"
+        "50005 rows at 50k rows/chunk must plan two chunks for this test's crash-and-reclaim \
+         setup to exercise a running client against — the boundary-discovery correctness of \
+         that count is proven elsewhere (see this test's doc comment)"
     );
 
     let claimed = chunk_queue::claim_chunks(&raw, "dead-worker", 10)

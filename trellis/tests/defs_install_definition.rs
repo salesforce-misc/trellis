@@ -259,6 +259,114 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     );
 }
 
+/// Issue #121, regression guard, fast/unit-style form (issue #297): the direct
+/// build's chunk-boundary discovery (`defs::backfill::discover_pk_ranges`,
+/// exercised here through `install_definition`'s real `plan_one_to_one_chunks`
+/// -> persisted-`backfill_chunks` path) once had a live bug where an
+/// unqualified `order by <col>` resolved to the *output* list's same-named
+/// `<col>::text` cast instead of the input column, sorting lexicographically
+/// (`'9999' > '50000'`) instead of numerically — silently over-chunking a
+/// composite-keyed source into extra, overlapping chunks invisible to a
+/// final-state count/value check alone, since the direct build's
+/// overwrite-upsert is idempotent; only the *chunk count* itself exposes it.
+///
+/// This used to be a `client_e2e.rs` test that started a real `TrellisClient`
+/// and polled up to 20s for a live multi-threaded drain to converge, purely to
+/// get to a point where `backfill_chunks` could be counted — flaky under CI
+/// runner load (#297) despite the chunk count itself being knowable
+/// synchronously, right after `install_definition` returns, with no client
+/// and no polling at all. This test asserts exactly that, then drains the
+/// persisted chunks the same deterministic way
+/// `install_definition_fast_path_builds_target_without_staging_the_ring`
+/// above does, to also keep the final-built-value correctness check that a
+/// chunk-count-only assertion can't provide on its own.
+///
+/// 99999 rows, one key column (`b`) cycling `1..=3` per value of the other
+/// (`a`), forces the 50k-row chunk boundary to land *inside* an `a`-group
+/// rather than on a clean one — the shape that would silently duplicate work
+/// across chunks under the bug. See also
+/// `defs_backfill_direct.rs`'s `one_to_one_build_with_a_composite_key_is_exhaustive_across_a_boundary_inside_a_group`,
+/// which proves the same boundary shape is built exhaustively and correctly
+/// through the *other* (in-call, non-durable-queue) direct-build entry point,
+/// `backfill_definition` — that test doesn't assert chunk count (it can't:
+/// `backfill_definition` never persists to `backfill_chunks`), so it alone
+/// would not have caught the #121 over-chunking bug; this test is the one
+/// that does, for the durable-queue path `install_definition` actually uses.
+#[tokio::test]
+async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks()
+{
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table widgets (a bigint, b bigint, primary key (a, b)); \
+             insert into widgets (a, b) \
+             select (g - 1) / 3 + 1, (g - 1) % 3 + 1 from generate_series(1, 99999) g",
+        )
+        .await
+        .expect("seed widgets with a composite primary key");
+
+    let cols = numeric(&["a", "b"]);
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM widgets_calc FROM widgets SELECT a + b AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(def.status, TransformStatus::Backfilling);
+
+    let chunk_count: i64 = client
+        .query_one(
+            "select count(*) from backfill_chunks where definition_id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("count persisted chunks")
+        .get(0);
+    assert_eq!(
+        chunk_count, 2,
+        "99999 rows at 50k rows/chunk must be exactly two chunks, \
+         not silently over-chunked by a boundary-discovery bug"
+    );
+
+    drain_backfill_chunks(&db.pool, "public").await;
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from widgets \
+             left join widgets_calc on widgets_calc.a = widgets.a and widgets_calc.b = widgets.b \
+             where widgets_calc.a is null \
+                or widgets_calc.total is distinct from (widgets.a + widgets.b)::numeric",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "every composite-keyed row must be built exactly once with the right value"
+    );
+
+    let status: String = client
+        .query_one(
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
+            ),
+            &[],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(
+        status, "live",
+        "draining both persisted chunks must flip the definition to live"
+    );
+}
+
 /// A reviewer's high-severity follow-up to issue #76's own grammar work: the
 /// catalog correctly persists an explicitly-qualified source's fully-qualified
 /// identity (`defs_catalog.rs`'s
