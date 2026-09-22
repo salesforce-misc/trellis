@@ -357,13 +357,17 @@ pub enum Expr {
     ///
     /// In an [`KeySpace::Aggregate`] definition, `name` may instead be one of
     /// `SUM`/`MIN`/`MAX`/`AVG` (looked up in
-    /// [`super::registry::AGGREGATE_FUNCTION_SPECS`]) with a single Numeric
-    /// argument, or `COUNT` (issue #75) with an empty `args` — `COUNT(*)`
-    /// row-counting, the only `COUNT` shape this grammar accepts — since
-    /// `*` is not itself an expression. There's no separate AST node for
-    /// aggregate calls, since they're syntactically identical `name(args)`
-    /// calls, just resolved against a different registry depending on
-    /// key-space.
+    /// [`super::registry::AGGREGATE_FUNCTION_SPECS`]) with a single orderable
+    /// argument (issue #120 generalized `MIN`/`MAX` past `Numeric` to any
+    /// type with a real Postgres ordering — see
+    /// [`super::registry::aggregate_result_type`]), or `COUNT` with either an
+    /// empty `args` (`COUNT(*)` row-counting, issue #75 — `*` is not itself
+    /// an expression, so this is the one arity-0 shape) or a single argument
+    /// of any type (`COUNT(<expr>)`, issue #120 — counts non-null
+    /// occurrences of `<expr>`, a different semantic from `COUNT(*)`).
+    /// There's no separate AST node for aggregate calls, since they're
+    /// syntactically identical `name(args)` calls, just resolved against a
+    /// different registry depending on key-space.
     FunctionCall { name: String, args: Vec<Expr> },
 }
 

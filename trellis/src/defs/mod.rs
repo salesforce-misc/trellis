@@ -253,12 +253,38 @@ mod tests {
         );
     }
 
+    /// Issue #120: `COUNT(<column>)` — counting non-null occurrences of a
+    /// specific column, a different semantic from `COUNT(*)` — parses
+    /// successfully in an aggregate definition.
     #[test]
-    fn rejects_count_of_a_column_in_an_aggregate_definition() {
-        let err = parse("TRANSFORM t FROM s GROUP BY a SELECT COUNT(a) AS x").unwrap_err();
+    fn parses_count_of_a_column_in_an_aggregate_definition() {
+        let def = parse("TRANSFORM t FROM s GROUP BY a SELECT COUNT(b) AS x").unwrap();
+        assert_eq!(
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COUNT".to_string(),
+                args: vec![Expr::Column("b".to_string())],
+            }
+        );
+    }
+
+    /// `COUNT` with more than one argument is a plain arity error, the same
+    /// as any other registered function — Postgres itself has no `count(a,
+    /// b)`.
+    #[test]
+    fn rejects_count_with_more_than_one_argument() {
+        let err = parse("TRANSFORM t FROM s GROUP BY a SELECT COUNT(a, b) AS x").unwrap_err();
         match err {
-            ParseError::UnsupportedAggregateFunction { name } => assert_eq!(name, "COUNT"),
-            other => panic!("expected UnsupportedAggregateFunction, got {other:?}"),
+            ParseError::FunctionArityMismatch {
+                name,
+                expected,
+                found,
+            } => {
+                assert_eq!(name, "COUNT");
+                assert_eq!(expected, 1);
+                assert_eq!(found, 2);
+            }
+            other => panic!("expected FunctionArityMismatch, got {other:?}"),
         }
     }
 

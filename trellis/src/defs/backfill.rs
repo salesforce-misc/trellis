@@ -944,6 +944,22 @@ fn classify_field(expr: &Expr, value_type: ValueType) -> FieldKind {
                 _ => FieldKind::RecomputeOnly,
             }
         }
+        // Issue #120: `COUNT(<expr>)` — counts non-null occurrences rather
+        // than every row, but is exactly as invertible as `COUNT(*)` (see
+        // `invertibility::classify`'s own doc comment: "both are invertible
+        // regardless of the column's `ValueType`"), and — like `COUNT(*)` —
+        // needs no hidden partial column of its own; its visible column is
+        // the running count. Checked ahead of the generic one-argument arm
+        // below, which would otherwise classify it against
+        // `AggregateArg::Column(value_type)` — a shape `invertibility::classify`
+        // does not recognize for `COUNT` (`("COUNT", AggregateArg::Column(_))
+        // => None`) and would wrongly fall to `FieldKind::RecomputeOnly`.
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
+            match classify("COUNT", AggregateArg::Count(CountArg::Column)) {
+                Some(v) if v.is_invertible() => FieldKind::Count,
+                _ => FieldKind::RecomputeOnly,
+            }
+        }
         Expr::FunctionCall { name, args } if args.len() == 1 => {
             match classify(name, AggregateArg::Column(value_type)) {
                 Some(v) if v.is_invertible() && name == "SUM" => FieldKind::Sum,
@@ -1232,8 +1248,20 @@ async fn backfill_aggregate(
                 ));
             }
             FieldKind::Count => {
+                // Issue #120: `COUNT(<expr>)` renders `count(<expr>)`;
+                // `COUNT(*)` (empty `args`) still renders bare `count(*)`.
+                // No cast needed either way — Postgres's own `count()`
+                // already returns `bigint`, matching this field's declared
+                // `Integer(Int8)` type (`registry::AGGREGATE_FUNCTION_SPECS`'s
+                // `COUNT` row).
                 insert_cols.push(col);
-                stage_exprs.push("count(*)::numeric".to_string());
+                let count_sql = match expr {
+                    Expr::FunctionCall { args, .. } if !args.is_empty() => {
+                        format!("count({})", render_field(&args[0]))
+                    }
+                    _ => "count(*)".to_string(),
+                };
+                stage_exprs.push(count_sql);
             }
             FieldKind::RecomputeOnly => {
                 insert_cols.push(col);

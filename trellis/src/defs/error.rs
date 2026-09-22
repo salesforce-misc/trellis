@@ -26,10 +26,6 @@ pub enum ParseError {
     UnsupportedOperator { operator: String },
     /// A function call other than one in [`super::registry::FUNCTIONS`].
     UnsupportedFunction { name: String },
-    /// `COUNT(<column>)` or `COUNT()` — issue #75 only implements row-
-    /// counting `COUNT(*)`, not Postgres's "count non-null occurrences of
-    /// this column" form.
-    UnsupportedAggregateFunction { name: String },
     /// A registered function called with the wrong number of arguments
     /// (issue #64) — a structural check the parser can make directly from
     /// [`super::registry::FunctionSpec::arg_types`]'s length, without
@@ -117,10 +113,6 @@ impl fmt::Display for ParseError {
             ParseError::UnsupportedFunction { name } => write!(
                 f,
                 "unsupported function '{name}': not in the registered function set (ADR-0004: grammar and evaluator function sets must match)"
-            ),
-            ParseError::UnsupportedAggregateFunction { name } => write!(
-                f,
-                "unsupported aggregate function '{name}': COUNT is only supported as COUNT(*) (row-counting); COUNT(<column>) is not implemented"
             ),
             ParseError::FunctionArityMismatch {
                 name,

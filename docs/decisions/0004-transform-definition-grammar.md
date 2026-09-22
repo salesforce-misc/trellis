@@ -145,10 +145,13 @@ shape:
 
 * `GROUP BY <col1>[, <col2>...]` produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  numeric column in exactly one of `SUM`, `MIN`, `MAX`, `AVG`, resolved against a
-  separate aggregate-function registry. `COUNT(*)` (issue #75) is supported;
-  `COUNT(<column>)` is recognized by name only, to give a "not yet implemented"
-  error.
+  column in exactly one of `SUM`, `MIN`, `MAX`, `AVG` (originally numeric-only;
+  issue #120 generalized `MIN`/`MAX` to any type Postgres itself has a `min`/
+  `max` aggregate for — `text`/`varchar` lands, `uuid` does not, despite having
+  a full btree opclass — see `docs/type-support.md`), resolved against a
+  separate aggregate-function registry. `COUNT(*)` (issue #75) and
+  `COUNT(<expr>)` (issue #120 — counts non-null occurrences of `<expr>`, a
+  different Postgres semantic from `COUNT(*)`) are both supported.
 * `JOIN <other> ON <cond> [INNER|LEFT|RIGHT]` for cross-join is recognized and
   rejected by name; cross-join remains out of scope. Relationship reference
   syntax is defined with the relationship feature — see

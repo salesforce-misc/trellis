@@ -356,6 +356,39 @@ pub enum ValidationError {
         function: String,
         rel: String,
     },
+    /// A `KeySpace::OneToOne` field's `MIN`/`MAX` wraps a **to-many**
+    /// relationship path over a `text`/`varchar`-typed column (issue #120) —
+    /// `EnumAggregateOverToManyRelationshipUnsupported`'s exact structural
+    /// twin, for the same reason: this one shape folds a real multi-row
+    /// group through the pure, synchronous, DB-less evaluator
+    /// (`eval::eval_to_many_aggregate` -> `eval::reduce_numeric_aggregate` ->
+    /// `eval::reduce_text_aggregate`) with no live-Postgres fallback, unlike
+    /// a `KeySpace::Aggregate` field's own `MIN`/`MAX(text)` (always
+    /// `Invertibility::RecomputeOnly`, always resolved by a real server-side
+    /// `min()`/`max()` push-down instead). Postgres's `text` ordering is a
+    /// per-*column* **collation**, not a fixed, universal property of the
+    /// `text` family the way `date`/`inet` ordering is — and this crate
+    /// tracks no column collation metadata at all — so the evaluator has no
+    /// way to answer "which of these two distinct strings sorts first"
+    /// correctly without a live lookup it structurally never has here.
+    /// Refusing at validation time is what keeps an assumed byte-order
+    /// (`C`/`POSIX`) fallback from silently computing the wrong answer under
+    /// any other collation — see `eval::reduce_text_aggregate`'s own doc
+    /// comment for the runtime-side twin of this guard. (`uuid` — this
+    /// issue's other candidate `MIN`/`MAX` family — turned out, checked live
+    /// rather than assumed, not to need an equivalent guard: Postgres has no
+    /// `min(uuid)`/`max(uuid)` aggregate *at all*, the same "opclass but no
+    /// aggregate" finding #114/#116 made for `bytea`/`macaddr`, so `uuid`
+    /// never reaches this arm in the first place — `registry::aggregate_result_type`
+    /// refuses it outright as an ordinary `FunctionArgTypeMismatch`,
+    /// independent of relationship shape.) Every other `MIN`/`MAX(text)`
+    /// shape — a `KeySpace::Aggregate` field, or a to-*one* relationship
+    /// path — is unaffected.
+    TextAggregateOverToManyRelationshipUnsupported {
+        field: String,
+        function: String,
+        rel: String,
+    },
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -608,6 +641,18 @@ impl fmt::Display for ValidationError {
                  comparison cannot be resolved without a live connection this fold has no way \
                  to reach (issue #117); a GROUP BY definition's own {function}(<enum column>) \
                  is unaffected"
+            ),
+            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
+                field,
+                function,
+                rel,
+            } => write!(
+                f,
+                "calculated field '{field}': {function}('{rel}.<column>') over a to-many \
+                 relationship is not supported for a text-typed column — its ordering depends on \
+                 a column collation this crate does not track, which cannot be resolved without \
+                 a live connection this fold has no way to reach (issue #120); a GROUP BY \
+                 definition's own {function}(<text column>) is unaffected"
             ),
         }
     }
@@ -1632,6 +1677,36 @@ fn infer_expr(
                 }
                 return Ok(ValueType::Numeric);
             };
+            // Issue #120: `COUNT` is special-cased ahead of the generic
+            // per-argument loop below, for both its accepted shapes —
+            // `COUNT(*)` (`args` empty) and `COUNT(<expr>)` (`args` one
+            // element). `AGGREGATE_FUNCTION_SPECS`'s `COUNT` row declares
+            // `arg_types: &[]` (the parser, not this table, enforces
+            // `COUNT`'s arity — see `super::parser`'s own `COUNT` branch), so
+            // the generic `args.iter().zip(spec.arg_types)` loop just below
+            // would `zip` a real one-element `args` against an empty
+            // `arg_types` and silently produce *zero* iterations — meaning
+            // `COUNT(<expr>)`'s argument would never be recursively
+            // validated at all (an unresolved column, unknown relationship,
+            // etc. would sail through unchecked). Postgres's own `count(x)`
+            // accepts any argument type with no restriction, so there is
+            // nothing to admit here beyond "the argument itself resolves" —
+            // unlike `SUM`/`MIN`/`MAX`/`AVG`, whose argument type gates
+            // through `registry::aggregate_result_type` below.
+            if name == "COUNT" {
+                for arg in args {
+                    infer_expr(
+                        arg,
+                        field_name,
+                        source_columns,
+                        relationships,
+                        fields_by_name,
+                        types,
+                        in_progress,
+                    )?;
+                }
+                return Ok(spec.return_type);
+            }
             let mut arg_types: Vec<ValueType> = Vec::with_capacity(args.len());
             for (i, (arg, expected)) in args.iter().zip(spec.arg_types).enumerate() {
                 let arg_t = infer_expr(
@@ -1715,20 +1790,38 @@ fn infer_expr(
                 // multi-row fold — so it is unaffected, matched by
                 // `RelationshipCardinality::ToMany` specifically rather than
                 // "any `RelationshipPath` argument".
+                //
+                // Issue #120: `MIN`/`MAX(text)` wrapping a to-many path hits
+                // the identical structural gap, for the identical reason —
+                // see `ValidationError::TextAggregateOverToManyRelationshipUnsupported`'s
+                // own doc comment. `uuid` never reaches this match arm at
+                // all (checked live, not assumed): Postgres has no
+                // `min(uuid)`/`max(uuid)` aggregate whatsoever, so
+                // `registry::aggregate_result_type` already returned `None`
+                // for it above, well before this block — the same "opclass
+                // but no aggregate" shape #114/#116 found for
+                // `bytea`/`macaddr`.
                 if matches!(name.as_str(), "MIN" | "MAX")
-                    && matches!(result, ValueType::Other(PgType::Enum(_)))
+                    && matches!(result, ValueType::Other(PgType::Enum(_)) | ValueType::Text)
                     && let Expr::RelationshipPath { rel, .. } = &args[0]
                     && relationships
                         .get(rel)
                         .is_some_and(|r| r.cardinality == RelationshipCardinality::ToMany)
                 {
-                    return Err(
-                        ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
+                    return Err(match result {
+                        ValueType::Text => {
+                            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
+                                field: field_name.to_string(),
+                                function: name.clone(),
+                                rel: rel.clone(),
+                            }
+                        }
+                        _ => ValidationError::EnumAggregateOverToManyRelationshipUnsupported {
                             field: field_name.to_string(),
                             function: name.clone(),
                             rel: rel.clone(),
                         },
-                    );
+                    });
                 }
                 return Ok(result);
             }
@@ -2803,6 +2896,152 @@ mod tests {
             ),
         ]);
         assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    /// Issue #120's `text` twin of `min_max_enum_over_a_to_many_relationship_is_refused`
+    /// — see `ValidationError::TextAggregateOverToManyRelationshipUnsupported`'s
+    /// own doc comment for why `text`'s collation-dependent ordering hits the
+    /// identical structural gap enum's schema-dependent ordering does.
+    #[test]
+    fn min_max_text_over_a_to_many_relationship_is_refused() {
+        let d = def(vec![FieldDef {
+            name: "worst".to_string(),
+            expr: Expr::FunctionCall {
+                name: "MAX".to_string(),
+                args: vec![Expr::RelationshipPath {
+                    rel: "items".to_string(),
+                    column: "label".to_string(),
+                }],
+            },
+        }]);
+        let source_columns = HashMap::new();
+        let relationships = HashMap::from([(
+            "items".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToMany,
+                to_table: "items".to_string(),
+                to_col: "order_id".to_string(),
+                column_types: HashMap::from([("label".to_string(), ValueType::Text)]),
+            },
+        )]);
+        let err = validate(&d, &source_columns, &relationships).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TextAggregateOverToManyRelationshipUnsupported {
+                field: "worst".to_string(),
+                function: "MAX".to_string(),
+                rel: "items".to_string(),
+            }
+        );
+    }
+
+    /// A plain `KeySpace::Aggregate` field's own `MIN`/`MAX(<text column>)` —
+    /// no relationship at all — is unaffected: always
+    /// [`super::invertibility::Invertibility::RecomputeOnly`], always
+    /// resolved by a live server-side `min()`/`max()` push-down.
+    #[test]
+    fn min_max_text_over_a_plain_group_by_column_is_accepted() {
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "worst".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "MAX".to_string(),
+                        args: vec![col("label")],
+                    },
+                },
+            ],
+        );
+        let source_columns = HashMap::from([
+            ("tag".to_string(), ValueType::Numeric),
+            ("label".to_string(), ValueType::Text),
+        ]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+    }
+
+    /// Issue #120: `MIN`/`MAX(<uuid column>)` is refused *unconditionally* —
+    /// checked live rather than assumed, Postgres has no `min(uuid)`/
+    /// `max(uuid)` aggregate at all (the same "opclass but no aggregate"
+    /// shape #114/#116 found for `bytea`/`macaddr` — `trellis/tests/
+    /// defs_min_max_text_and_uuid.rs` pins this against a live server), so
+    /// `registry::aggregate_result_type("MIN"/"MAX", ValueType::Uuid)` is
+    /// `None` and this is an ordinary `FunctionArgTypeMismatch`, independent
+    /// of relationship shape — a plain `GROUP BY` field's own
+    /// `MIN`/`MAX(<uuid column>)` is refused identically (no special
+    /// to-many-only guard needed the way `text`/`enum` need, since there is
+    /// no shape of this call this crate could ever admit).
+    #[test]
+    fn min_max_uuid_is_refused_unconditionally() {
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "worst".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "MAX".to_string(),
+                        args: vec![col("token")],
+                    },
+                },
+            ],
+        );
+        let source_columns = HashMap::from([
+            ("tag".to_string(), ValueType::Numeric),
+            ("token".to_string(), ValueType::Uuid),
+        ]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::FunctionArgTypeMismatch {
+                field: "worst".to_string(),
+                function: "MAX".to_string(),
+                arg_index: 0,
+                expected: ValueType::Numeric,
+                found: ValueType::Uuid,
+            }
+        );
+    }
+
+    /// Issue #120: `COUNT(<column>)` in a `GROUP BY` definition — counting
+    /// non-null occurrences of a specific column, unlike `COUNT(*)` — parses
+    /// and validates, typed `bigint` (`Integer(Int8)`), matching Postgres's
+    /// own `count(x)`.
+    #[test]
+    fn count_of_a_column_in_a_group_by_is_accepted_and_typed_bigint() {
+        let d = aggregate_def(
+            &["tag"],
+            vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: col("tag"),
+                },
+                FieldDef {
+                    name: "n".to_string(),
+                    expr: Expr::FunctionCall {
+                        name: "COUNT".to_string(),
+                        args: vec![col("amount")],
+                    },
+                },
+            ],
+        );
+        let source_columns = HashMap::from([
+            ("tag".to_string(), ValueType::Numeric),
+            ("amount".to_string(), ValueType::Numeric),
+        ]);
+        assert_eq!(validate(&d, &source_columns, &HashMap::new()), Ok(()));
+        let types = infer_field_types(&d, &source_columns, &HashMap::new()).unwrap();
+        assert_eq!(
+            types["n"],
+            ValueType::Integer(crate::integer::IntWidth::Int8)
+        );
     }
 
     /// A resolved *to-one* relationship whose column is read by `rel.column`.

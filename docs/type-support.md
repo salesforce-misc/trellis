@@ -99,8 +99,8 @@ per-type capability, so it's omitted from the aggregate cells.
 | `numeric` `decimal` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ | ✅ | rejected as PK today; `1.0`≠`1.00` under text match |
 | `real` `double precision` | ✅ | 🎯 | 🎯 typed index | 🎯 typed index | ✅ | ✅ SUM/AVG/MIN/MAX (recompute-only) | typed binary float, Postgres's non-IEEE order (#112); `-0`≠`'-0'` under text match keeps it off the key roles |
 | `boolean` | ✅ | 🎯 | ✅ `GROUP BY` only; ⚠️ relationship/PK | ⚠️ (rare) | ✅ | ✅ `bool_and`/`bool_or` (recompute-only) | `ValueType::Boolean` predates #119; has a second `::text` renderer no other admitted type does (#119) |
-| `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ⚠️ MIN/MAX | landed in #79 |
-| `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | 🎯 MIN/MAX/`string_agg` | requires deterministic collation |
+| `uuid` | ✅ | 🎯 | ✅ | ✅ | ✅ | ❌ MIN/MAX | landed in #79; MIN/MAX checked live for #120 and found `uuid_ops` has a full btree opclass but no `min`/`max` aggregate wired to it — `bytea`/`macaddr`'s finding, not a rendering hazard |
+| `text` `varchar` | ✅ | 🎯 | ✅ | ✅ | ✅ | ✅ MIN/MAX (recompute-only); ⚠️ `string_agg` | MIN/MAX landed in #120 (`GROUP BY` role only — always server-side push-down; a to-many-relationship-wrapped `KeySpace::OneToOne` fold is refused, since ordering needs a column collation this crate doesn't track); `string_agg` deferred, see "Order-sensitive aggregates" below |
 | `char(n)` `citext` | ✅ | ⚠️ | ❌ padding/case | ❌ | ⚠️ passthrough | — | hazard is padding/case, not volatility |
 | `bytea` | ✅ (hex text) | 🎯 | ✅ | ✅ | ✅ literal (#109) | ❌ no such Postgres aggregate | `bytea_output` pinned to `hex`, whose rendering is a bijection (#114); literal must be canonical lowercase hex; Postgres has no `min(bytea)`/`max(bytea)` despite `bytea` having a full btree opclass |
 | `date` | ✅ | 🎯 | ✅ | ✅ | ✅ literal (#109) | ✅ MIN/MAX | key roles landed in #113 — no typed index needed. `DATE 'YYYY-MM-DD'` only; `'today'` is why `date_in` is STABLE |
@@ -927,15 +927,211 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     existed as a passthrough type since #108, and every role gained here is
     a function of the family alone. Cross-checked against a live server in
     `trellis/tests/defs_jsonb.rs` and `trellis/tests/defs_typed_literals.rs`.
-* **Aggregate maintenance** — `array_agg`/`string_agg` are `IMMUTABLE` in
-  Postgres (not `STABLE`, contrary to an earlier draft of this epic's
-  scope note — see "jsonb semantics (#115)" above) and still need an
-  incremental-delta design or a group-recompute fallback, plus an
-  `ORDER BY`-inside-aggregate grammar decision (#120). `jsonb_agg` over a
-  `jsonb` argument has landed (#115, recompute-only); `jsonb_agg` over any
-  other argument type remains unadmitted, since only the `jsonb`-argument
-  case has been shown to exclude the GUC-dependent hazard its `STABLE`
-  marking is really about.
+* **Non-numeric & order-sensitive aggregates (#120)** — the epic's own scope
+  note bundled three things together: generalize `MIN`/`MAX` past numeric,
+  design order-sensitive `string_agg`/`array_agg`/`jsonb_agg` maintenance,
+  and align `COUNT(<column>)`. Read against the actual code (`staging::
+  apply_aggregate.rs`, `defs::invertibility`) rather than assumed from the
+  note, the three turned out to be very differently sized:
+
+  * **`MIN`/`MAX` generalization was a small, contained admission-layer
+    fix, not new machinery.** `defs::invertibility::classify`'s `MIN`/`MAX`
+    arm has been unconditional on argument type since before this issue
+    (issue #11's original gate rule: `("MIN" | "MAX", AggregateArg::Column(_))
+    => RecomputeOnly`), and a `KeySpace::Aggregate` field's `MIN`/`MAX` was
+    already resolved entirely by a server-side `min()`/`max()` push-down
+    (`staging::apply_aggregate::probe_recompute_fields_bulk`/
+    `probe_field_value`), never a Rust-side fold. The only real gap was
+    `registry::aggregate_result_type` falling through to `None` for `Text`
+    (not in the numeric family, no early-return arm the way `Boolean`/the
+    `Other` families have). Checked live per #111-#119's playbook rather
+    than assumed, `text` and `uuid` land completely differently:
+
+    * **`text`/`varchar` lands** for the `GROUP BY` role — `min(text)`/
+      `max(text)` are real Postgres aggregates keeping the argument's own
+      type. The one shape with no live-SQL fallback (a `KeySpace::OneToOne`
+      field's `MIN`/`MAX` wrapping a to-many relationship path,
+      `eval::eval_to_many_aggregate`) is refused
+      (`ValidationError::TextAggregateOverToManyRelationshipUnsupported`):
+      Postgres `text` ordering is a property of the *column's own
+      collation* (`pg_attribute.attcollation`), which this crate tracks
+      nowhere, so the pure, synchronous, DB-less evaluator has no way to
+      answer a genuine multi-distinct-value tie honestly without a
+      connection it structurally never has here — the identical shape
+      issue #117 found for `enum` (schema-defined ordering) and #119's
+      "reject rather than guess" posture, just with collation in place of
+      creation-order. `eval::reduce_text_aggregate`/
+      `EvalError::TextOrderingUnavailable` answer only the trivial
+      single-distinct-value case and raise rather than assume byte order
+      (`C`/`POSIX`) for a real tie.
+    * **`uuid` does not land at all** — checked live, not assumed from
+      "has a full btree opclass" (`uuid_ops` is a complete, `IMMUTABLE`
+      one). `select min(v) from (values ('...'::uuid)) t(v)` is `ERROR:
+      function min(uuid) does not exist` on a live Postgres 17.11, and no
+      `pg_proc`/`pg_aggregate` row names `min`/`max` over a lone `uuid`
+      argument — the identical "opclass but no aggregate" finding #114
+      made for `bytea` and #116 made for `macaddr`/`macaddr8`.
+      `registry::aggregate_result_type` returns `None` for `MIN`/`MAX(uuid)`
+      unconditionally; the validator reports the ordinary
+      `FunctionArgTypeMismatch` any aggregate/type mismatch gets.
+      `trellis/tests/defs_min_max_text_and_uuid.rs` pins both findings live.
+
+  * **`COUNT(<column>)` landed, and needed real (if narrow) new plumbing,
+    not just a grammar change.** `defs::invertibility` already modelled
+    `CountArg::Column` (issue #75's own groundwork) as invertible with no
+    hidden partials, so the delta *model* needed nothing new. Three
+    concrete gaps did, though: (1) the parser's aggregate-`COUNT` branch
+    accepted only the literal `*`; (2) `super::validate::infer_expr`'s
+    generic per-argument loop `zip`s `args` against `AGGREGATE_FUNCTION_SPECS`'s
+    `COUNT` row's `arg_types: &[]`, which silently produces *zero*
+    iterations for a real one-element `args` — meaning the argument would
+    never be recursively validated at all once the grammar accepted it, a
+    real (if latent) hole, not just a missing feature; (3) `staging::
+    apply_aggregate`'s two forced-full-recompute renderers (`upsert_group`'s
+    single-group probe and `apply_forced_groups_bulk`'s bulk `INSERT ...
+    SELECT`) both hardcoded `count(*)` for *every* `AggFieldKind::Count`
+    field — silently wrong for `COUNT(<column>)` specifically whenever an
+    image-less recompute trigger forced that field's group onto the
+    full-recompute path (it would have written the group's raw row count,
+    not the column's non-null count). A fourth, subtler gap surfaced only
+    once live tests were run: `COUNT`'s row-contribution text is `"0"`/`"1"`
+    (never absent, since `count(x)` is never `NULL`, unlike `SUM`/`AVG`),
+    so `add_contributions`/`sub_contributions`/`diff_contributions` had to
+    learn that a `Count` field's `"0"` contribution means "skip this row"
+    — the counterpart of `Sum`/`Avg`'s `None` — without also treating a
+    genuine `SUM(amount) = 0` contribution as skippable.
+    Bundled in, since #111's own "exact integer semantics" note explicitly
+    earmarked it for this issue: `COUNT` (both `COUNT(*)` and
+    `COUNT(<column>)`) is now declared `bigint` (`Integer(Int8)`), matching
+    Postgres's own `pg_typeof(count(x))`, not the `numeric` it collapsed
+    into before #111 had anywhere to put an integer.
+    `trellis/tests/defs_count_column.rs` covers all four, live, including
+    the forced-full-recompute path specifically.
+
+  * **Order-sensitive `array_agg`/`string_agg`/`jsonb_agg` maintenance is a
+    design, deliberately not attempted this pass** — the issue's own
+    framing, and correctly so: `array_agg`/`string_agg` are `IMMUTABLE` in
+    Postgres (not `STABLE`, contrary to an earlier draft of this epic's
+    scope note — see "jsonb semantics (#115)" above), so nothing here is
+    *inadmissible*; what's missing is (a) `ORDER BY`-inside-aggregate
+    grammar and (b) an incremental-maintenance story for it. Sketched, not
+    implemented:
+
+    1. **Delta maintenance is not sound for any of the three, full stop —
+       this is not a "hasn't been built yet" gap, it's a "there is no
+       partial-state design that would make it invertible" one.** Every
+       genuinely invertible aggregate in this crate (`SUM`, `COUNT`, `AVG`
+       via `Sum`+`Count` partials) shares one property: the *old value plus
+       a bounded, summary partial* is enough to compute the new value after
+       a delete, because the underlying fold is a commutative monoid over a
+       *summary* (a running total, a running count) that a deletion can
+       invert by subtraction. `array_agg`/`string_agg`/`jsonb_agg` are
+       folds over the *ordered sequence itself* — the aggregate's own
+       "state" is the whole multiset (really: the whole *ordered list*, if
+       `ORDER BY` is added) of contributing values, and a delete needs to
+       know which position was removed and what the ORDER BY-correct
+       neighbor relationship is now, which no bounded summary encodes. This
+       is `MIN`/`MAX`'s "a deleted row might have held the extremum, and
+       there's no way to recover the next-best value from the aggregate's
+       current state alone" taken to its extreme: for `MIN`/`MAX` the
+       "next-best value" is at least a *single scalar* a recompute can find
+       with one probe; for an ordered-list aggregate, an insert/delete
+       changes the *entire remaining sequence's* neighbor structure, not
+       one scalar. There is no `PartialField` shape (`defs::invertibility::
+       PartialField` today only has `Sum`/`Count`, for exactly the
+       bounded-summary aggregates) that would rescue this — it would need
+       to track the *entire ordered contents* as the "partial," at which
+       point the partial *is* a full recompute's input and the "delta"
+       buys nothing. **Conclusion: group-recompute (this crate's existing
+       `Invertibility::RecomputeOnly` path, already fully wired for
+       `MIN`/`MAX`/float `SUM`/`AVG`/`SUM(interval)`/`bool_and`/`bool_or`/
+       `bit_and`/`bit_or`/`jsonb_agg(jsonb)`) is the *only* sound design for
+       these three — never an approximated delta, per this crate's own
+       standing rule.** This needs no new maintenance mechanism at all:
+       `AggFieldKind::RecomputeOnly` and `probe_recompute_fields_bulk`
+       already do exactly this for every other non-invertible aggregate.
+    2. **The real open design question is narrower than "how do we
+       maintain it" — it's "what does `ORDER BY` inside an aggregate call
+       even mean here, grammar-wise, and does recompute make it safe to
+       add at all."** Two sub-questions, not one:
+       * *Grammar shape.* Postgres's own syntax is `string_agg(expr, sep
+         ORDER BY sort_expr [, sort_expr ...] [ASC|DESC])` (and the
+         `array_agg`/`jsonb_agg` equivalent without the separator). This
+         crate's grammar (`super::registry::AGGREGATE_FUNCTION_SPECS`) has
+         never had a keyword-bearing aggregate argument list before —
+         every aggregate here is `name(single_expr)`. Adding `ORDER BY`
+         needs either a dedicated AST node (`Expr::OrderedAggregateCall`,
+         carrying the value expr plus a `Vec<(Expr, SortDirection)>`) or
+         widening `Expr::FunctionCall` itself — the former is more
+         honest about the shape being genuinely different from every
+         other aggregate call (arity isn't fixed, there's a keyword
+         inside the parens), and avoids every non-order-sensitive
+         aggregate's code (registry lookups, `render_expr_sql`,
+         `validate_aggregate_field_expr`) having to reason about an
+         `order_by` field it never uses.
+       * *Without `ORDER BY` at all* (bare `array_agg(x)`/`string_agg(x,
+         sep)` on a `GROUP BY` field), a full group-recompute is *safe but
+         under-determined*: Postgres's own answer is order-dependent (no
+         `ORDER BY` means "whatever order the scan happens to produce"),
+         so two recomputes of the same group are not guaranteed to
+         *agree* with each other, though the *set* of elements is always
+         correct — the same "non-corrupting but not deterministic" caveat
+         #115 already documents for `jsonb_agg(jsonb)`. That is a genuine,
+         disclosed limitation, not a correctness bug, and this crate could
+         land it exactly the way `jsonb_agg(jsonb)` already did — zero new
+         grammar, immediate value for a caller who doesn't need a
+         guaranteed order (e.g. `array_agg(tag)` for an unordered set of
+         tags). **This sub-piece is basically free** (the registry/
+         invertibility/`AggFieldKind::RecomputeOnly` plumbing already
+         exists) and was *not* done in this pass anyway, to avoid
+         shipping `array_agg`/`string_agg` half-designed (with the
+         `ORDER BY` question still genuinely open) in the same PR as the
+         two concretely-scoped, fully-implemented pieces above — landing
+         it needs its own small follow-up so its own tests/docs get equal
+         attention, not because it is technically hard.
+       * *With `ORDER BY`*, recompute is still sound (Postgres itself
+         computes the true, deterministic answer every time), but the
+         `ORDER BY` expression(s) need the same type/immutability
+         admission every other expression in this grammar gets
+         (`super::validate`), and — the one genuinely new wrinkle — a
+         sort key that is itself order-*unstable* under this crate's own
+         rendering (e.g. a `real`/`double precision` sort key, where
+         `-0`/`0` are equal-but-differently-rendered per #112) could make
+         two textually-different recomputes agree on Postgres's own
+         answer while looking byte-different to ADR-0013's cross-check —
+         worth checking live per column type before wiring, the same
+         "verify, don't assume" pass this issue applied everywhere else,
+         and exactly the kind of finding #111-#120 turned up repeatedly
+         for *other* roles when checked rather than assumed.
+    3. **Interaction with `defs::invertibility`/`AggFieldKind` gating**:
+       none needed beyond what already exists. `array_agg`/`string_agg`/
+       `jsonb_agg(<any type>)` all belong in `invertibility::classify`'s
+       existing `RecomputeOnly` bucket (the same arm `jsonb_agg(jsonb)`
+       already occupies) — no new `Invertibility` variant, no new
+       `PartialField`. The only *new* code this would need is: (a) the
+       grammar/AST piece above, (b) `registry::AGGREGATE_FUNCTION_SPECS`
+       rows for `ARRAY_AGG`/`STRING_AGG` and widening `JSONB_AGG`'s
+       argument past `jsonb`-only now that the GUC hazard reasoning
+       (#115) is understood well enough to know which other argument
+       types are safe, and (c) `eval`/`oracle` rendering for the `ORDER
+       BY` clause, mirroring `render_expr_sql`'s existing per-expression
+       renderer.
+
+    This was considered and deliberately not attempted in this pass — the
+    issue's own scope note frames it as "design," and forcing it into the
+    same change as the two concretely-scoped, fully-implemented pieces
+    above risked exactly what #227's implementer was praised for *not*
+    doing: shipping a genuine design fork half-decided rather than escalating
+    it. Recommendation: land bare (no-`ORDER BY`) `array_agg`/`string_agg`
+    as their own small, `jsonb_agg(jsonb)`-shaped follow-up first (cheap,
+    immediately useful, no grammar change); take the `ORDER BY` grammar
+    question to a follow-up issue of its own once the `Expr::OrderedAggregateCall`
+    shape above (or an alternative a reviewer prefers) is agreed, rather
+    than guessed at under this issue's own time box.
+  * `jsonb_agg` over a `jsonb` argument has landed (#115, recompute-only);
+    `jsonb_agg` over any other argument type remains unadmitted, since only
+    the `jsonb`-argument case has been shown to exclude the GUC-dependent
+    hazard its `STABLE` marking is really about.
 * **Enum semantics (#117)** — every type family before this one is a single,
   universal Postgres builtin: `bytea` is always OID 17, its rendering rules
   are the same on every installation, and `PgType`'s own module doc could

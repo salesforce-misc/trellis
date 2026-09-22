@@ -871,12 +871,11 @@ impl Parser {
                         }
 
                         if upper == "COUNT" {
-                            // `COUNT(*)` (row-counting) is the only supported
-                            // shape — `COUNT(<column>)` is not a plain
-                            // `parse_call_args` expression, so it's parsed
-                            // directly here rather than through
-                            // `AGGREGATE_FUNCTION_SPECS`'s expression-argument
-                            // machinery.
+                            // `COUNT(*)` (row-counting, issue #75) is `*`
+                            // literally — not a `parse_call_args` expression —
+                            // so it's parsed directly here rather than
+                            // through `AGGREGATE_FUNCTION_SPECS`'s
+                            // expression-argument machinery.
                             if self.peek_is_symbol('*') {
                                 self.advance();
                                 match self.advance() {
@@ -898,8 +897,27 @@ impl Parser {
                                     args: Vec::new(),
                                 });
                             }
-                            self.skip_balanced_parens()?;
-                            return Err(ParseError::UnsupportedAggregateFunction { name: upper });
+                            // `COUNT(<expr>)` (issue #120): counts non-null
+                            // occurrences of `<expr>` rather than every row —
+                            // a different Postgres semantic from `COUNT(*)`,
+                            // sharing its name because Postgres's own grammar
+                            // does too. Any single expression this grammar can
+                            // parse is accepted here (a bare column, a
+                            // relationship path, a composed expression); the
+                            // validator (`super::validate::infer_expr`) is
+                            // what actually resolves and types it —
+                            // `count(x)` accepts any argument type in
+                            // Postgres, so there is no type restriction to
+                            // enforce here, unlike `SUM`/`MIN`/`MAX`/`AVG`.
+                            let args = self.parse_call_args()?;
+                            if args.len() != 1 {
+                                return Err(ParseError::FunctionArityMismatch {
+                                    name,
+                                    expected: 1,
+                                    found: args.len(),
+                                });
+                            }
+                            return Ok(Expr::FunctionCall { name: upper, args });
                         }
 
                         let spec = lookup_aggregate_function(&upper)

@@ -470,6 +470,33 @@ pub enum EvalError {
         function: &'static str,
         pg_type: &'static str,
     },
+    /// A `MIN`/`MAX(text)` fold ([`reduce_text_aggregate`]) was handed a
+    /// group with more than one *distinct* value (issue #120) —
+    /// [`EvalError::EnumOrderingUnavailable`]'s exact structural twin, for
+    /// the same reason: `text`'s ordering is a property of the *column's own
+    /// collation* (`pg_attribute.attcollation`), which this crate tracks
+    /// nowhere, rather than a fixed, universal property of the family the
+    /// way `date`/`inet` ordering is — so this pure, synchronous,
+    /// DB-less evaluator has no way to answer "which of these two distinct
+    /// strings sorts first" correctly without a connection it structurally
+    /// never has here. A single-distinct-value group (the overwhelmingly
+    /// common shape this variant is *not* raised for) needs no ordering at
+    /// all — `MIN`/`MAX` of one repeated value is that value — so this only
+    /// ever fires on a genuine multi-value tie this evaluator cannot break
+    /// honestly. Guessing (e.g. assuming Rust's own byte-order `Ord` on the
+    /// text, which happens to equal Postgres's `C`/`POSIX` collation but not
+    /// necessarily a real column's) would be exactly the "silent, wrong-order
+    /// fold" issue #117 was written to rule out for `enum`, one layer over.
+    ///
+    /// **Reachability mirrors `EnumOrderingUnavailable` exactly** — see that
+    /// variant's own doc comment; every word of its reachability argument
+    /// applies here with "text" in place of "enum" and
+    /// [`super::validate::ValidationError::TextAggregateOverToManyRelationshipUnsupported`]
+    /// in place of the enum validation guard.
+    TextOrderingUnavailable {
+        field: String,
+        function: &'static str,
+    },
 }
 
 impl EvalError {
@@ -513,7 +540,8 @@ impl EvalError {
             | EvalError::UnsupportedRelationshipPath { field, .. }
             | EvalError::UnknownRelationship { field, .. }
             | EvalError::AggregateRequiredForToMany { field, .. }
-            | EvalError::EnumOrderingUnavailable { field, .. } => field,
+            | EvalError::EnumOrderingUnavailable { field, .. }
+            | EvalError::TextOrderingUnavailable { field, .. } => field,
             EvalError::Cycle(field) => field,
         }
     }
@@ -588,6 +616,12 @@ impl fmt::Display for EvalError {
                  distinct value cannot be resolved without a live connection to determine \
                  the type's creation-order comparison"
             ),
+            EvalError::TextOrderingUnavailable { field, function } => write!(
+                f,
+                "calculated field '{field}': {function}(text) over more than one distinct \
+                 value cannot be resolved without knowing the column's collation, which this \
+                 engine does not track"
+            ),
         }
     }
 }
@@ -606,7 +640,8 @@ impl std::error::Error for EvalError {
             | EvalError::UnsupportedRelationshipPath { .. }
             | EvalError::UnknownRelationship { .. }
             | EvalError::AggregateRequiredForToMany { .. }
-            | EvalError::EnumOrderingUnavailable { .. } => None,
+            | EvalError::EnumOrderingUnavailable { .. }
+            | EvalError::TextOrderingUnavailable { .. } => None,
         }
     }
 }
@@ -1082,7 +1117,11 @@ fn eval_to_many_aggregate(
     if name == "COUNT" {
         // `COUNT(<rel>.<column>)`: related rows whose `column` is non-NULL,
         // matching Postgres `COUNT(<col>)`. The empty set counts to 0.
-        let mut count: usize = 0;
+        //
+        // Issue #120: `bigint` (`Integer(Int8)`), matching Postgres's own
+        // `pg_typeof(count(x))` — see `registry::AGGREGATE_FUNCTION_SPECS`'s
+        // `COUNT` row doc comment.
+        let mut count: i64 = 0;
         for row in related {
             match row.get(column) {
                 Some(Some(_)) => count += 1,
@@ -1095,7 +1134,7 @@ fn eval_to_many_aggregate(
                 }
             }
         }
-        return Ok(Some(Value::Numeric(int_numeric(count))));
+        return Ok(Some(Value::Integer(IntWidth::Int8, count)));
     }
 
     let value_type = reldata
@@ -1339,7 +1378,47 @@ fn eval_aggregate_expr(
             // also covers `row_contribution`'s single-row-slice call in
             // `staging::apply_aggregate` (issue #11's delta model): a lone
             // row's "contribution" to a group's count is always exactly 1.
-            Ok(Some(Value::Numeric(int_numeric(rows.len()))))
+            //
+            // Issue #120: `bigint` (`Integer(Int8)`), matching Postgres's
+            // own `pg_typeof(count(*))` — see `registry::AGGREGATE_FUNCTION_SPECS`'s
+            // `COUNT` row doc comment.
+            Ok(Some(Value::Integer(IntWidth::Int8, rows.len() as i64)))
+        }
+        // Issue #120: `COUNT(<expr>)` — counts non-null occurrences of
+        // `<expr>` across the group, a different Postgres semantic from
+        // `COUNT(*)` (which needs no per-row evaluation at all, above).
+        // Deliberately **not** routed through `fold_aggregate`/
+        // `reduce_numeric_aggregate` below: those two both implement
+        // `SUM`/`MIN`/`MAX`/`AVG`'s "an aggregate of zero non-null values is
+        // `NULL`" rule (`registry::aggregate_result_type(name, ..)` gates
+        // which values even reach the fold, and `COUNT` is deliberately
+        // absent from it — see that function's own doc comment — so every
+        // value would be filtered out and the fold would wrongly return
+        // `NULL`), whereas `count(x)` is **never** `NULL` — it is `0` over a
+        // group whose every `x` is `NULL`, or even over zero rows (unreachable
+        // here: a `GROUP BY` group always has at least one row).
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
+            let relationships = RelationshipContext::default();
+            let mut count: i64 = 0;
+            for row in rows {
+                let mut per_row_cache = HashMap::new();
+                let mut per_row_in_progress = HashSet::new();
+                let value = eval_expr(
+                    &args[0],
+                    field_name,
+                    row,
+                    source_columns,
+                    &relationships,
+                    fields_by_name,
+                    &mut per_row_cache,
+                    &mut per_row_in_progress,
+                    regex_cache,
+                )?;
+                if value.is_some() {
+                    count += 1;
+                }
+            }
+            Ok(Some(Value::Integer(IntWidth::Int8, count)))
         }
         Expr::FunctionCall { name, args }
             if super::registry::lookup_aggregate_function(name).is_some() =>
@@ -1678,6 +1757,17 @@ fn reduce_numeric_aggregate(
     // this never races that arm.
     if matches!(&values[0], Value::Other(PgType::Bit | PgType::VarBit, _)) {
         return reduce_bit_aggregate(name, values, field_name);
+    }
+
+    // Issue #120: `MIN`/`MAX(text)` folds on the same "own family, own
+    // terms" grounds as `enum`'s arm does (issue #117) — see
+    // `reduce_text_aggregate`'s own doc comment for the identical structural
+    // reason (`enum`'s ordering is schema-defined and live; `text`'s is
+    // collation-defined and per-column — neither is a fixed, universal
+    // property of the family this evaluator could reproduce with no
+    // connection).
+    if let Value::Text(_) = &values[0] {
+        return reduce_text_aggregate(name, values, field_name);
     }
 
     // Issue #112: a float anywhere in the group makes the whole fold a
@@ -2084,6 +2174,70 @@ fn reduce_enum_aggregate(
     }
 }
 
+/// (Issue #120) — [`reduce_numeric_aggregate`]'s early-return arm for
+/// [`ValueType::Text`](super::ast::ValueType::Text), the `text` twin of
+/// [`reduce_enum_aggregate`] just above, and for the identical structural
+/// reason (see that function's own doc comment for the fuller version of
+/// this argument).
+///
+/// Every other family this module folds `MIN`/`MAX` over has an ordering
+/// that is either a fixed, universal property of the family itself
+/// (`date`/`time`/`interval`, `inet`, the exact-numeric/float
+/// families — reproducible in pure Rust with no connection) or, for `enum`,
+/// at least resolvable from the *type* alone given a live connection
+/// (`pg_enum.enumsortorder`). Postgres `text` ordering is neither: it is a
+/// property of the *column's own collation* (`pg_attribute.attcollation`),
+/// which can differ column-to-column even within one database, and this
+/// crate tracks no collation metadata anywhere (`docs/type-support.md`'s
+/// `text`/`varchar` row: "requires deterministic collation" — a gap, not a
+/// solved problem, as of this issue). Assuming byte order (Rust's own `Ord`
+/// for `String`, which happens to equal Postgres's `C`/`POSIX` collation)
+/// would silently disagree with a database's actual collation the moment it
+/// isn't byte-order — the exact "silent, wrong-order fold" shape issue #117
+/// was written to rule out for `enum`, one layer over.
+///
+/// This is *not* the gap for the overwhelmingly common case, though: a
+/// `KeySpace::Aggregate` field's own `MIN`/`MAX(text)` is always
+/// [`super::invertibility::Invertibility::RecomputeOnly`], so
+/// `staging::apply_aggregate` never calls this function over a multi-row
+/// group at all — it always asks Postgres directly (`probe_recompute_fields_bulk`),
+/// under whatever the column's *real* collation is. This function answers
+/// only the one case it safely can with no connection: a group whose values
+/// are all textually identical needs no ordering at all (`MIN`/`MAX` of one
+/// repeated value is that value, regardless of what order the collation
+/// would give two *different* strings). Any group with more than one
+/// distinct value raises [`EvalError::TextOrderingUnavailable`] rather than
+/// guess — see that variant's own doc comment for exactly which production
+/// paths can and cannot reach that case (in short: never the real one, the
+/// same as [`EvalError::EnumOrderingUnavailable`]).
+fn reduce_text_aggregate(
+    name: &str,
+    values: Vec<Value>,
+    field_name: &str,
+) -> Result<Option<Value>, EvalError> {
+    let mut texts = values.into_iter().filter_map(|value| match value {
+        Value::Text(text) => Some(text),
+        _ => None,
+    });
+    let Some(first) = texts.next() else {
+        return Ok(None);
+    };
+    match name {
+        "MIN" | "MAX" => {
+            for text in texts {
+                if text != first {
+                    return Err(EvalError::TextOrderingUnavailable {
+                        field: field_name.to_string(),
+                        function: if name == "MIN" { "MIN" } else { "MAX" },
+                    });
+                }
+            }
+            Ok(Some(Value::Text(first)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Folds a group of `Value::Boolean`s for `bool_and`/`bool_or` (issue #119)
 /// — [`reduce_numeric_aggregate`]'s early-return arm for
 /// [`ValueType::Boolean`](super::ast::ValueType::Boolean), the same shape
@@ -2311,7 +2465,7 @@ fn apply_operator(
 /// An `i64` always renders as a valid plain decimal, so the reparse can't
 /// fail for a real [`Value::Integer`]; going through [`Numeric::parse`]
 /// rather than a bespoke constructor keeps `Numeric`'s normalization
-/// invariants in one place, exactly as [`int_numeric`] already does.
+/// invariants in one place.
 fn as_numeric(value: Value) -> Option<Numeric> {
     match value {
         Value::Numeric(n) => Some(n),
@@ -2390,10 +2544,6 @@ fn apply_function(
     // `text` value, which Postgres itself caps at 1GB — so every result
     // here is at most ~2^30 and provably fits `int4` with no range check.
     Some(Value::Integer(IntWidth::Int4, result as i64))
-}
-
-fn int_numeric(n: usize) -> Numeric {
-    Numeric::parse(&n.to_string()).expect("a usize always renders as a valid decimal literal")
 }
 
 /// `strpos(haystack, needle)`: the 1-based *character* (not byte) position
@@ -3685,7 +3835,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             result["out"],
-            Some(Value::Numeric(Numeric::parse("2").unwrap()))
+            Some(Value::Integer(IntWidth::Int8, 2)),
+            "issue #120: COUNT is bigint, matching Postgres's own pg_typeof(count(x))"
         );
     }
 
@@ -3697,7 +3848,7 @@ mod tests {
         let ctx = comments_context();
         assert_eq!(
             eval_rel(&agg_rel("COUNT"), &r, &types, &ctx).unwrap()["out"],
-            Some(Value::Numeric(Numeric::parse("0").unwrap())),
+            Some(Value::Integer(IntWidth::Int8, 0)),
             "COUNT over empty set is 0"
         );
         for func in ["SUM", "MIN", "MAX", "AVG"] {
@@ -3720,10 +3871,7 @@ mod tests {
             &comments_context(),
         )
         .unwrap();
-        assert_eq!(
-            result["out"],
-            Some(Value::Numeric(Numeric::parse("0").unwrap()))
-        );
+        assert_eq!(result["out"], Some(Value::Integer(IntWidth::Int8, 0)));
     }
 
     #[test]

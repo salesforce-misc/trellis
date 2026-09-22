@@ -1089,13 +1089,16 @@ fn field_value_type(
             field_value_type(&args[0], source_columns, rels)
         }
         // Issue #111: likewise for the aggregates — `sum(int4)` is `bigint`,
-        // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose: it is
-        // type-agnostic row-counting, so `registry::aggregate_result_type`
-        // deliberately has no row for it and its constant `FunctionSpec`
-        // return type (below) is the right answer. Its one-argument form
-        // (`COUNT(<rel>.<col>)` over a to-many relationship) is why this
-        // needs naming rather than falling out of the `args.is_empty()`
-        // guard.
+        // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose:
+        // `registry::aggregate_result_type` deliberately has no row for it
+        // (both `COUNT(*)` and `COUNT(<expr>)` are type-agnostic — Postgres
+        // accepts any argument type and always returns `bigint`), so its
+        // constant `FunctionSpec` return type (below, `Integer(Int8)` as of
+        // issue #120's registry alignment — `numeric` before it) is the
+        // right answer regardless of which shape reaches here. Its
+        // one-argument form (`COUNT(<rel>.<col>)` over a to-many
+        // relationship) is why this needs naming rather than falling out of
+        // the `args.is_empty()` guard.
         Expr::FunctionCall { name, args }
             if name != "COUNT"
                 && registry::lookup_aggregate_function(name).is_some()
@@ -1436,11 +1439,16 @@ mod tests {
     /// `field_value_type` (which drives per-cell comparison choice) actually
     /// agrees that every one of the five aggregate functions — both the
     /// `Invertible` ones (`SUM`/`COUNT`/`AVG`) and the `RecomputeOnly` ones
-    /// (`MIN`/`MAX`, see `trellis::dev::defs::invertibility`) — produces a Numeric
-    /// result, since that's what selects `Comparison::DecimalByValue` over
-    /// `Comparison::Exact` for the field.
+    /// (`MIN`/`MAX`, see `trellis::dev::defs::invertibility`) — produces the
+    /// type Postgres itself would: `Numeric` for `SUM`/`AVG`/`MIN`/`MAX` over
+    /// a `Numeric` column, and — since issue #120's registry alignment —
+    /// `Integer(Int8)` (`bigint`) for `COUNT`, matching
+    /// `pg_typeof(count(*))`/`pg_typeof(count(x))`, which selects
+    /// `Comparison::Exact` rather than `Comparison::DecimalByValue` for the
+    /// field (`Comparison::for_type`'s own `ValueType::Integer(_) =>
+    /// Comparison::Exact` arm).
     #[test]
-    fn field_value_type_classifies_every_aggregate_function_as_numeric() {
+    fn field_value_type_classifies_count_as_bigint_and_the_rest_as_numeric() {
         let source_columns = HashMap::from([("c1".to_string(), ValueType::Numeric)]);
         let count_expr = Expr::FunctionCall {
             name: "COUNT".into(),
@@ -1452,7 +1460,7 @@ mod tests {
                 &source_columns,
                 &RelIndex::new(&empty_program())
             ),
-            ValueType::Numeric
+            ValueType::Integer(IntWidth::Int8)
         );
         for name in ["SUM", "AVG", "MIN", "MAX"] {
             let expr = Expr::FunctionCall {

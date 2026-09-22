@@ -277,10 +277,18 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
     },
+    // Issue #120: `count(*)` and `count(<anything>)` are both `bigint` in
+    // Postgres (`pg_typeof(count(*))`/`pg_typeof(count(col))`), never
+    // `numeric` — this row used to declare `Numeric` only because, before
+    // issue #111, `ValueType` had no way to say "integer". `arg_types` stays
+    // `&[]`: the parser/validator special-case `COUNT`'s arity (0 for `*`,
+    // 0 or 1 for a real argument) rather than reading it from here — see
+    // `super::parser`'s and `super::validate::infer_expr`'s own `COUNT`
+    // branches.
     FunctionSpec {
         name: "COUNT",
         arg_types: &[],
-        return_type: ValueType::Numeric,
+        return_type: ValueType::Integer(IntWidth::Int8),
     },
     // Issue #119: `bool_and`/`bool_or` are Postgres's row-wise `AND`/`OR`
     // folds — `true` iff every/any non-NULL value in the group is `true`,
@@ -542,6 +550,45 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     if let ValueType::Boolean = arg {
         return match name {
             "BOOL_AND" | "BOOL_OR" => Some(ValueType::Boolean),
+            _ => None,
+        };
+    }
+    // Issue #120: `text`/`varchar` is a first-class (non-`Other`) `ValueType`
+    // with a real Postgres btree ordering that `MIN`/`MAX` hadn't yet been
+    // generalized to — `min(text)`/`max(text)` are real Postgres aggregates
+    // that keep the argument's own type (`pg_typeof(min(v))` is `text`,
+    // mirrored back exactly like every other family in this function).
+    // `SUM`/`AVG` still fall through to `None` below — Postgres has no
+    // `sum(text)` — and `text` is not in the numeric family, so this is
+    // routed here rather than into the numeric gate.
+    //
+    // `uuid` was checked live alongside `text` (per #111-#119's playbook —
+    // verify, don't assume from "has a full btree opclass") and turns out
+    // **not** to belong in this arm at all: `select min(v) from (values
+    // ('...'::uuid)) t(v)` is `ERROR: function min(uuid) does not exist` on
+    // a live Postgres 17, and no `pg_proc`/`pg_aggregate` row names `min`/
+    // `max` over a lone `uuid` argument — despite `uuid_ops` being a
+    // complete, `IMMUTABLE` btree opclass (`ORDER BY`/`<`/`>` all work).
+    // This is exactly `bytea`'s finding (#114) and `macaddr`/`macaddr8`'s
+    // (#116): an opclass with no aggregate wired to it is not a
+    // rendering/ordering hazard this crate could work around — there is no
+    // server-side construct for `MIN`/`MAX(uuid)` to be a subset *of*, so it
+    // falls through to `None` below (`uuid.is_numeric_family()` is `false`,
+    // same as `Text`, and `uuid` gets no early-return arm of its own the way
+    // `Boolean`/`Text` do — the `_ => None` path several lines down is what
+    // actually returns `None` for it). `trellis/tests/defs_min_max_text_and_uuid.rs`
+    // pins this live.
+    //
+    // Whether the *pure evaluator* (`defs::eval::reduce_numeric_aggregate`)
+    // could honor `text`'s ordering with no live connection is a separate
+    // question this admission alone does not answer — see
+    // `reduce_text_aggregate`'s own doc comment. A `KeySpace::Aggregate`
+    // field's own `MIN`/`MAX` never depends on the evaluator's fold at all:
+    // `MIN`/`MAX` are unconditionally `Invertibility::RecomputeOnly`, so
+    // `staging::apply_aggregate` always asks Postgres directly.
+    if let ValueType::Text = arg {
+        return match name {
+            "MIN" | "MAX" => Some(arg),
             _ => None,
         };
     }

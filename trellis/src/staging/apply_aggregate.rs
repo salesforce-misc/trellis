@@ -41,13 +41,23 @@
 //!   (image-less changes, or a group forced onto it — see below) re-derives
 //!   *both* partials from a live probe, keeping them consistent with what a
 //!   fresh delta from that point forward would produce.
-//! - A field that is a direct `COUNT(*)` call (issue #75) is
-//!   [`AggFieldKind::Count`] — also invertible, and simpler than `SUM`: its
-//!   new value is `old value + (rows added) - (rows removed)`, with no
-//!   hidden partial column, since `COUNT(*)` counts every row
-//!   unconditionally (no NULL-skipping ambiguity for a partial count to
-//!   resolve) and a group whose count would hit zero is deleted outright
-//!   rather than needing to represent a zero-row group's count.
+//! - A field that is a direct `COUNT(*)` or `COUNT(<expr>)` call (issue #75,
+//!   widened to a real argument by issue #120) is [`AggFieldKind::Count`] —
+//!   also invertible, and simpler than `SUM`: its new value is `old value +
+//!   (contributions added) - (contributions removed)`, with no hidden
+//!   partial column (unlike `SUM`/`AVG`, whose running count partial exists
+//!   only to recover Postgres's own "sum of zero non-null values is NULL"
+//!   rule — `COUNT` never needs that, because it *is* its own count).
+//!   `COUNT(*)` counts every row unconditionally (no NULL to skip at all);
+//!   `COUNT(<expr>)` counts non-null occurrences of `<expr>`, folding
+//!   through the exact same per-row contribution/null-skip machinery
+//!   `SUM`/`AVG` already use ([`add_contributions`]/[`sub_contributions`] —
+//!   a null contribution simply isn't pushed). Either way, a group whose
+//!   *row count* hits zero is deleted outright by [`probe_group_exists`],
+//!   independent of any field's own value — so `COUNT(<expr>)` legitimately
+//!   writes a real `0` while its group stays alive with other rows present
+//!   (unlike `COUNT(*)`, whose own zero and the group's extinction always
+//!   coincide).
 //! - Anything else — `MIN`/`MAX` (always [`Invertibility::RecomputeOnly`]
 //!   per the gate: a deleted row might have held the extreme value, and
 //!   there is no way to recover the next-best one from the aggregate's
@@ -265,6 +275,17 @@ pub(super) fn classify_fields(
         let kind = match &field_exprs[&field.name] {
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
                 match invertibility::classify("COUNT", AggregateArg::Count(CountArg::Star)) {
+                    Some(v) if v.is_invertible() => AggFieldKind::Count,
+                    _ => AggFieldKind::RecomputeOnly,
+                }
+            }
+            // Issue #120: `COUNT(<expr>)` — see `defs::backfill::classify_field`'s
+            // twin of this arm for why it must be checked ahead of the
+            // generic one-argument arm below (that arm would otherwise
+            // classify it against `AggregateArg::Column(value_type)`, a
+            // shape `invertibility::classify` doesn't recognize for `COUNT`).
+            Expr::FunctionCall { name, args } if name == "COUNT" && args.len() == 1 => {
+                match invertibility::classify("COUNT", AggregateArg::Count(CountArg::Column)) {
                     Some(v) if v.is_invertible() => AggFieldKind::Count,
                     _ => AggFieldKind::RecomputeOnly,
                 }
@@ -1281,6 +1302,34 @@ pub(super) fn accumulate_changes(
     Ok(())
 }
 
+/// Whether one field's per-row `row_contribution` text should actually be
+/// pushed into a [`FieldAccum`]'s `adds`/`subs` (issue #120's `COUNT(<expr>)`
+/// wrinkle).
+///
+/// `Sum`/`Avg` (and `COUNT(*)`) get their "skip this row" signal for free
+/// from `row_contribution`'s `None`: a `NULL` argument folds to `None`
+/// (Postgres's own "aggregate of zero non-null values is NULL" rule,
+/// `eval::reduce_numeric_aggregate`'s empty-`values` check), and `COUNT(*)`
+/// never skips at all. `COUNT(<expr>)` (issue #120) cannot reuse that same
+/// signal: `count(x)` is *never* `NULL` — a `GROUP BY` group's true
+/// `COUNT(<expr>)` value is `0`, not `NULL`, when every row's `expr` is
+/// `NULL` — so `eval::eval_aggregate_expr`'s `COUNT(<expr>)` arm, reused here
+/// via `row_contribution`'s single-row-slice trick, always returns
+/// `Some("0")` or `Some("1")` per row (never `None`), one bit encoding
+/// whether *this row's* argument was itself non-null. For `Count`
+/// specifically, then, a `"0"` contribution means "skip this row" — the
+/// direct counterpart of `Sum`/`Avg`'s `None` — while a real `Sum`/`Avg`
+/// contribution of literal `"0"` (e.g. `SUM(amount)` where `amount = 0`) must
+/// still be pushed: `0` is a perfectly ordinary non-null value to sum, and
+/// treating it as "skip" would wrongly discard it from
+/// [`group_has_activity`]'s "this field had real activity" signal (a
+/// genuine `SUM(amount) = 0` group would then look inactive on any row whose
+/// contribution rounded to exactly `0`). So the special-case is scoped to
+/// `AggFieldKind::Count` alone.
+fn is_pushable_contribution(kind: AggFieldKind, text: &str) -> bool {
+    kind != AggFieldKind::Count || text != "0"
+}
+
 /// Registers `contrib`'s row as having entered `group`: every `Sum`/`Avg`/
 /// `Count` field always gets a [`FieldAccum`] entry (even one that stays
 /// empty, when this row's own contribution is NULL) — the entry's mere
@@ -1309,7 +1358,9 @@ pub(super) fn add_contributions(
             continue;
         }
         let accum = group.field_accum.entry(field.name.clone()).or_default();
-        if let Some(v) = contrib.get(&field.name).cloned().flatten() {
+        if let Some(v) = contrib.get(&field.name).cloned().flatten()
+            && is_pushable_contribution(field.kind, &v)
+        {
             accum.adds.push(v);
         }
     }
@@ -1332,7 +1383,9 @@ pub(super) fn sub_contributions(
             continue;
         }
         let accum = group.field_accum.entry(field.name.clone()).or_default();
-        if let Some(v) = contrib.get(&field.name).cloned().flatten() {
+        if let Some(v) = contrib.get(&field.name).cloned().flatten()
+            && is_pushable_contribution(field.kind, &v)
+        {
             accum.subs.push(v);
         }
     }
@@ -1384,10 +1437,14 @@ pub(super) fn diff_contributions(
             continue;
         }
         let accum = group.field_accum.entry(field.name.clone()).or_default();
-        if let Some(v) = new_v {
+        if let Some(v) = new_v
+            && is_pushable_contribution(field.kind, &v)
+        {
             accum.adds.push(v);
         }
-        if let Some(v) = old_v {
+        if let Some(v) = old_v
+            && is_pushable_contribution(field.kind, &v)
+        {
             accum.subs.push(v);
         }
     }
@@ -1673,23 +1730,36 @@ async fn probe_sum_and_count(
     Ok((row.get(0), row.get(1)))
 }
 
-/// Probes a `COUNT(*)` field's raw row count for one group directly from the
-/// source — the full-recompute path's counterpart to the ordinary delta
-/// path's incremented visible column, used only when
-/// [`GroupPlan::force_full_recompute`] is set. Unlike
-/// [`probe_sum_and_count`], `COUNT(*)` has no argument expression to render;
-/// this always probes `count(*)`, matching [`crate::defs::oracle::render_expr_sql`]'s
-/// own `COUNT(*)` rendering. Joins `plan.rel_joins` like every other source
-/// probe, needed when a `GROUP BY` key (issue #137), not any field, is what
-/// reads the relationship.
-async fn probe_count_star(
+/// Probes an [`AggFieldKind::Count`] field's raw count for one group
+/// directly from the source — the full-recompute path's counterpart to the
+/// ordinary delta path's incremented visible column, used only when
+/// [`GroupPlan::force_full_recompute`] is set. `expr` is the field's own
+/// (substituted) `COUNT(*)`/`COUNT(<arg>)` call: `COUNT(*)` has no argument
+/// expression to render and always probes `count(*)`, matching
+/// [`crate::defs::oracle::render_expr_sql`]'s own `COUNT(*)` rendering;
+/// `COUNT(<arg>)` (issue #120) renders `count(<arg>)`, `arg` rendered via
+/// [`render_agg_expr`] exactly like [`probe_sum_and_count`]'s own argument —
+/// relationship-aware, so a `COUNT(post.word_count)`-shaped field reaching
+/// this (rather than being folded via the ordinary delta path) still
+/// resolves correctly. Joins `plan.rel_joins` like every other source probe,
+/// needed when a `GROUP BY` key (issue #137), not any field, is what reads
+/// the relationship.
+async fn probe_count(
     txn: &Transaction<'_>,
     plan: &AggregateTargetPlan,
+    expr: &Expr,
     values: &[Option<String>],
 ) -> Result<i64, ApplyError> {
+    let Expr::FunctionCall { args, .. } = expr else {
+        panic!("probe_count called on a non-COUNT field");
+    };
+    let count_sql = match args.first() {
+        Some(arg) => format!("count({})", render_agg_expr(plan, arg)),
+        None => "count(*)".to_string(),
+    };
     let where_sql = group_where_clause_source(plan, 1, "s");
     let sql = format!(
-        "select count(*) from {} s{} where {where_sql}",
+        "select {count_sql} from {} s{} where {where_sql}",
         ddl::qualified_source_table(&plan.source),
         rel_joins_sql(plan),
     );
@@ -1826,7 +1896,8 @@ async fn upsert_group(
                     continue;
                 }
                 if group.force_full_recompute {
-                    let count = probe_count_star(txn, plan, &group.group_values).await?;
+                    let expr = &plan.field_exprs[field.name.as_str()];
+                    let count = probe_count(txn, plan, expr, &group.group_values).await?;
                     count_star_probed.push(count);
                     columns.push(ColumnPlan::CountForced(
                         field.name.clone(),
@@ -2031,16 +2102,19 @@ async fn upsert_group(
                 next += 1;
                 let count_delta = format!("${count_param}::bigint");
 
-                let insert_count = format!("({count_delta})::numeric");
+                // Issue #120: no `::numeric` cast — `col` is declared
+                // `bigint`, matching Postgres's own `count()` return type.
                 let update_count = format!("coalesce({target_ident}.{col}, 0) + {count_delta}");
 
                 insert_cols.push(col.clone());
-                insert_exprs.push(insert_count);
+                insert_exprs.push(count_delta.clone());
                 update_sets.push(format!("{col} = {update_count}"));
             }
             ColumnPlan::CountForced(name, idx) => {
                 let col = quote_ident(name);
-                let count_expr = format!("${next}::bigint::numeric");
+                // Issue #120: no trailing `::numeric` — `col` is declared
+                // `bigint`.
+                let count_expr = format!("${next}::bigint");
                 params.push(&count_star_probed[*idx]);
                 next += 1;
                 insert_cols.push(col.clone());
@@ -2329,8 +2403,21 @@ async fn apply_forced_groups_bulk(
                     ));
                 }
                 AggFieldKind::Count => {
+                    // Issue #120: `COUNT(<expr>)` renders `count(<expr>)`;
+                    // `COUNT(*)` still renders bare `count(*)`. No cast
+                    // needed either way — Postgres's `count()` already
+                    // returns `bigint`, matching this field's declared
+                    // `Integer(Int8)` type.
                     insert_cols.push(col.clone());
-                    select_exprs.push("count(*)::numeric".to_string());
+                    let expr = &plan.field_exprs[field.name.as_str()];
+                    let Expr::FunctionCall { args, .. } = expr else {
+                        panic!("AggFieldKind::Count field's own expression must be a FunctionCall");
+                    };
+                    let count_sql = match args.first() {
+                        Some(arg) => format!("count({})", render_agg_expr(plan, arg)),
+                        None => "count(*)".to_string(),
+                    };
+                    select_exprs.push(count_sql);
                 }
                 AggFieldKind::RecomputeOnly => {
                     let expr = render_agg_expr(plan, &plan.field_exprs[field.name.as_str()]);
@@ -2867,9 +2954,14 @@ fn build_delta_carriers(
 
                 let active = format!("k.{active_name}");
                 let count_delta_ref = format!("k.{count_delta_name}");
+                // Issue #120: no `::numeric` cast needed — `count_delta_ref`
+                // is already bound `bigint` (the carrier array's own
+                // declared type above), matching this field's declared
+                // `Integer(Int8)` column exactly (Postgres's own `count()`
+                // is `bigint`, never `numeric`).
                 insert_cols.push(col.clone());
                 insert_exprs.push(format!(
-                    "case when {active} then ({count_delta_ref})::numeric else null end"
+                    "case when {active} then {count_delta_ref} else null end"
                 ));
                 update_sets.push(format!(
                     "{col} = case when {active} then coalesce({target_ident}.{col}, 0) + {count_delta_ref} else {target_ident}.{col} end"
@@ -3229,6 +3321,102 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
             .collect()
+    }
+
+    /// Issue #120: `COUNT(<expr>)`'s row-contribution text is `"0"`/`"1"`
+    /// (never absent — see [`is_pushable_contribution`]'s own doc comment),
+    /// so [`diff_contributions`] must recognize a `Count` field's `"0"`
+    /// contribution as "skip this row" the same way it recognizes `None` for
+    /// `Sum`/`Avg`. Isolates the exact bug this issue's own review found
+    /// (silently over-counting `COUNT(<column>)` because a `"0"`
+    /// contribution used to be pushed just like a real `SUM` `"0"` would be)
+    /// with no live database in the loop.
+    #[test]
+    fn diff_contributions_treats_a_count_fields_zero_contribution_as_a_skip() {
+        let field = AggFieldPlan {
+            name: "n".to_string(),
+            value_type: ValueType::Integer(crate::integer::IntWidth::Int8),
+            kind: AggFieldKind::Count,
+        };
+
+        // non-null -> null: must push into `subs` only.
+        let mut group = GroupPlan::new(vec![Some("1".to_string())]);
+        diff_contributions(
+            std::slice::from_ref(&field),
+            &mut group,
+            &HashMap::from([("n".to_string(), Some("1".to_string()))]),
+            &HashMap::from([("n".to_string(), Some("0".to_string()))]),
+        );
+        let accum = &group.field_accum["n"];
+        assert_eq!(accum.adds.len(), 0, "a '0' contribution must not be added");
+        assert_eq!(
+            accum.subs.len(),
+            1,
+            "the prior '1' contribution must be subtracted"
+        );
+
+        // null -> non-null: must push into `adds` only.
+        let mut group = GroupPlan::new(vec![Some("1".to_string())]);
+        diff_contributions(
+            std::slice::from_ref(&field),
+            &mut group,
+            &HashMap::from([("n".to_string(), Some("0".to_string()))]),
+            &HashMap::from([("n".to_string(), Some("1".to_string()))]),
+        );
+        let accum = &group.field_accum["n"];
+        assert_eq!(
+            accum.adds.len(),
+            1,
+            "the new '1' contribution must be added"
+        );
+        assert_eq!(
+            accum.subs.len(),
+            0,
+            "a '0' contribution must not be subtracted"
+        );
+
+        // null -> null (no change): no entry at all, matching
+        // `group_has_activity`'s "no real activity" signal.
+        let mut group = GroupPlan::new(vec![Some("1".to_string())]);
+        diff_contributions(
+            std::slice::from_ref(&field),
+            &mut group,
+            &HashMap::from([("n".to_string(), Some("0".to_string()))]),
+            &HashMap::from([("n".to_string(), Some("0".to_string()))]),
+        );
+        assert!(!group.field_accum.contains_key("n"));
+    }
+
+    /// [`add_contributions`]'s own twin of the above: a `Count` field's `"0"`
+    /// contribution (row entering the group with its counted argument
+    /// `NULL`) must not be pushed into `adds`, while `COUNT(*)`'s
+    /// always-`"1"` contribution (or a genuine non-null `COUNT(<column>)`
+    /// contribution) still is.
+    #[test]
+    fn add_contributions_skips_a_count_fields_zero_contribution() {
+        let field = AggFieldPlan {
+            name: "n".to_string(),
+            value_type: ValueType::Integer(crate::integer::IntWidth::Int8),
+            kind: AggFieldKind::Count,
+        };
+        let mut group = GroupPlan::new(vec![Some("1".to_string())]);
+        add_contributions(
+            std::slice::from_ref(&field),
+            &mut group,
+            &HashMap::from([("n".to_string(), Some("0".to_string()))]),
+        );
+        let accum = &group.field_accum["n"];
+        assert!(
+            accum.adds.is_empty(),
+            "a '0' contribution must not be added"
+        );
+
+        add_contributions(
+            std::slice::from_ref(&field),
+            &mut group,
+            &HashMap::from([("n".to_string(), Some("1".to_string()))]),
+        );
+        assert_eq!(group.field_accum["n"].adds.len(), 1);
     }
 
     /// Issue #171: a composite `GROUP BY`'s key must be the crate's single
