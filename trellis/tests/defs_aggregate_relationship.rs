@@ -1327,3 +1327,216 @@ async fn an_invalid_aggregate_definition_leaves_no_target_table() {
         "validation must run before any DDL is issued"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #120: `COUNT(<rel>.<column>)` — a to-one relationship path wrapped
+// in `COUNT` rather than `SUM`, inside a `GROUP BY` definition.
+//
+// Before #120 this shape couldn't even parse (`COUNT` only accepted `*` in
+// an aggregate definition). The parser/validator/`apply_aggregate` fixes
+// #120 landed are all generic over *which* function wraps a relationship
+// path — `build_forward_relationship_shape`'s `substitute_relationship_path`
+// call rewrites every field's expression the same way regardless of the
+// wrapping function name (issue #94/#136 machinery, unmodified by #120) —
+// but #120's own test files only exercise `COUNT(<plain column>)`, never
+// `COUNT(<rel>.<column>)`. This is the front-door regression test that
+// shape actually landed working, through all three propagation directions
+// this file's `SUM(post.word_count)` tests already cover for `SUM`.
+// ---------------------------------------------------------------------
+
+const TAG_WORD_COUNTS: &str = "TRANSFORM tag_word_counts FROM post_tags GROUP BY tag \
+     SELECT COUNT(*) AS post_count, COUNT(post.word_count) AS non_null_word_counts, \
+     SUM(post.word_count) AS total_words";
+
+/// [`oracle_def`]'s twin, with an added `COUNT(post.word_count)` field —
+/// counts related rows whose `word_count` is non-`NULL`, unlike `post_count`
+/// (`COUNT(*)`, every related row) and unlike `total_words` (`SUM`, which
+/// skips the same NULLs but adds rather than counts).
+fn count_rel_oracle_def() -> TransformDef {
+    let mut def = oracle_def();
+    def.target = "tag_word_counts".to_string();
+    def.fields.insert(
+        2,
+        FieldDef {
+            name: "non_null_word_counts".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COUNT".to_string(),
+                args: vec![Expr::RelationshipPath {
+                    rel: "post".to_string(),
+                    column: "word_count".to_string(),
+                }],
+            },
+        },
+    );
+    def
+}
+
+type CountRelTotals = HashMap<String, (Option<String>, Option<String>, Option<String>)>;
+
+async fn count_rel_oracle_totals(client: &Client) -> CountRelTotals {
+    let base = render_aggregate_relationship_select_sql(&count_rel_oracle_def(), &post_rel());
+    let sql = format!(
+        "select tag, post_count::text, non_null_word_counts::text, total_words::text from ({base}) t"
+    );
+    client
+        .query(sql.as_str(), &[])
+        .await
+        .expect("query aggregate relationship oracle")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
+        .collect()
+}
+
+async fn count_rel_target_totals(client: &Client) -> CountRelTotals {
+    client
+        .query(
+            "select tag, post_count::text, non_null_word_counts::text, total_words::text \
+             from tag_word_counts",
+            &[],
+        )
+        .await
+        .expect("read tag_word_counts")
+        .into_iter()
+        .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
+        .collect()
+}
+
+/// Backfill, a forward from-side insert, and a reverse to-side update — the
+/// same three propagation directions [`aggregate_over_a_to_one_relationship_backfills_to_the_oracle`]/
+/// [`inserting_a_from_side_row_updates_its_groups_total`]/
+/// [`updating_a_to_side_row_updates_every_dependent_group`] each prove for
+/// `SUM(post.word_count)`, proven here for `COUNT(post.word_count)` instead
+/// — including the reverse-delta path (`super::apply`'s `ReverseAggregateShape`,
+/// `diff_contributions`/`add_contributions`/`sub_contributions`), which
+/// #120's own review called out as the subtlest part of `COUNT`'s "0 means
+/// skip this row" rule and had no relationship-path coverage at all before
+/// this test.
+#[tokio::test]
+async fn count_of_a_relationship_path_folds_through_backfill_forward_and_reverse() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_WORD_COUNTS, &post_tags_columns(), "public")
+        .await
+        .expect("install COUNT(<rel>.<column>) in a GROUP BY definition");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    // Backfill: `rust` = rows 10 (post 1, wc 100), 11 (post 2, wc 250), 13
+    // (post 999, no such post -> NULL); `db` = rows 12 (post 1, wc 100), 14
+    // (post 3, wc NULL). `non_null_word_counts` excludes both NULL-producing
+    // rows (the unmatched FK and the genuinely NULL column), unlike
+    // `post_count` which counts every related row regardless.
+    let totals = count_rel_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        count_rel_oracle_totals(&client).await,
+        "after backfill"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(
+            Some("3".to_string()),
+            Some("2".to_string()),
+            Some("350".to_string())
+        ))
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(
+            Some("2".to_string()),
+            Some("1".to_string()),
+            Some("100".to_string())
+        ))
+    );
+
+    // Forward delta: a new post_tags row (post 2, wc 250) joins tag `db`.
+    client
+        .execute(
+            "insert into post_tags (id, post, tag) values (15, 2, 'db')",
+            &[],
+        )
+        .await
+        .expect("insert a new post_tag");
+    stage_cdc(
+        &client,
+        "post_tags",
+        "15",
+        "insert",
+        None,
+        Some("{\"id\":15,\"post\":2,\"tag\":\"db\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = count_rel_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        count_rel_oracle_totals(&client).await,
+        "after a forward delta touching a COUNT field's relationship read"
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(
+            Some("3".to_string()),
+            Some("2".to_string()),
+            Some("350".to_string())
+        )),
+        "'db' must now count post 1 (non-null) and post 2 (non-null) = 2, \
+         folded in via the forward delta"
+    );
+
+    // Reverse delta: the to-side post's word_count changes value (non-NULL
+    // -> non-NULL, never crossing the NULL boundary) — every dependent
+    // group's COUNT(post.word_count) must stay unchanged while SUM tracks
+    // the new value, proving the reverse path's per-field diff doesn't
+    // conflate "the resolved value changed" with "non-null-ness changed".
+    client
+        .execute("update posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    stage_cdc(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = count_rel_target_totals(&client).await;
+    assert_eq!(
+        totals,
+        count_rel_oracle_totals(&client).await,
+        "after a reverse delta touching a COUNT field's relationship read"
+    );
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(
+            Some("3".to_string()),
+            Some("2".to_string()),
+            Some("650".to_string())
+        )),
+        "rust's non_null_word_counts stays 2 (post 1's value changed but is \
+         still non-null); total_words tracks the new value (400 + 250)"
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(
+            Some("3".to_string()),
+            Some("2".to_string()),
+            Some("650".to_string())
+        )),
+        "db's non_null_word_counts stays 2 for the same reason; total_words \
+         is now 400 (post 1) + 250 (post 2)"
+    );
+}
