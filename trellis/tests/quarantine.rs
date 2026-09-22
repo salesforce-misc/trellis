@@ -420,11 +420,20 @@ async fn a_clean_drain_clears_death_counters() {
 
     // A death recorded by some earlier isolate attempt, reached past here
     // directly rather than re-deriving it through a whole failing batch.
+    //
+    // Seeded under the *qualified* spelling while the ring row below stays
+    // bare — issue #283: `key_deaths` is keyed on the canonical identity of a
+    // source table, so `clear_key_deaths` resolves the drained batch's raw
+    // `src_table` before clearing. That makes this the sharper version of this
+    // scenario: the counter is found and cleared across a spelling difference,
+    // where before the fix the two spellings were two unrelated counters and a
+    // bare-staged drain could only ever clear a bare-keyed row.
+    let orders = qualify_fixture_table("orders");
     client
         .execute(
             "insert into key_deaths (src_table, key, deaths, last_error) \
-             values ('orders', '1', 3, 'earlier isolate attempt')",
-            &[],
+             values ($1, '1', 3, 'earlier isolate attempt')",
+            &[&orders],
         )
         .await
         .expect("seed a pre-existing death count");
@@ -443,7 +452,7 @@ async fn a_clean_drain_clears_death_counters() {
     drain(&db.pool, seg_seq, "worker").await;
 
     assert_eq!(
-        key_deaths_count(&client, "orders", "1").await,
+        key_deaths_count(&client, &orders, "1").await,
         None,
         "a clean drain must clear the death counter for every key it applied"
     );
@@ -1553,9 +1562,9 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
 // before asking the catalog what to quarantine.
 // ---------------------------------------------------------------------
 
-/// A threshold's worth of `poison` rows recorded under the **bare** spelling
-/// of a source table (`orders`, not `public.orders`) must still trip the
-/// whole-transform fuse.
+/// A threshold's worth of `poison` rows must still trip the whole-transform
+/// fuse when the fuse check itself is handed the **bare** spelling of their
+/// source table (`orders`, not `public.orders`).
 ///
 /// `trip_transform_fuse_if_crossed` used to hand its raw `src_table` straight
 /// to `catalog::transforms_for_source`, whose contract (issue #74, ADR-0007)
@@ -1566,12 +1575,25 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
 /// absent for exactly the sources it was supposed to protect.
 ///
 /// Issue #267 stopped `staging::apply` *emitting* a bare `src_table` going
-/// forward, but bare rows still reach this function from durable pre-#267 ring
+/// forward, but bare names still reach this function from durable pre-#267 ring
 /// rows, and from this crate's own integration fixtures (this file included)
 /// that stage `src_table` by hand. Pre-fix this test's final assertion sees
 /// `live`; post-fix the bare name is resolved through
 /// `catalog::resolve_graph_identity` exactly as every `apply.rs` call site
 /// already resolves it, and the fuse trips.
+///
+/// The `poison` rows themselves are staged **qualified** here, and were bare
+/// when this test landed with #281: issue #283 made the qualified identity
+/// `poison`'s canonical key rather than merely a spelling it might hold, so
+/// staging them bare now models legacy on-disk state that
+/// `V33__quarantine_canonical_src_table.sql` folds, not anything the live code
+/// produces. What #281 is actually about — the *argument* reaching the fuse
+/// bare, and having to be resolved before the catalog can answer with any
+/// definitions at all — is unchanged and still exactly what this test drives.
+/// The fold itself is covered by
+/// `the_v33_fold_combines_dual_spelling_quarantine_rows`, and the
+/// two-spellings-one-budget property by
+/// `two_spellings_of_one_source_charge_one_combined_fuse_budget`.
 #[tokio::test]
 async fn a_bare_src_table_still_trips_the_whole_transform_fuse() {
     use trellis::staging::quarantine::{
@@ -1584,14 +1606,16 @@ async fn a_bare_src_table_still_trips_the_whole_transform_fuse() {
     seed_order_totals(&db, &client).await;
 
     // Deliberately bare: no `qualify_fixture_table`, i.e. exactly what a
-    // pre-#267 durable ring row (or a hand-staging fixture) leaves behind.
+    // pre-#267 durable ring row (or a hand-staging fixture) leaves behind, and
+    // what the fuse check below is handed.
     let bare = "orders";
     assert!(
         !bare.contains('.'),
         "the whole point of this test is an unqualified spelling"
     );
+    let orders = qualify_fixture_table(bare);
     for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
-        insert_poison_marker(&client, bare, &format!("bare-{i}")).await;
+        insert_poison_marker(&client, &orders, &format!("bare-{i}")).await;
     }
     assert_eq!(
         transform_status(&client, "order_totals").await,
@@ -1663,5 +1687,418 @@ async fn an_unresolvable_src_table_leaves_the_fuse_a_quiet_no_op() {
         "live",
         "an unresolvable `src_table` names no definition, so it must quarantine nothing — \
          least of all an unrelated live transform on a real source"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #283: quarantine's counter/marker tables key on one *canonical*
+// identity per logical source table, not on the raw ring spelling.
+// ---------------------------------------------------------------------
+
+/// One `FoldedChange` for `src_table`/`key` whose image cannot evaluate
+/// (`price` is not a number), i.e. a change guaranteed to reproduce an
+/// `Isolate`-class failure when `isolate_and_evict` probes it alone — the
+/// shape `zero_threshold_disables_eviction_even_past_the_default_threshold`
+/// already uses to drive that function directly.
+fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
+    FoldedChange {
+        src_table: src_table.to_string(),
+        key: key.to_string(),
+        new_image: Some(r#"{"price":"not-a-number","tax":"1.50"}"#.to_string()),
+        old_image: None,
+        src_changed: None,
+        origin_lsn: None,
+        lsn: None,
+        hop_gen: 0,
+        first_seen: SystemTime::now(),
+        group_key: None,
+        is_truncate: false,
+        relationship_reverse_deferred: None,
+        retry_count: 0,
+    }
+}
+
+async fn poison_rows_for(client: &Client, src_table: &str) -> i64 {
+    client
+        .query_one(
+            "select count(*) from poison where src_table = $1",
+            &[&src_table],
+        )
+        .await
+        .expect("count poison rows")
+        .get(0)
+}
+
+/// The headline property of issue #283: a threshold's worth of evictions spread
+/// across **two spellings of one logical source table** charges **one** combined
+/// whole-transform fuse budget, and trips it.
+///
+/// Every quarantine counter/marker table used to store and match whatever
+/// `src_table` spelling the ring row being diagnosed happened to carry. A source
+/// staged both bare (`orders` — pre-#267 durable ring rows, hand-staging
+/// fixtures) and qualified (`public.orders`) therefore ran two entirely
+/// independent sets of quarantine state: here, five real evictions for five
+/// distinct keys of one physical table split into a 3-row budget and a 2-row
+/// budget, neither reaching `DEFAULT_TRANSFORM_DEATH_THRESHOLD`, so the fuse
+/// never tripped even though the source had killed a full threshold's worth of
+/// rows. Pre-fix this test's final assertion sees `live`.
+///
+/// Driven through `isolate_and_evict` itself rather than hand-inserted `poison`
+/// rows, deliberately: the fix is that the *write* side resolves `src_table` to
+/// its canonical identity before touching any of these tables, so a test that
+/// staged the markers directly would be asserting its own spelling choice rather
+/// than the mechanism's. `threshold = 1` evicts on each key's first observed
+/// death, keeping the scenario to one eviction per call; the whole-transform
+/// fuse's own threshold is untouched and is what the assertions below turn on.
+#[tokio::test]
+async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
+    use trellis::staging::quarantine::DEFAULT_TRANSFORM_DEATH_THRESHOLD;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    let qualified = qualify_fixture_table("orders");
+    let bare = "orders";
+
+    // Alternating spellings, one eviction per key: with a threshold of 5 that
+    // is 3 bare and 2 qualified — pre-fix, two independent budgets of 3 and 2.
+    for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
+        let src_table = if i % 2 == 0 { bare } else { qualified.as_str() };
+        let folded = vec![unevaluable_change(src_table, &format!("{i}"))];
+        let retry = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
+            .await
+            .expect("isolate_and_evict must not error on an unevaluable change");
+        let retry = retry.unwrap_or_else(|| {
+            panic!("the key staged under {src_table:?} must have been evicted at threshold 1")
+        });
+        assert!(
+            retry.is_empty(),
+            "the evicted key was the batch's only change, so nothing is left to retry"
+        );
+    }
+
+    assert_eq!(
+        poison_rows_for(&client, bare).await,
+        0,
+        "no quarantine row may be written under the raw bare spelling any more — the canonical \
+         identity is the key (issue #283)"
+    );
+    assert_eq!(
+        poison_rows_for(&client, &qualified).await,
+        DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64,
+        "all five evictions must land in one budget under the canonical identity, however the \
+         ring row that produced each of them was spelled"
+    );
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "quarantined",
+        "a threshold's worth of evictions for one logical source must trip the whole-transform \
+         fuse even when they arrive under two different spellings of it (issue #283)"
+    );
+}
+
+/// The same canonical keying, one tier down: two spellings of one source must
+/// charge **one** row-level death counter for the same physical row, not two
+/// independent ones (which made the row-level fuse take up to twice as many real
+/// failures to fire).
+#[tokio::test]
+async fn two_spellings_of_one_row_charge_one_death_counter() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    let qualified = qualify_fixture_table("orders");
+
+    // Threshold 3, and three real failures for one key — arriving under the
+    // bare spelling twice and the qualified spelling once. Pre-fix that is a
+    // counter of 2 and a counter of 1, and nothing is ever evicted.
+    for src_table in ["orders", qualified.as_str(), "orders"] {
+        let folded = vec![unevaluable_change(src_table, "1")];
+        isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 3)
+            .await
+            .expect("isolate_and_evict must not error on an unevaluable change");
+    }
+
+    assert_eq!(
+        key_deaths_count(&client, "orders", "1").await,
+        None,
+        "nothing may be counted under the raw bare spelling (issue #283)"
+    );
+    assert_eq!(
+        key_deaths_count(&client, &qualified, "1").await,
+        Some(3),
+        "all three observed deaths for one physical row must land on one counter"
+    );
+    assert!(
+        poison_marker_exists(&client, &qualified, "1").await,
+        "the combined counter must reach the threshold and evict the key — pre-fix the two split \
+         counters reached 2 and 1 and it never did (issue #283)"
+    );
+}
+
+/// Issue #159's serialization row lock (`transform_fuse_gate`) must serialize
+/// two concurrent evictions for one logical source **across spellings** — it was
+/// keyed per spelling, so two workers evicting the same source under different
+/// names took two different lock rows and serialized against nothing, which is
+/// the exact race that table exists to close.
+///
+/// Same forced interleaving as
+/// `concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse`
+/// (see its doc comment for why each ordering holds by construction rather than
+/// by timing), with one difference: worker A checks the fuse under the bare
+/// spelling and worker B under the qualified one. Pre-fix neither blocks on the
+/// other and neither trips — A counts zero rows under its bare name, B counts
+/// `threshold - 1` under its own — so the final assertion sees `live`. Post-fix
+/// both resolve to one gate row, B cannot count until A commits, and B's count
+/// includes A's row and trips.
+#[tokio::test]
+async fn the_fuse_gate_serializes_two_spellings_of_one_source() {
+    use std::time::Duration;
+
+    use trellis::staging::quarantine::{
+        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
+    };
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let qualified = qualify_fixture_table("orders");
+    let bare = "orders";
+
+    for i in 0..(DEFAULT_TRANSFORM_DEATH_THRESHOLD - 2) {
+        insert_poison_marker(&client, &qualified, &format!("settled-{i}")).await;
+    }
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "the fixture must start live — a quarantined definition is skipped by the fuse check"
+    );
+
+    let mut client_a = db.pool.get().await.expect("pool connection for worker a");
+    let mut client_b = db.pool.get().await.expect("pool connection for worker b");
+
+    // Worker A: one more eviction, checked under the *bare* spelling.
+    let txn_a = client_a.transaction().await.expect("begin worker a");
+    poison_in_txn(&txn_a, &qualified, "concurrent-a").await;
+    trip_transform_fuse_if_crossed(&txn_a, &db.pool, bare)
+        .await
+        .expect("worker a's fuse check");
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "worker a alone only reaches `threshold - 1` visible keys, so it must not trip the fuse"
+    );
+
+    let mut worker_b_blocked = false;
+    let worker_b = async {
+        let txn_b = client_b.transaction().await.expect("begin worker b");
+        poison_in_txn(&txn_b, &qualified, "concurrent-b").await;
+        // The *qualified* spelling, against worker A's bare one.
+        trip_transform_fuse_if_crossed(&txn_b, &db.pool, &qualified)
+            .await
+            .expect("worker b's fuse check");
+        txn_b.commit().await.expect("commit worker b");
+    };
+    let release_worker_a = async {
+        for _ in 0..200 {
+            if backends_waiting_on_a_lock(&client).await > 0 {
+                worker_b_blocked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        txn_a.commit().await.expect("commit worker a");
+    };
+    tokio::join!(worker_b, release_worker_a);
+
+    assert!(
+        worker_b_blocked,
+        "worker b must have parked on the one shared gate row while worker a held it — two \
+         spellings of one source that take two different lock rows serialize against nothing \
+         (issues #159, #283)"
+    );
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "quarantined",
+        "the second worker through the gate must count both spellings' evictions and trip the fuse"
+    );
+}
+
+/// `V33__quarantine_canonical_src_table.sql` must fold pre-existing bare rows
+/// into their qualified counterpart: `key_deaths.deaths` **summed**, the marker
+/// tables deduplicated, and every bare row gone afterwards.
+///
+/// Runs the migration's own SQL text (not a paraphrase of it) a second time,
+/// against dual-spelling rows staged directly — the migration itself has of
+/// course already run against this database, and every statement in it is
+/// idempotent and re-runnable by construction, which is what makes replaying it
+/// a legitimate way to test the fold. The `create temporary table` it opens with
+/// is local to this connection and dropped again at the end of the script.
+#[tokio::test]
+async fn the_v33_fold_combines_dual_spelling_quarantine_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    let qualified = qualify_fixture_table("orders");
+    let bare = "orders";
+
+    // A key poisoned under both spellings; a key poisoned only bare.
+    insert_poison_marker(&client, &qualified, "both").await;
+    insert_poison_marker(&client, bare, "both").await;
+    insert_poison_marker(&client, bare, "bare-only").await;
+
+    // Death counters to sum: 4 + 3 for the shared key, 2 for the bare-only one.
+    client
+        .execute(
+            "insert into key_deaths (src_table, key, deaths, last_error, last_death_at) values \
+                 ($1, 'both', 4, 'from the qualified row', now() - interval '1 hour'), \
+                 ($2, 'both', 3, 'from the bare row', now()), \
+                 ($2, 'bare-only', 2, 'bare only', now())",
+            &[&qualified, &bare],
+        )
+        .await
+        .expect("seed dual-spelling key_deaths rows");
+
+    // Held work under the bare spelling only, for the already-qualified key:
+    // the fold has to carry it across or `release_key` would never find it.
+    insert_poison_held(
+        &client,
+        bare,
+        "both",
+        1,
+        "insert",
+        None,
+        Some(r#"{"price":"1.00","tax":"0.10"}"#),
+        Some(1),
+    )
+    .await;
+
+    // The gate's own bookkeeping, one row per spelling.
+    client
+        .execute(
+            "insert into transform_fuse_gate (src_table, checks) values ($1, 7), ($2, 5)",
+            &[&qualified, &bare],
+        )
+        .await
+        .expect("seed dual-spelling gate rows");
+
+    // One `column_failures` row under each spelling for the same physical row
+    // and the same `(transform, column)` — the split dedup that let one
+    // stubborn row charge `column_deaths` twice.
+    client
+        .execute(
+            "insert into column_failures (transform_table, column_name, src_table, key, error) \
+             values ('public.order_totals', 'total', $1, 'both', 'qualified'), \
+                    ('public.order_totals', 'total', $2, 'both', 'bare')",
+            &[&qualified, &bare],
+        )
+        .await
+        .expect("seed dual-spelling column_failures rows");
+
+    client
+        .batch_execute(include_str!(
+            "../migrations/V33__quarantine_canonical_src_table.sql"
+        ))
+        .await
+        .expect("replay the V33 fold");
+
+    for table in [
+        "poison",
+        "poison_held",
+        "key_deaths",
+        "column_failures",
+        "transform_fuse_gate",
+    ] {
+        let leftover: i64 = client
+            .query_one(
+                &format!("select count(*) from {table} where src_table = $1"),
+                &[&bare],
+            )
+            .await
+            .expect("count bare rows")
+            .get(0);
+        assert_eq!(
+            leftover, 0,
+            "{table} must hold no bare-spelled rows once the fold has run"
+        );
+    }
+
+    assert_eq!(
+        poison_rows_for(&client, &qualified).await,
+        2,
+        "the shared key must have deduplicated and the bare-only key must have been carried across"
+    );
+    assert!(
+        poison_marker_exists(&client, &qualified, "bare-only").await,
+        "a key poisoned only under the bare spelling must survive the fold, qualified"
+    );
+
+    assert_eq!(
+        key_deaths_count(&client, &qualified, "both").await,
+        Some(7),
+        "the two split death counters for one physical row must be summed, not clobbered"
+    );
+    assert_eq!(
+        key_deaths_count(&client, &qualified, "bare-only").await,
+        Some(2),
+        "a counter that only ever existed bare must be carried across unchanged"
+    );
+    let last_error: String = client
+        .query_one(
+            "select last_error from key_deaths where src_table = $1 and key = 'both'",
+            &[&qualified],
+        )
+        .await
+        .expect("read the folded last_error")
+        .get(0);
+    assert_eq!(
+        last_error, "from the bare row",
+        "the surviving diagnostic must be whichever spelling's row died more recently"
+    );
+
+    let held: i64 = client
+        .query_one(
+            "select count(*) from poison_held where src_table = $1 and key = 'both'",
+            &[&qualified],
+        )
+        .await
+        .expect("count folded held rows")
+        .get(0);
+    assert_eq!(held, 1, "the bare row's parked work must be carried across");
+
+    let (checks, gate_rows): (i64, i64) = {
+        let row = client
+            .query_one(
+                "select (select checks from transform_fuse_gate where src_table = $1), \
+                        (select count(*) from transform_fuse_gate)",
+                &[&qualified],
+            )
+            .await
+            .expect("read the folded gate row");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(
+        gate_rows, 1,
+        "one lock row per logical source, not per spelling"
+    );
+    assert_eq!(checks, 12, "the gate's check bookkeeping must combine");
+
+    let failures: i64 = client
+        .query_one(
+            "select count(*) from column_failures where key = 'both'",
+            &[],
+        )
+        .await
+        .expect("count folded column_failures rows")
+        .get(0);
+    assert_eq!(
+        failures, 1,
+        "the split dedup key must collapse to one row for one physical row (issue #283) — this is \
+         the one place the dual spelling over-counted rather than under-counted"
     );
 }

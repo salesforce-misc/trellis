@@ -4151,10 +4151,38 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // one batch's evaluation. Truncate sentinels are never candidates: a
     // truncate is whole-keyspace, not a key quarantine can attribute
     // anything to.
-    let candidates: Vec<(&str, &str)> = folded
+    //
+    // Issue #283: every quarantine table — `poison` included — is keyed on the
+    // *canonical* (qualified, where resolvable) identity of a source table, not
+    // the raw ring spelling, so each distinct `src_table` in this batch is
+    // resolved once here and that canonical value is what this exclusion query,
+    // `applied_keys` (`clear_key_deaths`) and `poisoned_park`
+    // (`park_batch_contribution`) all use below. Matching raw would miss a key
+    // already poisoned under the other spelling of its own table and
+    // re-evaluate (then re-poison) it. Nothing else in this function changes
+    // spelling: `by_source` and everything downstream of it still key on
+    // `catalog_source_key`, exactly as before.
+    let mut canonical_srcs = quarantine::CanonicalSrcTables::default();
+    for change in folded {
+        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
+            continue;
+        }
+        canonical_srcs.get(pool, &change.src_table).await?;
+    }
+    let canonical_of = |src_table: &str| -> String {
+        canonical_srcs
+            .canonical(src_table)
+            .unwrap_or(src_table)
+            .to_string()
+    };
+    let canonical_candidates: Vec<(String, String)> = folded
         .iter()
         .filter(|c| !c.is_truncate && c.relationship_reverse_deferred.is_none())
-        .map(|c| (c.src_table.as_str(), c.key.as_str()))
+        .map(|c| (canonical_of(&c.src_table), c.key.clone()))
+        .collect();
+    let candidates: Vec<(&str, &str)> = canonical_candidates
+        .iter()
+        .map(|(t, k)| (t.as_str(), k.as_str()))
         .collect();
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
     tracing::Span::current().record("poisoned", poisoned.len());
@@ -4189,11 +4217,20 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             relationship_reverse_deferrals.push(change);
             continue;
         }
-        if poisoned.contains(&(change.src_table.clone(), change.key.clone())) {
-            poisoned_park.push(change.clone());
+        // Canonical on all three lines below, per this function's `poisoned`
+        // comment above (issue #283): the exclusion match, the parked row's own
+        // `src_table` (`poison_held` is keyed canonically, and issue #267 made
+        // the qualified spelling the ring invariant a release would replay it
+        // under anyway), and `applied_keys`, whose only consumer is
+        // `clear_key_deaths` against the canonically-keyed `key_deaths`.
+        let canonical_src_table = canonical_of(&change.src_table);
+        if poisoned.contains(&(canonical_src_table.clone(), change.key.clone())) {
+            let mut parked = change.clone();
+            parked.src_table = canonical_src_table;
+            poisoned_park.push(parked);
             continue;
         }
-        applied_keys.push((change.src_table.clone(), change.key.clone()));
+        applied_keys.push((canonical_src_table, change.key.clone()));
         by_source
             .entry(catalog_source_key(&change.src_table))
             .or_default()

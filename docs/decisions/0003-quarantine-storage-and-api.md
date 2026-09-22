@@ -68,6 +68,20 @@ for a fold failure is the `(src_table, key)` that failed to fold.
   key)`, one row per `(transform, column)` pair that failed while propagating a
   source row.
 
+**`src_table` here is the canonical, fully-qualified identity of the source
+table, not whatever spelling the ring row being diagnosed happened to carry**
+(issue #283, ADR-0007's qualified identity). Every one of these tables —
+`poison`, `poison_held`, `key_deaths`, `column_failures`, and the transform
+fuse's own `transform_fuse_gate` lock row — is both written and read under it,
+with `staging::quarantine` resolving the ring spelling once per source table per
+batch. Before that, one logical source staged under two spellings (bare `orders`
+and qualified `public.orders` — a real and durable duality) ran two independent
+sets of quarantine state: two half-threshold fuse budgets that never tripped,
+two death counters for one physical row, a fold exclusion blind to a key already
+poisoned under the other spelling, and a per-spelling (therefore
+non-serializing) fuse gate. `V33__quarantine_canonical_src_table.sql` folded the
+pre-existing bare rows into their qualified counterpart.
+
 Column detail is separate from `poison` rather than a `failures` array on it,
 because landing in `poison` means "globally excluded from folding" — correct for
 the whole-key fuse but wrong for a column-only failure, where a paused column

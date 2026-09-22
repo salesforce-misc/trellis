@@ -206,6 +206,13 @@ pub(super) async fn source_table_missing(
 /// [`super::apply::compute`] runs before evaluating anything, so a poisoned
 /// key never reaches `f()` at all: the fold excludes it **globally**, not
 /// just from this one failing batch.
+///
+/// **`candidates` must already carry the canonical `src_table` identity**
+/// (issue #283) — `poison` is keyed on it, so a raw bare spelling matches
+/// nothing here and the key it names is re-evaluated (and re-poisoned) despite
+/// already being evicted. [`super::apply::compute`], the only caller, resolves
+/// each distinct source table through [`CanonicalSrcTables`] before building
+/// this list, and compares the returned set against the same canonical pairs.
 pub(super) async fn poisoned_keys_among(
     pool: &Pool,
     candidates: &[(&str, &str)],
@@ -287,6 +294,13 @@ fn folded_change_op(change: &FoldedChange) -> &'static str {
 /// from inside a successful apply's own transaction, per doc 06: "a clean
 /// drain clears the counters for the keys it just applied, so a transient
 /// death does not accumulate toward a false eviction."
+///
+/// **`keys` must already carry the canonical `src_table` identity** (issue
+/// #283), for the same reason [`poisoned_keys_among`]'s candidates must:
+/// [`record_key_death`] writes under it, so clearing by a raw bare spelling
+/// would delete nothing and leave a transient death accumulating toward a false
+/// eviction forever. `ApplyPlan::applied_keys` — this function's only source of
+/// `keys` — is built canonically in [`super::apply::compute`] for that reason.
 pub(super) async fn clear_key_deaths(
     txn: &Transaction<'_>,
     keys: &[(String, String)],
@@ -313,6 +327,11 @@ pub(super) async fn clear_key_deaths(
 /// Increments `key_deaths` for `(src_table, key)` and returns the new
 /// count — an upsert, since the counter's row may not exist yet for a key's
 /// first attributed failure.
+///
+/// `src_table` is the canonical identity, not the ring spelling (issue #283):
+/// two spellings of one logical source used to maintain two independent
+/// row-level counters for the same physical row, so the row-level fuse took up
+/// to twice as many real failures to fire.
 async fn record_key_death(
     client: &impl GenericClient,
     src_table: &str,
@@ -332,6 +351,23 @@ async fn record_key_death(
         )
         .await?;
     Ok(row.get(0))
+}
+
+/// One key [`isolate_and_evict`]'s probe loop reproduced an
+/// [`FailureClass::Isolate`] failure for, carrying **both** spellings of its
+/// source table (issue #283) because the two halves of that function need
+/// different ones: quarantine's own counter/marker tables are keyed on
+/// `canonical_src_table`, while matching the key back to the ring row it came
+/// from (its parked contribution, and the `retry_folded` exclusion) has to use
+/// `raw_src_table`, the spelling `folded` actually holds.
+#[derive(Clone)]
+struct PoisonedProbe {
+    /// The ring row's own `src_table`, verbatim.
+    raw_src_table: String,
+    /// [`qualified_src_table`] of the above — quarantine's canonical key.
+    canonical_src_table: String,
+    key: String,
+    last_error: String,
 }
 
 /// Marks `(src_table, key)` poisoned (idempotent — a re-eviction after
@@ -366,7 +402,16 @@ async fn evict_key(
     )
     .await?;
     if let Some(change) = contribution {
-        park_batch_contribution(txn, seg_seq, std::slice::from_ref(change)).await?;
+        // Issue #283: `poison_held` is keyed on the same canonical identity as
+        // the `poison` row just written, so the parked contribution is restaged
+        // under `src_table` rather than the ring row's own spelling. Without
+        // this, a bare-staged ring row's held work would be invisible to
+        // `release_key`'s canonical delete — orphaned parked work that
+        // `converge` gates on forever. Replaying it later under the qualified
+        // name is also what issue #267 made the ring invariant anyway.
+        let mut parked = change.clone();
+        parked.src_table = src_table.to_string();
+        park_batch_contribution(txn, seg_seq, std::slice::from_ref(&parked)).await?;
     }
     Ok(())
 }
@@ -415,7 +460,16 @@ pub async fn isolate_and_evict(
         return Ok(None);
     }
 
-    let mut poisoned: Vec<(String, String, String)> = Vec::new();
+    // Issue #283: every counter/marker write below lands under the *canonical*
+    // (qualified, where resolvable) identity of the ring row's `src_table`,
+    // never the raw spelling — resolved once per distinct source table here and
+    // threaded through `attribute_column_failure`/`record_key_death`/
+    // `evict_key`/`trip_transform_fuse_if_crossed` alike. The raw spelling is
+    // still what this function *matches ring rows on* (`contribution` below,
+    // and the `retry_folded` filter at the end): those compare against
+    // `folded`'s own strings, which are the ring's, not quarantine's.
+    let mut canonical_srcs = CanonicalSrcTables::default();
+    let mut poisoned: Vec<PoisonedProbe> = Vec::new();
     for change in folded {
         // Issue #134/#135 review follow-up: a `rel_reverse_deferred` row
         // must never be probed/poisoned/parked here, for the same reason
@@ -476,12 +530,14 @@ pub async fn isolate_and_evict(
                     // intentionally attributes nothing rather than guess,
                     // and the row-level fuse below is exactly what still
                     // protects against the failure going otherwise unhandled.
-                    attribute_column_failure(pool, &change.src_table, &change.key, &err).await?;
-                    poisoned.push((
-                        change.src_table.clone(),
-                        change.key.clone(),
-                        err.to_string(),
-                    ));
+                    let canonical = canonical_srcs.get(pool, &change.src_table).await?;
+                    attribute_column_failure(pool, &canonical, &change.key, &err).await?;
+                    poisoned.push(PoisonedProbe {
+                        raw_src_table: change.src_table.clone(),
+                        canonical_src_table: canonical,
+                        key: change.key.clone(),
+                        last_error: err.to_string(),
+                    });
                 }
                 continue;
             }
@@ -521,12 +577,14 @@ pub async fn isolate_and_evict(
                 return Err(err);
             }
             if class == FailureClass::Isolate {
-                attribute_column_failure(pool, &change.src_table, &change.key, &err).await?;
-                poisoned.push((
-                    change.src_table.clone(),
-                    change.key.clone(),
-                    err.to_string(),
-                ));
+                let canonical = canonical_srcs.get(pool, &change.src_table).await?;
+                attribute_column_failure(pool, &canonical, &change.key, &err).await?;
+                poisoned.push(PoisonedProbe {
+                    raw_src_table: change.src_table.clone(),
+                    canonical_src_table: canonical,
+                    key: change.key.clone(),
+                    last_error: err.to_string(),
+                });
             }
         }
     }
@@ -535,13 +593,19 @@ pub async fn isolate_and_evict(
         return Ok(None);
     }
 
-    let mut evict_now: Vec<(String, String, String)> = Vec::new();
+    let mut evict_now: Vec<PoisonedProbe> = Vec::new();
     {
         let client = pool.get().await?;
-        for (src_table, key, last_error) in &poisoned {
-            let deaths = record_key_death(&**client, src_table, key, last_error).await?;
+        for probe in &poisoned {
+            let deaths = record_key_death(
+                &**client,
+                &probe.canonical_src_table,
+                &probe.key,
+                &probe.last_error,
+            )
+            .await?;
             if deaths >= threshold {
-                evict_now.push((src_table.clone(), key.clone(), last_error.clone()));
+                evict_now.push(probe.clone());
             }
         }
     }
@@ -552,11 +616,19 @@ pub async fn isolate_and_evict(
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    for (src_table, key, last_error) in &evict_now {
+    for probe in &evict_now {
         let contribution = folded
             .iter()
-            .find(|c| !c.is_truncate && &c.src_table == src_table && &c.key == key);
-        evict_key(&txn, seg_seq, src_table, key, last_error, contribution).await?;
+            .find(|c| !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key);
+        evict_key(
+            &txn,
+            seg_seq,
+            &probe.canonical_src_table,
+            &probe.key,
+            &probe.last_error,
+            contribution,
+        )
+        .await?;
     }
     // Sorted (and deduped) — the dedup is what this is for, but the sort now
     // also fixes the order in which this transaction takes the per-source
@@ -566,7 +638,16 @@ pub async fn isolate_and_evict(
     // above has already taken every one of them before the first gate is
     // touched, so a transaction waiting on a gate is never itself holding one
     // while a gate-holder waits on it.
-    let mut evicted_src_tables: Vec<&str> = evict_now.iter().map(|(t, _, _)| t.as_str()).collect();
+    //
+    // Deduped on the *canonical* identity (issue #283), which is also what
+    // makes the gate and both counts below single-keyed for a source staged
+    // under two spellings: two raw spellings of one logical table are one
+    // entry here, taking one gate and counting one combined budget, instead of
+    // two independent half-budgets neither of which ever reached the threshold.
+    let mut evicted_src_tables: Vec<&str> = evict_now
+        .iter()
+        .map(|p| p.canonical_src_table.as_str())
+        .collect();
     evicted_src_tables.sort_unstable();
     evicted_src_tables.dedup();
     for src_table in evicted_src_tables {
@@ -574,9 +655,11 @@ pub async fn isolate_and_evict(
     }
     txn.commit().await?;
 
+    // Raw, not canonical: this set is matched against `folded`'s own ring
+    // spellings just below.
     let evicted: HashSet<(&str, &str)> = evict_now
         .iter()
-        .map(|(t, k, _)| (t.as_str(), k.as_str()))
+        .map(|p| (p.raw_src_table.as_str(), p.key.as_str()))
         .collect();
     let retry_folded: Vec<FoldedChange> = folded
         .iter()
@@ -623,7 +706,25 @@ pub async fn isolate_and_evict(
 /// reached `transforms_for_source` and found nothing; both still do, which is
 /// exactly the pre-existing behavior for the cases where nothing *can* be
 /// found.
-async fn qualified_src_table(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
+///
+/// **Issue #283: this is also the canonical key every quarantine counter and
+/// marker table is now written and read under** — `poison`, `poison_held`,
+/// `key_deaths`, `column_failures` and `transform_fuse_gate`. Before that, all
+/// five stored whatever spelling the ring row happened to carry, so one logical
+/// source staged both bare and qualified accumulated two independent sets of
+/// quarantine state that never combined: two half-threshold fuse budgets that
+/// never tripped, two row-level death counters for one physical row, a fold
+/// exclusion that missed a key poisoned under the other spelling, and a
+/// per-spelling (so non-serializing) `take_fuse_gate` lock row. Every write and
+/// every read now goes through this one resolution, and
+/// `V33__quarantine_canonical_src_table.sql` folded the pre-existing bare rows
+/// into their qualified counterpart. The unresolvable spellings above are the
+/// deliberate exception: they keep their raw key, which is self-consistent
+/// (nothing else can resolve them either) and exactly the pre-#283 behaviour.
+pub(super) async fn qualified_src_table(
+    pool: &Pool,
+    src_table: &str,
+) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
     }
@@ -631,6 +732,44 @@ async fn qualified_src_table(pool: &Pool, src_table: &str) -> Result<String, App
         Ok(qualified) => Ok(qualified),
         Err(catalog::CatalogError::SourceTableNotFound(_)) => Ok(src_table.to_string()),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// A memo over [`qualified_src_table`] for the two callers that resolve a whole
+/// folded batch's worth of `src_table`s at once ([`isolate_and_evict`] and
+/// [`super::apply::compute`], issue #283): a batch routinely carries many
+/// changes per source table, and the resolution is a pure function of the
+/// catalog for the duration of one batch.
+///
+/// Cheap by construction in the common case: an already-qualified spelling —
+/// which, since issue #267, is every `src_table` `apply.rs` emits — short
+/// circuits inside [`qualified_src_table`] without touching the database at
+/// all, so this only ever spends a round trip on the durable bare rows and
+/// hand-staged fixtures that issue #281's doc comment enumerates, once each.
+#[derive(Default)]
+pub(super) struct CanonicalSrcTables {
+    cache: HashMap<String, String>,
+}
+
+impl CanonicalSrcTables {
+    /// The canonical (qualified, where resolvable) identity for `src_table`,
+    /// resolving and memoizing it on first sight.
+    pub(super) async fn get(&mut self, pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
+        if let Some(canonical) = self.cache.get(src_table) {
+            return Ok(canonical.clone());
+        }
+        let canonical = qualified_src_table(pool, src_table).await?;
+        self.cache.insert(src_table.to_string(), canonical.clone());
+        Ok(canonical)
+    }
+
+    /// The already-resolved canonical identity for `src_table`, or `None` if
+    /// [`Self::get`] was never called for it — the borrow-free lookup
+    /// [`super::apply::compute`] uses once it has pre-resolved every source
+    /// table in a batch, so its per-change hot loop takes no `&mut self` and no
+    /// `.await`.
+    pub(super) fn canonical(&self, src_table: &str) -> Option<&str> {
+        self.cache.get(src_table).map(String::as_str)
     }
 }
 
@@ -786,9 +925,26 @@ pub async fn trip_transform_fuse_if_crossed(
     pool: &Pool,
     src_table: &str,
 ) -> Result<(), ApplyError> {
+    // Issue #283: resolve the canonical identity *first*, before the gate and
+    // both counts — all three key on it, and so does every write
+    // `isolate_and_evict` made on the way here. Deliberately ahead of the
+    // pre-threshold fast path below, which used to be the reason this
+    // resolution sat further down (it takes a pool connection while `txn` is
+    // open — see `pool.rs`'s note on that hazard): the fast path's own count is
+    // one of the queries that has to be canonically keyed, so it can't run
+    // first. The cost is bounded to the case that needs it — an
+    // already-qualified `src_table`, which since issue #267 is every spelling
+    // `apply.rs` emits, short-circuits inside `qualified_src_table` with no
+    // database access at all, and the gate this eviction is about to take is
+    // not yet held when the connection is acquired.
+    let src_table = &qualified_src_table(pool, src_table).await?;
+
     // Issue #159's serialization point, before either count below. Must come
     // first: a count taken ahead of the gate could be stale by the time the
-    // gate is granted, which is the whole bug.
+    // gate is granted, which is the whole bug. Keyed canonically (issue #283),
+    // so two workers evicting one logical source under two different spellings
+    // queue on one gate row instead of taking two independent locks and
+    // serializing against nothing.
     take_fuse_gate(txn, src_table).await?;
 
     // Unwindowed guard, kept from the pre-#160 shape: every definition's
@@ -810,8 +966,9 @@ pub async fn trip_transform_fuse_if_crossed(
         return Ok(());
     }
 
-    let qualified = qualified_src_table(pool, src_table).await?;
-    let definitions = catalog::transforms_for_source(pool, &qualified).await?;
+    // Already canonical (resolved at the top of this function, issue #283) —
+    // which is exactly the form `transforms_for_source` requires (issue #281).
+    let definitions = catalog::transforms_for_source(pool, src_table).await?;
     // Defense in depth for the issue-#281 class: "threshold crossed, nothing
     // to quarantine" is never a normal outcome — `poison` rows only exist for
     // a source some definition was evaluating — so say so out loud rather than
@@ -822,7 +979,6 @@ pub async fn trip_transform_fuse_if_crossed(
     if definitions.is_empty() {
         tracing::warn!(
             src_table = %src_table,
-            qualified = %qualified,
             poisoned_total,
             "whole-transform fuse threshold crossed but no definitions resolved for this \
              source; nothing quarantined"
@@ -954,7 +1110,12 @@ async fn attribute_column_failure(
     }
     let transform = def.def.target;
 
-    charge_column_failure(pool, &transform, field, src_table, key, &err.to_string()).await
+    // Issue #283: `column_failures` is keyed on the canonical identity, not the
+    // raw ring spelling — its primary key `(transform_table, column_name,
+    // src_table, key)` is what makes `column_deaths` count *distinct* failing
+    // rows, and a split key let one stubborn row charge that counter twice
+    // (the one place the dual spelling over-counted rather than under-counted).
+    charge_column_failure(pool, &transform, field, &qualified, key, &err.to_string()).await
 }
 
 /// Every column [`super::apply::compute`] must currently exclude from
@@ -1696,17 +1857,27 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
 /// Returns how many held rows were replayed.
 #[cfg(any(test, feature = "internals"))]
 pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usize, ApplyError> {
+    // Issue #283: quarantine's tables are keyed canonically, but this is an
+    // operator entry point that may be handed either spelling of a source, and
+    // rows written before the V33 fold (or under a spelling V33 could not
+    // resolve) can still be keyed raw. Matching the set of both is what keeps a
+    // release total either way — a partial release would leave orphaned parked
+    // work `converge` gates on forever, which is strictly worse than the extra
+    // array element. Each replayed row is restaged under *its own* stored
+    // `src_table` rather than one chosen spelling, so a legacy bare held row
+    // goes back onto the ring exactly as it left it.
+    let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
     let held = txn
         .query(
             "select seg_seq, op, lsn, old_image::text, new_image::text, origin_lsn, \
-                    src_changed, hop_gen, group_key \
+                    src_changed, hop_gen, group_key, src_table \
              from poison_held \
-             where src_table = $1 and key = $2 \
+             where src_table = any($1::text[]) and key = $2 \
              order by seg_seq asc, held_seq asc",
-            &[&src_table, &key],
+            &[&names, &key],
         )
         .await?;
 
@@ -1721,6 +1892,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
             let src_changed: Option<SystemTime> = row.get(6);
             let hop_gen: i32 = row.get(7);
             let group_key: Option<Vec<String>> = row.get(8);
+            let src_table: String = row.get(9);
             if op == "recompute" {
                 StagedChange::Recompute {
                     src_table: src_table.to_string(),
@@ -1754,18 +1926,18 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
     append::append(&txn, &changes).await?;
 
     txn.execute(
-        "delete from poison_held where src_table = $1 and key = $2",
-        &[&src_table, &key],
+        "delete from poison_held where src_table = any($1::text[]) and key = $2",
+        &[&names, &key],
     )
     .await?;
     txn.execute(
-        "delete from poison where src_table = $1 and key = $2",
-        &[&src_table, &key],
+        "delete from poison where src_table = any($1::text[]) and key = $2",
+        &[&names, &key],
     )
     .await?;
     txn.execute(
-        "delete from key_deaths where src_table = $1 and key = $2",
-        &[&src_table, &key],
+        "delete from key_deaths where src_table = any($1::text[]) and key = $2",
+        &[&names, &key],
     )
     .await?;
 
@@ -1789,7 +1961,21 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
 /// or stale signal, so there is no separate "reload and check again" step
 /// here: the error that triggers this call already reflects current
 /// database state.
+///
+/// The quarantine deletes match both the canonical identity and the raw ring
+/// spelling (issue #283), for the same reason [`release_key`]'s do: a leftover
+/// `poison_held` row for a table that no longer exists can never be released or
+/// drained, so a partial purge re-wedges exactly what this call exists to
+/// unwedge. The *ring* deletes stay on the raw spelling alone — `src_table`
+/// there is the string the wedged rows literally hold, which is what
+/// `SourceTableDropped` reported (issue #267's final fix) and the only spelling
+/// that can be in the ring for this call to have happened at all. Note that a
+/// dropped table is precisely the case [`qualified_src_table`] cannot resolve,
+/// so for a bare wedged row the canonical name usually *is* the raw one here;
+/// the array covers the reverse case, where the ring row is qualified and older
+/// quarantine rows for it are not.
 pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), ApplyError> {
+    let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     for slot in 0..RING_SIZE {
@@ -1800,17 +1986,37 @@ pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), App
         )
         .await?;
     }
-    txn.execute("delete from poison where src_table = $1", &[&src_table])
-        .await?;
     txn.execute(
-        "delete from poison_held where src_table = $1",
-        &[&src_table],
+        "delete from poison where src_table = any($1::text[])",
+        &[&names],
     )
     .await?;
-    txn.execute("delete from key_deaths where src_table = $1", &[&src_table])
-        .await?;
+    txn.execute(
+        "delete from poison_held where src_table = any($1::text[])",
+        &[&names],
+    )
+    .await?;
+    txn.execute(
+        "delete from key_deaths where src_table = any($1::text[])",
+        &[&names],
+    )
+    .await?;
     txn.commit().await?;
     Ok(())
+}
+
+/// `src_table` plus its canonical identity, deduped — the match set the two
+/// whole-key/whole-source *deletes* above use instead of a single spelling
+/// (issue #283). Only for delete paths that must be total: counting and
+/// charging still key strictly on the canonical identity, which is the entire
+/// point of that issue (two spellings, one budget), and would be re-split by
+/// matching a set here.
+async fn canonical_and_raw(pool: &Pool, src_table: &str) -> Result<Vec<String>, ApplyError> {
+    let canonical = qualified_src_table(pool, src_table).await?;
+    if canonical == src_table {
+        return Ok(vec![canonical]);
+    }
+    Ok(vec![canonical, src_table.to_string()])
 }
 
 // ---------------------------------------------------------------------

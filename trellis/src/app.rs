@@ -624,6 +624,23 @@ impl Trellis {
                 // fixtures stage bare names by hand. Matching against both
                 // forms keeps this query correct either way rather than
                 // picking one and silently going empty for the other.
+                //
+                // Issue #283 has since made the qualified spelling `poison`'s
+                // canonical *key*, not just what new rows happen to carry:
+                // `staging::quarantine` resolves `src_table` once and both
+                // writes and reads it canonically, and
+                // `V33__quarantine_canonical_src_table.sql` folded the
+                // pre-existing bare rows into their qualified counterpart. The
+                // bare arm below is therefore no longer load-bearing for
+                // ordinary installations and is kept only for the spellings
+                // that fold deliberately declines (a bare suffix ambiguous
+                // across two schemas, or a source nothing in the catalog can
+                // resolve) plus fixtures that hand-stage bare rows after the
+                // migration ran. Unlike the counting/charging sites that issue
+                // fixed, this is a read-only operator sample with no budget
+                // behind it, so matching a set of spellings here cannot re-split
+                // anything — see `quarantine::canonical_and_raw`'s doc comment
+                // for that same distinction on the delete paths.
                 let qualified: String = source_row.get(0);
                 let bare = qualified
                     .split_once('.')

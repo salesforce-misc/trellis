@@ -277,12 +277,15 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // not reissued to anything else either. Issue #142 (ADR-0014) added V32
     // (`paused` joins `transform_definitions.status`'s check constraint —
     // the operator-driven half of the pause state whose other half is the
-    // poison fuse's `quarantined`).
+    // poison fuse's `quarantined`). Issue #283 added V33 (folds pre-existing
+    // bare-spelled quarantine rows into their qualified counterpart, now that
+    // every counter/marker table keys on one canonical identity per logical
+    // source table).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32
+            27, 28, 29, 30, 31, 32, 33
         ]
     );
 }

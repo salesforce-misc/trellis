@@ -552,9 +552,15 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         "expected a WARN event for evicting the poisoned key: {events:#?}"
     );
     let evicted = evicted.unwrap();
+    // The *canonical* identity, not the bare `src_table` the folded change above
+    // carries (issue #283): every quarantine table is keyed on it, so the
+    // eviction warning names the row it actually wrote. An operator reading this
+    // line and then grepping `poison` for the name in it only gets a hit if
+    // those two agree, which is exactly what that issue restored.
+    let canonical = format!("{DEFAULT_SCHEMA}.orders");
     assert_eq!(
         evicted.fields.get("src_table").map(String::as_str),
-        Some("orders")
+        Some(canonical.as_str())
     );
     assert_eq!(evicted.fields.get("key").map(String::as_str), Some("1"));
 }
