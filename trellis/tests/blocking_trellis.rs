@@ -76,9 +76,10 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     trellis.shutdown().expect("shutdown (sync)");
 }
 
-/// (b): `BlockingTrellis::define` must return before a plain (non-relationship)
-/// 1-1 transform's backfill actually runs — per `docs/decisions/0008-public-api-design.md`'s
-/// decision 1 and the `app` module's doc comment, `define()` only enumerates
+/// (b): `BlockingTrellis::apply`ing a `TRANSFORM` statement must return before
+/// a plain (non-relationship) 1-1 transform's backfill actually runs — per
+/// `docs/decisions/0008-public-api-design.md`'s
+/// decision 1 and the `app` module's doc comment, registering a definition only enumerates
 /// and persists the backfill's chunk work; some running drain
 /// (`application_threads`) worker elsewhere in the fleet is what actually
 /// executes it (`trellis/tests/defs_backfill_chunk_queue.rs` exercises the
@@ -88,8 +89,8 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 /// drain threads — and no other client of any kind runs against this
 /// isolated test database. That makes the check below deterministic rather
 /// than a timing-dependent race: with nothing anywhere ever claiming the
-/// enqueued chunk, `status()` immediately after `define()` returns can only
-/// read back `Backfilling`. Were `define()` still fully synchronous (as it
+/// enqueued chunk, `status()` immediately after `apply()` returns can only
+/// read back `Backfilling`. Were registration still fully synchronous (as it
 /// was before this branch's backgrounding work), the target would already
 /// be fully built in-call and `status()` would read back `Live` instead,
 /// with no worker involved at all — so this test does discriminate the
@@ -136,7 +137,7 @@ fn define_returns_before_backfill_completes() {
     assert_eq!(
         status,
         TransformStatus::Backfilling,
-        "define() must return before any drain worker (of which there are none here) could \
+        "apply() must return before any drain worker (of which there are none here) could \
          possibly have built the target"
     );
 

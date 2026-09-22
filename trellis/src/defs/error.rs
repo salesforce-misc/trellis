@@ -62,9 +62,11 @@ pub enum ParseError {
     /// accept (issue #109) — rejected by name so the message can point at
     /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
     UnsupportedCastOperator,
-    /// A `PAUSE`/`RESUME`/`DROP RELATIONSHIP` naming a relationship without
-    /// the from-table that scopes it (issue #227/#228, decision 1) — e.g.
+    /// A `DROP RELATIONSHIP` naming a relationship without the from-table that
+    /// scopes it (issue #227/#228, decision 1) — e.g.
     /// `DROP RELATIONSHIP author` instead of `DROP RELATIONSHIP posts.author`.
+    /// `DROP` is the only verb that can reach this: `PAUSE`/`RESUME` are
+    /// transform-only, so they never parse a relationship address at all.
     /// A relationship name is unique only per from-table, so a bare one
     /// doesn't identify anything to act on.
     UnscopedRelationshipAddress { address: String },

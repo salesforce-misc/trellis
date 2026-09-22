@@ -398,12 +398,12 @@ impl Parser {
     /// `TRANSFORM` is the **only** kind keyword these two verbs accept: a
     /// relationship is a reusable component of a transform, not something that
     /// does work of its own, so there is nothing a pause could suspend (the
-    /// same reason ADR-0014 gives for having no `pause_relationship`). So
-    /// `PAUSE RELATIONSHIP ...` is not a form this grammar has and declines —
-    /// it is simply not a form this grammar has, and it is rejected by the
-    /// ordinary [`Self::expect_keyword`] path, exactly like any other keyword
-    /// that doesn't belong where it was written. `DROP` is the one verb that
-    /// takes either kind ([`Self::parse_drop_ref`]).
+    /// same reason ADR-0014 gives for having no `pause_relationship`).
+    /// `PAUSE RELATIONSHIP ...` is simply not a form this grammar has: it is
+    /// rejected by the ordinary [`Self::expect_keyword`] path below, exactly
+    /// like any other keyword that doesn't belong where it was written, with no
+    /// special case for the phrase anywhere. `DROP` is the one verb that takes
+    /// either kind ([`Self::parse_drop_ref`]).
     fn parse_transform_ref(&mut self, verb: Verb) -> Result<TransformRef, ParseError> {
         self.expect_keyword("TRANSFORM")?;
         let (target, column) = self.parse_transform_address(verb)?;
@@ -438,7 +438,7 @@ impl Parser {
 
         if self.peek_is_keyword("RELATIONSHIP") {
             self.advance();
-            let (schema, from_table, name) = self.parse_relationship_address(Verb::Drop)?;
+            let (schema, from_table, name) = self.parse_relationship_address()?;
             return Ok(DefinitionRef::Relationship {
                 schema,
                 from_table,
@@ -502,8 +502,11 @@ impl Parser {
         })
     }
 
-    /// Parses a `PAUSE`/`RESUME`/`DROP RELATIONSHIP` address:
+    /// Parses a `DROP RELATIONSHIP` address:
     /// `[<schema>.]<from_table>.<relationship_name>` (issue #228 decision 1).
+    /// `DROP` is the only verb that reaches here — `PAUSE`/`RESUME` are
+    /// transform-only — which is why this takes no [`Verb`] the way
+    /// [`Self::parse_transform_address`] does.
     ///
     /// The last dotted component is always the relationship name; the
     /// remaining one or two are the from-table's own `[<schema>.]<table>`
@@ -517,7 +520,6 @@ impl Parser {
     /// schema-qualified form this address is *supposed* to accept.
     fn parse_relationship_address(
         &mut self,
-        verb: Verb,
     ) -> Result<(Option<String>, String, String), ParseError> {
         let mut parts = vec![self.expect_ident()?];
         while self.peek_is_symbol('.') {
@@ -540,7 +542,7 @@ impl Parser {
                 Ok((Some(schema), from_table, name))
             }
             _ => Err(ParseError::MalformedDefinitionAddress {
-                statement: format!("{} RELATIONSHIP", verb.keyword()),
+                statement: "DROP RELATIONSHIP".to_string(),
                 address: parts.join("."),
                 detail: "a relationship is addressed as \
                          [<schema>.]<from_table>.<relationship_name> — at most three \
