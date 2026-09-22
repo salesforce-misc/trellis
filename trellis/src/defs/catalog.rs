@@ -4237,18 +4237,26 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
 /// **Not resolved by issue #73.** An earlier draft of this comment predicted
 /// #73 (persisting `transform_definitions.target_table` qualified) would let
 /// `apply.rs` pass a qualified key straight through here once it landed. It
-/// doesn't: a chained definition's downstream `Recompute` trigger — what
+/// didn't: a chained definition's downstream `Recompute` trigger — what
 /// actually stages a "target-table-as-source" change into this apply path —
-/// gets its `src_table` from [`super::ddl::neighbor_table_name`], which
-/// issue #73 deliberately leaves bare (see that function's own doc comment:
-/// it's read live, over a connection whose `search_path` already resolves
-/// it, not compared as a persisted identity string). Catalog persistence and
+/// got its `src_table` from [`super::ddl::neighbor_table_name`], which issue
+/// #73 deliberately leaves bare (see that function's own doc comment: it's
+/// read live, over a connection whose `search_path` already resolves it, not
+/// compared as a persisted identity string). Catalog persistence and
 /// emitted-statement qualification are two different jobs — ADR-0007 splits
-/// them into separate decision points (1) and (3) — and only the first is
-/// this issue's. Making every emitted `src_table`/trigger row qualified, so
-/// this and `staging::apply::catalog_source_key` could drop their
-/// `split_part`/bare-suffix matching entirely, is issue #75's emission
-/// audit, not #72's or #73's.
+/// them into separate decision points (1) and (3) — and only the first was
+/// #72's or #73's.
+///
+/// **Issue #267 closed the emission side, but this match stays a
+/// `split_part`.** That issue canonicalized every `src_table`
+/// `staging::apply` writes into the ring to qualified identity, so no
+/// *newly* staged row reaches here bare. The bare-suffix comparison is kept
+/// regardless, for the same two reasons `staging::apply::catalog_source_key`
+/// keeps its strip: ring rows are durable, so a segment staged before that
+/// fix can still be drained after it, and this crate's own integration
+/// fixtures stage bare `src_table`s by hand. `catalog_source_key` strips
+/// unconditionally either way, so what arrives here is always bare and the
+/// exact-match form would still never succeed.
 pub async fn source_table_version(
     pool: &Pool,
     source_table: &str,

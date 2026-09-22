@@ -5300,7 +5300,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // same physical table (`publication::qualify` of the WAL relation's
         // own namespace) — `resolve_graph_identity`'s first step is a
         // `search_path` lookup of the real relation, which a target table
-        // always satisfies, so both paths name the same physical schema.
+        // satisfies, and both sides then format the schema it finds through
+        // that same `publication::qualify`, so the two strings are equal by
+        // construction rather than by coincidence. (Strictly, step 1 returns
+        // the *first* `current_schemas(false)` match, so an unrelated relation
+        // of the same bare name in an earlier schema on the pinned path would
+        // resolve to the wrong one — a pre-existing property of
+        // `resolve_graph_identity` shared with every other caller, including
+        // the reader lookup on the next line, not something this staging site
+        // introduces: the reader lookup would come back empty for that same
+        // wrong name and propagation would stop rather than misfold.)
         // Without that agreement, one write to an intermediate hop folds as
         // two unrelated `(src_table, key)` groups and the downstream target's
         // batched upsert is handed the same conflict key twice, which
@@ -5918,10 +5927,12 @@ pub async fn apply_and_mark_drained_many(
     // comment); `source_table_versions.source_table` is qualified as of
     // issue #72, so this matches against its bare table-name suffix, same
     // as `defs::source_table_version`'s own read — see that function's doc
-    // comment for why issue #73 doesn't retire this (short version:
-    // `source_key` still traces back to `ddl::neighbor_table_name`, which
-    // stays bare regardless; only issue #75's emission audit would let this
-    // go back to an exact match).
+    // comment for why neither issue #73 nor issue #267 retires this (short
+    // version: #267 made every *newly* emitted ring `src_table` qualified,
+    // but `catalog_source_key` still strips unconditionally — durable
+    // pre-#267 ring rows and this crate's bare-by-hand test fixtures — so
+    // `source_key` is bare here either way and an exact match would never
+    // hit).
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
             .query_opt(
