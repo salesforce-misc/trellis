@@ -241,11 +241,12 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // Before any write, and inside the same transaction as the writes, so a
     // `define` that registers a new dependent cannot interleave between the
     // refusal check and the commit (issue #231).
-    let blockers = dependency_blockers(&txn, target, &qualified, id).await?;
+    let (blockers, column_detail) = dependency_blockers(&txn, target, &qualified, id).await?;
     if !blockers.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
             subject: target.to_string(),
             dependents: blockers,
+            column_detail,
         });
     }
 
@@ -417,6 +418,12 @@ pub(crate) async fn drop_relationship(
         return Err(CatalogError::DependentsBlockDrop {
             subject: format!("{from_table}.{name}"),
             dependents,
+            // A relationship's own readers are found by which relationship
+            // *name* they reference (`relationship_readers` above), not by
+            // which column of a target table they read — column-granularity
+            // detail has nothing to add here the way it does for
+            // `drop_transform`'s own table-shaped subject.
+            column_detail: Vec::new(),
         });
     }
 
@@ -495,7 +502,7 @@ async fn dependency_blockers(
     target: &str,
     qualified_target: &str,
     definition_id: i64,
-) -> Result<Vec<String>, CatalogError> {
+) -> Result<(Vec<String>, Vec<String>), CatalogError> {
     let mut blockers = source_edge_dependents(txn, qualified_target, definition_id).await?;
 
     // ADR-0014's "chains off the target" is not only the `FROM <target>`
@@ -532,7 +539,51 @@ async fn dependency_blockers(
 
     blockers.sort();
     blockers.dedup();
-    Ok(blockers)
+
+    // Issue #242: for naming precision only (every blocker found here is
+    // already in `blockers` above, by the DAG-property argument
+    // `catalog::column_dependents`'s own doc comment makes) — for each of
+    // this target's own declared columns, ask the same column-granularity
+    // dependency-edge infrastructure `ALTER TRANSFORM ... DROP <field>`
+    // (issue #241) uses for its own, load-bearing check, so a `DROP
+    // TRANSFORM` refusal can name the exact column a dependent reads instead
+    // of only "something reads this table."
+    let column_detail = match txn
+        .query_opt(
+            "select definition_text from transform_definitions where id = $1",
+            &[&definition_id],
+        )
+        .await?
+    {
+        Some(row) => {
+            let text: String = row.get(0);
+            match super::parse(&text) {
+                Ok(def) => {
+                    let mut detail = Vec::new();
+                    for field in &def.fields {
+                        let deps = super::catalog::column_dependents_any_keyspace(
+                            txn,
+                            target,
+                            &field.name,
+                        )
+                        .await?;
+                        detail.extend(
+                            deps.iter()
+                                .map(|(t, f)| format!("{t}.{f} reads {target}.{}", field.name)),
+                        );
+                    }
+                    detail
+                }
+                // Same "best-effort, never fail the drop over this precision
+                // feature" tolerance `column_dependents` itself already
+                // applies to every *other* definition's text.
+                Err(_) => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+
+    Ok((blockers, column_detail))
 }
 
 /// The bare target names of every definition reached by a `source` edge out

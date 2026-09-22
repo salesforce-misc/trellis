@@ -524,12 +524,71 @@ async fn backfill_one_to_one(
             source_table,
             pk,
             &substituted,
+            None,
             &lo,
             &hi,
         )
         .await?;
     }
 
+    Ok(())
+}
+
+/// Populates every one of `written_fields` across `def`'s target in one
+/// source enumeration — `ALTER TRANSFORM`'s single-pass column-add/alter
+/// backfill (`catalog::alter_transform`, ADR-0015, issue #241), reusing
+/// exactly the PK-range-chunked writer ([`write_one_to_one_range`])
+/// [`backfill_one_to_one`] already uses for a first `define`'s initial
+/// build, restricted to write only `written_fields` rather than every field
+/// of `def`.
+///
+/// `def` is the *merged* (already-edited) field list, so cross-field-alias
+/// substitution ([`substitute_all_fields`]) can still resolve a new field's
+/// reference to an existing sibling column — but only `written_fields` ever
+/// enters the `INSERT`/`ON CONFLICT UPDATE SET` column list: an untouched
+/// existing field is never re-computed or re-written by this call, matching
+/// ADR-0015's "an edit never rewrites the whole target table to change one
+/// column."
+///
+/// Deliberately bypasses [`write_one_to_one_range`]'s usual "skip whatever
+/// `column_status` currently has paused" exclusion for exactly the fields in
+/// `written_fields`: those fields are paused by `alter_transform`'s own
+/// caller for the specific purpose of letting *this* call populate them
+/// while live CDC apply leaves them alone — the same "the one write path
+/// allowed to touch a paused column is the operator-driven recompute that
+/// owns the pause" pattern `staging::quarantine::resume_column`'s own
+/// `recompute_column` already relies on for a single-column resume.
+///
+/// Relationship-free 1-1 only ([`uses_relationships`] is `alter_transform`'s
+/// own gate before this is ever called) — this has no join-aware
+/// counterpart the way [`backfill_relationship_one_to_one`] is for a first
+/// `define`; see `catalog::alter_transform`'s doc comment for why that's a
+/// deliberate, flagged scope-down rather than a fundamental limit.
+pub(crate) async fn backfill_altered_columns(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    source_table: &str,
+    written_fields: &HashSet<String>,
+) -> Result<(), BackfillError> {
+    let pk = source_primary_key(pool, source_table).await?;
+    let substituted = substitute_all_fields(def)?;
+    let source = ddl::qualified_source_table(source_table);
+    let client = pool.get().await?;
+    for (lo, hi) in discover_pk_ranges(&client, &source, &pk).await? {
+        write_one_to_one_range(
+            &client,
+            def,
+            target_schema,
+            source_table,
+            &pk,
+            &substituted,
+            Some(written_fields),
+            &lo,
+            &hi,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -577,6 +636,14 @@ async fn write_one_to_one_range(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     substituted: &[Expr],
+    // `Some(set)` restricts the write to exactly `set` — used only by
+    // [`backfill_altered_columns`]'s column-add/alter single-pass backfill,
+    // which must deliberately write a field `column_status` currently has
+    // paused (see that function's own doc comment). `None` is every other
+    // caller's ordinary path: every field of `def` *except* whatever
+    // `column_status` currently has paused, unchanged from before this
+    // parameter existed.
+    restrict_to: Option<&HashSet<String>>,
     lo: &Option<Vec<String>>,
     hi: &[String],
 ) -> Result<(), BackfillError> {
@@ -589,19 +656,32 @@ async fn write_one_to_one_range(
     // this definition currently has paused from both the computed column
     // list and the `ON CONFLICT` update set — see `paused_columns_for`'s doc
     // comment for why a durable, re-executable chunk write can't skip this.
-    let paused = paused_columns_for(client, &def.target).await?;
+    // Skipped entirely when `restrict_to` is `Some`: that caller already
+    // knows exactly which fields it wants written (and, per its own doc
+    // comment, wants them written *because* they're paused), so there is
+    // nothing for this exclusion to add.
+    let paused = match restrict_to {
+        Some(_) => HashSet::new(),
+        None => paused_columns_for(client, &def.target).await?,
+    };
+    let should_write = |name: &str| -> bool {
+        match restrict_to {
+            Some(set) => set.contains(name),
+            None => !paused.contains(name),
+        }
+    };
 
     let field_idents: Vec<String> = def
         .fields
         .iter()
-        .filter(|f| !paused.contains(&f.name))
+        .filter(|f| should_write(&f.name))
         .map(|f| quote_ident(&f.name))
         .collect();
     let field_exprs: Vec<String> = def
         .fields
         .iter()
         .zip(substituted)
-        .filter(|(f, _)| !paused.contains(&f.name))
+        .filter(|(f, _)| should_write(&f.name))
         .map(|(_, expr)| render_expr_sql(expr))
         .collect();
 
@@ -731,6 +811,7 @@ pub(crate) async fn execute_one_to_one_chunk(
         source_table,
         &pk,
         &substituted,
+        None,
         &lo,
         &hi,
     )

@@ -98,7 +98,10 @@ use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
 use tokio_postgres::GenericClient;
 
-use super::ast::{Expr, KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::ast::{
+    AlterClause, AlterTransform, Expr, FieldDef, KeySpace, RelationshipDef, TransformDef,
+    ValueType, render_definition_text,
+};
 use super::backfill::{self, BackfillError};
 use super::chunk_queue;
 use super::ddl::{self, DdlError};
@@ -112,7 +115,8 @@ use super::model::{
 use super::parser::{parse, parse_relationship};
 use super::pg_type::PgType;
 use super::validate::{
-    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError, validate,
+    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
+    infer_field_types, validate,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -252,12 +256,63 @@ pub enum CatalogError {
     /// blockers so the order to retire them in is explicit rather than
     /// something the operator has to reconstruct.
     DependentsBlockDrop {
-        /// What the caller asked to drop: a bare transform name, or
-        /// `from_table.relationship_name` for a relationship.
+        /// What the caller asked to drop: a bare transform name,
+        /// `from_table.relationship_name` for a relationship, or
+        /// `target.column` for an `ALTER TRANSFORM ... DROP <field>`
+        /// (issue #241).
         subject: String,
         /// The bare target names of the live definitions standing in the way.
         dependents: Vec<String>,
+        /// issue #242: for every blocker whose exact reference resolved to
+        /// one specific column of the subject (column-granularity
+        /// dependency edges — [`column_dependents`]), a human-readable
+        /// `"<dependent>.<field> reads <subject>.<column>"` detail line.
+        /// This is strictly additive precision over `dependents` alone, not
+        /// a replacement — a bare transform-level blocker (e.g. the
+        /// `RELATIONSHIP` declaration itself, which reads no column of its
+        /// own) can appear in `dependents` with nothing here to say about
+        /// it. Empty whenever no blocker's reference could be resolved this
+        /// precisely.
+        column_detail: Vec<String>,
     },
+    /// [`alter_transform`] was asked to edit a target that isn't currently
+    /// [`TransformStatus::Live`] (ADR-0015) — most concretely, still
+    /// `backfilling` behind its own initial build, or already frozen
+    /// (`paused`/`quarantined`). Mirrors [`crate::staging::apply::ApplyError::DefinitionNotLive`]'s
+    /// exact reasoning for [`crate::staging::quarantine::resume_column`]: a
+    /// column-add's single-pass backfill takes one read of the source table,
+    /// and a row a still-running initial-backfill chunk inserts into the
+    /// target *during* that window would never be revisited — so an edit
+    /// only ever starts from a settled, fully-built target.
+    TransformNotLive {
+        transform: String,
+        status: TransformStatus,
+    },
+    /// [`alter_transform`] was asked to `ALTER <field> AS <expr>` a field
+    /// that isn't one of the target's declared calculated fields — unlike
+    /// `DROP`ping an absent field (idempotent success) or `ADD`ing one that
+    /// already exists (idempotent iff the formula matches), there is no
+    /// reading under which altering a field that was never there is a
+    /// no-op: there is nothing to replace.
+    AlterFieldNotFound {
+        transform: String,
+        field: String,
+        declared: Vec<String>,
+    },
+    /// [`alter_transform`] was asked to `ADD <expr> AS <field>` a field name
+    /// that already exists with a *different* formula than `<expr>` —
+    /// distinct from the idempotent case (same formula, a no-op success):
+    /// `ADD` only ever introduces a field, so re-adding an existing name
+    /// under a new formula is ambiguous with `ALTER` and refused rather than
+    /// silently reinterpreted as one.
+    AlterFieldAlreadyExists { transform: String, field: String },
+    /// `ALTER TRANSFORM` was asked to edit a target/expression shape outside
+    /// this release's scope — see [`alter_transform`]'s own doc comment for
+    /// exactly what's covered. Not a rejection of the definition's *shape* in
+    /// the way [`CatalogError::Validate`] is (the edit would very likely be
+    /// accepted by `define`); it's this operation's own, narrower coverage
+    /// declining, with a message that says so.
+    UnsupportedAlter(String),
 }
 
 impl CatalogError {
@@ -296,6 +351,12 @@ impl CatalogError {
             // precondition.
             CatalogError::TransformNotPaused { .. } => ErrorCode::Conflict,
             CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
+            // Same "the world isn't in the state this operation needs"
+            // category as `TransformNotPaused` above.
+            CatalogError::TransformNotLive { .. } => ErrorCode::Conflict,
+            CatalogError::AlterFieldNotFound { .. } => ErrorCode::NotFound,
+            CatalogError::AlterFieldAlreadyExists { .. } => ErrorCode::Conflict,
+            CatalogError::UnsupportedAlter(_) => ErrorCode::Validation,
         }
     }
 }
@@ -359,14 +420,48 @@ impl fmt::Display for CatalogError {
             CatalogError::DependentsBlockDrop {
                 subject,
                 dependents,
+                column_detail,
+            } => {
+                write!(
+                    f,
+                    "cannot drop '{subject}': {} still derive{} from it — retire {} first \
+                     (Trellis refuses rather than cascading)",
+                    dependents.join(", "),
+                    if dependents.len() == 1 { "s" } else { "" },
+                    if dependents.len() == 1 { "it" } else { "them" },
+                )?;
+                if !column_detail.is_empty() {
+                    write!(f, " ({})", column_detail.join("; "))?;
+                }
+                Ok(())
+            }
+            CatalogError::TransformNotLive { transform, status } => write!(
+                f,
+                "'{transform}' is {}, not live; ALTER TRANSFORM only edits a fully-built, live \
+                 definition",
+                status.as_str()
+            ),
+            CatalogError::AlterFieldNotFound {
+                transform,
+                field,
+                declared,
             } => write!(
                 f,
-                "cannot drop '{subject}': {} still derive{} from it — retire {} first \
-                 (Trellis refuses rather than cascading)",
-                dependents.join(", "),
-                if dependents.len() == 1 { "s" } else { "" },
-                if dependents.len() == 1 { "it" } else { "them" },
+                "transform '{transform}' declares no field '{field}' to ALTER; it declares: {}",
+                if declared.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    declared.join(", ")
+                }
             ),
+            CatalogError::AlterFieldAlreadyExists { transform, field } => write!(
+                f,
+                "transform '{transform}' already has a field '{field}' with a different \
+                 formula; use ALTER '{field}' AS <expr> to change it, not ADD"
+            ),
+            CatalogError::UnsupportedAlter(detail) => {
+                write!(f, "unsupported ALTER TRANSFORM: {detail}")
+            }
         }
     }
 }
@@ -388,6 +483,10 @@ impl std::error::Error for CatalogError {
             CatalogError::TransformNotFound { .. } => None,
             CatalogError::TransformNotPaused { .. } => None,
             CatalogError::DependentsBlockDrop { .. } => None,
+            CatalogError::TransformNotLive { .. } => None,
+            CatalogError::AlterFieldNotFound { .. } => None,
+            CatalogError::AlterFieldAlreadyExists { .. } => None,
+            CatalogError::UnsupportedAlter(_) => None,
         }
     }
 }
@@ -1058,6 +1157,474 @@ async fn table_has_other_reader(
         .await?
         .get(0);
     Ok(exists)
+}
+
+/// Edits an already-registered 1-1 transform's calculated fields in place —
+/// `ALTER TRANSFORM`'s catalog-side implementation (ADR-0015, issues
+/// #241/#242), reached through [`crate::Trellis::apply`] like every other
+/// definition-changing statement (issue #227).
+///
+/// **Scope, this release.** Only a [`KeySpace::OneToOne`] target with no
+/// relationship-enriched field, before or after the edit, is supported:
+/// `ADD`/`ALTER` clauses whose merged field list would read any relationship
+/// path, and any edit at all against a [`KeySpace::Aggregate`] target, are
+/// refused with [`CatalogError::UnsupportedAlter`]. `DROP` alone never needs
+/// this restriction in principle (it recomputes nothing), but is held to the
+/// same gate for simplicity in this first pass — a deliberate, flagged
+/// scope-down, not an oversight: the single-pass backfill this reuses
+/// ([`backfill::backfill_altered_columns`], built on
+/// [`backfill::backfill_one_to_one`]'s chunked writer) only renders a plain
+/// `INSERT ... SELECT ... FROM <source>` and has no join-aware counterpart
+/// the way [`backfill::backfill_relationship_one_to_one`] is for a first
+/// `define`; wiring column-scoped writes through that relationship-aware
+/// path, and building an aggregate-target column-add/drop path (which would
+/// need to reason about the hidden `__{f}_sum`/`__{f}_count` partials
+/// `ddl::create_aggregate_target_table` maintains), are both real follow-up
+/// work, not fundamental blockers.
+///
+/// **Idempotency, per clause** (ADR-0015's "Edits are idempotent"): re-`ADD`ing
+/// a field that already exists with the exact same formula, re-`ALTER`ing a
+/// field to the formula it already has, and `DROP`ping a field already
+/// absent are each a no-op. If *every* clause in the statement turns out to
+/// be one of these, the whole call is a no-op success — no version bump, no
+/// DDL, nothing written — matching pause/resume/drop's own "a replayed
+/// migration must be safe in both directions" discipline.
+///
+/// **Single-pass backfill.** Every `ADD`/`ALTER`ed field this call actually
+/// changes is populated by *one* enumeration of the source
+/// ([`backfill::backfill_altered_columns`]), never a backfill per column —
+/// the same single-pass contract [`install_definition`]'s own initial build
+/// already honors, reused rather than reimplemented.
+///
+/// **The pause-state reuse.** While a changed field's single-pass backfill
+/// runs, it is parked in `column_status` — the exact mechanism
+/// `staging::quarantine`'s operator-driven column pause already is, "the
+/// column-granularity form of the pause state a target already has" in the
+/// ADR's own words: live CDC apply already excludes any `column_status`-listed
+/// column from what it computes/writes (`staging::apply`'s
+/// `paused_columns_for`/per-batch plan construction), so the field holds no
+/// committed value and nothing but this call's own backfill touches it until
+/// the backfill completes and this call clears the row.
+///
+/// **The version fence.** This call bumps both `transform_definitions
+/// .definition_version` (an audit-visible, monotonic counter on the edited
+/// row itself, per the ADR) and `source_table_versions.version` for the
+/// definition's source table — the *second* of which is what actually fences
+/// anything: it is the exact value `staging::apply::ApplyPlan`'s Phase 2
+/// captures and Phase 3 (`apply_and_mark_drained_many`) re-checks under `FOR
+/// SHARE`, so a drain worker whose in-flight batch loaded the *old* field
+/// list before this call's transaction commits is forced to hit
+/// `ApplyError::VersionFenceMiss` and reload the catalog — landing on the
+/// *new* field list, with the just-edited columns' `column_status` rows
+/// already visible — rather than racing this call's own backfill with a
+/// half-populated column. This is the same fence every *first*
+/// `create_definition_inner` already bumps, for exactly this reason; nothing
+/// new is invented here, only reused for an edit instead of only a define.
+///
+/// **Cycle detection.** The merged field list (existing fields, with `ADD`/
+/// `DROP`/`ALTER` applied) is run through [`validate`] — the same validator,
+/// same `super::validate::detect_cycle` call, [`create_definition_inner`]
+/// runs for a first `define` — before anything is written. The table-level
+/// whole-graph check ([`reject_if_table_cycle`]) is deliberately *not*
+/// re-run: an edit changes neither `def.source`, `def.target`, nor the set of
+/// relationships a table-level edge exists for (a relationship a new field
+/// reads was already declared, with its own edge, before this edit could
+/// reference it), so the table-level graph this call would check against is
+/// unchanged from the one already checked when the target was first defined
+/// — re-running it would only re-confirm the same edge is still not a cycle.
+///
+/// **The `DROP <field>` refusal.** Requires column-granularity dependency
+/// edges finer than a whole-transform drop's table-level check — exactly
+/// issue #242's gap, closed once via [`column_dependents_any_keyspace`] and
+/// used here as the *entire* correctness check (not just a naming nicety the
+/// way [`super::lifecycle::drop_transform`]'s own use of it is): a dropped
+/// field refuses, naming the specific reader, iff some other definition's
+/// field or `GROUP BY` key resolves to exactly this `(target, field)` pair.
+pub async fn alter_transform(
+    pool: &Pool,
+    alter: &AlterTransform,
+) -> Result<AlterOutcome, CatalogError> {
+    let Some(current) = definition_by_target(pool, &alter.target).await? else {
+        return Err(CatalogError::TransformNotFound {
+            transform: alter.target.clone(),
+        });
+    };
+    if current.status != TransformStatus::Live {
+        return Err(CatalogError::TransformNotLive {
+            transform: alter.target.clone(),
+            status: current.status,
+        });
+    }
+    if !matches!(current.def.key_space, KeySpace::OneToOne) {
+        return Err(CatalogError::UnsupportedAlter(format!(
+            "'{}' is an aggregate (GROUP BY) transform; ALTER TRANSFORM only supports 1-1 \
+             transforms in this release",
+            alter.target
+        )));
+    }
+
+    let mut fields = current.def.fields.clone();
+    let mut added = Vec::new();
+    let mut altered = Vec::new();
+    let mut dropped = Vec::new();
+    let mut real_adds: Vec<FieldDef> = Vec::new();
+    let mut real_alters: Vec<FieldDef> = Vec::new();
+    let mut real_drops: Vec<String> = Vec::new();
+
+    for clause in &alter.clauses {
+        match clause {
+            AlterClause::Add(new_field) => {
+                match fields.iter().find(|f| f.name == new_field.name) {
+                    Some(existing) if existing.expr == new_field.expr => {
+                        // Idempotent no-op: this field already exists with
+                        // this exact formula.
+                    }
+                    Some(_) => {
+                        return Err(CatalogError::AlterFieldAlreadyExists {
+                            transform: alter.target.clone(),
+                            field: new_field.name.clone(),
+                        });
+                    }
+                    None => {
+                        fields.push(new_field.clone());
+                        added.push(new_field.name.clone());
+                        real_adds.push(new_field.clone());
+                    }
+                }
+            }
+            AlterClause::Alter(new_field) => {
+                match fields.iter().position(|f| f.name == new_field.name) {
+                    None => {
+                        return Err(CatalogError::AlterFieldNotFound {
+                            transform: alter.target.clone(),
+                            field: new_field.name.clone(),
+                            declared: fields.iter().map(|f| f.name.clone()).collect(),
+                        });
+                    }
+                    Some(idx) if fields[idx].expr == new_field.expr => {
+                        // Idempotent no-op: already this exact formula.
+                    }
+                    Some(idx) => {
+                        fields[idx] = new_field.clone();
+                        altered.push(new_field.name.clone());
+                        real_alters.push(new_field.clone());
+                    }
+                }
+            }
+            AlterClause::Drop(name) => match fields.iter().position(|f| &f.name == name) {
+                None => {
+                    // Idempotent no-op: already absent.
+                }
+                Some(idx) => {
+                    fields.remove(idx);
+                    dropped.push(name.clone());
+                    real_drops.push(name.clone());
+                }
+            },
+        }
+    }
+
+    if real_adds.is_empty() && real_alters.is_empty() && real_drops.is_empty() {
+        // Every clause was an idempotent no-op — ADR-0015's "edits are
+        // idempotent in both directions": no version bump, no DDL, nothing
+        // written.
+        return Ok(AlterOutcome {
+            definition: current,
+            added,
+            dropped,
+            altered,
+        });
+    }
+
+    let merged = TransformDef {
+        fields,
+        ..current.def.clone()
+    };
+
+    if (!real_adds.is_empty() || !real_alters.is_empty()) && backfill::uses_relationships(&merged) {
+        return Err(CatalogError::UnsupportedAlter(format!(
+            "'{}' would read a relationship path after this edit; ALTER TRANSFORM's ADD/ALTER \
+             clauses only support relationship-free 1-1 transforms in this release",
+            alter.target
+        )));
+    }
+
+    // Reuse the exact validator (and, inside it, the exact column-cycle
+    // detector) a first `define` runs — see this function's own doc comment
+    // on why the table-level whole-graph check is deliberately not re-run.
+    let relationships = resolve_relationships(pool, &merged).await?;
+    validate(&merged, &current.source_columns, &relationships)?;
+    let field_types = infer_field_types(&merged, &current.source_columns, &relationships)?;
+
+    // Pre-transaction dependency check for every real `DROP` — issue #241's
+    // column-granularity refusal, using #242's same infrastructure.
+    // Best-effort here (re-checked for real under the row lock below, issue
+    // #231's discipline — a definition can register a brand-new dependent
+    // between this check and the transaction's commit).
+    for field in &real_drops {
+        check_no_column_dependents(pool, &alter.target, field).await?;
+    }
+
+    let (target_schema, _) = current
+        .target_table
+        .split_once('.')
+        .expect("target_table is always schema-qualified (issue #73)");
+    let target_ident = ddl::qualified_target_table_ident(&current.target_table);
+
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+
+    // Row-lock the definition and recheck its status: a pause, a drop, or
+    // another concurrent alter must not interleave between the checks above
+    // and this commit (issue #231's lesson, applied here the same way
+    // `lifecycle::drop_transform` applies it to its own precondition).
+    let row = txn
+        .query_opt(
+            "select status, definition_version from transform_definitions where id = $1 for update",
+            &[&current.id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(CatalogError::TransformNotFound {
+            transform: alter.target.clone(),
+        });
+    };
+    let status_text: String = row.get(0);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    if status != TransformStatus::Live {
+        return Err(CatalogError::TransformNotLive {
+            transform: alter.target.clone(),
+            status,
+        });
+    }
+    let old_version: i64 = row.get(1);
+    let new_version = old_version + 1;
+
+    // Re-check every real `DROP`'s dependents inside the transaction,
+    // against this transaction's own view of `transform_definitions` — the
+    // same ordering discipline `lifecycle::drop_transform`'s
+    // `dependency_blockers` call already follows.
+    for field in &real_drops {
+        check_no_column_dependents_in_txn(&txn, &alter.target, field).await?;
+    }
+
+    for field in &real_drops {
+        txn.batch_execute(&format!(
+            "alter table {target_ident} drop column if exists {}",
+            quote_ident(field)
+        ))
+        .await?;
+    }
+    for field in &real_adds {
+        let pg_type = ddl::pg_type_name(
+            field_types
+                .get(&field.name)
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+        );
+        txn.batch_execute(&format!(
+            "alter table {target_ident} add column if not exists {} {pg_type}",
+            quote_ident(&field.name)
+        ))
+        .await?;
+    }
+    for field in &real_alters {
+        let pg_type = ddl::pg_type_name(
+            field_types
+                .get(&field.name)
+                .copied()
+                .unwrap_or(ValueType::Numeric),
+        )
+        .to_string();
+        let current_pg_type =
+            target_column_pg_type_in_txn(&txn, &current.target_table, &field.name).await?;
+        if current_pg_type.as_deref() != Some(pg_type.as_str()) {
+            // The formula's inferred type changed — there is no existing
+            // value of the new type worth preserving, so this recomputes the
+            // whole column from scratch via `USING NULL` rather than
+            // attempting an assignment cast Postgres might refuse (or
+            // silently mistranslate) for an arbitrary old value.
+            txn.batch_execute(&format!(
+                "alter table {target_ident} alter column {} type {pg_type} using null",
+                quote_ident(&field.name)
+            ))
+            .await?;
+        }
+    }
+
+    // The column-granularity pause: freeze every changed field from live CDC
+    // apply (and from any other concurrent backfill) until this call's own
+    // single-pass recompute below finishes and clears it. `on conflict do
+    // nothing`: a field already paused for some other reason (an operator
+    // pause, a tripped column fuse) simply stays paused through this edit
+    // too; this call's own unpause step at the end only ever clears the rows
+    // it is certain it itself parked here (`written_fields`, below).
+    for field in real_adds.iter().chain(real_alters.iter()) {
+        txn.execute(
+            "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
+             values ($1, $2, now(), false) \
+             on conflict (transform_table, column_name) do nothing",
+            &[&alter.target, &field.name],
+        )
+        .await?;
+    }
+
+    let new_text = render_definition_text(&merged);
+    txn.execute(
+        "update transform_definitions \
+         set definition_text = $1, definition_version = $2 \
+         where id = $3",
+        &[&new_text, &new_version, &current.id],
+    )
+    .await?;
+
+    // The same version-fence bump `create_definition_inner` makes for a
+    // brand-new definition — see this function's own doc comment.
+    txn.query_one(
+        "insert into source_table_versions (source_table, version) \
+         values ($1, 1) \
+         on conflict (source_table) \
+         do update set version = source_table_versions.version + 1 \
+         returning version",
+        &[&current.source_table],
+    )
+    .await?;
+
+    txn.commit().await?;
+
+    // Outside the transaction (and, deliberately, holding no lock): the
+    // single-pass backfill below is the same "one enumeration of the source"
+    // shape `install_definition`'s own build is, sized for however large the
+    // source table is — exactly the work a first `define` already does
+    // without holding a transaction open across it.
+    if !real_adds.is_empty() || !real_alters.is_empty() {
+        let mut written_fields: HashSet<String> =
+            real_adds.iter().map(|f| f.name.clone()).collect();
+        written_fields.extend(real_alters.iter().map(|f| f.name.clone()));
+        backfill::backfill_altered_columns(
+            pool,
+            &merged,
+            target_schema,
+            &current.source_table,
+            &written_fields,
+        )
+        .await
+        .map_err(CatalogError::DirectBackfill)?;
+
+        // Unpause: the recompute above is done, so every changed field now
+        // holds a committed value and ordinary live CDC apply may resume
+        // writing it.
+        let client = pool.get().await?;
+        for field in &written_fields {
+            client
+                .execute(
+                    "delete from column_status where transform_table = $1 and column_name = $2",
+                    &[&alter.target, field],
+                )
+                .await?;
+        }
+    }
+
+    let definition = definition_by_target(pool, &alter.target)
+        .await?
+        .expect("the definition this call just edited must still exist");
+    Ok(AlterOutcome {
+        definition,
+        added,
+        dropped,
+        altered,
+    })
+}
+
+/// [`alter_transform`]'s output: the edited definition's new state, plus
+/// which fields were actually added/dropped/altered (excluding any
+/// idempotent no-op clause) — the same "report what really happened, not
+/// just what was asked" contract [`super::lifecycle::PauseOutcome`]/
+/// [`super::lifecycle::DropOutcome`] already keep.
+#[derive(Debug, Clone)]
+pub struct AlterOutcome {
+    pub definition: Definition,
+    pub added: Vec<String>,
+    pub dropped: Vec<String>,
+    pub altered: Vec<String>,
+}
+
+/// [`alter_transform`]'s pre-transaction, best-effort half of the `DROP
+/// <field>` refusal check — see [`column_dependents_any_keyspace`]'s own doc
+/// comment for why this is the *entire* correctness gate for a column drop,
+/// not just a naming nicety.
+async fn check_no_column_dependents(
+    pool: &Pool,
+    target: &str,
+    field: &str,
+) -> Result<(), CatalogError> {
+    let client = pool.get().await?;
+    check_no_column_dependents_via(&**client, target, field).await
+}
+
+/// The transaction-scoped counterpart to [`check_no_column_dependents`],
+/// re-run under the target's own row lock (issue #231's discipline) so a
+/// dependent registered between the pre-check and this commit cannot slip
+/// through.
+async fn check_no_column_dependents_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    target: &str,
+    field: &str,
+) -> Result<(), CatalogError> {
+    check_no_column_dependents_via(txn, target, field).await
+}
+
+async fn check_no_column_dependents_via(
+    client: &impl GenericClient,
+    target: &str,
+    field: &str,
+) -> Result<(), CatalogError> {
+    let deps = column_dependents_any_keyspace(client, target, field).await?;
+    if deps.is_empty() {
+        return Ok(());
+    }
+    let mut dependents: Vec<String> = deps.iter().map(|(t, _)| t.clone()).collect();
+    dependents.sort();
+    dependents.dedup();
+    let column_detail: Vec<String> = deps
+        .iter()
+        .map(|(t, f)| format!("{t}.{f} reads {target}.{field}"))
+        .collect();
+    Err(CatalogError::DependentsBlockDrop {
+        subject: format!("{target}.{field}"),
+        dependents,
+        column_detail,
+    })
+}
+
+/// The target-table counterpart to `ddl::source_column_pg_types`, scoped to
+/// one column and run inside `alter_transform`'s own transaction: the
+/// concrete Postgres type (`format_type`) a target column currently has, so
+/// an `ALTER <field> AS <expr>` whose new formula infers the *same*
+/// [`ValueType`] never issues a needless `ALTER COLUMN ... TYPE ... USING
+/// NULL` (which would otherwise discard every already-computed value for no
+/// reason — see [`alter_transform`]'s own comment on that statement). `None`
+/// if the column somehow doesn't exist yet (defensive; every real `ALTER`
+/// field is, by construction, a physical column already).
+async fn target_column_pg_type_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    qualified_target: &str,
+    column: &str,
+) -> Result<Option<String>, CatalogError> {
+    let row = txn
+        .query_opt(
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attname = $2 \
+               and a.attnum > 0 \
+               and not a.attisdropped",
+            &[&qualified_target, &column],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
 }
 
 async fn create_definition_inner(
@@ -4501,6 +5068,51 @@ pub(crate) async fn column_dependents(
     upstream_column: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
     let client = pool.get().await?;
+    column_dependents_via(&**client, upstream_table, upstream_column, true).await
+}
+
+/// [`column_dependents`], generalized to *every* downstream key-space (not
+/// just [`KeySpace::OneToOne`]) and to any `impl GenericClient` (a plain
+/// pooled connection, or a transaction) rather than just a fresh pooled one —
+/// the column-granularity dependency-edge infrastructure issues #241/#242
+/// both need for a *drop* refusal, as opposed to [`column_dependents`]'s own
+/// pause/cascade/resume use.
+///
+/// **Why the wider key-space net matters here.** `column_dependents`'s
+/// 1-1-only filter is correct for its own callers (`staging::quarantine`'s
+/// column-pause cascade — nothing outside the 1-1 tier has a `column_status`
+/// row to cascade onto), but is exactly *wrong* for a drop refusal: an
+/// aggregate transform's `GROUP BY` can key on a to-one relationship path or
+/// a chained source column just as readily as a 1-1 field can (issue #137),
+/// and dropping the column such a grouping key reads is exactly as
+/// destructive as dropping one a 1-1 field reads — the refusal must see it
+/// too. So this walks every downstream definition's [`KeySpace::Aggregate`]
+/// `group_by` keys (via [`GroupByKey::as_expr`]) in addition to every
+/// definition's `fields`, named by [`GroupByKey::target_column_name`] when a
+/// grouping key itself is the match — the same target-column-name convention
+/// [`super::validate`]'s own grouping-key/field-passthrough checks use.
+///
+/// Used by [`super::lifecycle::drop_transform`] (naming precision only —
+/// every blocker this finds is already caught by that function's
+/// table-level checks, per this module's own `column_dependents` doc
+/// comment's DAG-property note) and by [`alter_transform`]'s `DROP <field>`
+/// clause (where it is the *entire* refusal check, not just a naming
+/// enhancement — column-granularity dependency edges are the only edges a
+/// single-field drop has to check against).
+pub(crate) async fn column_dependents_any_keyspace(
+    client: &impl GenericClient,
+    upstream_table: &str,
+    upstream_column: &str,
+) -> Result<Vec<(String, String)>, CatalogError> {
+    column_dependents_via(client, upstream_table, upstream_column, false).await
+}
+
+async fn column_dependents_via(
+    client: &impl GenericClient,
+    upstream_table: &str,
+    upstream_column: &str,
+    only_one_to_one: bool,
+) -> Result<Vec<(String, String)>, CatalogError> {
     let def_rows = client
         .query(
             // `split_part(target_table, '.', 2)`, not the qualified column
@@ -4543,7 +5155,7 @@ pub(crate) async fn column_dependents(
         // unexpected chance it doesn't, rather than let one bad row prevent
         // cascading a pause to every other, healthy dependent.
         let Ok(def) = parse(&text) else { continue };
-        if !matches!(def.key_space, KeySpace::OneToOne) {
+        if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
         // `def.source` (freshly re-parsed from `definition_text`), not the
@@ -4564,6 +5176,24 @@ pub(crate) async fn column_dependents(
                 &rel_to_table,
             ) {
                 deps.push((target.clone(), field.name.clone()));
+            }
+        }
+        // A `GROUP BY` key is not itself a `FieldDef` in `def.fields` — see
+        // `ast::KeySpace::Aggregate`'s own doc comment — so the loop above
+        // never sees it. Only reachable when `only_one_to_one` is false
+        // (see this function's own doc comment on why the drop-refusal
+        // caller needs this and the pause-cascade caller must not).
+        if !only_one_to_one && let KeySpace::Aggregate { group_by } = &def.key_space {
+            for key in group_by {
+                if expr_references_column(
+                    &key.as_expr(),
+                    &def.source,
+                    upstream_table,
+                    upstream_column,
+                    &rel_to_table,
+                ) {
+                    deps.push((target.clone(), key.target_column_name().to_string()));
+                }
             }
         }
     }

@@ -123,6 +123,17 @@ pub enum Statement {
     /// terminal reap. Idempotent; refused if a still-registered dependent
     /// chains off the subject.
     Drop(DefinitionRef),
+    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
+    /// #241/#242) — edits an already-registered transform's calculated
+    /// fields in place: `ADD`, `DROP`, and `ALTER` clauses, one calculated
+    /// field each. The key-space is not named and cannot change; a
+    /// granularity change is a new transform plus cutover, not an edit — the
+    /// grammar has no key-space clause here to write, rather than a
+    /// validator rejecting one. Idempotent per-clause, matching
+    /// pause/resume/drop's discipline: re-adding a field with the same
+    /// formula, re-altering to the formula it already has, and dropping an
+    /// already-absent field are all no-op successes.
+    AlterTransform(AlterTransform),
 }
 
 /// What a [`Statement::Pause`]/[`Statement::Resume`] addresses: a registered
@@ -213,6 +224,35 @@ impl fmt::Display for DefinitionRef {
             } => write!(f, "{schema}.{from_table}.{name}"),
         }
     }
+}
+
+/// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
+/// #241/#242).
+///
+/// `target` is the **bare** target-table name — the same operator-facing
+/// addressing [`TransformRef`]/[`DefinitionRef::Transform`] use, not the
+/// `TRANSFORM`/`FROM` grammar's schema-qualifiable table reference: an edit
+/// acts on an already-registered definition by its bare identity, exactly
+/// like `PAUSE`/`RESUME`/`DROP TRANSFORM` do, rather than re-declaring the
+/// table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTransform {
+    pub target: String,
+    /// At least one clause — the parser refuses an empty list (there is
+    /// nothing to apply `ALTER TRANSFORM <target>` alone would mean).
+    pub clauses: Vec<AlterClause>,
+}
+
+/// One clause of an [`AlterTransform`] statement — one calculated field, one
+/// operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterClause {
+    /// `ADD <expr> AS <field>` — introduces a new calculated field.
+    Add(FieldDef),
+    /// `DROP <field>` — removes a calculated field and the data it computed.
+    Drop(String),
+    /// `ALTER <field> AS <expr>` — replaces an existing field's formula.
+    Alter(FieldDef),
 }
 
 /// The target table's primary-key space (see `docs/transforms.md#granularity`).
@@ -487,6 +527,123 @@ impl fmt::Display for ValueType {
 pub enum Operator {
     Add,
     GreaterThan,
+}
+
+/// Renders `def` back into valid Trellis grammar text — the inverse of
+/// [`super::parser::parse`] — so [`super::catalog::alter_transform`] can
+/// persist an edited field list the same way [`super::catalog`] persists
+/// every definition: as `definition_text`, re-parsed on read (see that
+/// module's doc comment for why), never a serialized AST. Only
+/// `ALTER TRANSFORM`'s caller needs this (a first `TRANSFORM ...` statement
+/// is already source text, verbatim); it lives here, next to the AST it
+/// renders, rather than in `catalog`.
+///
+/// Always fully parenthesizes a [`Expr::BinaryOp`] rather than reproducing
+/// [`super::registry`]'s precedence table in reverse — verbose, but
+/// unconditionally round-trip-safe: [`super::parser::parse`] accepts a
+/// parenthesized subexpression anywhere `docs/decisions/0004-transform-definition-grammar.md`'s
+/// grammar accepts one, and a fresh render never needs to *look* like the
+/// original text, only to re-parse into the same [`TransformDef`].
+pub(crate) fn render_definition_text(def: &TransformDef) -> String {
+    let mut out = String::from("TRANSFORM ");
+    render_table_ref(&mut out, &def.target, def.explicit_target_schema.as_deref());
+    out.push_str(" FROM ");
+    render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
+
+    if let KeySpace::Aggregate { group_by } = &def.key_space {
+        out.push_str(" GROUP BY ");
+        let keys: Vec<String> = group_by
+            .iter()
+            .map(|key| match key {
+                GroupByKey::Column(column) => column.clone(),
+                GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+            })
+            .collect();
+        out.push_str(&keys.join(", "));
+    }
+
+    out.push_str(" SELECT ");
+    let fields: Vec<String> = def
+        .fields
+        .iter()
+        .map(|field| format!("{} AS {}", render_field_expr(&field.expr), field.name))
+        .collect();
+    out.push_str(&fields.join(", "));
+
+    // `def.predicate` is always `Predicate::True` (the grammar's only
+    // variant, and the same value an omitted `WHERE` parses to) — omitting
+    // the clause entirely round-trips identically to writing `WHERE TRUE`,
+    // so there is nothing this render ever needs to spell out.
+    let Predicate::True = def.predicate;
+
+    out
+}
+
+fn render_table_ref(out: &mut String, table: &str, explicit_schema: Option<&str>) {
+    if let Some(schema) = explicit_schema {
+        out.push_str(schema);
+        out.push('.');
+    }
+    out.push_str(table);
+}
+
+fn render_field_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Column(name) => name.clone(),
+        Expr::NumberLiteral(text) => text.clone(),
+        Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
+        Expr::TypedLiteral { value_type, text } => format!(
+            "CAST('{}' AS {})",
+            text.replace('\'', "''"),
+            typed_literal_keyword(*value_type)
+        ),
+        Expr::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+        Expr::BinaryOp { op, lhs, rhs } => format!(
+            "({} {} {})",
+            render_field_expr(lhs),
+            render_operator(*op),
+            render_field_expr(rhs)
+        ),
+        // `COUNT(*)` is the one call this grammar parses with an empty
+        // argument list (`*` is not itself an expression) — every other
+        // empty-args shape is unreachable (every other function/aggregate
+        // this grammar accepts requires at least one argument), so this
+        // check unambiguously identifies it rather than merely guessing.
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "COUNT(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } => {
+            let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
+            format!("{name}({})", rendered_args.join(", "))
+        }
+    }
+}
+
+fn render_operator(op: Operator) -> &'static str {
+    match op {
+        Operator::Add => "+",
+        Operator::GreaterThan => ">",
+    }
+}
+
+/// The typed-literal keyword [`super::typed_literal::TYPED_LITERALS`] spells
+/// `value_type` with — the reverse of [`super::typed_literal::lookup_typed_literal`].
+/// Every allowlisted entry's keyword is, by that table's own invariant,
+/// unique per [`ValueType`] it produces (`type_keyword_matches_value_type`
+/// pins the forward half of that bijection), so a [`Expr::TypedLiteral`]
+/// already carrying one of those [`ValueType`]s always finds its keyword
+/// back here.
+fn typed_literal_keyword(value_type: ValueType) -> &'static str {
+    super::typed_literal::TYPED_LITERALS
+        .iter()
+        .find(|spec| spec.value_type == value_type)
+        .map(|spec| spec.keyword)
+        .unwrap_or_else(|| {
+            panic!(
+                "render_definition_text: no typed-literal keyword registered for {value_type} — \
+                 every TypedLiteral this grammar can parse must have one"
+            )
+        })
 }
 
 /// The partial-data predicate slot (`docs/transforms.md#partial-data`).

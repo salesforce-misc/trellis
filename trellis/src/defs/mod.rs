@@ -50,8 +50,11 @@ pub mod validate;
 // doors onto it. Names the engine does not use are split out below and
 // compiled only behind those gates, which is what keeps a plain
 // `cargo build` free of `unused_imports` rather than an `allow`.
-pub use ast::{DefinitionRef, Statement, TransformRef, ValueType};
-pub use catalog::{CatalogError, all_source_tables, create_relationship, install_definition};
+pub use ast::{AlterClause, AlterTransform, DefinitionRef, Statement, TransformRef, ValueType};
+pub use catalog::{
+    AlterOutcome, CatalogError, all_source_tables, alter_transform, create_relationship,
+    install_definition,
+};
 pub use error::ParseError;
 pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
 pub use parser::{parse, parse_statement};

@@ -284,12 +284,14 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // (`relationship_definitions.from_schema`, the schema a relationship's
     // from-table resolved to at definition time — what a scoped `DROP
     // RELATIONSHIP <schema>.<from_table>.<name>` qualifier is now checked
-    // against).
+    // against). Issues #241/#242 (ADR-0015) added V35
+    // (`transform_definitions.definition_version`, the monotonic
+    // per-definition edit counter `ALTER TRANSFORM` bumps).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34
+            27, 28, 29, 30, 31, 32, 33, 34, 35
         ]
     );
 }

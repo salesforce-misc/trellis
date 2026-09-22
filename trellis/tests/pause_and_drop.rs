@@ -572,6 +572,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         TrellisError::Catalog(CatalogError::DependentsBlockDrop {
             subject,
             dependents,
+            ..
         }) => {
             assert_eq!(subject, "order_rollup");
             assert_eq!(
@@ -673,6 +674,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
             TrellisError::Catalog(CatalogError::DependentsBlockDrop {
                 subject,
                 dependents,
+                ..
             }) => {
                 assert_eq!(subject, "order_rollup");
                 assert_eq!(
@@ -1236,6 +1238,7 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
         TrellisError::Catalog(CatalogError::DependentsBlockDrop {
             subject,
             dependents,
+            ..
         }) => {
             assert_eq!(subject, "order_doubles");
             // Both layers standing on this target, named together (issue
@@ -1338,6 +1341,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
         TrellisError::Catalog(CatalogError::DependentsBlockDrop {
             subject,
             dependents,
+            ..
         }) => {
             assert_eq!(subject, "order_doubles");
             assert_eq!(
@@ -1431,6 +1435,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         TrellisError::Catalog(CatalogError::DependentsBlockDrop {
             subject,
             dependents,
+            ..
         }) => {
             assert_eq!(subject, "authors.posts");
             assert_eq!(dependents, vec!["author_stats".to_string()]);
