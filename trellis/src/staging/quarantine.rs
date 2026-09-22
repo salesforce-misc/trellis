@@ -608,8 +608,9 @@ pub async fn isolate_and_evict(
 /// **Unresolvable names fall through to the raw spelling rather than
 /// erroring**, which is the one deliberate difference from
 /// `apply::qualified_schema_node_key` (that one propagates
-/// [`catalog::CatalogError::SourceTableNotFound`], mirroring
-/// `catalog::resolve_relationship_endpoint`'s same tolerance instead). Every
+/// [`catalog::CatalogError::SourceTableNotFound`] to its caller; this one
+/// instead mirrors `catalog::resolve_relationship_endpoint`, which tolerates
+/// exactly that variant and hands back the name unchanged). Every
 /// caller here is *diagnosing* an already-failed batch: turning a name this
 /// module cannot resolve into a brand-new `ApplyError` would replace the
 /// original failure being quarantined with a confusing secondary one, and
