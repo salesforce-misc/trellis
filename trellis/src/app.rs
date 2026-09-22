@@ -1281,7 +1281,7 @@ impl Trellis {
             // user-defined enum type (a connection is only ever used for an
             // OID this process hasn't already classified as a fixed
             // builtin — see that function's own doc comment).
-            match defs::pg_type::value_type_for_oid(&client, type_oid).await? {
+            match defs::pg_type::value_type_for_oid(&**client, type_oid).await? {
                 // Issue #108 review: a column whose OID the registry still
                 // can't place at all (an array, a range, a composite, a
                 // domain, `citext`, ...) stays *out* of the validator's

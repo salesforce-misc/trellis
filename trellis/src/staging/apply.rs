@@ -2964,7 +2964,7 @@ pub(crate) async fn to_column_types(
         // `pg_type::value_type_for_oid`'s own doc comment.
         types.insert(
             name,
-            crate::defs::pg_type::value_type_for_oid(&client, type_oid).await?,
+            crate::defs::pg_type::value_type_for_oid(&**client, type_oid).await?,
         );
     }
     Ok(types)

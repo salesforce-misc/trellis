@@ -28,10 +28,11 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 
+use tokio_postgres::GenericClient;
+
 use super::ast::ValueType;
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
-use crate::pool::Client;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
 /// first-class [`ValueType`] variant. Carried inside [`ValueType::Other`]
@@ -435,8 +436,20 @@ fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
 /// column's table got dropped out from under a still-live definition
 /// either), so this issue doesn't invent one for enums specifically — see
 /// `docs/type-support.md`'s enum section.
+///
+/// Generic over [`GenericClient`] (issue #241's `ALTER TRANSFORM` type-change
+/// refusal) rather than pinned to a pooled [`crate::pool::Client`): that
+/// refusal's authoritative recheck runs under `alter_transform`'s own
+/// row-locking transaction, and taking a *second* pooled connection while
+/// already mid-transaction is the "classic pool-exhaustion deadlock"
+/// `ddl::source_primary_key_in_txn`'s own doc comment warns against —
+/// classifying straight off the transaction's own `&tokio_postgres::Transaction`
+/// avoids that entirely. Every other, pre-existing caller still passes a
+/// pooled client (`&**client`, the same double-deref
+/// `catalog::check_no_column_dependents_via`'s call site already uses to
+/// reach the same trait from a `deadpool_postgres::Client`).
 pub async fn value_type_for_oid(
-    client: &Client,
+    client: &impl GenericClient,
     type_oid: u32,
 ) -> Result<ValueType, tokio_postgres::Error> {
     let builtin = value_type_for_builtin_oid(type_oid);
@@ -467,7 +480,7 @@ pub async fn value_type_for_oid(
 /// (via [`value_type_for_oid`]'s caller) rather than panicking or silently
 /// mis-joining.
 async fn lookup_enum_qualified_name(
-    client: &Client,
+    client: &impl GenericClient,
     type_oid: u32,
 ) -> Result<Option<String>, tokio_postgres::Error> {
     let row = client

@@ -28,9 +28,12 @@
 //!   infrastructure's naming precision retrofitted onto `DROP TRANSFORM`
 //!   (`dropping_a_field_still_read_by_a_dependent_is_refused`,
 //!   `dropping_a_transform_names_the_specific_column_a_dependent_reads`)
-//! - this release's deliberate scope-downs: aggregate targets and a
-//!   not-yet-live target (`altering_an_aggregate_transform_is_unsupported`,
-//!   `altering_a_target_that_is_not_live_is_rejected`)
+//! - this release's deliberate scope-downs: aggregate targets, a
+//!   not-yet-live target, and a genuine column-type change
+//!   (`altering_an_aggregate_transform_is_unsupported`,
+//!   `altering_a_target_that_is_not_live_is_rejected`,
+//!   `altering_a_field_to_a_different_result_type_is_refused`,
+//!   `a_type_changing_alter_refuses_the_whole_statement`)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -168,6 +171,25 @@ async fn column_names(raw: &Client, schema: &str, table: &str) -> HashSet<String
     .collect()
 }
 
+/// The concrete Postgres type (`format_type`) `schema.table.column`
+/// currently has — used by the type-changing-`ALTER` refusal tests to
+/// confirm a refused `ALTER` never actually touches the physical column,
+/// not just that the call returned an error.
+async fn column_pg_type(raw: &Client, schema: &str, table: &str, column: &str) -> String {
+    raw.query_one(
+        "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+         from pg_attribute a \
+         where a.attrelid = pg_catalog.to_regclass($1) \
+           and a.attname = $2 \
+           and a.attnum > 0 \
+           and not a.attisdropped",
+        &[&format!("{schema}.{table}"), &column],
+    )
+    .await
+    .expect("introspect the column's physical type")
+    .get(0)
+}
+
 fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
     match applied {
         Applied::Altered {
@@ -288,14 +310,30 @@ async fn alter_single_column_recomputes_existing_rows() {
     let trellis = running(db.dsn()).await;
     wait_for_live(&raw, "order_calc").await;
 
+    // `total`'s new formula (`a + b + b`) infers the exact same `ValueType`
+    // (numeric) its column already has — issue #241's second review round:
+    // this is the case a type-changing-`ALTER` refusal must *not* catch, so
+    // this test also pins the column's physical type stays `numeric`
+    // throughout, not just that the call succeeds.
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric"
+    );
+
     let applied = trellis
         .apply("ALTER TRANSFORM order_calc ALTER total AS a + b + b")
         .await
-        .expect("alter a column's formula");
+        .expect("a same-result-type ALTER must still succeed");
     let (added, dropped, altered) = into_altered(applied);
     assert!(added.is_empty());
     assert!(dropped.is_empty());
     assert_eq!(altered, vec!["total".to_string()]);
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric",
+        "a same-type ALTER never touches the physical column type"
+    );
 
     let rows = raw
         .query(
@@ -313,6 +351,153 @@ async fn alter_single_column_recomputes_existing_rows() {
         let total: f64 = row.get::<_, String>(2).parse().unwrap();
         assert_eq!(total, a + b + b, "every existing row must be recomputed");
     }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Issue #241/#242's second review round: `ALTER <field> AS <expr>` refuses
+/// outright when the new formula's inferred result type genuinely differs
+/// from the field's current physical column type, rather than issuing the
+/// `ALTER COLUMN ... TYPE ... USING NULL` that would otherwise silently
+/// rewrite the *entire* target table under an `ACCESS EXCLUSIVE` lock —
+/// exactly what ADR-0015 (`docs/decisions/0015-transform-redefinition.md`)
+/// promises an edit never does. `total` here is declared `numeric` (`a +
+/// b`); `a > b` infers `boolean`, a genuine type change.
+#[tokio::test]
+async fn altering_a_field_to_a_different_result_type_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let before_type = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await;
+    assert_eq!(before_type, "numeric");
+    let before_version = persisted_definition_version(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a > b")
+        .await
+        .expect_err("a genuine type change (numeric -> boolean) must be refused");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => {
+            assert!(
+                detail.contains("total")
+                    && detail.contains("numeric")
+                    && detail.contains("boolean"),
+                "the refusal must name the field and both types: {detail}"
+            );
+            assert!(
+                detail.to_uppercase().contains("DROP") && detail.to_uppercase().contains("ADD"),
+                "the refusal must point at DROP+ADD as the supported path: {detail}"
+            );
+        }
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+
+    // The refusal is a pre-flight validation, not a runtime failure midway
+    // through work: no DDL and no backfill ever ran, so the column's
+    // physical type and the definition's persisted version are exactly as
+    // they were before this call.
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        before_type,
+        "a refused ALTER must never touch the physical column type — no table lock, \
+         no rewrite, was ever attempted"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        before_version,
+        "a refused ALTER must not bump the definition version — nothing was written"
+    );
+
+    // The existing data is untouched too — not just the schema.
+    let rows = raw
+        .query(
+            &format!(
+                "select a::text, b::text, total::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let b: f64 = row.get::<_, String>(1).parse().unwrap();
+        let total: f64 = row.get::<_, String>(2).parse().unwrap();
+        assert_eq!(
+            total,
+            a + b,
+            "the refused ALTER must not have recomputed anything"
+        );
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The type-change refusal blocks the *whole* statement, not just its own
+/// clause: a combined `ADD ..., ALTER ...` where the `ALTER` half is a
+/// genuine type change must leave the `ADD` half unapplied too — matching
+/// every other all-or-nothing refusal `ALTER TRANSFORM` already has (a
+/// cycle, a blocked `DROP`).
+#[tokio::test]
+async fn a_type_changing_alter_refuses_the_whole_statement() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let before_version = persisted_definition_version(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply(
+            "ALTER TRANSFORM order_calc \
+             ADD a + a AS double_a, \
+             ALTER total AS a > b",
+        )
+        .await
+        .expect_err("the ALTER half's type change must refuse the whole statement");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(_)) => {}
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(
+        !columns.contains("double_a"),
+        "the ADD half must not have been applied either: {columns:?}"
+    );
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric",
+        "the ALTER half must never have touched the physical column type"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        before_version,
+        "a refused combined statement must not bump the definition version"
+    );
 
     trellis.shutdown().await.expect("shutdown");
 }
