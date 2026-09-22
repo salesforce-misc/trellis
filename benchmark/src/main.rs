@@ -19,6 +19,38 @@
 //! cargo run -p benchmark --features engine-access --release -- relationship-aggregate
 //! ```
 //!
+//! ## Streaming scenarios
+//!
+//! The scenarios above time the direct, ring-bypassing backfill build. The
+//! streaming ones (see [`streaming`], issue #270) instead drive the real
+//! product path through a live [`trellis::Client`] — CDC intake -> ring append
+//! -> seal -> claim -> fold -> apply — and are epic #269's validation battery:
+//!
+//! ```text
+//! # V-LAT: the T1 depth ladder, and one depth alone
+//! cargo run -p benchmark --features engine-access --release -- hop-ladder
+//! cargo run -p benchmark --features engine-access --release -- hop-latency --depth 10 --rate 10 --duration-secs 30
+//! cargo run -p benchmark --features engine-access --release -- hop-latency --depth 10 --maintenance-interval-ms 10 --poll-interval-ms 20
+//! # V-THRU / V-SHAPE
+//! cargo run -p benchmark --features engine-access --release -- throughput-ramp --rates 100000,200000,220000,250000
+//! cargo run -p benchmark --features engine-access --release -- transaction-shape --shapes 1,100,10000 --target-rate 20000
+//! # V-AGG
+//! cargo run -p benchmark --features engine-access --release -- fold-in-ratio --ratios 10,100,1000 --target-rate 400000
+//! # the ceiling every throughput number sits under, and V-IDLE
+//! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 5
+//! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --duration-secs 60
+//! ```
+//!
+//! All seven accept `--application-threads`, `--poll-interval-ms`,
+//! `--maintenance-interval-ms` and `--reconcile-interval-ms`
+//! ([`streaming::tuning::EngineTuning`], which is also where a later child of
+//! #269 adds a knob of its own). Each prints one JSON line per measurement
+//! point, cross-checks `trellis_changes_applied_total` against the rows its
+//! generator committed, and runs an independent SQL oracle over the terminal
+//! target — the process exits non-zero on an oracle or cross-check failure,
+//! but **not** on a missed latency target or an unsustained rate, which are
+//! measurements rather than errors.
+//!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large
 //! enough to distort the numbers. Each scenario prints one line of JSON to
@@ -30,6 +62,7 @@
 mod generate;
 mod scenario;
 mod scenario_relationship;
+mod streaming;
 
 use std::time::Duration;
 
@@ -95,6 +128,13 @@ const RELATIONSHIP_AGGREGATE_CEILING: Duration = Duration::from_secs(10);
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let name = args.first().map(String::as_str).unwrap_or("both");
+
+    if let Some(ok) = streaming::cli::run(name, &args) {
+        if !ok {
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if name == "relationship-aggregate" {
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
@@ -191,7 +231,8 @@ fn parse_args(args: &[String], name: &str) -> Result<Vec<Scenario>, String> {
         }
         other => Err(format!(
             "unknown scenario {other:?} — expected one of: high-cardinality, low-cardinality, \
-             both, relationship-aggregate, custom"
+             both, relationship-aggregate, custom, {}",
+            streaming::cli::SCENARIOS.join(", ")
         )),
     }
 }
