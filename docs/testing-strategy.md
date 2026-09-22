@@ -117,8 +117,10 @@ program.** This is the `generative` crate; full architecture lives in
   order-insensitivity over commuting ops, read-your-own-writes via `await`, and — the
   hardest — non-idempotent aggregate delta convergence.
 
-It runs in CI at low case counts (a healthy run is minutes, not seconds — a "pass"
-in one second executed nothing), with an env override for deep nightly runs. It
+Its properties are opt-in: each is `#[ignore]`d, so PR-time CI (plain
+`cargo test --workspace`) runs only the crate's fast non-property tests, and deep
+runs opt in with `-- --ignored` plus a `PROPTEST_CASES` override (a healthy deep
+run is minutes, not seconds — a "pass" in one second executed nothing). It
 assumes the system *reaches* quiescence and judges *what the answer is* there; it
 structurally cannot judge timing, liveness, or long-horizon resource behavior — tier 6.
 

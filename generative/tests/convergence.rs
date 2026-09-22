@@ -202,6 +202,7 @@ proptest! {
     #![proptest_config(proptest_config())]
 
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_for_trivial_programs(program in trivial_program()) {
         run_one(&program)?;
     }

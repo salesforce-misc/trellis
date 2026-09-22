@@ -284,6 +284,7 @@ proptest! {
     /// converge against their own oracle at every checkpoint — neither
     /// perturbing the other, and neither's correctness masking the other's.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_two_side_by_side_instances_each_converge_against_their_own_oracle(
         program_a in trivial_program(),
         program_b in trivial_program(),

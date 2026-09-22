@@ -67,41 +67,35 @@ async fn a_backend_that_cannot_stand_up_is_reported_unusable() {
     );
 }
 
-/// Self-enforcing half of the fast/deep CI split (issue #172):
-/// `.github/workflows/ci.yml`'s fast lane skips every proptest property with
-/// `cargo test -p generative -- --skip property_`, relying on all 10
-/// properties being named with a `property_` prefix rather than a
-/// hand-maintained name list. This scans every `generative/tests/*.rs`
-/// source file, finds each `proptest! { ... }` block, and asserts every `fn`
-/// declared inside one starts with `property_` — so a future property added
-/// without the prefix fails the build here instead of silently dodging the
-/// fast-lane skip (and silently getting deep-run at PR-time case counts).
+/// Self-enforcing half of the fast/deep split (issue #172): every proptest property is `#[ignore]`d, so a plain `cargo test
+/// --workspace` — the command every contributor and CI lane reaches for first —
+/// never deep-runs them by accident. Deep runs opt in with `-- --ignored` (just
+/// the properties) or `-- --include-ignored` (everything). Properties are also
+/// named with a `property_` prefix so they stay easy to spot and to filter
+/// (`cargo test -p generative -- --ignored property_convergence`).
+///
+/// This scans every `generative/tests/*.rs` source file, finds each
+/// `proptest! { ... }` block, and asserts every `fn` declared inside one both
+/// starts with `property_` and carries an `#[ignore ...]` attribute — so a
+/// future property added without either fails the build here instead of
+/// silently running on every push at PR-time case counts.
 ///
 /// This is a line-based scan, not a real parser: it tracks brace depth to
 /// find the extent of each `proptest! { ... }` block, and within that span
 /// looks for lines whose *trimmed* text starts with `fn ` (or `pub fn `) to
-/// find declarations — matching how every `proptest!` block in this crate is
-/// actually formatted today (macro invocation alone on its own line, `fn`
-/// declarations flush against the block's indentation, never inlined after
-/// other code). It does not understand string/char literals containing brace
-/// characters, so a `proptest!` block containing a brace inside a string
-/// literal could throw off depth tracking; none currently do. It also would
-/// not catch a property function declared with unusual formatting this scan
-/// doesn't recognize (e.g. `fn` and the name split across a line break, or a
-/// macro-generated fn) — see this test's own source if extending the
-/// property list ever needs either.
-///
-/// **Naming note:** deliberately does not contain the literal substring
-/// `property_` anywhere in its own name. `cargo test`'s test-name filter
-/// (including `--skip`) matches by substring, and this crate's fast lane
-/// runs `cargo test -p generative -- --skip property_` — a name like
-/// `..._is_named_with_the_property_prefix` would itself match that filter
-/// and get skipped by the very mechanism it exists to enforce (caught by
-/// actually running the fast-lane invocation locally: this test, and one of
-/// the scanner's own unit tests below, both briefly vanished from the
-/// filtered run for exactly this reason before being renamed).
+/// find declarations, and lines starting with `#[ignore` to find the
+/// attribute on the next declaration — matching how every `proptest!` block
+/// in this crate is actually formatted today (macro invocation alone on its
+/// own line, attributes and `fn` declarations flush against the block's
+/// indentation, never inlined after other code). It does not understand
+/// string/char literals containing brace characters, so a `proptest!` block
+/// containing a brace inside a string literal could throw off depth tracking;
+/// none currently do. It also would not catch a property function declared
+/// with unusual formatting this scan doesn't recognize (e.g. `fn` and the name
+/// split across a line break, or a macro-generated fn) — see this test's own
+/// source if extending the property list ever needs either.
 #[test]
-fn every_fn_declared_inside_proptest_blocks_uses_the_required_prefix() {
+fn every_fn_declared_inside_proptest_blocks_is_prefixed_and_ignored_by_default() {
     let tests_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
     let mut violations = Vec::new();
     let mut saw_any_proptest_block = false;
@@ -117,13 +111,22 @@ fn every_fn_declared_inside_proptest_blocks_uses_the_required_prefix() {
     for path in entries {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
-        let names = functions_declared_in_proptest_blocks(&source);
-        if !names.is_empty() {
+        let fns = functions_declared_in_proptest_blocks(&source);
+        if !fns.is_empty() {
             saw_any_proptest_block = true;
         }
-        for name in names {
+        for ProptestFn { name, ignored } in fns {
             if !name.starts_with("property_") {
-                violations.push(format!("{}: fn {name}", path.display()));
+                violations.push(format!(
+                    "{}: fn {name} is missing the `property_` prefix",
+                    path.display()
+                ));
+            }
+            if !ignored {
+                violations.push(format!(
+                    "{}: fn {name} is missing an `#[ignore = \"...\"]` attribute",
+                    path.display()
+                ));
             }
         }
     }
@@ -137,21 +140,32 @@ fn every_fn_declared_inside_proptest_blocks_uses_the_required_prefix() {
     assert!(
         violations.is_empty(),
         "every fn inside a `proptest! {{ ... }}` block must be named with a `property_` prefix \
-         (see `.github/workflows/ci.yml`'s fast-lane `--skip property_`), but found:\n{}",
+         and marked `#[ignore]` so plain `cargo test` never deep-runs it (see \
+         generative/README.md), but found:\n{}",
         violations.join("\n")
     );
 }
 
+/// One `fn` declared directly inside a `proptest! { ... }` block.
+#[derive(Debug, PartialEq, Eq)]
+struct ProptestFn {
+    name: String,
+    /// Whether an `#[ignore ...]` attribute appeared between the previous
+    /// declaration (or the block's opening) and this one.
+    ignored: bool,
+}
+
 /// Scans `source` for every `proptest! { ... }` block (tracking brace depth
 /// from the line containing the macro invocation to the line where that
-/// depth returns to zero) and returns the name of every `fn` declared
-/// directly inside one. See
-/// [`every_fn_declared_inside_proptest_blocks_uses_the_required_prefix`]'s doc
-/// comment for this scan's known shape assumptions and blind spots.
-fn functions_declared_in_proptest_blocks(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// depth returns to zero) and returns every `fn` declared directly inside
+/// one. See
+/// [`every_fn_declared_inside_proptest_blocks_is_prefixed_and_ignored_by_default`]'s
+/// doc comment for this scan's known shape assumptions and blind spots.
+fn functions_declared_in_proptest_blocks(source: &str) -> Vec<ProptestFn> {
+    let mut fns = Vec::new();
     let mut in_block = false;
     let mut depth: i32 = 0;
+    let mut pending_ignore = false;
 
     for line in source.lines() {
         if !in_block {
@@ -162,6 +176,7 @@ fn functions_declared_in_proptest_blocks(source: &str) -> Vec<String> {
                 continue;
             }
             in_block = true;
+            pending_ignore = false;
             depth = 0;
             depth += brace_delta(&line[bang_idx..]);
             if depth <= 0 {
@@ -170,8 +185,15 @@ fn functions_declared_in_proptest_blocks(source: &str) -> Vec<String> {
             continue;
         }
 
+        if line.trim_start().starts_with("#[ignore") {
+            pending_ignore = true;
+        }
         if let Some(name) = fn_name_declared_on_line(line) {
-            names.push(name);
+            fns.push(ProptestFn {
+                name,
+                ignored: pending_ignore,
+            });
+            pending_ignore = false;
         }
 
         depth += brace_delta(line);
@@ -180,7 +202,7 @@ fn functions_declared_in_proptest_blocks(source: &str) -> Vec<String> {
         }
     }
 
-    names
+    fns
 }
 
 /// Net change in brace depth across `text` (ignores string/char literals --
@@ -214,22 +236,26 @@ fn fn_name_declared_on_line(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod proptest_scanner_tests {
-    use super::functions_declared_in_proptest_blocks;
+    use super::{ProptestFn, functions_declared_in_proptest_blocks};
+
+    fn names(source: &str) -> Vec<String> {
+        functions_declared_in_proptest_blocks(source)
+            .into_iter()
+            .map(|f| f.name)
+            .collect()
+    }
 
     #[test]
     fn finds_a_single_prefixed_fn_in_a_simple_block() {
         let source = "proptest! {\n    #[test]\n    fn property_foo(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n}\n";
-        assert_eq!(
-            functions_declared_in_proptest_blocks(source),
-            vec!["property_foo".to_string()]
-        );
+        assert_eq!(names(source), vec!["property_foo".to_string()]);
     }
 
     #[test]
     fn finds_multiple_properties_in_one_block() {
         let source = "proptest! {\n    #![proptest_config(cfg())]\n\n    #[test]\n    fn property_a(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n\n    #[test]\n    fn property_b(\n        x in 0..1i32,\n    ) {\n        assert!(x >= 0);\n    }\n}\n";
         assert_eq!(
-            functions_declared_in_proptest_blocks(source),
+            names(source),
             vec!["property_a".to_string(), "property_b".to_string()]
         );
     }
@@ -237,7 +263,7 @@ mod proptest_scanner_tests {
     #[test]
     fn catches_a_fn_missing_the_prefix() {
         let source = "proptest! {\n    #[test]\n    fn not_prefixed_correctly(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n}\n";
-        let names = functions_declared_in_proptest_blocks(source);
+        let names = names(source);
         assert_eq!(names, vec!["not_prefixed_correctly".to_string()]);
         assert!(!names[0].starts_with("property_"));
     }
@@ -245,9 +271,36 @@ mod proptest_scanner_tests {
     #[test]
     fn ignores_fns_outside_any_proptest_block() {
         let source = "fn helper() {}\n\nproptest! {\n    #[test]\n    fn property_only_one(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n}\n\nfn another_helper() {}\n";
+        assert_eq!(names(source), vec!["property_only_one".to_string()]);
+    }
+
+    #[test]
+    fn records_which_fns_carry_an_ignore_attribute() {
+        let source = "proptest! {\n    /// Doc comment.\n    #[test]\n    #[ignore = \"deep lane\"]\n    fn property_a(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n\n    #[test]\n    fn property_b(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n}\n";
         assert_eq!(
             functions_declared_in_proptest_blocks(source),
-            vec!["property_only_one".to_string()]
+            vec![
+                ProptestFn {
+                    name: "property_a".to_string(),
+                    ignored: true,
+                },
+                ProptestFn {
+                    name: "property_b".to_string(),
+                    ignored: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ignore_outside_the_block_does_not_leak_into_it() {
+        let source = "#[ignore]\n#[test]\nfn unrelated() {}\n\nproptest! {\n    #[test]\n    fn property_a(x in 0..1i32) {\n        assert!(x >= 0);\n    }\n}\n";
+        assert_eq!(
+            functions_declared_in_proptest_blocks(source),
+            vec![ProptestFn {
+                name: "property_a".to_string(),
+                ignored: false,
+            }]
         );
     }
 }

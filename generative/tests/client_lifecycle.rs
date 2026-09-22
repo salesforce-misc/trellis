@@ -186,6 +186,7 @@ proptest! {
     /// false-positive gap in `staging::converge::converged_through`)
     /// and the fix, now landed in both places. Re-enabled.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_across_a_mid_stream_client_restart(
         program in program_with_client_restart(true)
     ) {
@@ -220,6 +221,7 @@ proptest! {
     /// regression in this fix would be caught immediately, before any
     /// randomly-generated case even runs.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_across_a_mid_stream_scale_out(
         program in program_with_scale_out(true)
     ) {

@@ -7,9 +7,13 @@ operational notes.
 
 ## A real full run is minutes, not seconds
 
-If `cargo test -p generative` reports green in about a second, it executed
-nothing — check `PROPTEST_CASES` and that the properties actually ran, not
-just the meta-tests. Each proptest case round-trips through a real Postgres
+Every proptest property in this crate is `#[ignore]`d, so a plain `cargo
+test -p generative` (or `cargo test --workspace`) runs only the fast,
+non-property tests — see the CI split below. To actually deep-run the
+properties, opt in with `-- --ignored` (properties only) or
+`-- --include-ignored` (everything). If such an opted-in run reports green in
+about a second, it executed nothing — check `PROPTEST_CASES` and that the
+properties actually ran, not just the meta-tests. Each proptest case round-trips through a real Postgres
 cluster (`testkit`), so a healthy run at the design doc §9 case-count band
 (12–24 per property) takes real wall-clock time. A suite that reports green
 too fast to have done that work is a bug in the harness, not a fast pass —
@@ -37,41 +41,54 @@ not a suite problem, and is out of scope for this crate to fix; see the git
 history for `generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for
 the full measurement writeup.
 
-Because paying that cost 10 times over on every push/PR would be expensive,
-the crate's 10 proptest properties are all named with a `property_` prefix
-(enforced by a self-check in `tests/meta.rs` that scans every `proptest! {
-... }` block in `tests/*.rs` and fails the build if any `#[test] fn` inside
-one lacks the prefix — a future property added without it breaks CI rather
-than silently skipping the split below). That prefix is the actual fast/deep
-split, wired into two workflows:
+Because paying that cost for every property on every push/PR would be
+expensive — and because a contributor's (or agent's) first reflex is a plain
+`cargo test --workspace` — the properties are **opt-in**. Every `fn` inside a
+`proptest! { ... }` block carries
+`` #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"] ``
+and a `property_` name prefix, both enforced by a self-check in
+`tests/meta.rs` that scans every `proptest!` block in `tests/*.rs` and fails
+the build if any `fn` inside one lacks either (so a new property can't
+silently start running on every push). That attribute is the fast/deep split,
+wired into two workflows:
 
-- **`.github/workflows/ci.yml`'s "Test generative (fast lane)" step (every
-  push/PR):** `cargo test -p generative -- --skip property_` — skips all 10
-  properties at once, by prefix, and runs everything else in the crate (the
-  lib, `coverage`, `meta`, `oracle`, `backend_seam`, `backfill`, and every
-  hand-built pin/regression test) at each target's own default case count.
-  This is the ~22s-and-under path described above; the DB-backed pins can
-  still individually hit the quiesce stall, just far less often than a
-  16-case property's ~80 ops.
+- **`.github/workflows/ci.yml`'s "Test" step (every push/PR):** a plain
+  `cargo test --workspace`. For this crate that skips every property (they're
+  ignored) and runs everything else (the lib, `coverage`, `meta`, `oracle`,
+  `backend_seam`, `backfill`, and every hand-built pin/regression test) at
+  each target's own default case count. This is the ~22s-and-under path
+  described above; the DB-backed pins can still individually hit the quiesce
+  stall, just far less often than a 16-case property's ~80 ops.
 - **`.github/workflows/nightly.yml` (scheduled, 06:00 UTC daily, plus
   `workflow_dispatch`):** deep-runs exactly one property,
   `property_convergence_holds_for_trivial_programs`, at `PROPTEST_CASES=200`
   — `cargo test -p generative --test convergence
-  property_convergence_holds_for_trivial_programs`. This is the crate's most
-  exercised property (see the design doc's property list) and the only one
-  given an in-repo deep run today; the other 9 are not deep-run anywhere in
-  this repo's CI config. The property's
+  property_convergence_holds_for_trivial_programs -- --ignored`. This is the
+  crate's most exercised property (see the design doc's property list) and
+  the only one given an in-repo deep run today; the others are not deep-run
+  anywhere in this repo's CI config. The property's
   `FileFailurePersistence::SourceParallel` config (see
   `tests/convergence.rs`'s `proptest_config`) already writes any failing case
   to `generative/tests/convergence.proptest-regressions` and replays it first
   on the next run — commit that file if a deep run ever produces one, so the
-  failure becomes a real, replayable regression the fast lane picks up too.
+  failure becomes a real, replayable regression. Note that the fast lane does
+  *not* replay it (the property is ignored there); a regression worth pinning
+  on every push should also get a hand-minimized pin test.
 
-**Case-count calibration across all 10 properties is not this repo's job.** A
+Useful local invocations:
+
+```sh
+cargo test --workspace                                   # fast: no properties
+cargo test -p generative -- --ignored                    # every property, default 16 cases
+PROPTEST_CASES=4 cargo test -p generative --test noise -- --ignored   # one file, quick smoke
+cargo test -p generative --test convergence -- --include-ignored     # a file's properties + its other tests
+```
+
+**Case-count calibration across all the properties is not this repo's job.** A
 separate, out-of-repo nightly (run by the maintainer, not part of any
 workflow file here) covers that; don't go looking for it in
 `.github/workflows/` — it isn't there.
 
-The "minutes, not seconds" heuristic above describes the *deep* lane (and a
-manual `cargo test -p generative` with no `--skip`), not the PR-path fast
-lane, which is designed to be fast.
+The "minutes, not seconds" heuristic above describes the *deep* lane (any
+run with `--ignored`/`--include-ignored`), not the default fast lane, which is
+designed to be fast.

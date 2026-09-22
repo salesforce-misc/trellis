@@ -687,6 +687,7 @@ proptest! {
     /// `generative::oracle::sql_oracle`'s own independent recompute — across
     /// the generated space, not just one fixed numeric-add case.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_self_check_catches_out_of_band_tampering_across_generated_programs(
         (program, cell_selector, field_selector) in program_with_corruption_selectors()
     ) {

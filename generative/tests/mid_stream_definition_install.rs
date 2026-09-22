@@ -103,6 +103,7 @@ proptest! {
     /// definition, i.e. must correctly backfill those preexisting rows and
     /// then keep up with whatever ops follow.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_with_a_mid_stream_definition_install(
         program in program_with_mid_stream_def_install(true)
     ) {

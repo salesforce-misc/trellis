@@ -128,6 +128,7 @@ proptest! {
     /// D2's property: reordering ops across distinct target keys must not
     /// change the converged state.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_commuting_reorderings_converge_identically(program in trivial_program()) {
         run_one(&program)?;
     }

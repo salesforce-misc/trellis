@@ -104,6 +104,7 @@ proptest! {
     /// `1..=MAX_BULK_INSERT_ROWS` via `prop_flat_map`, the same idiom
     /// `MAX_SEED_ROWS`/`MAX_MUTATES` already use).
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_for_bulk_insert_programs(program in bulk_insert_program()) {
         run_one(&program)?;
     }

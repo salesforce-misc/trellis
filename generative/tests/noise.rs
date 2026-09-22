@@ -152,6 +152,7 @@ proptest! {
     /// interleaved throughout a real generated program's op stream, must
     /// never perturb the tracked convergence check.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_untracked_table_noise_never_perturbs_convergence((program, noise) in program_with_noise_plan()) {
         run_one(&program, &noise)?;
     }
@@ -159,6 +160,7 @@ proptest! {
     /// E5's property: interleaved `CHECKPOINT`s must never perturb the
     /// tracked convergence check either.
     #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_interleaved_checkpoints_never_perturb_convergence((program, noise) in program_with_checkpoint_plan()) {
         run_one(&program, &noise)?;
     }
