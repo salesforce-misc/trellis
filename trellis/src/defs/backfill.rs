@@ -791,6 +791,28 @@ async fn discover_pk_ranges(
         .map(|c| format!("{c}::text"))
         .collect::<Vec<_>>()
         .join(", ");
+    // A genuine `PRIMARY KEY` column is always `NOT NULL` (Postgres enforces
+    // it), so this is a no-op filter there — it only ever excludes anything
+    // when `pk` is the nullable fallback key `source_primary_key_in_txn`
+    // resolves for a chained aggregate's `GROUP BY` (`UNIQUE NULLS NOT
+    // DISTINCT`, issue #128). `hi_select` reads each column as a bare
+    // `col::text`, which panics on a genuine SQL `NULL` (`Row::get::<_,
+    // String>` isn't `Option`-aware) — and a row-value comparison alone
+    // doesn't reliably keep such a row out of the window: `(a, b) > (lo_a,
+    // lo_b)` is `true` (not `null`/excluded) whenever `a` alone already
+    // decides it, even if `b` is `NULL` (Postgres's row-comparison semantics
+    // short-circuit on the first deciding member). Filtering every column
+    // to `is not null` up front keeps any such row out of both the paging
+    // window and the boundary itself, matching this build's own invariant
+    // that a NULL-keyed group can never be represented in a 1-1 target
+    // (its own primary key is unconditionally `NOT NULL`) — the same
+    // grouping this test suite already documents for the live-apply path in
+    // `one_to_one_chained_off_nullable_aggregate_group_key.rs`.
+    let not_null_filter = pk_idents
+        .iter()
+        .map(|c| format!("{c} is not null"))
+        .collect::<Vec<_>>()
+        .join(" and ");
 
     let mut ranges = Vec::new();
     let mut lo: Option<Vec<String>> = None;
@@ -801,7 +823,7 @@ async fn discover_pk_ranges(
                     .query_opt(
                         &format!(
                             "select {hi_select} from \
-                             (select {col_list} from {source} \
+                             (select {col_list} from {source} where {not_null_filter} \
                               order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
                              order by {order_desc} limit 1"
                         ),
@@ -817,7 +839,8 @@ async fn discover_pk_ranges(
                     .query_opt(
                         &format!(
                             "select {hi_select} from \
-                             (select {col_list} from {source} where {where_clause} \
+                             (select {col_list} from {source} \
+                              where {where_clause} and {not_null_filter} \
                               order by {col_list} limit {BACKFILL_CHUNK_ROWS}) s \
                              order by {order_desc} limit 1"
                         ),
