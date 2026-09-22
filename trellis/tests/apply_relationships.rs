@@ -540,7 +540,15 @@ async fn reverse_recompute_to_one_converges_across_related_row_mutations() {
 
 /// The from-side `Recompute` keys the reverse resolver staged into the active
 /// ring segment, distinct and sorted.
+///
+/// `from_table` is accepted bare, for callers' readability, and qualified
+/// through [`qualify_fixture_table`] before the probe — issue #267: reverse
+/// recompute now stages its `src_table` under the same qualified identity CDC
+/// intake uses (`relationship_definitions.from_table` is bare, so `compute`
+/// canonicalizes it at the staging boundary), so a bare probe here matches
+/// nothing at all rather than reporting the rows that really were staged.
 async fn staged_from_side_recomputes(client: &Client, from_table: &str) -> Vec<String> {
+    let from_table = qualify_fixture_table(from_table);
     let seg = active_seg_table(client).await;
     let sql = format!("select distinct key from {seg} where src_table = $1 order by key");
     client
@@ -706,7 +714,10 @@ async fn reverse_recompute_to_many_stages_from_side_recomputes() {
 /// segment — deliberately *not* `distinct`, unlike [`staged_from_side_recomputes`]
 /// above: issue #79 is exactly a case where the same key is staged more than
 /// once, which a `distinct` read would silently hide.
+/// `from_table` is qualified through [`qualify_fixture_table`] for the same
+/// reason [`staged_from_side_recomputes`] does it (issue #267).
 async fn staged_recompute_count(client: &Client, from_table: &str, key: &str) -> i64 {
+    let from_table = qualify_fixture_table(from_table);
     let seg = active_seg_table(client).await;
     let sql = format!("select count(*) from {seg} where src_table = $1 and key = $2");
     client
@@ -939,6 +950,10 @@ async fn staged_recompute_src_changed(
     from_table: &str,
     key: &str,
 ) -> Option<std::time::SystemTime> {
+    // Qualified for the same reason [`staged_from_side_recomputes`] does it
+    // (issue #267) — and this one is a `query_one`, so a bare probe would fail
+    // outright on "no rows" rather than quietly return a zero count.
+    let from_table = qualify_fixture_table(from_table);
     let seg = active_seg_table(client).await;
     let sql = format!(
         "select src_changed from {seg} where src_table = $1 and key = $2 and op = 'recompute'"

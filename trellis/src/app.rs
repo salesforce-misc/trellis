@@ -612,22 +612,18 @@ impl Trellis {
                     )
                     .await?
                     .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
-                // Issue #72: `transform_definitions.source_table` is now
-                // fully qualified, but `poison.src_table` (what CDC intake
-                // actually stages) isn't uniformly so — a raw/CDC-sourced
-                // definition's poisoned rows are staged qualified (matching
-                // `qualified` directly), while a definition chained off
-                // another's target table are staged bare. Landing issue #73
-                // (which persists `transform_definitions.target_table`
-                // qualified too) doesn't close this gap: a chained
-                // definition's poisoned rows get their `src_table` from
-                // `ddl::neighbor_table_name`, which #73 deliberately leaves
-                // bare (see `defs::source_table_version`'s doc comment for
-                // the full rationale, and why closing this for good is
-                // issue #75's emission-audit territory instead). Matching
-                // against both forms keeps this query correct either way
-                // rather than picking one and silently going empty for the
-                // other.
+                // Issue #72: `transform_definitions.source_table` is fully
+                // qualified, and as of issue #267 so is every `src_table`
+                // `staging::apply` emits — a definition chained off another's
+                // target table used to stage its downstream trigger (and so
+                // its poisoned rows) under `ddl::neighbor_table_name`'s
+                // deliberately bare name, which this query's `bare` arm
+                // existed to catch. Both arms are kept regardless: `poison`
+                // rows are durable, so rows recorded before that fix still
+                // carry the bare spelling, and this crate's own integration
+                // fixtures stage bare names by hand. Matching against both
+                // forms keeps this query correct either way rather than
+                // picking one and silently going empty for the other.
                 let qualified: String = source_row.get(0);
                 let bare = qualified
                     .split_once('.')

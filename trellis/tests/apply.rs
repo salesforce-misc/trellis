@@ -1332,7 +1332,11 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     assert_eq!(total, "11.50");
 
     // The apply must have staged a Recompute trigger for order_totals's own
-    // downstream reader, landing in the ring's active segment.
+    // downstream reader, landing in the ring's active segment — under
+    // `order_totals`'s *qualified* identity (issue #267: propagation used to
+    // stage the bare `def.target`, which the fold could never coalesce with
+    // the qualified spelling CDC intake stages for the very same table once
+    // an intermediate hop joins the publication).
     let staged: i64 = client
         .query_one(
             "select count(*) from (
@@ -1340,7 +1344,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
                  union all select src_table, key from seg_1
                  union all select src_table, key from seg_2
                  union all select src_table, key from seg_3
-             ) rows where src_table = 'order_totals' and key = '1'",
+             ) rows where src_table = 'public.order_totals' and key = '1'",
             &[],
         )
         .await
@@ -1375,7 +1379,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
                  union all select src_table, key from seg_1
                  union all select src_table, key from seg_2
                  union all select src_table, key from seg_3
-             ) rows where src_table = 'order_summary'",
+             ) rows where src_table = 'public.order_summary'",
             &[],
         )
         .await

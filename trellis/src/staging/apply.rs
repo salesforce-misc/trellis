@@ -438,16 +438,24 @@ impl From<crate::error::Error> for ApplyError {
 /// `ApplyPlan::versions`, etc.), can stay unchanged rather than needing this
 /// hot path to thread real schema identity through. See
 /// [`crate::defs::source_table_version`]'s doc comment for the full
-/// bare-vs-qualified rationale — including why issue #73 (which also
-/// persists `transform_definitions.target_table` qualified) does *not*
-/// retire this stripping: a target table's own downstream `src_table` (the
-/// `Recompute` rows this module stages) is still unqualified —
-/// [`crate::defs::ddl::neighbor_table_name`] deliberately never adds a
-/// schema, issue #73 or not — so stripping remains a no-op for that case,
-/// exactly as before #72, rather than becoming a stable identity function
-/// this call site could now skip outright. Retiring the split entirely (by
-/// qualifying every emitted `src_table`, `Recompute` rows included) is issue
-/// #75's emission-audit territory.
+/// bare-vs-qualified rationale.
+///
+/// Since issue #267 this module no longer *emits* a bare `src_table` at all:
+/// every row it stages carries a qualified identity, so as a matter of fact
+/// this function now only ever sees a dotted name and its strip is a stable
+/// suffix extraction rather than a conditional one. It is kept as a strip
+/// regardless, for two reasons. Ring rows are durable — a segment staged
+/// before the upgrade can still be drained after it — and the *fixtures* in
+/// this crate's own integration tests stage bare names by hand
+/// (`tests/claims.rs`, `tests/converge.rs`, `tests/liveness.rs`,
+/// `tests/app_converge.rs`, and others), which readers are expected to keep
+/// tolerating. Note what #267 *did* change is narrower than "always
+/// qualified everywhere": [`crate::defs::ddl::neighbor_table_name`] still
+/// deliberately returns a bare `def.target`, and this module still keys its
+/// own in-memory bookkeeping (`changed`, `ApplyPlan::downstream_readers`,
+/// `ApplyPlan::targets`) on that bare name. Only the string that crosses
+/// into the ring is canonicalized — see
+/// [`ApplyPlan::downstream_readers`].
 ///
 /// This function's output stays purely a *lookup key* (issue #76's own
 /// reviewer follow-up): every catalog read below it (`source_table_version`,
@@ -475,23 +483,19 @@ fn catalog_source_key(src_table: &str) -> &str {
 /// A no-op for the common case — `src_table` already contains a `.` — which
 /// covers every real CDC-staged or backfill-enumerated change (issue #76
 /// qualifies `change.src_table` unconditionally at the point it's staged).
-/// Two different shapes of bare `src_table` reach this function, needing
-/// two different resolutions — both handled by delegating to
+/// Two different shapes of bare name reach this function, needing two
+/// different resolutions — both handled by delegating to
 /// [`catalog::resolve_graph_identity`] rather than this function choosing
 /// between them itself:
 ///
-/// 1. A downstream `Recompute` trigger *this apply path itself* staged for
-///    a chained definition's target (`compute`'s "Downstream propagation"
-///    step, `apply_and_mark_drained`), carrying the plain, bare
-///    `def.def.target` as its `src_table` (qualifying every such row at the
-///    point it's staged is issue #75's emission-audit territory, not this
-///    one's — see `catalog_source_key`'s own doc comment on the same
-///    deliberate-bare convention). This is `resolve_graph_identity`'s
-///    bare-target-suffix fallback: the name can only be some other live
+/// 1. A chained definition's own target, bare as
+///    [`crate::defs::ddl::neighbor_table_name`] always returns it — the
+///    `changed`/[`ApplyPlan::downstream_readers`] bookkeeping key `compute`'s
+///    "Downstream propagation" reader lookup asks about. This is
+///    `resolve_graph_identity`'s bare-target-suffix fallback (for a target
+///    that isn't on the `search_path`): the name can only be some other live
 ///    definition's own target.
-/// 2. A reverse-recompute trigger for a relationship's from-side
-///    (`from_side_keys`'s callers below, staging `rel.def.from_table` as
-///    `src_table`) —
+/// 2. A relationship's from-side, `rel.def.from_table` —
 ///    `relationship_definitions.from_table` is always bare (ADR-0007's
 ///    "Scope" section leaves relationship endpoints unqualified) and is a
 ///    genuine *source* table, never anyone's target, so the bare-target-
@@ -499,6 +503,16 @@ fn catalog_source_key(src_table: &str) -> &str {
 ///    `resolve_graph_identity`'s *first* step instead: a plain physical
 ///    `search_path` lookup, exactly like resolving a fresh definition's own
 ///    bare `FROM`.
+///
+/// Issue #267 turned both of those from after-the-fact repairs of an
+/// already-staged bare `src_table` into the canonicalization applied *before*
+/// staging: this function's output is now what those rows carry into the ring
+/// in the first place, so a bare `src_table` reaching `compute` is no longer
+/// something this module itself produces. See
+/// [`ApplyPlan::downstream_readers`] and
+/// [`accumulate_from_side_recomputes`] for the two emission sites, and
+/// [`catalog_source_key`] for why the reading side still tolerates a bare
+/// name anyway.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
@@ -934,6 +948,18 @@ async fn accumulate_from_side_recomputes(
         return Ok(());
     }
     let join_keys: Vec<String> = key_hops.keys().cloned().collect();
+    // Issue #267: `relationship_definitions.from_table` is bare (ADR-0007's
+    // "Scope" leaves relationship endpoints unqualified), but this
+    // accumulator's entries become staged `src_table`s verbatim
+    // ([`apply_and_mark_drained_many`]'s step 4), so they are canonicalized to
+    // qualified identity here — the spelling CDC intake stages for this same
+    // from-side table (which, being a genuine source table, is normally a
+    // publication member), and the spelling the Phase 3
+    // `relationship_reverse_fallback` twin of this path has always used
+    // (`ReverseRelationshipShape::from_table` is already qualified). Two
+    // spellings of one table fold as two unrelated `(src_table, key)` groups;
+    // see `ApplyPlan::downstream_readers` for what that costs.
+    let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
     let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
     let matches = from_side_keys(
         pool,
@@ -951,7 +977,7 @@ async fn accumulate_from_side_recomputes(
         let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
         let src_changed = key_src_changed.get(&join_text).copied().flatten();
         reverse_recomputes
-            .entry((rel.def.from_table.clone(), from_key))
+            .entry((qualified_from_table.clone(), from_key))
             .and_modify(|(h, sc)| {
                 *h = (*h).max(hop);
                 *sc = earliest_src_changed(*sc, src_changed);
@@ -3925,11 +3951,13 @@ mod tests {
 /// loaded for it (`None` for a source with no definitions at all — still
 /// fenced, so a definition created against it mid-drain is caught too).
 /// `downstream_readers` records, per target table this batch wrote to,
-/// whether any definition currently reads it — decided here (a catalog
-/// read, like the evaluation lookups above it) rather than in Phase 3,
-/// which holds no pool connection of its own and must stay a pure,
-/// txn-scoped function. See [`apply_and_mark_drained`]'s doc comment on the
-/// staleness this implies and why it's an accepted tradeoff.
+/// whether any definition currently reads it *and*, when one does, the
+/// fully-qualified identity to stage that target's propagated `src_table`
+/// under — both decided here (a catalog read, like the evaluation lookups
+/// above it) rather than in Phase 3, which holds no pool connection of its
+/// own and must stay a pure, txn-scoped function. See
+/// [`apply_and_mark_drained`]'s doc comment on the staleness this implies
+/// and why it's an accepted tradeoff.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyPlan {
     versions: HashMap<String, Option<i64>>,
@@ -3941,7 +3969,19 @@ pub struct ApplyPlan {
     /// vs. `apply_aggregate::apply_aggregate_target`'s sequential per-group
     /// upserts) are different enough not to share one plan type.
     aggregate_targets: HashMap<String, AggregateTargetPlan>,
-    downstream_readers: HashMap<String, bool>,
+    /// Per target table this batch wrote to: `Some(qualified_identity)` when
+    /// some definition currently reads that target (so step 4 must stage a
+    /// downstream trigger for it), `None` when nothing does (propagation
+    /// stops). Issue #267: the payload is the *qualified* identity
+    /// ([`qualified_schema_node_key`] of the bare `def.def.target`), not the
+    /// bare key this map is itself keyed on, because the bare name is the one
+    /// thing Phase 3 must *not* stage — see step 4's own comment, and
+    /// [`catalog_source_key`]'s doc comment for the wider convention.
+    /// Resolved here rather than in Phase 3 for the same reason the
+    /// has-a-reader question is: it needs a catalog read, and it costs
+    /// nothing extra since the reader lookup already performs exactly this
+    /// resolution.
+    downstream_readers: HashMap<String, Option<String>>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -4255,11 +4295,24 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // definition it's evaluated against). A live `42P01` here means
         // `source_key` no longer exists (issue #16's dropped-table purge,
         // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
+        //
+        // Issue #267: reported as `qualified_source` (the ring's own spelling)
+        // rather than the bare `source_key`. This error's two consumers —
+        // `quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
+        // `folded.retain(|c| c.src_table != source_table)` — both compare it
+        // to a ring row's `src_table` as an exact string, so a bare name
+        // purges and filters *nothing* and the retry loop re-fails forever on
+        // the same input. The `NoPrimaryKey` arm just below always did report
+        // the qualified form (`source_primary_key` echoes back the name it was
+        // given, which is `qualified_source` here); this arm's bare spelling
+        // happened to match only for a propagated downstream trigger, the one
+        // producer of bare `src_table` rows — which is exactly what #267
+        // stopped producing, so the two arms are made consistent instead.
         let pk = match ddl::source_primary_key(pool, qualified_source).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
                 return Err(ApplyError::SourceTableDropped {
-                    source_table: source_key.to_string(),
+                    source_table: qualified_source.to_string(),
                 });
             }
             Err(DdlError::NoPrimaryKey { source_table })
@@ -5070,8 +5123,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let pk = match ddl::source_primary_key(pool, &change.src_table).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
+                // Issue #267: the ring's own spelling, not the bare
+                // `source_key` — see the by-source loop above's identical
+                // comment on this same arm.
                 return Err(ApplyError::SourceTableDropped {
-                    source_table: source_key.to_string(),
+                    source_table: change.src_table.clone(),
                 });
             }
             Err(DdlError::NoPrimaryKey { source_table })
@@ -5188,6 +5244,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     ),
                 );
             }
+            // Issue #267: canonicalized to qualified identity for the same
+            // reason [`accumulate_from_side_recomputes`] does it — this shares
+            // that function's accumulator, and its entries are staged as
+            // `src_table` verbatim.
+            let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
             let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
             let from_keys = from_side_keys(
                 pool,
@@ -5200,7 +5261,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             let hop = change.hop_gen + 1;
             for (from_key, _) in from_keys {
                 reverse_recomputes
-                    .entry((rel.def.from_table.clone(), from_key))
+                    .entry((qualified_from_table.clone(), from_key))
                     .and_modify(|(h, sc)| {
                         *h = (*h).max(hop);
                         *sc = earliest_src_changed(*sc, change.src_changed);
@@ -5230,11 +5291,26 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // a bare `Recompute`-staged `src_table` above (this *is* exactly
         // that case, one step earlier: `target` is about to become such a
         // row's `src_table` the moment this loop's caller stages it).
-        let has_downstream =
-            !catalog::transforms_for_source(pool, &qualified_schema_node_key(pool, target).await?)
-                .await?
-                .is_empty();
-        downstream_readers.insert(target.clone(), has_downstream);
+        //
+        // Issue #267: that resolution is now *kept*, not discarded once the
+        // reader question is answered, and Phase 3 stages it verbatim as the
+        // propagated row's `src_table`. Reusing the identity this lookup
+        // already computed is what makes the emitted spelling agree, by
+        // construction, with the one CDC intake independently stages for the
+        // same physical table (`publication::qualify` of the WAL relation's
+        // own namespace) — `resolve_graph_identity`'s first step is a
+        // `search_path` lookup of the real relation, which a target table
+        // always satisfies, so both paths name the same physical schema.
+        // Without that agreement, one write to an intermediate hop folds as
+        // two unrelated `(src_table, key)` groups and the downstream target's
+        // batched upsert is handed the same conflict key twice, which
+        // Postgres rejects outright — a permanent live-lock, since every
+        // retry re-derives the identical pair.
+        let qualified_target = qualified_schema_node_key(pool, target).await?;
+        let has_downstream = !catalog::transforms_for_source(pool, &qualified_target)
+            .await?
+            .is_empty();
+        downstream_readers.insert(target.clone(), has_downstream.then_some(qualified_target));
         // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
         // recorded for a *terminal* transform — one with no downstream
         // reader of its own — reusing this exact "does anything read
@@ -6611,14 +6687,20 @@ pub async fn apply_and_mark_drained_many(
     let mut hop_bound_tables = Vec::new();
     let mut worst_hop_gen = 0;
     for (target, touched) in &changed {
-        if !plan
+        // Issue #267: `target` is the bare `def.def.target` this whole
+        // function keys its bookkeeping on, but the `src_table` staged below
+        // must be the qualified identity Phase 2 resolved for it — the same
+        // string CDC intake stages for this table if it is (or later becomes)
+        // a publication member in its own right, which every intermediate hop
+        // of a chain eventually does. `None` here means nothing reads this
+        // target, so propagation stops; see `ApplyPlan::downstream_readers`.
+        let Some(qualified_target) = plan
             .downstream_readers
             .get(*target)
-            .copied()
-            .unwrap_or(false)
-        {
+            .and_then(Option::as_ref)
+        else {
             continue;
-        }
+        };
         // Issue #180 hardening: one batch can physically touch the same
         // target key more than once. The forward aggregate step (3b) and
         // *each* per-record reverse-relationship fast-path apply (3d) extend
@@ -6655,7 +6737,7 @@ pub async fn apply_and_mark_drained_many(
         for (key, hop_gen, src_changed, deleted_old_image) in touched {
             let next_hop = hop_gen + 1;
             if next_hop > MAX_HOP_GEN {
-                hop_bound_tables.push(target.to_string());
+                hop_bound_tables.push(qualified_target.clone());
                 worst_hop_gen = worst_hop_gen.max(next_hop);
                 continue;
             }
@@ -6690,7 +6772,7 @@ pub async fn apply_and_mark_drained_many(
             match deleted_old_image {
                 Some(old_image) if !rewritten.contains(key.as_str()) => {
                     recompute_changes.push(StagedChange::Cdc {
-                        src_table: target.to_string(),
+                        src_table: qualified_target.clone(),
                         key: key.clone(),
                         op: append::CdcOp::Delete,
                         lsn: None,
@@ -6704,7 +6786,7 @@ pub async fn apply_and_mark_drained_many(
                 }
                 _ => {
                     recompute_changes.push(StagedChange::Recompute {
-                        src_table: target.to_string(),
+                        src_table: qualified_target.clone(),
                         key: key.clone(),
                         hop_gen: next_hop,
                         group_key: None,
