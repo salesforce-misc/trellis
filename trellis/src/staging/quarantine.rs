@@ -586,6 +586,53 @@ pub async fn isolate_and_evict(
     Ok(Some(retry_folded))
 }
 
+/// Resolves a ring row's raw `src_table` to the fully-qualified identity
+/// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] require
+/// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a bare
+/// lookup there silently finds *nothing* rather than erroring) — this
+/// module's counterpart to `super::apply`'s own `qualified_schema_node_key`,
+/// which every `apply.rs` call site already goes through.
+///
+/// Issue #281: both of this module's `transforms_for_source` call sites
+/// ([`trip_transform_fuse_if_crossed`] and [`attribute_column_failure`]) used
+/// to pass the raw `src_table` straight through, so for any bare spelling the
+/// whole-transform fuse crossed its threshold and quarantined nothing, and
+/// column failures went unattributed — both entirely silently, since an
+/// unqualified argument is an empty result set, not an error. Issue #267
+/// stopped `apply.rs` *emitting* bare `src_table` going forward, but durable
+/// pre-#267 ring rows, `relationship_definitions.from_table`-shaped bare
+/// names (ADR-0007 leaves relationship endpoints unqualified), and the
+/// crate's own integration fixtures that stage bare `src_table` by hand all
+/// still reach here.
+///
+/// **Unresolvable names fall through to the raw spelling rather than
+/// erroring**, which is the one deliberate difference from
+/// `apply::qualified_schema_node_key` (that one propagates
+/// [`catalog::CatalogError::SourceTableNotFound`], mirroring
+/// `catalog::resolve_relationship_endpoint`'s same tolerance instead). Every
+/// caller here is *diagnosing* an already-failed batch: turning a name this
+/// module cannot resolve into a brand-new `ApplyError` would replace the
+/// original failure being quarantined with a confusing secondary one, and
+/// could abort the eviction transaction that is the whole point of the call.
+/// Two real shapes hit that branch — `apply::relationship_reverse_deferred_src_table`'s
+/// U+001F-prefixed synthetic sentinel (neither bare nor qualified, and not a
+/// physical table at all; [`isolate_and_evict`] already skips those rows
+/// before either call site, so this is belt-and-braces), and a durable ring
+/// row naming a source table that has since been dropped. Both previously
+/// reached `transforms_for_source` and found nothing; both still do, which is
+/// exactly the pre-existing behavior for the cases where nothing *can* be
+/// found.
+async fn qualified_src_table(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
+    if src_table.contains('.') {
+        return Ok(src_table.to_string());
+    }
+    match catalog::resolve_graph_identity(pool, src_table).await {
+        Ok(qualified) => Ok(qualified),
+        Err(catalog::CatalogError::SourceTableNotFound(_)) => Ok(src_table.to_string()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Whole-transform fuse (ADR-0003's original, coarser tier — issue #105)
 // ---------------------------------------------------------------------
@@ -711,6 +758,11 @@ async fn take_fuse_gate(txn: &Transaction<'_>, src_table: &str) -> Result<(), Ap
 /// needs no gate of its own — once the gate has been passed, every committed
 /// sibling row is visible to both, whatever their `poisoned_at`.
 ///
+/// `src_table` is routed through [`qualified_src_table`] before the catalog
+/// lookup (issue #281): a bare spelling handed straight to
+/// [`catalog::transforms_for_source`] silently resolves to *no* definitions,
+/// so the fuse would cross its threshold and then quarantine nothing at all.
+///
 /// The old unwindowed `count(*)` survives as a cheap guard in front of the
 /// loop: a window can only ever *remove* `poison` rows from the count, so a
 /// source below threshold in total is below it for every definition, and the
@@ -757,7 +809,24 @@ pub async fn trip_transform_fuse_if_crossed(
         return Ok(());
     }
 
-    let definitions = catalog::transforms_for_source(pool, src_table).await?;
+    let qualified = qualified_src_table(pool, src_table).await?;
+    let definitions = catalog::transforms_for_source(pool, &qualified).await?;
+    // Defense in depth for the issue-#281 class: "threshold crossed, nothing
+    // to quarantine" is never a normal outcome — `poison` rows only exist for
+    // a source some definition was evaluating — so say so out loud rather than
+    // returning silently, which is exactly what made the original bug
+    // invisible. Not a `debug_assert!`: a source table legitimately dropped
+    // (or every definition on it dropped) between the eviction and this lookup
+    // reaches here too, and that is not a programming error.
+    if definitions.is_empty() {
+        tracing::warn!(
+            src_table = %src_table,
+            qualified = %qualified,
+            poisoned_total,
+            "whole-transform fuse threshold crossed but no definitions resolved for this \
+             source; nothing quarantined"
+        );
+    }
     for def in definitions {
         if def.status == TransformStatus::Quarantined {
             continue;
@@ -862,7 +931,11 @@ async fn attribute_column_failure(
     };
     let field = eval_err.field();
 
-    let candidates = catalog::transforms_for_source(pool, src_table).await?;
+    // Issue #281: qualify first — a bare `src_table` handed straight to
+    // `transforms_for_source` returns an empty candidate set, so every column
+    // failure on it fell through unattributed. See [`qualified_src_table`].
+    let qualified = qualified_src_table(pool, src_table).await?;
+    let candidates = catalog::transforms_for_source(pool, &qualified).await?;
     let mut matches = candidates.into_iter().filter(|def| {
         matches!(def.def.key_space, KeySpace::OneToOne)
             && def.def.fields.iter().any(|f| f.name == field)

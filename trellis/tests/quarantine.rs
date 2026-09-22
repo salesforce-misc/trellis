@@ -1547,3 +1547,121 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
          whole-transform fuse just as promptly as one worker reaching it alone (issue #159)"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #281: the whole-transform fuse must resolve a *bare* `src_table`
+// before asking the catalog what to quarantine.
+// ---------------------------------------------------------------------
+
+/// A threshold's worth of `poison` rows recorded under the **bare** spelling
+/// of a source table (`orders`, not `public.orders`) must still trip the
+/// whole-transform fuse.
+///
+/// `trip_transform_fuse_if_crossed` used to hand its raw `src_table` straight
+/// to `catalog::transforms_for_source`, whose contract (issue #74, ADR-0007)
+/// requires an already-qualified name and whose non-qualified behaviour is to
+/// return an *empty* definition set rather than an error. So for a bare
+/// `src_table` the fuse counted its way past the threshold, logged nothing,
+/// quarantined nothing, and returned `Ok(())` — the poisoning defence silently
+/// absent for exactly the sources it was supposed to protect.
+///
+/// Issue #267 stopped `staging::apply` *emitting* a bare `src_table` going
+/// forward, but bare rows still reach this function from durable pre-#267 ring
+/// rows, and from this crate's own integration fixtures (this file included)
+/// that stage `src_table` by hand. Pre-fix this test's final assertion sees
+/// `live`; post-fix the bare name is resolved through
+/// `catalog::resolve_graph_identity` exactly as every `apply.rs` call site
+/// already resolves it, and the fuse trips.
+#[tokio::test]
+async fn a_bare_src_table_still_trips_the_whole_transform_fuse() {
+    use trellis::staging::quarantine::{
+        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
+    };
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    // Deliberately bare: no `qualify_fixture_table`, i.e. exactly what a
+    // pre-#267 durable ring row (or a hand-staging fixture) leaves behind.
+    let bare = "orders";
+    assert!(
+        !bare.contains('.'),
+        "the whole point of this test is an unqualified spelling"
+    );
+    for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
+        insert_poison_marker(&client, bare, &format!("bare-{i}")).await;
+    }
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "the fixture must start live — a non-live definition is invisible to \
+         `transforms_for_source` in the first place"
+    );
+
+    let mut fuse_client = db.pool.get().await.expect("pool connection");
+    let txn = fuse_client.transaction().await.expect("begin");
+    trip_transform_fuse_if_crossed(&txn, &db.pool, bare)
+        .await
+        .expect("fuse check must not error on a bare src_table");
+    txn.commit().await.expect("commit");
+
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "quarantined",
+        "a threshold's worth of poison rows under a bare `src_table` must quarantine the \
+         transform on that source, not silently resolve to zero definitions (issue #281)"
+    );
+}
+
+/// The `RelationshipReverseDeferred` sentinel `src_table`
+/// (`apply::relationship_reverse_deferred_src_table` — U+001F-prefixed, and
+/// neither bare nor qualified) is issue #281's one genuinely unresolvable
+/// spelling: it names no physical table and no definition's target, so the
+/// bare-name resolution the fix adds *cannot* succeed for it. It must fall
+/// through to the pre-existing "no definitions, nothing to do" outcome rather
+/// than surfacing `CatalogError::SourceTableNotFound` as a brand-new
+/// `ApplyError` from inside an eviction transaction.
+///
+/// (`isolate_and_evict` already skips deferred-reverse rows before they can
+/// reach the fuse at all — see
+/// `isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_reverse`
+/// above — so this pins the belt-and-braces behaviour of the `pub` function
+/// itself, which is also what a hand-written `poison` row for a since-dropped
+/// source table would hit.)
+#[tokio::test]
+async fn an_unresolvable_src_table_leaves_the_fuse_a_quiet_no_op() {
+    use trellis::staging::quarantine::{
+        DEFAULT_TRANSFORM_DEATH_THRESHOLD, trip_transform_fuse_if_crossed,
+    };
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    for unresolvable in [
+        "\u{1f}trellis-rel-reverse-deferred:7",
+        "long_since_dropped_table",
+    ] {
+        for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
+            insert_poison_marker(&client, unresolvable, &format!("k-{i}")).await;
+        }
+        let mut fuse_client = db.pool.get().await.expect("pool connection");
+        let txn = fuse_client.transaction().await.expect("begin");
+        trip_transform_fuse_if_crossed(&txn, &db.pool, unresolvable)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("fuse check must not error on the unresolvable {unresolvable:?}: {e}")
+            });
+        txn.commit().await.expect("commit");
+    }
+
+    assert_eq!(
+        transform_status(&client, "order_totals").await,
+        "live",
+        "an unresolvable `src_table` names no definition, so it must quarantine nothing — \
+         least of all an unrelated live transform on a real source"
+    );
+}

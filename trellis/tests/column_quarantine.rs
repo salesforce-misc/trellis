@@ -1966,3 +1966,97 @@ async fn resume_column_resolves_a_to_one_relationship_from_the_projection_not_li
          the projection had already settled"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #281: column attribution must resolve a *bare* `src_table` before
+// asking the catalog which transforms read that source.
+// ---------------------------------------------------------------------
+
+/// Stages one malformed CDC insert per id under the **bare** `orders`
+/// spelling — `insert_cdc_row`'s deliberate opposite (it qualifies every
+/// `src_table` through `qualify_fixture_table`, precisely so this whole
+/// file's machinery is exercised at all). This is what a durable pre-#267
+/// ring row looks like, and what several of this crate's other integration
+/// fixtures still stage by hand.
+async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &[i64]) {
+    let table = active_segment_table(client).await;
+    for id in ids {
+        client
+            .execute(
+                &format!(
+                    "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                     values ('orders', $1, 'insert', $2, null, $3::text::jsonb, 0)"
+                ),
+                &[
+                    &id.to_string(),
+                    &PgLsn::from(1u64),
+                    &Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+                ],
+            )
+            .await
+            .expect("stage bare-src_table cdc row");
+    }
+    let seg_seq = seal_active_segment(client).await;
+    let result = apply::drain_once(
+        pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_column_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ApplyError::Eval(_))),
+        "a malformed numeric field must still surface as an evaluator failure for a bare \
+         src_table (`apply::compute` resolves it via `qualified_schema_node_key`), got \
+         {result:?}"
+    );
+}
+
+/// A calculated-field failure on a row staged with a **bare** `src_table`
+/// must still be attributed to its `(transform, column)` pair.
+///
+/// `attribute_column_failure` used to pass its raw `src_table` straight to
+/// `catalog::transforms_for_source`, which requires an already-qualified name
+/// (issue #74, ADR-0007) and answers a bare one with an *empty* candidate set
+/// rather than an error. The lookup therefore matched no definition, the
+/// function fell out through its "no candidate" arm, and the failure went
+/// completely unattributed — indistinguishable, from the outside, from the
+/// deliberate ambiguous-match fallback, and with no log line either.
+///
+/// Note `apply::compute` itself handles the same bare row fine (hence the
+/// `ApplyError::Eval` this fixture asserts on): it routes every
+/// `transforms_for_source` call through its own `qualified_schema_node_key`.
+/// The gap was quarantine's two call sites alone. Pre-fix both assertions
+/// below see `None`; post-fix the column is charged and, at the threshold,
+/// paused.
+#[tokio::test]
+async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    seed_order_totals(&db, &client).await;
+    assert_eq!(
+        DEFAULT_COLUMN_DEATH_THRESHOLD, 5,
+        "test assumes the default"
+    );
+
+    let ids: Vec<i64> = (1..=DEFAULT_COLUMN_DEATH_THRESHOLD as i64).collect();
+    stage_bad_orders_bare(&mut client, &db.pool, &ids).await;
+
+    let status = column_status_row(&client, "order_totals", "total")
+        .await
+        .expect(
+            "a threshold's worth of evaluator failures on a bare `src_table` must pause the \
+             column, not go unattributed (issue #281)",
+        );
+    assert!(status.0, "a threshold trip is a local fuse, not a cascade");
+    assert!(status.1.is_some(), "the tripping error must be recorded");
+    assert_eq!(
+        column_deaths_count(&client, "order_totals", "total").await,
+        None,
+        "the counter must reset once the fuse trips"
+    );
+}
