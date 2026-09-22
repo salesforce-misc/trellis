@@ -467,8 +467,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "GROUP BY key '{column}' is a {value_type} column, a type Trellis can only pass \
                  through today: GROUP BY keys are matched by their text rendering, which doesn't \
-                 agree with this type's own equality (see docs/type-support.md). Supported GROUP \
-                 BY key types are numeric, text, boolean, uuid, oid, date, time and timetz"
+                 agree with this type's own equality (see docs/type-support.md); supported GROUP \
+                 BY key types are {}",
+                supported_group_by_key_types()
             ),
             ValidationError::UnknownGroupByRelationship { rel } => write!(
                 f,
@@ -1313,6 +1314,73 @@ fn reject_unsupported_group_by_key_type(
     }
 }
 
+/// [`GROUP_BY_KEY_TYPE_NAMES`] rendered for a user-facing error message, so
+/// the "supported GROUP BY key types are ..." list in
+/// [`ValidationError::UnsupportedGroupByKeyType`]'s `Display` cannot drift
+/// out of step with the allowlist it describes the way it did before issue
+/// #264 — the exact hand-maintained-second-copy failure mode issue #111
+/// already fixed for [`ValidationError::RelationshipUnsupportedJoinKeyType`]
+/// via [`super::catalog::supported_join_key_types`].
+///
+/// It had drifted: the message was missing `timestamp` (admitted since
+/// #248) and, after this week's #246/#254/#256/#258/#260/#261/#262 merges,
+/// `timestamptz`, `bytea`, `bit varying`, and the network-address types too.
+pub(crate) fn supported_group_by_key_types() -> String {
+    GROUP_BY_KEY_TYPE_NAMES.join(", ")
+}
+
+/// The names [`reject_unsupported_group_by_key_type`] actually admits, in
+/// the same order as that function's `Ok` arms, kept here as the single
+/// source [`supported_group_by_key_types`] renders instead of a
+/// hand-written string.
+///
+/// This is **not** the same set as
+/// [`super::catalog::TEXT_STABLE_JOIN_KEY_TYPES`] — the two gates are
+/// checked against each other, deliberately, not assumed identical:
+///
+/// * `numeric` and `boolean` are admitted *here* but refused as a
+///   relationship/primary-key join key (`numeric`: #107, its own text
+///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
+///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
+///   are safe for this role for reasons specific to it — `boolean`'s
+///   because `staging::apply_aggregate` never does the raw-text comparison
+///   that trips it up elsewhere, once `canonicalize_group_key_part` closes
+///   the in-memory `GroupPlan`-bucketing half of the gap (issue #119).
+/// * `inet` is admitted here for the identical reason `boolean` is (its own
+///   `network_show`-vs-`inet_out` split, closed the same way), but stays off
+///   the join-key list.
+/// * Fixed-length `bit` is refused *here only*, for a DDL-only reason with
+///   nothing to do with text-rendering: `ddl::create_aggregate_target_table`
+///   would declare a brand-new `bit(1)` column from a bare `ValueType`,
+///   truncating any wider source column (issue #118's `VarBit` arm has the
+///   live evidence). It is a perfectly good join/primary key, where the
+///   role only ever reuses an already-existing column's own concrete type.
+///
+/// See [`reject_unsupported_group_by_key_type`]'s own arm-by-arm comments
+/// for the live evidence behind each entry; the
+/// `unsupported_group_by_key_type_message_matches_the_real_admission_list`
+/// test below drives that function directly so this list can't silently
+/// fall out of sync with it again.
+const GROUP_BY_KEY_TYPE_NAMES: &[&str] = &[
+    "numeric",
+    "text",
+    "uuid",
+    "boolean",
+    "oid",
+    "bytea",
+    "date",
+    "time without time zone",
+    "time with time zone",
+    "timestamp without time zone",
+    "timestamp with time zone",
+    "cidr",
+    "macaddr",
+    "macaddr8",
+    "inet",
+    "bit varying",
+    "enum types",
+];
+
 pub(crate) fn infer_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
@@ -1792,6 +1860,7 @@ mod tests {
     use super::*;
     use crate::defs::ast::{FieldDef, Operator};
     use crate::defs::pg_type::PgType;
+    use crate::float::FloatWidth;
 
     fn def(fields: Vec<FieldDef>) -> TransformDef {
         TransformDef {
@@ -2108,6 +2177,112 @@ mod tests {
                 }),
                 "{pg_type} must not be accepted as a GROUP BY key"
             );
+        }
+    }
+
+    /// Issue #264: `UnsupportedGroupByKeyType`'s `Display` impl used to
+    /// name a second, hand-maintained copy of this gate's admission list
+    /// ("numeric, text, boolean, uuid, oid, date, time and timetz") that had
+    /// drifted stale — missing `timestamp` (admitted since #248) and, after
+    /// #246/#254/#256/#258/#260/#261/#262, `timestamptz`, `bytea`, `bit
+    /// varying`, and the network-address types too.
+    ///
+    /// This test drives [`reject_unsupported_group_by_key_type`] directly
+    /// with one representative value per type family it actually
+    /// classifies — every admitted family alongside every still-refused one
+    /// (`interval`, `real`/`double precision`, `jsonb`, `json`, fixed-length
+    /// `bit`, `money`, `xml`, `tsvector`/`tsquery`) — and checks that
+    /// [`supported_group_by_key_types`]'s rendering names exactly the
+    /// families that came back `Ok`. A future admission change to that
+    /// function that isn't mirrored in [`GROUP_BY_KEY_TYPE_NAMES`] fails
+    /// here, the same drift guard #111 gave the sibling join-key message.
+    #[test]
+    fn unsupported_group_by_key_type_message_matches_the_real_admission_list() {
+        const DEMO_ENUM: PgType = PgType::Enum("enum:public.demo_enum");
+        let candidates: &[(&str, ValueType)] = &[
+            // Admitted today.
+            ("numeric", ValueType::Integer(IntWidth::Int2)),
+            ("numeric", ValueType::Integer(IntWidth::Int4)),
+            ("numeric", ValueType::Integer(IntWidth::Int8)),
+            ("numeric", ValueType::Numeric),
+            ("text", ValueType::Text),
+            ("uuid", ValueType::Uuid),
+            ("boolean", ValueType::Boolean),
+            ("oid", ValueType::Other(PgType::Oid)),
+            ("bytea", ValueType::Other(PgType::Bytea)),
+            ("date", ValueType::Other(PgType::Date)),
+            ("time without time zone", ValueType::Other(PgType::Time)),
+            ("time with time zone", ValueType::Other(PgType::TimeTz)),
+            (
+                "timestamp without time zone",
+                ValueType::Other(PgType::Timestamp),
+            ),
+            (
+                "timestamp with time zone",
+                ValueType::Other(PgType::TimestampTz),
+            ),
+            ("cidr", ValueType::Other(PgType::Cidr)),
+            ("macaddr", ValueType::Other(PgType::MacAddr)),
+            ("macaddr8", ValueType::Other(PgType::MacAddr8)),
+            ("inet", ValueType::Other(PgType::Inet)),
+            ("bit varying", ValueType::Other(PgType::VarBit)),
+            ("enum types", ValueType::Other(DEMO_ENUM)),
+            // Still refused today — must NOT show up in the message.
+            ("real", ValueType::Float(FloatWidth::Float4)),
+            ("double precision", ValueType::Float(FloatWidth::Float8)),
+            ("interval", ValueType::Other(PgType::Interval)),
+            ("json", ValueType::Other(PgType::Json)),
+            ("jsonb", ValueType::Other(PgType::Jsonb)),
+            ("bit", ValueType::Other(PgType::Bit)),
+            ("money", ValueType::Other(PgType::Money)),
+            ("xml", ValueType::Other(PgType::Xml)),
+            ("tsvector", ValueType::Other(PgType::TsVector)),
+            ("tsquery", ValueType::Other(PgType::TsQuery)),
+        ];
+
+        let mut admitted_names: Vec<&str> = Vec::new();
+        for (name, value_type) in candidates.iter().copied() {
+            match reject_unsupported_group_by_key_type("k", value_type) {
+                Ok(()) => {
+                    if !admitted_names.contains(&name) {
+                        admitted_names.push(name);
+                    }
+                }
+                Err(ValidationError::UnsupportedGroupByKeyType { .. }) => {}
+                Err(other) => panic!("unexpected error for {value_type}: {other:?}"),
+            }
+        }
+
+        let message = supported_group_by_key_types();
+        for name in GROUP_BY_KEY_TYPE_NAMES {
+            assert!(
+                admitted_names.contains(name),
+                "{name} is listed in GROUP_BY_KEY_TYPE_NAMES but no candidate for it is \
+                 actually admitted by reject_unsupported_group_by_key_type; the message and \
+                 the gate have drifted apart"
+            );
+        }
+        for name in &admitted_names {
+            assert!(
+                GROUP_BY_KEY_TYPE_NAMES.contains(name),
+                "{name} is admitted by reject_unsupported_group_by_key_type but is missing \
+                 from GROUP_BY_KEY_TYPE_NAMES, so UnsupportedGroupByKeyType's message would \
+                 no longer name every type it should — the exact drift issue #264 fixed"
+            );
+        }
+        // Split on the join separator rather than a raw substring `contains`
+        // check: "bit" (refused) would otherwise falsely match inside "bit
+        // varying" (admitted), which is exactly the wrong kind of pass.
+        let message_tokens: Vec<&str> = message.split(", ").collect();
+        for (name, value_type) in candidates {
+            if !admitted_names.contains(name) {
+                assert!(
+                    !message_tokens.contains(name),
+                    "'{name}' ({value_type}) is still refused by \
+                     reject_unsupported_group_by_key_type but appears in the supported-types \
+                     message"
+                );
+            }
         }
     }
 
