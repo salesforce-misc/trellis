@@ -1613,9 +1613,9 @@ pub async fn resume_column(
 /// Deletes the definition's unclaimed, undone `backfill_chunks` rows too
 /// (issue #332): the fresh backfill makes them redundant, and a pause only
 /// withheld them from dispatch. Chunks a worker still holds are left for that
-/// worker to finish; should it give one up instead, it is discarded rather
-/// than handed out again (issue #360, `defs::chunk_queue::release_chunk`/
-/// `reclaim_stale_chunks`).
+/// worker; however it gives one up, it is discarded rather than handed out
+/// again or used to complete the definition (issues #360/#397,
+/// `defs::chunk_queue::finish_chunk`/`release_chunk`/`reclaim_stale_chunks`).
 ///
 /// **The trip half of this contract** lives in
 /// [`trip_transform_fuse_if_crossed`], called from [`isolate_and_evict`]
@@ -1701,12 +1701,12 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `claim_chunks`' `for update skip locked` never waits on these rows.
     //
     // A chunk a worker still holds is left alone, as a pause leaves it: that
-    // worker may still be writing its range, and it is `finish_chunk`'s
-    // completion that parks the catch-up marker repairing the target should
-    // that write land after the rebuild has already gone live (#331). The
-    // `fuse_rearmed_at` stamp above is what marks it stale if that worker
-    // releases it or dies instead (issue #360): the chunk queue then deletes
-    // it rather than freeing it for a rerun.
+    // worker may still be writing its range. The `fuse_rearmed_at` stamp
+    // above marks it stale (issues #360/#397): however that worker gives it
+    // up (finishing, failing or dying), the chunk queue deletes it rather
+    // than completing the definition or freeing it for a rerun, and parks
+    // the catch-up marker repairing the target should its write land after
+    // the rebuild has already gone live (#331).
     txn.execute(
         "delete from backfill_chunks \
          where definition_id = $1 and not done and claimed_by is null",

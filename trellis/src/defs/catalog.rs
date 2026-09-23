@@ -971,13 +971,13 @@ async fn install_plain_one_to_one(
             definition.status = status;
             Ok(definition)
         }
-        Err(BackfillError::Unsupported(_)) => {
+        Err(CatalogError::DirectBackfill(BackfillError::Unsupported(_))) => {
             delete_definition_row(pool, definition.id).await?;
             create_definition(pool, source_text, source_columns).await
         }
         Err(err) => {
             delete_definition_row(pool, definition.id).await?;
-            Err(CatalogError::DirectBackfill(err))
+            Err(err)
         }
     }
 }
@@ -1074,22 +1074,17 @@ async fn go_live_if_backfilling(
 ///
 /// **Only a still-`backfilling` definition completes (issue #331).** The
 /// pause gates new chunk claims, not a chunk a worker already holds, so the
-/// last chunk can finish after the definition has been paused or quarantined
-/// (or, once resumed, dropped back to `waiting_to_backfill` while a worker
-/// still held one of its chunks). [`go_live_if_backfilling`] leaves a definition that
-/// has moved on exactly as it is; the chunk itself is still retired by the
-/// caller.
+/// last chunk can finish after the definition has been paused or quarantined.
+/// [`go_live_if_backfilling`] leaves a definition that has moved on exactly as
+/// it is; the chunk itself is still retired by the caller. A chunk held across
+/// a *resume* never reaches here: `finish_chunk` discards it instead, since
+/// the resumed definition's rebuild owns its way back to `live` (issues
+/// #360/#397).
 ///
 /// The catch-up marker is parked unless the definition is **frozen**. A
 /// frozen one gets nothing from it: resume
 /// ([`crate::staging::quarantine::resume_transform`]) clears its coverage,
-/// re-parks a marker of its own and rebuilds by a fresh backfill. Every other
-/// status still needs one. A leftover chunk (#332) can finish after resume's
-/// rebuild already took the definition `live`, and its range write is an
-/// upsert computed from the chunk's own snapshot. That write can overwrite a
-/// newer value the live fold just wrote, and only a later re-derivation
-/// repairs it. For a `waiting_to_backfill` definition the marker is normally
-/// a no-op (resume's is still parked).
+/// re-parks a marker of its own and rebuilds by a fresh backfill.
 ///
 /// Returns the status the definition is left in: [`TransformStatus::Live`]
 /// when this call completed it, its unchanged current status otherwise.
