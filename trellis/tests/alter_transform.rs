@@ -12,9 +12,10 @@
 //!   `drop_single_column_removes_the_physical_column`,
 //!   `alter_single_column_recomputes_existing_rows`,
 //!   `combined_add_drop_alter_in_one_statement`)
-//! - single-pass backfill of multiple added columns, and a real concurrent
-//!   race the version fence must resolve correctly rather than merely not
-//!   crash on (`single_pass_backfill_stays_consistent_under_concurrent_writes`)
+//! - single-pass backfill of multiple added columns under a concurrent
+//!   writer (`single_pass_backfill_stays_consistent_under_concurrent_writes`,
+//!   which runs no live pipeline and drives the initial build's chunk queue
+//!   by hand instead; see its doc comment for why)
 //! - the column-granularity pause state: the new column reports paused while
 //!   backfilling, and the rest of the target stays live and queryable
 //!   (`the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live`)
@@ -37,12 +38,13 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+use trellis::defs::chunk_queue;
 use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
@@ -565,124 +567,164 @@ async fn combined_add_drop_alter_in_one_statement() {
 // Single-pass backfill and the version fence
 // ---------------------------------------------------------------------
 
-/// Adds *two* columns in one statement, over a source large enough
-/// (150k rows, three 50k chunks) that the backfill takes real wall time,
-/// while a concurrent writer continuously updates existing rows' `a` through
-/// the *live, running* CDC pipeline for the whole duration.
+/// Claims, runs, and finishes every pending direct-build backfill chunk
+/// until none remain, flipping a freshly-defined 1-1 target to `live` with
+/// no running `Client`. This is the hand-driven stand-in for a drain worker
+/// that `defs_install_definition.rs` uses.
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    const CLAIMED_BY: &str = "alter_transform_test_backfill_worker";
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                DEFAULT_TARGET_SCHEMA,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+/// **Single pass, not one job per column.** Adds two columns in one
+/// statement while a concurrent writer keeps rewriting `a`. `col_x = a` and
+/// `col_y = a + 1` only agree (`col_y == col_x + 1`) if both came from the
+/// same read of a row. A backfill that ran one pass per column would read
+/// `a` twice, and every row the writer changed between the two passes would
+/// break the invariant.
 ///
-/// Two things must both hold in the final, converged state:
+/// The check reads the backfill's own output the moment `ALTER TRANSFORM`
+/// returns, with no live pipeline running. That's deliberate. With a
+/// pipeline, the catch-up the edit parks (issue #305) re-derives every row
+/// from a single source image once it drains, so a converged final state
+/// satisfies the invariant whether or not the backfill was single-pass. The
+/// earlier version of this test asserted on exactly that converged state
+/// and passed with a per-column backfill substituted in (issue #299). It
+/// also spent most of its time waiting for a live pipeline to drain several
+/// hundred thousand enumerated rows under a wall-clock budget. With no
+/// pipeline there is nothing to wait for.
 ///
-/// 1. **Single pass, not one job per column.** `col_x = a` and `col_y = a +
-///    1` are only ever consistent with each other (`col_y == col_x + 1`) if
-///    both were computed from the exact same read of a row — a backfill that
-///    ran one job per column could observe two *different* values of a
-///    concurrently-updated row's `a` between the two jobs and violate this
-///    invariant. This test's own `writer` task guarantees the concurrent
-///    pressure needed to make that violation possible if it were happening.
-/// 2. **The version fence.** `a`'s own already-live passthrough column must
-///    keep reflecting the writer's latest updates throughout (the alter must
-///    not block ordinary live apply), and the two new columns must end up
-///    fully populated and correct for *every* row, including ones the writer
-///    touched while the columns were still paused — proving the fence
-///    handed any in-flight batch that raced the edit's commit back to a
-///    fresh reload rather than a half-populated write.
+/// What the old version's final state also touched is covered where it can
+/// be checked directly. The version-fence bump:
+/// `an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock` below,
+/// and `apply.rs`'s
+/// `a_definition_change_on_a_touched_source_trips_the_version_fence`. Rows
+/// changed while the new column was paused getting repaired:
+/// `defs_backfill_chunk_queue.rs`'s
+/// `alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_backfill`.
+/// Live apply writing every column except a paused one:
+/// `column_quarantine.rs`'s
+/// `paused_column_freezes_instead_of_going_null_or_being_overwritten`.
 #[tokio::test]
 async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
+    // Large enough that each backfill pass takes long enough for the writer
+    // to land many updates inside it.
+    const ROWS: i64 = 20_000;
+
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    seed_orders(&raw, 150_000).await;
+    seed_orders(&raw, ROWS).await;
 
-    let definer = define_only(db.dsn()).await;
-    definer
+    let trellis = define_only(db.dsn()).await;
+    trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
-    definer.shutdown().await.expect("shut the definer down");
-
-    let trellis = running(db.dsn()).await;
-    wait_for_live(&raw, "order_calc").await;
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "ALTER TRANSFORM requires a live target"
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let updates = Arc::new(AtomicU64::new(0));
     let writer = {
         let dsn = db.dsn().to_string();
         let stop = Arc::clone(&stop);
+        let updates = Arc::clone(&updates);
         tokio::spawn(async move {
-            let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.expect("connect");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-                .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-                .await
-                .expect("set search_path");
+            let client = connect_raw(&dsn).await;
             let mut id = 1i64;
             while !stop.load(Ordering::Relaxed) {
-                // Rewrite `a` in place (`id` stays the key) so every row is
-                // still exactly reproducible from `orders` at any instant.
+                // Rewrite `a` in place (`id` stays the key), so every value
+                // `a` ever holds is `id` plus a multiple of 1,000,000.
                 client
                     .execute("update orders set a = a + 1000000 where id = $1", &[&id])
                     .await
                     .expect("concurrent update");
-                id = (id % 150_000) + 1;
+                updates.fetch_add(1, Ordering::Relaxed);
+                id = (id % ROWS) + 1;
                 tokio::time::sleep(Duration::from_micros(200)).await;
             }
         })
     };
 
+    // Let the writer get going before the edit starts.
+    while updates.load(Ordering::Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let before = updates.load(Ordering::Relaxed);
     let applied = trellis
         .apply("ALTER TRANSFORM order_calc ADD a AS col_x, ADD a + 1 AS col_y")
         .await
-        .expect("add two columns while the pipeline is live and under write pressure");
-    let (added, _, _) = into_altered(applied);
-    assert_eq!(added, vec!["col_x".to_string(), "col_y".to_string()]);
-
+        .expect("add two columns under write pressure");
+    let during = updates.load(Ordering::Relaxed) - before;
     stop.store(true, Ordering::Relaxed);
     writer.await.expect("writer task");
 
-    // Drain everything staged so far before asserting a final, settled state.
-    // That is far more than the writer's last few updates: `wait_for_live`
-    // doesn't wait for the ring, so the define's own enumeration and its
-    // catch-up re-enumeration (150k rows each) can still be queued here.
-    // Locally that takes ~10s to drain; CI runs this suite ~2.5x slower, so
-    // the budget is sized well past that.
-    let token = trellis.watermark_token().await.expect("watermark");
-    trellis
-        .await_converged(token, Duration::from_secs(120))
-        .await
-        .expect("convergence");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["col_x".to_string(), "col_y".to_string()]);
+    assert!(
+        during > 0,
+        "the writer must have updated rows while the backfill ran, or this test proves nothing"
+    );
 
     let rows = raw
         .query(
-            &format!(
-                "select o.a::text, t.a::text, t.col_x::text, t.col_y::text \
-                 from orders o join {DEFAULT_TARGET_SCHEMA}.order_calc t on o.id = t.id"
-            ),
+            &format!("select id, col_x::text, col_y::text from {DEFAULT_TARGET_SCHEMA}.order_calc"),
             &[],
         )
         .await
-        .expect("read source+target together");
-    assert_eq!(rows.len(), 150_000, "no row was lost");
+        .expect("read the backfilled target");
+    assert_eq!(rows.len() as i64, ROWS, "the backfill must cover every row");
     for row in rows {
-        let source_a: f64 = row.get::<_, String>(0).parse().unwrap();
-        let target_a: f64 = row.get::<_, String>(1).parse().unwrap();
-        let col_x: f64 = row.get::<_, String>(2).parse().unwrap();
-        let col_y: f64 = row.get::<_, String>(3).parse().unwrap();
+        let id: i64 = row.get(0);
+        let col_x: i64 = row
+            .get::<_, Option<String>>(1)
+            .unwrap_or_else(|| panic!("row {id}: col_x must be backfilled"))
+            .parse()
+            .unwrap();
+        let col_y: i64 = row
+            .get::<_, Option<String>>(2)
+            .unwrap_or_else(|| panic!("row {id}: col_y must be backfilled"))
+            .parse()
+            .unwrap();
         assert_eq!(
-            target_a, source_a,
-            "the already-live column must keep reflecting the writer's updates \
-             — the edit must not have blocked ordinary live apply"
-        );
-        assert_eq!(
-            col_x, source_a,
-            "the new column must reflect the converged source, for every row"
+            col_x % 1_000_000,
+            id,
+            "row {id}: col_x must be a value `a` actually held"
         );
         assert_eq!(
             col_y,
-            col_x + 1.0,
-            "col_y must always equal col_x + 1 — this can only fail if the two \
-             columns were populated from two different reads of the row, i.e. a \
-             backfill-per-column implementation rather than a single pass"
+            col_x + 1,
+            "row {id}: col_y must equal col_x + 1. This only fails if the two columns were \
+             populated from two different reads of the row, i.e. a backfill per column \
+             rather than a single pass"
         );
     }
 

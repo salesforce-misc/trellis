@@ -73,7 +73,7 @@
 //! excludes any currently-paused column of the audited transform from the
 //! comparison entirely (see [`paused_columns`]).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -436,16 +436,9 @@ pub async fn self_check(
         AwaitOutcome::CaughtUp(pass) => pass,
     };
 
-    let identities_seen_first: BTreeSet<DivergenceIdentity> =
-        divergences.iter().map(DivergenceIdentity::of).collect();
-    let stable: Vec<Divergence> = {
-        let mut schema_again = check_schema(pool, &def, &pk).await?;
-        schema_again.extend(pass2.divergences);
-        schema_again
-    }
-    .into_iter()
-    .filter(|d| identities_seen_first.contains(&DivergenceIdentity::of(d)))
-    .collect();
+    let mut second = check_schema(pool, &def, &pk).await?;
+    second.extend(pass2.divergences);
+    let stable = reproduced(&divergences, second);
 
     let outcome = if stable.is_empty() {
         SelfCheckOutcome::Converged
@@ -460,6 +453,21 @@ pub async fn self_check(
         next_after: pass2.next_after,
         outcome,
     })
+}
+
+/// The re-check's filter (ADR-0013): of the divergences `second` (the
+/// re-check pass) found, keeps only those whose [`DivergenceIdentity`] was
+/// also in `first`. A divergence that resolved on re-check was a convergence
+/// race, so it's dropped. One that shows up only on the re-check hasn't
+/// survived two passes yet, so it isn't reported either. Returns `second`'s
+/// copies, so a reproduced [`Divergence::Cell`] carries the fresher values.
+fn reproduced(first: &[Divergence], second: Vec<Divergence>) -> Vec<Divergence> {
+    let identities_seen_first: BTreeSet<DivergenceIdentity> =
+        first.iter().map(DivergenceIdentity::of).collect();
+    second
+        .into_iter()
+        .filter(|d| identities_seen_first.contains(&DivergenceIdentity::of(d)))
+        .collect()
 }
 
 /// A [`Divergence`]'s identity for the purpose of deciding whether it
@@ -636,21 +644,50 @@ async fn compare_once(
         .await?;
     txn.commit().await?;
 
-    let mut recomputed: std::collections::BTreeMap<String, Vec<Option<String>>> =
-        std::collections::BTreeMap::new();
-    for row in &recompute_rows {
-        let key: String = row.get(0);
-        let values: Vec<Option<String>> = (0..comparable.len()).map(|i| row.get(i + 1)).collect();
-        recomputed.insert(key, values);
-    }
-    let mut persisted: std::collections::BTreeMap<String, Vec<Option<String>>> =
-        std::collections::BTreeMap::new();
-    for row in &persisted_rows {
-        let key: String = row.get(0);
-        let values: Vec<Option<String>> = (0..comparable.len()).map(|i| row.get(i + 1)).collect();
-        persisted.insert(key, values);
-    }
+    let page = |rows: &[tokio_postgres::Row]| -> Page {
+        rows.iter()
+            .map(|row| {
+                let key: String = row.get(0);
+                let values: Vec<Option<String>> =
+                    (0..comparable.len()).map(|i| row.get(i + 1)).collect();
+                (key, values)
+            })
+            .collect()
+    };
+    let columns: Vec<&str> = comparable.iter().map(|f| f.name.as_str()).collect();
+    let diff = diff_page(
+        &columns,
+        page(&recompute_rows),
+        page(&persisted_rows),
+        scope.limit,
+    );
 
+    Ok(ComparePass {
+        checked_through,
+        rows_compared: diff.rows_compared,
+        next_after: diff.next_after,
+        divergences: diff.divergences,
+    })
+}
+
+/// One side of a [`compare_once`] page: key text to the `::text` value of
+/// each compared column, in `columns` order.
+type Page = BTreeMap<String, Vec<Option<String>>>;
+
+/// [`diff_page`]'s result: [`ComparePass`] minus the token.
+#[derive(Debug, PartialEq, Eq)]
+struct PageDiff {
+    rows_compared: i64,
+    next_after: Option<String>,
+    divergences: Vec<Divergence>,
+}
+
+/// The pure half of [`compare_once`]: diffs the recompute page against the
+/// persisted page once both `LIMIT`ed reads are back. `columns` names the
+/// compared columns, in the order each page's value vectors hold them.
+/// `limit` is the bound both reads ran with, so a page holding `limit` keys
+/// is one whose read was cut off.
+fn diff_page(columns: &[&str], mut recomputed: Page, mut persisted: Page, limit: i64) -> PageDiff {
     // The two `LIMIT`ed reads are keyset-scoped independently, so whenever a
     // divergence makes the two sides' key sets differ, their pages end at
     // *different* keys: a target missing one row inside the page pulls one
@@ -667,10 +704,13 @@ async fn compare_once(
     // boundary, so the following call picks them up. A page where neither
     // side hit the limit reached the end of the keyspace — no boundary, and
     // `next_after` is `None`.
-    let recompute_bound = (recompute_rows.len() as i64 >= scope.limit)
+    //
+    // Page length stands in for the read's row count: every key is a
+    // distinct primary key, so the two are always equal.
+    let recompute_bound = (recomputed.len() as i64 >= limit)
         .then(|| recomputed.keys().next_back().cloned())
         .flatten();
-    let persisted_bound = (persisted_rows.len() as i64 >= scope.limit)
+    let persisted_bound = (persisted.len() as i64 >= limit)
         .then(|| persisted.keys().next_back().cloned())
         .flatten();
     let page_end = match (recompute_bound, persisted_bound) {
@@ -689,11 +729,11 @@ async fn compare_once(
         match persisted.get(key) {
             None => divergences.push(Divergence::MissingRow { key: key.clone() }),
             Some(p_values) => {
-                for (field, (r, p)) in comparable.iter().zip(r_values.iter().zip(p_values.iter())) {
+                for (column, (r, p)) in columns.iter().zip(r_values.iter().zip(p_values.iter())) {
                     if r != p {
                         divergences.push(Divergence::Cell {
                             key: key.clone(),
-                            column: field.name.clone(),
+                            column: column.to_string(),
                             persisted: p.clone(),
                             recomputed: r.clone(),
                         });
@@ -709,14 +749,12 @@ async fn compare_once(
     }
 
     let all_keys: BTreeSet<&String> = recomputed.keys().chain(persisted.keys()).collect();
-    let rows_compared = all_keys.len() as i64;
 
-    Ok(ComparePass {
-        checked_through,
-        rows_compared,
+    PageDiff {
+        rows_compared: all_keys.len() as i64,
         next_after: page_end,
         divergences,
-    })
+    }
 }
 
 /// Every column [`self_check`] must currently exclude from comparison for
@@ -933,5 +971,131 @@ mod tests {
             recomputed: Some("4".to_string()),
         };
         assert_eq!(DivergenceIdentity::of(&a), DivergenceIdentity::of(&b));
+    }
+
+    /// Builds a [`Page`] of single-column rows from `(key, value)` pairs.
+    fn page(rows: &[(&str, &str)]) -> Page {
+        rows.iter()
+            .map(|(key, value)| (key.to_string(), vec![Some(value.to_string())]))
+            .collect()
+    }
+
+    fn cell(key: &str, persisted: &str, recomputed: &str) -> Divergence {
+        Divergence::Cell {
+            key: key.to_string(),
+            column: "price".to_string(),
+            persisted: Some(persisted.to_string()),
+            recomputed: Some(recomputed.to_string()),
+        }
+    }
+
+    fn missing(key: &str) -> Divergence {
+        Divergence::MissingRow {
+            key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn diff_page_reports_nothing_for_identical_pages_that_reach_the_end_of_the_keyspace() {
+        let rows = [("1", "10"), ("2", "20")];
+        assert_eq!(
+            diff_page(&["price"], page(&rows), page(&rows), 100),
+            PageDiff {
+                rows_compared: 2,
+                next_after: None,
+                divergences: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn diff_page_classifies_a_cell_a_missing_row_and_an_extra_row() {
+        let diff = diff_page(
+            &["price"],
+            page(&[("1", "11"), ("2", "20")]),
+            page(&[("1", "9999"), ("3", "30")]),
+            100,
+        );
+        assert_eq!(
+            diff.divergences,
+            vec![
+                cell("1", "9999", "11"),
+                missing("2"),
+                Divergence::ExtraRow {
+                    key: "3".to_string()
+                },
+            ]
+        );
+        assert_eq!(diff.rows_compared, 3);
+        assert_eq!(diff.next_after, None);
+    }
+
+    /// Regression, keyset page alignment: the recompute read and the
+    /// persisted read are two independently-`LIMIT`ed queries, so once a real
+    /// divergence makes their key sets differ, their pages end at different
+    /// keys. Here the target is missing row `2` and the limit is 3, so the
+    /// recompute page is `{1,2,3}` while the persisted page is `{1,3,4}`.
+    /// Diffing those raw would report key `4` as an `ExtraRow` only because it
+    /// fell off the recompute side's page. That false divergence reproduces
+    /// on the re-check, so the re-check can't filter it, and `next_after`
+    /// would then skip past `4`, so no later page would compare it either.
+    /// Only the genuine `MissingRow { 2 }` may be reported, and `next_after`
+    /// must land on `3`.
+    #[test]
+    fn diff_page_does_not_invent_a_divergence_from_the_two_sides_ending_at_different_keys() {
+        let diff = diff_page(
+            &["price"],
+            page(&[("1", "10"), ("2", "20"), ("3", "30")]),
+            page(&[("1", "10"), ("3", "30"), ("4", "40")]),
+            3,
+        );
+        assert_eq!(
+            diff,
+            PageDiff {
+                rows_compared: 3,
+                next_after: Some("3".to_string()),
+                divergences: vec![missing("2")],
+            }
+        );
+    }
+
+    #[test]
+    fn diff_page_bounds_the_page_by_whichever_side_alone_hit_the_limit() {
+        // The target has an extra row `0` ahead of everything, so only the
+        // persisted side fills its limit, ending at `2`. The recompute side's
+        // `3` belongs to the next page.
+        let diff = diff_page(
+            &["price"],
+            page(&[("1", "10"), ("2", "20"), ("3", "30")]),
+            page(&[("0", "0"), ("1", "10"), ("2", "20")]),
+            3,
+        );
+        assert_eq!(
+            diff,
+            PageDiff {
+                rows_compared: 3,
+                next_after: Some("2".to_string()),
+                divergences: vec![Divergence::ExtraRow {
+                    key: "0".to_string()
+                }],
+            }
+        );
+    }
+
+    /// A divergence that doesn't reproduce on the re-check was a convergence
+    /// race and must be dropped. A divergence that does reproduce is still
+    /// reported, carrying the re-check's values. One that appears only on the
+    /// re-check hasn't survived two passes, so it isn't reported yet.
+    #[test]
+    fn reproduced_keeps_only_divergences_seen_on_both_passes() {
+        let first = vec![cell("1", "9999", "11"), missing("2")];
+        let second = vec![cell("1", "8888", "11"), missing("5")];
+        assert_eq!(reproduced(&first, second), vec![cell("1", "8888", "11")]);
+    }
+
+    #[test]
+    fn reproduced_keeps_a_stable_divergence_rather_than_erasing_it() {
+        let both = vec![cell("1", "9999", "11")];
+        assert_eq!(reproduced(&both, both.clone()), both);
     }
 }
