@@ -31,11 +31,11 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    create_definition, create_relationship, create_target_table, relationship_projection,
-    source_primary_key,
+    create_definition, create_relationship, create_target_table, install_definition,
+    relationship_projection, source_primary_key,
 };
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -631,4 +631,203 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
         "a to-many context must resolve the new comment immediately, live — no projection, \
          no staleness window"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #288: same-named relationships on same-named from-tables in
+// different schemas each resolve to their own relationship.
+// ---------------------------------------------------------------------
+
+/// Issue #288: `blog.posts` and `shop.posts` each declare a relationship
+/// named `author` — legal now that a relationship name is unique per
+/// *qualified* from-table. A transform over `shop.posts` must resolve its
+/// `author.<column>` path to `shop.posts`' own `author`, never the same-named
+/// one on `blog.posts`, on every path that reads one: the definition's own
+/// validation and projection widening (`install_definition`), the ring's
+/// enumeration and forward CDC apply (`build_relationship_context`), and the
+/// reverse recompute a to-side change triggers (`relationships_to_table`, then
+/// the from-side reads through `RelationshipDefinition::qualified_from_table`,
+/// which must hit `shop.posts` even though the draining session's
+/// `search_path` reaches no `posts` at all).
+///
+/// `blog.posts`' `author` is declared first, so a reader that fell back to
+/// the bare `(from_table, name)` pair would either trip over two rows or pick
+/// blog's. The two relationships point at differently-named to-side tables
+/// (`writers`, `vendors`) with distinguishable values, so this pins only the
+/// from-side keying #288 fixes; the to-side is still keyed bare (#372).
+///
+/// Only `shop.posts` gets a transform: two transforms over same-named source
+/// tables in different schemas trip a separate, pre-existing bare-suffix
+/// lookup in the drain's version fence (`source_table_versions` matched on
+/// `split_part(source_table, '.', 2)`), unrelated to relationships.
+#[tokio::test]
+async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to_side() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema blog; create schema shop; \
+             create table writers (id integer primary key, name text); \
+             create table vendors (id integer primary key, name text); \
+             alter table writers replica identity full; \
+             alter table vendors replica identity full; \
+             insert into writers (id, name) values (1, 'writer-1'); \
+             insert into vendors (id, name) values (1, 'vendor-1'); \
+             create table blog.posts (id integer primary key, author_id integer); \
+             create table shop.posts (id integer primary key, author_id integer); \
+             alter table blog.posts replica identity full; \
+             alter table shop.posts replica identity full; \
+             insert into blog.posts (id, author_id) values (1, 1); \
+             insert into shop.posts (id, author_id) values (1, 1);",
+        )
+        .await
+        .expect("seed blog, shop and the two to-side tables");
+
+    // The `RELATIONSHIP` grammar has no qualified from-table spelling, so the
+    // bare `posts` reaches `blog.posts`/`shop.posts` through each pool's own
+    // `search_path` (`Config::schema`, then `target_schema`, then `public`).
+    let schema_pool = |target_schema: &str| {
+        let config = trellis::Config::from_dsn(db.dsn().to_string())
+            .expect("valid dsn")
+            .with_target_schema(target_schema)
+            .expect("valid target schema");
+        trellis::pool::Pool::new(&config).expect("build pool")
+    };
+    let blog_rel = create_relationship(
+        &schema_pool("blog"),
+        "RELATIONSHIP author FROM posts.author_id TO writers.id",
+    )
+    .await
+    .expect("blog.posts declares `author`");
+    let shop_rel = create_relationship(
+        &schema_pool("shop"),
+        "RELATIONSHIP author FROM posts.author_id TO vendors.id",
+    )
+    .await
+    .expect("shop.posts declares its own `author`");
+
+    // Each to-one relationship's settled projection was created in its
+    // declaring pool's `target_schema` (`blog`/`shop`), but a reader looks
+    // for it in the *reading* pool's — a separate, pre-existing limitation of
+    // pools with different target schemas sharing one catalog, not what this
+    // test is about. Move both to where `db.pool` (which installs and drains
+    // everything below) looks for them.
+    for (schema, relationship_id) in [("blog", blog_rel.id), ("shop", shop_rel.id)] {
+        client
+            .batch_execute(&format!(
+                "alter table {schema}._trellis_rel_projection_{relationship_id} \
+                 set schema {DEFAULT_TARGET_SCHEMA}"
+            ))
+            .await
+            .expect("move the projection to the reading pool's target schema");
+    }
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM shop_feed FROM shop.posts SELECT author.name AS author_name",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("author_id", ValueType::Numeric),
+        ]),
+        DEFAULT_TARGET_SCHEMA,
+    )
+    .await
+    .expect("install shop_feed");
+    // A bare to-one path isn't a shape the direct build renders, so the
+    // definition falls back to the ring's enumeration of its existing rows
+    // (`install_definition`'s `Unsupported` arm); drain it.
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        author_names(&client, "shop_feed").await,
+        vec![(1, Some("vendor-1".to_string()))],
+        "the initial enumeration must resolve shop.posts' own `author`, not blog.posts'"
+    );
+
+    // Forward: a new from-side row.
+    client
+        .execute("insert into shop.posts (id, author_id) values (2, 1)", &[])
+        .await
+        .expect("insert a second shop post");
+    stage_cdc(
+        &client,
+        "shop.posts",
+        "2",
+        "insert",
+        None,
+        Some("{\"id\":2,\"author_id\":1}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        author_names(&client, "shop_feed").await,
+        vec![
+            (1, Some("vendor-1".to_string())),
+            (2, Some("vendor-1".to_string()))
+        ],
+        "the forward path must resolve shop.posts' own `author`, not blog.posts'"
+    );
+
+    // Reverse, blog's to-side: recomputes `blog.posts`' rows, which no
+    // transform reads — shop_feed must not move.
+    client
+        .execute("update writers set name = 'writer-1b' where id = 1", &[])
+        .await
+        .expect("rename writer 1");
+    stage_cdc(
+        &client,
+        "writers",
+        "1",
+        "update",
+        Some("{\"id\":1,\"name\":\"writer-1\"}"),
+        Some("{\"id\":1,\"name\":\"writer-1b\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        author_names(&client, "shop_feed").await,
+        vec![
+            (1, Some("vendor-1".to_string())),
+            (2, Some("vendor-1".to_string()))
+        ],
+        "a change to blog.posts' `author` to-side must not touch shop_feed"
+    );
+
+    // Reverse, shop's to-side: re-derives shop_feed's rows from `shop.posts`.
+    client
+        .execute("update vendors set name = 'vendor-1b' where id = 1", &[])
+        .await
+        .expect("rename vendor 1");
+    stage_cdc(
+        &client,
+        "vendors",
+        "1",
+        "update",
+        Some("{\"id\":1,\"name\":\"vendor-1\"}"),
+        Some("{\"id\":1,\"name\":\"vendor-1b\"}"),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        author_names(&client, "shop_feed").await,
+        vec![
+            (1, Some("vendor-1b".to_string())),
+            (2, Some("vendor-1b".to_string()))
+        ],
+        "the reverse recompute must re-derive shop.posts' rows through shop's own `author`"
+    );
+}
+
+async fn author_names(client: &Client, target: &str) -> Vec<(i32, Option<String>)> {
+    client
+        .query(
+            &format!("select id, author_name from {target} order by id"),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read {target}: {e}"))
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
 }

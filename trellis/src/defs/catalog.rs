@@ -260,7 +260,8 @@ pub enum CatalogError {
     /// something the operator has to reconstruct.
     DependentsBlockDrop {
         /// What the caller asked to drop: a bare transform name,
-        /// `from_table.relationship_name` for a relationship, or
+        /// `schema.from_table.relationship_name` for a relationship (its
+        /// qualified address, issue #288, however the `DROP` spelled it), or
         /// `target.column` for an `ALTER TRANSFORM ... DROP <field>`
         /// (issue #241).
         subject: String,
@@ -3256,15 +3257,13 @@ async fn resolve_relationship_endpoint(pool: &Pool, table: &str) -> Result<Strin
 /// — same two-step resolution (physical `search_path` lookup, falling back
 /// to a live definition's own bare target-suffix), for callers outside a
 /// catalog-owned transaction. `staging::apply::compute`'s
-/// `qualified_schema_node_key` is the one caller today: a `Recompute` row's
-/// `src_table` reaching `compute` bare is either (a) this same apply path's
-/// own downstream-propagation trigger for a chained definition's target —
-/// step 2 here, the bare-target-suffix fallback — or (b) reverse-recompute's
-/// `rel.def.from_table` (`relationship_definitions.from_table`, always bare
-/// — ADR-0007's "Scope" section leaves relationship endpoints unqualified),
-/// which is never anyone's target, so it needs step 1, the physical lookup,
-/// instead. Both cases reach this one function rather than `compute` having
-/// to tell them apart itself.
+/// `qualified_schema_node_key` is one caller: a `Recompute` row's `src_table`
+/// reaching `compute` bare is this same apply path's own
+/// downstream-propagation trigger for a chained definition's target — step 2
+/// here, the bare-target-suffix fallback. (Reverse recompute's from-side used
+/// to come through here too, re-resolving a relationship's bare `from_table`;
+/// since issue #288 it uses the relationship's own recorded schema,
+/// [`super::RelationshipDefinition::qualified_from_table`], instead.)
 pub(crate) async fn resolve_graph_identity(
     pool: &Pool,
     table: &str,

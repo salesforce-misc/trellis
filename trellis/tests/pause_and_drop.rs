@@ -1519,7 +1519,10 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
             // which is itself a registered definition naming the target.
             assert_eq!(
                 dependents,
-                vec!["report_view".to_string(), "reports.rollup".to_string()]
+                vec![
+                    "report_view".to_string(),
+                    format!("{DEFAULT_SCHEMA}.reports.rollup")
+                ]
             );
         }
         other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
@@ -1545,8 +1548,8 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
 /// fleet-wide intake wedge, reachable with zero readers in the picture.
 ///
 /// Retirement order is therefore relationship-then-target, and the refusal
-/// names the relationship in the `from_table.name` spelling
-/// `drop_relationship` takes.
+/// names the relationship by its qualified `schema.from_table.name` address —
+/// the spelling `DROP RELATIONSHIP` resolves unambiguously (issue #288).
 #[tokio::test]
 async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_readers() {
     let cluster = TestCluster::start();
@@ -1607,7 +1610,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
             assert_eq!(subject, "order_doubles");
             assert_eq!(
                 dependents,
-                vec!["reports.rollup".to_string()],
+                vec![format!("{DEFAULT_SCHEMA}.reports.rollup")],
                 "the relationship itself is the blocker — there is no reader to name"
             );
         }
@@ -1698,7 +1701,7 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
             dependents,
             ..
         }) => {
-            assert_eq!(subject, "authors.posts");
+            assert_eq!(subject, format!("{DEFAULT_SCHEMA}.authors.posts"));
             assert_eq!(dependents, vec!["author_stats".to_string()]);
         }
         other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),

@@ -193,10 +193,10 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
 }
 
 /// Issue #228 decision 1 allows the optional `<schema>.` qualifier on a
-/// relationship address. `relationship_definitions` stores from-tables bare —
-/// the `RELATIONSHIP` grammar has no qualified endpoint spelling to store — so
-/// the qualifier is checked against the from-table's registered
-/// fully-qualified identity rather than joining the lookup key. The two
+/// relationship address. A relationship is keyed on the schema its bare
+/// from-table resolved to when declared (`from_schema`, issues #285/#288), so
+/// the qualified address is an exact lookup; with only one schema declaring
+/// `authors.posts`, the bare address names that same relationship. The two
 /// spellings must therefore reach the same relationship.
 #[tokio::test]
 async fn a_schema_qualified_relationship_address_resolves_to_the_same_relationship() {

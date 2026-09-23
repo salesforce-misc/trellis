@@ -420,7 +420,9 @@ pub(crate) async fn drop_relationship(
     let dependents = relationship_readers(&txn, &qualified_from, name, None).await?;
     if !dependents.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
-            subject: format!("{from_table}.{name}"),
+            // Qualified whichever way the address was spelled: it names the
+            // one relationship this resolved to (issue #288).
+            subject: format!("{qualified_from}.{name}"),
             dependents,
             // A relationship's own readers are found by which relationship
             // *name* they reference (`relationship_readers` above), not by
@@ -500,7 +502,7 @@ pub(crate) async fn drop_relationship(
 ///
 /// Returns blocker names sorted and deduplicated, in the same two spellings
 /// [`CatalogError::DependentsBlockDrop`]'s `subject` uses: a bare transform
-/// name, or `from_table.relationship_name` for a relationship. A definition
+/// name, or `schema.from_table.relationship_name` for a relationship. A definition
 /// reachable both by a `source` edge and through a relationship is one
 /// blocker, named once.
 async fn dependency_blockers(
@@ -539,10 +541,11 @@ async fn dependency_blockers(
     //    subgraph still standing on this target rather than one layer of it
     //    at a time.
     for (qualified_from, name) in relationships_pointing_at(txn, target).await? {
-        let from_table = qualified_from
-            .split_once('.')
-            .map_or(qualified_from.as_str(), |(_, table)| table);
-        blockers.push(format!("{from_table}.{name}"));
+        // The qualified address (issue #288): `blog.posts.author` and
+        // `shop.posts.author` are two blockers, and a bare `posts.author`
+        // would both collapse them into one below and name a `DROP
+        // RELATIONSHIP` address that is refused as ambiguous.
+        blockers.push(format!("{qualified_from}.{name}"));
         blockers.extend(relationship_readers(txn, &qualified_from, &name, Some(target)).await?);
     }
 
