@@ -644,7 +644,7 @@ fn uniqueish_id() -> String {
 ///
 /// Uses a dedicated [`ProducerSession`] (not the pool): the session guards
 /// (`synchronous_commit`, the producer singleton advisory lock) are
-/// connection-scoped, and this function's session is dropped before
+/// connection-scoped, and this function's session is released before
 /// [`intake::Intake::connect`] opens its own — two `ProducerSession`s (or a
 /// `ProducerSession` and `Intake::connect`'s internal one) held
 /// concurrently on the same database would collide on that lock.
@@ -684,8 +684,11 @@ async fn setup_staging(
         .await?;
     }
 
-    // `session` drops here, closing its connection and releasing the
-    // producer singleton lock before `Intake::connect` opens its own.
+    // Release the producer singleton on the server before `Intake::connect`
+    // takes it on its own connection. Dropping the session would free it
+    // only once the backend noticed the closed socket, which can be after
+    // `Intake::connect`'s `pg_try_advisory_lock` has already failed.
+    session.release().await?;
     Ok(())
 }
 

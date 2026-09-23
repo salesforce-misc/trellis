@@ -380,6 +380,50 @@ async fn a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it
     );
 }
 
+/// Whether any session holds the bigint advisory lock `key`, as `pg_locks`
+/// reports it: split across `classid` (high 32 bits) and `objid` (low 32).
+async fn singleton_held(client: &Client, key: i64) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from pg_locks where locktype = 'advisory' and granted \
+             and classid = (($1::bigint >> 32) & 4294967295)::text::oid \
+             and objid = ($1::bigint & 4294967295)::text::oid)",
+            &[&key],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// `release` frees the singleton before it returns, unlike a drop, whose
+/// release waits on the backend noticing the closed socket. Client startup
+/// hands the singleton from its setup session straight to intake's, so that
+/// handoff must succeed on the very next attempt, with no polling.
+#[tokio::test]
+async fn a_released_producer_session_frees_the_singleton_immediately() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    // Opened up front: a fresh connection's handshake would give a dropped
+    // session's backend time to exit and hide the difference.
+    let observer = connect_raw(db.dsn()).await;
+    let key = trellis::staging::session::producer_singleton_lock_key(DEFAULT_SCHEMA);
+
+    for _ in 0..20 {
+        let session = trellis::staging::ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("the previous session released the singleton");
+        assert!(
+            singleton_held(&observer, key).await,
+            "the live session holds it"
+        );
+        session.release().await.expect("release");
+        assert!(
+            !singleton_held(&observer, key).await,
+            "release must free the singleton before returning"
+        );
+    }
+}
+
 /// Issue #234, the direct engine-level counterpart of
 /// `a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it`:
 /// the singleton is scoped to one **Trellis instance**, not to the database.

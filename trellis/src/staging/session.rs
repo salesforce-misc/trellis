@@ -95,12 +95,18 @@ pub fn producer_singleton_lock_key(schema: &str) -> i64 {
 }
 
 /// A guarded connection held for the lifetime of one producer (CDC intake).
-/// Acquiring one enforces both session guards; dropping it closes the
-/// connection, releasing the singleton lock instantly. Session-scoped rather
-/// than a TTL lease so "the process died" and "the lock is free" are the
-/// same instant, not eventually the same.
+/// Acquiring one enforces both session guards. Session-scoped rather than a
+/// TTL lease, so a producer whose process dies frees the lock as soon as
+/// Postgres notices the connection is gone.
+///
+/// Dropping a session frees the lock only *eventually*: the server-side
+/// backend releases it when it sees the socket close, which can be after the
+/// next statement on another connection has already run. A caller handing the
+/// singleton to another session must call [`ProducerSession::release`]
+/// rather than drop it.
 pub struct ProducerSession {
     client: Client,
+    schema: String,
     _connection: tokio::task::JoinHandle<()>,
 }
 
@@ -139,8 +145,23 @@ impl ProducerSession {
 
         Ok(Self {
             client,
+            schema: schema.to_string(),
             _connection: handle,
         })
+    }
+
+    /// Releases the singleton lock on the server, then closes the
+    /// connection. Once this returns, another session can acquire the lock
+    /// immediately, which dropping doesn't guarantee (see the type's doc
+    /// comment).
+    pub async fn release(self) -> Result<(), StagingError> {
+        self.client
+            .query_one(
+                "select pg_advisory_unlock($1)",
+                &[&producer_singleton_lock_key(&self.schema)],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Starts a transaction on this session's connection, for callers that
