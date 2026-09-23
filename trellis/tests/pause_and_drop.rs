@@ -1119,6 +1119,9 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
     // One row past a single chunk's 50,000-row bound, so the queue holds one
     // chunk to keep in flight and one to leave unclaimed.
     seed_source(&raw, "orders", 50_001).await;
+    // A sibling definition's queue, which resuming `order_doubles` must not
+    // touch.
+    seed_source(&raw, "items", 10).await;
     raw.batch_execute("create publication trellis_pub")
         .await
         .expect("create publication");
@@ -1128,17 +1131,23 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
+    trellis
+        .apply("TRANSFORM item_doubles FROM items SELECT a + a AS x")
+        .await
+        .expect("define a sibling chunked 1-1 transform");
     assert_eq!(
         count(&raw, "select count(*) from backfill_chunks").await,
-        2,
-        "precondition: the queue was enumerated as two chunks"
+        3,
+        "precondition: the queues were enumerated as two chunks and one"
     );
 
+    // `claim_chunks` hands out the lowest id first: `order_doubles`' first chunk.
     let in_flight = chunk_queue::claim_chunks(&raw, "issue-332-worker", 1)
         .await
         .expect("claim one chunk");
     assert_eq!(in_flight.len(), 1, "precondition: one chunk is in flight");
     let in_flight = &in_flight[0];
+    let paused_id = in_flight.definition_id;
 
     trellis
         .apply("PAUSE TRANSFORM order_doubles")
@@ -1158,17 +1167,26 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
         .await
         .expect("claim after resume");
     assert!(
-        reclaimed.is_empty(),
+        reclaimed.iter().all(|c| c.definition_id != paused_id),
         "no pre-pause chunk is claimable after resume, since the fresh backfill \
          rebuilds the target anyway: {reclaimed:?}"
     );
     assert_eq!(
-        count(
-            &raw,
-            "select count(*) from backfill_chunks where not done and claimed_by is null"
+        reclaimed.len(),
+        1,
+        "the sibling definition's queue is left intact: {reclaimed:?}"
+    );
+    let unclaimed: i64 = raw
+        .query_one(
+            "select count(*) from backfill_chunks \
+             where definition_id = $1 and not done and claimed_by is null",
+            &[&paused_id],
         )
-        .await,
-        0,
+        .await
+        .expect("count the paused definition's unclaimed chunks")
+        .get(0);
+    assert_eq!(
+        unclaimed, 0,
         "the unclaimed chunk was discarded, not merely withheld"
     );
     let still_held: i64 = raw
