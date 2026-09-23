@@ -27,34 +27,61 @@
 //! [`delete_orphaned_target_rows`] runs inside the discharge transaction
 //! before the enumeration cursor is declared, so its snapshot is at or before
 //! the cursor's. Each statement in that `READ COMMITTED` transaction reads
-//! its own snapshot, so there is a gap between the two, and a source change
-//! can commit in it:
+//! its own snapshot, so there is a short gap between the two, and a source
+//! change can commit in it. What makes CDC committed during the pass safe to
+//! lean on: its ring rows land in the active segment, and the maintenance
+//! loop running this pass is the only thing that seals one, so they drain
+//! only after the pass has flipped the definition `live` and are never
+//! skipped for it.
 //!
 //! - **A key deleted in the gap** is not orphaned yet when this runs and is
-//!   not enumerated either. Its CDC delete removes it. That delete committed
-//!   after this discharge pass began, so its ring row lands in the active
-//!   segment, and the maintenance loop that runs this pass is the only thing
-//!   that seals a segment. The row can't be drained before the pass has
-//!   flipped the definition `live`, so the apply doesn't skip it. For an
-//!   aggregate, the delete's apply probes the group, finds no source row and
-//!   deletes it (`apply_aggregate_target`'s existence check).
+//!   not enumerated either. Its CDC delete removes it. For an aggregate, the
+//!   delete's apply probes the group, finds no source row and deletes it
+//!   (`apply_aggregate_target`'s existence check), provided nothing has
+//!   repopulated the group by then (see the limits below).
 //! - **A key re-inserted in the gap** (after this deleted it) is enumerated,
 //!   and its `Recompute` re-derives it from live state.
 //! - **Anything after the `DECLARE`** is ordinary CDC, applied once the
-//!   definition is `live` (the same argument), and ordered against the
-//!   enumeration by the #312 catch-up gate.
+//!   definition is `live`, and ordered against the enumeration by the #312
+//!   catch-up gate.
 //!
-//! Running it *after* the `DECLARE` instead would be wrong for aggregates. A
-//! group that was empty at the cursor's snapshot and repopulated before the
-//! anti-join would survive with its pre-pause value. Nothing would enumerate
-//! it, and the new rows' CDC would fold into that stale value as deltas.
-//! Deleting the group first means those deltas build it from nothing, which
-//! is the right total.
+//! Running it after the intake wait (as #330's spike did) is wrong for
+//! aggregates over a window as long as the wait: a group empty at the
+//! cursor's snapshot and repopulated before the anti-join survives at its
+//! pre-pause value, nothing enumerates it, and the new rows' CDC folds into
+//! that stale value as deltas. Deleting the group first means those deltas
+//! build it from nothing. `a_group_repopulated_after_the_enumeration_snapshot_holds_only_its_new_rows`
+//! pins this.
 //!
 //! Deleting a row the source *does* still back (a group repopulated in the
 //! gap) is harmless: the enumeration or CDC re-derives it. So the anti-join
 //! only has to be exact in one direction. It must never keep a row that no
 //! source row backs.
+//!
+//! ## What no placement closes (aggregates only)
+//!
+//! The anti-join and the cursor read different snapshots, so *either* order
+//! leaves a short race. The two races mirror each other:
+//!
+//! - Immediately after `DECLARE`: a group empty at the cursor's snapshot and
+//!   repopulated before the anti-join keeps its stale pre-pause value.
+//! - Before `DECLARE` (this code): a group still backed when the anti-join
+//!   runs, whose last rows are deleted before `DECLARE` and which is
+//!   repopulated before those deletes drain, keeps its stale value, and the
+//!   deletes and inserts fold onto it as deltas.
+//!
+//! This order was chosen because its race needs a group to both empty inside
+//! the gap and refill before the drain. Reading both on one snapshot would
+//! close it.
+//!
+//! A wider window remains that has nothing to do with this module, and it
+//! also hits a fresh deferred definition's discharge. Take an aggregate
+//! group whose every row in the cursor's snapshot is deleted after `DECLARE`
+//! (during the intake wait, say) and which is refilled before the drain. It
+//! never gets a forced recompute: each enumerated key's `Recompute` either
+//! finds its row gone and is dropped, or folds with that row's CDC delete
+//! into a plain delta. So the group ends up as its target value (stale, or
+//! absent) plus the CDC deltas, not as its live contents.
 //!
 //! # Only the definitions this marker rebuilds
 //!

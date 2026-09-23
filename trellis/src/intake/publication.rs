@@ -743,13 +743,13 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// So, first thing in the transaction, `resume_orphans::delete_orphaned_target_rows`
 /// deletes every row of each promoted definition's target that no source row
 /// backs, reporting each through the target-mutation seam. It runs before
-/// `DECLARE` because the maintenance loop that runs this pass is also the only
-/// sealer: any source change committed after the pass starts is drained only
-/// once the definition is `live`. A key deleted after the anti-join is then
-/// removed by its own CDC, and a key re-inserted after it is enumerated or
-/// arrives as CDC. Running after `DECLARE` would leave an aggregate group that
-/// was repopulated in between at its stale pre-pause value. That module's doc
-/// comment has the full argument.
+/// `DECLARE`, and never after the intake wait, which would leave an aggregate
+/// group repopulated during the wait at its stale pre-pause value. The
+/// maintenance loop that runs this pass is also the only sealer, so any
+/// source change committed after the pass starts is drained only once the
+/// definition is `live`. The anti-join and the cursor still read different
+/// snapshots, which leaves a short race for aggregates in either order. That
+/// module's doc comment has the full argument and its limits.
 // The maintenance loop calls [`run_pending_backfills_until`] so it can stop
 // the wait on shutdown. This no-stop form is the tests' entry point, so
 // nothing in the crate calls it unless `internals` exposes it.
@@ -816,7 +816,7 @@ pub(crate) async fn run_pending_backfills_until(
         .await?;
 
         let txn = client.transaction().await?;
-        // Issue #330: before the enumeration's `DECLARE`, never after — see
+        // Issue #330: before the enumeration's `DECLARE` and its intake wait; see
         // "Dropping what the source no longer backs" above. On the rollback
         // below, the deletes roll back with everything else.
         super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, &advancing).await?;
@@ -1818,10 +1818,11 @@ mod catch_up_tests {
     /// runs. Group 0 is empty when the discharge starts and is repopulated
     /// after the enumeration's snapshot is taken, so the cursor never sees
     /// the new row and only its CDC carries it. The group must come out as
-    /// that row alone. Had the anti-join run after `DECLARE` (as #330's
-    /// spike did, after the intake wait), it would have seen the new row,
-    /// kept the group's pre-pause total of 12, and the CDC insert would have
-    /// folded into that as a delta: 112.
+    /// that row alone. Had the anti-join run after the intake wait (as
+    /// #330's spike did), it would have seen the new row, kept the group's
+    /// pre-pause total of 12, and the CDC insert would have folded into that
+    /// as a delta: 112. The repopulation lands during the wait, so this test
+    /// can't tell "before `DECLARE`" from "right after `DECLARE`": both pass.
     #[tokio::test]
     async fn a_group_repopulated_after_the_enumeration_snapshot_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
