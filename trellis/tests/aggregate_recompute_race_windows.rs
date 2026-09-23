@@ -43,8 +43,10 @@
 //! double count described on it. The last two pin parts of the mechanism the
 //! five windows don't reach on their own: a row the delta path creates
 //! inheriting the extinct horizon, and the fold comparing a telescoped
-//! delta by its *earliest* commit. The final test is issue #322's
-//! definition-time enumeration, which the same rule closes.
+//! delta by its *earliest* commit. Then come issue #322's definition-time
+//! enumeration, which the same rule closes, and two cases found in review:
+//! an extinction with no row to delete, and a delta that reaches the
+//! aggregate through a relationship's reverse fast path.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -958,5 +960,61 @@ async fn issue_322_definition_time_enumeration_does_not_double_count_a_pre_defin
     h.assert_matches_oracle("C's delta must not count it a second time")
         .await;
 
+    h.finish().await;
+}
+
+/// W1 through a relationship: the aggregate sums a to-one parent's column.
+/// A forced recompute of group 1 joins the parent live, so it already counts
+/// the parent update P. P's own CDC then reaches the aggregate through the
+/// relationship reverse fast path, which diffs every from-side row's
+/// contribution under P's old and new images. That delta has to be judged
+/// against group 1's horizon by P's LSN like any other, or it adds P's
+/// change a second time.
+#[tokio::test]
+async fn w1_a_relationship_reverse_delta_is_judged_against_the_horizon() {
+    let mut h = Harness::start(
+        &format!(
+            "{SRC_DDL}; \
+             create table public.parents (id integer primary key, w numeric); \
+             alter table public.parents replica identity full; \
+             insert into public.parents values (1, 3); \
+             insert into public.src values (1, 1, 1)"
+        ),
+        &[
+            Setup::Relationship("RELATIONSHIP parent FROM src.g TO parents.id"),
+            Setup::Transform(
+                "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(parent.w) AS total, COUNT(*) AS n",
+            ),
+        ],
+        "agg",
+    )
+    .await;
+    let oracle_sql = "select trim_scale(s.g::numeric)::text, trim_scale(sum(p.w))::text, \
+                      trim_scale(count(*)::numeric)::text from public.src s \
+                      left join public.parents p on p.id = s.g group by s.g";
+    assert_eq!(
+        h.target().await,
+        h.groups(oracle_sql).await,
+        "initial build"
+    );
+
+    h.append_recomputes(&[1]).await;
+    let k = h.seal().await;
+    h.commit("update public.parents set w = 4 where id = 1")
+        .await;
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.groups(oracle_sql).await,
+        "the forced recompute reads the parent change live"
+    );
+
+    h.feed().await;
+    h.settle().await;
+    assert_eq!(
+        h.target().await,
+        h.groups(oracle_sql).await,
+        "the parent change's reverse delta must not count it again"
+    );
     h.finish().await;
 }

@@ -1438,6 +1438,12 @@ pub(crate) struct RelationshipReverseRecord {
     /// The folded change's own `GREATEST` `lsn` — this record's own
     /// identity in the projection's LSN chain once it applies.
     lsn: Option<PgLsn>,
+    /// The folded change's earliest image-bearing `lsn`
+    /// ([`fold::FoldedChange::min_image_lsn`]). The fast path's per-group
+    /// deltas carry it so `apply_aggregate::apply_aggregate_target` can
+    /// re-derive a group whose recompute horizon may already count this
+    /// parent change (issue #321), exactly as it does for a from-side delta.
+    min_image_lsn: Option<PgLsn>,
     /// The projection's `__trellis_lsn` as read live, in Phase 2, for
     /// whichever of `old_row`/`new_row`'s key was available (preferring the
     /// old key, the pre-this-batch identity) — see this struct's own doc
@@ -4623,6 +4629,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     old_image: change.old_image.clone(),
                     new_image: change.new_image.clone(),
                     lsn: change.lsn,
+                    min_image_lsn: change.min_image_lsn,
                     prev_lsn: capture.prev_lsn,
                     prev_gen: capture.prev_gen,
                     watermark: capture.watermark,
@@ -5113,6 +5120,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             old_image: change.old_image.clone(),
             new_image: change.new_image.clone(),
             lsn: change.lsn,
+            min_image_lsn: change.min_image_lsn,
             prev_lsn: capture.prev_lsn,
             prev_gen: capture.prev_gen,
             watermark: capture.watermark,
@@ -6919,6 +6927,7 @@ pub async fn apply_and_mark_drained_many(
                         group.hop_gen = group.hop_gen.max(record.hop_gen);
                         group.src_changed =
                             earliest_src_changed(group.src_changed, record.src_changed);
+                        group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::diff_contributions(
                             &target_plan.fields,
                             group,
@@ -6933,6 +6942,7 @@ pub async fn apply_and_mark_drained_many(
                         old_group.hop_gen = old_group.hop_gen.max(record.hop_gen);
                         old_group.src_changed =
                             earliest_src_changed(old_group.src_changed, record.src_changed);
+                        old_group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::sub_contributions(
                             &target_plan.fields,
                             old_group,
@@ -6946,6 +6956,7 @@ pub async fn apply_and_mark_drained_many(
                         new_group.hop_gen = new_group.hop_gen.max(record.hop_gen);
                         new_group.src_changed =
                             earliest_src_changed(new_group.src_changed, record.src_changed);
+                        new_group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::add_contributions(
                             &target_plan.fields,
                             new_group,

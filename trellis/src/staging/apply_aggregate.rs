@@ -432,7 +432,15 @@ impl GroupPlan {
     fn touch(&mut self, change: &FoldedChange) {
         self.hop_gen = self.hop_gen.max(change.hop_gen);
         self.src_changed = super::apply::earliest_src_changed(self.src_changed, change.src_changed);
-        self.min_image_lsn = match (self.min_image_lsn, change.min_image_lsn) {
+        self.note_image_lsn(change.min_image_lsn);
+    }
+
+    /// Lowers [`Self::min_image_lsn`] to `lsn` when it is earlier, ignoring
+    /// a missing side. Also called by the relationship reverse fast path
+    /// (`super::apply`), whose deltas come from a parent's folded change
+    /// rather than a from-side one.
+    pub(super) fn note_image_lsn(&mut self, lsn: Option<PgLsn>) {
+        self.min_image_lsn = match (self.min_image_lsn, lsn) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
