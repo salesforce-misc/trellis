@@ -91,10 +91,18 @@ pub struct ClientOptions {
     /// discharge, apply's downstream propagation, and every idle app-worker
     /// task's `LISTEN`.
     pub wake_channel: String,
-    /// How long a claim may sit unrefreshed before [`staging::reclaim_stale`]
-    /// takes it back. Only consulted when `staging_worker` is set (the
-    /// maintenance loop rides only with the staging worker — see the module
-    /// doc comment).
+    /// How long a claim may sit unrefreshed before it's taken back: ring
+    /// segment claims by [`staging::reclaim_stale`] (the maintenance loop,
+    /// only when `staging_worker` is set), and backfill-chunk claims by
+    /// [`chunk_queue::reclaim_stale_chunks`] (every app-worker task,
+    /// regardless of `staging_worker`).
+    ///
+    /// Must be at least twice [`HeartbeatDaemonConfig::interval`] (see
+    /// [`Self::heartbeat`]), or [`Client::start`] rejects the options with
+    /// [`ClientError::HeartbeatNotUnderReclaimTtl`]: a live worker only
+    /// refreshes its claims once per heartbeat interval, so a TTL at or
+    /// under that interval reclaims claims out from under workers that are
+    /// still running them.
     pub reclaim_ttl: Duration,
     /// How often the maintenance loop (seal/recover/reclaim) ticks.
     pub maintenance_interval: Duration,
@@ -118,7 +126,9 @@ pub struct ClientOptions {
     /// Intake's txn-buffer hard cap (bytes).
     pub hard_cap: usize,
     /// The out-of-band heartbeat daemon's tick interval and idle-exit
-    /// timeout, one per app-worker task.
+    /// timeout, one per app-worker task. The same interval also paces each
+    /// in-flight backfill chunk's claim refresh. Its `interval` must be at
+    /// most half of `reclaim_ttl` (see that field).
     pub heartbeat: HeartbeatDaemonConfig,
     /// How long an app-worker task's idle `LISTEN` wait sits before polling
     /// `next_claimable_segment` again anyway (a floor under `NOTIFY`
@@ -161,6 +171,21 @@ impl Default for ClientOptions {
     }
 }
 
+/// The option checks [`Client::start_with_config`] runs before spawning
+/// anything, split out so they're unit-testable without a database.
+fn validate_options(options: &ClientOptions) -> Result<(), ClientError> {
+    if options.staging_worker && options.source_tables.is_empty() {
+        return Err(ClientError::NoSourceTables);
+    }
+    if options.heartbeat.interval.saturating_mul(2) > options.reclaim_ttl {
+        return Err(ClientError::HeartbeatNotUnderReclaimTtl {
+            heartbeat_interval: options.heartbeat.interval,
+            reclaim_ttl: options.reclaim_ttl,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------
@@ -176,6 +201,17 @@ pub enum ClientError {
     /// `staging_worker` was set but `source_tables` was empty — nothing to
     /// publish or stream.
     NoSourceTables,
+    /// `heartbeat.interval` is more than half of `reclaim_ttl`. Claims
+    /// would go stale between two refreshes of a live worker and be
+    /// reclaimed and re-run by a peer while the worker is still running
+    /// them. A chunk that takes longer than the TTL would then never finish,
+    /// because each run's completion is discarded once the claim has moved.
+    HeartbeatNotUnderReclaimTtl {
+        /// The configured `heartbeat.interval`.
+        heartbeat_interval: Duration,
+        /// The configured `reclaim_ttl`.
+        reclaim_ttl: Duration,
+    },
     /// The background thread failed to spawn.
     Spawn(std::io::Error),
     /// The background thread exited (panicked, or its `run` future dropped
@@ -207,7 +243,9 @@ impl ClientError {
         match self {
             // `staging_worker` set with no source tables is a rejected
             // call, same category as any other invalid-configuration error.
-            ClientError::NoSourceTables => ErrorCode::Validation,
+            ClientError::NoSourceTables | ClientError::HeartbeatNotUnderReclaimTtl { .. } => {
+                ErrorCode::Validation
+            }
             ClientError::Spawn(_)
             | ClientError::ThreadExitedBeforeReady
             | ClientError::ThreadPanicked => ErrorCode::Internal,
@@ -227,6 +265,15 @@ impl fmt::Display for ClientError {
                 f,
                 "staging_worker is set but ClientOptions::source_tables is empty; nothing to \
                  publish or stream"
+            ),
+            ClientError::HeartbeatNotUnderReclaimTtl {
+                heartbeat_interval,
+                reclaim_ttl,
+            } => write!(
+                f,
+                "ClientOptions::heartbeat.interval ({heartbeat_interval:?}) must be at most half of \
+                 ClientOptions::reclaim_ttl ({reclaim_ttl:?}); otherwise live workers' claims go \
+                 stale between heartbeats and are reclaimed while still in flight"
             ),
             ClientError::Spawn(err) => {
                 write!(f, "failed to spawn the client's runtime thread: {err}")
@@ -263,6 +310,7 @@ impl std::error::Error for ClientError {
             ClientError::Intake(err) => Some(err),
             ClientError::Apply(err) => Some(err),
             ClientError::NoSourceTables
+            | ClientError::HeartbeatNotUnderReclaimTtl { .. }
             | ClientError::ThreadExitedBeforeReady
             | ClientError::ThreadPanicked => None,
         }
@@ -363,9 +411,7 @@ impl Client {
         options: ClientOptions,
     ) -> Result<Client, ClientError> {
         let dsn = config.dsn().to_string();
-        if options.staging_worker && options.source_tables.is_empty() {
-            return Err(ClientError::NoSourceTables);
-        }
+        validate_options(&options)?;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ClientError>>();
@@ -1048,12 +1094,6 @@ struct AppWorkerConfig {
     watermark: staging::StagedWatermark,
 }
 
-/// How many pending backfill chunks one [`app_worker_loop`] iteration claims
-/// at a time — small enough that one worker doesn't hoard a huge definition's
-/// whole queue while peers sit idle, matching the spirit of
-/// `staging::MAX_COALESCE_SEGMENTS`'s own per-tick batch cap.
-const MAX_BACKFILL_CHUNK_CLAIM: i64 = 4;
-
 /// One application-worker task: registers itself as a drainer, runs an
 /// out-of-band heartbeat daemon for its ring-segment claims, then loops
 /// claiming and draining sealed batches *and* claiming and executing pending
@@ -1303,13 +1343,13 @@ async fn heartbeat_worker_if_due(
     *next_due = Instant::now() + interval;
 }
 
-/// Claims up to [`MAX_BACKFILL_CHUNK_CLAIM`] pending direct-build backfill
-/// chunks (`defs::chunk_queue`, docs/decisions/0007's amendment) and executes
-/// each one, marking it done (flipping its definition `backfilling` ->
-/// `live` once every chunk is done — see `chunk_queue::finish_chunk`) or,
-/// on a write error, releasing the claim immediately for the reclaim-stale
-/// sweep or another worker to retry — the same "release on error rather than
-/// wait out the TTL" discipline [`app_worker_loop`]'s segment path uses.
+/// Claims one pending direct-build backfill chunk (`defs::chunk_queue`,
+/// docs/decisions/0007's amendment) and executes it, marking it done
+/// (flipping its definition `backfilling` -> `live` once every chunk is done
+/// — see `chunk_queue::finish_chunk`) or, on a write error, releasing the
+/// claim immediately for the reclaim-stale sweep or another worker to retry
+/// — the same "release on error rather than wait out the TTL" discipline
+/// [`app_worker_loop`]'s segment path uses.
 /// Returns whether it claimed anything, so the caller's own idle-wait
 /// decision treats a tick that only did backfill work as progress too.
 ///
@@ -1318,6 +1358,16 @@ async fn heartbeat_worker_if_due(
 /// [`HeartbeatDaemonConfig::interval`] (the same cadence its segment claims
 /// heartbeat at), so a chunk write outliving `reclaim_ttl` isn't falsely
 /// reclaimed mid-write (see `chunk_queue::run_claimed_chunk`'s doc comment).
+///
+/// Exactly one chunk per call, because that heartbeat only covers the chunk
+/// that is executing. This used to claim a batch of up to four and run them
+/// one after another, so every chunk queued behind the running one sat
+/// claimed with no refresh at all. Once the running chunk took longer than
+/// `reclaim_ttl`, a peer's sweep reclaimed the queued ones and ran them too,
+/// and this worker's own completion of them was discarded (`finish_chunk`
+/// is scoped to the current claimant). Claiming one at a time costs nothing:
+/// the caller loops straight back around after any backfill progress, and a
+/// peer can pick up the next chunk in the meantime.
 async fn drain_backfill_chunks(
     pool: &Pool,
     claimed_by: &str,
@@ -1325,33 +1375,28 @@ async fn drain_backfill_chunks(
     heartbeat_interval: Duration,
 ) -> bool {
     let claimed = match pool.get().await {
-        Ok(client) => {
-            chunk_queue::claim_chunks(&**client, claimed_by, MAX_BACKFILL_CHUNK_CLAIM).await
-        }
+        Ok(client) => chunk_queue::claim_chunks(&**client, claimed_by, 1).await,
         Err(err) => Err(err.into()),
     };
-    let claimed = match claimed {
-        Ok(chunks) if !chunks.is_empty() => chunks,
-        _ => return false,
+    let Some(chunk) = claimed.ok().and_then(|chunks| chunks.into_iter().next()) else {
+        return false;
     };
 
-    for chunk in &claimed {
-        match chunk_queue::run_claimed_chunk(
-            pool,
-            chunk,
-            target_schema,
-            claimed_by,
-            heartbeat_interval,
-        )
-        .await
-        {
-            Ok(()) => {
-                let _ = chunk_queue::finish_chunk(pool, chunk, claimed_by).await;
-            }
-            Err(_) => {
-                if let Ok(client) = pool.get().await {
-                    let _ = chunk_queue::release_chunk(&**client, chunk.id, claimed_by).await;
-                }
+    match chunk_queue::run_claimed_chunk(
+        pool,
+        &chunk,
+        target_schema,
+        claimed_by,
+        heartbeat_interval,
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
+        }
+        Err(_) => {
+            if let Ok(client) = pool.get().await {
+                let _ = chunk_queue::release_chunk(&**client, chunk.id, claimed_by).await;
             }
         }
     }
@@ -1460,5 +1505,240 @@ mod error_code_tests {
 
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+}
+
+#[cfg(test)]
+mod option_validation_tests {
+    use super::*;
+
+    fn options_with(heartbeat_interval: Duration, reclaim_ttl: Duration) -> ClientOptions {
+        ClientOptions {
+            application_threads: 1,
+            reclaim_ttl,
+            heartbeat: HeartbeatDaemonConfig {
+                interval: heartbeat_interval,
+                ..HeartbeatDaemonConfig::default()
+            },
+            ..ClientOptions::default()
+        }
+    }
+
+    #[test]
+    fn the_default_options_pass_validation() {
+        assert!(validate_options(&ClientOptions::default()).is_ok());
+    }
+
+    /// The configuration behind the `client_e2e` flake this check exists
+    /// for: a 200ms `reclaim_ttl` with the default 5s heartbeat. Chunk
+    /// claims then went stale 200ms into every chunk run, and a chunk that
+    /// took longer than that was reclaimed and re-run by the peer worker
+    /// indefinitely.
+    #[test]
+    fn a_reclaim_ttl_shorter_than_the_heartbeat_interval_is_rejected() {
+        let err = validate_options(&options_with(
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        ))
+        .expect_err("a TTL under the heartbeat interval must be rejected");
+        assert!(matches!(
+            err,
+            ClientError::HeartbeatNotUnderReclaimTtl { .. }
+        ));
+        assert_eq!(err.code(), ErrorCode::Validation);
+    }
+
+    #[test]
+    fn the_heartbeat_interval_must_be_at_most_half_the_reclaim_ttl() {
+        assert!(
+            validate_options(&options_with(
+                Duration::from_millis(100),
+                Duration::from_millis(200)
+            ))
+            .is_ok(),
+            "exactly half is allowed"
+        );
+        assert!(
+            validate_options(&options_with(
+                Duration::from_millis(101),
+                Duration::from_millis(200)
+            ))
+            .is_err(),
+            "just over half is rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backfill_chunk_claim_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use crate::defs::ast::ValueType;
+
+    /// A backfill chunk is heartbeated only while it runs, so a worker must
+    /// never hold a claim on a chunk it isn't running yet. The old code
+    /// claimed up to four at once and ran them in turn, and the queued ones
+    /// went stale and were reclaimed by a peer while the first was still
+    /// running (see [`drain_backfill_chunks`]'s doc comment).
+    ///
+    /// Checked deterministically with an advisory-lock gate rather than a
+    /// timing budget: a statement trigger on the target blocks the first
+    /// chunk's write on a lock this test holds. While the write is parked
+    /// there, exactly one chunk may be claimed.
+    #[tokio::test]
+    async fn a_worker_claims_only_the_chunk_it_is_running() {
+        const GATE: i64 = 0x7472_6c73;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        // Same-crate pool; see apply.rs's metrics test for why testkit's own
+        // `db.pool` is a different type here.
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&pool_config).expect("build a same-crate pool");
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path");
+
+        // One row over the 50k-row chunk size: the smallest table that
+        // plans two chunks.
+        raw.batch_execute(
+            "create table public.gated (id bigint primary key, price numeric); \
+             insert into public.gated select g, g from generate_series(1, 50001) g",
+        )
+        .await
+        .expect("seed source");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("price".to_string(), ValueType::Numeric),
+        ]);
+        let def = defs::install_definition(
+            &pool,
+            "TRANSFORM gated_calc FROM gated SELECT price + price AS double_price",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        let chunk_count: i64 = raw
+            .query_one(
+                "select count(*) from backfill_chunks where definition_id = $1",
+                &[&def.id],
+            )
+            .await
+            .expect("count chunks")
+            .get(0);
+        assert_eq!(chunk_count, 2, "the gate test needs two planned chunks");
+
+        raw.batch_execute(&format!(
+            "create function public.gated_calc_gate() returns trigger language plpgsql as $$ \
+             begin perform pg_advisory_xact_lock({GATE}); return null; end $$; \
+             create trigger gated_calc_gate before insert on public.gated_calc \
+             for each statement execute function public.gated_calc_gate(); \
+             select pg_advisory_lock({GATE});"
+        ))
+        .await
+        .expect("install the write gate and close it");
+
+        let worker_pool = pool.clone();
+        let worker = tokio::spawn(async move {
+            drain_backfill_chunks(
+                &worker_pool,
+                "gated-worker",
+                "public",
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        // Wait for the chunk write to park on the gate: an event, not a
+        // convergence budget. The bound only turns a hang into a failure.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let parked: bool = raw
+                .query_one(
+                    "select exists(select 1 from pg_locks \
+                     where locktype = 'advisory' and not granted)",
+                    &[],
+                )
+                .await
+                .expect("read pg_locks")
+                .get(0);
+            if parked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the chunk write never reached the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let claimed: Vec<Option<String>> = raw
+            .query(
+                "select claimed_by from backfill_chunks where definition_id = $1 order by id",
+                &[&def.id],
+            )
+            .await
+            .expect("read claims")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            claimed,
+            vec![Some("gated-worker".to_string()), None],
+            "while one chunk is running, the other must stay unclaimed for a peer to take"
+        );
+
+        raw.batch_execute(&format!("select pg_advisory_unlock({GATE})"))
+            .await
+            .expect("open the gate");
+        assert!(
+            worker.await.expect("worker task"),
+            "the call claimed and ran a chunk"
+        );
+
+        let states: Vec<(bool, Option<String>)> = raw
+            .query(
+                "select done, claimed_by from backfill_chunks where definition_id = $1 order by id",
+                &[&def.id],
+            )
+            .await
+            .expect("read chunk states")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            states,
+            vec![(true, None), (false, None)],
+            "one call finishes exactly the chunk it claimed"
+        );
+
+        assert!(
+            drain_backfill_chunks(&pool, "gated-worker", "public", Duration::from_secs(5)).await
+        );
+        assert!(
+            !drain_backfill_chunks(&pool, "gated-worker", "public", Duration::from_secs(5)).await,
+            "nothing is left to claim"
+        );
+        let status: String = raw
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&def.id],
+            )
+            .await
+            .expect("read status")
+            .get(0);
+        assert_eq!(status, "live");
     }
 }

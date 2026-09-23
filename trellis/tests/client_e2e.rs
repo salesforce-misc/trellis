@@ -178,6 +178,21 @@ async fn oracle_snapshot(
         .collect()
 }
 
+/// Ages every claim the simulated `"dead-worker"` holds an hour into the
+/// past, so it's stale under any `reclaim_ttl` and the client's first chunk
+/// sweep frees it. The reclaim tests below do this instead of running the
+/// client with a TTL short enough to expire mid-test: a TTL that short also
+/// expires the claims of the client's own live workers.
+async fn backdate_dead_claims(raw: &Client) {
+    raw.execute(
+        "update backfill_chunks set claimed_at = now() - interval '1 hour' \
+         where claimed_by = 'dead-worker'",
+        &[],
+    )
+    .await
+    .expect("backdate the dead worker's claims");
+}
+
 #[tokio::test]
 async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle() {
     let cluster = TestCluster::start();
@@ -790,10 +805,11 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
 ///
 /// This simulates exactly that crash: a chunk is claimed by a `"dead-worker"`
 /// that never executes or finishes it — *before* any `Client` exists at
-/// all — then a single `staging_worker: false` client is started (with a
-/// short `reclaim_ttl`/`maintenance_interval` so the test doesn't wait out
-/// production-sized defaults) and must, entirely on its own, reclaim that
-/// stale claim, execute it, and flip the definition to `Live`.
+/// all — then a single `staging_worker: false` client is started and must,
+/// entirely on its own, reclaim that stale claim, execute it, and flip the
+/// definition to `Live`. The dead claim is backdated past the default
+/// `reclaim_ttl` (see [`backdate_dead_claims`]) rather than the client being
+/// given a tiny TTL, so the client's first sweep frees it at once.
 #[tokio::test]
 async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker_anywhere() {
     let cluster = TestCluster::start();
@@ -826,15 +842,20 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
         .await
         .expect("claim_chunks (simulating a crashed worker)");
     assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+    backdate_dead_claims(&raw).await;
 
     // A drain-only client — no staging worker anywhere in this test, and
     // this is the *only* client instance running. Without the app-worker
     // loop's own reclaim sweep, nothing would ever free the stale claim
     // above.
+    // Default `reclaim_ttl` and heartbeat: a live worker's claim can't be
+    // falsely reclaimed within this test's budget, so the only thing it
+    // waits on is the work itself. A short `maintenance_interval` just keeps
+    // the sweep cadence tight; the first sweep runs as soon as each worker
+    // starts anyway.
     let options = ClientOptions {
         staging_worker: false,
         application_threads: 2,
-        reclaim_ttl: Duration::from_millis(200),
         maintenance_interval: Duration::from_millis(50),
         poll_interval: Duration::from_millis(50),
         ..Default::default()
@@ -911,6 +932,17 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
 /// dataset — since the boundary-discovery correctness itself is someone
 /// else's job now. 50_005 rows (one over the 50_000-row chunk size) is the
 /// minimum that still yields two chunks.
+///
+/// This test kept timing out on CI after #297's split, and the cause was not
+/// load alone. It ran the client with a 200ms `reclaim_ttl` next to the
+/// default 5s chunk heartbeat, so a live worker's claim went stale 200ms into
+/// every chunk run. Once the 50k-row chunk took longer than that (about 80ms
+/// on an idle dev box, several times that on a loaded runner), the peer
+/// worker reclaimed it and ran it again. The first run's `finish_chunk` then
+/// found the claim gone and did nothing, and the two workers kept passing the
+/// chunk back and forth until the 20s budget ran out. `Client::start` now
+/// rejects that configuration, and this test backdates the dead claim instead
+/// of shrinking the TTL, so the budget covers only the backfill work itself.
 #[tokio::test]
 async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     let cluster = TestCluster::start();
@@ -955,11 +987,16 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
         .await
         .expect("claim_chunks (simulating a crashed worker)");
     assert_eq!(claimed.len(), 2);
+    backdate_dead_claims(&raw).await;
 
+    // Default `reclaim_ttl` and heartbeat: a live worker's claim can't be
+    // falsely reclaimed within this test's budget, so the only thing it
+    // waits on is the work itself. A short `maintenance_interval` just keeps
+    // the sweep cadence tight; the first sweep runs as soon as each worker
+    // starts anyway.
     let options = ClientOptions {
         staging_worker: false,
         application_threads: 2,
-        reclaim_ttl: Duration::from_millis(200),
         maintenance_interval: Duration::from_millis(50),
         poll_interval: Duration::from_millis(50),
         ..Default::default()
