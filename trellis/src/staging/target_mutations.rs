@@ -294,8 +294,9 @@ pub struct TargetMutations {
     assume_readers: Option<bool>,
 }
 
-/// [`TargetMutations::into_staged`]'s output: the downstream rows to append, every target whose propagation would exceed [`MAX_HOP_GEN`]
-/// with the worst hop generation seen, and the transaction's write token.
+/// [`TargetMutations::into_staged`]'s output: the downstream rows to append,
+/// every target whose propagation would exceed [`MAX_HOP_GEN`] with the worst
+/// hop generation seen, and the transaction's write token.
 pub(crate) struct Propagation {
     pub changes: Vec<StagedChange>,
     pub hop_bound_tables: Vec<String>,
@@ -862,5 +863,84 @@ mod tests {
         let untouched = TargetMutations::assuming_read();
         let propagation = untouched.into_staged(&txn).await.expect("stage untouched");
         assert_eq!(propagation.write_token, None, "no key changed, no token");
+    }
+
+    /// `read_new_images` over a composite, mixed-type row identity (a text
+    /// part carrying the composite separator, a `date` part) and a
+    /// mixed-case join-key column: an updated key comes back with its new
+    /// image, a deleted one with none, and each `group_key` is the union of
+    /// the prior and new images' join-key values.
+    #[tokio::test]
+    async fn read_new_images_matches_composite_mixed_type_keys() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "set datestyle to 'ISO, YMD'; \
+                 create table t (a text, b date, \"Grp\" int, primary key (a, b)); \
+                 insert into t values ('x' || chr(31) || 'y', '2026-01-02', 1), \
+                                      ('z', '2026-03-04', 2)",
+            )
+            .await
+            .expect("create t");
+        let txn = client.transaction().await.expect("begin");
+        let key_columns = ddl::identity_key_columns(&txn, "public.t")
+            .await
+            .expect("pk");
+        let columns = live_row_columns(&txn, "public.t").await.expect("columns");
+        let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
+        let image = row_as_text_jsonb_sql("t", &columns);
+        let before: Vec<(String, String)> = txn
+            .query(
+                &format!("select {key_sql}, ({image})::text from t order by \"Grp\" for update"),
+                &[],
+            )
+            .await
+            .expect("pre-lock")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        txn.batch_execute(
+            "update t set \"Grp\" = 5 where a = 'x' || chr(31) || 'y'; \
+             delete from t where a = 'z'",
+        )
+        .await
+        .expect("write");
+        let mut keys = BTreeMap::new();
+        for (key, prior) in &before {
+            keys.insert(
+                key.clone(),
+                KeyMutation {
+                    prior_image: Some(prior.clone()),
+                    hop_gen: 0,
+                    src_changed: None,
+                },
+            );
+        }
+        let feed = EndpointFeed {
+            key_columns,
+            group_key_columns: vec!["Grp".to_string()],
+        };
+        let mut got = read_new_images(&txn, "public.t", &columns, &feed, &keys)
+            .await
+            .expect("re-read");
+        let updated = got
+            .remove(&before[0].0)
+            .expect("the updated key comes back");
+        assert_eq!(
+            updated.image.as_deref(),
+            Some(r#"{"a": "x\u001fy", "b": "2026-01-02", "Grp": "5"}"#)
+        );
+        assert_eq!(
+            updated.group_key,
+            Some(vec!["1".to_string(), "5".to_string()])
+        );
+        let deleted = got
+            .remove(&before[1].0)
+            .expect("the deleted key comes back");
+        assert_eq!(deleted.image, None);
+        assert_eq!(deleted.group_key, Some(vec!["2".to_string()]));
+        assert!(got.is_empty());
     }
 }
