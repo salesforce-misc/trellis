@@ -34,7 +34,7 @@ sequenceDiagram
     Note over W,DB: Phase 3 — apply ∪ mark (ONE transaction)
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
-    W->>DB: 2. derived writes, gone-key deletes, truncate handling
+    W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: per-key ordering lock + basis check)
     W->>DB: 3. aggregate + join maintenance (delta arithmetic)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. mark this claim's buckets drained
@@ -103,6 +103,57 @@ exactly the state batch *k−1*'s new side left.**
 
 Because the deltas are invertible they also **commute**, so an out-of-order drain
 converges to the same total.
+
+## Absolute writes do not commute: the basis check
+
+Batches drain out of `seg_seq` order, and key-routing does not order a key's
+writes *across* batches ([04](04-claiming-and-the-fold.md)). The argument above
+covers that for deltas only. Every write path has to be checked against this
+table:
+
+| Write kind | Commutes? | Idempotent? | What makes an out-of-order drain safe |
+|---|---|---|---|
+| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above) |
+| 1-1 field writes and deletes, from an image or a live recompute read | **no** | yes | the per-key ordering lock and basis check, below |
+| Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
+| Truncate | no | yes | the drain barrier (full serialization) |
+
+A 1-1 write is an absolute value: "set this key's row to `f(row)`". Two such writes
+for one key in two batches don't commute. If the batch computed from the older
+source state reaches Phase 3 last, its value overwrites the newer one, and nothing
+is left staged to correct it. That is the same **permanent staleness** the version
+fence exists for, caused by ordinary data changes instead of a definition change
+(issue #344). It needs no crash or retry to happen. It only needs one worker to
+stall between Phase 2 and Phase 3, e.g. over a large catch-up batch.
+
+So every 1-1 write and delete carries its **basis**: the source row it was
+computed from (the staged image, or Phase 2's live read), or "no source row" for a
+delete. Phase 3 applies it only if that basis is still the source's current state:
+
+1. **The ordering lock.** Before writing any 1-1 target, Phase 3 takes a
+   transaction-scoped advisory lock on every `(target, stripe)` its keys fall in,
+   in ascending order. A stripe is the key's claim bucket (`route % 8`), so the
+   workers draining one batch's buckets in parallel never contend. Only batches from
+   different segments that share a bucket serialize. It can't be the target row's
+   `FOR UPDATE` alone: a stale insert racing a delete has no row to lock.
+2. **The basis check**, under that lock, in one statement: re-read each key's
+   source row and compare. A write's basis holds if the current row contains
+   every column of it with the same text (containment, since an image omits an
+   unchanged TOASTed column). A delete's basis holds if the row is gone.
+3. **A change whose basis no longer holds** is re-evaluated against the current
+   row, when its definition reads no relationship: written if the row exists,
+   deleted if not. Otherwise (or if evaluation fails) it is re-staged as a bare
+   recompute, which a later batch reads live.
+
+Why that converges: every Phase 3 for a key runs one at a time, and each one
+writes only a value computed from the source's state *at that moment*. A source
+change that commits after the check has a batch of its own still to come, and
+that batch waits on the lock and then sees the change. So the last Phase 3 for a
+key always writes that key's final state.
+
+Re-evaluating instead of skipping matters for a hot key. If the source changes
+faster than a batch drains, every batch's basis is stale by the time it applies.
+Skipping would leave the target frozen until the key went quiet.
 
 ## What this replaced
 
@@ -178,6 +229,10 @@ The design:
 - **Backstop:** the edit's re-derivation stages its rows at a higher position, so
   they land in a **later** batch than any in-flight drain's and cannot be swallowed
   by a batch already claimed.
+
+The fence covers definition changes only. The same staleness caused by two
+batches for one key draining out of order is closed separately, by the per-key
+ordering lock and basis check ([above](#absolute-writes-do-not-commute-the-basis-check)).
 
 **The fence runs first in Phase 3**, so a superseded batch rolls back before
 touching a derived row. The fence set must include tables that are *evaluated* but
@@ -288,4 +343,10 @@ identical from outside otherwise.
    value is never *wrong* — it is a deterministic function of the state that was
    read — only possibly *superseded*, and a later batch guarantees the superseding
    recompute runs. Parallelism costs some redundant recomputes, never a wrong
-   final value.
+   final value. "Later" means later to *commit*, not later in `seg_seq`: for an
+   absolute write, invariant 7 is what makes that true.
+7. **A non-commutative write commits only if its basis is still current**, checked
+   under a lock that serializes every Phase 3 for that key. A new write path must
+   either commute (deltas), check its basis, or be serialized some other way
+   (the `prev_lsn` guard, the truncate barrier). See the classification table
+   under [the basis check](#absolute-writes-do-not-commute-the-basis-check).

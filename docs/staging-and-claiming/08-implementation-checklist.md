@@ -83,6 +83,10 @@ These fail only if you write them deliberately; ordinary end-to-end tests pass a
       reports converged across a parked key.
 - [ ] **Crash in the seal's phase gap** wedges, and the age-gated recovery unwedges
       it without stomping a healthy in-flight seal.
+- [ ] **Two batches for one key, applied in reverse order.** Compute an older
+      batch, drain a newer one for the same key, then apply the older one; assert
+      a 1-1 target ends on the newer value. Cover a live recompute read, an older
+      image, a stale write after a delete, and a stale delete after a re-insert.
 
 ## Anti-patterns to name in review
 
@@ -102,5 +106,8 @@ Each is a regression to something this design deliberately avoids:
   this design exists to prevent.
 - Quarantining an error that names a schema defect — converts a loud, fixable
   error into permanently hidden work.
+- A new write path that neither commutes nor checks its basis — it is correct
+  only while its batches happen to drain in order
+  ([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-basis-check)).
 - An unreferenced data-modifying or `FOR UPDATE` CTE — Postgres may plan it away,
   and it will lock nothing while looking like it does.

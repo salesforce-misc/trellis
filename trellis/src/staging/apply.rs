@@ -3058,22 +3058,34 @@ fn buffer_transform_apply_metrics(
 /// — so a downstream `Recompute` row this write's own propagation stages
 /// (see [`apply_and_mark_drained_many`]'s step 4) keeps a real origin
 /// instead of losing it at this hop.
+///
+/// `src_table` and `basis` (issue #344) say what this write was computed
+/// from: the ring's spelling of the source table, and the source row it
+/// evaluated as a JSON object of column text. [`apply_target`] only writes
+/// `values` if that row is still the source's current state — see
+/// [`reconcile_with_source`].
 #[derive(Debug, Clone)]
 struct TargetWrite {
     pk_text: String,
     values: Vec<Option<String>>,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    src_table: String,
+    basis: String,
 }
 
 /// One key's deletion from a target table (the folded change had no
 /// `new_image`). `src_changed` plays the same forward-carrying role as
 /// [`TargetWrite::src_changed`].
+///
+/// `src_table` plays the same role as [`TargetWrite::src_table`]. A delete's
+/// basis is always "the source row is absent", so it needs no field for it.
 #[derive(Debug, Clone)]
 struct TargetDelete {
     pk_text: String,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    src_table: String,
 }
 
 /// Everything Phase 3 needs to write one target table: its primary key
@@ -3101,6 +3113,42 @@ struct TargetPlan {
     /// struct's own eventual reuse of `qualified_source`'s established
     /// pattern from #76.
     qualified_target: String,
+    /// Issue #344: where [`reconcile_with_source`] re-reads the source rows
+    /// this plan was computed from.
+    source: SourceCheck,
+    /// Issue #344: how to re-evaluate a key whose source row changed after
+    /// Phase 2 read it. `None` for a definition that reads a relationship:
+    /// its evaluation needs related rows only Phase 2 loads, so such a key
+    /// is re-staged as a recompute instead.
+    reeval: Option<ReEval>,
+}
+
+/// The source table a [`TargetPlan`] was computed from, as Phase 3 needs it
+/// to check that plan's bases against the source's current rows (issue
+/// #344). Resolved in Phase 2, like everything else Phase 3 reads.
+#[derive(Debug, Clone)]
+struct SourceCheck {
+    /// The ring's spelling of the source table, as every physical read of
+    /// it uses (see `compute`'s `qualified_source`).
+    qualified_source: String,
+    /// The source's canonical identity ([`quarantine::CanonicalSrcTables`]),
+    /// which the per-key ordering lock is derived from. It has to be one
+    /// spelling per physical table, so two batches that spell the same
+    /// source differently still serialize on the same key.
+    canonical_source: String,
+    /// Every column of the source, for the current-row JSON the bases are
+    /// compared against. The same list [`read_live_rows_batch`] renders, so
+    /// a basis read live in Phase 2 compares equal to an unchanged row.
+    columns: Vec<String>,
+}
+
+/// What [`reconcile_with_source`] needs to re-evaluate a 1-1 definition
+/// against a source row that changed after Phase 2 read it (issue #344).
+#[derive(Debug, Clone)]
+struct ReEval {
+    def: TransformDef,
+    source_columns: HashMap<String, ValueType>,
+    paused: std::collections::HashSet<String>,
 }
 
 /// One target table this batch must clear in full before its own keyed
@@ -3184,6 +3232,24 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
+
+    /// Issue #344: a basis is compared to the source's current row as jsonb,
+    /// so it must be valid JSON whatever text a column holds, keep SQL NULL
+    /// distinct from the text `"null"`, and come out the same for the same
+    /// row regardless of map order.
+    #[test]
+    fn a_row_basis_is_valid_escaped_json_with_nulls_kept_distinct() {
+        let row: Row = HashMap::from([
+            ("id".to_string(), Some("1".to_string())),
+            ("note".to_string(), Some("say \"hi\"\n\\".to_string())),
+            ("gone".to_string(), None),
+            ("literal".to_string(), Some("null".to_string())),
+        ]);
+        assert_eq!(
+            row_to_json_text(&row),
+            r#"{"gone":null,"id":"1","literal":"null","note":"say \"hi\"\n\\"}"#
+        );
+    }
 
     /// Issue #180's step-4 guard: a key this batch both deleted (with a
     /// captured pre-delete image) and wrote — reachable when the forward
@@ -4393,6 +4459,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 rows[i] = live_rows.remove(changes[i].key.as_str());
             }
         }
+        // Issue #344: the source column list a 1-1 target's Phase 3 check
+        // renders the current row with. Loaded at most once per source, and
+        // only when some definition on it is 1-1.
+        let mut source_row_columns: Option<Vec<String>> = None;
 
         // `qualified_source` (via `qualified_schema_node_key`), not
         // `source_key`: `schema_nodes`/`schema_edges` now key on qualified
@@ -4748,6 +4818,29 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // key now mirrors the source's in full, at whatever arity it
                 // has, rather than narrowing to one column.
                 let target_pk = pk.clone();
+                let columns = match &source_row_columns {
+                    Some(columns) => columns.clone(),
+                    None => {
+                        let client = pool.get().await?;
+                        let columns = live_row_columns(&**client, qualified_source).await?;
+                        source_row_columns = Some(columns.clone());
+                        columns
+                    }
+                };
+                let source_check = SourceCheck {
+                    qualified_source: qualified_source.to_string(),
+                    canonical_source: canonical_of(qualified_source),
+                    columns,
+                };
+                let reeval = if eval::relationship_references(&def.def).is_empty() {
+                    Some(ReEval {
+                        def: def.def.clone(),
+                        source_columns: def.source_columns.clone(),
+                        paused: paused.clone(),
+                    })
+                } else {
+                    None
+                };
                 let plan = targets
                     .entry(def.def.target.clone())
                     .or_insert_with(|| TargetPlan {
@@ -4761,6 +4854,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         // catalog `Definition`) already carries it. See
                         // `TargetPlan::qualified_target`'s doc comment.
                         qualified_target: def.target_table.clone(),
+                        source: source_check,
+                        reeval,
                     });
 
                 // Reused across every change below (issue #68): `regexp_count`'s
@@ -4848,18 +4943,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                     &paused,
                                 )?,
                             };
-                            let values: Vec<Option<String>> = field_names
-                                .iter()
-                                .map(|name| match evaluated.remove(name) {
-                                    Some(Some(value)) => Some(value.to_string()),
-                                    Some(None) | None => None,
-                                })
-                                .collect();
+                            let values = evaluated_values(&field_names, &mut evaluated);
                             plan.writes.push(TargetWrite {
                                 pk_text: change.key.clone(),
                                 values,
                                 hop_gen: change.hop_gen,
                                 src_changed: change.src_changed,
+                                src_table: change.src_table.clone(),
+                                basis: row_to_json_text(row),
                             });
                         }
                         None => {
@@ -4867,6 +4958,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk_text: change.key.clone(),
                                 hop_gen: change.hop_gen,
                                 src_changed: change.src_changed,
+                                src_table: change.src_table.clone(),
                             });
                         }
                     }
@@ -5634,6 +5726,294 @@ fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashS
         .collect()
 }
 
+/// One evaluated row's values in `field_names` order, rendered to the text
+/// [`TargetWrite::values`] carries — shared by [`compute`] and
+/// [`reconcile_with_source`]'s re-evaluation so the two can't drift.
+fn evaluated_values(
+    field_names: &[String],
+    evaluated: &mut HashMap<String, Option<eval::Value>>,
+) -> Vec<Option<String>> {
+    field_names
+        .iter()
+        .map(|name| match evaluated.remove(name) {
+            Some(Some(value)) => Some(value.to_string()),
+            Some(None) | None => None,
+        })
+        .collect()
+}
+
+/// A [`Row`] as a JSON object of column text (`null` for SQL NULL) — the
+/// shape [`TargetWrite::basis`] carries, compared in Phase 3 against the
+/// source's current row with jsonb containment. Hand-built, like intake's
+/// images, since this crate has no JSON dependency.
+fn row_to_json_text(row: &Row) -> String {
+    let mut fields: Vec<String> = row
+        .iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Some(text) => crate::intake::json_string(text),
+                None => "null".to_string(),
+            };
+            format!("{}:{value}", crate::intake::json_string(name))
+        })
+        .collect();
+    fields.sort_unstable();
+    format!("{{{}}}", fields.join(","))
+}
+
+/// How many per-target lock stripes [`lock_one_to_one_keys`] spreads keys
+/// over. Equal to the claim bucket count, and derived from the same hash as
+/// a ring row's `route`, so a stripe is exactly a bucket: the workers
+/// draining one segment's buckets in parallel never contend, and only
+/// batches from *different* segments that share a bucket serialize.
+const KEY_ORDER_STRIPES: i64 = claim::SEG_BUCKETS;
+
+/// Issue #344's ordering lock: before any 1-1 target is written, takes a
+/// transaction-scoped advisory lock on every `(target, stripe)` this batch's
+/// keys fall in, in ascending order.
+///
+/// Segments drain in any order, so two batches carrying the same key can
+/// reach Phase 3 concurrently, each with a value computed from a different
+/// source state. The target row's own `FOR UPDATE` pre-lock can't order them
+/// when the row doesn't exist yet (a stale insert racing a delete), so this
+/// lock is what makes every Phase 3 that touches a key run one at a time.
+/// [`reconcile_with_source`] then re-reads the source under it: a source
+/// change that commits after that read has its own batch still to come, and
+/// that batch waits here for this one to commit.
+///
+/// The lock is per stripe, not per key: one advisory lock per key would put
+/// a whole batch's keys in Postgres's shared lock table, which a large batch
+/// can exhaust. Hash collisions only over-serialize.
+///
+/// Taken once for every 1-1 target in the batch, sorted as one set, before
+/// any row lock — so two batches can never each hold a stripe the other is
+/// waiting for.
+async fn lock_one_to_one_keys(
+    txn: &Transaction<'_>,
+    targets: &HashMap<String, TargetPlan>,
+) -> Result<(), ApplyError> {
+    let mut lock_targets: Vec<&str> = Vec::new();
+    let mut lock_sources: Vec<&str> = Vec::new();
+    let mut lock_keys: Vec<&str> = Vec::new();
+    for plan in targets.values() {
+        let keys = plan
+            .writes
+            .iter()
+            .map(|w| w.pk_text.as_str())
+            .chain(plan.deletes.iter().map(|d| d.pk_text.as_str()));
+        for key in keys {
+            lock_targets.push(&plan.qualified_target);
+            lock_sources.push(&plan.source.canonical_source);
+            lock_keys.push(key);
+        }
+    }
+    if lock_keys.is_empty() {
+        return Ok(());
+    }
+    // The inner `order by` fixes the acquisition order: the outer query
+    // evaluates the (volatile) lock function row by row over the sorted
+    // subquery. `hashtextextended(...) & 2147483647` is the ring's own
+    // `route` expression (`V3__staging_ring.sql`).
+    txn.query(
+        "select count(*) from ( \
+           select pg_advisory_xact_lock(t, s) from ( \
+             select distinct hashtext(u.target) as t, \
+                    ((hashtextextended(u.src || E'\\x1f' || u.key, 0) & 2147483647) % $4)::int4 as s \
+             from unnest($1::text[], $2::text[], $3::text[]) as u(target, src, key) \
+             order by 1, 2 \
+           ) ordered \
+         ) locked",
+        &[&lock_targets, &lock_sources, &lock_keys, &KEY_ORDER_STRIPES],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A key [`reconcile_with_source`] couldn't settle in Phase 3, to re-stage as
+/// an image-less recompute: `(src_table, key, hop_gen, src_changed)`, the
+/// same shape as [`ApplyPlan::reverse_recomputes`].
+type Restage = (String, String, i32, Option<std::time::SystemTime>);
+
+/// Issue #344's check: keeps only the writes and deletes whose basis is still
+/// the source's current state, and settles every other one against that
+/// current state instead. Runs under [`lock_one_to_one_keys`], so no other
+/// Phase 3 for these keys runs between this read and this transaction's
+/// commit.
+///
+/// A write's basis is the source row it was evaluated from; it still holds
+/// when the current row contains every column of it with the same text
+/// (containment, not equality, because an image omits an unchanged TOASTed
+/// column). A delete's basis is "no source row"; it still holds when there
+/// is none. A change whose basis no longer holds was computed from a source
+/// state some later change has replaced, and applying it would overwrite
+/// that change's value if its batch has already drained. So it is instead:
+///
+/// - re-evaluated against the current row, when [`TargetPlan::reeval`]
+///   allows (a write if the row exists, a delete if not). Writing the
+///   current state, rather than skipping, keeps a key that changes faster
+///   than a batch drains from never being written at all.
+/// - otherwise, or if re-evaluation fails, dropped and returned as a
+///   [`Restage`], so a later batch reads it live again.
+///
+/// Returns `None` when every basis held — the common case — so the caller
+/// applies the plan as computed without copying it.
+async fn reconcile_with_source(
+    txn: &Transaction<'_>,
+    target: &str,
+    plan: &TargetPlan,
+) -> Result<Option<(Vec<TargetWrite>, Vec<TargetDelete>, Vec<Restage>)>, ApplyError> {
+    // Every change as (basis, decoded key); a key that decodes to `None` is
+    // never written or deleted (see `apply_target`), so it isn't checked.
+    let mut bases: Vec<Option<&str>> = Vec::new();
+    let mut keys: Vec<Vec<String>> = Vec::new();
+    let mut origin: Vec<Result<usize, usize>> = Vec::new();
+    for (i, w) in plan.writes.iter().enumerate() {
+        if let Some(parts) = decode_target_pk_parts(&plan.pk, target, &w.pk_text)? {
+            bases.push(Some(&w.basis));
+            keys.push(parts);
+            origin.push(Ok(i));
+        }
+    }
+    for (i, d) in plan.deletes.iter().enumerate() {
+        if let Some(parts) = decode_target_pk_parts(&plan.pk, target, &d.pk_text)? {
+            bases.push(None);
+            keys.push(parts);
+            origin.push(Err(i));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(None);
+    }
+
+    let arity = plan.pk.len();
+    let key_refs: Vec<&Vec<String>> = keys.iter().collect();
+    let arrays = transpose_pk_parts(arity, &key_refs);
+    let mut params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+    params.push(&bases);
+    let unnest_args: Vec<String> = plan
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("${}::text[]::{}[]", i + 1, c.data_type))
+        .chain(std::iter::once(format!("${}::text[]", arity + 1)))
+        .collect();
+    let key_cols: Vec<String> = (0..arity).map(pk_keyset_col).collect();
+    let key_match = plan
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("t.{} = u.{}", quote_ident(&c.name), pk_keyset_col(i)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let doc_expr = row_as_text_jsonb_sql("t", &plan.source.columns);
+    // One row per current column of each mismatched change's source row, or
+    // a single row with a NULL column name when the source row is gone.
+    let sql = format!(
+        "select u.o, e.key, e.value \
+         from unnest({}) with ordinality as u({}, basis, o) \
+         left join lateral (select {doc_expr} as doc from {} t where {key_match}) s on true \
+         left join lateral jsonb_each_text(s.doc) e on true \
+         where case when u.basis is null then s.doc is not null \
+                    else s.doc is null or not (s.doc @> u.basis::jsonb) end",
+        unnest_args.join(", "),
+        key_cols.join(", "),
+        ddl::qualified_source_table(&plan.source.qualified_source),
+    );
+    let rows = txn.query(&sql, &params).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    // `ordinality` is 1-based.
+    let mut current: HashMap<usize, Option<Row>> = HashMap::new();
+    for row in rows {
+        let index = usize::try_from(row.get::<_, i64>(0) - 1).expect("ordinality is positive");
+        let column: Option<String> = row.get(1);
+        let entry = current.entry(index).or_insert(None);
+        if let Some(column) = column {
+            entry
+                .get_or_insert_with(Row::new)
+                .insert(column, row.get::<_, Option<String>>(2));
+        }
+    }
+
+    let mut writes: Vec<TargetWrite> = Vec::with_capacity(plan.writes.len());
+    let mut deletes: Vec<TargetDelete> = Vec::with_capacity(plan.deletes.len());
+    let mut restage: Vec<Restage> = Vec::new();
+    // A key the batch carried twice (two spellings of one source) settles
+    // once: every copy is checked against the same current row, so a copy
+    // whose basis held already settles it, and a second mismatched copy adds
+    // nothing.
+    let mut settled: std::collections::HashSet<String> = (0..origin.len())
+        .filter(|index| !current.contains_key(index))
+        .map(|index| join_pk_parts(&keys[index]))
+        .collect();
+    let mut regex_cache = eval::RegexCache::new();
+    for (index, origin) in origin.iter().enumerate() {
+        let Some(current_row) = current.remove(&index) else {
+            match *origin {
+                Ok(i) => writes.push(plan.writes[i].clone()),
+                Err(i) => deletes.push(plan.deletes[i].clone()),
+            }
+            continue;
+        };
+        let (pk_text, hop_gen, src_changed, src_table) = match *origin {
+            Ok(i) => {
+                let w = &plan.writes[i];
+                (&w.pk_text, w.hop_gen, w.src_changed, &w.src_table)
+            }
+            Err(i) => {
+                let d = &plan.deletes[i];
+                (&d.pk_text, d.hop_gen, d.src_changed, &d.src_table)
+            }
+        };
+        if !settled.insert(join_pk_parts(&keys[index])) {
+            continue;
+        }
+        let reevaluated = match (&plan.reeval, current_row) {
+            (_, None) => Some(None),
+            (Some(reeval), Some(row)) => eval::evaluate_excluding(
+                &reeval.def,
+                &row,
+                &reeval.source_columns,
+                &mut regex_cache,
+                &reeval.paused,
+            )
+            .ok()
+            .map(|mut evaluated| {
+                Some((
+                    evaluated_values(&plan.field_names, &mut evaluated),
+                    row_to_json_text(&row),
+                ))
+            }),
+            (None, Some(_)) => None,
+        };
+        match reevaluated {
+            Some(Some((values, basis))) => writes.push(TargetWrite {
+                pk_text: pk_text.clone(),
+                values,
+                hop_gen,
+                src_changed,
+                src_table: src_table.clone(),
+                basis,
+            }),
+            Some(None) => deletes.push(TargetDelete {
+                pk_text: pk_text.clone(),
+                hop_gen,
+                src_changed,
+                src_table: src_table.clone(),
+            }),
+            None => restage.push((src_table.clone(), pk_text.clone(), hop_gen, src_changed)),
+        }
+    }
+    tracing::debug!(
+        transform = %target,
+        restaged = restage.len(),
+        "a 1-1 batch's source rows changed after Phase 2 read them; settled against the current rows"
+    );
+    Ok(Some((writes, deletes, restage)))
+}
+
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
 /// upsert and delete, returning the keys Postgres actually wrote to vs.
 /// deleted (as opposed to every key this batch merely *proposed* — the
@@ -5686,10 +6066,19 @@ async fn apply_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &TargetPlan,
-) -> Result<(Vec<String>, Vec<TargetDeletedKey>), ApplyError> {
+) -> Result<(Vec<String>, Vec<TargetDeletedKey>, Vec<Restage>), ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
+
+    // Issue #344: settle every change whose source row moved on since Phase
+    // 2 against the current row, before locking or writing anything.
+    let reconciled = reconcile_with_source(txn, target, plan).await?;
+    let (plan_writes, plan_deletes, restage): (&[TargetWrite], &[TargetDelete], Vec<Restage>) =
+        match &reconciled {
+            Some((writes, deletes, restage)) => (writes, deletes, restage.clone()),
+            None => (&plan.writes, &plan.deletes, Vec::new()),
+        };
 
     let arity = plan.pk.len();
     let pk_idents: Vec<String> = plan.pk.iter().map(|c| quote_ident(&c.name)).collect();
@@ -5729,13 +6118,11 @@ async fn apply_target(
     // corruption issue #205 closes) or as a literal SQL `NULL` (which this
     // target's own `NOT NULL` primary-key column(s) would just as reliably
     // reject).
-    let decoded_writes: Vec<Option<Vec<String>>> = plan
-        .writes
+    let decoded_writes: Vec<Option<Vec<String>>> = plan_writes
         .iter()
         .map(|w| decode_target_pk_parts(&plan.pk, target, &w.pk_text))
         .collect::<Result<_, _>>()?;
-    let decoded_deletes: Vec<Option<Vec<String>>> = plan
-        .deletes
+    let decoded_deletes: Vec<Option<Vec<String>>> = plan_deletes
         .iter()
         .map(|d| decode_target_pk_parts(&plan.pk, target, &d.pk_text))
         .collect::<Result<_, _>>()?;
@@ -5809,8 +6196,7 @@ async fn apply_target(
     // Only a write whose key actually decoded to a representable (non-NULL)
     // PK value is a candidate for insertion — see `decode_target_pk_parts`'s
     // doc comment on why a NULL-decoded write has no row to write at all.
-    let writable: Vec<(&TargetWrite, &Vec<String>)> = plan
-        .writes
+    let writable: Vec<(&TargetWrite, &Vec<String>)> = plan_writes
         .iter()
         .zip(decoded_writes.iter())
         .filter_map(|(w, k)| k.as_ref().map(|k| (w, k)))
@@ -5982,7 +6368,7 @@ async fn apply_target(
     let span = tracing::Span::current();
     span.record("written", written.len());
     span.record("deleted", deleted.len());
-    Ok((written, deleted))
+    Ok((written, deleted, restage))
 }
 
 /// Phase 3 (design doc: "apply ∪ mark-drained are one transaction"). Given
@@ -6005,7 +6391,9 @@ async fn apply_target(
 ///    [`compute`]) survive, while anything the truncate is meant to erase
 ///    does not.
 /// 3. **The ordered pre-lock + upsert/delete**, per target table, via
-///    [`apply_target`], immediately followed by the **relationship
+///    [`apply_target`], under issue #344's per-key ordering lock
+///    ([`lock_one_to_one_keys`]) and after its basis check
+///    ([`reconcile_with_source`]), immediately followed by the **relationship
 ///    settled-parent projection gen bump** (issue #130, epic #127): every
 ///    to-one relationship parent this batch's relationship resolution
 ///    touched (`plan.relationship_gen_bumps`) gets its projection's
@@ -6235,9 +6623,13 @@ pub async fn apply_and_mark_drained_many(
             .await?;
     }
 
-    // 3. Ordered pre-lock + upsert/delete, per target table.
+    // 3. Ordered pre-lock + upsert/delete, per target table, each under
+    // issue #344's per-key ordering lock (taken for every target up front).
+    lock_one_to_one_keys(txn, &plan.targets).await?;
+    let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
-        let (written, deleted) = apply_target(txn, target, target_plan).await?;
+        let (written, deleted, restage) = apply_target(txn, target, target_plan).await?;
+        restaged.extend(restage);
         keys_written += written.len();
         keys_deleted += deleted.len();
 
@@ -7009,6 +7401,19 @@ pub async fn apply_and_mark_drained_many(
     // two fallback cases — the ordering-check-miss stopgap, and definitions
     // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
     // fast path.
+    // Issue #344: keys `reconcile_with_source` couldn't re-evaluate in Phase
+    // 3, staged at their own `hop_gen` — a re-read of the same hop, not a
+    // step further downstream.
+    for (src_table, key, hop_gen, src_changed) in restaged {
+        recompute_changes.push(StagedChange::Recompute {
+            src_table,
+            key,
+            hop_gen,
+            group_key: None,
+            src_changed,
+        });
+    }
+
     for (from_table, key, hop_gen, src_changed) in &relationship_reverse_fallback {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());

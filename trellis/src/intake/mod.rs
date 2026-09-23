@@ -327,7 +327,7 @@ fn tuple_to_json(relation: &Relation, tuple: &[ColumnValue]) -> String {
 /// A minimal, dependency-free JSON string-literal encoder (quote, backslash,
 /// control characters) — just enough for column names and `pgoutput`'s
 /// text-format column values, not a general serializer.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

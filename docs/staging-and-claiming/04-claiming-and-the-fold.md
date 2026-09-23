@@ -93,6 +93,13 @@ one bucket, but it does **not** co-locate an aggregate group: two workers on two
 buckets of one batch still contend on a hot group row. A known limitation, not an
 accident.
 
+Nor does it **order a key's writes across batches.** A key lands in one bucket
+*per batch*, but batches drain out of order and in parallel, so two batches'
+records for the same key can reach Phase 3 in either order. Deltas commute, so
+that's harmless for them. Absolute (1-1) writes don't, and Phase 3's per-key
+ordering lock and basis check exist for that
+([05](05-apply-and-exactly-once-deltas.md#absolute-writes-do-not-commute-the-basis-check)).
+
 **The honest cost:** the fold filter `route % bucket_count = ANY(mine)` rides the
 sequential scan the fold already does, so **every holder scans the whole batch for
 its 1/b**. The fold is `O(b × S)` for a batch of S rows, of which `(b−1) × S` is

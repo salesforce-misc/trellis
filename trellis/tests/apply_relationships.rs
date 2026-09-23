@@ -29,10 +29,10 @@ use trellis::defs::{
     create_definition, create_relationship, create_target_table, render_relationship_select_sql,
     source_primary_key,
 };
-use trellis::staging::apply;
 use trellis::staging::{
     StagedWatermark, TRUNCATE_SENTINEL_KEY, has_pending, retire_drained_segments,
 };
+use trellis::staging::{apply, claim, fold};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -1069,4 +1069,161 @@ async fn reverse_recompute_fan_in_keeps_the_earliest_src_changed() {
     );
 
     drain_to_quiescence(&db.pool, &mut client).await;
+}
+
+/// Issue #344's fallback path: a batch computed from a source row that
+/// changed before its Phase 3 ran can't be re-evaluated there when its
+/// definition reads a relationship (the related rows are only loaded in
+/// Phase 2). It must neither write its stale value over the newer batch's
+/// nor drop the key: it is re-staged as a recompute instead.
+#[tokio::test]
+async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table categories (id integer primary key, name text); \
+             create table articles (id integer primary key, category_id integer, title text); \
+             alter table categories replica identity full; \
+             alter table articles replica identity full; \
+             insert into categories (id, name) values (10, 'Tech'), (20, 'Sci')",
+        )
+        .await
+        .expect("create tables");
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    let source_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("category_id", ValueType::Numeric),
+        ("title", ValueType::Text),
+    ]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM article_cat FROM articles SELECT category.name AS category_name",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, "articles")
+        .await
+        .expect("introspect articles pk");
+    create_target_table(
+        &db.pool,
+        &to_one_def(),
+        "public",
+        &pk,
+        &source_columns,
+        &to_one_def().source,
+    )
+    .await
+    .expect("create target table");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let projection_table = projection_table_name(&db.pool, relationship.id).await;
+    client
+        .batch_execute(&format!(
+            "insert into {projection_table} (id, __trellis_gen, __trellis_lsn, name) values \
+             (10, 0, pg_current_wal_lsn(), 'Tech'), (20, 0, pg_current_wal_lsn(), 'Sci') \
+             on conflict (id) do update set name = excluded.name"
+        ))
+        .await
+        .expect("settle the parent projection");
+
+    // Batch 1: article 1 is inserted pointing at 'Tech', and computed but
+    // not applied.
+    client
+        .execute(
+            "insert into articles (id, category_id, title) values (1, 10, 'a1')",
+            &[],
+        )
+        .await
+        .expect("insert article");
+    stage_cdc(
+        &client,
+        "articles",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":"1","category_id":"10","title":"a1"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    let mut phase1_client = db.pool.get().await.expect("connection");
+    let txn = phase1_client.transaction().await.expect("begin phase 1");
+    claim::claim(&*txn, seg1, "slow_worker", 1)
+        .await
+        .expect("claim");
+    let filter = claim::owned_bucket_filter(&*txn, seg1, "slow_worker")
+        .await
+        .expect("owned_bucket_filter");
+    let folded = fold::fold(&txn, seg1, filter).await.expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    let stale_plan = apply::compute(&db.pool, &folded).await.expect("compute");
+
+    // Batch 2: article 1 moves to 'Sci' and drains completely first.
+    client
+        .execute("update articles set category_id = 20 where id = 1", &[])
+        .await
+        .expect("re-point article");
+    stage_cdc(
+        &client,
+        "articles",
+        "1",
+        "update",
+        Some(r#"{"id":"1","category_id":"10","title":"a1"}"#),
+        Some(r#"{"id":"1","category_id":"20","title":"a1"}"#),
+    )
+    .await;
+    // Not `drain_to_quiescence`: batch 1 stays pending until its Phase 3.
+    let seg2 = seal_active_segment(&mut client).await;
+    apply::drain_once(
+        &db.pool,
+        seg2,
+        "fast_worker",
+        1,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain batch 2")
+    .expect("batch 2 must drain");
+    let sci = HashMap::from([("1".to_string(), Some("Sci".to_string()))]);
+    assert_eq!(target_to_one(&client).await, sci);
+
+    // Batch 1's Phase 3 runs last.
+    let mut phase3_client = db.pool.get().await.expect("connection");
+    let txn = phase3_client.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg1,
+        "slow_worker",
+        &stale_plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply batch 1");
+    txn.commit().await.expect("commit phase 3");
+
+    assert_eq!(
+        target_to_one(&client).await,
+        sci,
+        "the stale batch must not overwrite the newer value"
+    );
+    assert_eq!(
+        staged_recompute_count(&client, "articles", "1").await,
+        1,
+        "the stale batch must re-stage its key rather than drop it"
+    );
+    retire_drained_segments(&mut client)
+        .await
+        .expect("free the ring slots batches 1 and 2 used");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(target_to_one(&client).await, sci);
+    assert_eq!(target_to_one(&client).await, oracle_to_one(&client).await);
 }

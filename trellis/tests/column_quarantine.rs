@@ -357,7 +357,15 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
 
     seed_order_totals(&db, &client).await;
 
-    // A healthy row, computed successfully before anything pauses.
+    // A healthy row, computed successfully before anything pauses. The
+    // source row exists too: Phase 3 checks each write against it (#344).
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (100, 10.00, 1.50)",
+            &[],
+        )
+        .await
+        .expect("insert healthy source row");
     insert_cdc_row(
         &client,
         "seg_0",
@@ -400,6 +408,13 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
 
     // A brand-new, perfectly healthy delta to the *already-written* row: its
     // `total` must stay exactly as it was, not be recomputed, not go null.
+    client
+        .execute(
+            "update orders set price = 999.00, tax = 999.00 where id = 100",
+            &[],
+        )
+        .await
+        .expect("update healthy source row");
     let table = active_segment_table(&client).await;
     insert_cdc_row(
         &client,

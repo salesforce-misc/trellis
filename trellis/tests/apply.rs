@@ -1897,7 +1897,13 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("from \"trellis\".\"orders\" t") && line.contains("\"id\" ="))
+        // `join unnest(` singles out Phase 2's refetch: Phase 3's issue #344
+        // check also reads `orders` by key, but from its own `unnest(...)`.
+        .filter(|line| {
+            line.contains("from \"trellis\".\"orders\" t")
+                && line.contains("\"id\" =")
+                && line.contains("join unnest(")
+        })
         .collect();
     assert_eq!(
         refetch_queries.len(),
@@ -2158,7 +2164,13 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         std::fs::read_to_string(cluster.root().join("postgres.log")).expect("read postgres log");
     let refetch_queries: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("from \"trellis\".\"orders\" t") && line.contains("\"id\" ="))
+        // `join unnest(` singles out Phase 2's refetch: Phase 3's issue #344
+        // check also reads `orders` by key, but from its own `unnest(...)`.
+        .filter(|line| {
+            line.contains("from \"trellis\".\"orders\" t")
+                && line.contains("\"id\" =")
+                && line.contains("join unnest(")
+        })
         .collect();
     assert_eq!(
         refetch_queries.len(),
@@ -2409,4 +2421,320 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
         .await
         .expect("query barrier");
     assert_eq!(batch, vec![seg3]);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #344: two batches for the same key, applied out of order.
+//
+// Segments drain in any order and nothing orders one batch's Phase 3 against
+// another's for the same key, so a slow worker can commit a value computed
+// from an older source state *after* a newer batch has already drained. The
+// tests below run that interleaving by hand: batch 1 is claimed, folded and
+// computed, then the source row changes and batch 2 drains completely, and
+// only then does batch 1's Phase 3 run. The target must end on the value the
+// source's current state implies, whatever batch 1 computed.
+// ---------------------------------------------------------------------------
+
+/// A source `orders` table, an `order_totals` (`price + tax`) definition over
+/// it and the target table, with `seed` inserted into `orders` *before* the
+/// definition exists when given (so the definition's own backfill enumeration
+/// also stages it).
+async fn out_of_order_fixture(seed: Option<&str>) -> (TestCluster, testkit::TestDatabase, Client) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute("create table orders (id integer primary key, price numeric, tax numeric)")
+        .await
+        .expect("create source table");
+    if let Some(seed) = seed {
+        client
+            .batch_execute(&format!(
+                "insert into orders (id, price, tax) values {seed}"
+            ))
+            .await
+            .expect("seed source table");
+    }
+
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
+        .await
+        .expect("create target table");
+
+    (cluster, db, client)
+}
+
+/// Phases 1 and 2 of a drain of `seg_seq` as `worker`: claims every bucket,
+/// folds, commits the claim, and computes the plan, stopping short of
+/// Phase 3 so a test can run other batches before this one applies.
+async fn claim_and_compute(pool: &trellis::Pool, seg_seq: i64, worker: &str) -> apply::ApplyPlan {
+    let mut phase1_client = pool.get().await.expect("connection");
+    let txn = phase1_client.transaction().await.expect("begin phase 1");
+    claim::claim(&*txn, seg_seq, worker, 1)
+        .await
+        .expect("claim");
+    let filter = claim::owned_bucket_filter(&*txn, seg_seq, worker)
+        .await
+        .expect("owned_bucket_filter");
+    let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+    txn.commit().await.expect("commit phase 1");
+    apply::compute(pool, &folded).await.expect("compute")
+}
+
+/// Phase 3 of a drain [`claim_and_compute`] started.
+async fn apply_computed(
+    pool: &trellis::Pool,
+    seg_seq: i64,
+    worker: &str,
+    plan: &apply::ApplyPlan,
+) -> apply::ApplyOutcome {
+    let mut phase3_client = pool.get().await.expect("connection");
+    let txn = phase3_client.transaction().await.expect("begin phase 3");
+    let outcome = apply::apply_and_mark_drained(
+        &txn,
+        seg_seq,
+        worker,
+        plan,
+        "trellis_apply_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("apply");
+    txn.commit().await.expect("commit phase 3");
+    outcome
+}
+
+async fn order_total(client: &Client, id: i32) -> Option<String> {
+    client
+        .query_opt(
+            "select total::text from public.order_totals where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("read target")
+        .map(|row| row.get(0))
+}
+
+/// Drains every sealed segment still claimable, so a test's final assertion
+/// sees a settled target.
+async fn drain_everything_left(pool: &trellis::Pool, client: &Client) {
+    while let Some(&seg) = apply::next_claimable_segments(client, 1)
+        .await
+        .expect("next claimable")
+        .first()
+    {
+        drain(pool, seg, "sweeper").await;
+    }
+}
+
+/// The repro from issue #344: batch 1 is a bare recompute trigger (the shape
+/// a catch-up enumeration stages), so its Phase 2 reads the live source row.
+#[tokio::test]
+async fn a_recompute_read_before_a_newer_batch_drains_does_not_overwrite_it() {
+    let (_cluster, db, mut client) = out_of_order_fixture(Some("(1, 10.00, 1.00)")).await;
+
+    // The definition's own enumeration already staged a recompute for id 1;
+    // batch 1 is that segment. Its Phase 2 reads price = 10.00.
+    let seg1 = seal_active_segment(&mut client).await;
+    let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
+
+    client
+        .execute("update orders set price = 20.00 where id = 1", &[])
+        .await
+        .expect("update source row");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "1",
+        "update",
+        Some(r#"{"price":"10.00","tax":"1.00"}"#),
+        Some(r#"{"price":"20.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg2, "fast_worker").await;
+    assert_eq!(order_total(&client, 1).await.as_deref(), Some("21.00"));
+
+    apply_computed(&db.pool, seg1, "slow_worker", &stale_plan).await;
+    drain_everything_left(&db.pool, &client).await;
+    assert_eq!(
+        order_total(&client, 1).await.as_deref(),
+        Some("21.00"),
+        "a recompute read before a newer batch drained must not overwrite that batch's value"
+    );
+}
+
+/// The same race with two image-bearing CDC updates: batch 1's image is
+/// older than batch 2's, and batch 2 drains first.
+#[tokio::test]
+async fn an_older_cdc_image_applied_after_a_newer_one_does_not_overwrite_it() {
+    let (_cluster, db, mut client) = out_of_order_fixture(None).await;
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 15.00, 1.00)",
+            &[],
+        )
+        .await
+        .expect("insert source row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":"1","price":"15.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
+
+    client
+        .execute("update orders set price = 20.00 where id = 1", &[])
+        .await
+        .expect("update source row");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "1",
+        "update",
+        Some(r#"{"id":"1","price":"15.00","tax":"1.00"}"#),
+        Some(r#"{"id":"1","price":"20.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg2, "fast_worker").await;
+    assert_eq!(order_total(&client, 1).await.as_deref(), Some("21.00"));
+
+    apply_computed(&db.pool, seg1, "slow_worker", &stale_plan).await;
+    drain_everything_left(&db.pool, &client).await;
+    assert_eq!(
+        order_total(&client, 1).await.as_deref(),
+        Some("21.00"),
+        "an older image applied late must not overwrite a newer one"
+    );
+}
+
+/// A stale write must not resurrect a row a newer batch deleted.
+#[tokio::test]
+async fn a_stale_write_applied_after_a_newer_delete_does_not_resurrect_the_row() {
+    let (_cluster, db, mut client) = out_of_order_fixture(None).await;
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 10.00, 1.00)",
+            &[],
+        )
+        .await
+        .expect("insert source row");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":"1","price":"10.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
+
+    client
+        .execute("delete from orders where id = 1", &[])
+        .await
+        .expect("delete source row");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "1",
+        "delete",
+        Some(r#"{"id":"1","price":"10.00","tax":"1.00"}"#),
+        None,
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg2, "fast_worker").await;
+    assert_eq!(order_total(&client, 1).await, None);
+
+    apply_computed(&db.pool, seg1, "slow_worker", &stale_plan).await;
+    drain_everything_left(&db.pool, &client).await;
+    assert_eq!(
+        order_total(&client, 1).await,
+        None,
+        "a stale write must not resurrect a row a newer batch deleted"
+    );
+}
+
+/// The mirror image: a stale delete must not remove a row the source got
+/// back and a newer batch already wrote.
+#[tokio::test]
+async fn a_stale_delete_applied_after_a_newer_insert_does_not_remove_the_row() {
+    let (_cluster, db, mut client) = out_of_order_fixture(Some("(1, 10.00, 1.00)")).await;
+    // Settle the definition's own enumeration first.
+    seal_active_segment(&mut client).await;
+    drain_everything_left(&db.pool, &client).await;
+    assert_eq!(order_total(&client, 1).await.as_deref(), Some("11.00"));
+
+    client
+        .execute("delete from orders where id = 1", &[])
+        .await
+        .expect("delete source row");
+    insert_cdc_row(
+        &client,
+        "seg_1",
+        "orders",
+        "1",
+        "delete",
+        Some(r#"{"id":"1","price":"10.00","tax":"1.00"}"#),
+        None,
+    )
+    .await;
+    let seg1 = seal_active_segment(&mut client).await;
+    let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
+
+    client
+        .execute(
+            "insert into orders (id, price, tax) values (1, 30.00, 1.00)",
+            &[],
+        )
+        .await
+        .expect("re-insert source row");
+    insert_cdc_row(
+        &client,
+        "seg_2",
+        "orders",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":"1","price":"30.00","tax":"1.00"}"#),
+    )
+    .await;
+    let seg2 = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg2, "fast_worker").await;
+    assert_eq!(order_total(&client, 1).await.as_deref(), Some("31.00"));
+
+    apply_computed(&db.pool, seg1, "slow_worker", &stale_plan).await;
+    drain_everything_left(&db.pool, &client).await;
+    assert_eq!(
+        order_total(&client, 1).await.as_deref(),
+        Some("31.00"),
+        "a stale delete must not remove a row a newer batch wrote"
+    );
 }
