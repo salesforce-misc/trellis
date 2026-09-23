@@ -2817,6 +2817,18 @@ pub async fn relationship_by_name(
     name: &str,
 ) -> Result<Option<RelationshipDefinition>, CatalogError> {
     let client = pool.get().await?;
+    relationship_by_name_in(&**client, from_schema, from_table, name).await
+}
+
+/// [`relationship_by_name`] on the caller's own connection or transaction,
+/// for a caller already inside one (`intake::resume_orphans`, which runs in a
+/// backfill marker's discharge transaction).
+pub(crate) async fn relationship_by_name_in(
+    client: &impl GenericClient,
+    from_schema: &str,
+    from_table: &str,
+    name: &str,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
     let row = client
         .query_opt(
             &format!(

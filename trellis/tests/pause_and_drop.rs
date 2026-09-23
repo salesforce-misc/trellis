@@ -406,7 +406,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // (`segments.drained_mask`, `V10__drained_mask.sql`), and `seg_claims`
     // holds a row for every bucket a worker still owns. If a paused
     // definition's share were held open for its eventual resume — the thing
-    // ADR-0014's "Resume rebuilds by backfill, not by catch-up" section rules
+    // ADR-0014's "Resume reconciles with source, not by catch-up" section rules
     // out — those segments could never finish draining, and the ring would
     // fill and wedge for `order_echo` too.
     drain_to_quiescence(&db.pool, &mut raw).await;

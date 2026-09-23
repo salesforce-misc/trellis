@@ -1586,23 +1586,28 @@ pub async fn resume_column(
 /// mutation, because resuming a transform that isn't frozen at all is caller
 /// error, not a silent no-op, matching [`resume_column`]'s
 /// [`ApplyError::ColumnNotPaused`] discipline. The recovery is identical for
-/// both triggers and deliberately so: ADR-0014's "resume rebuilds by
-/// backfill, not by catch-up" is exactly the behaviour this function already
-/// had, since a frozen definition's share of the change stream is drained
-/// for its siblings while it's frozen and is not recoverable by replay. Drops
-/// the definition to [`TransformStatus::WaitingToBackfill`] and re-parks a
-/// fresh `pending_backfill` marker for its source table (reusing
-/// [`crate::intake::publication::park_backfill_catchup`] — the exact
-/// mechanism a chunked build's own post-completion catch-up already uses,
-/// see `defs::catalog::complete_direct_backfill`), so the actual re-backfill
-/// runs through [`crate::intake::publication::run_pending_backfills`]'s own
-/// `xmin`-fence-respecting discharge — never a shortcut that re-derives the
-/// target without waiting out a concurrent transaction that might still be
-/// pinning the fence (issue #55; docs/observability.md's "Backfill status
-/// and the `xmin` caveat" applies here exactly as it does to a fresh
-/// transform's own initial backfill: resuming can sit in
-/// `waiting_to_backfill` for as long as some unrelated transaction pins the
-/// cluster's `xmin`, and that is correct, not a fault).
+/// both triggers and deliberately so (ADR-0014's "Resume reconciles with
+/// source, not by catch-up"): a frozen definition's share of the change
+/// stream is drained for its siblings while it's frozen and is not
+/// recoverable by replay.
+///
+/// This function itself only schedules that reconciliation. It drops the
+/// definition to [`TransformStatus::WaitingToBackfill`] and re-parks a fresh
+/// `pending_backfill` marker for its source table (reusing
+/// [`crate::intake::publication::park_backfill_catchup`], the mechanism a
+/// chunked build's own post-completion catch-up uses, see
+/// `defs::catalog::complete_direct_backfill`). The target is left exactly as
+/// the freeze left it until that marker's discharge
+/// ([`crate::intake::publication::run_pending_backfills`]) runs, which in one
+/// transaction deletes every target row no current source row backs (issue
+/// #330, `intake::resume_orphans`) and enumerates every current source row
+/// for the drain to re-derive. The discharge respects the marker's `xmin`
+/// fence, never re-deriving the target without waiting out a concurrent
+/// transaction that might still be pinning it (issue #55;
+/// docs/observability.md's "Backfill status and the `xmin` caveat" applies
+/// here exactly as it does to a fresh transform's own initial backfill:
+/// resuming can sit in `waiting_to_backfill` for as long as some unrelated
+/// transaction pins the cluster's `xmin`, and that is correct, not a fault).
 ///
 /// Clears any stale `backfill_coverage` record for the source table first
 /// (issue #79, bug B's multi-reader contract): a quarantined definition's

@@ -20,15 +20,15 @@ stateDiagram-v2
     Backfilling --> Live: backfill completes
     Live --> Paused: pause (intentional)
     Live --> Paused: auto-pause (poison threshold)
-    Paused --> Live: resume — rebuild by backfill
+    Paused --> Live: resume — reconcile with source
     Paused --> [*]: drop — data removed
 ```
 
 A live definition reaches `Paused` two ways that share one state: an operator pauses it
 deliberately, or the engine auto-pauses it when a target accumulates too many poisoned
 rows. Both stop the claim-time fold from writing to the target and hold its current,
-now-stale value. From `Paused`, an operator either resumes — which rebuilds the target
-by backfill — or drops it, which removes the definition and its data.
+now-stale value. From `Paused`, an operator either resumes — which reconciles the target
+with current source data — or drops it, which removes the definition and its data.
 
 Drop acts only on a paused definition. There is no direct live-to-gone edge: quiescing
 first is a precondition, so the removal never has to reason about a fold still
@@ -45,16 +45,30 @@ the operator addresses the poisoned rows and resumes. Column-level quarantine is
 same idea at column granularity — a paused column holds a deliberately stale value while
 the rest of the target stays live.
 
-### Resume rebuilds by backfill, not by catch-up
+### Resume reconciles with source, not by catch-up
 
 A paused definition must not pin the staging ring. Holding ring segments open for a
 paused target would wedge the ring for every other definition reading the same source.
 So while a definition is paused, its share of the change stream is drained for its
 siblings and is not recoverable by replay.
 
-Resume therefore reconciles the target with a fresh backfill from source — the same way
-defining it built it — not a catch-up over buffered changes, because there are none. A
-long pause is not free: the cost of resuming scales with the data, not with the length
+Resume therefore reconciles the target with current source data rather than catching up
+over buffered changes, because there are none. The target is not cleared and rebuilt.
+Readers keep seeing its rows throughout, and the reconciliation has two halves, committed
+together in one transaction (issue #330):
+
+- Every target row that no current source row backs is deleted. That covers a 1-1 row
+  whose source row was deleted, and an aggregate group whose rows were all deleted or,
+  through a relationship-path `GROUP BY` key, all moved to other groups.
+- Every current source row is enumerated for the drain to re-derive, the same
+  enumeration a new definition's catch-up runs.
+
+Deletions are visible the moment that transaction commits. Rows whose values changed
+during the pause stay stale until the drain re-derives them, and rows the source gained
+appear the same way. The deletes go through the target-mutation seam like any other
+target write, so a live definition reading this target drops them too.
+
+A long pause is not free: the cost of resuming scales with the data, not with the length
 of the pause. This is the contract, stated so a caller does not expect a cheap resume.
 
 ### Drop always removes the associated data
@@ -77,8 +91,8 @@ retires dependents first. The refusal names them so the order to follow is expli
 
 A dependent blocks whatever its status — being registered at all is enough. A dependent
 mid-backfill is reading the target right now; a paused one is worse, because resume
-rebuilds by a fresh backfill from source, so a dependent frozen over a dropped source can
-never be resumed. Only a fully retired dependent stops blocking. Reverse dependency order
+reconciles it against its source, so a dependent frozen over a dropped source can never be
+resumed. Only a fully retired dependent stops blocking. Reverse dependency order
 therefore means *dropping* the dependents first, not merely pausing them.
 
 ### In-flight work is quiesced by the pause, never by deleting shared state
@@ -125,8 +139,8 @@ decide the operation and composes it behind the facade, returning plain data.
 
 - Every definition has a reversible freeze and a terminal removal. The freeze holds stale
   data; the removal takes the data with it.
-- A long pause costs a full rebuild to resume, because the change stream is drained for
-  siblings while paused.
+- A long pause costs a full re-enumeration of the source to resume, because the change
+  stream is drained for siblings while paused.
 - Removal is safe under load: it quiesces through the pause and touches only
   definition-owned rows, never shared source-keyed staging or poison state.
 - A framework migration's rollback is honest: pause-then-drop, idempotent in both

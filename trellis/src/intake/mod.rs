@@ -27,6 +27,7 @@ pub mod error;
 pub mod pgoutput;
 pub mod publication;
 pub mod replica_identity;
+mod resume_orphans;
 pub mod slot_loss;
 pub mod spill;
 

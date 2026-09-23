@@ -30,7 +30,8 @@
 //!
 //! Every target writer (`apply::apply_target`, `apply_aggregate::apply_aggregate_target`,
 //! the truncate clears (`apply::clear_target`), `quarantine::recompute_column`,
-//! `defs::backfill::backfill_altered_columns`) takes a `&mut TargetMutations`
+//! `defs::backfill::backfill_altered_columns`, and a rebuild's orphan delete,
+//! `intake::resume_orphans`) takes a `&mut TargetMutations`
 //! and reports each physically-changed key into it. None of them returns the
 //! changed keys to its caller, so a caller cannot forget to propagate them:
 //! the only way a changed key leaves a writer is through [`TargetMutations::record`],
@@ -75,8 +76,9 @@
 //!
 //! Writers capture the prior image with the same statement that already
 //! row-locks the key before writing it (a `SELECT ... FOR UPDATE` pre-lock,
-//! extended to return each row's image), or, for a truncate clear, with the
-//! delete's own `RETURNING`.
+//! extended to return each row's image), or, for a delete with no pre-lock (a
+//! truncate clear, a rebuild's orphan delete), with the delete's own
+//! `RETURNING`.
 //! Postgres 17's `RETURNING` cannot name the pre-update row, so the pre-lock
 //! is the only place an update's old image can come from.
 //!

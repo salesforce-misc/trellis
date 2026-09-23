@@ -734,6 +734,22 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// this waits. A caller with no intake running yet must not call this at all
 /// (see `client::setup_staging`); tests with no CDC stream pass
 /// [`crate::staging::StagedWatermark::saturated`].
+///
+/// # Dropping what the source no longer backs (issue #330)
+///
+/// The enumeration only reaches keys the source still has. A definition this
+/// pass rebuilds (a resumed one, above all) can hold target rows whose source
+/// rows went away while it was frozen, and nothing would ever enumerate them.
+/// So, first thing in the transaction, `resume_orphans::delete_orphaned_target_rows`
+/// deletes every row of each promoted definition's target that no source row
+/// backs, reporting each through the target-mutation seam. It runs before
+/// `DECLARE` because the maintenance loop that runs this pass is also the only
+/// sealer: any source change committed after the pass starts is drained only
+/// once the definition is `live`. A key deleted after the anti-join is then
+/// removed by its own CDC, and a key re-inserted after it is enumerated or
+/// arrives as CDC. Running after `DECLARE` would leave an aggregate group that
+/// was repopulated in between at its stale pre-pause value. That module's doc
+/// comment has the full argument.
 // The maintenance loop calls [`run_pending_backfills_until`] so it can stop
 // the wait on shutdown. This no-stop form is the tests' entry point, so
 // nothing in the crate calls it unless `internals` exposes it.
@@ -800,6 +816,10 @@ pub(crate) async fn run_pending_backfills_until(
         .await?;
 
         let txn = client.transaction().await?;
+        // Issue #330: before the enumeration's `DECLARE`, never after — see
+        // "Dropping what the source no longer backs" above. On the rollback
+        // below, the deletes roll back with everything else.
+        super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, &advancing).await?;
         let staged = if coverage_covers(&txn, &marker.table).await? {
             false
         } else {
@@ -1662,6 +1682,215 @@ mod catch_up_tests {
         assert!(
             xmax(&client).await > 3,
             "a later fence replaces an older one"
+        );
+    }
+
+    /// Seals and drains until nothing is pending: a bounded loop, not a
+    /// convergence wait.
+    async fn drain_all(pool: &crate::pool::Pool, client: &mut tokio_postgres::Client) {
+        let watermark = StagedWatermark::saturated();
+        for _ in 0..16 {
+            let outcome = crate::staging::seal::seal_phase1(client)
+                .await
+                .expect("seal phase 1");
+            crate::staging::seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+                .await
+                .expect("seal phase 2");
+            while crate::staging::apply::drain_once(
+                pool,
+                outcome.sealed_seg_seq,
+                "catch_up_tests",
+                1,
+                "wake",
+                &watermark,
+            )
+            .await
+            .expect("drain_once")
+            .is_some()
+            {}
+            crate::staging::retire_drained_segments(client)
+                .await
+                .expect("retire drained segments");
+            if !crate::staging::has_pending(client)
+                .await
+                .expect("has_pending")
+            {
+                return;
+            }
+        }
+        panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+    }
+
+    /// `public.orders` (group `g = 0` holds ids 2, 4, 6 and group 1 holds 1,
+    /// 3, 5, with `a = id`) summed by `order_rollup`, built, paused, changed
+    /// by `gap`, and resumed, with the resume's marker settled and ready to
+    /// discharge. Returns a same-crate pool and the discharging connection.
+    async fn resumed_rollup(
+        db: &testkit::TestDatabase,
+        gap: &str,
+    ) -> (crate::pool::Pool, tokio_postgres::Client) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
+        let mut client = connect(db).await;
+        client
+            .batch_execute(
+                "create table public.orders (id bigint primary key, g bigint, a numeric); \
+                 alter table public.orders replica identity full; \
+                 insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
+            )
+            .await
+            .expect("seed orders");
+        let columns = [
+            ("id", crate::defs::ValueType::Numeric),
+            ("g", crate::defs::ValueType::Numeric),
+            ("a", crate::defs::ValueType::Numeric),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+        crate::defs::install_definition(
+            &pool,
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install order_rollup");
+        drain_all(&pool, &mut client).await;
+        crate::defs::lifecycle::pause_transform(&pool, "order_rollup")
+            .await
+            .expect("pause");
+        client.batch_execute(gap).await.expect("write while paused");
+        crate::staging::quarantine::resume_transform(&pool, "order_rollup")
+            .await
+            .expect("resume");
+        // Settles the fence the resume captured.
+        client
+            .batch_execute("select txid_current()")
+            .await
+            .expect("consume an xid");
+        (pool, client)
+    }
+
+    /// Stages one CDC change on `public.orders` the way intake would.
+    async fn stage_order_cdc(
+        client: &mut tokio_postgres::Client,
+        key: &str,
+        op: crate::staging::CdcOp,
+        old_image: Option<&str>,
+        new_image: Option<&str>,
+    ) {
+        let txn = client.transaction().await.expect("begin");
+        append::append(
+            &txn,
+            &[StagedChange::Cdc {
+                src_table: "public.orders".to_string(),
+                key: key.to_string(),
+                op,
+                lsn: Some(PgLsn::from(1)),
+                old_image: old_image.map(str::to_string),
+                new_image: new_image.map(str::to_string),
+                origin_lsn: None,
+                src_changed: None,
+                hop_gen: 0,
+                group_key: None,
+            }],
+        )
+        .await
+        .expect("stage cdc");
+        txn.commit().await.expect("commit cdc");
+    }
+
+    async fn rollup_rows(client: &tokio_postgres::Client) -> Vec<(i64, String)> {
+        client
+            .query(
+                "select g::bigint, total::text from public.order_rollup order by g",
+                &[],
+            )
+            .await
+            .expect("read order_rollup")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    }
+
+    /// Issue #330's ordering, the half that fixes where the orphan delete
+    /// runs. Group 0 is empty when the discharge starts and is repopulated
+    /// after the enumeration's snapshot is taken, so the cursor never sees
+    /// the new row and only its CDC carries it. The group must come out as
+    /// that row alone. Had the anti-join run after `DECLARE` (as #330's
+    /// spike did, after the intake wait), it would have seen the new row,
+    /// kept the group's pre-pause total of 12, and the CDC insert would have
+    /// folded into that as a delta: 112.
+    #[tokio::test]
+    async fn a_group_repopulated_after_the_enumeration_snapshot_holds_only_its_new_rows() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) =
+            resumed_rollup(&db, "delete from public.orders where g = 0").await;
+        let mut writer = connect(&db).await;
+
+        let writer_ref = &mut writer;
+        discharge_racing(&mut discharger, |go, _done| async move {
+            writer_ref
+                .batch_execute("insert into public.orders values (10, 0, 100)")
+                .await
+                .expect("repopulate group 0");
+            stage_order_cdc(
+                writer_ref,
+                "10",
+                crate::staging::CdcOp::Insert,
+                None,
+                Some(r#"{"id":"10","g":"0","a":"100"}"#),
+            )
+            .await;
+            go.send(()).expect("release discharge");
+        })
+        .await;
+        drain_all(&pool, &mut discharger).await;
+
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "100".to_string()), (1, "9".to_string())],
+            "group 0 is rebuilt from its new row alone, not on top of its pre-pause total"
+        );
+    }
+
+    /// The other half: group 1's last row is deleted after the enumeration's
+    /// snapshot, so the orphan delete (which ran before it) kept the group
+    /// and the enumeration still names that row. The row's CDC delete is
+    /// what removes the group, applied once the definition is `live`.
+    #[tokio::test]
+    async fn a_group_emptied_after_the_orphan_delete_is_dropped_by_its_cdc() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) =
+            resumed_rollup(&db, "delete from public.orders where id in (3, 5)").await;
+        let mut writer = connect(&db).await;
+
+        let writer_ref = &mut writer;
+        discharge_racing(&mut discharger, |go, _done| async move {
+            writer_ref
+                .batch_execute("delete from public.orders where id = 1")
+                .await
+                .expect("empty group 1");
+            stage_order_cdc(
+                writer_ref,
+                "1",
+                crate::staging::CdcOp::Delete,
+                Some(r#"{"id":"1","g":"1","a":"1"}"#),
+                None,
+            )
+            .await;
+            go.send(()).expect("release discharge");
+        })
+        .await;
+        drain_all(&pool, &mut discharger).await;
+
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "12".to_string())],
+            "group 1 went extinct after the orphan delete ran; its CDC delete drops it"
         );
     }
 }
