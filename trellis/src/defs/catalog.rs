@@ -1565,11 +1565,14 @@ pub async fn alter_transform(
         // clears for a whole target. A pause left behind here would outlive
         // its column and silently apply to a later `ADD` of the same name,
         // since that `ADD`'s own pause below only ever undoes a pause it
-        // created itself (issue #309). Cascade edges *out of* this column
-        // can't exist once the dependents check above has passed (every
-        // downstream reader would have refused the drop); edges *into* it
-        // are cleared so resuming the upstream column never tries to
-        // recompute a column that is gone.
+        // created itself (issue #309). Edges *into* it are cleared so
+        // resuming the upstream column never tries to recompute a column
+        // that is gone. Edges *out of* it can still exist even though the
+        // dependents check above passed: a pause cascaded onto a reader
+        // whose formula was later `ALTER`ed to stop reading this column
+        // keeps its edge. Clearing it leaves that reader paused with no
+        // recorded reason, and its own `RESUME` recovers it. That is still
+        // better than an edge from a column that no longer exists.
         for table in ["column_status", "column_deaths", "column_failures"] {
             txn.execute(
                 &format!("delete from {table} where transform_table = $1 and column_name = $2"),
