@@ -263,7 +263,7 @@ fn commit_id_range(first_id: i64, k: u64, rows_per_commit: usize) -> (i64, i64) 
 /// `$1..=$2` id range, so a commit costs one small bind regardless of its row
 /// count. What CDC decodes is identical either way: the same row images in
 /// one transaction per commit.
-fn parallel_insert_sql(source_table: &str, groups: Option<usize>) -> String {
+pub(crate) fn parallel_insert_sql(source_table: &str, groups: Option<usize>) -> String {
     match groups {
         Some(groups) => format!(
             "insert into public.{source_table} (id, grp, val) \

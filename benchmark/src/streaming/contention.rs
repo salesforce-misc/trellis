@@ -15,8 +15,10 @@
 //! * **Generator vs engine.** The load generator's own backends share the
 //!   database, and one waiting on a lock would say nothing about Trellis. A
 //!   backend running the generator's `INSERT INTO public.<source>` is
-//!   counted apart ([`Role::Generator`]); everything else in the database —
-//!   drain workers, intake, the maintenance tick — is the engine.
+//!   counted apart ([`Role::Generator`]); every other client backend in the
+//!   database — drain workers, intake's staging writes, the maintenance tick
+//!   — is the engine. Intake's replication stream is a `walsender`, not a
+//!   client backend, so the server-side WAL decoding it drives isn't sampled.
 //! * **Row locks vs everything else.** Two drain workers applying
 //!   overlapping aggregate groups serialize on the target rows' tuple locks,
 //!   which Postgres reports as a `Lock` wait on `transactionid` (waiting for
@@ -43,7 +45,10 @@ use tokio_postgres::Client as RawClient;
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The aggregate apply's ordered pre-lock (`staging::apply_aggregate`'s
-/// `apply_aggregate_target`) is the only engine statement ending in this.
+/// `apply_aggregate_target`) ends in this. So does a 1-1 transform's
+/// composite-key pre-lock (`staging::apply`), which `fold_in`'s
+/// aggregate-only pipeline never installs; a scenario that mixes the two
+/// would have to tell them apart.
 const PRELOCK_MARKER: &str = "for update of t";
 
 /// Whose backend a sampled row is.
@@ -94,7 +99,9 @@ pub fn classify(state: &str, wait_event_type: Option<&str>, wait_event: Option<&
 
 /// Which side a backend running `query` is on. `generator_insert_prefix` is
 /// the start of the generator's own statement against the scenario's source
-/// table (`insert into public.<source>`).
+/// table, through the space after the table name (`insert into
+/// public.<source> `, see [`generator_insert_prefix`]) so a table whose name
+/// merely starts with `<source>` isn't mistaken for it.
 pub fn role(query: &str, generator_insert_prefix: &str) -> Role {
     if query
         .trim_start()
@@ -319,7 +326,14 @@ pub async fn sample(
         );
         tokio::time::sleep(SAMPLE_INTERVAL).await;
     }
-    summarize(&snapshots, &format!("insert into public.{source_table}"))
+    summarize(&snapshots, &generator_insert_prefix(source_table))
+}
+
+/// The prefix every `load` generator statement against
+/// `public.<source_table>` starts with: `insert into public.<source_table>`
+/// and the space before its column list.
+pub fn generator_insert_prefix(source_table: &str) -> String {
+    format!("insert into public.{source_table} ")
 }
 
 /// `pg_stat_database`'s deadlock and rollback counters for `raw`'s database.
@@ -341,6 +355,7 @@ pub async fn deadlocks_and_rollbacks(raw: &RawClient) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::load;
 
     fn row(state: &str, wait: Option<(&str, &str)>, query: &str) -> ActivityRow {
         (
@@ -388,20 +403,29 @@ mod tests {
 
     #[test]
     fn the_generators_inserts_are_not_engine_time() {
-        let prefix = "insert into public.agg_src";
+        let prefix = generator_insert_prefix("agg_src");
+        // The statements `load` actually sends, not a hand-copied string:
+        // if the generator's SQL drifts, attribution breaks here first.
+        for groups in [Some(400), None] {
+            assert_eq!(
+                role(&load::parallel_insert_sql("agg_src", groups), &prefix),
+                Role::Generator
+            );
+        }
+        assert_eq!(
+            role("  INSERT INTO public.agg_src (id) values (1)", &prefix),
+            Role::Generator
+        );
+        assert_eq!(
+            role("insert into public.agg_totals (grp) values (1)", &prefix),
+            Role::Engine
+        );
+        // Only the source table itself, not one whose name extends it.
         assert_eq!(
             role(
-                "insert into public.agg_src (id, grp, val) select g, g % 400, g from generate_series($1::bigint, $2::bigint) g",
-                prefix
+                "insert into public.agg_src_archive (id) values (1)",
+                &prefix
             ),
-            Role::Generator
-        );
-        assert_eq!(
-            role("  INSERT INTO public.agg_src (id) values (1)", prefix),
-            Role::Generator
-        );
-        assert_eq!(
-            role("insert into public.agg_totals (grp) values (1)", prefix),
             Role::Engine
         );
     }
@@ -427,7 +451,7 @@ mod tests {
             ],
             vec![row("idle in transaction", None, prelock)],
         ];
-        let s = summarize(&snapshots, "insert into public.agg_src");
+        let s = summarize(&snapshots, &generator_insert_prefix("agg_src"));
         assert_eq!(s.samples, 2);
         assert_eq!(s.engine_busy_mean, 2.5);
         assert_eq!(s.engine_row_lock_mean, 1.5);
@@ -459,7 +483,7 @@ mod tests {
 
     #[test]
     fn an_empty_window_summarizes_to_zeroes() {
-        let s = summarize(&[], "insert into public.agg_src");
+        let s = summarize(&[], &generator_insert_prefix("agg_src"));
         assert_eq!(s, ContentionSummary::default());
         assert_eq!(s.row_lock_share(), 0.0);
     }

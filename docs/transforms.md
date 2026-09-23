@@ -48,8 +48,9 @@ SELECT
 are.** Fewer groups do not buy more headroom, but they don't cost any either.
 Issue #277 measured a single `SUM`/`COUNT(*)` aggregate offered 400k rows/sec
 from 8 drain workers. It folded the same ~85k rows/sec at 10, 100 and 400
-groups. At that end the cost is per source row (the claim-time fold and per-row
-image decoding), and hot target rows aren't what limits it. The shape that hurts
+groups. At that end the cost is per source row (the claim-time fold and
+decoding each staged row image are the largest sampled costs), and hot target
+rows aren't what limits it. The shape that hurts
 is many distinct groups receiving writes at once: 56–69k rows/sec at 4,000
 groups, and ~2k rows/sec at 40,000. At 40,000 groups, one drain worker folded
 more than eight did. Every group a batch touches costs an existence

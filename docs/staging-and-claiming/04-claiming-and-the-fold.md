@@ -61,9 +61,9 @@ rows. No bucket is ever held twice.
 > winner's whole fold, then gets nothing and moves on. Under saturating load
 > with 8 drain workers, ~40% of busy engine backend time went to this wait, and
 > at 16 workers it was ~60%. A prototype that committed each claim before
-> folding removed the wait entirely. Throughput didn't move at 400 or 4,000
-> groups beyond run-to-run noise, because per-row drain work binds there
-> first. With 400 groups, the workers freed from the claim queue went on to
+> folding removed the wait entirely. Throughput didn't move beyond run-to-run
+> noise, at 400 groups on its own or at 4,000 combined with a batched
+> existence probe, because per-row drain work binds there first. With 400 groups, the workers freed from the claim queue went on to
 > queue for the aggregate's target-row pre-lock. Fixing this won't raise
 > throughput until that per-row cost comes down.
 
