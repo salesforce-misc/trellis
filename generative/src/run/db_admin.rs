@@ -34,10 +34,18 @@ const PAUSED: &str = "paused";
 /// back up and before anything is resumed. `statuses` is every installed
 /// definition's `(target, status)`. Every definition in a generated program
 /// reads a published source table, so every one of them must be `paused`.
+///
+/// Panics on an empty `statuses`: with no transform to look at the check
+/// would pass without checking anything, and a slot loss in a program that
+/// installs no definition is a generator or harness bug.
 pub fn check_slot_loss_detected(
     op_index: usize,
     statuses: Vec<(String, String)>,
 ) -> Result<(), RunError> {
+    assert!(
+        !statuses.is_empty(),
+        "slot-loss detection check at op {op_index} over no transforms proves nothing"
+    );
     let not_paused: Vec<(String, String)> = statuses
         .into_iter()
         .filter(|(_, status)| status != PAUSED)
@@ -191,6 +199,13 @@ mod tests {
     fn every_transform_paused_counts_as_detected() {
         check_slot_loss_detected(3, statuses(&[("d0", "paused"), ("d1", "paused")]))
             .expect("all paused is the #310 contract");
+    }
+
+    /// No transforms is not a pass: there was nothing to detect the loss on.
+    #[test]
+    #[should_panic(expected = "over no transforms proves nothing")]
+    fn an_empty_status_list_is_not_a_vacuous_pass() {
+        let _ = check_slot_loss_detected(3, Vec::new());
     }
 
     /// The control: a transform that came up anything but `paused` after a

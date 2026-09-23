@@ -18,7 +18,7 @@ use generative::generate::{
     db_admin_plan_for, trivial_program,
 };
 use generative::model::{
-    DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode, SlotLossKind,
+    DbAdminAction, DbAdminEvent, DbAdminPlan, Op, OpOutcome, Program, RestartMode, SlotLossKind,
 };
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
@@ -103,16 +103,18 @@ proptest! {
     }
 }
 
-/// No database: every drawn plan is anchored inside its program, holds at
-/// most three events, anchors a slot loss only on an insert or update
-/// (issue #330, see `db_admin_plan_for`), and across enough draws every
-/// action shows up, so none silently drops out of the sweep.
+/// No database: every drawn plan is anchored inside its program and holds at
+/// most three events, and across enough draws every action shows up, and a
+/// slot loss lands on a row-removing op (a delete or truncate in the gap,
+/// issue #330) as well as on an insert or update, so none silently drops out
+/// of the sweep.
 #[test]
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let mut runner = TestRunner::default();
     let strategy = program_with_db_admin_plan();
     let (mut checkpoint, mut fast, mut immediate, mut dropped, mut invalidated) =
         (false, false, false, false, false);
+    let (mut gap_adds, mut gap_removes) = (false, false);
     for _ in 0..300 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
@@ -126,14 +128,10 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                 DbAdminAction::RestartPostgres(RestartMode::Fast) => fast = true,
                 DbAdminAction::RestartPostgres(RestartMode::Immediate) => immediate = true,
                 DbAdminAction::LoseSlot(kind) => {
-                    assert!(
-                        matches!(
-                            program.ops[event.op],
-                            Op::Insert { .. } | Op::BulkInsert { .. } | Op::Update { .. }
-                        ),
-                        "slot loss anchored on {:?}",
-                        program.ops[event.op]
-                    );
+                    match program.ops[event.op] {
+                        Op::Delete { .. } | Op::Truncate { .. } => gap_removes = true,
+                        _ => gap_adds = true,
+                    }
                     match kind {
                         SlotLossKind::Dropped => dropped = true,
                         SlotLossKind::Invalidated => invalidated = true,
@@ -143,9 +141,9 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         }
     }
     assert!(
-        checkpoint && fast && immediate && dropped && invalidated,
+        checkpoint && fast && immediate && dropped && invalidated && gap_adds && gap_removes,
         "checkpoint={checkpoint} fast={fast} immediate={immediate} dropped={dropped} \
-         invalidated={invalidated}"
+         invalidated={invalidated} gap_adds={gap_adds} gap_removes={gap_removes}"
     );
 }
 
@@ -264,19 +262,54 @@ async fn an_invalidated_slot_pauses_every_transform_and_resuming_converges() {
     run(&cluster, &program, &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+
+    // The cluster-wide retention cap the invalidation lowered is back out of
+    // the configuration files, so it can't reach a later case.
+    let db = cluster.create_isolated_database().await;
+    let overridden: i64 = db
+        .pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select count(*) from pg_file_settings where name = 'max_slot_wal_keep_size'",
+            &[],
+        )
+        .await
+        .expect("read pg_file_settings")
+        .get(0);
+    assert_eq!(
+        overridden, 0,
+        "max_slot_wal_keep_size left set after the run"
+    );
 }
 
-/// A slot loss whose gap deletes a source row. The resume's rebuild only
-/// visits source rows that still exist, so the deleted row's 1-1 target
-/// row survives and the run diverges. That is issue #330; un-ignore this
-/// once it's fixed, and widen `db_admin_plan_for` to anchor a slot loss on
-/// any op.
+/// A slot loss whose gap deletes a source row. The resume's rebuild must
+/// drop the deleted row's 1-1 target row and take it out of its aggregate
+/// group, though no stream ever delivered the delete (issue #330).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "issue #330: RESUME keeps target rows the gap deleted from the source"]
 async fn a_slot_loss_whose_gap_deletes_a_row_converges_after_resume() {
     let cluster = TestCluster::start();
     let program = one_to_one_and_aggregate_program();
     let plan = plan(&[(4, DbAdminAction::LoseSlot(SlotLossKind::Dropped))]);
+    run(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// A slot loss whose gap truncates the source: the resume's rebuild must
+/// empty both targets, the aggregate included, from a source it enumerates
+/// as having no rows at all (issue #330).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_loss_whose_gap_truncates_the_source_converges_after_resume() {
+    let cluster = TestCluster::start();
+    let mut program = one_to_one_and_aggregate_program();
+    let table = program.tables[0].name.clone();
+    program.ops.push(Op::Truncate {
+        table,
+        expect: OpOutcome::Succeeds,
+    });
+    let plan = plan(&[(6, DbAdminAction::LoseSlot(SlotLossKind::Dropped))]);
     run(&cluster, &program, &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));

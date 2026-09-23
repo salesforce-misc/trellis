@@ -3183,40 +3183,16 @@ mod strategy {
     /// and resets only after an attempt stays up for 60s. Four restarts in
     /// one short program already cost 1+2+4+8s.
     ///
-    /// **A slot loss is anchored only on an op that removes no source row**
-    /// (an insert or an update, never a delete or truncate). The loss puts
-    /// that op in the gap, and the recovery is a `RESUME`, which rebuilds
-    /// from the source rows that exist and never visits a key the gap
-    /// deleted. That stale target row is issue #330. Once #330 is fixed,
-    /// widen this to every op; `generative/tests/db_admin.rs` keeps an
-    /// ignored pin for exactly that case.
+    /// A slot loss can land on any op, a delete or truncate included: the
+    /// loss puts that op in the gap, and since issue #330 the operator's
+    /// `RESUME` drops target rows whose source rows the gap removed.
     pub fn db_admin_plan_for(program: &Program) -> impl Strategy<Value = DbAdminPlan> + use<> {
         let op_count = program.ops.len();
-        let gap_candidates: Vec<usize> = program
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| {
-                matches!(
-                    op,
-                    Op::Insert { .. } | Op::BulkInsert { .. } | Op::Update { .. }
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let in_place = (0..op_count, db_admin_in_place_action())
-            .prop_map(|(op, action)| DbAdminEvent { op, action });
-        let event = if gap_candidates.is_empty() {
-            in_place.boxed()
-        } else {
-            let slot_loss = (proptest::sample::select(gap_candidates), slot_loss_kind()).prop_map(
-                |(op, kind)| DbAdminEvent {
-                    op,
-                    action: DbAdminAction::LoseSlot(kind),
-                },
-            );
-            prop_oneof![3 => in_place, 2 => slot_loss].boxed()
-        };
+        let action = prop_oneof![
+            3 => db_admin_in_place_action(),
+            2 => slot_loss_kind().prop_map(DbAdminAction::LoseSlot),
+        ];
+        let event = (0..op_count, action).prop_map(|(op, action)| DbAdminEvent { op, action });
         prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
     }
 

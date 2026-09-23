@@ -923,17 +923,29 @@ impl ManualBackend {
             }
             SlotLossKind::Invalidated => {
                 // `ALTER SYSTEM` refuses to run in a transaction block, so
-                // each statement goes on its own.
-                self.raw
-                    .execute("alter system set max_slot_wal_keep_size = '0'", &[])
-                    .await?;
-                self.raw.execute("select pg_reload_conf()", &[]).await?;
-                let invalidated = self.invalidate_slot(&slot).await;
-                self.raw
-                    .execute("alter system reset max_slot_wal_keep_size", &[])
-                    .await?;
-                self.raw.execute("select pg_reload_conf()", &[]).await?;
-                invalidated
+                // each statement goes on its own. The reset is attempted
+                // whatever happened before it, a failed reload after the
+                // `set` included: `ALTER SYSTEM` persists in
+                // `postgresql.auto.conf`, so a skipped reset would keep the
+                // cap at zero for every later case on this cluster, across
+                // restarts too. The first error wins.
+                let invalidated = async {
+                    self.raw
+                        .execute("alter system set max_slot_wal_keep_size = '0'", &[])
+                        .await?;
+                    self.raw.execute("select pg_reload_conf()", &[]).await?;
+                    self.invalidate_slot(&slot).await
+                }
+                .await;
+                let reset = async {
+                    self.raw
+                        .execute("alter system reset max_slot_wal_keep_size", &[])
+                        .await?;
+                    self.raw.execute("select pg_reload_conf()", &[]).await?;
+                    Ok::<(), ManualBackendError>(())
+                }
+                .await;
+                invalidated.and(reset)
             }
         }
     }
