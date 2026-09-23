@@ -5712,6 +5712,11 @@ type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
 /// tuple.
 type TargetDeletedKey = (String, String);
 
+/// What [`apply_target`] did to one target: the keys it physically wrote, the
+/// keys it deleted (with their pre-delete images), and the keys its issue
+/// #344 basis check re-staged instead of applying.
+type AppliedTarget = (Vec<String>, Vec<TargetDeletedKey>, Vec<Restage>);
+
 /// Every key in one target's [`ChangedKey`] accumulator that this batch
 /// *wrote* (no captured pre-delete image), as a lookup set — the guard
 /// [`apply_and_mark_drained_many`]'s step 4 checks before it lets a
@@ -6066,7 +6071,7 @@ async fn apply_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &TargetPlan,
-) -> Result<(Vec<String>, Vec<TargetDeletedKey>, Vec<Restage>), ApplyError> {
+) -> Result<AppliedTarget, ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
