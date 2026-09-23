@@ -1394,6 +1394,15 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// every `(transform, column)` pair actually resumed, `transform`/`column`
 /// itself first, in the order resumed.
 ///
+/// Each pair's unpause also parks a `pending_backfill` catch-up marker for
+/// its definition's source table, in the same transaction (issue #305): the
+/// recompute reads the source once, so a row changed after that read — its
+/// delta applied while the column was still paused — would otherwise keep a
+/// stale value forever. The marker's discharge re-derives every row with the
+/// column unpaused, the same closed loop
+/// `defs::catalog::complete_direct_backfill` ends a first `define`'s chunked
+/// build with.
+///
 /// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
 /// isn't currently paused — resuming a live column is caller error, not a
 /// silent no-op.
@@ -1490,14 +1499,27 @@ pub async fn resume_column(
         }
         recompute_column(pool, &def, &c).await?;
 
-        let client = pool.get().await?;
-        client
-            .execute(
-                "delete from column_status where transform_table = $1 and column_name = $2",
-                &[&t, &c],
-            )
-            .await?;
-        let affected = client
+        // Unpause and park a catch-up marker in one transaction (issue
+        // #305). `recompute_column` read the source under one snapshot, and
+        // until `column_status` is cleared live CDC apply skips `c`: a row
+        // changed after that read had its delta applied to every *other*
+        // column, leaving `c` at the recompute's pre-change value, and
+        // nothing would ever revisit it once unpaused. The marker is the same
+        // closed loop a first `define`'s chunked build ends with
+        // (`defs::catalog::complete_direct_backfill`): once its fence
+        // settles, `run_pending_backfills` re-enumerates the source and
+        // re-derives every row with `c` unpaused. It must become visible
+        // atomically with the unpause — a marker discharged while `c` is
+        // still paused would re-open exactly this gap.
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
+        txn.execute(
+            "delete from column_status where transform_table = $1 and column_name = $2",
+            &[&t, &c],
+        )
+        .await?;
+        crate::intake::publication::park_backfill_catchup(&*txn, &def.source_table).await?;
+        let affected = txn
             .query(
                 "delete from column_pause_cascades \
                  where upstream_transform = $1 and upstream_column = $2 \
@@ -1505,12 +1527,10 @@ pub async fn resume_column(
                 &[&t, &c],
             )
             .await?;
-        resumed.push((t.clone(), c.clone()));
-
         for row in affected {
             let downstream_transform: String = row.get(0);
             let downstream_column: String = row.get(1);
-            let status = client
+            let status = txn
                 .query_opt(
                     "select local_fuse from column_status \
                      where transform_table = $1 and column_name = $2",
@@ -1526,7 +1546,7 @@ pub async fn resume_column(
             if local_fuse {
                 continue;
             }
-            let remaining: i64 = client
+            let remaining: i64 = txn
                 .query_one(
                     "select count(*) from column_pause_cascades \
                      where downstream_transform = $1 and downstream_column = $2",
@@ -1538,6 +1558,8 @@ pub async fn resume_column(
                 queue.push_back((downstream_transform, downstream_column));
             }
         }
+        txn.commit().await?;
+        resumed.push((t.clone(), c.clone()));
     }
 
     tracing::Span::current().record("resumed", resumed.len());

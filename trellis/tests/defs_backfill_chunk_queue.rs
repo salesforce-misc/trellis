@@ -754,3 +754,159 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .get(0);
     assert_eq!(a_x_after_discharge, 99);
 }
+
+/// Discharges every parked `pending_backfill` marker and drains the
+/// resulting enumeration through the ring. `run_pending_backfills` only
+/// discharges a marker once its `xmin` fence has settled, and that fence is
+/// cluster-wide (another test in this binary can briefly hold a transaction
+/// open against the same cluster), so this retries the discharge — briefly,
+/// and bounded — until the table is empty rather than assuming a single pass
+/// settles it.
+async fn discharge_pending_backfills(pool: &trellis::Pool, client: &mut Client) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        publication::run_pending_backfills(client, "trellis_chunk_queue_test")
+            .await
+            .expect("run_pending_backfills");
+        let remaining: i64 = client
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count pending_backfill")
+            .get(0);
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending_backfill markers never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drain_to_quiescence(pool, client).await;
+}
+
+/// Issue #305: `ALTER TRANSFORM ... ADD` must close its new column's
+/// backfill with the same parked catch-up a first `define`'s own chunked
+/// build closes with (`defs::catalog::complete_direct_backfill`), not just
+/// unpause the column and hope nothing slipped past.
+///
+/// The race: while the single-pass backfill runs, the new column sits in
+/// `column_status`, so live CDC apply writes every *other* column of a
+/// changed row but leaves the new one alone. A source row changed after the
+/// backfill already read it — its delta applied while the column was still
+/// paused — ends up with every other column current and the new column
+/// permanently stale, since nothing re-derives it once the column unpauses.
+///
+/// The interleaving itself can't be forced from outside `alter_transform`,
+/// so this reproduces the state it leaves behind directly (source row
+/// updated, target's existing column updated to match, new column still
+/// holding the backfill's pre-change value) and then asserts the catch-up
+/// the edit parked repairs it.
+#[tokio::test]
+async fn alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_backfill() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             alter table s replica identity full; \
+             insert into s (id, a) values (1, 10), (2, 20)",
+        )
+        .await
+        .expect("seed source");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM a_calc FROM s SELECT a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition");
+    let claimed = chunk_queue::claim_chunks(&client, "worker", 10)
+        .await
+        .expect("claim the chunk");
+    assert_eq!(claimed.len(), 1);
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "public",
+        "worker",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("run the chunk");
+    chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker")
+        .await
+        .expect("finish the chunk");
+    // Settle the define's own catch-up first, so the only marker left to
+    // discharge below is one the ALTER itself parked.
+    discharge_pending_backfills(&db.pool, &mut client).await;
+
+    let statement = trellis::defs::parse_statement("ALTER TRANSFORM a_calc ADD a + a AS double_a")
+        .expect("parse the ALTER");
+    let trellis::defs::Statement::AlterTransform(alter) = statement else {
+        panic!("expected an ALTER TRANSFORM statement, got {statement:?}");
+    };
+    trellis::defs::alter_transform(&db.pool, &alter)
+        .await
+        .expect("alter_transform");
+
+    let target = format!("{DEFAULT_TARGET_SCHEMA}.a_calc");
+    let double_a: i64 = client
+        .query_one(
+            &format!("select double_a::bigint from {target} where id = 1"),
+            &[],
+        )
+        .await
+        .expect("read the backfilled column")
+        .get(0);
+    assert_eq!(double_a, 20, "the single-pass backfill populated the row");
+
+    // The state the race leaves behind: `s.a` moved 10 -> 50 after the
+    // backfill read row 1, and its delta was applied while `double_a` was
+    // still paused — `x` followed it, `double_a` didn't.
+    client
+        .execute("update s set a = 50 where id = 1", &[])
+        .await
+        .expect("update the source row");
+    client
+        .execute(&format!("update {target} set x = 50 where id = 1"), &[])
+        .await
+        .expect("apply the delta's unpaused column");
+
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = $1",
+            &[&format!("{DEFAULT_SCHEMA}.s")],
+        )
+        .await
+        .expect("read pending_backfill")
+        .get(0);
+    assert_eq!(
+        parked, 1,
+        "ALTER TRANSFORM must park a catch-up marker for its source table when it unpauses \
+         the new column, exactly as complete_direct_backfill does for a first define"
+    );
+
+    discharge_pending_backfills(&db.pool, &mut client).await;
+
+    let rows = client
+        .query(
+            &format!("select id, x::bigint, double_a::bigint from {target} order by id"),
+            &[],
+        )
+        .await
+        .expect("read the target after the catch-up");
+    let rows: Vec<(i64, i64, i64)> = rows
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, 50, 100), (2, 20, 40)],
+        "the catch-up must re-derive the new column for the row that changed mid-backfill"
+    );
+}

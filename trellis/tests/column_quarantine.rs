@@ -2197,3 +2197,137 @@ async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_writ
     assert_eq!(err.code(), trellis::ErrorCode::NotFound);
     assert!(err.to_string().contains("no_such_transform"), "got {err}");
 }
+
+/// Issue #305: `resume_column` must close its single-snapshot recompute with
+/// the same parked catch-up a first `define`'s chunked build closes with
+/// (`defs::catalog::complete_direct_backfill`), not just clear
+/// `column_status` and hope nothing slipped past.
+///
+/// The race: [`quarantine::resume_column`]'s recompute reads the source once;
+/// a row changed after that read, whose delta is applied before the column
+/// unpauses, gets every *other* column updated by live CDC apply but leaves
+/// the resumed column stale forever. The interleaving can't be forced from
+/// outside `resume_column`, so this reproduces the state it leaves behind
+/// (source row changed, resumed column still at its pre-change value) and
+/// asserts the catch-up the resume parked repairs it.
+#[tokio::test]
+async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute() {
+    use trellis::intake::publication;
+    use trellis::staging::{has_pending, retire_drained_segments};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    client
+        .execute("insert into orders (id, price, tax) values (1, 10, 5)", &[])
+        .await
+        .expect("seed a source row");
+    // Stand-in for the target row live CDC apply already built for it —
+    // `resume_column`'s recompute only fills in rows that exist.
+    client
+        .execute("insert into public.order_totals (id) values (1)", &[])
+        .await
+        .expect("seed the target row");
+    quarantine::pause_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("pause the column");
+    let parked_before: i64 = client
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count pending_backfill")
+        .get(0);
+    assert_eq!(parked_before, 0, "no marker is pending before the resume");
+
+    quarantine::resume_column(&db.pool, "order_totals", "total")
+        .await
+        .expect("resume the column");
+    let total: String = client
+        .query_one(
+            "select total::text from public.order_totals where id = 1",
+            &[],
+        )
+        .await
+        .expect("read the recomputed column")
+        .get(0);
+    assert_eq!(total, "15", "the recompute populated the row");
+
+    // The state the race leaves behind: `orders.price` moved 10 -> 20 after
+    // the recompute read row 1, and its delta was applied while `total` was
+    // still paused, so `total` never followed it.
+    client
+        .execute("update orders set price = 20 where id = 1", &[])
+        .await
+        .expect("update the source row");
+
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = $1",
+            &[&format!("{DEFAULT_SCHEMA}.orders")],
+        )
+        .await
+        .expect("read pending_backfill")
+        .get(0);
+    assert_eq!(
+        parked, 1,
+        "resume_column must park a catch-up marker for the definition's source table when it \
+         unpauses the column, exactly as complete_direct_backfill does for a first define"
+    );
+
+    // Discharge it (retrying while the cluster-wide `xmin` fence settles) and
+    // drain the enumeration it stages.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        publication::run_pending_backfills(&mut client, "trellis_column_quarantine_test")
+            .await
+            .expect("run_pending_backfills");
+        let remaining: i64 = client
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count pending_backfill")
+            .get(0);
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending_backfill marker never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for _ in 0..16 {
+        let seg_seq = seal_active_segment(&mut client).await;
+        while apply::drain_once(
+            &db.pool,
+            seg_seq,
+            "worker",
+            1,
+            "trellis_column_quarantine_test",
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(&mut client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(&client).await.expect("has_pending") {
+            break;
+        }
+    }
+
+    let total: String = client
+        .query_one(
+            "select total::text from public.order_totals where id = 1",
+            &[],
+        )
+        .await
+        .expect("read the column after the catch-up")
+        .get(0);
+    assert_eq!(
+        total, "25",
+        "the catch-up must re-derive the resumed column for the row that changed mid-recompute"
+    );
+}

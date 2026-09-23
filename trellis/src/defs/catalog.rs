@@ -1206,6 +1206,15 @@ async fn table_has_other_reader(
 /// committed value and nothing but this call's own backfill touches it until
 /// the backfill completes and this call clears the row.
 ///
+/// **The catch-up (issue #305).** Clearing that row is not the end of it: a
+/// source row changed after the backfill read it, with its delta applied
+/// while the field was still paused, would otherwise keep a stale value for
+/// the field forever. The unpause therefore parks a `pending_backfill`
+/// catch-up marker for the source table in the same transaction — the exact
+/// closed loop [`complete_direct_backfill`] ends a first `define`'s chunked
+/// build with, whose discharge re-derives every row once the marker's fence
+/// settles.
+///
 /// **The version fence.** This call bumps both `transform_definitions
 /// .definition_version` (an audit-visible, monotonic counter on the edited
 /// row itself, per the ADR) and `source_table_versions.version` for the
@@ -1545,18 +1554,32 @@ pub async fn alter_transform(
         .await
         .map_err(CatalogError::DirectBackfill)?;
 
-        // Unpause: the recompute above is done, so every changed field now
-        // holds a committed value and ordinary live CDC apply may resume
-        // writing it.
-        let client = pool.get().await?;
+        // Unpause, and close the backfill's tail race in the same
+        // transaction (issue #305). Each PK-range chunk above read the
+        // source under its own snapshot, and until this commit live CDC
+        // apply skips every paused field: a row changed after its chunk read
+        // it had its delta applied to every *other* column, leaving the
+        // changed field at the chunk's pre-change value, and nothing would
+        // ever revisit it once unpaused. The parked catch-up marker is the
+        // same closed loop a first `define`'s chunked build ends with
+        // ([`complete_direct_backfill`]): once its fence settles,
+        // `run_pending_backfills` re-enumerates the source and re-derives
+        // every row with these fields unpaused. Atomic with the unpause, not
+        // after it: a marker visible before the unpause could be discharged
+        // (and its enumeration applied) while the fields were still paused,
+        // re-opening exactly this gap; a crash between two separate commits
+        // would lose the catch-up outright.
+        let mut client = pool.get().await?;
+        let txn = client.transaction().await?;
         for field in &written_fields {
-            client
-                .execute(
-                    "delete from column_status where transform_table = $1 and column_name = $2",
-                    &[&alter.target, field],
-                )
-                .await?;
+            txn.execute(
+                "delete from column_status where transform_table = $1 and column_name = $2",
+                &[&alter.target, field],
+            )
+            .await?;
         }
+        crate::intake::publication::park_backfill_catchup(&*txn, &current.source_table).await?;
+        txn.commit().await?;
     }
 
     let definition = definition_by_target(pool, &alter.target)
