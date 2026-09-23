@@ -205,8 +205,12 @@ async fn run_across_a_seal_boundary(variant: RelInterleavingVariant, workers: us
     // which two segments the two critical ops actually land in
     // nondeterministic. 3s comfortably exceeds how long this test's brief
     // critical section takes (a handful of round trips plus a couple of
-    // 10ms polls), so in practice the harness's own manual seals are the
-    // only ones that fire during it — but it still stays well inside
+    // 10ms polls), so usually the harness's own manual seals are the only
+    // ones that fire during it. A tick can still land inside it, because
+    // the tick's phase relative to this section is arbitrary. That extra
+    // seal doesn't hurt the seal-boundary property, but it can leave the
+    // ring full for a moment, and `force_seal_active_segment` retries
+    // through that instead of failing. The interval still stays well inside
     // `quiesce()`'s 30s timeout, so the maintenance loop's *other* jobs
     // (recovery, retirement) still run enough to let convergence complete;
     // widening it further (as that pin does, to 10s) is safe there only

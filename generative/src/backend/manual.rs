@@ -49,8 +49,8 @@ use trellis::dev::defs::{
     source_primary_key,
 };
 use trellis::dev::staging::{
-    StagingError, await_converged, has_pending as staging_has_pending, seal_phase1, seal_phase2,
-    watermark_token,
+    StagingError, await_converged, has_pending as staging_has_pending, retire_drained_segments,
+    seal_phase1, seal_phase2, watermark_token,
 };
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, IntakeError, Pool};
 
@@ -584,12 +584,50 @@ impl ManualBackend {
     /// actually reached the ring (poll [`ManualBackend::has_pending`]) —
     /// see that method's doc comment.
     ///
+    /// `seal_phase1`'s three refusals (`RingFull`, `SealGateBlocked`,
+    /// `Raced`) are backpressure the caller must retry through, not
+    /// failures (see its doc comment), so this retries them the way the
+    /// engine's own `seal_if_active_nonempty` does. On `RingFull` it runs a
+    /// retirement pass first. Nothing else in this harness retires a
+    /// drained slot: only the engine's maintenance tick does. Without that
+    /// pass, whether the next slot is free depends on whether a tick
+    /// happened to land between the slot's occupant becoming retirable and
+    /// this call. If the ring is really full of undrained work (a
+    /// maintenance tick sealed an extra segment just before this call and
+    /// the drain workers haven't caught up), the retry waits for the
+    /// workers to drain it, bounded by [`QUIESCE_TIMEOUT`] like
+    /// [`ManualBackend::quiesce`]. After that the last refusal is returned
+    /// as the error.
+    ///
     /// This module is the one place the backend seam allows direct access
     /// to `trellis::staging`'s seal machinery — see the module doc comment
     /// and [`ManualBackend::max_bucket_count`]'s own precedent for the same
     /// door.
     pub async fn force_seal_active_segment(&mut self) -> Result<i64, ManualBackendError> {
-        let outcome = seal_phase1(&mut self.raw).await?;
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+        const MAX_BACKOFF: Duration = Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        let mut backoff = INITIAL_BACKOFF;
+        let outcome = loop {
+            let refusal = match seal_phase1(&mut self.raw).await {
+                Ok(outcome) => break outcome,
+                Err(StagingError::Raced) => continue,
+                Err(err @ StagingError::RingFull { .. }) => {
+                    if !retire_drained_segments(&mut self.raw).await?.is_empty() {
+                        continue;
+                    }
+                    err
+                }
+                Err(err @ StagingError::SealGateBlocked) => err,
+                Err(other) => return Err(other.into()),
+            };
+            let waited = started.elapsed();
+            if waited >= QUIESCE_TIMEOUT {
+                return Err(refusal.into());
+            }
+            tokio::time::sleep(backoff.min(QUIESCE_TIMEOUT - waited)).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        };
         // Issue #271: `seal_phase2` now `pg_notify`s the wake channel the
         // instant it publishes the fence. Every caller here has always used
         // `ClientOptions::default()`'s wake channel (never overridden by

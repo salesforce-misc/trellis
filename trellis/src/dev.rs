@@ -71,7 +71,11 @@ pub mod staging {
     /// a maintenance tick's timing. There is no facade equivalent — "seal
     /// now" is an internal cadence concern, not a user capability — so this
     /// stays a gated reach rather than a new public method.
+    /// `retire_drained_segments` rides along because a forced seal must
+    /// answer `RingFull` the same way the engine's own seal-on-demand does:
+    /// retire what's retirable, then retry.
     pub use crate::staging::{
-        StagingError, await_converged, has_pending, seal_phase1, seal_phase2, watermark_token,
+        StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,
+        seal_phase2, watermark_token,
     };
 }
