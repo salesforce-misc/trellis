@@ -18,7 +18,9 @@
 //!   by hand instead; see its doc comment for why)
 //! - the column-granularity pause state: the new column reports paused while
 //!   backfilling, and the rest of the target stays live and queryable
-//!   (`the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live`)
+//!   (`the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live`,
+//!   which holds the backfill at a fixed point mid-way and drives live apply
+//!   by hand; see its doc comment)
 //! - that pause is only ever undone for a field the `ALTER` itself paused,
 //!   including when another pause lands mid-backfill, and `DROP <field>`
 //!   clears the dropped column's quarantine bookkeeping (issue #309:
@@ -48,9 +50,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
+use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
@@ -737,85 +741,292 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// The column-granularity form of the pause state: while `double_a` is
-/// backfilling, `quarantine_status` reports it paused, and the rest of the
-/// target (its already-live `a` column) stays queryable and correct
-/// throughout — the ADR's "the rest of the target stays live."
+/// Stages the CDC row intake would stage for `update orders set a = new_a
+/// where id = id` (`orders` has `replica identity full`, so both images are
+/// complete), into the active ring segment.
+async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
+    let active: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    let b = id * 2;
+    let old_image = format!(r#"{{"id":"{id}","a":"{old_a}","b":"{b}"}}"#);
+    let new_image = format!(r#"{{"id":"{id}","a":"{new_a}","b":"{b}"}}"#);
+    raw.execute(
+        &format!(
+            "insert into seg_{active} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+             values ($1, $2, 'update', $3, $4::text::jsonb, $5::text::jsonb, 0)"
+        ),
+        &[
+            &format!("{DEFAULT_SCHEMA}.orders"),
+            &id.to_string(),
+            &PgLsn::from(1u64),
+            &old_image,
+            &new_image,
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("stage cdc for orders row {id}: {e}"));
+}
+
+/// Seals and drains through the engine's own apply path until nothing is
+/// pending anywhere in the ring: the hand-driven stand-in for a running
+/// `Client`'s maintenance loop and drain workers (the same helper
+/// `pause_and_drop.rs` uses).
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // No live `Intake` stages anything here, so there is no real staged
+    // watermark to hold apply back. A saturated one never does.
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        while apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "alter_transform_test",
+            1,
+            "trellis_alter_transform_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
+}
+
+/// The column-granularity form of the pause state, checked at a fixed point
+/// in the middle of the backfill rather than raced against it: while
+/// `double_a` is backfilling, `quarantine_status` reports it paused, live
+/// apply leaves it alone, and the rest of the target (its already-live `a`
+/// column) stays readable and keeps taking live changes. That is the ADR's
+/// "the rest of the target stays live."
+///
+/// The backfill writes one PK-range chunk per autocommit statement
+/// (`BACKFILL_CHUNK_ROWS`, 50,000 rows). The test holds it inside its second
+/// chunk with a row trigger on the target that waits on an advisory lock the
+/// test holds, so at the checkpoint the first chunk is committed and the
+/// second is not. Nothing here waits on a live pipeline: the initial build
+/// runs through the chunk queue by hand, and the live change is staged and
+/// drained through `apply::drain_once` by hand.
+///
+/// The earlier version of this test (issue #359) ran a live pipeline over
+/// 150,000 rows and polled `quarantine_status` hoping to catch the paused
+/// state inside the backfill's wall-clock window. It never checked the rest
+/// of the target at all.
 #[tokio::test]
 async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stays_live() {
+    // One row past the first 50,000-row chunk, so the backfill has a second
+    // chunk to be held inside.
+    const ROWS: i64 = 50_001;
+    const GATE_ID: i64 = ROWS;
+    const GATE_KEY: i64 = 359;
+    // Row 1 sits in the already-committed first chunk.
+    const LIVE_ID: i64 = 1;
+    const LIVE_NEW_A: i64 = 1000;
+
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    // Large enough that the backfill's own wall time gives the polling loop
-    // below a real window to observe the paused state in.
-    seed_orders(&raw, 150_000).await;
+    seed_orders(&raw, ROWS).await;
 
-    let definer = define_only(db.dsn()).await;
-    definer
+    let trellis = Arc::new(define_only(db.dsn()).await);
+    trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
-    definer.shutdown().await.expect("shut the definer down");
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "ALTER TRANSFORM requires a live target"
+    );
 
-    let trellis = running(db.dsn()).await;
-    wait_for_live(&raw, "order_calc").await;
+    // The gate: any write to the target's GATE_ID row waits for GATE_KEY,
+    // which `gate` holds until the checkpoint is done.
+    raw.batch_execute(&format!(
+        "create function public.alter_transform_test_gate() returns trigger \
+         language plpgsql as $$ begin \
+             if new.id = {GATE_ID} then perform pg_advisory_xact_lock_shared({GATE_KEY}); end if; \
+             return new; \
+         end $$; \
+         create trigger alter_transform_test_gate \
+             before insert or update on {DEFAULT_TARGET_SCHEMA}.order_calc \
+             for each row execute function public.alter_transform_test_gate();"
+    ))
+    .await
+    .expect("install the backfill gate");
+    let gate = connect_raw(db.dsn()).await;
+    gate.execute("select pg_advisory_lock($1)", &[&GATE_KEY])
+        .await
+        .expect("close the gate");
 
     let alter = {
-        let dsn = db.dsn().to_string();
+        let trellis = Arc::clone(&trellis);
         tokio::spawn(async move {
-            let trellis = Trellis::connect(
-                Config::from_dsn(dsn).expect("valid dsn"),
-                TrellisOptions::default(),
-            )
-            .await
-            .expect("connect");
             trellis
                 .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
                 .await
-                .expect("add a column")
         })
     };
 
-    let observed_paused = Arc::new(AtomicBool::new(false));
-    {
-        let observed_paused = Arc::clone(&observed_paused);
-        let dsn = db.dsn().to_string();
-        tokio::spawn(async move {
-            let trellis = Trellis::connect(
-                Config::from_dsn(dsn).expect("valid dsn"),
-                TrellisOptions::default(),
+    // Not a race: once the backfill reaches the gate it stays there until
+    // the test opens it. The timeout only turns a backfill that never gets
+    // there into a failure instead of a hang.
+    poll_until(
+        Duration::from_secs(60),
+        "the backfill must reach the gated row in its second chunk",
+        async || {
+            raw.query_one(
+                "select count(*) from pg_locks \
+                 where locktype = 'advisory' and not granted and objid = $1::bigint::oid \
+                   and database = (select oid from pg_database where datname = current_database())",
+                &[&GATE_KEY],
             )
             .await
-            .expect("connect");
-            for _ in 0..600 {
-                if let Ok(entry) = trellis.quarantine_status("order_calc.double_a").await
-                    && entry.state == trellis::QuarantineState::Paused
-                {
-                    observed_paused.store(true, Ordering::Relaxed);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-    }
+            .expect("read pg_locks")
+            .get::<_, i64>(0)
+                > 0
+        },
+    )
+    .await;
+    assert!(
+        !alter.is_finished(),
+        "the ALTER must still be running while its backfill is held"
+    );
 
-    let applied = alter.await.expect("alter task");
+    // Checkpoint: the first chunk is committed, the second isn't.
+    //
+    // 1. The new column reports paused.
+    let entry = trellis
+        .quarantine_status("order_calc.double_a")
+        .await
+        .expect("status");
+    assert_eq!(
+        entry.state,
+        trellis::QuarantineState::Paused,
+        "the new column must report paused while its backfill is in flight"
+    );
+
+    // 2. The target stays readable. A lock timeout turns a backfill that
+    //    locked readers out into a failure instead of a hang.
+    raw.batch_execute("set lock_timeout = '10s'")
+        .await
+        .expect("set lock_timeout");
+    let row = raw
+        .query_one(
+            &format!(
+                "select count(*), \
+                        count(*) filter (where double_a is not null), \
+                        count(*) filter (where double_a is distinct from a + a and double_a is not null), \
+                        count(*) filter (where a is distinct from id) \
+                 from {DEFAULT_TARGET_SCHEMA}.order_calc"
+            ),
+            &[],
+        )
+        .await
+        .expect("the target must stay readable while the new column backfills");
+    let (total, populated, wrong, stale_a): (i64, i64, i64, i64) =
+        (row.get(0), row.get(1), row.get(2), row.get(3));
+    assert_eq!(total, ROWS, "every row stays in the target");
+    assert_eq!(stale_a, 0, "the already-live column keeps its values");
+    assert!(
+        populated > 0 && populated < ROWS,
+        "the checkpoint must fall mid-backfill, with the first chunk committed and the \
+         second not (populated {populated} of {ROWS}); if BACKFILL_CHUNK_ROWS changed, \
+         resize ROWS"
+    );
+    assert_eq!(wrong, 0, "the committed chunk wrote double_a = a + a");
+
+    // 3. Live apply keeps writing the already-live column and leaves the
+    //    paused one alone. Row LIVE_ID's double_a was backfilled from a = 1,
+    //    so it must stay 2: neither recomputed to 2000 nor nulled.
+    raw.execute(
+        "update orders set a = $1::bigint where id = $2",
+        &[&LIVE_NEW_A, &LIVE_ID],
+    )
+    .await
+    .expect("update the source row");
+    stage_orders_update(&raw, LIVE_ID, LIVE_ID, LIVE_NEW_A).await;
+    let mut ring = connect_raw(db.dsn()).await;
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        drain_to_quiescence(&db.pool, &mut ring),
+    )
+    .await
+    .expect("live apply must not wait on the in-flight backfill");
+    let row = raw
+        .query_one(
+            &format!(
+                "select a::text, double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where id = $1"
+            ),
+            &[&LIVE_ID],
+        )
+        .await
+        .expect("read the live row");
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some(LIVE_NEW_A.to_string().as_str()),
+        "live apply must keep writing the already-live column while the new one backfills"
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("2"),
+        "live apply must leave the paused column at its backfilled value"
+    );
+
+    // Open the gate. The edit finishes and the column goes live.
+    gate.execute("select pg_advisory_unlock($1)", &[&GATE_KEY])
+        .await
+        .expect("open the gate");
+    let applied = alter
+        .await
+        .expect("join the ALTER")
+        .expect("the ALTER completes once the gate opens");
     let (added, _, _) = into_altered(applied);
     assert_eq!(added, vec!["double_a".to_string()]);
 
-    assert!(
-        observed_paused.load(Ordering::Relaxed),
-        "the new column must report paused while its single-pass backfill is in flight"
-    );
-
-    // Once the edit returns, the column is live again.
     let entry = trellis
         .quarantine_status("order_calc.double_a")
         .await
         .expect("status");
     assert_eq!(entry.state, trellis::QuarantineState::Live);
 
-    trellis.shutdown().await.expect("shutdown");
+    // Every row is backfilled. Row LIVE_ID is left out of the value check:
+    // its chunk read a = 1 before the live change, and repairing that is the
+    // catch-up's job (`defs_backfill_chunk_queue.rs`'s
+    // `alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_backfill`).
+    let row = raw
+        .query_one(
+            &format!(
+                "select count(*) filter (where double_a is null), \
+                        count(*) filter (where id <> $1 and double_a is distinct from a + a) \
+                 from {DEFAULT_TARGET_SCHEMA}.order_calc"
+            ),
+            &[&LIVE_ID],
+        )
+        .await
+        .expect("read the backfilled target");
+    let (missing, wrong): (i64, i64) = (row.get(0), row.get(1));
+    assert_eq!(missing, 0, "the backfill must cover every row");
+    assert_eq!(wrong, 0, "every backfilled double_a must equal a + a");
+
+    Arc::into_inner(trellis)
+        .expect("the ALTER task released its handle")
+        .shutdown()
+        .await
+        .expect("shutdown");
 }
 
 /// `(local_fuse, cascade edges into it)` for `transform.column`'s
