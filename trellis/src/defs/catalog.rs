@@ -1002,10 +1002,21 @@ async fn go_live_if_backfilling(
 /// last chunk can finish after the definition has been paused or quarantined
 /// (or, once resumed, dropped back to `waiting_to_backfill` with leftover
 /// chunks re-dispatched). [`go_live_if_backfilling`] leaves a definition that
-/// has moved on exactly as it is, and no catch-up marker is parked for it
-/// either: the chunk itself is still retired by the caller, and resume
-/// ([`crate::staging::quarantine::resume_transform`]) re-parks a marker of
-/// its own and rebuilds by a fresh backfill.
+/// has moved on exactly as it is; the chunk itself is still retired by the
+/// caller.
+///
+/// The catch-up marker is parked unless the definition is **frozen**. A
+/// frozen one gets nothing from it: resume
+/// ([`crate::staging::quarantine::resume_transform`]) clears its coverage,
+/// re-parks a marker of its own and rebuilds by a fresh backfill. Every other
+/// status still needs one. A leftover chunk (#332) can finish after resume's
+/// rebuild already took the definition `live`, and its range write is an
+/// upsert computed from the chunk's own snapshot. That write can overwrite a
+/// newer value the live fold just wrote, and only a later re-derivation
+/// repairs it. For a `waiting_to_backfill` definition the marker is normally
+/// a no-op (resume's is still parked), but it is also what keeps the
+/// definition from being stranded if resume's marker was lost to an in-flight
+/// discharge (#311).
 ///
 /// Returns the status the definition is left in: [`TransformStatus::Live`]
 /// when this call completed it, its unchanged current status otherwise.
@@ -1022,8 +1033,8 @@ pub(crate) async fn complete_direct_backfill(
     // so handing it an already-qualified `"schema.table"` string would never
     // match anything and this would fail every time with
     // [`CatalogError::SourceTableNotFound`].
-    let outcome = go_live_if_backfilling(txn, definition_id).await?;
-    if outcome == GoLive::Flipped {
+    let status = go_live_if_backfilling(txn, definition_id).await?.status();
+    if !status.is_frozen() {
         let qualified: String = txn
             .query_one(
                 "select source_table from transform_definitions where id = $1",
@@ -1033,7 +1044,7 @@ pub(crate) async fn complete_direct_backfill(
             .get(0);
         crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
     }
-    Ok(outcome.status())
+    Ok(status)
 }
 
 /// Deletes a definition row by id (issue #55) — used by [`install_definition`]
@@ -5540,6 +5551,70 @@ mod go_live_tests {
                 assert_eq!(outcome, GoLive::LeftAs(status));
                 assert_eq!(persisted, status.as_str(), "{status:?} is left untouched");
             }
+        }
+    }
+
+    /// The chunk queue's completion parks its catch-up marker for every
+    /// definition it leaves unfrozen, not only one it flipped itself. That
+    /// includes a definition resume's rebuild already took `live` while a
+    /// leftover chunk (#332) was still writing. A frozen definition gets no
+    /// marker, since its resume parks its own.
+    #[tokio::test]
+    async fn chunk_completion_parks_a_catch_up_unless_the_definition_is_frozen() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = db.pool.get().await.expect("acquire connection");
+        client
+            .execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1)",
+                &[],
+            )
+            .await
+            .expect("seed source_table_versions");
+
+        for status in TransformStatus::ALL {
+            client
+                .execute("delete from pending_backfill", &[])
+                .await
+                .expect("clear markers");
+            let id: i64 = client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, 'public.orders', 1, '', $2) returning id",
+                    &[&format!("public.t_{}", status.as_str()), &status.as_str()],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0);
+
+            let txn = client.transaction().await.expect("begin");
+            let left = complete_direct_backfill(&txn, id)
+                .await
+                .expect("complete_direct_backfill");
+            txn.commit().await.expect("commit");
+
+            let parked: bool = client
+                .query_one(
+                    "select exists(select 1 from pending_backfill \
+                     where table_name = 'public.orders')",
+                    &[],
+                )
+                .await
+                .expect("read markers")
+                .get(0);
+            let expected = if status == TransformStatus::Backfilling {
+                TransformStatus::Live
+            } else {
+                status
+            };
+            assert_eq!(left, expected, "{status:?}: status left behind");
+            assert_eq!(
+                parked,
+                !status.is_frozen(),
+                "{status:?}: a catch-up marker is parked exactly when the definition is unfrozen"
+            );
         }
     }
 }
