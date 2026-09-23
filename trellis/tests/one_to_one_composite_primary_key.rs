@@ -225,12 +225,20 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
 
     setup_source_and_target(&db.pool, &raw).await;
 
-    // Two lines under order 1, one under order 2 — `line_no = 1` repeats
-    // across two different orders, and `order_id = 1` repeats across two
-    // different lines, so neither column alone could serve as the key.
+    // Two lines under each order — `line_no = 1` repeats across two
+    // different orders, and each `order_id` repeats across two different
+    // lines, so neither column alone could serve as the key.
+    //
+    // `(2, 3)` is there so the key set is not closed under swapping the two
+    // columns (`(3, 2)` does not exist). Without it, a decode that read the
+    // columns in the wrong order would go unnoticed: apply's issue #344 basis
+    // check looks the swapped key up in the source, finds that *other* row,
+    // and re-evaluates against it, so every row still lands under the right
+    // key with the right value. With it, the swapped key finds no source row
+    // at all and `(2, 3)` is never written.
     raw.batch_execute(
         "insert into order_lines (order_id, line_no, price, qty) values \
-         (1, 1, 10.00, 2), (1, 2, 5.00, 3), (2, 1, 7.00, 4)",
+         (1, 1, 10.00, 2), (1, 2, 5.00, 3), (2, 1, 7.00, 4), (2, 3, 6.00, 1)",
     )
     .await
     .expect("insert source rows");
@@ -247,16 +255,21 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
             "2\u{1f}1",
             r#"{"order_id":"2","line_no":"1","price":"7.00","qty":"4"}"#,
         ),
+        (
+            "2\u{1f}3",
+            r#"{"order_id":"2","line_no":"3","price":"6.00","qty":"1"}"#,
+        ),
     ] {
         stage_cdc(&raw, key, "insert", None, Some(image)).await;
     }
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     let snapshot = target_snapshot(&raw).await;
-    assert_eq!(snapshot.len(), 3, "one target row per composite key");
+    assert_eq!(snapshot.len(), 4, "one target row per composite key");
     assert_eq!(snapshot.get("1\u{1f}1"), Some(&Some("12.00".to_string())));
     assert_eq!(snapshot.get("1\u{1f}2"), Some(&Some("8.00".to_string())));
     assert_eq!(snapshot.get("2\u{1f}1"), Some(&Some("11.00".to_string())));
+    assert_eq!(snapshot.get("2\u{1f}3"), Some(&Some("7.00".to_string())));
 
     // Update one line's quantity — must recompute only that composite key's
     // row, leaving its same-order_id and same-line_no siblings untouched
@@ -279,7 +292,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     let snapshot = target_snapshot(&raw).await;
-    assert_eq!(snapshot.len(), 3, "the update must not add or remove a row");
+    assert_eq!(snapshot.len(), 4, "the update must not add or remove a row");
     assert_eq!(snapshot.get("1\u{1f}1"), Some(&Some("20.00".to_string())));
     assert_eq!(
         snapshot.get("1\u{1f}2"),
@@ -312,11 +325,12 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     let remaining = target_snapshot(&raw).await;
-    assert_eq!(remaining.len(), 2, "the delete must remove exactly one row");
+    assert_eq!(remaining.len(), 3, "the delete must remove exactly one row");
     assert!(
         !remaining.contains_key("1\u{1f}1"),
         "the deleted row must be gone: {remaining:?}"
     );
     assert_eq!(remaining.get("1\u{1f}2"), Some(&Some("8.00".to_string())));
     assert_eq!(remaining.get("2\u{1f}1"), Some(&Some("11.00".to_string())));
+    assert_eq!(remaining.get("2\u{1f}3"), Some(&Some("7.00".to_string())));
 }

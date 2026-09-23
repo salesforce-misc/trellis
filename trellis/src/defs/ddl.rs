@@ -829,7 +829,8 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// that changes a real value's text therefore makes those paths disagree,
 /// duplicating or orphaning the target row for exactly the values it
 /// rewrites — empirically reproduced for a `text` primary key holding a
-/// literal U+0001 (see
+/// literal U+0001 (see `intake::tests`'
+/// `extract_key_keeps_a_control_character_in_a_key_value_verbatim` and
 /// `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
 /// never *need* the `NULL` substitution, the only safe encoding for it is
 /// the identity one.

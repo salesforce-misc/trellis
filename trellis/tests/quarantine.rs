@@ -657,8 +657,8 @@ async fn a_halting_schema_error_is_never_quarantined_and_stops_the_instance() {
 /// quarantine bookkeeping ever engages, because there is no failure left to
 /// isolate or halt on. `defs_catalog.rs`'s
 /// `a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted`
-/// and `one_to_one_composite_primary_key.rs`'s end-to-end insert/update/delete
-/// coverage are the more direct pins of this behavior; this test's own value
+/// and `one_to_one_composite_primary_key.rs`'s insert/update/delete coverage
+/// are the more direct pins of this behavior; this test's own value
 /// is narrower — confirming the old halt/quarantine path this file is about
 /// genuinely never engages for this shape any more.
 #[tokio::test]

@@ -1516,8 +1516,9 @@ mod tests {
     /// was written under a key no other path could find — duplicating it on
     /// re-derive and orphaning it on delete. See
     /// `ddl::encode_key_part`'s "`PrimaryKeyColumn::nullable` selects the
-    /// encoding" section, and the end-to-end
-    /// `trellis/tests/one_to_one_control_char_pk.rs`.
+    /// encoding" section. This is the only check on intake's half of that
+    /// contract: `trellis/tests/one_to_one_control_char_pk.rs` stages the
+    /// verbatim key by hand and covers the apply half.
     #[test]
     fn extract_key_keeps_a_control_character_in_a_key_value_verbatim() {
         let r = relation(vec![("id", true), ("payload", false)]);
