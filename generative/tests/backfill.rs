@@ -29,7 +29,7 @@
 //! already live under CDC with pre-existing rows), and what makes this test
 //! actually discriminate: no-op the direct build and it fails.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
@@ -37,6 +37,7 @@ use testkit::TestCluster;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
+use trellis::dev::staging::{await_converged, watermark_token};
 
 #[tokio::test]
 async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
@@ -173,6 +174,19 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
     );
 }
 
+/// Advisory-lock key gating the backfill chunk write in
+/// `quiesce_blocks_until_a_slow_backfill_actually_reaches_live`. Advisory
+/// locks are per-database and each test runs in its own isolated database,
+/// so the value only has to be distinct within this test.
+const GATE_LOCK_KEY: i64 = 300;
+
+/// How long after observing ring convergence the gate stays closed. It only
+/// has to comfortably exceed the skew between the releaser's convergence
+/// observation and `quiesce`'s own (both poll with a 250ms backoff ceiling),
+/// so that a `quiesce` which only waits on the ring reliably returns before
+/// the release.
+const RELEASE_MARGIN: Duration = Duration::from_secs(1);
+
 /// public-api-design review gap: [`ManualBackend::quiesce`] used to only
 /// await CDC-ring convergence — it had no awareness of a still-`Backfilling`
 /// direct-build definition's `defs::chunk_queue` work at all (docs/decisions/0007's
@@ -191,19 +205,23 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
 /// created (via a `ddl_command_end` event trigger, so there is no window
 /// between the table existing and the slow trigger being on it for a real
 /// app worker to race past), makes the definition's one backfill chunk write
-/// take a deliberate 13s.
+/// block on an advisory lock this test holds on a separate connection.
 ///
-/// 13s, not some smaller number, is itself load-bearing: manual verification
-/// (temporarily disabling the new definitions-settled wait) measured the
-/// ring-convergence half of `quiesce` alone stalling for ~10s on this exact
-/// scenario — presumably the very age-gate stall this test's own doc comment
-/// (and `local_docs/transit-comparison.md` §3.3) describes — so a shorter
-/// delay here would still pass by that same coincidence this test exists to
-/// stop relying on. 13s safely clears it (and stays well under
-/// `QUIESCE_TIMEOUT`'s 30s), so if `quiesce` regressed to only waiting on
-/// ring convergence, this test would reliably fail (returning at ~10s,
-/// before the elapsed-time assertion's 13s floor) rather than passing by
-/// accident again.
+/// **Why an event gate, not a fixed `pg_sleep`.** The ring-convergence half
+/// of `quiesce` alone stalls for ~10s on this exact scenario (measured with
+/// `GENERATIVE_QUIESCE_TIMING=1`; presumably the seal age-gate stall that
+/// `local_docs/transit-comparison.md` §3.3 describes), independent of how
+/// slow the chunk write is. A fixed sleep shorter than that stall lets a
+/// `quiesce` that only waits on ring convergence pass by the very
+/// coincidence this test exists to rule out: issue #300 measured a 1.5s
+/// sleep passing with `await_definitions_settled` deleted. So the gate is
+/// released on an *event*, not a clock: a helper task waits for the ring to
+/// converge on its own connection, lets [`RELEASE_MARGIN`] pass, and only
+/// then releases the lock. A `quiesce` that really waits on the backfill
+/// cannot return before that release, however long or short the ring stall
+/// is. One that only waits on the ring returns about when the helper sees
+/// convergence, a full margin before the release, and fails the ordering
+/// assertion below.
 #[tokio::test]
 async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
     let cluster = TestCluster::start();
@@ -274,22 +292,34 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
         .await
         .expect("quiesce to drain seed CDC before the definition exists");
 
-    // Deterministically slow down the definition's backfill chunk write
+    // Close the gate before anything can write to the target. The lock is
+    // session-level, held by `gate` until the releaser task below unlocks it
+    // (or, if that task panics, until `gate` is dropped and its session ends,
+    // so a failure can't leave the backfill wedged).
+    let (gate, gate_conn) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect gate session");
+    tokio::spawn(gate_conn);
+    gate.batch_execute(&format!("select pg_advisory_lock({GATE_LOCK_KEY})"))
+        .await
+        .expect("close the backfill gate");
+
+    // Deterministically block the definition's backfill chunk write
     // without racing this backend's already-running application worker: a
     // `ddl_command_end` event trigger fires *inside* the same DDL command
     // that creates the target table (`install`'s `create_target_table`
     // call, below), attaching a statement-level `before insert` trigger to
     // it before that command even commits — so by the time the backfill
     // chunk is enqueued (a separate, later transaction), the target table
-    // already carries the slow-write trigger. There is no window in which a
-    // real app worker could claim and finish the chunk before the slow-down
-    // is in place.
+    // already carries the gated-write trigger. There is no window in which a
+    // real app worker could claim and finish the chunk before the gate is
+    // in place.
     backend
-        .execute_raw(
+        .execute_raw(&format!(
             "create function _slow_backfill_write() returns trigger as $$ \
-             begin perform pg_sleep(13.0); return null; end; \
-             $$ language plpgsql",
-        )
+             begin perform pg_advisory_xact_lock({GATE_LOCK_KEY}); return null; end; \
+             $$ language plpgsql"
+        ))
         .await
         .expect("create the slow-write trigger function");
     backend
@@ -321,10 +351,10 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
         .expect("create the ddl event trigger");
 
     // Phase 2: install the definition. Its target table is created (and,
-    // via the event trigger above, instantly made slow to write to), then
-    // its one backfill chunk is enqueued — and, since this backend has a
-    // real running application worker, claimed and executed automatically,
-    // just slowly.
+    // via the event trigger above, instantly gated), then its one backfill
+    // chunk is enqueued — and, since this backend has a real running
+    // application worker, claimed and executed automatically, blocking on
+    // the gate.
     let def_only = Program {
         tables: vec![],
         relationships: Vec::new(),
@@ -337,18 +367,48 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
     backend
         .install(&def_only)
         .await
-        .expect("install definition (enqueues its one, now artificially slow, backfill chunk)");
+        .expect("install definition (enqueues its one, now gated, backfill chunk)");
 
-    let delay = Duration::from_secs(13);
-    let started = std::time::Instant::now();
+    let (observer, observer_conn) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect ring observer");
+    tokio::spawn(observer_conn);
+    // Same instance-schema resolution `ManualBackend::connect` uses, so the
+    // observer's convergence read sees the backend's own ring tables.
+    let instance_schema = trellis::Config::from_dsn(db.dsn())
+        .expect("resolve instance schema")
+        .schema()
+        .to_string();
+    observer
+        .batch_execute(&format!("set search_path to {instance_schema}, public"))
+        .await
+        .expect("point the observer at the instance schema");
+    let releaser = tokio::spawn(async move {
+        let token = watermark_token(&observer)
+            .await
+            .expect("observer watermark token");
+        await_converged(&observer, token, Duration::from_secs(30))
+            .await
+            .expect("the ring must converge while the backfill chunk is still gated");
+        tokio::time::sleep(RELEASE_MARGIN).await;
+        let released_at = Instant::now();
+        gate.batch_execute(&format!("select pg_advisory_unlock({GATE_LOCK_KEY})"))
+            .await
+            .expect("open the backfill gate");
+        released_at
+    });
+
     backend
         .quiesce()
         .await
-        .expect("quiesce must wait for the slow backfill chunk to actually finish");
+        .expect("quiesce must wait for the gated backfill chunk to actually finish");
+    let returned_at = Instant::now();
+    let released_at = releaser.await.expect("releaser task");
     assert!(
-        started.elapsed() >= delay,
-        "quiesce returned before the artificially slow chunk write could have finished — it \
-         isn't actually waiting on the backfill at all"
+        returned_at >= released_at,
+        "quiesce returned {:?} before the backfill gate was even opened — it only waited on \
+         ring convergence, not on the backfill",
+        released_at - returned_at
     );
 
     let snapshot = backend.snapshot().await.expect("snapshot");
