@@ -67,7 +67,15 @@ Supporting counters/gauges keep the histograms interpretable:
 * `intake_restarts_total{outcome}` — times CDC intake stopped (`error`, or
   `stream_ended`) and the client restarted it with capped exponential backoff.
   Every stop is also logged at `error!` with the cause. A sustained
-  non-zero rate means source changes aren't being staged, so alert on it.
+  non-zero rate means source changes aren't being staged. The third outcome,
+  `producer_lock_held`, means another producer session holds the staging
+  producer lock: this client is standing by and retrying so it can take over,
+  and it logs that at `info!` once, then `debug!`, instead of as an error.
+* `intake_consecutive_failures{slot}` — intake failures in a row since intake
+  last stayed up for 60s. It reads `0` while intake is healthy and climbs while
+  it's stuck restarting. Alert on this (say, `>= 3`) rather than on the
+  lifetime counter, which can't tell an occasional blip from a stuck loop.
+  `producer_lock_held` restarts don't count toward it.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.

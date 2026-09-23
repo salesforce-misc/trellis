@@ -709,10 +709,16 @@ impl RestartBackoff {
         }
     }
 
+    /// How long an attempt must stay up to count as healthy, ending any
+    /// failure streak before it.
+    fn healthy_after(&self) -> Duration {
+        self.max
+    }
+
     /// The delay before the next restart, given how long the attempt that
     /// just ended ran for.
     fn next_delay(&mut self, ran_for: Duration) -> Duration {
-        if ran_for >= self.max {
+        if ran_for >= self.healthy_after() {
             self.current = self.initial;
         }
         let delay = self.current;
@@ -755,19 +761,77 @@ impl RestartBackoff {
 /// retries forever at the capped delay, logging every time. That's
 /// deliberate: it's the loud, actionable signal the issue asks for, and
 /// the same log-and-retry-next-tick stance [`maintenance_loop`] takes.
+///
+/// The exception is a restart refused with `ProducerAlreadyRunning` (issue
+/// #341): another producer session holds the staging producer lock, so this
+/// client is standing by, not failing, and keeps retrying so it takes over
+/// once that session goes away. The first refusal in a row logs at `info!`
+/// and repeats at `debug!`, rather than `error!` every 60s forever. The
+/// `producer_lock_held` restart outcome still counts every one.
+///
+/// Alongside the lifetime restart counter, `trellis_intake_consecutive_failures`
+/// (issue #342) tracks the current streak: failures in a row since an
+/// attempt last stayed up for [`RestartBackoff::healthy_after`], the same
+/// window that resets the backoff. It's cleared as soon as a running attempt
+/// passes that window, so a recovered intake reads `0` rather than whatever
+/// its last streak reached. Lock refusals neither extend nor clear it.
 async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
 where
     A: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), IntakeError>>,
 {
     let mut restarts: u64 = 0;
+    let mut consecutive_failures: u64 = 0;
+    let mut standing_by = false;
+    crate::metrics::set_intake_consecutive_failures(slot, 0);
     loop {
         let started = Instant::now();
-        let outcome = attempt().await;
+        let run = attempt();
+        tokio::pin!(run);
+        let outcome = tokio::select! {
+            outcome = &mut run => outcome,
+            () = tokio::time::sleep(backoff.healthy_after()) => {
+                consecutive_failures = 0;
+                crate::metrics::set_intake_consecutive_failures(slot, 0);
+                run.await
+            }
+        };
         let ran_for = started.elapsed();
+        if ran_for >= backoff.healthy_after() {
+            consecutive_failures = 0;
+        }
         let retry_in = backoff.next_delay(ran_for);
         restarts += 1;
+        let lock_held = matches!(
+            outcome,
+            Err(IntakeError::Staging(StagingError::ProducerAlreadyRunning))
+        );
+        if !lock_held {
+            consecutive_failures += 1;
+        }
+        crate::metrics::set_intake_consecutive_failures(slot, consecutive_failures);
         match outcome {
+            Err(_) if lock_held => {
+                if standing_by {
+                    tracing::debug!(
+                        slot = %slot,
+                        retry_in = ?retry_in,
+                        restarts,
+                        "CDC intake still standing by: another producer session holds the \
+                         staging producer lock"
+                    );
+                } else {
+                    tracing::info!(
+                        slot = %slot,
+                        retry_in = ?retry_in,
+                        restarts,
+                        "CDC intake standing by: another producer session holds the staging \
+                         producer lock, so this client isn't staging source changes; it will \
+                         keep retrying and take over once that session ends"
+                    );
+                }
+                crate::metrics::increment_intake_restarts("producer_lock_held");
+            }
             Err(err) => {
                 tracing::error!(
                     slot = %slot,
@@ -776,6 +840,7 @@ where
                     ran_for = ?ran_for,
                     retry_in = ?retry_in,
                     restarts,
+                    consecutive_failures,
                     "CDC intake stopped with an error; source changes are not being staged \
                      until it restarts"
                 );
@@ -787,12 +852,14 @@ where
                     ran_for = ?ran_for,
                     retry_in = ?retry_in,
                     restarts,
+                    consecutive_failures,
                     "CDC intake's replication stream ended unexpectedly; source changes are \
                      not being staged until it restarts"
                 );
                 crate::metrics::increment_intake_restarts("stream_ended");
             }
         }
+        standing_by = lock_held;
         tokio::time::sleep(retry_in).await;
     }
 }
@@ -1904,6 +1971,143 @@ mod intake_supervisor_tests {
             Duration::from_secs(1)
         );
         assert_eq!(backoff.next_delay(short), Duration::from_secs(2));
+    }
+
+    fn lock_held() -> IntakeError {
+        IntakeError::Staging(StagingError::ProducerAlreadyRunning)
+    }
+
+    /// `slot`'s current `trellis_intake_consecutive_failures` value, if the
+    /// series exists yet.
+    fn consecutive_failures(slot: &str) -> Option<f64> {
+        let rendered = crate::metrics::Metrics::new().render_prometheus();
+        let prefix = format!("trellis_intake_consecutive_failures{{slot=\"{slot}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse().expect("numeric gauge value"))
+    }
+
+    /// Issue #341: another producer session holding the staging producer
+    /// lock is a standby state, not a failure, so it must not log `error!`
+    /// on every retry. The first refusal of a run is `info!` (visible at the
+    /// default level, marking the transition), repeats are `debug!`, and the
+    /// restart counter records them under their own outcome.
+    #[tokio::test]
+    async fn producer_lock_contention_logs_below_error() {
+        let (_guard, captured) = install_capture();
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut resumed_tx = Some(resumed_tx);
+        let mut n = 0;
+
+        let supervisor = supervise_intake("slot_341", FAST, move || {
+            n += 1;
+            let resumed = if n == 4 { resumed_tx.take() } else { None };
+            async move {
+                if let Some(tx) = resumed {
+                    let _ = tx.send(());
+                    std::future::pending::<()>().await;
+                }
+                Err(lock_held())
+            }
+        });
+
+        tokio::select! {
+            _ = supervisor => panic!("supervise_intake must never return"),
+            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
+                got.expect("intake was never restarted").expect("sender dropped");
+            }
+        }
+
+        let events = captured.0.lock().unwrap().clone();
+        let levels: Vec<_> = events
+            .iter()
+            .filter(|e| e.fields.get("slot").map(String::as_str) == Some("slot_341"))
+            .map(|e| e.level)
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::INFO,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG
+            ],
+            "{events:?}"
+        );
+
+        let rendered = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            rendered.contains("trellis_intake_restarts_total{outcome=\"producer_lock_held\"}"),
+            "lock-held restarts must stay countable:\n{rendered}"
+        );
+        assert_eq!(
+            consecutive_failures("slot_341"),
+            Some(0.0),
+            "standing by is not a failure"
+        );
+    }
+
+    /// Issue #342: the consecutive-failures gauge climbs with each failed
+    /// attempt in a row, ignores lock contention, and drops back to 0 once a
+    /// running attempt passes the healthy window, without waiting for that
+    /// attempt to end.
+    #[tokio::test]
+    async fn consecutive_failures_tracks_the_streak_and_clears_while_healthy() {
+        const SLOT: &str = "slot_342";
+        let seen_at_attempt_start = Arc::new(Mutex::new(Vec::new()));
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut resumed_tx = Some(resumed_tx);
+        let mut n = 0;
+
+        let seen = seen_at_attempt_start.clone();
+        let supervisor = supervise_intake(SLOT, FAST, move || {
+            seen.lock().unwrap().push(consecutive_failures(SLOT));
+            n += 1;
+            let resumed = if n == 6 { resumed_tx.take() } else { None };
+            async move {
+                match n {
+                    1 | 2 | 5 => Err(IntakeError::MissingProgressRow {
+                        slot: SLOT.to_string(),
+                    }),
+                    3 => Ok(()),
+                    4 => Err(lock_held()),
+                    _ => {
+                        let _ = resumed.expect("sixth attempt").send(());
+                        std::future::pending().await
+                    }
+                }
+            }
+        });
+
+        tokio::select! {
+            // Polled first, so by the time the second branch's sleep (far
+            // past FAST's 4ms healthy window) completes, the supervisor has
+            // already been woken for its own, earlier healthy-window timer.
+            biased;
+            _ = supervisor => panic!("supervise_intake must never return"),
+            got = tokio::time::timeout(Duration::from_secs(10), async {
+                resumed_rx.await.expect("sender dropped");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }) => got.expect("intake was never restarted"),
+        }
+
+        assert_eq!(
+            *seen_at_attempt_start.lock().unwrap(),
+            [
+                Some(0.0),
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+                Some(3.0),
+                Some(4.0)
+            ],
+            "failures (errors and stream ends) count, lock contention doesn't"
+        );
+        assert_eq!(
+            consecutive_failures(SLOT),
+            Some(0.0),
+            "an attempt that stays up past the healthy window clears the streak"
+        );
     }
 }
 

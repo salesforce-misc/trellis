@@ -117,10 +117,25 @@ const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
 
 /// Issue #325: count of times the client's CDC intake stopped and was
 /// restarted, labeled `outcome` (`error`: `run()` returned an error, or a
-/// restart's reconnect failed; `stream_ended`: the replication stream closed).
-/// Any sustained non-zero rate means source changes are not being staged.
-/// The matching `error!` log line carries the actual error.
+/// restart's reconnect failed; `stream_ended`: the replication stream closed;
+/// `producer_lock_held`: a restart found another producer session holding the
+/// staging producer lock, issue #341). A sustained non-zero `error` or
+/// `stream_ended` rate means this client isn't staging source changes. The
+/// matching log line carries the actual error.
 const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
+
+/// Issue #342: how many times in a row this client's CDC intake has stopped
+/// without an attempt staying up for the supervisor's healthy window (the
+/// restart backoff's 60s cap), labeled `slot`. `0` means intake is running
+/// normally; it drops back to `0` as soon as a running attempt passes the
+/// healthy window, not only when the next one fails. Unlike the lifetime
+/// [`INTAKE_RESTARTS_METRIC`], this tells an occasional blip (1, then back to
+/// 0) from a stuck restart loop (climbing), so alerts can key off "N failures
+/// in a row". A `producer_lock_held` restart neither counts nor resets it:
+/// another session producing is standing by, not failing. Labeled by slot
+/// because a gauge, unlike a counter, can't be summed across two clients in
+/// one process.
+const INTAKE_CONSECUTIVE_FAILURES_METRIC: &str = "trellis_intake_consecutive_failures";
 
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
@@ -185,7 +200,13 @@ fn describe_metrics() {
     metrics::describe_counter!(
         INTAKE_RESTARTS_METRIC,
         "Count of times CDC intake stopped and was restarted, labeled by outcome \
-         (error/stream_ended). Source changes are not staged while intake is down."
+         (error/stream_ended/producer_lock_held). Source changes are not staged while intake \
+         is down."
+    );
+    metrics::describe_gauge!(
+        INTAKE_CONSECUTIVE_FAILURES_METRIC,
+        "Consecutive CDC intake failures since intake last stayed up for 60s, labeled by \
+         slot. 0 when intake is healthy; a climbing value means it is stuck restarting."
     );
 }
 
@@ -288,6 +309,14 @@ pub fn increment_relationship_reverse_fairness_escalated() {
 pub fn increment_intake_restarts(outcome: &str) {
     ensure_installed();
     metrics::counter!(INTAKE_RESTARTS_METRIC, "outcome" => outcome.to_string()).increment(1);
+}
+
+/// Sets [`INTAKE_CONSECUTIVE_FAILURES_METRIC`] for `slot` (issue #342).
+/// Called from `client::supervise_intake`.
+pub fn set_intake_consecutive_failures(slot: &str, failures: u64) {
+    ensure_installed();
+    metrics::gauge!(INTAKE_CONSECUTIVE_FAILURES_METRIC, "slot" => slot.to_string())
+        .set(failures as f64);
 }
 
 /// A handle onto this process's in-process metrics registry — the public,

@@ -91,18 +91,94 @@ impl fmt::Display for ErrorCode {
 /// otherwise — most other server-side failures at this crate's call sites
 /// (a malformed generated statement, an unexpected type error) are engine
 /// bugs, not a condition a caller can act on differently.
+///
+/// The exception to "a `DbError` reached the server, so it isn't
+/// connectivity" is the server telling us the connection itself is gone or
+/// unavailable (issue #340): SQLSTATE class `08` (connection exception) and
+/// `57P01`/`57P02`/`57P03` (admin shutdown, which is what
+/// `pg_terminate_backend` sends; crash shutdown; cannot connect now) are
+/// [`ErrorCode::Connectivity`]. Otherwise the same fault reads differently
+/// depending on whether the server's `FATAL` or the socket close reached the
+/// caller first.
 pub fn classify_pg_error(err: &tokio_postgres::Error) -> ErrorCode {
+    match err.as_db_error() {
+        Some(db_err) => classify_sqlstate(db_err.code()),
+        None => ErrorCode::Connectivity,
+    }
+}
+
+/// [`classify_pg_error`]'s mapping for a server-side error's SQLSTATE.
+fn classify_sqlstate(code: &tokio_postgres::error::SqlState) -> ErrorCode {
     use tokio_postgres::error::SqlState;
 
-    let Some(db_err) = err.as_db_error() else {
-        return ErrorCode::Connectivity;
-    };
-    let code = db_err.code();
-    if *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::FOREIGN_KEY_VIOLATION {
+    if code.code().starts_with("08")
+        || *code == SqlState::ADMIN_SHUTDOWN
+        || *code == SqlState::CRASH_SHUTDOWN
+        || *code == SqlState::CANNOT_CONNECT_NOW
+    {
+        ErrorCode::Connectivity
+    } else if *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::FOREIGN_KEY_VIOLATION {
         ErrorCode::Conflict
     } else if *code == SqlState::UNDEFINED_TABLE {
         ErrorCode::NotFound
     } else {
         ErrorCode::Internal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_postgres::error::SqlState;
+
+    use super::*;
+
+    /// Issue #340: the server reporting a dead or unavailable connection is
+    /// connectivity, whichever connection it happened to (a producer
+    /// session's `57P01` must match the walsender's transport-level drop).
+    #[test]
+    fn connection_loss_sqlstates_classify_as_connectivity() {
+        for code in [
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CRASH_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+            SqlState::CONNECTION_EXCEPTION,
+            SqlState::CONNECTION_FAILURE,
+            SqlState::CONNECTION_DOES_NOT_EXIST,
+            SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+            SqlState::PROTOCOL_VIOLATION,
+        ] {
+            assert_eq!(
+                classify_sqlstate(&code),
+                ErrorCode::Connectivity,
+                "{}",
+                code.code()
+            );
+        }
+    }
+
+    #[test]
+    fn other_sqlstates_keep_their_classification() {
+        assert_eq!(
+            classify_sqlstate(&SqlState::UNIQUE_VIOLATION),
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            classify_sqlstate(&SqlState::FOREIGN_KEY_VIOLATION),
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            classify_sqlstate(&SqlState::UNDEFINED_TABLE),
+            ErrorCode::NotFound
+        );
+        // Same `57` class as admin shutdown, but a cancelled statement, not a
+        // lost connection.
+        assert_eq!(
+            classify_sqlstate(&SqlState::QUERY_CANCELED),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            classify_sqlstate(&SqlState::SYNTAX_ERROR),
+            ErrorCode::Internal
+        );
     }
 }

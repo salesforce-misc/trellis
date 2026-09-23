@@ -151,6 +151,55 @@ async fn unreachable_dsn_surfaces_a_typed_error_without_panicking() {
     }
 }
 
+/// Issue #340: a connection killed server-side (`pg_terminate_backend`, the
+/// same fault a chaos test injects into intake's producer connection) must
+/// classify as `Connectivity`, the same as a transport-level drop. The
+/// server reports it as a real `DbError` with SQLSTATE `57P01`
+/// (admin_shutdown), which `classify_pg_error` used to fold into `Internal`.
+/// The connection future is what deterministically receives that `FATAL`
+/// (a query issued afterward sees only "connection closed"), so that's the
+/// error this test classifies.
+#[tokio::test]
+async fn terminated_backend_classifies_as_connectivity() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_empty_database().await;
+
+    let (victim, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect victim");
+    let connection = tokio::spawn(connection);
+    let pid: i32 = victim
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("victim pid")
+        .get(0);
+
+    let killer = db.pool.get().await.expect("acquire connection");
+    let terminated: bool = killer
+        .query_one("select pg_terminate_backend($1)", &[&pid])
+        .await
+        .expect("terminate victim")
+        .get(0);
+    assert!(terminated, "pg_terminate_backend must find the victim");
+
+    let err = connection
+        .await
+        .expect("connection task must not panic")
+        .expect_err("a terminated backend must end its connection with an error");
+    let db_err = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected the server's FATAL as a DbError, got {err:?}"));
+    assert_eq!(
+        *db_err.code(),
+        tokio_postgres::error::SqlState::ADMIN_SHUTDOWN,
+        "{db_err:?}"
+    );
+    assert_eq!(
+        trellis::error_code::classify_pg_error(&err),
+        trellis::ErrorCode::Connectivity
+    );
+}
+
 /// Issue #182: a pool with no `max_size`/`wait_timeout` configured lets a
 /// caller that shows up once every slot is already checked out wait
 /// forever — silently, with no error and no log line, ever. Configures a
