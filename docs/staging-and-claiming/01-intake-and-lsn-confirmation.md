@@ -210,9 +210,11 @@ knife-edged guards:
   through one seam (`staging::target_mutations`), carrying the row's prior image
   so a downstream aggregate can fix the group the row left. Publishing it as
   well would stage every such write twice (issue #312), and an aggregate
-  target's CDC can't even be decoded. The one exception is a target that is
-  also a relationship endpoint: its settled parent projection is driven by
-  CDC, so it stays published.
+  target's CDC can't even be decoded. A target that is also a relationship
+  endpoint is no exception (issue #375): its settled parent projection, reverse
+  deltas and from-side `group_key` need image-bearing, ordered changes, so the
+  seam stages that target's rows CDC-shaped instead, with the row's new image
+  and, as the `lsn`, a write token read after the writer's last row lock.
 - **The initial snapshot handshake must be gap-free by construction**, not by
   overlap-and-dedup: create the slot with `EXPORT_SNAPSHOT`, backfill from that
   exact snapshot, then stream from the slot's consistent point.

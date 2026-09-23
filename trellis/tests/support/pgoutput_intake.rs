@@ -13,8 +13,8 @@
 //!
 //! The publication is exactly what [`trellis::defs::publication_tables`]
 //! asks for, and [`Pipeline::attach`] asserts that set up front: since issue
-//! #315 no Trellis-owned target is ever published, unless it is a
-//! relationship endpoint (issue #375).
+//! #315 no Trellis-owned target is ever published, and since #375 not even
+//! one that is a relationship endpoint.
 
 use std::collections::HashMap;
 
@@ -168,7 +168,7 @@ impl Pipeline {
             .expect("publication_tables");
         assert_eq!(
             published, expected_published,
-            "only true sources and relationship endpoints are published (issues #315, #375)"
+            "only tables this instance does not own are published (issues #315, #375)"
         );
         raw.batch_execute(&format!(
             "create publication {PUBLICATION} for table {}",

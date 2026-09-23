@@ -52,14 +52,14 @@
 //! # Part 2 — the obligation-table test matrix (issue #173 phase 4)
 //!
 //! `docs/relationship-propagation.md` (issue #173 phases 1-3) is the prose
-//! obligation table: six propagation paths as columns, six recurring edge
-//! inputs as rows, each cell either a code site + pinning test, a structural
+//! obligation table: seven propagation paths as columns (the seventh, the
+//! seam-fed endpoint target, since #403), six recurring edge inputs as rows, each cell either a code site + pinning test, a structural
 //! **N/A**, or a named **GAP**. That table is hand-maintained prose, so a
 //! genuinely missing cell reads the same as one nobody has checked yet.
 //! `obligation_matrix` below is the same table turned into code: `Path` and
 //! `EdgeInput` are closed enums, and `cell()` is a `match` over their full
-//! cross product with no wildcard arm, so adding a seventh path or a
-//! seventh edge input is a compile error here until every new cell is
+//! cross product with no wildcard arm, so adding a path or an edge input is
+//! a compile error here until every new cell is
 //! explicitly classified — the same "enums for closed vocabularies, so a
 //! new variant forces every `match` to be revisited" discipline
 //! `docs/testing-strategy.md` §1 names and `ReverseTrigger`
@@ -345,7 +345,7 @@ async fn repoint_to_null_parent_converges_across_a_seal_boundary() {
 // =========================================================================
 
 mod obligation_matrix {
-    /// The six propagation paths `docs/relationship-propagation.md` names as
+    /// The propagation paths `docs/relationship-propagation.md` names as
     /// columns. Kept in the doc's own left-to-right order so a reader
     /// flipping between the doc and this file doesn't have to re-map
     /// anything.
@@ -357,6 +357,12 @@ mod obligation_matrix {
         TruncateClear,
         AggregateIncremental,
         Backfill,
+        /// Issue #375's direction 1 (#403): a relationship endpoint that is
+        /// one of this instance's own targets is never published, and the
+        /// target-mutation seam (`staging::target_mutations`) is its only
+        /// change feed, staging each write CDC-shaped. Every other path's
+        /// input for such an endpoint comes from here instead of intake.
+        SeamFedEndpoint,
     }
 
     /// The six recurring edge inputs the doc names as rows — issue #173's
@@ -377,13 +383,14 @@ mod obligation_matrix {
         SharedFromTableTwoRelationships,
     }
 
-    pub(super) const ALL_PATHS: [Path; 6] = [
+    pub(super) const ALL_PATHS: [Path; 7] = [
         Path::ForwardRead,
         Path::ReverseDelta,
         Path::ReverseFallback,
         Path::TruncateClear,
         Path::AggregateIncremental,
         Path::Backfill,
+        Path::SeamFedEndpoint,
     ];
 
     pub(super) const ALL_EDGE_INPUTS: [EdgeInput; 6] = [
@@ -422,7 +429,7 @@ mod obligation_matrix {
         };
         use Path::{
             AggregateIncremental, Backfill, ForwardRead, ReverseDelta, ReverseFallback,
-            TruncateClear,
+            SeamFedEndpoint, TruncateClear,
         };
 
         match (path, input) {
@@ -456,6 +463,11 @@ mod obligation_matrix {
                 "backfill runs once against a live snapshot; TRUNCATE is a live CDC event \
                  only the ring ever sees",
             ),
+            (SeamFedEndpoint, TruncateWholeKeyspace) => Handled(&[
+                "trellis/tests/endpoint_seam_feed.rs::a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes \
+                 (a target is cleared through the seam, so its readers see a CDC-shaped delete \
+                 per key, never the key-less sentinel)",
+            ]),
 
             // --- A NULL join key (#128) ---
             (ForwardRead, NullJoinKey) => Handled(&[
@@ -479,6 +491,11 @@ mod obligation_matrix {
             ]),
             (Backfill, NullJoinKey) => Handled(&[
                 "trellis/tests/defs_backfill_relationship.rs::relationship_build_matches_oracle_including_no_match_and_multi_child",
+            ]),
+            (SeamFedEndpoint, NullJoinKey) => Handled(&[
+                "trellis/tests/endpoint_seam_feed.rs::an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included \
+                 (an aggregate target's NULL group as a to-side join key)",
+                "trellis/src/staging/target_mutations.rs::read_new_images_matches_null_grouping_components",
             ]),
 
             // --- A composite source primary key (#121, #126, #163, #177) ---
@@ -510,6 +527,9 @@ mod obligation_matrix {
             (Backfill, CompositePrimaryKey) => Handled(&[
                 "trellis/tests/defs_relationship_composite_pk.rs::aggregate_over_a_to_one_relationship_with_composite_pk_backfills_to_the_oracle",
             ]),
+            (SeamFedEndpoint, CompositePrimaryKey) => Handled(&[
+                "trellis/src/staging/target_mutations.rs::read_new_images_matches_composite_mixed_type_keys",
+            ]),
 
             // --- A missing/nonexistent parent, and an FK re-point to one (#138, #169) ---
             (ForwardRead, MissingOrRepointedParent) => Handled(&[
@@ -540,6 +560,11 @@ mod obligation_matrix {
                  Known Gap 1: no test drove the delta path's own old/new resolution across the \
                  nonexistent-parent boundary, only the reverse path's equivalent)",
             ]),
+            (SeamFedEndpoint, MissingOrRepointedParent) => Handled(&[
+                "trellis/tests/endpoint_seam_feed.rs::a_from_side_targets_seam_group_key_bumps_an_erased_parents_gen \
+                 (a from-side target's child re-pointed within one batch still bumps the \
+                 parent the fold erased, through the seam row's group_key)",
+            ]),
             (Backfill, MissingOrRepointedParent) => Handled(&[
                 "N/A for a bare to-one passthrough (ring only, no direct backfill fast path); \
                  handled for a to-many aggregate's missing-children case: \
@@ -569,6 +594,12 @@ mod obligation_matrix {
                 "backfill reads a live full-table snapshot, not a CDC image; the later \
                  incremental drain is what the declare-time gate protects",
             ),
+            (SeamFedEndpoint, MissingReplicaIdentity) => Handled(&[
+                "an endpoint target is never published, so its replica identity is never \
+                 read: the seam captures each prior image under its own row lock. Pinned by \
+                 trellis/tests/relationship_target_endpoints.rs::a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished \
+                 and ::a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through_the_seam_alone",
+            ]),
 
             // --- A shared from-table reachable via two relationships (#79) ---
             (ForwardRead, SharedFromTableTwoRelationships) => Handled(&[
@@ -597,10 +628,13 @@ mod obligation_matrix {
                 "covered by the backfill half of the same two_relationships_sharing_a_to_side_column_name_resolve_independently \
                  fixture — issue #79's original repro",
             ]),
+            (SeamFedEndpoint, SharedFromTableTwoRelationships) => Handled(&[
+                "trellis/tests/endpoint_seam_feed.rs::a_from_side_target_of_two_relationships_unions_both_join_keys",
+            ]),
         }
     }
 
-    /// The structural check itself: walk every cell of the 6x6 matrix and
+    /// The structural check itself: walk every cell of the 7x6 matrix and
     /// assert it was actually classified with non-empty content. This can
     /// never catch a *wrong* classification (that's what the tests each
     /// cell names are for) — it only catches a cell nobody has looked at,

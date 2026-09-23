@@ -137,6 +137,6 @@ pub use session::producer_singleton_lock_key;
 #[cfg(any(test, feature = "internals"))]
 pub use state::SegmentState;
 #[cfg(any(test, feature = "internals"))]
-pub use target_mutations::{TargetMutations, set_endpoint_targets_seam_fed};
+pub use target_mutations::TargetMutations;
 #[cfg(any(test, feature = "internals"))]
 pub use worker_registry::has_live_workers;

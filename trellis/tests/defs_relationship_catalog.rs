@@ -1439,7 +1439,6 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
         .batch_execute(
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
-             insert into s (id, a) values (1, 10), (2, 20); \
              create table order_line_items (id integer primary key, t2_id integer); \
              alter table order_line_items replica identity full",
         )
@@ -1460,16 +1459,10 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
     .await
     .expect("def A installs with an explicit non-default target schema");
 
-    // custom.t2 becomes the relationship's to-side below — issue #129's
-    // unconditional projection gate needs REPLICA IDENTITY FULL on it, same
-    // as any other to-one relationship's to-side.
-    db.pool
-        .get()
-        .await
-        .expect("get connection")
-        .batch_execute("alter table custom.t2 replica identity full")
-        .await
-        .expect("set replica identity full on custom.t2");
+    // `s` starts empty, so def A builds directly and is `live` by now: a
+    // target still `backfilling` can't be made a relationship endpoint
+    // (issue #403). No replica identity is needed on it either, since an
+    // endpoint that is this instance's own target is never published.
 
     // The relationship's bare `TO t2.id` must still resolve to def A's
     // `custom.t2` — a plain `search_path` walk alone (what `to_regclass`
@@ -1521,7 +1514,6 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
         .batch_execute(
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
-             insert into s (id, a) values (1, 10), (2, 20); \
              create table order_line_items (id integer primary key, t2_id integer); \
              alter table order_line_items replica identity full; \
              insert into order_line_items (id, t2_id) values (1, 1), (2, 2)",
@@ -1543,16 +1535,10 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
     .await
     .expect("def A installs with an explicit non-default target schema");
 
-    // custom.t2 becomes the relationship's to-side below — issue #129's
-    // unconditional projection gate needs REPLICA IDENTITY FULL on it, same
-    // as any other to-one relationship's to-side.
-    db.pool
-        .get()
-        .await
-        .expect("get connection")
-        .batch_execute("alter table custom.t2 replica identity full")
-        .await
-        .expect("set replica identity full on custom.t2");
+    // `s` starts empty, so def A builds directly and is `live` by now: a
+    // target still `backfilling` can't be made a relationship endpoint
+    // (issue #403). No replica identity is needed on it either, since an
+    // endpoint that is this instance's own target is never published.
 
     // The relationship's bare `TO t2.id` must resolve to def A's `custom.t2`
     // (already covered by the test above; needed here as this test's own

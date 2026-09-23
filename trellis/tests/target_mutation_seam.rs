@@ -113,13 +113,12 @@ async fn setup() -> (TestCluster, TestDatabase, Client) {
     (cluster, db, raw)
 }
 
-/// A seam-only target (some definition's target, no relationship touching
-/// it) is never in the publication, even while another definition reads it:
-/// its readers hear about it through the seam. A target that is a
-/// relationship endpoint stays published — its settled parent projection is
-/// driven by CDC.
+/// A target is never in the publication, even while another definition
+/// reads it: its readers hear about it through the seam. Since #403 that
+/// includes a target that is a relationship endpoint, whose settled parent
+/// projection the seam's CDC-shaped rows drive.
 #[tokio::test]
-async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoint() {
+async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
     let (_cluster, db, raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, k integer, v numeric); \
@@ -163,13 +162,11 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
         "agg is hist's source, but a seam-only target is never published"
     );
 
-    // A relationship endpoint keeps CDC. `t` is a plain 1-1 target.
-    raw.batch_execute(
-        "create table public.t (id integer primary key, doubled numeric); \
-         alter table public.t replica identity full",
-    )
-    .await
-    .expect("create t");
+    // A relationship endpoint is no exception. `t` is a plain 1-1 target, on
+    // its default replica identity.
+    raw.batch_execute("create table public.t (id integer primary key, doubled numeric)")
+        .await
+        .expect("create t");
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -192,13 +189,10 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
     .expect("define a reader through the relationship");
     let mut published = publication_tables(&db.pool).await.expect("publication");
     published.sort();
-    assert!(
-        published.contains(&"public.t".to_string()),
-        "a relationship endpoint target stays published: {published:?}"
-    );
-    assert!(
-        !published.contains(&"public.agg".to_string()),
-        "{published:?}"
+    assert_eq!(
+        published,
+        vec!["public.reports".to_string(), "public.src".to_string()],
+        "only true sources are published, not the endpoint target t"
     );
 }
 

@@ -198,9 +198,12 @@ This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
 at or below the horizon only *may* have been read, so skipping the delta would be
 unsound. Re-deriving is correct either way. The cost is that a group keeps being
 re-derived while intake lags behind the apply and changes keep arriving for it.
-In steady state that is a catch-up effect. A chained aggregate over a published
-relationship endpoint is the exception: its upstream write reaches it both as the
-seam's `Recompute` and as CDC, so every such CDC delta re-derives its group.
+In steady state that is a catch-up effect. A target reaches its readers through
+one feed only, the seam (a relationship-endpoint target included, since issue
+#375), so a chained aggregate sees no CDC for it at all. The horizon still
+matters for one window: the upgrade that took endpoint targets out of the
+publication, where CDC for an endpoint written before the drop still arrives
+after the seam's `Recompute` for the same write.
 
 The same rule covers a definition's inline enumeration at `DEFINE` time
 (issue #322), which has no intake to wait on. The #312 watermark wait in

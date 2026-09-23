@@ -23,10 +23,10 @@
 //! - **W5, extinction**: the delta path's existence probe deletes a group a
 //!   concurrent delete emptied; the group is then recreated, and the delete's
 //!   own delta lands on the recreated group.
-//! - **Chained W1**: the aggregate reads a 1-1 target that is also a
-//!   relationship endpoint, published (today by the engine, under #315's
-//!   exception; here by the test itself, see the test) so both the seam's
-//!   `Recompute` and the target's own CDC reach the ring.
+//! - **Chained W1**: the aggregate reads a 1-1 target that is still
+//!   published, as an endpoint target was before #403 unpublished it (here
+//!   by the test itself, see the test), so both the seam's `Recompute` and
+//!   the target's own CDC reach the ring.
 //!
 //! Everything is driven by hand, as `intermediate_hop_cdc.rs` does: `pgoutput`
 //! bytes are read off a second logical slot and fed to a real
@@ -47,8 +47,9 @@
 //! delta by its *earliest* commit. Then come issue #322's definition-time
 //! enumeration, which the same rule closes, two cases found in review (an
 //! extinction with no row to delete, and a delta that reaches the aggregate
-//! through a relationship's reverse fast path), and a seam-style writer whose
-//! ordering token is taken before it commits (#375's direction 1).
+//! through a relationship's reverse fast path), a seam-style writer whose
+//! ordering token is taken before it commits (#375's direction 1), and two
+//! writers of one relationship-endpoint key through the real seam (#403).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -64,8 +65,8 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::{create_relationship, install_definition};
 use trellis::intake::{self, spill};
 use trellis::staging::{
-    CdcOp, MIN_ROWS_TO_SPLIT, SEG_BUCKETS, StagedChange, StagedWatermark, apply, has_pending,
-    retire_drained_segments,
+    CdcOp, MIN_ROWS_TO_SPLIT, SEG_BUCKETS, StagedChange, StagedWatermark, TargetMutations, apply,
+    has_pending, retire_drained_segments,
 };
 
 const PUBLICATION: &str = "race_pub";
@@ -786,54 +787,51 @@ async fn w5_extinct_then_recreated_group_double_subtracts_the_absorbed_delete() 
     h.finish().await;
 }
 
-/// Chained W1: `h3` aggregates `h1`, a 1-1 target of `src` that is also a
-/// relationship endpoint. A write to `h1` reaches `h3` twice: as the seam's
-/// image-less `Recompute` (staged in the apply that wrote `h1`) and as `h1`'s
-/// own CDC (staged when intake decodes that apply). The `Recompute` drains
-/// first and re-derives the group from live `h1`, which already holds the
-/// write; the CDC delta then adds it again. This is W1 with intake's lag
-/// behind the apply as the window, which is structural rather than a race.
+/// Chained W1, as the upgrade that unpublished relationship-endpoint targets
+/// (#375's direction 1, #403) leaves it: `h3` aggregates `h1`, a 1-1 target
+/// of `src` that is still in the publication. A write to `h1` reaches `h3`
+/// twice: as the seam's image-less `Recompute` (staged in the apply that
+/// wrote `h1`) and as `h1`'s own CDC (staged when intake decodes that apply).
+/// The `Recompute` drains first and re-derives the group from live `h1`,
+/// which already holds the write; the CDC delta then adds it again. This is
+/// W1 with intake's lag behind the apply as the window, which is structural
+/// rather than a race.
 ///
 /// # What this pins, and what it leans on
 ///
 /// Two separate things meet here, and only the second is under test:
 ///
-/// 1. **The double feed.** `h1`'s CDC exists only because `h1` is published.
-///    Today the engine publishes it itself (#315 keeps a relationship
-///    endpoint in [`trellis::defs::publication_tables`]). Once #375's
-///    direction 1 lands, the seam is the only feed for every target the
-///    instance owns and the engine unpublishes `h1`; the double feed then
-///    survives only in direction 1's transition window, where `h1` CDC
-///    already in the slot before the `ALTER PUBLICATION ... DROP TABLE`
-///    still arrives.
+/// 1. **The double feed.** The engine never publishes one of its own targets
+///    any more, a relationship endpoint included. Before #403 it published an
+///    endpoint target, and the seam fed that target's readers image-less
+///    `Recompute`s alongside. So an upgraded instance still decodes CDC for
+///    such a target written before intake's `ALTER PUBLICATION ... DROP
+///    TABLE`, paired with the previous binary's `Recompute` for the same
+///    write: this test's shape. The test publishes `h1` itself
+///    ([`Setup::Publish`]) and declares no relationship on it, so this
+///    binary's seam stages the `Recompute` the previous one did for an
+///    endpoint (it stages CDC-shaped rows for an endpoint now, see
+///    `endpoint_seam_feed.rs`).
 /// 2. **The recompute horizon** (the regression this pins): the
 ///    `Recompute`'s forced re-derive stamps group 1's horizon after its live
 ///    read, and `h1`'s CDC delta, whose commit that read already saw, lands
 ///    at or below it and re-derives instead of adding.
 ///
-/// So the test publishes `h1` itself ([`Setup::Publish`]) instead of relying
-/// on the engine's list, and it keeps producing the double feed after
-/// direction 1. It also asserts the shape of both feeds as it goes: an
-/// image-less `recompute` for `h1` from the seam, then an image-bearing
-/// `insert` from CDC. If the seam's row for an aggregate reader becomes
-/// image-bearing (#375's caution 3 leaves that open), the first of those
-/// fails on purpose. Two image-bearing rows for one write are two deltas with
-/// no forced re-derive between them, which no horizon absorbs, so this test
-/// would no longer be pinning the horizon and needs revisiting, not
-/// loosening.
+/// It asserts the shape of both feeds as it goes: an image-less `recompute`
+/// for `h1` from the seam, then an image-bearing `insert` from CDC. Two
+/// image-bearing rows for one write would be two deltas with no forced
+/// re-derive between them, which no horizon absorbs. That is the one part of
+/// the upgrade window this does not cover: a write *this* binary made to an
+/// endpoint target before the drop committed. Pre-release, it is accepted
+/// rather than migrated.
 #[tokio::test]
-async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_counts() {
+async fn chained_w1_aggregate_over_a_target_still_published_from_before_the_upgrade_double_counts()
+{
     let mut h = Harness::start(
-        &format!(
-            "{SRC_DDL}; \
-             create table public.labels (id integer primary key, name text); \
-             alter table public.labels replica identity full; \
-             insert into public.labels values (1, 'one')"
-        ),
+        SRC_DDL,
         &[
             Setup::Transform("TRANSFORM h1 FROM public.src SELECT g AS g, v AS v"),
             Setup::Sql("alter table public.h1 replica identity full"),
-            Setup::Relationship("RELATIONSHIP label FROM h1.g TO labels.id"),
             Setup::Transform(
                 "TRANSFORM h3 FROM public.h1 GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
             ),
@@ -1273,6 +1271,179 @@ async fn a_seam_writer_with_a_pre_commit_token_straddling_a_forced_recompute() {
         horizon_of(&h.raw, 3).await,
         horizon[2],
         "group 3's delta was above its horizon, so it applied as a delta"
+    );
+
+    h.finish().await;
+}
+
+/// One writer of `public.h1` key `id` through the real target-mutation seam
+/// ([`TargetMutations`]), shaped like every seam writer: resolve the image
+/// expression, pre-lock the row capturing its prior image, write, record,
+/// then flush, which reads the write token and stages the seam's rows. `h1`
+/// is a relationship endpoint, so they are CDC-shaped. Returns the token the
+/// staged row carries; the caller decides when to commit.
+async fn endpoint_seam_write(txn: &tokio_postgres::Transaction<'_>, id: i32, v: i32) -> PgLsn {
+    let mut mutations = TargetMutations::new();
+    let image = mutations
+        .image_sql(txn, "public.h1", "t")
+        .await
+        .expect("image_sql")
+        .expect("h1 has a reader, so the seam captures its images");
+    let prior: String = txn
+        .query_one(
+            &format!("select ({image})::text from public.h1 t where id = $1 for update"),
+            &[&id],
+        )
+        .await
+        .expect("pre-lock the key")
+        .get(0);
+    txn.execute(
+        "update public.h1 set v = $2::integer where id = $1",
+        &[&id, &v],
+    )
+    .await
+    .expect("write h1");
+    mutations.record("public.h1", id.to_string(), Some(prior), 0, None);
+    mutations.flush(txn).await.expect("flush the seam");
+    let slot: i16 = txn
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    let row = txn
+        .query_one(
+            &format!(
+                "select op, lsn from seg_{slot} \
+                 where src_table = 'public.h1' and row_txid = pg_current_xact_id()"
+            ),
+            &[],
+        )
+        .await
+        .expect("the writer staged exactly one row for h1");
+    let op: String = row.get(0);
+    assert_eq!(op, "update", "an endpoint target's seam row is CDC-shaped");
+    row.get::<_, Option<PgLsn>>(1)
+        .expect("an image-bearing seam row carries the write token")
+}
+
+/// A group row of `h3`'s recompute horizon.
+async fn h3_horizon(raw: &Client, group: i32) -> PgLsn {
+    raw.query_one(
+        "select __trellis_recompute_lsn from public.h3 where g = $1::integer",
+        &[&group],
+    )
+    .await
+    .expect("read the group's recompute horizon")
+    .get(0)
+}
+
+/// #375's caution 2, driven through the real seam now that it is the only
+/// feed for a relationship-endpoint target (#403), not a hand-built row.
+/// Two writers of one key of `h1` (an endpoint, read by the aggregate `h3`)
+/// straddle a forced recompute of that key's group:
+///
+/// - **A** takes its token and commits before the recompute's live read,
+///   which therefore counts it.
+/// - **B** locks the key after A committed, so its token is above A's (the
+///   per-key order the fold relies on). It takes its token before the read
+///   and commits after it, so the read never saw it, yet its token is at or
+///   below the horizon the read stamps.
+///
+/// Each seam row lands in its own batch, drained after the recompute's. Each
+/// is at or below its group's horizon, so each re-derives the group instead
+/// of applying its delta: A's delta would count A a second time, and B's is
+/// only right if nothing before it was double-counted. The final total must
+/// equal a from-scratch `GROUP BY` over `h1`.
+#[tokio::test]
+async fn two_seam_writers_of_one_endpoint_key_straddling_a_forced_recompute() {
+    let mut h = Harness::start(
+        &format!(
+            "{SRC_DDL}; \
+             create table public.labels (id integer primary key, name text); \
+             alter table public.labels replica identity full"
+        ),
+        &[
+            Setup::Transform("TRANSFORM h1 FROM public.src SELECT g AS g, v AS v"),
+            Setup::Relationship("RELATIONSHIP label FROM h1.g TO labels.id"),
+            Setup::Transform(
+                "TRANSFORM h3 FROM public.h1 GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+            ),
+        ],
+        "h3",
+    )
+    .await;
+    let oracle = "select trim_scale(g::numeric)::text, trim_scale(sum(v))::text, \
+                  trim_scale(count(*)::numeric)::text from public.h1 group by g";
+    // The source starts empty (see the chained W1 test for why).
+    h.commit("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
+    h.feed().await;
+    h.settle().await;
+    assert_eq!(h.target().await, h.groups(oracle).await, "after the build");
+
+    // Batch k: a forced recompute of group 1, as a catch-up would stage.
+    let txn = h.raw.transaction().await.expect("begin append");
+    trellis::staging::append(
+        &txn,
+        &[StagedChange::Recompute {
+            src_table: "public.h1".to_string(),
+            key: "1".to_string(),
+            hop_gen: 1,
+            group_key: None,
+            src_changed: None,
+            prior_image: None,
+        }],
+    )
+    .await
+    .expect("append the recompute");
+    txn.commit().await.expect("commit append");
+    let k = h.seal().await;
+
+    let mut a = connect_raw(h.db.dsn()).await;
+    let txn_a = a.transaction().await.expect("begin A");
+    let token_a = endpoint_seam_write(&txn_a, 1, 11).await;
+    txn_a.commit().await.expect("commit A");
+    let k_a = h.seal().await;
+
+    let mut b = connect_raw(h.db.dsn()).await;
+    let txn_b = b.transaction().await.expect("begin B");
+    let token_b = endpoint_seam_write(&txn_b, 1, 12).await;
+
+    h.drain(k, "worker-1", 1).await;
+    let horizon = h3_horizon(&h.raw, 1).await;
+    assert_eq!(
+        h.target().await[&"1".to_string()],
+        (Some("11".to_string()), Some("1".to_string())),
+        "batch k's live read counts A and not the uncommitted B"
+    );
+    assert!(
+        token_a < token_b,
+        "premise: B locked the key after A committed, so its token ({token_b}) is above A's \
+         ({token_a})"
+    );
+    assert!(
+        token_b <= horizon,
+        "premise: B's token ({token_b}) is at or below group 1's horizon ({horizon}) although \
+         the read did not see B"
+    );
+
+    txn_b.commit().await.expect("commit B");
+    let k_b = h.seal().await;
+    assert_eq!(h.staged_ops(k_a, "public.h1").await, ["update"]);
+    assert_eq!(h.staged_ops(k_b, "public.h1").await, ["update"]);
+
+    h.drain(k_a, "worker-1", 1).await;
+    assert!(
+        h3_horizon(&h.raw, 1).await > horizon,
+        "A's delta is at or below the horizon, so group 1 re-derived (restamping it) rather \
+         than counting A twice"
+    );
+    assert_eq!(h.target().await, h.groups(oracle).await, "after A's batch");
+    h.drain(k_b, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.groups(oracle).await,
+        "B's delta is at or below the horizon too, and re-derives"
     );
 
     h.finish().await;
