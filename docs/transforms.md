@@ -10,6 +10,36 @@ Trellis maintains these tables **incrementally** as source data changes, trading
 spikey read load for a steady write load that keeps the table cheap to read (see
 the README for fuller motivation).
 
+## Source tables
+
+**Trellis requires every source table to have a primary key.** A change arriving
+over logical replication is identified by its primary key, and a 1-1 target
+inherits that key as its own. A definition over a table with no primary key is
+rejected when it is defined, with an error naming the table. Trellis never adds
+the key itself: the source schema is the user's
+([0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)).
+A table whose replica identity is `USING INDEX` over a unique index is accepted
+too, since that index plays the primary key's part, but a primary key is the
+rule to design to.
+
+Some shapes need more than the key. An aggregate, and any read through a to-one
+relationship, needs a deleted or re-keyed source row's whole old image, which
+Postgres logs only under `REPLICA IDENTITY FULL`. That, too, is checked and
+never applied; the rejection quotes the exact `ALTER TABLE` to run.
+
+One consequence is worth stating plainly: **an aggregate target does not qualify
+as a source table.** Its grouping columns may be `NULL`, so its identity is a
+`UNIQUE NULLS NOT DISTINCT` constraint rather than a primary key. Chaining off
+it still works inside the instance that owns it, because an instance hands each
+write to one of its own targets on to that target's readers in the writing
+transaction, never over logical replication (see
+[Chaining and cycle detection](#chaining-and-cycle-detection)). That internal
+path is what makes the chain possible, and it stops at the instance boundary: to
+another Trellis instance, or to any other logical-replication consumer, an
+aggregate target is an ordinary table with no primary key, and Trellis rejects
+it as a source like any other. See [instance-identity](instance-identity.md)
+for the cross-instance rules.
+
 ## Granularity
 
 Granularity determines the target's primary-key space — what a single target row
@@ -130,7 +160,9 @@ A transform can only chain off a target once that target's own transform is
 `TransformNotLive`: wait for the upstream to go live, then define the chained
 transform. Each write to a target reaches the transforms reading it inside the
 same transaction as the write; a target is never part of the CDC publication
-itself (unless it is also a relationship endpoint).
+itself (unless it is also a relationship endpoint). That in-transaction hand-off
+is why an aggregate target, which has no primary key, can be chained off at all
+(see [Source tables](#source-tables)). It does not cross into another instance.
 
 **Cycles are rejected at definition time across the whole graph.** A definition
 that would introduce a cycle, directly or transitively, is invalid and rejected
@@ -142,6 +174,44 @@ Any target table, regardless of granularity, may be defined over a *subset* of
 its source rows via a row-level predicate. Like a partial index, materializing
 only a narrow, high-value slice keeps the write load small; excluded rows never
 enter the target or incur maintenance cost.
+
+## Target tables are Trellis-owned
+
+A target is materialized as a plain table in the target schema, and reading it
+is the whole point: query it, join it, index it, grant it to whoever needs it.
+Its contents and shape, though, belong to Trellis
+([0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md)).
+Trellis assumes it is the table's only writer. A change made behind its back is
+not corrected, and whether it reaches anything chained off the table is
+undefined. Treat a target as read-only, and specifically:
+
+* **Do not insert, update or delete rows.** An edited row stays wrong until the
+  next event that recomputes it, and a row added by hand is accounted for by
+  nothing. `self_check`
+  ([0013](decisions/0013-self-check-production-recompute-audit.md)) reports the
+  divergence; it does not repair it. `PAUSE` then `RESUME` rebuilds the table
+  from source.
+* **Do not add, drop, rename or retype columns.** Trellis addresses its columns
+  by name and type. Redefining the transform is how a column changes
+  ([Changing a definition](#changing-a-definition)).
+* **Do not change the key constraints or the replica identity.** A 1-1 target's
+  primary key and an aggregate target's unique grouping constraint are how
+  Trellis addresses a row when it upserts or deletes it. The replica identity
+  matters once the table is in a publication, which is the case for a target
+  that is a relationship endpoint or that another instance reads as a source:
+  `REPLICA IDENTITY NOTHING` makes Postgres refuse Trellis's own updates.
+* **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
+  the table and its definition together, and refuses while another definition
+  still chains off it. A hand `TRUNCATE` leaves the table empty until the
+  transform is paused and resumed.
+* **Expect a partial table while `backfilling`, and after `RESUME`.** The
+  [status](#status) says when the table is complete; a reader that needs
+  completeness checks it.
+
+Indexes, and grants to other roles, are yours to add. They live and die with the
+table, so `DROP TRANSFORM` takes them with it. Another Trellis instance may read
+a 1-1 target as a source, exactly as it would any table with a primary key. An
+aggregate target may not be read that way (see [Source tables](#source-tables)).
 
 ## Status
 

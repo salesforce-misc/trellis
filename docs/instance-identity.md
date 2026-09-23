@@ -107,16 +107,21 @@ Two things remain the operator's responsibility, not the engine's:
   `DEFAULT_TARGET_SCHEMA`), so nothing keeps two instances' targets apart
   automatically.
 
-An instance can read another instance's target as a source, but only a 1-1
-target. The reading instance has no view of the other instance's writes except
-CDC through its own publication, and CDC keys a change by primary key (or by a
-`REPLICA IDENTITY USING INDEX` index). A 1-1 target mirrors its source's
-primary key, so that works. An aggregate target has none, so `CREATE TRANSFORM`
-rejects it as a source with `SourceNotChangeKeyed` (issue #376). Publishing it
-would make Postgres refuse the owning instance's own updates to it. To chain
-off an aggregate target, define the downstream transform in the instance that
-owns it: an instance passes writes to its own targets on to their readers in
-the same transaction, without CDC.
+An instance can read another instance's 1-1 target as a source, exactly as it
+would any other table with a primary key. It cannot read another instance's
+aggregate target. Trellis requires a source table to have a primary key
+([transforms — Source tables](transforms.md#source-tables)), and an aggregate
+target has none: its grouping columns may be `NULL`, so its identity is a
+`UNIQUE NULLS NOT DISTINCT` constraint. Inside the owning instance that never
+matters, because an instance hands each write to one of its own targets on to
+that target's readers in the writing transaction, without logical replication.
+That internal path stops at the instance boundary. The reading instance's only
+view of the table is CDC through its own publication, and it has no primary key
+to identify a change by, so `CREATE TRANSFORM` rejects the definition with
+`SourceNotChangeKeyed` (issue #376). Publishing the table would also make
+Postgres refuse the owning instance's own updates to it, since it has no replica
+identity. To chain off an aggregate target, define the downstream transform in
+the instance that owns it.
 
 One behaviour to expect rather than debug: convergence latency is coupled
 across co-tenant instances. `staging::watermark_token` is
