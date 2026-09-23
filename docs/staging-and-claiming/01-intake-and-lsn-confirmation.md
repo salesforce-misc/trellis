@@ -180,6 +180,14 @@ knife-edged guards:
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
   flight at `ADD` time has settled.
+- **A marker is deleted only by the discharge that read it.** A table has one
+  marker, and the catch-ups that park one (a direct build going live, a column
+  resume, `ALTER TRANSFORM`) can land while that table's marker is mid-discharge,
+  after its enumeration snapshot is already fixed. Each park gives the marker a new
+  `generation` (keeping the later of the two fences), and discharge deletes only the
+  generation it read, skipping a row a park still has locked. The re-parked marker
+  survives for the next pass, whose snapshot includes the park's commit (issues
+  #311, #367).
 - **That enumeration overlaps the stream, so it must not get ahead of intake.** A
   change committed after the `ADD` but before the enumeration is both streamed and
   enumerated. The enumeration's image-less `Recompute` makes an aggregate re-derive

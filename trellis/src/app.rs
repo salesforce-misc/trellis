@@ -619,16 +619,9 @@ impl Trellis {
             });
         }
 
-        client
-            .execute(
-                "insert into pending_backfill (table_name, fence_snapshot) \
-                 values ($1, pg_current_snapshot()) \
-                 on conflict (table_name) \
-                 do update set fence_snapshot = excluded.fence_snapshot, added_at = now()",
-                &[&qualified],
-            )
-            .await?;
-        Ok(())
+        crate::intake::publication::park_backfill_catchup(&**client, &qualified)
+            .await
+            .map_err(TrellisError::Publication)
     }
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first —

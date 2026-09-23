@@ -145,16 +145,7 @@ pub async fn reconcile_publication(
         // The fence: captured in the *same* transaction as the ADD, so it
         // names exactly the transactions concurrent with this table joining
         // the stream — see the module doc.
-        let fence: String = txn
-            .query_one("select pg_current_snapshot()::text", &[])
-            .await?
-            .get(0);
-        txn.execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ($1, $2::text::pg_snapshot) on conflict (table_name) do nothing",
-            &[table, &fence],
-        )
-        .await?;
+        park_marker(&txn, table).await?;
     }
     txn.commit().await?;
     Ok(())
@@ -203,25 +194,49 @@ pub(crate) async fn park_target_catchup_if_read(
 /// event the amendment describes, just triggered by "every chunk done"
 /// instead of "a table newly joined the publication."
 ///
-/// `on conflict (table_name) do nothing`: if a marker already exists for this
-/// table (a concurrent publication-join, or another definition on the same
-/// table finishing its own build around the same time), that marker's own
-/// discharge already re-derives every current definition on the table once
-/// its fence settles — a second marker would only add a redundant round trip,
-/// not any missed coverage, so first-writer-wins is correct here.
+/// See [`park_marker`] for what happens when a marker for this table already
+/// exists.
 pub(crate) async fn park_backfill_catchup(
     client: &impl GenericClient,
     qualified_table: &str,
 ) -> Result<(), IntakeError> {
-    let fence: String = client
-        .query_one("select pg_current_snapshot()::text", &[])
-        .await?
-        .get(0);
+    park_marker(client, qualified_table).await
+}
+
+/// Parks a `pending_backfill` marker for `qualified_table`, fenced at the
+/// calling transaction's current snapshot. Every writer of a marker goes
+/// through here.
+///
+/// A table has at most one marker, so a park that finds one already there
+/// merges into it (issues #311/#367). It can't simply leave the existing row
+/// alone: that row may be mid-discharge, its enumeration snapshot already
+/// taken before this caller's change, and the discharge would then delete the
+/// only marker and this caller's catch-up would never run. Instead the park
+/// gives the row a fresh `generation`, and [`run_pending_backfills`] deletes
+/// only the generation it read. A discharge that raced this park leaves the
+/// marker for the next pass, which enumerates again from a snapshot that
+/// includes this caller's commit.
+///
+/// The merged row keeps whichever fence is later. Settlement compares only
+/// the fence's `xmax` ([`Snapshot::settled_since`]), so the later fence waits
+/// for everything either park had to wait for. The fence this statement read
+/// can be the older one when it had to wait on the row lock of a concurrent
+/// park.
+async fn park_marker(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<(), IntakeError> {
     client
         .execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ($1, $2::text::pg_snapshot) on conflict (table_name) do nothing",
-            &[&qualified_table, &fence],
+            "insert into pending_backfill as pb (table_name, fence_snapshot) \
+             values ($1, pg_current_snapshot()) \
+             on conflict (table_name) do update set \
+               fence_snapshot = case \
+                 when pg_snapshot_xmax(excluded.fence_snapshot) > pg_snapshot_xmax(pb.fence_snapshot) \
+                 then excluded.fence_snapshot else pb.fence_snapshot end, \
+               generation = default, \
+               added_at = now()",
+            &[&qualified_table],
         )
         .await?;
     Ok(())
@@ -315,6 +330,9 @@ pub(crate) async fn backfill_marker_unsettled(
 struct PendingBackfill {
     table: String,
     fence: Snapshot,
+    /// Which park of `table` this is ([`park_marker`]). Discharge deletes
+    /// only this generation.
+    generation: i64,
 }
 
 async fn fetch_pending_backfills(
@@ -322,7 +340,7 @@ async fn fetch_pending_backfills(
 ) -> Result<Vec<PendingBackfill>, IntakeError> {
     let rows = client
         .query(
-            "select table_name, fence_snapshot::text from pending_backfill",
+            "select table_name, fence_snapshot::text, generation from pending_backfill",
             &[],
         )
         .await?;
@@ -330,7 +348,12 @@ async fn fetch_pending_backfills(
         .map(|r| {
             let table: String = r.get(0);
             let fence_text: String = r.get(1);
-            Snapshot::parse(&fence_text).map(|fence| PendingBackfill { table, fence })
+            let generation: i64 = r.get(2);
+            Snapshot::parse(&fence_text).map(|fence| PendingBackfill {
+                table,
+                fence,
+                generation,
+            })
         })
         .collect()
 }
@@ -796,9 +819,20 @@ pub(crate) async fn run_pending_backfills_until(
             append_enumeration(&txn, &marker.table).await?;
             true
         };
+        // Delete only the marker this pass read (issues #311/#367). A park
+        // since then gave the row a new generation, so it stays for the next
+        // pass: this enumeration's snapshot may predate that park's change.
+        // `skip locked` covers a park that is still in flight: the row stays
+        // either way. If that park commits, its generation is new anyway; if
+        // it rolls back, the next pass re-runs this marker, which is
+        // redundant but safe. Waiting for it instead would hold the
+        // maintenance loop on a caller's transaction.
         txn.execute(
-            "delete from pending_backfill where table_name = $1",
-            &[&marker.table],
+            "delete from pending_backfill where table_name in ( \
+                 select table_name from pending_backfill \
+                 where table_name = $1 and generation = $2 \
+                 for update skip locked)",
+            &[&marker.table, &marker.generation],
         )
         .await?;
         if staged {
@@ -1365,6 +1399,8 @@ mod tests {
 mod catch_up_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tokio::sync::oneshot;
+
     use super::*;
 
     /// Issue #312 review: once one enumeration gives up waiting for intake,
@@ -1429,5 +1465,200 @@ mod catch_up_tests {
             .expect("count markers")
             .get(0);
         assert_eq!(markers, 2, "both markers must survive for the next pass");
+    }
+
+    async fn connect(db: &testkit::TestDatabase) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+        client
+    }
+
+    /// One source table, `public.t`, in the publication with a settled
+    /// marker waiting to be discharged. Returns the discharging client and a
+    /// second connection for the racing park.
+    async fn one_settled_marker(
+        db: &testkit::TestDatabase,
+    ) -> (tokio_postgres::Client, tokio_postgres::Client) {
+        let mut discharger = connect(db).await;
+        discharger
+            .batch_execute(
+                "create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 create publication test_pub;",
+            )
+            .await
+            .expect("seed source table");
+        reconcile_publication(&mut discharger, "test_pub", &["public.t".to_string()])
+            .await
+            .expect("reconcile parks a marker");
+        (discharger, connect(db).await)
+    }
+
+    async fn marker_generation(client: &tokio_postgres::Client) -> Option<i64> {
+        client
+            .query_opt(
+                "select generation from pending_backfill where table_name = 'public.t'",
+                &[],
+            )
+            .await
+            .expect("read marker")
+            .map(|r| r.get(0))
+    }
+
+    /// Runs one discharge pass on `discharger`, holding it at the wait for
+    /// intake (after its enumeration snapshot is fixed, before it deletes the
+    /// marker) while `race` runs. This forces the #311 window by hand instead
+    /// of timing it. `race` sends on `go` to let the discharge finish, and
+    /// `done` fires once the discharge has committed.
+    async fn discharge_racing<F, Fut>(discharger: &mut tokio_postgres::Client, race: F)
+    where
+        F: FnOnce(oneshot::Sender<()>, oneshot::Receiver<()>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let watermark = StagedWatermark::new();
+        let waiting = tokio::sync::Notify::new();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        // `stop` is polled only while the enumeration waits for intake.
+        let stop = || {
+            waiting.notify_one();
+            false
+        };
+        let discharge = async {
+            run_pending_backfills_until(
+                discharger,
+                "wake",
+                &watermark,
+                Duration::from_secs(600),
+                &stop,
+            )
+            .await
+            .expect("run_pending_backfills_until");
+            let _ = done_tx.send(());
+        };
+        let drive = async {
+            waiting.notified().await;
+            let release = async {
+                go_rx.await.expect("race releases the discharge");
+                watermark.advance(PgLsn::from(u64::MAX));
+            };
+            tokio::join!(race(go_tx, done_rx), release);
+        };
+        tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(discharge, drive);
+        })
+        .await
+        .expect("discharge must not block on a racing park");
+    }
+
+    /// Issues #311/#367: a catch-up parked for a table whose marker is
+    /// mid-discharge must survive that discharge. The discharge's enumeration
+    /// snapshot predates the second park, so it can't stand in for it.
+    #[tokio::test]
+    async fn a_park_during_discharge_survives_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut discharger, parker) = one_settled_marker(&db).await;
+        let before = marker_generation(&parker).await.expect("marker parked");
+
+        let parker_ref = &parker;
+        discharge_racing(&mut discharger, |go, _done| async move {
+            park_backfill_catchup(parker_ref, "public.t")
+                .await
+                .expect("park during discharge");
+            go.send(()).expect("release discharge");
+        })
+        .await;
+
+        let after = marker_generation(&parker)
+            .await
+            .expect("the racing park's marker must survive the older discharge");
+        assert_ne!(after, before, "the surviving marker is the racing park's");
+    }
+
+    /// The same race with the park's transaction still open when the
+    /// discharge deletes: the discharge must neither block on it nor delete
+    /// the row out from under it.
+    #[tokio::test]
+    async fn a_park_in_flight_during_discharge_survives_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut discharger, mut parker) = one_settled_marker(&db).await;
+        let before = marker_generation(&parker).await.expect("marker parked");
+
+        let parker_ref = &mut parker;
+        discharge_racing(&mut discharger, |go, done| async move {
+            let txn = parker_ref.transaction().await.expect("begin park");
+            park_backfill_catchup(&txn, "public.t")
+                .await
+                .expect("park during discharge");
+            go.send(()).expect("release discharge");
+            done.await.expect("discharge finished");
+            txn.commit().await.expect("commit park");
+        })
+        .await;
+
+        let after = marker_generation(&parker)
+            .await
+            .expect("the in-flight park's marker must survive the older discharge");
+        assert_ne!(after, before, "the surviving marker is the racing park's");
+    }
+
+    /// A second park keeps the later of the two fences, whichever order they
+    /// arrive in, so the merged marker waits for everything either needed.
+    #[tokio::test]
+    async fn a_repeat_park_keeps_the_later_fence() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = connect(&db).await;
+        async fn xmax(client: &tokio_postgres::Client) -> i64 {
+            client
+                .query_one(
+                    "select pg_snapshot_xmax(fence_snapshot)::text::bigint \
+                     from pending_backfill where table_name = 'public.t'",
+                    &[],
+                )
+                .await
+                .expect("read fence")
+                .get(0)
+        }
+        client
+            .execute(
+                "insert into pending_backfill (table_name, fence_snapshot) \
+                 values ('public.t', '1000000:1000000:'::pg_snapshot)",
+                &[],
+            )
+            .await
+            .expect("plant a fence ahead of the cluster");
+        park_backfill_catchup(&client, "public.t")
+            .await
+            .expect("park behind it");
+        assert_eq!(xmax(&client).await, 1_000_000, "an older fence never wins");
+
+        client
+            .execute(
+                "update pending_backfill set fence_snapshot = '3:3:'::pg_snapshot",
+                &[],
+            )
+            .await
+            .expect("plant a fence behind the cluster");
+        park_backfill_catchup(&client, "public.t")
+            .await
+            .expect("park ahead of it");
+        assert!(
+            xmax(&client).await > 3,
+            "a later fence replaces an older one"
+        );
     }
 }

@@ -1,0 +1,15 @@
+-- Issues #311/#367: a `pending_backfill` marker's identity is its generation,
+-- not its table name.
+--
+-- A table has at most one marker, and discharge (`run_pending_backfills`) used
+-- to delete it by `table_name` alone. A second catch-up parked for the same
+-- table while an earlier marker was mid-discharge (its enumeration snapshot
+-- already taken) either no-op'd on the conflict or refreshed the row, and
+-- either way the in-flight discharge then deleted it, so the second caller's
+-- catch-up never ran.
+--
+-- Every park now draws a fresh generation (a new row takes the column default;
+-- a conflicting park sets it back to `default`), and discharge deletes only the
+-- generation it read. A marker re-parked mid-discharge survives for the next
+-- pass.
+alter table pending_backfill add column generation bigserial not null;
