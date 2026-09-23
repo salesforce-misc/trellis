@@ -19,6 +19,7 @@ pub const SCENARIOS: &[&str] = &[
     "throughput-ramp",
     "transaction-shape",
     "fold-in-ratio",
+    "group-contention",
     "intake-ceiling",
     "idle-cost",
     "generator-reach",
@@ -63,6 +64,10 @@ const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 /// fold-in ratio), not a harness fault, and is why this raises the grace
 /// rather than lowering the default target rate.
 const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(120);
+
+/// Issue #277's group-count axis: the five points it names, bracketing
+/// #268's 1000:1 (400 groups at 400k rows/sec) by two decades either side.
+const CONTENTION_DEFAULT_GROUPS: &[usize] = &[10, 100, 400, 4_000, 40_000];
 
 const INTAKE_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
 /// Short, because at max rate the generator writes millions of rows/sec that
@@ -334,44 +339,34 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
             let results =
                 runtime().block_on(fold_in::run_sweep(&ratios, target_rate, offer, &tuning));
+            Some(report_fold_in(&results, name))
+        }
+
+        "group-contention" => {
+            let groups = usize_list(args, "--groups", CONTENTION_DEFAULT_GROUPS);
+            let threads = usize_list(
+                args,
+                "--threads",
+                &[throughput::THROUGHPUT_APPLICATION_THREADS],
+            );
+            let target_rate = number(args, "--target-rate").unwrap_or(FOLD_IN_DEFAULT_TARGET_RATE);
+            let offer = offer(args, FOLD_IN_DEFAULT_DURATION, FOLD_IN_DEFAULT_GRACE);
+            let tuning = throughput_tuning(args);
+
+            // One probe at a time, reported as it lands: a full grid runs for
+            // tens of minutes, and a partial one is still worth reading.
+            let runtime = runtime();
             let mut ok = true;
-            for result in &results {
-                println!("{}", result.to_json());
-                if result.oracle_ok == Some(false) {
-                    eprintln!(
-                        "CORRECTNESS FAILURE: fold-in {}:1 — {} of {} groups disagree with the \
-                         oracle",
-                        result.fold_in_ratio, result.oracle_mismatched_groups, result.oracle_groups
-                    );
-                    ok = false;
-                }
-                if !result.generator_bound {
-                    eprintln!(
-                        "fold-in {}:1 — T3 {} at {} rows/sec: folded {} while offered, {} \
-                         (offered {:.0}/sec)",
-                        result.fold_in_ratio,
-                        if result.kept_target_rate { "YES" } else { "NO" },
-                        result.target_rows_per_sec,
-                        match result.in_window_folded_rows_per_sec {
-                            Some(rate) => format!("{rate:.0} rows/sec"),
-                            None => "(too few samples to fit)".to_string(),
-                        },
-                        match result.folded_rows_per_sec {
-                            Some(rate) => format!("{rate:.0} rows/sec end to end"),
-                            None => "never caught up within the grace period".to_string(),
-                        },
-                        result.achieved_rows_per_sec,
-                    );
-                }
-                if result.generator_bound {
-                    eprintln!(
-                        "GENERATOR-BOUND: fold-in {}:1 — generator offered only {:.0} of {} \
-                         rows/sec and the aggregate drained all of it, so this row says nothing \
-                         about T3 at the target; raise --connections",
-                        result.fold_in_ratio,
-                        result.achieved_rows_per_sec,
-                        result.target_rows_per_sec
-                    );
+            for &g in &groups {
+                for &application_threads in &threads {
+                    let tuning = EngineTuning {
+                        application_threads,
+                        ..tuning.clone()
+                    };
+                    let result =
+                        runtime.block_on(fold_in::run_probe(g, target_rate, offer, &tuning));
+                    ok &= report_fold_in(std::slice::from_ref(&result), name);
+                    report_contention(&result);
                 }
             }
             Some(ok)
@@ -477,6 +472,76 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
         _ => None,
     }
+}
+
+/// Issue #277's one-line reading of a probe's [`contention`] sample.
+fn report_contention(result: &fold_in::FoldInResult) {
+    let c = &result.contention;
+    eprintln!(
+        "{} groups x {} drain workers: folded {} while offered; engine busy {:.2} backends, \
+         {:.2} waiting on row locks ({:.0}%, {:.2} in the aggregate pre-lock), {:.2} running, \
+         {:.2} idle in txn; {} deadlocks, {} rollbacks",
+        result.groups,
+        result.application_threads,
+        match result.in_window_folded_rows_per_sec {
+            Some(rate) => format!("{rate:.0} rows/sec"),
+            None => "(too few samples to fit)".to_string(),
+        },
+        c.engine_busy_mean,
+        c.engine_row_lock_mean,
+        c.row_lock_share() * 100.0,
+        c.prelock_wait_mean,
+        c.engine_running_mean,
+        c.engine_idle_in_txn_mean,
+        result.deadlocks,
+        result.xact_rollbacks,
+    );
+    for (class, statement, mean) in &c.top_statements {
+        eprintln!("    {mean:>6.2} {:<11} {statement}", class.label());
+    }
+}
+
+/// Prints one JSON line per aggregate probe, flags oracle failures, and
+/// states each probe's T3 verdict — or that it measured the generator.
+fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
+    let mut ok = true;
+    for result in results {
+        println!("{}", result.to_json(scenario));
+        if result.oracle_ok == Some(false) {
+            eprintln!(
+                "CORRECTNESS FAILURE: {} groups — {} of {} groups disagree with the oracle",
+                result.groups, result.oracle_mismatched_groups, result.oracle_groups
+            );
+            ok = false;
+        }
+        if result.generator_bound {
+            eprintln!(
+                "GENERATOR-BOUND: {} groups — generator offered only {:.0} of {} rows/sec and \
+                 the aggregate drained all of it, so this row says nothing about T3 at the \
+                 target; raise --connections",
+                result.groups, result.achieved_rows_per_sec, result.target_rows_per_sec
+            );
+        } else {
+            eprintln!(
+                "fold-in {:.0}:1 ({} groups) — T3 {} at {} rows/sec: folded {} while offered, {} \
+                 (offered {:.0}/sec)",
+                result.fold_in_ratio,
+                result.groups,
+                if result.kept_target_rate { "YES" } else { "NO" },
+                result.target_rows_per_sec,
+                match result.in_window_folded_rows_per_sec {
+                    Some(rate) => format!("{rate:.0} rows/sec"),
+                    None => "(too few samples to fit)".to_string(),
+                },
+                match result.folded_rows_per_sec {
+                    Some(rate) => format!("{rate:.0} rows/sec end to end"),
+                    None => "never caught up within the grace period".to_string(),
+                },
+                result.achieved_rows_per_sec,
+            );
+        }
+    }
+    ok
 }
 
 /// Prints one JSON line per probe and flags correctness/cross-check failures.

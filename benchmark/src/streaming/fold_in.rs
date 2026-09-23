@@ -18,6 +18,17 @@
 //! this scenario's 400k rows/sec target, undershot it at every ratio, and
 //! still reported `sustained: true` — a verdict on the generator that read
 //! like one on T3. `generator_bound` now flags exactly that combination.
+//!
+//! The same probe backs issue #277's `group-contention` scenario, which takes
+//! the group count directly (`--groups`) and crosses it with the drain-worker
+//! count (`--threads`). Every probe also samples where the engine's backends
+//! spent the window ([`contention`]), so a slow row can be attributed —
+//! row-lock waits in the claim or in the aggregate's target-row pre-lock, the
+//! per-group source probes, the fold — rather than guessed at.
+//!
+//! Offer above the ceiling when characterizing: `in_window_folded_rows_per_sec`
+//! of a pipeline that can't keep up *is* its capacity at that shape, which is
+//! the number #277's curves are made of.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -27,6 +38,7 @@ use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
+use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::load::{
     GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
 };
@@ -51,9 +63,13 @@ pub const DEFAULT_RATIOS: &[usize] = &[10, 100, 1000];
 
 #[derive(Debug)]
 pub struct FoldInResult {
-    pub fold_in_ratio: usize,
+    /// `target_rows_per_sec / groups`: source rows per group per second.
+    pub fold_in_ratio: f64,
     pub groups: usize,
     pub target_rows_per_sec: f64,
+    /// Drain workers ([`EngineTuning::application_threads`]) — issue #277's
+    /// second axis.
+    pub application_threads: usize,
     /// Generator writer connections.
     pub connections: usize,
     pub offered_duration_secs: f64,
@@ -101,22 +117,35 @@ pub struct FoldInResult {
     pub oracle_ok: Option<bool>,
     pub oracle_groups: i64,
     pub oracle_mismatched_groups: i64,
+    /// Issue #277: where the engine's backends spent the offer window, over
+    /// the same span the in-window fold rate is fitted to — see
+    /// [`contention`].
+    pub contention: ContentionSummary,
+    /// `pg_stat_database` deadlocks over the offer window.
+    pub deadlocks: i64,
+    /// `pg_stat_database` rolled-back transactions over the offer window —
+    /// see [`contention::deadlocks_and_rollbacks`].
+    pub xact_rollbacks: i64,
 }
 
 impl FoldInResult {
-    pub fn to_json(&self) -> String {
+    pub fn to_json(&self, scenario: &str) -> String {
         format!(
-            "{{\"scenario\":\"fold-in-ratio\",\"fold_in_ratio\":{},\"groups\":{},\
-             \"target_rows_per_sec\":{},\"connections\":{},\"offered_duration_secs\":{:.3},\
+            "{{\"scenario\":\"{}\",\"fold_in_ratio\":{:.1},\"groups\":{},\
+             \"target_rows_per_sec\":{},\"application_threads\":{},\"connections\":{},\
+             \"offered_duration_secs\":{:.3},\
              \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
              \"changes_applied\":{},\"sustained\":{},\"folded_rows_per_sec\":{},\
              \"in_window_folded_rows_per_sec\":{},\"kept_target_rate\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
-             \"oracle_mismatched_groups\":{}}}",
+             \"oracle_mismatched_groups\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\
+             \"contention\":{}}}",
+            scenario,
             self.fold_in_ratio,
             self.groups,
             self.target_rows_per_sec,
+            self.application_threads,
             self.connections,
             self.offered_duration_secs,
             self.rows_issued,
@@ -137,6 +166,9 @@ impl FoldInResult {
             },
             self.oracle_groups,
             self.oracle_mismatched_groups,
+            self.deadlocks,
+            self.xact_rollbacks,
+            self.contention.to_json(),
         )
     }
 }
@@ -282,16 +314,19 @@ fn json_rate(rate: Option<f64>) -> String {
 /// at or *below* the row count. This instead polls and calls the ring drained
 /// once a poll finds no new applied changes since the previous one.
 pub async fn run_probe(
-    fold_in_ratio: usize,
+    groups: usize,
     target_rows_per_sec: f64,
     offer: Offer,
     tuning: &EngineTuning,
 ) -> FoldInResult {
-    let groups = ((target_rows_per_sec / fold_in_ratio as f64).round() as usize).max(1);
+    assert!(groups >= 1, "an aggregate needs at least one group");
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
+    // Issue #277's sampler gets its own connection: `raw` is busy sampling
+    // the fold rate over the same window.
+    let sampler = connect_raw(db.dsn()).await;
 
     raw.batch_execute(&format!(
         "create table public.{SOURCE_TABLE} \
@@ -332,11 +367,19 @@ pub async fn run_probe(
         groups: Some(groups),
         pace: Pace::RowsPerSec(target_rows_per_sec),
     };
+    let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
     let offer_start = Instant::now();
-    let (load, fold_samples) = tokio::join!(
+    let (load, fold_samples, contention) = tokio::join!(
         run_parallel_load(db.dsn(), SOURCE_TABLE, 1, &load_cfg),
         sample_fold_progress(&raw, &terminal, offer_start, offer.duration),
+        contention::sample(
+            &sampler,
+            SOURCE_TABLE,
+            offer_start + offer.duration.mul_f64(FOLD_RATE_SETTLE_FRACTION),
+            offer_start + offer.duration,
+        ),
     );
+    let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
     let in_window_folded_rows_per_sec = fold_rate(&fold_samples);
 
     // An aggregate has an exact convergence signal that a 1-1 chain's row
@@ -378,9 +421,10 @@ pub async fn run_probe(
     let folded_rows_per_sec =
         drained_after.map(|elapsed| load.rows_issued as f64 / elapsed.as_secs_f64());
     FoldInResult {
-        fold_in_ratio,
+        fold_in_ratio: target_rows_per_sec / groups as f64,
         groups,
         target_rows_per_sec,
+        application_threads: tuning.application_threads,
         connections: offer.connections,
         offered_duration_secs: load.elapsed.as_secs_f64(),
         rows_issued: load.rows_issued,
@@ -402,7 +446,15 @@ pub async fn run_probe(
         oracle_ok,
         oracle_groups,
         oracle_mismatched_groups,
+        contention,
+        deadlocks: deadlocks_after - deadlocks_before,
+        xact_rollbacks: rollbacks_after - rollbacks_before,
     }
+}
+
+/// The group count a fold-in `ratio` gives at `target_rows_per_sec`.
+pub fn groups_for_ratio(ratio: usize, target_rows_per_sec: f64) -> usize {
+    ((target_rows_per_sec / ratio as f64).round() as usize).max(1)
 }
 
 /// [`run_probe`] for every ratio in `ratios`, in order.
@@ -414,7 +466,8 @@ pub async fn run_sweep(
 ) -> Vec<FoldInResult> {
     let mut results = Vec::with_capacity(ratios.len());
     for &ratio in ratios {
-        results.push(run_probe(ratio, target_rows_per_sec, offer, tuning).await);
+        let groups = groups_for_ratio(ratio, target_rows_per_sec);
+        results.push(run_probe(groups, target_rows_per_sec, offer, tuning).await);
     }
     results
 }

@@ -36,6 +36,9 @@
 //! cargo run -p benchmark --features engine-access --release -- transaction-shape --shapes 1,100,10000 --target-rate 20000
 //! # V-AGG
 //! cargo run -p benchmark --features engine-access --release -- fold-in-ratio --ratios 10,100,1000 --target-rate 400000
+//! # issue #277: fold rate and lock-wait attribution by group count x drain workers
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
+//! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
 //! # the ceiling every throughput number sits under, and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 5
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1 --rate 300000

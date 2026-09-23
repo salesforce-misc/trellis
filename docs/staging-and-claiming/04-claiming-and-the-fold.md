@@ -53,6 +53,20 @@ RETURNING seg_seq, bucket;
 Two workers computing overlapping shares both insert; the loser is returned fewer
 rows. No bucket is ever held twice.
 
+> **Measured cost (issue #277):** "the loser is returned fewer rows" happens
+> only *after* the winner commits. `ON CONFLICT` against an uncommitted insert
+> waits on the inserter's transaction, and the claim shares one with the fold
+> (`drain_many`'s Phase 1). Workers that compute the same free share from the
+> same snapshot all go for the same lowest bucket, so every loser waits out the
+> winner's whole fold, then gets nothing and moves on. Under saturating load
+> with 8 drain workers, ~40% of busy engine backend time went to this wait, and
+> at 16 workers it was ~60%. A prototype that committed each claim before
+> folding removed the wait entirely. Throughput didn't move at 400 or 4,000
+> groups beyond run-to-run noise, because per-row drain work binds there
+> first. With 400 groups, the workers freed from the claim queue went on to
+> queue for the aggregate's target-row pre-lock. Fixing this won't raise
+> throughput until that per-row cost comes down.
+
 **The claim is one statement.** The claim rows and the batch's `sealed → draining`
 flip are the same `WITH … INSERT … UPDATE …` statement, so they commit together.
 Splitting them opens a crash window: a process dying in the gap leaves claim rows

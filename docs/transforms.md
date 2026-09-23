@@ -44,6 +44,21 @@ SELECT
   MAX(amount) AS max_amount
 ```
 
+**Throughput depends on how many groups a batch touches, not on how few there
+are.** Fewer groups do not buy more headroom, but they don't cost any either.
+Issue #277 measured a single `SUM`/`COUNT(*)` aggregate offered 400k rows/sec
+from 8 drain workers. It folded the same ~85k rows/sec at 10, 100 and 400
+groups. At that end the cost is per source row (the claim-time fold and per-row
+image decoding), and hot target rows aren't what limits it. The shape that hurts
+is many distinct groups receiving writes at once: 56–69k rows/sec at 4,000
+groups, and ~2k rows/sec at 40,000. At 40,000 groups, one drain worker folded
+more than eight did. Every group a batch touches costs an existence
+probe against the source table, run while that group's target row is locked.
+The probe can't use an index on the `GROUP BY` column, so drain workers whose
+batches share groups queue behind each other for those rows. If you're planning
+an aggregate with tens of thousands of groups written concurrently, benchmark
+it first (`benchmark group-contention --groups <n>`).
+
 ### Cross-join
 
 The primary-key space is the join of two source tables, mirroring the rows a

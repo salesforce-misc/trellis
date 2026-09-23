@@ -45,7 +45,10 @@
 //! - [`hop_latency`]: the hop-depth latency ladder (V-LAT / T1).
 //! - [`throughput`]: the single-hop probe, the throughput ramp (V-THRU / T2)
 //!   and the transaction-shape sweep (V-SHAPE).
-//! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3).
+//! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3), and issue
+//!   #277's group-count x drain-worker contention grid over the same probe.
+//! - [`contention`]: `pg_stat_activity` sampling that attributes engine
+//!   backend time to row-lock waits vs everything else (#277).
 //! - [`intake_ceiling`]: CDC decode + ring append alone, the ceiling every
 //!   other throughput number sits under.
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
@@ -53,6 +56,7 @@
 
 pub mod chain;
 pub mod cli;
+pub mod contention;
 pub mod fold_in;
 pub mod generator_reach;
 pub mod hop_latency;
