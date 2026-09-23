@@ -119,7 +119,7 @@ const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
 /// restarted, labeled `outcome` (`error`: `run()` returned an error, or a
 /// restart's reconnect failed; `stream_ended`: the replication stream closed).
 /// Any sustained non-zero rate means source changes are not being staged.
-/// The matching `error!`/`warn!` log line carries the actual error.
+/// The matching `error!` log line carries the actual error.
 const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
 
 /// The process-wide recorder handle, built and installed on first use. See

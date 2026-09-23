@@ -66,7 +66,7 @@ Supporting counters/gauges keep the histograms interpretable:
   chosen over a per-transform depth gauge for lower cost.
 * `intake_restarts_total{outcome}` — times CDC intake stopped (`error`, or
   `stream_ended`) and the client restarted it with capped exponential backoff.
-  Every stop is also logged (`error!`/`warn!`) with the cause. A sustained
+  Every stop is also logged at `error!` with the cause. A sustained
   non-zero rate means source changes aren't being staged, so alert on it.
 
 Backfill progress is deliberately *not* a metric — it's the transform's

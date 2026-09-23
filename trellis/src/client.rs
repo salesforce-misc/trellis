@@ -732,18 +732,24 @@ impl RestartBackoff {
 /// nothing logged: the process kept running maintenance and looked healthy
 /// while it had stopped consuming CDC for good.
 ///
-/// Every stop is now logged (`error!` for an `Err`, `warn!` for the stream
-/// ending: the client never configures a stop LSN, so a clean end means the
-/// server closed the stream), counted in `trellis_intake_restarts_total`, and
-/// followed by a restart after a [`RestartBackoff`] delay. Restarting is
+/// Every stop is now logged at `error!`, counted in
+/// `trellis_intake_restarts_total`, and followed by a restart after a
+/// [`RestartBackoff`] delay. That includes `run()` returning `Ok(())`: with
+/// the pinned `pgwire-replication`, the stream only ends cleanly on a
+/// configured stop LSN or a client-side `stop()`, and the client does
+/// neither. A server-side close (walsender terminated, Postgres shutting
+/// down) surfaces as an `Err`, so a clean end is unexpected, and intake is
+/// just as stopped either way. Restarting is
 /// safe for the same reason aborting on shutdown is: acked LSNs are durable
 /// and `Intake::connect` resumes from the last confirmed position, and a
-/// failed attempt's staging transaction was rolled back before `run()`
-/// returned. The previous attempt's `Intake` (its producer session and
-/// replication connection) is dropped before the backoff sleep, so the
-/// restart doesn't race its own predecessor for the producer lock or the
-/// slot. If the server still holds either briefly, that restart fails
-/// `connect`, which is logged and retried like any other failure.
+/// failed attempt's staging transaction never committed (dropping the
+/// attempt's `Intake` closes its producer connection, which rolls it back).
+/// That `Intake` (its producer session and replication connection) is
+/// dropped before the backoff sleep, so the restart doesn't race its own
+/// predecessor for the producer lock or the slot. If the server still holds
+/// either briefly, the restart fails (`ProducerAlreadyRunning` from
+/// `connect`, or "replication slot is active" from the new stream's first
+/// `recv`), which is logged and retried like any other failure.
 ///
 /// A deterministic error (one the same WAL will reproduce on every replay)
 /// retries forever at the capped delay, logging every time. That's
@@ -776,12 +782,13 @@ where
                 crate::metrics::increment_intake_restarts("error");
             }
             Ok(()) => {
-                tracing::warn!(
+                tracing::error!(
                     slot = %slot,
                     ran_for = ?ran_for,
                     retry_in = ?retry_in,
                     restarts,
-                    "CDC intake's replication stream ended; restarting it"
+                    "CDC intake's replication stream ended unexpectedly; source changes are \
+                     not being staged until it restarts"
                 );
                 crate::metrics::increment_intake_restarts("stream_ended");
             }
@@ -1829,10 +1836,55 @@ mod intake_supervisor_tests {
 
         let events = captured.0.lock().unwrap().clone();
         assert!(
-            events.iter().any(|e| e.level == tracing::Level::WARN
+            events.iter().any(|e| e.level == tracing::Level::ERROR
                 && e.fields.get("slot").map(String::as_str) == Some("slot_325_eos")),
-            "a stream end must be logged at warn: {events:?}"
+            "a stream end must be logged at error: {events:?}"
         );
+    }
+
+    /// The supervisor must feed each attempt's real uptime into the backoff:
+    /// two quick failures escalate the delay, then a failure after an attempt
+    /// that stayed up at least `max` restarts from `initial` again.
+    #[tokio::test]
+    async fn supervisor_resets_backoff_after_a_long_running_attempt() {
+        let (_guard, captured) = install_capture();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut resumed_tx = Some(resumed_tx);
+
+        let counter = attempts.clone();
+        let supervisor = supervise_intake("slot_325_reset", FAST, move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let resumed = if n == 3 { resumed_tx.take() } else { None };
+            async move {
+                if let Some(tx) = resumed {
+                    let _ = tx.send(());
+                    std::future::pending::<()>().await;
+                }
+                if n == 2 {
+                    // Stays up longer than FAST's 4ms cap before failing.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(IntakeError::MissingProgressRow {
+                    slot: "slot_325_reset".to_string(),
+                })
+            }
+        });
+
+        tokio::select! {
+            _ = supervisor => panic!("supervise_intake must never return"),
+            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
+                got.expect("intake was never restarted").expect("sender dropped");
+            }
+        }
+
+        let events = captured.0.lock().unwrap().clone();
+        let retry_in: Vec<_> = events
+            .iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .map(|e| e.fields.get("retry_in").cloned().expect("retry_in field"))
+            .collect();
+        assert_eq!(retry_in, ["1ms", "2ms", "1ms"], "{events:?}");
     }
 
     #[test]
