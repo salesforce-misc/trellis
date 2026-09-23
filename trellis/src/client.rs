@@ -132,8 +132,8 @@ pub struct ClientOptions {
     pub heartbeat: HeartbeatDaemonConfig,
     /// How long an app-worker task's idle `LISTEN` wait sits before polling
     /// `next_claimable_segment` again anyway (a floor under `NOTIFY`
-    /// delivery, and the only wake source if the listener connection itself
-    /// couldn't be opened).
+    /// delivery, and the only wake source while the listener connection is
+    /// down: the worker reopens it in the background with backoff).
     pub poll_interval: Duration,
     /// Issue #274 (epic #269): batches several source transactions into one
     /// ring transaction instead of one ring transaction per source commit —
@@ -1416,7 +1416,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     // segment drain should heartbeat at the same margin under `reclaim_ttl`.
     let chunk_heartbeat_interval = heartbeat_config.interval;
     let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
-    let mut wake = wake_listener(&dsn, &schema, &wake_channel).await.ok();
+    let mut wake = WakeListener::spawn(dsn.clone(), schema.clone(), wake_channel.clone());
 
     // Due immediately on the very first tick, same as `maintenance_loop`'s
     // own `next_reconcile` — see `sweep_stale_chunks_if_due`.
@@ -1677,17 +1677,22 @@ async fn drain_backfill_chunks(
 
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
 /// whichever comes first. Returns `true` if shutdown fired.
+///
+/// Issue #313: a closed wake channel is *not* a wake. It used to be read as
+/// one — `recv()` on a closed channel returns `None` immediately — so an idle
+/// worker whose `LISTEN` connection had died looped at full speed with no
+/// sleep at all. [`WakeListener`] now reopens its own connection and never
+/// closes the channel while it is alive, so `None` here only means its
+/// supervisor task is gone. Then the wait falls back to the poll floor, the
+/// same as a worker that never had a listener.
 async fn wait_for_wake(
-    wake: &mut Option<WakeListener>,
+    wake: &mut WakeListener,
     shutdown_rx: &mut watch::Receiver<bool>,
     poll_interval: Duration,
 ) -> bool {
     let notified = async {
-        match wake {
-            Some(listener) => {
-                listener.rx.recv().await;
-            }
-            None => std::future::pending::<()>().await,
+        if wake.rx.recv().await.is_none() {
+            std::future::pending::<()>().await;
         }
     };
 
@@ -1698,31 +1703,113 @@ async fn wait_for_wake(
     }
 }
 
-/// A `LISTEN`ing connection on `channel`, delivering one `()` per
-/// notification. Best-effort: if opening the connection fails, callers fall
-/// back to polling on the timeout alone (see [`wait_for_wake`]).
+/// First delay before reopening a wake listener's `LISTEN` connection after
+/// it closed or failed to open. Doubles on each consecutive failed open, up to
+/// [`WAKE_REOPEN_BACKOFF_MAX`], and resets once an open succeeds.
+const WAKE_REOPEN_BACKOFF_BASE: Duration = Duration::from_millis(250);
+/// Ceiling on [`WAKE_REOPEN_BACKOFF_BASE`]'s doubling, so a database that is
+/// down for a long time costs one connection attempt per this interval.
+const WAKE_REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A self-healing `LISTEN` on the wake channel, delivering one `()` per
+/// notification to [`wait_for_wake`].
 ///
-/// Holds the `tokio_postgres::Client` handle for its own connection, not
-/// just the polling task: dropping a `tokio_postgres::Client` closes its
-/// connection, which would end `_task`'s driver loop and silently stop
-/// notifications from ever being delivered (falling all the way back to
-/// `poll_interval` polling) even though the struct itself looked alive. The
-/// `_client` field exists purely to keep that connection open for as long
-/// as this `WakeListener` is.
+/// A background task owns the connection. When the connection closes, or
+/// can't be opened in the first place, the task backs off and reopens it
+/// (see [`keep_listening`]); meanwhile the worker polls on its
+/// `poll_interval` floor alone. The channel therefore stays open for as long
+/// as this struct lives, and a dead backend never looks like a wake
+/// (issue #313).
+///
+/// Dropping this aborts the task, which drops the connection's
+/// `tokio_postgres::Client` and so closes the connection.
 struct WakeListener {
     rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-    _client: tokio_postgres::Client,
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-async fn wake_listener(
-    dsn: &str,
-    schema: &str,
-    channel: &str,
-) -> Result<WakeListener, tokio_postgres::Error> {
-    let (client, mut connection) = tokio_postgres::connect(dsn, NoTls).await?;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::spawn(async move {
+impl WakeListener {
+    fn spawn(dsn: String, schema: String, channel: String) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(keep_listening(
+            move |tx| open_wake_session(dsn.clone(), schema.clone(), channel.clone(), tx),
+            tx,
+            WAKE_REOPEN_BACKOFF_BASE,
+            WAKE_REOPEN_BACKOFF_MAX,
+        ));
+        Self { rx, task }
+    }
+}
+
+impl Drop for WakeListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// [`WakeListener`]'s supervisor. Opens a listening session with `open`,
+/// runs it until its connection closes, and opens a new one, sleeping between
+/// attempts so a session that keeps dying or a database that keeps refusing
+/// connections can't spin: the sleep starts at `base` after a session ends,
+/// and doubles (capped at `max`) for each consecutive open that fails.
+///
+/// Every successful open sends one wake. Any `NOTIFY` sent while no `LISTEN`
+/// was active is lost, including the ones before the very first open, so the
+/// worker has to take one look at the queue once the `LISTEN` is in place.
+/// That wake is sent only after the `LISTEN` has committed, so a commit that
+/// lands between the two is still caught by its own notification.
+///
+/// Returns once the receiving side is gone.
+async fn keep_listening<Open, OpenFut, Session, E>(
+    mut open: Open,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    base: Duration,
+    max: Duration,
+) where
+    Open: FnMut(tokio::sync::mpsc::UnboundedSender<()>) -> OpenFut,
+    OpenFut: std::future::Future<Output = Result<Session, E>>,
+    Session: std::future::Future<Output = ()>,
+    E: fmt::Display,
+{
+    let mut delay = base;
+    while !tx.is_closed() {
+        match open(tx.clone()).await {
+            Ok(session) => {
+                delay = base;
+                let _ = tx.send(());
+                session.await;
+                tracing::warn!(
+                    retry_in = ?delay,
+                    "wake listener's LISTEN connection closed; polling until it reopens"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    retry_in = ?delay,
+                    "wake listener could not open its LISTEN connection; polling until it does"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max);
+            }
+        }
+    }
+}
+
+/// Opens one `LISTEN` session on `channel` for [`keep_listening`]: connects,
+/// starts forwarding notifications to `tx`, and issues the `LISTEN`. The
+/// returned future resolves when the connection closes. It holds the
+/// `tokio_postgres::Client` until then, because dropping the client would
+/// close the connection it is waiting on.
+async fn open_wake_session(
+    dsn: String,
+    schema: String,
+    channel: String,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Result<impl std::future::Future<Output = ()>, tokio_postgres::Error> {
+    let (client, mut connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let driver = tokio::spawn(async move {
         loop {
             match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
                 Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
@@ -1734,20 +1821,201 @@ async fn wake_listener(
         }
     });
 
-    client
+    if let Err(err) = client
         .batch_execute(&format!(
             "set search_path to {}, public; {}; listen {}",
-            quote_ident(schema),
+            quote_ident(&schema),
             crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS,
-            quote_ident(channel)
+            quote_ident(&channel)
         ))
-        .await?;
+        .await
+    {
+        driver.abort();
+        return Err(err);
+    }
 
-    Ok(WakeListener {
-        rx,
-        _client: client,
-        _task: task,
+    Ok(async move {
+        let _client = client;
+        let _ = driver.await;
     })
+}
+
+#[cfg(test)]
+mod wake_listener_tests {
+    //! Issue #313: a dead `LISTEN` connection must neither read as a wake nor
+    //! be reopened in a tight loop. Paused-clock tests, no Postgres.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Regression: `recv()` on a closed channel returns `None` at once, and
+    /// `wait_for_wake` used to count that as a wake, so every call returned
+    /// immediately and the idle worker loop spun with no sleep.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_wake_channel_waits_out_the_poll_floor() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        drop(tx);
+        let mut wake = WakeListener {
+            rx,
+            task: tokio::spawn(async {}),
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let poll_interval = Duration::from_millis(200);
+
+        let started = tokio::time::Instant::now();
+        for _ in 0..3 {
+            assert!(!wait_for_wake(&mut wake, &mut shutdown_rx, poll_interval).await);
+        }
+        assert_eq!(
+            started.elapsed(),
+            poll_interval * 3,
+            "each wait on a closed listener must sit out the full poll floor"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_still_ends_the_wait_early() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut wake = WakeListener {
+            rx,
+            task: tokio::spawn(async {}),
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        tx.send(()).unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert!(!wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_secs(60)).await);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The supervisor reopens a closed session after `base`, backs off
+    /// exponentially across failed opens, resets after a successful one, and
+    /// wakes the worker once per successful open.
+    #[tokio::test(start_paused = true)]
+    async fn keep_listening_reopens_with_backoff_and_wakes_on_each_open() {
+        let base = Duration::from_millis(100);
+        let max = Duration::from_millis(400);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Open #1 succeeds, but its connection dies at once. Opens #2-#4 fail.
+        // Open #5 succeeds and stays up.
+        let counter = Arc::clone(&opens);
+        let open = move |_tx: tokio::sync::mpsc::UnboundedSender<()>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                match n {
+                    1 => Ok(fake_session(false)),
+                    2..=4 => Err(format!("refused #{n}")),
+                    _ => Ok(fake_session(true)),
+                }
+            }
+        };
+        let supervisor = tokio::spawn(keep_listening(open, tx, base, max));
+
+        // Opens land at t = 0 (ok, closes), 100 (fail), 200 (fail),
+        // 400 (fail), 800 (ok, stays up): sleeps of base after the closed
+        // session, then 100, 200, 400 = capped doubling after each failure.
+        let expected = [
+            (50, 1, 1),
+            (150, 2, 0),
+            (350, 3, 0),
+            (750, 4, 0),
+            (850, 5, 1),
+        ];
+        let started = tokio::time::Instant::now();
+        for (at_ms, want_opens, want_wakes) in expected {
+            tokio::time::sleep_until(started + Duration::from_millis(at_ms)).await;
+            assert_eq!(
+                opens.load(Ordering::SeqCst),
+                want_opens,
+                "opens by {at_ms}ms"
+            );
+            let mut wakes = 0;
+            while rx.try_recv().is_ok() {
+                wakes += 1;
+            }
+            assert_eq!(
+                wakes, want_wakes,
+                "wakes delivered in the window ending {at_ms}ms"
+            );
+        }
+
+        // The healthy session holds: no further opens, however long we wait.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(opens.load(Ordering::SeqCst), 5);
+
+        // Dropping the receiver lets the supervisor stop at its next check.
+        drop(rx);
+        supervisor.abort();
+    }
+
+    /// A stand-in listening session: resolves at once (the connection
+    /// closed) unless `stays_up`.
+    fn fake_session(
+        stays_up: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        if stays_up {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// The issue's repro against a real backend: terminate the listener's
+    /// `LISTEN` connection and it reopens, wakes the worker once, and keeps
+    /// delivering notifications on the new connection. Each step waits on
+    /// the wake channel itself; the timeout is only a hang guard.
+    #[tokio::test]
+    async fn a_terminated_listen_backend_is_reopened() {
+        use crate::config::DEFAULT_SCHEMA;
+
+        const CHANNEL: &str = "wake_313";
+        let hang_guard = Duration::from_secs(30);
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut wake = WakeListener::spawn(
+            db.dsn().to_string(),
+            DEFAULT_SCHEMA.to_string(),
+            CHANNEL.to_string(),
+        );
+        let mut next_wake = async || {
+            tokio::time::timeout(hang_guard, wake.rx.recv())
+                .await
+                .expect("a wake before the hang guard")
+                .expect("the wake channel stays open")
+        };
+
+        next_wake().await; // the first open's catch-up wake
+
+        let admin = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        let terminated: i64 = admin
+            .query_one(
+                "select count(*) from ( \
+                   select pg_terminate_backend(pid) from pg_stat_activity \
+                   where datname = current_database() \
+                     and pid <> pg_backend_pid() \
+                     and query like '%listen%' || $1 || '%' \
+                 ) t",
+                &[&CHANNEL],
+            )
+            .await
+            .expect("terminate the listener's backend")
+            .get(0);
+        assert_eq!(terminated, 1, "exactly one LISTEN backend to terminate");
+
+        next_wake().await; // the reopen's catch-up wake
+
+        admin
+            .batch_execute(&format!("notify {CHANNEL}"))
+            .await
+            .expect("notify");
+        next_wake().await;
+    }
 }
 
 #[cfg(test)]

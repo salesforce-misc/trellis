@@ -146,3 +146,7 @@ trellis = { path = ".", features = ["internals"] }
 # feature's own, separate, non-dev use of `tracing-subscriber`'s `Layer`
 # trait).
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+# Dev-only: paused-clock unit tests (`start_paused`) for timing logic such as
+# `client::wait_for_wake`'s poll floor and the wake listener's reopen backoff,
+# so they assert exact virtual durations instead of racing a real clock.
+tokio = { version = "1", features = ["test-util"] }
