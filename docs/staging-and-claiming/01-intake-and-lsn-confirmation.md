@@ -180,11 +180,16 @@ knife-edged guards:
   `pending_backfill` marker in one transaction, deletes the marker in the same
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
-  flight at `ADD` time has settled. This discharge is the **only** capture path:
+  flight at `ADD` time has settled. The fence is taken inside the `ALTER`'s
+  transaction, so a writer that starts between the fence and the commit isn't
+  covered, a known gap
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#left-for-the-children-to-record-here)).
+  This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
   ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
-  staging worker runs the `ALTER`. The inventory in
+  staging worker runs the `ALTER`, apart from `DROP`'s reconcile, which is an
+  open question (#427). The inventory in
   [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
   lists the paths that don't go through it yet.
 - **A marker is deleted only by the discharge that read it.** A table has one
@@ -236,8 +241,10 @@ knife-edged guards:
   replication client Trellis uses supports it
   ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
   *Planned (#417):* `initial_snapshot_handshake` still reads every table in the
-  slot-creation transaction. The join markers `reconcile_publication` leaves
-  behind repair #393's gap on the first maintenance pass, by accident.
+  slot-creation transaction. For a table the same setup's `reconcile_publication`
+  just added, the join marker it leaves behind repairs #393's gap on the first
+  maintenance pass, by accident. A table that was already published gets no
+  marker and no repair.
 
 ## The load-bearing invariants
 

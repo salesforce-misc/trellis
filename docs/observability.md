@@ -24,7 +24,7 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   (issue #144) answers the coarser, fleet-wide question a per-transform status
   can't: is *any* drain worker running to build and maintain targets. It
   doesn't cover the staging worker, which is what moves a new transform out of
-  `waiting_to_backfill`. See
+  `waiting_to_backfill` (a known gap, #428). See
   [docs/embedding.md](embedding.md#the-silent-stall-hazard-issue-144) for the
   embedded-deployment misconfiguration this exists to catch.
 
@@ -183,6 +183,9 @@ quarantine are two arcs of one lifecycle:
   transform's build is running: a ring enumeration, chunks on drain threads,
   or a direct set-based build. The target is partial.
 * **`live`** — build complete; tracking live changes only. The steady state.
+  Not yet a promise that the target is complete: a ring enumeration's rows may
+  still be draining, and a chunked or direct build's go-live catch-up may still
+  be pending ([data-flow](data-flow.md#what-it-asks-of-a-deployment)).
 * **`quarantined`** — the fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**

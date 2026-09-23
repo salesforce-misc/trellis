@@ -35,9 +35,12 @@ marker-discharge machinery (`intake::publication::run_pending_backfills_until`):
 1. **Join.** The source gets a `pending_backfill` marker, fenced at the
    snapshot of the transaction that parks it. If the table isn't in the
    publication yet, the staging worker's reconcile pass adds it and parks the
-   marker in the same transaction (`reconcile_publication`), so the fence names
-   exactly the transactions in flight when the table joined the stream. Only the
-   staging worker changes the publication.
+   marker in the same transaction (`reconcile_publication`). The fence has to
+   cover every transaction that could have written the table before the join
+   committed, since the stream doesn't carry those writes. A fence taken inside
+   the `ALTER`'s own transaction falls slightly short of that (see
+   [below](#left-for-the-children-to-record-here)). Only the staging worker
+   changes the publication; `DROP` is an open exception (#427).
 2. **Wait.** The discharge leaves the marker alone until its fence settles:
    every transaction that was open when it was parked has ended. It then waits
    for intake to stage through the WAL position its read snapshot was taken at
@@ -78,7 +81,7 @@ The join has two cases, split by whether the source needs a publication change:
   and its fence is registration's own snapshot.
 
 Either way a `waiting_to_backfill` definition always has a marker in its
-future, and nothing but the staging worker ever runs `ALTER PUBLICATION`.
+future, and registration never runs `ALTER PUBLICATION`.
 *Planned (#418):* registration doesn't park a marker yet. It reads the source
 itself instead, which is what this ADR retires. #418 records the split here if
 the implementation differs.
@@ -87,14 +90,22 @@ the implementation differs.
 
 The capture snapshot is taken after the fence has settled, so every commit it
 doesn't see comes from a transaction that began after the join, and the stream
-carries it. What differs per build is how many snapshots it reads through, and
-so what covers the changes that land during it:
+carries it. A source that is another definition's target is the exception: it
+isn't streamed, and the target-mutation seam carries its writes only to a
+`live` reader. Apply skips a definition that isn't `live`, so every build also
+needs something to cover the changes that drain while it runs. What that is
+depends on how many snapshots the build reads through:
 
 | Build | Dispatched as | Reads the source | Covers changes during the build by |
 |---|---|---|---|
-| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: no change committed after the pass starts drains before the flip to `live` |
+| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target also gets a go-live catch-up marker (`mark_definitions_live`, #315): its writes arrive through the seam from drain workers, which don't wait for a seal |
 | **Plain 1-1 chunks** | chunk boundaries enumerated and enqueued as `backfill_chunks`, executed by drain threads | once per chunk, each under its own snapshot | the catch-up marker parked when the last chunk goes live (`complete_direct_backfill`), discharged by this same path |
-| **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job | once per statement | the same go-live catch-up marker |
+| **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job | once per statement | the same go-live catch-up marker. *Planned (#419):* today's in-registration build goes live through `go_live_if_backfilling`, not `complete_direct_backfill`, and parks a catch-up only when its source is another definition's target. On a source that is already published, a change that drains during the build is lost for good. #419 must park the catch-up for every direct build |
+
+The go-live catch-up re-reads the source, so a change that drained while the
+definition wasn't `live` reaches the target. For an aggregate its re-derivation
+of each group also corrects a change the build read whose streamed delta was
+folded again after the flip.
 
 A shape the direct build can't render (`BackfillError::Unsupported`) falls back
 to ring enumeration, now inside the discharge rather than inside registration.
@@ -140,11 +151,18 @@ to ring enumeration, now inside the discharge rather than inside registration.
 ## Consequences
 
 - **No definition is `live` when registration returns.** Callers and tests wait
-  for the status to reach `live` (`Trellis::status`) before relying on the
-  target, then use `await_converged` for read-your-writes on later source
-  writes. `await_converged` follows the change stream and doesn't wait for a
-  pending build. Plain 1-1 definitions already behave this way: they return
-  `backfilling` with their chunks queued.
+  for the status to reach `live` (`Trellis::status`), then take a watermark
+  token and `await_converged` on it. `await_converged` checks the ring and
+  intake's progress. It never reads a definition's status or a pending
+  marker, so on its own it doesn't wait for a build that hasn't started. After
+  `live` it's still needed, because `live` doesn't yet mean the target is
+  complete. A ring enumeration flips to `live` once its rows are staged, before
+  they drain. Their `Recompute` rows carry no `origin_lsn`, which the predicate
+  treats as older than any token, so the wait covers them. A chunked or direct
+  build flips to `live` with its go-live catch-up marker still waiting for a
+  later maintenance pass, and neither signal waits for that. Plain 1-1
+  definitions already work like this: they return `backfilling` with their
+  chunks queued.
 - **A running staging worker is required for anything to go live.** That's
   already true: live apply needs intake, and a deferred definition needs the
   discharge ([embedding](../embedding.md#the-silent-stall-hazard-issue-144)).
@@ -156,7 +174,8 @@ to ring enumeration, now inside the discharge rather than inside registration.
   registration-side children (#418, #419).
 - **Only the staging worker needs publication and replication privileges.**
   Registering processes need catalog access and the right to create target
-  tables, and nothing on the publication.
+  tables, and nothing on the publication. `DROP` is the open exception: it
+  reconciles the publication from whichever process applies it (#427).
 - **`backfill_coverage` becomes an optimization at most.** It lets a catch-up
   skip re-reading a table that provably hasn't changed since a build read it.
   No path depends on it for correctness.
@@ -178,10 +197,10 @@ when no row is Planned.
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` discharges | the table, once its fence settles and intake has caught up | **Kept: the one path** |
 | Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | through the discharge (ring enumeration, the only build the discharge runs today) | **Already the one path** |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | through the discharge | **Already the one path** |
-| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `install_definition`'s #315 park, `mark_definitions_live`'s #315 park, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | through the discharge | **Already the one path.** #419 decides which of these correctness still needs once builds start after the fence; #420 removes the rest |
-| Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | one column's values, in-call | **Differs: a redefinition-side capture that reads in-call. Planned, no child issue yet.** It moves to the discharge, with the column staying paused until its build finishes |
-| `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | the added columns' values, in-call | **Differs, as above. Planned, no child issue yet** |
-| Publication change outside the staging worker | `DROP` → `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | nothing, but it can `ALTER PUBLICATION` (and so park a join marker) from a non-staging process | **Moves to the staging worker's reconcile pass**, which already re-reconciles every maintenance pass. That supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time". **Planned, no child issue yet** |
+| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `install_definition`'s #315 park, `mark_definitions_live`'s #315 park, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | through the discharge | **Already the one path.** The chunked and direct builds' go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. #419 decides which of the others correctness still needs; #420 removes the rest |
+| Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | one column's values, in-call | **Differs: a redefinition-side capture that reads in-call. Planned (#425)** |
+| `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | the added columns' values, in-call | **Differs, as above. Planned (#426)** |
+| Publication change outside the staging worker | `DROP` → `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | nothing, but it can `ALTER PUBLICATION` (and so park a join marker) from a non-staging process | **Open: needs a design decision (#427).** Either it moves to the staging worker's reconcile pass, which already re-reconciles every maintenance pass and would supersede [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time", or `DROP` stays an explicit exception to "only the staging worker changes the publication", with the privileges that implies |
 
 ## Left for the children to record here
 
@@ -197,6 +216,22 @@ settles one records it in this section:
   and resumability").
 - **Which consistency bookkeeping stays (#419, #420).** Once every build
   starts after the fence has settled and intake has passed the snapshot, some
-  of the coverage fence, `backfill_coverage`, and `complete_direct_backfill`'s
-  recovery of deltas skipped while a definition wasn't `live` may be redundant.
-  Keep what correctness needs, say why here, and remove the rest.
+  of the coverage fence and `backfill_coverage` may be redundant. The go-live
+  catch-up of a chunked or direct build is not: it's what recovers the changes
+  that drained while the definition wasn't `live`. Keep what correctness needs,
+  say why here, and remove the rest.
+- **What `live` promises.** Today `live` means the build has finished, not that
+  the target is complete (see [Consequences](#consequences)). Whether the flip
+  should wait for the go-live catch-up to discharge, or a caller should get
+  some other "target complete" signal, is undecided.
+- **A join fence taken after the `ALTER` commits.** `reconcile_publication`
+  parks the marker inside the `ALTER`'s transaction, so the fence is a snapshot
+  from before the join commits. A writer whose transaction id is assigned after
+  that snapshot and which writes the table before the `ALTER` commits isn't
+  waited for. It isn't streamed either, because its write precedes the join.
+  If it commits after the capture snapshot, its row is lost on both sides. The
+  window is short, since the park is the `ALTER` transaction's last statement,
+  but it has been reproduced on Postgres 17. The fence needs to postdate the
+  commit without losing the marker to a crash between the two. One option: the
+  discharge re-fences a marker the first time it sees it, which is necessarily
+  after the commit.

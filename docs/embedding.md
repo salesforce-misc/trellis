@@ -37,13 +37,17 @@ builds the target, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 So a web process needs no publication ownership or replication privileges; only
 the worker does. Code that needs the target populated polls `status()` until
-the transform is `live`.
+the transform is `live`, then calls `await_converged` with a fresh
+`watermark_token()` to let the backfill's staged rows drain. Even then, a
+chunked or direct build's go-live catch-up can still be pending
+([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 
 *Planned (#418, #419):* today `apply` still reads the source while
 registering. An aggregate or relationship-enriched 1-1 transform is built
 completely before `apply` returns, which is slow against a large table.
-*Planned (no child issue yet):* `DROP` still changes the publication from the
-process that applies it.
+*Open (#427):* `DROP` still changes the publication from the process that
+applies it, so a process that drops transforms still needs publication
+privileges.
 
 ```rust
 // The one dedicated worker process for this fleet.
@@ -103,8 +107,8 @@ same window, no separate cleanup pass required. See
 worker is alive and heartbeating; it says nothing about whether that worker
 is keeping up. It also counts drain workers only. A fleet whose drain workers
 run but whose staging worker doesn't passes this check while every new
-transform stays in `WaitingToBackfill`, so a transform that never leaves that
-status is worth alerting on too. Use `Trellis::status`/`Trellis::watermark_token` +
+transform stays in `WaitingToBackfill` (a known gap, #428), so a transform
+that never leaves that status is worth alerting on too. Use `Trellis::status`/`Trellis::watermark_token` +
 `await_converged` to reason about an individual transform's own progress.
 
 ### Wiring it into a host health check
