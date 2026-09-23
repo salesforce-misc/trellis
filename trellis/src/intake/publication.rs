@@ -200,7 +200,7 @@ pub(crate) async fn park_backfill_catchup(
     client: &impl GenericClient,
     qualified_table: &str,
 ) -> Result<(), IntakeError> {
-    park_marker(client, qualified_table).await
+    Ok(park_marker(client, qualified_table).await?)
 }
 
 /// Parks a `pending_backfill` marker for `qualified_table`, fenced at the
@@ -222,10 +222,13 @@ pub(crate) async fn park_backfill_catchup(
 /// for everything either park had to wait for. The fence this statement read
 /// can be the older one when it had to wait on the row lock of a concurrent
 /// park.
-async fn park_marker(
+///
+/// Returns the bare Postgres error so [`crate::Trellis::request_backfill`]
+/// can report it as the plain database failure it is.
+pub(crate) async fn park_marker(
     client: &impl GenericClient,
     qualified_table: &str,
-) -> Result<(), IntakeError> {
+) -> Result<(), tokio_postgres::Error> {
     client
         .execute(
             "insert into pending_backfill as pb (table_name, fence_snapshot) \

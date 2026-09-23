@@ -459,3 +459,58 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
 
     running.shutdown().await.expect("shutdown running trellis");
 }
+
+/// Issues #311/#367 review: `request_backfill` parks through the shared
+/// `park_marker` upsert now, and a database failure there must still surface
+/// as a plain [`trellis::TrellisError::Db`]. It briefly surfaced as
+/// `TrellisError::Publication`, whose message claims a definition was just
+/// dropped.
+#[tokio::test]
+async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             create publication trellis_pub for table widgets;",
+        )
+        .await
+        .expect("seed a published source table");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("request_backfill on a published table");
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = 'trellis.widgets'",
+            &[],
+        )
+        .await
+        .expect("read markers")
+        .get(0);
+    assert_eq!(parked, 1, "request_backfill parks one marker");
+
+    // Make the park itself fail: its upsert now violates a check constraint.
+    client
+        .batch_execute(
+            "alter table pending_backfill \
+             add constraint refuse_widgets check (table_name <> 'trellis.widgets') not valid",
+        )
+        .await
+        .expect("add refusing constraint");
+    let err = trellis
+        .request_backfill("widgets")
+        .await
+        .expect_err("the park violates the constraint");
+    assert!(
+        matches!(err, trellis::TrellisError::Db(_)),
+        "a failed park is a plain database error, got {err:?}: {err}"
+    );
+}

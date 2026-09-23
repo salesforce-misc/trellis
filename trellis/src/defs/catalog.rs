@@ -1089,9 +1089,7 @@ async fn go_live_if_backfilling(
 /// upsert computed from the chunk's own snapshot. That write can overwrite a
 /// newer value the live fold just wrote, and only a later re-derivation
 /// repairs it. For a `waiting_to_backfill` definition the marker is normally
-/// a no-op (resume's is still parked), but it is also what keeps the
-/// definition from being stranded if resume's marker was lost to an in-flight
-/// discharge (#311).
+/// a no-op (resume's is still parked).
 ///
 /// Returns the status the definition is left in: [`TransformStatus::Live`]
 /// when this call completed it, its unchanged current status otherwise.

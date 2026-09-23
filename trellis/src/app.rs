@@ -619,9 +619,10 @@ impl Trellis {
             });
         }
 
-        crate::intake::publication::park_backfill_catchup(&**client, &qualified)
-            .await
-            .map_err(TrellisError::Publication)
+        // A failure here is a plain `Db` error. `TrellisError::Publication`
+        // describes a post-DROP reconcile failure and would misreport it.
+        crate::intake::publication::park_marker(&**client, &qualified).await?;
+        Ok(())
     }
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first —
