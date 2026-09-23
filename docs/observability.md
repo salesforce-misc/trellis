@@ -60,7 +60,18 @@ replication `Commit` event (`commit_time_micros`,
 
 Supporting counters/gauges keep the histograms interpretable:
 
-* `changes_applied_total{transform}` — throughput denominator.
+* `changes_applied_total{transform}` — staged changes each transform folded
+  and applied. One change is one row in the staging ring: a source row change
+  that intake staged from logical replication, or a row an upstream transform's
+  write staged for the next hop. The count doesn't depend on how rows were
+  batched, so you can compare it with the source's own write rate. It adds up
+  across hops. If 200 source rows update 10 keys of an aggregate that feeds a
+  second transform, the aggregate reports 200 and the second transform reports
+  10. It isn't the latency histograms' denominator. The claim-time fold
+  collapses a key's rows into one folded change, and the histograms observe
+  once per folded change, so `transform_latency_seconds_count` is the
+  folded-change rate. Folded changes with no origin timestamp (bare recompute
+  triggers) aren't observed there.
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost.

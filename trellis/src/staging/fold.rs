@@ -188,6 +188,16 @@ pub struct FoldedChange {
     /// batch's writes, which is the group a downstream aggregate must also
     /// re-derive.
     pub prior_image: Option<String>,
+    /// Issue #409: how many ring rows folded into this record — `count(*)`
+    /// over the group, after the truncate-void filter (a row a later
+    /// truncate voided was never applied, so it isn't counted). This is the
+    /// unit `trellis_changes_applied_total` counts in: one change per staged
+    /// row, whether intake staged it from logical replication or an upstream
+    /// hop's target write staged it as a `recompute`. A truncate sentinel is
+    /// one row like any other, not the number of rows it erased. Always at
+    /// least 1 for a record [`fold`] returns; [`merge_folded_changes`] sums
+    /// it across segments.
+    pub row_count: u64,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -323,7 +333,8 @@ pub async fn fold(
              (array_agg(old_image order by lsn asc, change_id asc) \
                  filter (where op = 'recompute' and old_image is not null))[1] as prior_image, \
              min(lsn) filter (where (old_image is not null or new_image is not null) \
-                                and op <> 'recompute') as min_image_lsn \
+                                and op <> 'recompute') as min_image_lsn, \
+             count(*) as row_count \
          from filtered \
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
@@ -356,6 +367,8 @@ pub async fn fold(
             retry_count: row.get(12),
             prior_image: row.get(13),
             min_image_lsn: row.get(14),
+            // `count(*)` is a non-negative bigint.
+            row_count: row.get::<_, i64>(15) as u64,
         })
         .collect())
 }
@@ -453,6 +466,8 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   exactly like `group_key`'s missing-side convention.
 /// - `retry_count`: `MAX` across the two sides, mirroring `hop_gen`'s own
 ///   cross-segment `MAX` rule and [`fold`]'s SQL `MAX(retry_count)`.
+/// - `row_count`: the sum — [`fold`]'s `count(*)` over both segments' rows
+///   (issue #409).
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     let src_changed = earlier.src_changed.max(later.src_changed);
     let hop_gen = if src_changed.is_some() {
@@ -572,6 +587,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         // segment's writes, the same "first prior image wins" rule the SQL
         // fold applies within one segment.
         prior_image: earlier.prior_image.or(later.prior_image),
+        row_count: earlier.row_count + later.row_count,
     }
 }
 
@@ -633,6 +649,7 @@ mod merge_tests {
             relationship_reverse_deferred: None,
             retry_count: 0,
             prior_image: None,
+            row_count: 1,
         }
     }
 
@@ -790,6 +807,28 @@ mod merge_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].new_image, Some("\"c\"".to_string()));
         assert_eq!(merged[0].lsn, Some(PgLsn::from(3)));
+    }
+
+    /// Issue #409: a merged record's `row_count` is the sum of every
+    /// contributing segment's, so `trellis_changes_applied_total` counts the
+    /// same staged rows whether they sealed into one segment or several.
+    #[test]
+    fn row_count_sums_across_segments() {
+        let mut a = base("1");
+        a.row_count = 4;
+        let mut b = base("1");
+        b.row_count = 2;
+        let c = base("1");
+        let untouched = base("2");
+
+        let mut merged = merge_folded_changes(vec![vec![a, untouched], vec![b], vec![c]]);
+        merged.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].row_count, 7);
+        assert_eq!(
+            merged[1].row_count, 1,
+            "a key in one segment keeps its count"
+        );
     }
 
     /// Issue #133: the cross-segment merge's `group_key` rule is a real set

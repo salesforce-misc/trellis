@@ -64,10 +64,13 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 /// see [`crate::defs::ast::TransformDef`]).
 const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
 
-/// Throughput denominator for [`TRANSFORM_LATENCY_METRIC`]
-/// (`docs/observability.md`'s "Recommended supporting counters/gauges so
-/// the histograms are interpretable"): one increment per applied change,
-/// recorded at the same call site as the latency observation.
+/// Staged ring rows each transform folded and applied (issue #409): one
+/// change per row intake staged from logical replication, or per row an
+/// upstream hop's target write staged for this one. Counted in rows, not
+/// folded changes, so the number doesn't depend on how the rows happened to
+/// be batched and can be compared with the source's own write rate. Not the
+/// latency histograms' denominator: those observe once per folded change,
+/// so their own `_count` series is that.
 const CHANGES_APPLIED_METRIC: &str = "trellis_changes_applied_total";
 
 /// End-to-end latency: time from the *source* commit to the *terminal*
@@ -173,8 +176,8 @@ fn describe_metrics() {
     );
     metrics::describe_counter!(
         CHANGES_APPLIED_METRIC,
-        "Count of changes applied, labeled by transform — the throughput denominator for \
-         trellis_transform_latency_seconds."
+        "Count of staged changes (one per source row change or upstream-hop recompute row) a \
+         transform folded and applied, labeled by transform."
     );
     metrics::describe_histogram!(
         END_TO_END_LATENCY_METRIC,
@@ -251,13 +254,13 @@ pub fn record_end_to_end_latency(transform: &str, latency: Duration) {
         .record(latency.as_secs_f64());
 }
 
-/// Increments [`CHANGES_APPLIED_METRIC`] by one for `transform`. Called
-/// once per applied change, at the same call site as
-/// [`record_transform_latency`] (when that change carries an origin
-/// timestamp) so the two series stay consistent.
-pub fn increment_changes_applied(transform: &str) {
+/// Increments [`CHANGES_APPLIED_METRIC`] by `rows` for `transform`. Called
+/// once per applied folded change, from the same post-commit flush as
+/// [`record_transform_latency`], with `rows` the number of staged ring rows
+/// that change folded (`FoldedChange::row_count`).
+pub fn increment_changes_applied(transform: &str, rows: u64) {
     ensure_installed();
-    metrics::counter!(CHANGES_APPLIED_METRIC, "transform" => transform.to_string()).increment(1);
+    metrics::counter!(CHANGES_APPLIED_METRIC, "transform" => transform.to_string()).increment(rows);
 }
 
 /// Sets [`STAGING_SEGMENTS_METRIC`] for `state` to `count` — ADR-0009
@@ -385,7 +388,7 @@ mod tests {
     #[test]
     fn transform_latency_and_changes_applied_are_recorded_and_render() {
         record_transform_latency("metrics_facade_test_target", Duration::from_millis(120));
-        increment_changes_applied("metrics_facade_test_target");
+        increment_changes_applied("metrics_facade_test_target", 1);
 
         let rendered = Metrics::new().render_prometheus();
         assert!(
@@ -454,7 +457,7 @@ mod tests {
     #[test]
     fn render_prometheus_produces_a_valid_exposition_format_body() {
         record_transform_latency("metrics_shape_test_target", Duration::from_millis(42));
-        increment_changes_applied("metrics_shape_test_target");
+        increment_changes_applied("metrics_shape_test_target", 1);
         record_end_to_end_latency("metrics_shape_test_target", Duration::from_millis(84));
         set_staging_segments("metrics_shape_test_state", 7);
 

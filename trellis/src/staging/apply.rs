@@ -2977,12 +2977,16 @@ pub(crate) async fn to_column_types(
 /// grouping already has in hand — no new I/O, no new join. `transform` is
 /// the consuming definition's target table (this crate's one "transform
 /// name," per `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own
-/// `transform` fields). `src_changed` is [`FoldedChange::src_changed`]:
+/// `transform` fields). `change`'s [`FoldedChange::src_changed`] is
 /// `Some` for a change that traces back to a real source commit (the
 /// histogram's eventual `.observe()` value is `now - src_changed`, `now`
 /// sampled fresh at flush time — see [`flush_apply_metrics`]), `None` for a
 /// bare recompute trigger with no origin timestamp to measure against —
 /// such a change still counts toward throughput, just not latency.
+/// Its [`FoldedChange::row_count`] is the number of staged ring rows the
+/// change folded: `trellis_changes_applied_total` counts staged
+/// rows (issue #409), while both latency histograms still observe once per
+/// folded change.
 ///
 /// **Buffers, does not record** (the epic #49 cross-cutting review's fix,
 /// closing a gap in issues #51/#52): `compute` (Phase 2) has no transaction
@@ -3026,17 +3030,33 @@ pub(crate) async fn to_column_types(
 /// `transform_observations`.
 fn buffer_transform_apply_metrics(
     transform: &str,
-    src_changed: Option<std::time::SystemTime>,
+    change: &FoldedChange,
     end_to_end_origins: &mut HashMap<String, Vec<std::time::SystemTime>>,
-    transform_observations: &mut Vec<(String, Option<std::time::SystemTime>)>,
+    transform_observations: &mut Vec<TransformObservation>,
 ) {
-    if let Some(src_changed) = src_changed {
+    if let Some(src_changed) = change.src_changed {
         end_to_end_origins
             .entry(transform.to_string())
             .or_default()
             .push(src_changed);
     }
-    transform_observations.push((transform.to_string(), src_changed));
+    transform_observations.push(TransformObservation {
+        transform: transform.to_string(),
+        src_changed: change.src_changed,
+        row_count: change.row_count,
+    });
+}
+
+/// One applied folded change, as [`buffer_transform_apply_metrics`] buffers
+/// it for [`flush_apply_metrics`]: `src_changed` feeds one per-transform
+/// latency observation (when `Some`), and `row_count` is how much the change
+/// adds to `trellis_changes_applied_total` (issue #409: one per staged ring
+/// row, not one per folded change).
+#[derive(Debug, Clone)]
+struct TransformObservation {
+    transform: String,
+    src_changed: Option<std::time::SystemTime>,
+    row_count: u64,
 }
 
 /// One key's write into a target table: the evaluated calculated-field
@@ -3357,6 +3377,11 @@ mod tests {
     /// `flush_apply_metrics` call on the winning attempt's plan records
     /// exactly one observation per metric — not two, even though `compute`
     /// itself ran twice.
+    ///
+    /// Issue #409: the key is staged as three ring rows (an insert and two
+    /// updates) that fold to one change. The counter reports the three
+    /// staged rows, while each latency histogram's `_count` reports the one
+    /// folded change.
     #[tokio::test]
     async fn compute_only_buffers_metrics_and_a_single_flush_records_them_exactly_once() {
         let cluster = testkit::TestCluster::start();
@@ -3445,25 +3470,33 @@ mod tests {
             .await
             .expect("seed source rows after the definition exists");
 
-        // Stage one CDC row with a real `src_changed`, so both the
-        // per-transform and end-to-end histograms have something to
-        // observe, not just the throughput counter.
-        client
-            .execute(
-                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen, \
-                 src_changed) \
-                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, now())",
-                &[
-                    &source,
-                    &"1",
-                    &"insert",
-                    &PgLsn::from(1u64),
-                    &None::<String>,
-                    &Some(r#"{"price":"10.00","tax":"1.50"}"#.to_string()),
-                ],
-            )
-            .await
-            .expect("stage cdc row");
+        // Stage three CDC rows for one key, each with a real
+        // `src_changed`, so both the per-transform and end-to-end
+        // histograms have something to observe, not just the throughput
+        // counter — and so the fold has several rows to collapse.
+        let image = r#"{"price":"10.00","tax":"1.50"}"#.to_string();
+        for (op, lsn, old_image) in [
+            ("insert", 1u64, None),
+            ("update", 2, Some(image.clone())),
+            ("update", 3, Some(image.clone())),
+        ] {
+            client
+                .execute(
+                    "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen, \
+                     src_changed) \
+                     values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0, now())",
+                    &[
+                        &source,
+                        &"1",
+                        &op,
+                        &PgLsn::from(lsn),
+                        &old_image,
+                        &Some(image.clone()),
+                    ],
+                )
+                .await
+                .expect("stage cdc row");
+        }
 
         let mut seal_client = client;
         let seal_outcome = crate::staging::seal::seal_phase1(&mut seal_client)
@@ -3484,6 +3517,8 @@ mod tests {
             .expect("owned_bucket_filter");
         let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
         txn.commit().await.expect("commit phase 1");
+        assert_eq!(folded.len(), 1, "three rows for one key fold to one change");
+        assert_eq!(folded[0].row_count, 3);
 
         // Before any `compute` call: the registry must not already mention
         // this test's distinctively-named transform (guards against a
@@ -3501,15 +3536,16 @@ mod tests {
         assert_eq!(
             plan1.transform_observations.len(),
             1,
-            "compute must buffer exactly one (transform, src_changed) observation: {:?}",
+            "compute must buffer exactly one observation per folded change: {:?}",
             plan1.transform_observations
         );
-        let (observed_transform, observed_src_changed) = &plan1.transform_observations[0];
-        assert_eq!(observed_transform, target);
+        let observation = &plan1.transform_observations[0];
+        assert_eq!(observation.transform, target);
         assert!(
-            observed_src_changed.is_some(),
+            observation.src_changed.is_some(),
             "the staged change carried a real src_changed, so it must be buffered as Some"
         );
+        assert_eq!(observation.row_count, 3);
         assert_eq!(
             plan1.end_to_end_origins.get(target).map(Vec::len),
             Some(1),
@@ -3545,9 +3581,9 @@ mod tests {
         let after_flush = crate::metrics::Metrics::new().render_prometheus();
         assert_eq!(
             metric_value(&after_flush, "trellis_changes_applied_total", target),
-            Some(1),
-            "exactly one throughput increment must land, even though compute() ran twice: \
-             {after_flush}"
+            Some(3),
+            "the counter must count the three staged rows exactly once, even though compute() \
+             ran twice: {after_flush}"
         );
         assert_eq!(
             metric_value(
@@ -3556,7 +3592,8 @@ mod tests {
                 target
             ),
             Some(1),
-            "exactly one per-transform latency observation must land: {after_flush}"
+            "exactly one per-transform latency observation must land — one per folded change, \
+             not per staged row: {after_flush}"
         );
         assert_eq!(
             metric_value(
@@ -4033,7 +4070,7 @@ pub struct ApplyPlan {
     /// from_key)` (issues #51/#52's multi-hop gap).
     reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)>,
     /// Epic #49 cross-cutting review fix (issues #51/#52): every
-    /// `(transform, src_changed)` observation [`buffer_transform_apply_metrics`]
+    /// [`TransformObservation`] [`buffer_transform_apply_metrics`]
     /// buffered during this `compute` call, in place of recording each one
     /// immediately — drained by [`flush_apply_metrics`] into
     /// [`crate::metrics::record_transform_latency`]/
@@ -4042,7 +4079,7 @@ pub struct ApplyPlan {
     /// (version-fence miss, rolled-back Phase 3 failure) never reaches the
     /// registry at all. See [`buffer_transform_apply_metrics`]'s doc comment
     /// for why eager recording here was the bug.
-    transform_observations: Vec<(String, Option<std::time::SystemTime>)>,
+    transform_observations: Vec<TransformObservation>,
     /// The terminal-transform-only counterpart to `transform_observations`,
     /// above: `end_to_end_origins` (the accumulator `compute` builds while
     /// evaluating every source) filtered down, once `downstream_readers` is
@@ -4230,12 +4267,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // part of `ApplyPlan` — only the terminal-filtered subset is.
     let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
     // Epic #49 cross-cutting review fix (issues #51/#52): every
-    // `(transform, src_changed)` pair `buffer_transform_apply_metrics` below
+    // observation `buffer_transform_apply_metrics` below
     // would previously have recorded immediately — now buffered here and
     // carried out on `ApplyPlan`, flushed post-commit by
     // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
     // comment for why eager recording here was the bug.
-    let mut transform_observations: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
+    let mut transform_observations: Vec<TransformObservation> = Vec::new();
     // Issue #79: deduped across *every* relationship (and every source_key)
     // this whole `compute` call processes, not just within one relationship's
     // `key_hops` — two distinct inbound relationships sharing the same
@@ -4875,7 +4912,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     }
                     buffer_transform_apply_metrics(
                         &def.def.target,
-                        change.src_changed,
+                        change,
                         &mut end_to_end_origins,
                         &mut transform_observations,
                     );
@@ -5037,7 +5074,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             for change in &changes {
                 buffer_transform_apply_metrics(
                     &def.def.target,
-                    change.src_changed,
+                    change,
                     &mut end_to_end_origins,
                     &mut transform_observations,
                 );
@@ -5225,7 +5262,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // by_source loop above (issue #51/ADR-0009 decision 5).
             buffer_transform_apply_metrics(
                 &def.def.target,
-                change.src_changed,
+                change,
                 &mut end_to_end_origins,
                 &mut transform_observations,
             );
@@ -5417,14 +5454,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
 /// inline, since both hand it the exact same `&ApplyPlan` shape regardless
 /// of how many segments that attempt coalesced.
 fn flush_apply_metrics(plan: &ApplyPlan) {
-    for (transform, src_changed) in &plan.transform_observations {
-        if let Some(src_changed) = src_changed {
+    for observation in &plan.transform_observations {
+        if let Some(src_changed) = observation.src_changed {
             let latency = std::time::SystemTime::now()
-                .duration_since(*src_changed)
+                .duration_since(src_changed)
                 .unwrap_or(std::time::Duration::ZERO);
-            crate::metrics::record_transform_latency(transform, latency);
+            crate::metrics::record_transform_latency(&observation.transform, latency);
         }
-        crate::metrics::increment_changes_applied(transform);
+        crate::metrics::increment_changes_applied(&observation.transform, observation.row_count);
     }
     for (transform, origins) in &plan.end_to_end_origins {
         for origin in origins {

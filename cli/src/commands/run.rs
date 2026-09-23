@@ -574,7 +574,7 @@ mod tests {
     /// the Prometheus content type whose body contains that observation.
     #[tokio::test]
     async fn serves_the_rendered_registry_as_a_200_with_the_prometheus_content_type() {
-        trellis::metrics::increment_changes_applied("run_cli_test_target");
+        trellis::metrics::increment_changes_applied("run_cli_test_target", 1);
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

@@ -120,6 +120,24 @@ per-transform depth would need a join the layout doesn't offer.
 `staging_segments{state}` gives the same "is the ring backing up" signal at
 near-zero cost.
 
+**Throughput counter unit (#409):** `trellis_changes_applied_total{transform}`
+counts staged ring rows a transform folded and applied, not folded changes. The
+fold collapses a fenced window's rows to one change per `(src_table, key)`, so
+counting folded changes measured neither transactions nor rows. It measured a
+batching artifact: the same 30 inserts could report 30, 3 or 1 depending on
+when a segment sealed. A staged row matches the operator's model (rows written
+to the source, comparable to the application's write rate and to
+`pg_stat_user_tables`). It also composes across hops with no extra plumbing,
+because a propagated change is itself a ring row: each target writer reports
+every physically changed key into `TargetMutations`, which stages one row per
+key for the next hop. The fold carries each group's `count(*)` as
+`FoldedChange::row_count`, and a truncate sentinel counts as one row. The
+latency histograms still observe once per folded change, because a folded
+change carries one origin timestamp and nobody asks for a row-weighted
+quantile. The counter is therefore no longer the histograms' throughput
+denominator. The histograms' own `_count` series is, minus bare recompute
+triggers, which carry no origin timestamp and aren't observed.
+
 ### 6. Histogram bucket boundaries
 
 **Decision:** exponential buckets, ~10ms–60s (matching the stated

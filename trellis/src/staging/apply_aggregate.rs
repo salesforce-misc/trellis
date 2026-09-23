@@ -4069,6 +4069,7 @@ mod tests {
             relationship_reverse_deferred: None,
             retry_count: 0,
             prior_image: None,
+            row_count: 1,
         }
     }
 
