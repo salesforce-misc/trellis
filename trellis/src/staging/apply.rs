@@ -3225,9 +3225,9 @@ struct ClearPlan {
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
-/// [`ApplyPlan::aggregate_clears`]'s doc comment for why this carries no
-/// [`PrimaryKeyColumn`] of its own (a plain full-table `DELETE`, no
-/// `RETURNING`-projected key shape needed). `qualified_target` plays the
+/// [`ApplyPlan::aggregate_clears`]'s doc comment. Unlike [`ClearPlan`], its
+/// `pk` is the target's own `GROUP BY` identity, not the truncated source's
+/// key. `qualified_target` plays the
 /// same role [`ClearPlan::qualified_target`]/[`TargetPlan::qualified_target`]
 /// do: the persisted, fully-qualified identity the `DELETE FROM` must bind,
 /// not the bare map key this is stored under.
@@ -3236,8 +3236,9 @@ struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
     /// The aggregate target's own row identity — its `GROUP BY` columns, as
-    /// `ddl::source_primary_key` reports them — so the clear can report each
-    /// cleared group's key to the seam (issue #315).
+    /// `ddl::identity_key_columns` reports them (ungated by key type, issue
+    /// #385) — so the clear can report each cleared group's key to the seam
+    /// (issue #315).
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
 }
@@ -5252,7 +5253,26 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         existing.src_changed =
                             earliest_src_changed(existing.src_changed, change.src_changed);
                     } else {
-                        let pk = ddl::source_primary_key(pool, &def.target_table).await?;
+                        // Issue #385: the ungated `identity_key_columns`, not
+                        // `source_primary_key`. The clear only renders this
+                        // identity through `pk_key_sql_expr` (a `::text` of
+                        // each column) to report cleared groups to the seam,
+                        // so the key-type gate buys nothing here — and a
+                        // `numeric` `GROUP BY` is still admitted, so the gate
+                        // halted the instance on every such truncate. A
+                        // chained reader can't depend on this key's text
+                        // being stable: #371 refuses to chain off an
+                        // aggregate whose identity fails the gate.
+                        let pk = {
+                            let client = pool.get().await?;
+                            ddl::identity_key_columns(&**client, &def.target_table).await?
+                        };
+                        if pk.is_empty() {
+                            return Err(DdlError::NoPrimaryKey {
+                                source_table: def.target_table.clone(),
+                            }
+                            .into());
+                        }
                         aggregate_clears.insert(
                             def.def.target.clone(),
                             AggregateClearPlan {
