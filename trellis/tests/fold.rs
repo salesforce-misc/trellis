@@ -579,6 +579,57 @@ async fn origin_lsn_least_merges_while_lsn_greatest_advances() {
     );
 }
 
+/// Issue #321: `min_image_lsn` is the LEAST `lsn` over a key's image-bearing
+/// rows only. A recompute row (NULL `lsn`) and an image-less row with a real
+/// `lsn` must not pull it down, and a key with no image-bearing row at all
+/// folds it to `None`, while `lsn` still GREATEST-advances over every row.
+#[tokio::test]
+async fn min_image_lsn_is_the_least_lsn_over_image_bearing_rows_only() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let update = |lsn: u64, old: &'static str, new: &'static str| RawRow {
+        key: "k",
+        op: "update",
+        lsn: Some(lsn),
+        old_image: Some(old),
+        new_image: Some(new),
+        origin_lsn: None,
+        src_changed: true,
+        hop_gen: 0,
+        group_key: None,
+    };
+    insert_row(&client, "seg_0", &update(300, r#"{"v":2}"#, r#"{"v":3}"#)).await;
+    insert_row(&client, "seg_0", &update(100, r#"{"v":1}"#, r#"{"v":2}"#)).await;
+    insert_row(&client, "seg_0", &RawRow::recompute("k", 0)).await;
+    // Image-less but LSN-bearing: below every image-bearing row, so it would
+    // win a plain `min(lsn)`.
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow {
+            lsn: Some(50),
+            old_image: None,
+            new_image: None,
+            ..update(0, "", "")
+        },
+    )
+    .await;
+    insert_row(&client, "seg_0", &RawRow::recompute("bare", 0)).await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    let record = find(&folded, "k");
+    assert_eq!(record.min_image_lsn, Some(PgLsn::from(100)));
+    assert_eq!(record.lsn, Some(PgLsn::from(300)));
+    assert_eq!(find(&folded, "bare").min_image_lsn, None);
+}
+
 /// A straddler — a row landing in the predecessor slot's half of the fence —
 /// folds in correctly, ties this to the both-slots window (not just the
 /// fold's own slot). Mirrors `sealing.rs`'s

@@ -1351,6 +1351,23 @@ pub(crate) const PROJECTION_GEN_COLUMN: &str = "__trellis_gen";
 /// represent.
 pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 
+/// An aggregate target row's recompute horizon (issue #321): the WAL insert
+/// position read *after* the live source read that last re-derived this
+/// group from scratch (`staging::apply_aggregate::apply_forced_groups_bulk`),
+/// or `NULL` if nothing ever has. Any source commit that read could see had
+/// its commit record written before it became visible, so its `end_lsn` is at
+/// or below this value. A folded delta whose earliest image-bearing `lsn` is
+/// at or below it may already be counted in the row, so Phase 3 re-derives
+/// the group instead of applying the delta. A row the delta path creates
+/// inherits the target's extinct horizon (`aggregate_extinct_horizon`) the
+/// same way, since the "no row" state it grew from was itself the product of
+/// a live read.
+///
+/// `__trellis_`-prefixed like [`PROJECTION_GEN_COLUMN`], and a `pg_lsn` type
+/// that `defs::pg_type` doesn't recognize, so a definition chained off an
+/// aggregate target never sees it as a readable source column.
+pub(crate) const RECOMPUTE_LSN_COLUMN: &str = "__trellis_recompute_lsn";
+
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
 /// back from [`super::model::Definition::source_table`]
@@ -1822,6 +1839,7 @@ pub async fn create_aggregate_target_table(
             }
         }
     }
+    sql.push_str(&format!(", {} pg_lsn", quote_ident(RECOMPUTE_LSN_COLUMN)));
     let pk_columns: Vec<String> = group_by
         .iter()
         .map(|k| quote_ident(k.target_column_name()))

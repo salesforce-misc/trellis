@@ -34,9 +34,17 @@
 //! waits for a backend to block on a row lock the test holds, which is a
 //! forced interleaving, not a race.
 //!
-//! **Every test here is `#[ignore]`d on purpose.** They are pinned pre-fix
-//! repros: each fails on the current tree with the double count described on
-//! it. #321's second step (the recompute horizon) removes the `#[ignore]`s.
+//! The fix is the recompute horizon (`apply_aggregate::apply_aggregate_target`):
+//! a forced recompute stamps each group row with the WAL insert position
+//! read after its live read, a live read that deletes a group row raises
+//! the target's extinct horizon the same way, and a delta whose earliest
+//! image-bearing commit is at or below its group's horizon re-derives the
+//! group instead of applying. Every test here failed before it with the
+//! double count described on it. The last two pin parts of the mechanism the
+//! five windows don't reach on their own: a row the delta path creates
+//! inheriting the extinct horizon, and the fold comparing a telescoped
+//! delta by its *earliest* commit. The final test is issue #322's
+//! definition-time enumeration, which the same rule closes.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -407,7 +415,6 @@ async fn bucket_of(raw: &Client, key: i32) -> i64 {
 /// a source commit C lands in group 1 afterwards, batch k's live read counts
 /// C, and then C's own CDC delta seals into batch k+1 and counts it again.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w1_later_batch_double_counts_a_concurrent_commit() {
     let mut h = Harness::start(
         &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
@@ -443,7 +450,6 @@ async fn w1_later_batch_double_counts_a_concurrent_commit() {
 /// k seals, but intake has not staged it yet, so its CDC still lands after
 /// batch k. The window starts at intake's staged position, not at the seal.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w1_later_batch_double_counts_a_commit_made_before_the_seal_but_staged_after() {
     let mut h = Harness::start(
         &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
@@ -478,7 +484,6 @@ async fn w1_later_batch_double_counts_a_commit_made_before_the_seal_but_staged_a
 /// group into a later batch k. Batches are not drained in order, so worker 1
 /// applies k first (counting C from live state) and worker 2 then applies j.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w2_earlier_batch_drained_later_double_counts_its_delta() {
     let mut h = Harness::start(
         &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
@@ -515,7 +520,6 @@ async fn w2_earlier_batch_drained_later_double_counts_its_delta() {
 /// marks the group forced, so it adds B's delta on top of worker 1's live
 /// re-derive, which already counted B.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w3_same_batch_different_bucket_double_counts_a_change() {
     let mut h = Harness::start(SRC_DDL, &[Setup::Transform(AGG)], "agg").await;
 
@@ -629,7 +633,6 @@ async fn w3_same_batch_different_bucket_double_counts_a_change() {
 /// it. Once the drain's backend is seen blocked on the test's connection,
 /// the test commits the move and releases the lock.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w4_grain_migration_between_phase_2_and_phase_3_double_subtracts_the_old_group() {
     let mut h = Harness::start(
         &format!("{SRC_DDL}; insert into public.src values (1, 1, 10), (3, 1, 7)"),
@@ -706,7 +709,6 @@ async fn w4_grain_migration_between_phase_2_and_phase_3_double_subtracts_the_old
 /// accounts for the delete. A new row r' then recreates group 5, and the
 /// delete's delta lands on the recreated group, subtracting r a second time.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn w5_extinct_then_recreated_group_double_subtracts_the_absorbed_delete() {
     let mut h = Harness::start(
         &format!("{SRC_DDL}; insert into public.src values (1, 5, 10)"),
@@ -749,7 +751,6 @@ async fn w5_extinct_then_recreated_group_double_subtracts_the_absorbed_delete() 
 /// then adds it again. This is W1 with intake's lag behind the apply as the
 /// window, which is structural rather than a race.
 #[tokio::test]
-#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
 async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_counts() {
     let mut h = Harness::start(
         &format!(
@@ -798,6 +799,129 @@ async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_coun
     h.feed().await;
     h.settle().await;
     h.assert_matches_oracle("h1's CDC delta must not count C a second time")
+        .await;
+
+    h.finish().await;
+}
+
+/// W5 with the recreating insert drained first: the delete's delta sits in
+/// batch j and the insert that recreates group 5 in a later batch k, which a
+/// second worker applies first. The insert creates group 5's row through the
+/// delta path, so that row has to inherit the extinct horizon; otherwise the
+/// delete's delta, applied afterwards, finds a row with no horizon and
+/// subtracts r a second time.
+#[tokio::test]
+async fn w5_a_group_recreated_by_a_delta_inherits_the_extinct_horizon() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 5, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+
+    h.commit("update public.src set v = 11 where id = 1").await;
+    h.feed().await;
+    h.commit("delete from public.src where id = 1").await;
+    let k0 = h.seal().await;
+    h.drain(k0, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        BTreeMap::new(),
+        "the update's existence probe sees group 5 empty and deletes its row"
+    );
+
+    // The delete's CDC in batch j, r' in a later batch k.
+    h.feed().await;
+    let j = h.seal().await;
+    h.commit("insert into public.src values (3, 5, 4)").await;
+    h.feed().await;
+    let k = h.seal().await;
+
+    h.drain(k, "worker-1", 1).await;
+    h.assert_matches_oracle("r' recreates group 5 as a delta")
+        .await;
+    h.drain(j, "worker-2", 1).await;
+    h.assert_matches_oracle("the delete's delta must not subtract r from the recreated group")
+        .await;
+
+    h.finish().await;
+}
+
+/// W1 with a second commit to C's key after the recompute: both of C's
+/// changes fold into one delta whose *latest* commit is above group 1's
+/// horizon but whose earliest (C itself) is below it. The delta telescopes
+/// both, so it must be judged by its earliest commit and re-derive the
+/// group; judging it by its latest would apply it and count C twice.
+#[tokio::test]
+async fn w1_a_telescoped_delta_is_judged_by_its_earliest_commit() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+
+    h.append_recomputes(&[1]).await;
+    let k = h.seal().await;
+    h.commit("insert into public.src values (2, 1, 5)").await;
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "batch k's forced recompute reads live state, so it already counts C"
+    );
+
+    // After the recompute: not absorbed.
+    h.commit("update public.src set v = 7 where id = 2").await;
+    h.feed().await;
+    let k1 = h.seal().await;
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle("C's insert-then-update delta must count key 2 once")
+        .await;
+
+    h.finish().await;
+}
+
+/// Issue #322, closed by the same rule: an aggregate defined through the
+/// ring path enumerates its source inline, as image-less recomputes, while a
+/// commit C made just before the definition is still unstaged. The
+/// enumeration's forced recompute counts C from live state, and C's own CDC
+/// then arrives as a delta at or below the group's horizon, so it re-derives
+/// the group rather than counting C again. No intake wait is involved.
+#[tokio::test]
+async fn issue_322_definition_time_enumeration_does_not_double_count_a_pre_define_commit() {
+    // A 1-1 over the (empty) source puts it in the publication; the
+    // aggregate under test is defined later, through the ring path.
+    let mut h = Harness::start(
+        SRC_DDL,
+        &[Setup::Transform(
+            "TRANSFORM mirror FROM public.src SELECT g AS g, v AS v",
+        )],
+        "agg",
+    )
+    .await;
+    h.commit("insert into public.src values (1, 1, 10)").await;
+    h.feed().await;
+    h.settle().await;
+
+    // C, committed before the definition and not yet staged.
+    h.commit("insert into public.src values (2, 1, 5)").await;
+    let columns = numeric_columns(&["id", "g", "v"]);
+    trellis::defs::create_definition(&h.db.pool, AGG, &columns)
+        .await
+        .expect("create the aggregate through the ring path");
+    let def = trellis::defs::parse(AGG).expect("parse the aggregate");
+    trellis::defs::create_aggregate_target_table(&h.db.pool, &def, "public", &columns)
+        .await
+        .expect("create the aggregate's target table");
+    let k = h.seal().await;
+    h.drain(k, "worker-1", 1).await;
+    h.assert_matches_oracle("the enumeration's forced recompute already counts C")
+        .await;
+
+    h.feed().await;
+    h.settle().await;
+    h.assert_matches_oracle("C's delta must not count it a second time")
         .await;
 
     h.finish().await;

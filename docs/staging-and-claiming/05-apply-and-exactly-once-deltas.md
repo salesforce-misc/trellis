@@ -113,7 +113,8 @@ table:
 
 | Write kind | Commutes? | Idempotent? | What makes an out-of-order drain safe |
 |---|---|---|---|
-| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above) |
+| Aggregate deltas (`+new − old`) | yes | **no** | exactly-once (the three properties above), plus the recompute horizon below whenever a group was also re-derived |
+| Aggregate forced recomputes and extinction deletes (a live `GROUP BY` read) | **no** | yes | the recompute horizon, below |
 | 1-1 field writes and deletes, from an image or a live recompute read | **no** | yes | the per-key ordering lock and basis check, below |
 | Relationship projection writes | no | yes | the per-row `prev_lsn` ordering guard |
 | Truncate | no | yes | the drain barrier (full serialization) |
@@ -154,6 +155,55 @@ key always writes that key's final state.
 Re-evaluating instead of skipping matters for a hot key. If the source changes
 faster than a batch drains, every batch's basis is stale by the time it applies.
 Skipping would leave the target frozen until the key went quiet.
+
+### Aggregate groups: the recompute horizon
+
+An aggregate group can also receive an absolute write. An image-less change
+(a catch-up enumeration, a chained hop's `Recompute`, a relationship fallback, a
+truncate) has no prior state to diff, so Phase 3 re-derives the whole group from
+a live `GROUP BY` read of the source. The delta path's existence probe is a live
+read as well: when it finds the group empty, it deletes the group's row.
+
+Either read can see a source commit whose own CDC delta has not been applied yet.
+That delta may be in a later batch, in an earlier batch that drains later, in
+another bucket of the same batch, or on the other side of a grain migration. When
+it lands, it counts the commit a second time (issue #321). Ordering batches
+cannot prevent this, because batches do not drain in order.
+
+So the live read records its basis as a WAL position, and a delta checks it:
+
+1. **The horizon.** The forced path's recompute statement also writes
+   `pg_current_wal_insert_lsn()` into the group row's hidden
+   `__trellis_recompute_lsn`. The function is evaluated while the statement runs,
+   after its snapshot is taken. A commit visible to that snapshot wrote its
+   commit record before it became visible, so its `end_lsn` (the `lsn` intake
+   stamps on its ring rows) is at or below the stamped value.
+2. **The extinct horizon.** A deleted row can't hold a horizon, so each batch
+   that deletes group rows raises its target's single row in
+   `aggregate_extinct_horizon` to the insert position after those reads. A row
+   that the delta path later creates starts with that value as its own horizon,
+   since the empty group it grew from was the result of a live read too.
+3. **The check.** The fold keeps each key's *earliest* image-bearing `lsn`
+   (`min_image_lsn`). A folded delta telescopes every commit from that one to its
+   latest. Under the pre-lock, each delta group compares that value against its
+   row's horizon, or against the target's extinct horizon when it has no row. At
+   or below, the delta may already be counted, so the group moves to the forced
+   path and is re-derived. Above, the delta applies as usual. The check runs per
+   group, so the two sides of a grain migration are judged against their own
+   groups.
+
+This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
+at or below the horizon only *may* have been read, so skipping the delta would be
+unsound. Re-deriving is correct either way. The cost is that a group keeps being
+re-derived while intake lags behind the apply and changes keep arriving for it.
+In steady state that is a catch-up effect. A chained aggregate over a published
+relationship endpoint is the exception: its upstream write reaches it both as the
+seam's `Recompute` and as CDC, so every such CDC delta re-derives its group.
+
+The same rule covers a definition's inline enumeration at `DEFINE` time
+(issue #322), which has no intake to wait on. The #312 watermark wait in
+[01](01-intake-and-lsn-confirmation.md) is now an optimization that makes these
+re-derivations rarer, not a correctness requirement.
 
 ## What this replaced
 
@@ -348,5 +398,9 @@ identical from outside otherwise.
 7. **A non-commutative write commits only if its basis is still current**, checked
    under a lock that serializes every Phase 3 for that key. A new write path must
    either commute (deltas), check its basis, or be serialized some other way
-   (the `prev_lsn` guard, the truncate barrier). See the classification table
-   under [the basis check](#absolute-writes-do-not-commute-the-basis-check).
+   (the `prev_lsn` guard, the truncate barrier). An aggregate group's absolute
+   writes record their basis as a recompute horizon, and a delta that would
+   commute with other deltas still has to check it
+   ([the recompute horizon](#aggregate-groups-the-recompute-horizon)). See the
+   classification table under
+   [the basis check](#absolute-writes-do-not-commute-the-basis-check).

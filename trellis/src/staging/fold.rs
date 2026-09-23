@@ -104,6 +104,16 @@ pub struct FoldedChange {
     /// GREATEST `lsn` over *every* row in the group, image-less rows
     /// included, so the watermark still covers them.
     pub lsn: Option<PgLsn>,
+    /// Issue #321: LEAST `lsn` over the group's image-bearing rows only (the
+    /// same filter the image arg-extremes use), `None` when there are none.
+    /// A folded delta telescopes every source commit from this one up to
+    /// `lsn`, so this is the commit an aggregate's recompute horizon has to
+    /// be compared against: if it is at or below a group's
+    /// `__trellis_recompute_lsn`, a forced recompute may already have counted
+    /// part of this delta, and `apply_aggregate::apply_aggregate_target`
+    /// re-derives the group instead of applying it. Recompute rows carry a
+    /// NULL `lsn`, so they never pull this down.
+    pub min_image_lsn: Option<PgLsn>,
     /// Reset to 0 if any row in the group is a source change. Otherwise —
     /// underspecified by the doc for the all-non-source case — pinned to
     /// `MAX(hop_gen)`: doc 05 describes `hop_gen` as a schema-derived bound
@@ -311,7 +321,9 @@ pub async fn fold(
              coalesce(max(retry_count) filter (where op = 'rel_reverse_deferred'), 0) \
                  as retry_count, \
              (array_agg(old_image order by lsn asc, change_id asc) \
-                 filter (where op = 'recompute' and old_image is not null))[1] as prior_image \
+                 filter (where op = 'recompute' and old_image is not null))[1] as prior_image, \
+             min(lsn) filter (where (old_image is not null or new_image is not null) \
+                                and op <> 'recompute') as min_image_lsn \
          from filtered \
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
@@ -343,6 +355,7 @@ pub async fn fold(
             relationship_reverse_deferred: row.get(11),
             retry_count: row.get(12),
             prior_image: row.get(13),
+            min_image_lsn: row.get(14),
         })
         .collect())
 }
@@ -410,8 +423,9 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 /// - `src_changed`/`lsn`: `Option::max` — `None` sorts below every `Some`,
 ///   and among two `Some`s the greater watermark/timestamp wins, matching
 ///   "OR across the group" and "GREATEST over every row" respectively.
-/// - `origin_lsn`: the lesser of the two, ignoring a missing side —
-///   `Option::min` would wrongly let a `None` beat a real `Some`.
+/// - `origin_lsn`/`min_image_lsn`: the lesser of the two, ignoring a
+///   missing side — `Option::min` would wrongly let a `None` beat a real
+///   `Some` (a bare recompute trigger folded alone has no `min_image_lsn`).
 /// - `hop_gen`: 0 if the merged `src_changed` is `Some` (a source change
 ///   resets propagation depth), else the greater of the two hop generations.
 /// - `first_seen`: the earlier of the two — first append into either
@@ -446,12 +460,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     } else {
         earlier.hop_gen.max(later.hop_gen)
     };
-    let origin_lsn = match (earlier.origin_lsn, later.origin_lsn) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let origin_lsn = least_present(earlier.origin_lsn, later.origin_lsn);
     let relationship_reverse_deferred = earlier
         .relationship_reverse_deferred
         .or(later.relationship_reverse_deferred);
@@ -547,6 +556,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         src_changed,
         origin_lsn,
         lsn: earlier.lsn.max(later.lsn),
+        min_image_lsn: least_present(earlier.min_image_lsn, later.min_image_lsn),
         hop_gen,
         first_seen: earlier.first_seen.min(later.first_seen),
         group_key: merge_group_keys(earlier.group_key, later.group_key),
@@ -562,6 +572,15 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         // segment's writes, the same "first prior image wins" rule the SQL
         // fold applies within one segment.
         prior_image: earlier.prior_image.or(later.prior_image),
+    }
+}
+
+/// The lesser of two optional LSNs, ignoring a missing side: SQL `min()`'s
+/// rule, which `Option::min` gets wrong (it lets `None` win).
+fn least_present(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -606,6 +625,7 @@ mod merge_tests {
             src_changed: None,
             origin_lsn: None,
             lsn: None,
+            min_image_lsn: None,
             hop_gen: 0,
             first_seen: SystemTime::UNIX_EPOCH,
             group_key: None,
@@ -731,6 +751,24 @@ mod merge_tests {
         second.origin_lsn = Some(PgLsn::from(7));
         let merged = merge_folded_changes(vec![vec![first], vec![second]]);
         assert_eq!(merged[0].origin_lsn, Some(PgLsn::from(7)));
+    }
+
+    /// Issue #321: `min_image_lsn` merges as the lesser present side, so a
+    /// key coalesced across segments is compared against a recompute horizon
+    /// by its *earliest* image-bearing commit, and a later segment's bare
+    /// recompute trigger (no `min_image_lsn`) never erases it.
+    #[test]
+    fn min_image_lsn_takes_the_lesser_non_null_side() {
+        let mut first = base("1");
+        first.min_image_lsn = Some(PgLsn::from(30));
+        let mut second = base("1");
+        second.min_image_lsn = Some(PgLsn::from(20));
+        let merged = merge_folded_changes(vec![vec![first.clone()], vec![second]]);
+        assert_eq!(merged[0].min_image_lsn, Some(PgLsn::from(20)));
+
+        let recompute_only = base("1");
+        let merged = merge_folded_changes(vec![vec![first], vec![recompute_only]]);
+        assert_eq!(merged[0].min_image_lsn, Some(PgLsn::from(30)));
     }
 
     /// More than two contributing segments still fold to exactly one

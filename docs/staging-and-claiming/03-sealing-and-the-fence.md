@@ -171,7 +171,10 @@ already-taken `seg_seq`.
 ## Who seals, and when
 
 **There is no timer.** A worker that finds nothing claimable and sees rows in the
-active segment seals it on demand, then retries the claim once. The busy-loop
+active segment seals it on demand, then retries the claim once. (This describes
+the demand-driven sealing design, issue #272. Until that lands, the client's
+maintenance loop still seals any non-empty active segment on its 300 ms tick,
+through the same `seal_if_active_nonempty` guard.) The busy-loop
 guard is structural: it seals only a *non-empty* active segment — **or** an empty
 one whose predecessor still strands a phase-gap straggler (below) — at most one
 seal per drain call.

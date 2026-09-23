@@ -195,7 +195,11 @@ knife-edged guards:
   delta counts the change a second time (issue #312). The enumeration therefore
   captures `pg_current_wal_insert_lsn()` right after declaring its cursor and does
   not append until intake's staged-through watermark reaches it, which puts every
-  overlapping delta in the same batch as the recompute or an earlier one. The
+  overlapping delta in the same batch as the recompute or an earlier one. That
+  ordering alone is not enough, because batches drain out of order and in
+  parallel: what actually prevents the double count is the aggregate recompute
+  horizon ([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon),
+  issue #321). The wait only makes the resulting re-derivations rarer. The
   discharge runs only once intake is running; setup leaves an existing slot's
   markers to the maintenance loop.
 - **Trellis's own writes to a target never stream at all.** A chain's

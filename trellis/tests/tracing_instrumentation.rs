@@ -512,6 +512,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         src_changed: None,
         origin_lsn: None,
         lsn: None,
+        min_image_lsn: None,
         hop_gen: 0,
         first_seen: SystemTime::now(),
         group_key: None,

@@ -97,10 +97,11 @@
 //! reason the "Image-less changes" section below explains — no prior
 //! state to diff against, so a full-recompute re-derivation (a live `JOIN`
 //! is simply the correct way to compute a *fresh* group value, not an
-//! incremental adjustment, so it carries none of the double-counting risk a
-//! live-read *delta* would) sidesteps the ambiguity. Truncate propagation
+//! incremental adjustment) sidesteps the ambiguity. Truncate propagation
 //! (a synthetic image-less recompute over every affected key) reaches the
-//! same path the same way.
+//! same path the same way. The re-derivation is an absolute write, though,
+//! and a delta for a commit it already read would count that commit again;
+//! see "The recompute horizon" below.
 //!
 //! # Grain migration
 //!
@@ -163,13 +164,36 @@
 //! this module's `(Some(old_row), None)` branch exactly as issue #180's
 //! aggregate-group case does. Again, no change to this module's own delta
 //! logic was needed.
+//!
+//! # The recompute horizon (issue #321)
+//!
+//! A forced group's live re-derivation, and the delta path's extinction
+//! delete (`probe_group_exists` finding the group empty), both read the
+//! source as of some moment in Phase 3. A source commit visible to that read
+//! can still have its own CDC delta in flight: in a later batch, an earlier
+//! batch drained later, another bucket of the same batch, or across a grain
+//! migration. Applied afterwards, that delta counts the commit twice.
+//!
+//! So [`apply_forced_groups_bulk`] stamps each row it re-derives with
+//! `pg_current_wal_insert_lsn()` in [`ddl::RECOMPUTE_LSN_COLUMN`], and any
+//! batch that deletes a group row raises the target's extinct horizon
+//! (`aggregate_extinct_horizon`) the same way. A commit the read could see
+//! has an `end_lsn` at or below that value. [`apply_aggregate_target`] reads
+//! each delta group's horizon under its pre-lock (the extinct horizon when
+//! the group has no row) and compares it against the group's earliest
+//! image-bearing commit ([`GroupPlan::min_image_lsn`]). At or below, the
+//! group is re-derived with the forced groups instead of taking the delta;
+//! above, the delta applies as before. A row the delta path creates inherits
+//! the extinct horizon, because the empty group it started from was itself
+//! the result of a live read. See `delta_may_be_absorbed`, and doc 05's
+//! "Aggregate groups: the recompute horizon".
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 use tokio_postgres::Transaction;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{PgLsn, ToSql};
 
 use crate::defs::ast::{Expr, GroupByKey, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::ddl::{self, avg_sum_column};
@@ -375,6 +399,13 @@ pub(super) struct GroupPlan {
     pub hop_gen: i32,
     pub src_changed: Option<std::time::SystemTime>,
     pub force_full_recompute: bool,
+    /// Issue #321: the earliest [`FoldedChange::min_image_lsn`] among the
+    /// image-bearing changes folded into this group's delta, on either side
+    /// of a grain migration. [`apply_aggregate_target`] compares it against
+    /// the group's recompute horizon and re-derives the group instead of
+    /// applying the delta when it is at or below. `None` (nothing image-bearing
+    /// with a known LSN touched the group) never re-derives.
+    pub min_image_lsn: Option<PgLsn>,
 }
 
 impl GroupPlan {
@@ -390,7 +421,20 @@ impl GroupPlan {
             hop_gen: 0,
             src_changed: None,
             force_full_recompute: false,
+            min_image_lsn: None,
         }
+    }
+
+    /// Records that an image-bearing `change` contributed to this group's
+    /// delta: the deepest `hop_gen`, the earliest `src_changed` origin
+    /// (issue #104), and the earliest image-bearing LSN (issue #321).
+    fn touch(&mut self, change: &FoldedChange) {
+        self.hop_gen = self.hop_gen.max(change.hop_gen);
+        self.src_changed = super::apply::earliest_src_changed(self.src_changed, change.src_changed);
+        self.min_image_lsn = match (self.min_image_lsn, change.min_image_lsn) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -1240,9 +1284,7 @@ pub(super) fn accumulate_changes(
                     .groups
                     .entry(key)
                     .or_insert_with(|| GroupPlan::new(values));
-                group.hop_gen = group.hop_gen.max(change.hop_gen);
-                group.src_changed =
-                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+                group.touch(change);
                 add_contributions(&plan.fields, group, &contrib);
             }
             (Some(old_row), None) => {
@@ -1255,9 +1297,7 @@ pub(super) fn accumulate_changes(
                     .groups
                     .entry(key)
                     .or_insert_with(|| GroupPlan::new(values));
-                group.hop_gen = group.hop_gen.max(change.hop_gen);
-                group.src_changed =
-                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+                group.touch(change);
                 sub_contributions(&plan.fields, group, &contrib);
             }
             (Some(old_row), Some(new_row)) => {
@@ -1277,9 +1317,7 @@ pub(super) fn accumulate_changes(
                         .groups
                         .entry(new_key)
                         .or_insert_with(|| GroupPlan::new(new_values));
-                    group.hop_gen = group.hop_gen.max(change.hop_gen);
-                    group.src_changed =
-                        super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+                    group.touch(change);
                     diff_contributions(&plan.fields, group, &old_contrib, &new_contrib);
                 } else {
                     // Grain migration: subtract from the old group, add to
@@ -1289,11 +1327,7 @@ pub(super) fn accumulate_changes(
                             .groups
                             .entry(old_key)
                             .or_insert_with(|| GroupPlan::new(old_values));
-                        old_group.hop_gen = old_group.hop_gen.max(change.hop_gen);
-                        old_group.src_changed = super::apply::earliest_src_changed(
-                            old_group.src_changed,
-                            change.src_changed,
-                        );
+                        old_group.touch(change);
                         sub_contributions(&plan.fields, old_group, &old_contrib);
                     }
                     {
@@ -1301,11 +1335,7 @@ pub(super) fn accumulate_changes(
                             .groups
                             .entry(new_key)
                             .or_insert_with(|| GroupPlan::new(new_values));
-                        new_group.hop_gen = new_group.hop_gen.max(change.hop_gen);
-                        new_group.src_changed = super::apply::earliest_src_changed(
-                            new_group.src_changed,
-                            change.src_changed,
-                        );
+                        new_group.touch(change);
                         add_contributions(&plan.fields, new_group, &new_contrib);
                     }
                 }
@@ -1780,6 +1810,7 @@ async fn upsert_group(
     target: &str,
     plan: &AggregateTargetPlan,
     group: &GroupPlan,
+    new_row_horizon: Option<PgLsn>,
 ) -> Result<bool, ApplyError> {
     let pk_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
     // `target` is always [`AggregateTargetPlan::target`]'s qualified
@@ -2114,6 +2145,13 @@ async fn upsert_group(
         })
         .collect();
 
+    // Issue #321: a row this creates inherits the target's extinct horizon
+    // (see `apply_aggregate_target`); an existing row keeps its own, so the
+    // conflict arm leaves the column alone.
+    insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
+    insert_exprs.push(format!("${next}::pg_lsn"));
+    params.push(&new_row_horizon);
+
     let insert_values: Vec<String> = pk_values_sql.into_iter().chain(insert_exprs).collect();
 
     let sql = format!(
@@ -2384,6 +2422,16 @@ async fn apply_forced_groups_bulk(
             }
         }
 
+        // Issue #321: stamp each re-derived row with its recompute horizon.
+        // `pg_current_wal_insert_lsn()` is volatile, so it is evaluated while
+        // this statement executes, after its snapshot was taken (Phase 3 runs
+        // at READ COMMITTED, one snapshot per statement). Every source commit
+        // that snapshot can see had its commit record inserted before it
+        // became visible, so its `end_lsn` is at or below the value stamped
+        // here. See `delta_may_be_absorbed`.
+        insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
+        select_exprs.push("pg_current_wal_insert_lsn()".to_string());
+
         let update_sets: Vec<String> = insert_cols
             .iter()
             .skip(arity)
@@ -2391,9 +2439,10 @@ async fn apply_forced_groups_bulk(
             .collect();
         // Every field this grammar can put on an aggregate target contributes
         // at least one column, so a definition always has at least one
-        // non-`GROUP BY` field to update; an empty `update_sets` would mean a
-        // group-by-only "aggregate" the grammar can't express.
-        debug_assert!(!update_sets.is_empty());
+        // non-`GROUP BY` field to update besides the horizon; updating only
+        // the horizon would mean a group-by-only "aggregate" the grammar
+        // can't express.
+        debug_assert!(update_sets.len() > 1);
 
         // The `GROUP BY` mirrors the leading `arity` SELECT expressions
         // (`select_exprs`'s `s.<group col>` prefix), so reuse them rather
@@ -2984,6 +3033,7 @@ async fn apply_delta_groups_bulk(
     target: &str,
     plan: &AggregateTargetPlan,
     groups: &[(&String, &GroupPlan)],
+    new_row_horizon: Option<PgLsn>,
 ) -> Result<(), ApplyError> {
     let arity = plan.group_by.len();
     // `target` is always [`AggregateTargetPlan::target`]'s qualified
@@ -3034,13 +3084,18 @@ async fn apply_delta_groups_bulk(
 
     // Round 2: brand-new groups, correlated back to `ord` via the
     // CTE-plus-join workaround this function's doc comment describes.
+    let pending_param_idx = base_params.len() + 1;
+    let horizon_param_idx = base_params.len() + 2;
     let mut insert_cols = pk_idents.clone();
     insert_cols.extend(insert_cols_fields);
+    // Issue #321: a row this creates inherits the target's extinct horizon
+    // (see `apply_aggregate_target`).
+    insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
     let select_exprs: Vec<String> = (0..arity)
         .map(|i| format!("k.{}", keyset_col(i)))
         .chain(insert_exprs_fields)
+        .chain(std::iter::once(format!("${horizon_param_idx}::pg_lsn")))
         .collect();
-    let pending_param_idx = base_params.len() + 1;
     let insert_sql = format!(
         "with ins as (\
             insert into {target_ident} ({}) \
@@ -3058,6 +3113,7 @@ async fn apply_delta_groups_bulk(
     );
     let mut insert_params = base_params.clone();
     insert_params.push(&pending_ords);
+    insert_params.push(&new_row_horizon);
     let inserted_rows = txn.query(&insert_sql, &insert_params).await?;
     let inserted_ords: HashSet<i64> = inserted_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
 
@@ -3089,6 +3145,51 @@ async fn apply_delta_groups_bulk(
     Ok(())
 }
 
+/// Issue #321's basis check: whether a delta whose earliest image-bearing
+/// commit is `min_image_lsn` may already be counted in a group whose
+/// recompute horizon is `horizon`. A source commit a live read could see had
+/// its commit record written before it became visible, so its `end_lsn` (the
+/// ring row's `lsn`) is at or below any WAL insert position read afterwards.
+/// A delta above the horizon therefore was not counted and applies as is; one
+/// at or below *may* have been, so the group is re-derived. Re-deriving is
+/// idempotent, so this errs toward re-evaluating, never toward skipping.
+fn delta_may_be_absorbed(min_image_lsn: Option<PgLsn>, horizon: Option<PgLsn>) -> bool {
+    matches!((min_image_lsn, horizon), (Some(lsn), Some(horizon)) if lsn <= horizon)
+}
+
+/// The target's extinct horizon (issue #321, `aggregate_extinct_horizon`):
+/// the WAL insert position after the latest live read that deleted one of
+/// its group rows, or `None` if none ever has.
+async fn read_extinct_horizon(
+    txn: &Transaction<'_>,
+    target: &str,
+) -> Result<Option<PgLsn>, ApplyError> {
+    let row = txn
+        .query_opt(
+            "select lsn from aggregate_extinct_horizon where target_table = $1",
+            &[&target],
+        )
+        .await?;
+    Ok(row.map(|r| r.get(0)))
+}
+
+/// Raises the target's extinct horizon to the current WAL insert position.
+/// Called once per batch, after every live read that deleted a group row.
+/// Holds this target's horizon row lock until commit, so concurrent batches
+/// that both delete groups of one target serialize from here on; that only
+/// happens on extinction, never on the ordinary delta path.
+async fn raise_extinct_horizon(txn: &Transaction<'_>, target: &str) -> Result<(), ApplyError> {
+    txn.execute(
+        "insert into aggregate_extinct_horizon (target_table, lsn) \
+         values ($1, pg_current_wal_insert_lsn()) \
+         on conflict (target_table) do update \
+         set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
+        &[&target],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Phase 3 for one aggregate target table. Every group this batch touched is
 /// written or deleted under a single ascending-ordered pre-lock taken up
 /// front (see below), then split by strategy:
@@ -3104,6 +3205,10 @@ async fn apply_delta_groups_bulk(
 ///   through [`upsert_group`] directly, while more than one goes through
 ///   the batched [`apply_delta_groups_bulk`] instead of one
 ///   `upsert_group` call each (issue #63 M4).
+/// - A delta group whose earliest image-bearing commit is at or below its
+///   recompute horizon (issue #321, see the module doc comment) joins the
+///   forced groups for this batch instead. A batch that deletes any group
+///   row raises the target's extinct horizon once, after every such delete.
 ///
 /// **Deadlock avoidance.** [`super::apply::apply_target`]'s 1-1 path takes
 /// every target row it will touch `FOR UPDATE` in ascending key order, in one
@@ -3137,6 +3242,7 @@ async fn apply_delta_groups_bulk(
         groups = plan.groups.len(),
         written = tracing::field::Empty,
         deleted = tracing::field::Empty,
+        rederived = tracing::field::Empty,
     )
 )]
 pub(super) async fn apply_aggregate_target(
@@ -3178,30 +3284,70 @@ pub(super) async fn apply_aggregate_target(
         .iter()
         .map(|c| format!("t.{}", quote_ident(c)))
         .collect();
-    // Issue #315: when something reads this target, the pre-lock also
-    // returns each locked row's image, positioned by the keyset's own
-    // ordinality (so it maps back to `group_keys[ord - 1]` exactly, with no
-    // re-encoding of the group key in SQL).
+    // The pre-lock returns each locked row's position in the keyset (so it
+    // maps back to `group_keys[ord - 1]` exactly, with no re-encoding of the
+    // group key in SQL) and its recompute horizon (issue #321), read under
+    // the lock so no other writer can move it before this batch commits.
+    // Issue #315: when something reads this target, it also returns each
+    // locked row's image.
     let prior_image_expr = mutations.image_sql(txn, target, "t").await?;
+    let horizon_col = quote_ident(ddl::RECOMPUTE_LSN_COLUMN);
     let prior_select = match &prior_image_expr {
-        Some(expr) => format!("k.ord, ({expr})::text"),
-        None => "1".to_string(),
+        Some(expr) => format!("k.ord, t.{horizon_col}, ({expr})::text"),
+        None => format!("k.ord, t.{horizon_col}"),
     };
     let prelock_sql = format!(
         "select {prior_select} from {target_ident} t join {} on {} order by {} for update of t",
-        keyset_unnest(&plan.group_by_types, 1, prior_image_expr.is_some()),
+        keyset_unnest(&plan.group_by_types, 1, true),
         keyset_match(&plan.group_by, "t", &prelock_null_safe),
         order_by.join(", "),
     );
     let locked = txn.query(&prelock_sql, &prelock_params).await?;
     let mut prior_images: HashMap<&str, String> = HashMap::new();
-    if prior_image_expr.is_some() {
-        for row in locked {
-            let ord: i64 = row.get(0);
-            let key = group_keys[usize::try_from(ord - 1).expect("ordinality is 1-based")];
-            prior_images.insert(key.as_str(), row.get(1));
+    // Every group with a target row, mapped to that row's horizon.
+    let mut row_horizons: HashMap<&str, Option<PgLsn>> = HashMap::new();
+    for row in locked {
+        let ord: i64 = row.get(0);
+        let key = group_keys[usize::try_from(ord - 1).expect("ordinality is 1-based")];
+        row_horizons.insert(key.as_str(), row.get(1));
+        if prior_image_expr.is_some() {
+            prior_images.insert(key.as_str(), row.get(2));
         }
     }
+
+    // Issue #321: a delta group with no target row is judged against the
+    // target's extinct horizon instead, and a row the delta path creates
+    // inherits it. Only read when some delta group has no row.
+    let extinct_horizon = if group_keys
+        .iter()
+        .any(|k| !plan.groups[*k].force_full_recompute && !row_horizons.contains_key(k.as_str()))
+    {
+        read_extinct_horizon(txn, target).await?
+    } else {
+        None
+    };
+
+    // Issue #321: a delta group whose earliest image-bearing commit is at or
+    // below its horizon may already be counted by the live read behind that
+    // horizon, so it is re-derived with the forced groups instead of
+    // applied. Per group, so a grain migration's two sides are judged
+    // against their own groups' horizons.
+    let rederived: HashSet<&str> = group_keys
+        .iter()
+        .filter(|k| {
+            let group = &plan.groups[**k];
+            !group.force_full_recompute && {
+                let horizon = row_horizons
+                    .get(k.as_str())
+                    .copied()
+                    .unwrap_or(extinct_horizon);
+                delta_may_be_absorbed(group.min_image_lsn, horizon)
+            }
+        })
+        .map(|&k| k.as_str())
+        .collect();
+    let takes_forced_path =
+        |key: &str, group: &GroupPlan| group.force_full_recompute || rederived.contains(key);
 
     let mut written = Vec::new();
     let mut deleted = Vec::new();
@@ -3209,7 +3355,7 @@ pub(super) async fn apply_aggregate_target(
     let forced: Vec<(&String, &GroupPlan)> = group_keys
         .iter()
         .map(|k| (*k, &plan.groups[*k]))
-        .filter(|(_, g)| g.force_full_recompute)
+        .filter(|(k, g)| takes_forced_path(k, g))
         .collect();
     if !forced.is_empty() {
         let (w, d) = apply_forced_groups_bulk(txn, target, plan, &forced).await?;
@@ -3218,9 +3364,9 @@ pub(super) async fn apply_aggregate_target(
     }
 
     let mut delta_groups: Vec<(&String, &GroupPlan)> = Vec::new();
-    for key in group_keys {
+    for &key in &group_keys {
         let group = &plan.groups[key];
-        if group.force_full_recompute {
+        if takes_forced_path(key, group) {
             continue;
         }
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
@@ -3249,12 +3395,12 @@ pub(super) async fn apply_aggregate_target(
         0 => {}
         1 => {
             let (key, group) = delta_groups[0];
-            if upsert_group(txn, target, plan, group).await? {
+            if upsert_group(txn, target, plan, group, extinct_horizon).await? {
                 written.push((key.clone(), group.hop_gen, group.src_changed));
             }
         }
         _ => {
-            apply_delta_groups_bulk(txn, target, plan, &delta_groups).await?;
+            apply_delta_groups_bulk(txn, target, plan, &delta_groups, extinct_horizon).await?;
             written.extend(
                 delta_groups
                     .iter()
@@ -3263,9 +3409,18 @@ pub(super) async fn apply_aggregate_target(
         }
     }
 
+    // Issue #321: every row deleted above was deleted because a live read
+    // (the forced path's survivor probe, or `probe_group_exists`) found its
+    // group empty, so it may have absorbed commits whose deltas are still in
+    // flight. Taken after those reads, like the forced path's own horizon.
+    if !deleted.is_empty() {
+        raise_extinct_horizon(txn, target).await?;
+    }
+
     let span = tracing::Span::current();
     span.record("written", written.len());
     span.record("deleted", deleted.len());
+    span.record("rederived", rederived.len());
     let counts = (written.len(), deleted.len());
     for (key, hop_gen, src_changed) in written.into_iter().chain(deleted) {
         let prior = prior_images.remove(key.as_str());
@@ -3668,6 +3823,26 @@ mod tests {
         assert_eq!(values, vec![Some("t".to_string())]);
     }
 
+    /// Issue #321's basis check: a delta re-derives its group only when both
+    /// LSNs are known and its earliest commit is at or below the horizon. The
+    /// boundary is inclusive, since a commit whose `end_lsn` equals the
+    /// horizon may have been visible to the read behind it.
+    #[test]
+    fn delta_may_be_absorbed_only_at_or_below_a_known_horizon() {
+        let lsn = |v: u64| Some(PgLsn::from(v));
+        assert!(delta_may_be_absorbed(lsn(10), lsn(20)));
+        assert!(delta_may_be_absorbed(lsn(20), lsn(20)));
+        assert!(!delta_may_be_absorbed(lsn(21), lsn(20)));
+        assert!(
+            !delta_may_be_absorbed(lsn(10), None),
+            "a group nothing ever re-derived from live state applies every delta"
+        );
+        assert!(
+            !delta_may_be_absorbed(None, lsn(20)),
+            "a delta with no known commit LSN has nothing to compare"
+        );
+    }
+
     /// The bulk-recompute path's extinct-group `DELETE` (step 3 of
     /// [`apply_forced_groups_bulk`]) removes a forced group's target row when
     /// no source row survives — reachable since issue #315, whenever a
@@ -3691,7 +3866,8 @@ mod tests {
                 "create table order_items \
                  (id integer primary key, order_id integer, amount numeric); \
                  create table order_summary \
-                 (order_id numeric primary key, total numeric, __total_count bigint); \
+                 (order_id numeric primary key, total numeric, __total_count bigint, \
+                  __trellis_recompute_lsn pg_lsn); \
                  insert into order_summary (order_id, total, __total_count) \
                  values (10, 99.00, 1)",
             )
@@ -3776,7 +3952,8 @@ mod tests {
                 "create table order_items \
                  (id integer primary key, order_id integer, amount numeric); \
                  create table order_summary \
-                 (order_id numeric unique, total numeric, __total_count bigint); \
+                 (order_id numeric unique, total numeric, __total_count bigint, \
+                  __trellis_recompute_lsn pg_lsn); \
                  insert into order_items (id, order_id, amount) \
                  values (1, null, 5.00), (2, null, 7.00)",
             )
@@ -3850,6 +4027,7 @@ mod tests {
             src_changed: None,
             origin_lsn: None,
             lsn: None,
+            min_image_lsn: None,
             hop_gen: 0,
             first_seen: std::time::SystemTime::UNIX_EPOCH,
             group_key: None,
@@ -4087,7 +4265,9 @@ mod tests {
          total numeric, __total_count bigint, \
          avg_amount numeric, __avg_amount_sum numeric, \
          row_count numeric, \
-         max_amount numeric)";
+         max_amount numeric, __trellis_recompute_lsn pg_lsn); \
+        create table aggregate_extinct_horizon \
+        (target_table text primary key, lsn pg_lsn not null)";
 
     /// Reads back every `order_summary` row, sorted by `order_id`, as text —
     /// used to compare the batched path's output against the unbatched

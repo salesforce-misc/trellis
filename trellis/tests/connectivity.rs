@@ -30,7 +30,7 @@ async fn migrate_up_is_idempotent() {
         first_run,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -94,7 +94,9 @@ async fn migrate_up_is_idempotent() {
         // from_table, name)`). Issues #311/#367 added V39
         // (`pending_backfill.generation`, so a discharge deletes only the
         // marker generation it read).
-        "expected exactly V1 through V7, V9 through V24, and V26 through V39 to be applied"
+        // Issue #321 added V40 (`aggregate_extinct_horizon`, the per-target
+        // extinct horizon for aggregate recompute basis checks).
+        "expected exactly V1 through V7, V9 through V24, and V26 through V40 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.
