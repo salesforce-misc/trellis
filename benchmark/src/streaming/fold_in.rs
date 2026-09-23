@@ -310,8 +310,9 @@ fn json_rate(rate: Option<f64>) -> String {
 ///
 /// "Caught up" is the target's own `sum(row_count)` reaching the committed
 /// row count (see the comment at the drain loop below), not
-/// `changes_applied`. That counter counts staged source rows (#409), but a
-/// retried apply can re-count some, so it isn't an exact completion signal.
+/// `changes_applied`. That counter counts staged source rows too (#409), but
+/// it's an in-process tally recorded after each apply commits, not the
+/// target's own state, so the target is the authoritative signal.
 pub async fn run_probe(
     groups: usize,
     target_rows_per_sec: f64,

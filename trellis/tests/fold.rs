@@ -795,6 +795,28 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
     )
     .await;
 
+    // "reinserted": written on both sides of the truncate. Only the
+    // post-truncate row survives into its group, so only it counts toward
+    // `row_count` (issue #409).
+    for (lsn, image) in [(12, r#"{"v":"gone"}"#), (32, r#"{"v":"back"}"#)] {
+        insert_row(
+            &client,
+            "seg_0",
+            &RawRow {
+                key: "reinserted",
+                op: "insert",
+                lsn: Some(lsn),
+                old_image: None,
+                new_image: Some(image),
+                origin_lsn: Some(lsn),
+                src_changed: true,
+                hop_gen: 0,
+                group_key: None,
+            },
+        )
+        .await;
+    }
+
     // A recompute trigger present in the same window — survives
     // unconditionally, regardless of the truncate.
     insert_row(&client, "seg_0", &RawRow::recompute("recomputed", 1)).await;
@@ -824,16 +846,24 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
         "the sentinel's own group must surface is_truncate"
     );
 
+    let reinserted = find(&folded, "reinserted");
+    assert_eq!(reinserted.new_image, Some(r#"{"v": "back"}"#.to_string()));
+    assert_eq!(reinserted.old_image, None);
+
     // Issue #409: a truncate sentinel counts as one staged row, and a row
-    // the truncate voided was never applied, so it isn't counted anywhere.
+    // the truncate voided was never applied, so it isn't counted anywhere:
+    // not in a group of its own ("stale" has none), and not in a group that
+    // survives through a post-truncate write ("reinserted" counts only that
+    // write).
     assert_eq!(sentinel.row_count, 1);
     assert_eq!(fresh.row_count, 1);
     assert_eq!(recomputed.row_count, 1);
+    assert_eq!(reinserted.row_count, 1);
 
     assert_eq!(
         folded.len(),
-        3,
-        "exactly fresh, recomputed, and the sentinel itself: {folded:?}"
+        4,
+        "exactly fresh, reinserted, recomputed, and the sentinel itself: {folded:?}"
     );
 }
 

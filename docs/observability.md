@@ -64,7 +64,10 @@ Supporting counters/gauges keep the histograms interpretable:
   and applied. One change is one row in the staging ring: a source row change
   that intake staged from logical replication, or a row an upstream transform's
   write staged for the next hop. The count doesn't depend on how rows were
-  batched, so you can compare it with the source's own write rate. It adds up
+  batched, so you can compare it with the source's own write rate. The one
+  exception is a `TRUNCATE`: it counts as one change, and rows staged before it
+  that hadn't been applied yet are dropped uncounted, because they never reach
+  the target. It adds up
   across hops. If 200 source rows update 10 keys of an aggregate that feeds a
   second transform, the aggregate reports 200 and the second transform reports
   10. It isn't the latency histograms' denominator. The claim-time fold

@@ -131,8 +131,12 @@ to the source, comparable to the application's write rate and to
 because a propagated change is itself a ring row: each target writer reports
 every physically changed key into `TargetMutations`, which stages one row per
 key for the next hop. The fold carries each group's `count(*)` as
-`FoldedChange::row_count`, and a truncate sentinel counts as one row. The
-latency histograms still observe once per folded change, because a folded
+`FoldedChange::row_count`, and a truncate sentinel counts as one row. The count
+is taken after the truncate-void filter, so a row a later truncate in the same
+window voided isn't counted: it was never applied, and the only alternative
+would be to charge it to the sentinel, which counts as one row. Whether such a
+row counts therefore depends on whether it drained before the truncate's
+segment, the one place batching still shows through. The latency histograms still observe once per folded change, because a folded
 change carries one origin timestamp and nobody asks for a row-weighted
 quantile. The counter is therefore no longer the histograms' throughput
 denominator. The histograms' own `_count` series is, minus bare recompute
