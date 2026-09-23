@@ -19,8 +19,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    DdlError, create_aggregate_target_table, create_definition, create_target_table, parse,
-    recompute, source_primary_key,
+    DdlError, create_aggregate_target_table, create_definition, create_target_table,
+    install_definition, parse, recompute, source_primary_key,
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
@@ -755,8 +755,9 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
 ///
 /// Issue #177's fix closes this gap too, not just the composite-arity one
 /// (which issue #121 later removed the rejection for — see this test's
-/// sibling immediately above): `create_definition_inner`'s `KeySpace::OneToOne`
-/// check calls `ddl::source_primary_key` itself (the same call
+/// sibling immediately above): `create_definition_inner`'s create-time key
+/// check (every key-space since issue #371, see the aggregate sibling below)
+/// calls `ddl::source_primary_key` itself (the same call
 /// `install_definition` already made), and that function's own type check
 /// (`is_text_stable_join_key_type`) runs unconditionally as part of fetching
 /// the primary key — there's no way to ask it for "just the columns, skip
@@ -814,6 +815,147 @@ async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_q
     assert_eq!(
         after.stop_count, before.stop_count,
         "a clean create-time rejection must not register as an instance halt"
+    );
+}
+
+/// Issue #371: the aggregate sibling of the test above. Live apply reads
+/// every source's primary key through `ddl::source_primary_key` whatever the
+/// reading definition's key-space, and `quarantine::classify` halts the
+/// instance on `UnsupportedPrimaryKeyType`. The create-time key check used to
+/// run for 1-1 definitions only, so an aggregate over a non-text-stable key
+/// installed cleanly and then halted the instance on its first live change.
+/// Two shapes reached that halt:
+///
+/// - an aggregate over an ordinary table with a `numeric` primary key;
+/// - an aggregate chained off another aggregate grouped by a `numeric`
+///   column (that upstream target's identity is its `GROUP BY` key).
+///
+/// Both must now be refused up front, by both entry points
+/// (`install_definition` and the ring-path `create_definition`), with nothing
+/// left behind and no halt registered.
+#[tokio::test]
+async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at_create_time() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let before = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats before");
+
+    let assert_unsupported_key =
+        |what: &str, result: Result<_, trellis::defs::CatalogError>| match result {
+            Err(trellis::defs::CatalogError::Ddl(DdlError::UnsupportedPrimaryKeyType {
+                pg_type,
+                ..
+            })) => assert_eq!(pg_type, "numeric", "{what}"),
+            Err(other) => panic!("{what}: expected UnsupportedPrimaryKeyType, got {other:?}"),
+            Ok(_) => panic!("{what}: expected a create-time rejection, but it was accepted"),
+        };
+
+    // Shape 3: an aggregate over an ordinary table keyed on `numeric`.
+    client
+        .batch_execute(
+            "create table ledger (entry_id numeric primary key, account text, cents integer); \
+             alter table ledger replica identity full",
+        )
+        .await
+        .expect("create source table with a numeric primary key");
+    let ledger_columns: HashMap<String, ValueType> = [
+        ("entry_id", ValueType::Numeric),
+        ("account", ValueType::Text),
+        ("cents", ValueType::Numeric),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t))
+    .collect();
+    let account_totals = "TRANSFORM account_totals FROM ledger GROUP BY account \
+                          SELECT account AS account, SUM(cents) AS total";
+    assert_unsupported_key(
+        "install_definition, aggregate over a numeric-keyed table",
+        install_definition(&db.pool, account_totals, &ledger_columns, "public").await,
+    );
+    assert_unsupported_key(
+        "create_definition, aggregate over a numeric-keyed table",
+        create_definition(&db.pool, account_totals, &ledger_columns).await,
+    );
+
+    // Shape 2: an aggregate chained off a `numeric`-grouped aggregate. The
+    // upstream itself is fine: its source is integer-keyed, and `numeric` is
+    // an admitted `GROUP BY` key type.
+    client
+        .batch_execute(
+            "create table sales (id integer primary key, price numeric, qty integer); \
+             alter table sales replica identity full",
+        )
+        .await
+        .expect("create integer-keyed source table");
+    let sales_columns: HashMap<String, ValueType> = [
+        ("id", ValueType::Numeric),
+        ("price", ValueType::Numeric),
+        ("qty", ValueType::Numeric),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t))
+    .collect();
+    install_definition(
+        &db.pool,
+        "TRANSFORM price_totals FROM sales GROUP BY price \
+         SELECT price AS price, SUM(qty) AS units",
+        &sales_columns,
+        "public",
+    )
+    .await
+    .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
+    client
+        .batch_execute("alter table price_totals replica identity full")
+        .await
+        .expect("widen price_totals's replica identity");
+    let price_totals_columns: HashMap<String, ValueType> =
+        [("price", ValueType::Numeric), ("units", ValueType::Numeric)]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect();
+    let units_rollup = "TRANSFORM units_rollup FROM price_totals GROUP BY units \
+                        SELECT units AS units, COUNT(*) AS prices";
+    assert_unsupported_key(
+        "install_definition, aggregate chained off a numeric-grouped aggregate",
+        install_definition(&db.pool, units_rollup, &price_totals_columns, "public").await,
+    );
+    assert_unsupported_key(
+        "create_definition, aggregate chained off a numeric-grouped aggregate",
+        create_definition(&db.pool, units_rollup, &price_totals_columns).await,
+    );
+
+    // Neither rejected definition left a catalog row or a target table.
+    for target in ["account_totals", "units_rollup"] {
+        let rows: i64 = client
+            .query_one(
+                "select count(*) from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await
+            .expect("count catalog rows")
+            .get(0);
+        assert_eq!(rows, 0, "no catalog row for rejected {target}");
+        let table: Option<String> = client
+            .query_one(
+                "select to_regclass($1)::text",
+                &[&format!("public.{target}")],
+            )
+            .await
+            .expect("probe target table")
+            .get(0);
+        assert_eq!(table, None, "no target table for rejected {target}");
+    }
+
+    let after = trellis::staging::halting_stop_stats(&db.pool)
+        .await
+        .expect("halting_stop_stats after");
+    assert_eq!(
+        after.stop_count, before.stop_count,
+        "a create-time rejection must not register as an instance halt"
     );
 }
 

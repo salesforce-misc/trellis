@@ -802,6 +802,13 @@ pub async fn install_definition(
             .map_err(CatalogError::Ddl)?;
         }
         KeySpace::Aggregate { .. } => {
+            // Issue #371: live apply reads the source's primary key through
+            // `ddl::source_primary_key` for an aggregate too, and a key type
+            // it refuses halts the instance there. Refuse it here instead,
+            // before any DDL, exactly as the 1-1 arm above does.
+            ddl::source_primary_key(pool, &qualified_source)
+                .await
+                .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
             ddl::create_aggregate_target_table(pool, &def, target_schema, source_columns)
                 .await
@@ -2315,8 +2322,8 @@ async fn create_definition_inner(
     }
 
     // Issue #121 (previously issue #177's arity gate): fail fast on a
-    // `OneToOne` source with no primary key at all, or an unsafe-to-key-on
-    // primary key type, before this transaction's one remaining side effect
+    // source with no primary key at all, or an unsafe-to-key-on primary key
+    // type, before this transaction's one remaining side effect
     // below (the initial backfill enumeration, which actually queries
     // `qualified_source`'s live rows) — a composite (multi-column) source
     // primary key is no longer rejected here: it mirrors onto the target as
@@ -2327,8 +2334,8 @@ async fn create_definition_inner(
     //
     // Checked here — after node/edge resolution and the cycle/collision
     // checks above, not immediately after `qualified_source` resolves, even
-    // though this key-space match is unconditional (unlike those checks, it
-    // doesn't depend on `qualified_target`) — deliberately: a chained
+    // though (unlike those checks) it doesn't depend on `qualified_target` —
+    // deliberately: a chained
     // definition's source can legitimately name another *not-yet-physically-
     // built* definition's target (`resolve_graph_identity_in_txn`'s own
     // fallback, issue #74), and every check above this point tolerates that
@@ -2342,20 +2349,26 @@ async fn create_definition_inner(
     // target its own upstream `install_definition` call hasn't built the
     // physical table for yet. Still strictly ahead of the initial backfill
     // enumeration just below — the first place this function would
-    // otherwise *use* that live relation for real — so a doomed-to-fail 1-1
+    // otherwise *use* that live relation for real — so a doomed-to-fail
     // definition never enumerates its source table.
     // Run against `txn`, not a second pooled connection (`ddl::source_primary_key`'s
     // own `pool`-taking form): this function is mid-transaction here, so taking
     // another connection would risk a pool-exhaustion deadlock and would read the
     // source relation's shape on a different snapshot than every other check
     // around it — see [`ddl::source_primary_key_in_txn`]'s own doc comment.
-    if let KeySpace::OneToOne = &def.key_space {
-        ddl::source_primary_key_in_txn(&*txn, &qualified_source)
-            .await
-            .map_err(CatalogError::Ddl)?;
-    }
+    //
+    // Issue #371: every key-space, not just `OneToOne`. Live apply calls
+    // `ddl::source_primary_key` on an aggregate's source too
+    // (`staging::apply`'s by-source and TRUNCATE loops), and
+    // `quarantine::classify` halts the instance on the key-type error it
+    // returns — so an aggregate over a `numeric`-keyed table, or chained off
+    // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
+    // used to be accepted here and then halt on its first live change.
+    ddl::source_primary_key_in_txn(&*txn, &qualified_source)
+        .await
+        .map_err(CatalogError::Ddl)?;
     // Issue #376: the authoritative copy of `install_definition`'s fail-fast
-    // check, placed with the 1-1 key check above because it reads the live
+    // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
     reject_unkeyed_source(&*txn, &qualified_source).await?;
 

@@ -239,9 +239,8 @@ impl DdlError {
     /// category for an error type that already has one.
     pub fn code(&self) -> ErrorCode {
         match self {
-            // The source table's shape doesn't support the 1-1 DDL slice —
-            // a rejected definition, same category as any other validation
-            // failure.
+            // The source table's key can't identify its rows — a rejected
+            // definition, same category as any other validation failure.
             DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. } => {
                 ErrorCode::Validation
             }
@@ -283,7 +282,7 @@ impl fmt::Display for DdlError {
             } => write!(
                 f,
                 "source table '{source_table}' has primary key {column} ({pg_type}), a type \
-                 whose equality isn't text-stable, so the 1-1 apply/backfill paths (which \
+                 whose equality isn't text-stable, so the apply/backfill paths (which \
                  compare primary keys as text) would silently diverge from the Postgres \
                  oracle's typed equality; supported primary key types are integer, bigint, \
                  smallint, uuid, text, and character varying"
@@ -418,8 +417,8 @@ pub async fn source_primary_key(
 
 /// [`source_primary_key`] against a caller-supplied client instead of a fresh
 /// pooled one — for callers already holding an open transaction
-/// (`catalog::create_definition_inner`'s issue #177 `KeySpace::OneToOne`
-/// gate). Two reasons that matters there rather than just calling
+/// (`catalog::create_definition_inner`'s create-time key gate, issues #177
+/// and #371). Two reasons that matters there rather than just calling
 /// [`source_primary_key`]: taking a *second* pooled connection while the
 /// first one is mid-transaction is the classic pool-exhaustion deadlock (N
 /// concurrent definition creations against a pool of N connections would each

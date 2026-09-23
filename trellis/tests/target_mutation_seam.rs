@@ -21,6 +21,7 @@ use trellis::defs::{
     install_definition, parse_statement, publication_tables,
 };
 use trellis::intake::publication;
+use trellis::integer::IntWidth;
 use trellis::staging::quarantine;
 use trellis::staging::{
     StagedChange, StagedWatermark, append, apply, has_pending, retire_drained_segments,
@@ -128,7 +129,10 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
     )
     .await
     .expect("create sources");
-    let columns = numeric_columns(&["id", "k", "v"]);
+    let mut columns = numeric_columns(&["id", "k", "v"]);
+    // `k` is `agg`'s identity, which `hist` keys on: it must be a text-stable
+    // key type, so not `numeric` (issue #371).
+    columns.insert("k".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
         "TRANSFORM public.agg FROM public.src GROUP BY k SELECT COUNT(*) AS n",
@@ -142,7 +146,10 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
     install_definition(
         &db.pool,
         "TRANSFORM public.hist FROM public.agg GROUP BY n SELECT COUNT(*) AS groups",
-        &numeric_columns(&["k", "n"]),
+        &HashMap::from([
+            ("k".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("n".to_string(), ValueType::Numeric),
+        ]),
         "public",
     )
     .await
@@ -156,8 +163,7 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
         "agg is hist's source, but a seam-only target is never published"
     );
 
-    // A relationship endpoint keeps CDC. `t` is a plain 1-1 target (a
-    // relationship's join key must be integral, unlike `agg`'s numeric key).
+    // A relationship endpoint keeps CDC. `t` is a plain 1-1 target.
     raw.batch_execute(
         "create table public.t (id integer primary key, doubled numeric); \
          alter table public.t replica identity full",
