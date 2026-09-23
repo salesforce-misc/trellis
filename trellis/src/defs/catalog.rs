@@ -1075,8 +1075,8 @@ async fn go_live_if_backfilling(
 /// **Only a still-`backfilling` definition completes (issue #331).** The
 /// pause gates new chunk claims, not a chunk a worker already holds, so the
 /// last chunk can finish after the definition has been paused or quarantined
-/// (or, once resumed, dropped back to `waiting_to_backfill` with leftover
-/// chunks re-dispatched). [`go_live_if_backfilling`] leaves a definition that
+/// (or, once resumed, dropped back to `waiting_to_backfill` while a worker
+/// still held one of its chunks). [`go_live_if_backfilling`] leaves a definition that
 /// has moved on exactly as it is; the chunk itself is still retired by the
 /// caller.
 ///

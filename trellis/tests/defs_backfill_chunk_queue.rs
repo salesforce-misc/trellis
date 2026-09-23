@@ -121,7 +121,7 @@ fn numeric(names: &[&str]) -> std::collections::HashMap<String, ValueType> {
 async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -167,7 +167,7 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
     let ttl = Duration::from_millis(300);
     tokio::time::sleep(ttl + Duration::from_millis(150)).await;
 
-    let reclaimed = chunk_queue::reclaim_stale_chunks(&client, ttl)
+    let reclaimed = chunk_queue::reclaim_stale_chunks(&mut client, ttl)
         .await
         .expect("reclaim_stale_chunks");
     assert_eq!(reclaimed, 1, "the dead worker's stale claim must be freed");
@@ -317,7 +317,7 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -353,7 +353,7 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
     let ttl = Duration::from_millis(300);
     tokio::time::sleep(ttl + Duration::from_millis(150)).await;
 
-    let reclaimed = chunk_queue::reclaim_stale_chunks(&client, ttl)
+    let reclaimed = chunk_queue::reclaim_stale_chunks(&mut client, ttl)
         .await
         .expect("reclaim_stale_chunks");
     assert_eq!(reclaimed, 1, "the dead worker's stale claim must be freed");
@@ -432,7 +432,7 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
 async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -492,7 +492,7 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     let mut total_reclaimed = 0u64;
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(80)).await;
-        total_reclaimed += chunk_queue::reclaim_stale_chunks(&client, ttl)
+        total_reclaimed += chunk_queue::reclaim_stale_chunks(&mut client, ttl)
             .await
             .expect("reclaim_stale_chunks");
     }
@@ -548,7 +548,7 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
 async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -575,7 +575,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
 
     let ttl = Duration::from_millis(300);
     tokio::time::sleep(ttl + Duration::from_millis(150)).await;
-    chunk_queue::reclaim_stale_chunks(&client, ttl)
+    chunk_queue::reclaim_stale_chunks(&mut client, ttl)
         .await
         .expect("reclaim_stale_chunks");
 

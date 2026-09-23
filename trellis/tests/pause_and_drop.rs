@@ -1023,7 +1023,7 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band(
 async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 40).await;
     raw.batch_execute("create publication trellis_pub")
         .await
@@ -1055,7 +1055,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         "precondition: the real dispatch path hands out chunks while the definition is not frozen"
     );
     for chunk in &before {
-        chunk_queue::release_chunk(&raw, chunk.id, "issue-231-worker")
+        chunk_queue::release_chunk(&mut raw, chunk.id, "issue-231-worker")
             .await
             .expect("release the claim taken to prove dispatch was open");
     }

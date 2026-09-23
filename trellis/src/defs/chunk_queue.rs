@@ -160,6 +160,16 @@ pub struct ClaimedChunk {
 /// ever claim-and-finish a "last chunk" to trigger the `Backfilling` ->
 /// `Live` flip in that case, this immediately completes the definition itself
 /// once it has confirmed there is truly nothing to wait for.
+///
+/// **A resume that raced the install (issue #360).** `install_definition`
+/// commits the `backfilling` row before this runs, so an operator can pause
+/// and resume the definition in between. That resume found no chunks to
+/// discard and already parked the rebuild that covers the whole source, so
+/// this enqueues nothing and completes nothing for a resumed definition — see
+/// [`RESUMED`]. The check and the inserts share one transaction holding the
+/// definition row's `for update` lock, the lock pause and resume take too, so
+/// a resume either lands first (and this sees it) or waits and discards the
+/// chunks inserted here as it would any paused definition's (#332).
 pub(crate) async fn enqueue_one_to_one(
     pool: &Pool,
     definition_id: i64,
@@ -168,25 +178,45 @@ pub(crate) async fn enqueue_one_to_one(
 ) -> Result<TransformStatus, BackfillError> {
     let ranges = backfill::plan_one_to_one_chunks(pool, def, source_table).await?;
 
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let locked = txn
+        .query_opt(
+            &format!(
+                "select status, {RESUMED} from transform_definitions d \
+                 where id = $1 for update"
+            ),
+            &[&definition_id],
+        )
+        .await?;
+    if let Some(row) = locked
+        && row.get::<_, bool>(1)
+    {
+        txn.commit().await?;
+        let status_text: String = row.get(0);
+        return Ok(
+            TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                panic!("transform_definitions.status held unrecognized value '{status_text}'")
+            }),
+        );
+    }
+
     if ranges.is_empty() {
         // Nothing to wait for — no chunk will ever be claimed-and-finished to
         // trigger the usual `Backfilling` -> `Live` flip, so do it directly,
-        // through the same race-free lock-then-check-then-complete sequence
-        // `finish_chunk` uses (there's nothing to race here — no chunk claim
-        // exists for this definition yet — but reusing the exact path keeps
-        // there being exactly one way a direct-build definition ever
-        // completes).
+        // through the same lock-then-check-then-complete sequence
+        // `finish_chunk` uses (the lock is already held above), keeping there
+        // being exactly one way a direct-build definition ever completes.
         // Reports what the completion actually left the definition in: an
         // operator can already pause it by now (issue #331), and that pause
         // stands rather than being reported — or forced — `live`.
-        let status = complete_if_no_chunks_remain(pool, definition_id)
+        let status = complete_if_no_chunks_remain_in_txn(&txn, definition_id)
             .await
             .map_err(catalog_completion_err_to_backfill)?;
+        txn.commit().await?;
         return Ok(status.unwrap_or(TransformStatus::Backfilling));
     }
 
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
     for (lo, hi) in &ranges {
         txn.execute(
             "insert into backfill_chunks (definition_id, lo, hi) values ($1, $2, $3)",
@@ -197,6 +227,20 @@ pub(crate) async fn enqueue_one_to_one(
     txn.commit().await?;
     Ok(TransformStatus::Backfilling)
 }
+
+/// SQL predicate over a `transform_definitions` row aliased `d`: whether the
+/// definition has ever been resumed (issue #360). Every resume
+/// (`staging::quarantine::resume_transform`) stamps `fuse_rearmed_at`, and
+/// nothing else writes it.
+///
+/// A resumed definition's rebuild runs through its parked catch-up marker, not
+/// through `backfill_chunks`, so none of its chunks should ever be claimable
+/// again: resume deletes the unclaimed ones, [`enqueue_one_to_one`] enqueues
+/// none after it, and [`release_chunk`]/[`reclaim_stale_chunks`] delete a
+/// chunk that was held across the resume rather than freeing it. Chunks are
+/// only ever enqueued at install, so "resumed at all" is the same as "resumed
+/// since these chunks were planned".
+const RESUMED: &str = "d.fuse_rearmed_at is not null";
 
 /// Claims up to `limit` unclaimed, undone chunks for `claimed_by` in one
 /// statement — the backfill-chunk analogue of `staging::claim`/
@@ -279,24 +323,36 @@ pub async fn claim_chunks(
 /// deleting a row, since there's no separate claims table to delete from —
 /// see this module's doc comment) makes the chunk claimable again on the very
 /// next [`claim_chunks`] call.
+///
+/// A stale chunk whose definition was resumed while it was held is deleted
+/// instead of freed (issue #360) — see [`free_or_discard_claims`].
+/// Returns how many stale claims it dealt with either way.
 pub async fn reclaim_stale_chunks(
-    client: &impl GenericClient,
+    client: &mut impl GenericClient,
     ttl: Duration,
 ) -> Result<u64, ChunkQueueError> {
     let ttl_secs = ttl.as_secs_f64();
-    let n = client
-        .execute(
-            "with dead as ( \
-                 select id from backfill_chunks \
-                 where claimed_by is not null and not done \
-                   and claimed_at < now() - (interval '1 second' * $1) \
-                 for update skip locked \
-             ) \
-             update backfill_chunks set claimed_by = null, claimed_at = null \
-             from dead where backfill_chunks.id = dead.id",
+    let txn = client.transaction().await?;
+    // `skip locked` on both tables: the sweep never waits, neither behind a
+    // live claimant's in-flight write nor behind a pause, resume or
+    // completion holding the definition row. A chunk skipped here is swept
+    // on a later pass.
+    let rows = txn
+        .query(
+            &format!(
+                "select bc.id, {RESUMED} from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.claimed_by is not null and not bc.done \
+                   and bc.claimed_at < now() - (interval '1 second' * $1) \
+                 for update of bc skip locked \
+                 for share of d skip locked"
+            ),
             &[&ttl_secs],
         )
         .await?;
+    let n = rows.len() as u64;
+    free_or_discard_claims(&txn, &rows).await?;
+    txn.commit().await?;
     Ok(n)
 }
 
@@ -305,19 +361,90 @@ pub async fn reclaim_stale_chunks(
 /// `claimed_by = $2` for the same reason that function is: a claim already
 /// reclaimed out from under this caller (the TTL sweep, or another worker) is
 /// left untouched.
+///
+/// A chunk whose definition was resumed while it was held is deleted instead
+/// of freed (issue #360) — see [`free_or_discard_claims`]. Returns how many
+/// claims (zero or one) it released or discarded.
 pub async fn release_chunk(
-    client: &impl GenericClient,
+    client: &mut impl GenericClient,
     id: i64,
     claimed_by: &str,
 ) -> Result<u64, ChunkQueueError> {
-    let n = client
-        .execute(
-            "update backfill_chunks set claimed_by = null, claimed_at = null \
-             where id = $1 and claimed_by = $2",
+    let txn = client.transaction().await?;
+    let rows = txn
+        .query(
+            &format!(
+                "select bc.id, {RESUMED} from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
+                 for update of bc for share of d"
+            ),
             &[&id, &claimed_by],
         )
         .await?;
+    let n = rows.len() as u64;
+    free_or_discard_claims(&txn, &rows).await?;
+    txn.commit().await?;
     Ok(n)
+}
+
+/// Gives up the claims `rows` (each `(chunk id, resumed)`, locked by the
+/// caller along with a share lock on each chunk's definition row) name.
+///
+/// A never-resumed definition's chunk is freed, claimable again by the next
+/// [`claim_chunks`]. A chunk held across its definition's resume is deleted
+/// instead (issue #360): resume discarded its unclaimed siblings and left
+/// this one only so its worker could finish it (#332), and running it again
+/// would redo work the resumed definition's rebuild already covers. Its
+/// worker's write may still have landed some of its range after that rebuild
+/// went live, so the catch-up marker the rerun's completion would have parked
+/// ([`super::catalog::complete_direct_backfill`]) is parked here instead,
+/// unless the definition is frozen again (its next resume parks its own).
+///
+/// The share lock is what makes `resumed` trustworthy: resume holds the
+/// definition row `for update` while it deletes unclaimed chunks, so it runs
+/// either wholly before this read (and `resumed` sees it) or wholly after the
+/// caller commits (and its delete sees the chunk freed here).
+async fn free_or_discard_claims(
+    txn: &tokio_postgres::Transaction<'_>,
+    rows: &[tokio_postgres::Row],
+) -> Result<(), ChunkQueueError> {
+    let (discard, free): (Vec<_>, Vec<_>) = rows.iter().partition(|row| row.get::<_, bool>(1));
+    let free: Vec<i64> = free.iter().map(|row| row.get(0)).collect();
+    let discard: Vec<i64> = discard.iter().map(|row| row.get(0)).collect();
+    if !free.is_empty() {
+        txn.execute(
+            "update backfill_chunks set claimed_by = null, claimed_at = null \
+             where id = any($1)",
+            &[&free],
+        )
+        .await?;
+    }
+    if discard.is_empty() {
+        return Ok(());
+    }
+    let discarded = txn
+        .query(
+            "delete from backfill_chunks bc using transform_definitions d \
+             where bc.id = any($1) and d.id = bc.definition_id \
+             returning d.source_table, d.status",
+            &[&discard],
+        )
+        .await?;
+    let mut sources = std::collections::BTreeSet::new();
+    for row in discarded {
+        let status_text: String = row.get(1);
+        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+            panic!("transform_definitions.status held unrecognized value '{status_text}'")
+        });
+        if !status.is_frozen() {
+            sources.insert(row.get::<_, String>(0));
+        }
+    }
+    for source in sources {
+        crate::intake::publication::park_marker(txn, &source).await?;
+    }
+    Ok(())
 }
 
 /// Executes one claimed chunk's write against its target
@@ -487,27 +614,6 @@ pub async fn finish_chunk(
     Ok(())
 }
 
-/// The lock-then-check-then-complete sequence [`finish_chunk`] runs inside
-/// its own transaction after marking a chunk done, factored out so
-/// [`enqueue_one_to_one`]'s zero-chunk case (nothing to mark done — every
-/// chunk enumerated already is) can reach the exact same race-free
-/// completion path via its own fresh transaction.
-async fn complete_if_no_chunks_remain(
-    pool: &Pool,
-    definition_id: i64,
-) -> Result<Option<TransformStatus>, ChunkQueueError> {
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    txn.query_opt(
-        "select id from transform_definitions where id = $1 for update",
-        &[&definition_id],
-    )
-    .await?;
-    let status = complete_if_no_chunks_remain_in_txn(&txn, definition_id).await?;
-    txn.commit().await?;
-    Ok(status)
-}
-
 /// Maps a [`ChunkQueueError`] from the zero-chunk completion path back into a
 /// [`BackfillError`] for [`enqueue_one_to_one`]'s signature — that path can
 /// only realistically fail on a DB/pool error (the completion SQL, or
@@ -526,7 +632,7 @@ fn catalog_completion_err_to_backfill(err: ChunkQueueError) -> BackfillError {
 }
 
 /// The shared "no chunks left? then flip to live" check both
-/// [`finish_chunk`] and [`complete_if_no_chunks_remain`] run once they
+/// [`finish_chunk`] and [`enqueue_one_to_one`]'s zero-chunk case run once they
 /// already hold the definition row's `for update` lock. Returns the status
 /// the completion left the definition in, or `None` while chunks remain —
 /// "flip to live" only ever happens from `backfilling` (issue #331; see
@@ -548,4 +654,299 @@ async fn complete_if_no_chunks_remain_in_txn(
     Ok(Some(
         catalog::complete_direct_backfill(txn, definition_id).await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::lifecycle::pause_transform;
+    use crate::defs::parser::parse;
+    use crate::staging::quarantine::resume_transform;
+    use tokio_postgres::NoTls;
+
+    const WORKER: &str = "issue-360-worker";
+
+    /// A same-crate pool plus a raw connection onto `db` (testkit's own
+    /// `db.pool` is the other crate instance's `Pool` type).
+    async fn connect(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path");
+        (pool, raw)
+    }
+
+    /// Seeds `public.<source>` with `rows` rows and a `backfilling` definition
+    /// `<target>` over it: the state `install_plain_one_to_one` has committed
+    /// by the time it calls [`enqueue_one_to_one`].
+    async fn seed_backfilling(
+        raw: &tokio_postgres::Client,
+        source: &str,
+        target: &str,
+        rows: i64,
+    ) -> (i64, TransformDef) {
+        let text = format!("TRANSFORM {target} FROM {source} SELECT a + a AS x");
+        raw.batch_execute(&format!(
+            "create table public.{source} (id bigint primary key, a numeric); \
+             insert into public.{source} select g, g from generate_series(1, {rows}) g; \
+             insert into source_table_versions (source_table, version) \
+             values ('public.{source}', 1)"
+        ))
+        .await
+        .expect("seed source");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ($1, $2, 1, $3, 'backfilling') returning id",
+                &[
+                    &format!("public.{target}"),
+                    &format!("public.{source}"),
+                    &text,
+                ],
+            )
+            .await
+            .expect("seed definition")
+            .get(0);
+        (id, parse(&text).expect("parse definition"))
+    }
+
+    async fn status_of(raw: &tokio_postgres::Client, id: i64) -> String {
+        raw.query_one(
+            "select status from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("read status")
+        .get(0)
+    }
+
+    async fn chunk_count(raw: &tokio_postgres::Client, id: i64) -> i64 {
+        raw.query_one(
+            "select count(*) from backfill_chunks where definition_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("count chunks")
+        .get(0)
+    }
+
+    async fn marker_generation(raw: &tokio_postgres::Client, table: &str) -> Option<i64> {
+        raw.query_opt(
+            "select generation from pending_backfill where table_name = $1",
+            &[&table],
+        )
+        .await
+        .expect("read marker")
+        .map(|row| row.get(0))
+    }
+
+    /// Issue #360, race 2: `install_definition` commits the `backfilling` row
+    /// before `enqueue_one_to_one` inserts its chunks. A PAUSE and RESUME
+    /// landing in that gap find no chunks to discard, so the chunks inserted
+    /// afterward must not be enqueued at all: resume already parked the
+    /// rebuild that covers them.
+    #[tokio::test]
+    async fn a_resume_that_raced_the_install_leaves_nothing_to_enqueue() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_backfilling(&raw, "orders", "order_doubles", 3).await;
+
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+        resume_transform(&pool, "order_doubles")
+            .await
+            .expect("resume");
+
+        let status = enqueue_one_to_one(&pool, id, &def, "public.orders")
+            .await
+            .expect("enqueue");
+        assert_eq!(status, TransformStatus::WaitingToBackfill);
+        assert_eq!(
+            chunk_count(&raw, id).await,
+            0,
+            "nothing is enqueued for a definition resume already rebuilds"
+        );
+    }
+
+    /// Issue #360, race 2's zero-chunk arm: an empty source's install
+    /// completes the definition directly. After a racing resume, that
+    /// completion would flip the definition `live` in the middle of the
+    /// rebuild's own discharge (which moves it `waiting_to_backfill` ->
+    /// `backfilling` -> `live` around its enumeration).
+    #[tokio::test]
+    async fn a_resume_that_raced_an_empty_install_is_not_completed_by_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_backfilling(&raw, "orders", "order_doubles", 0).await;
+
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+        resume_transform(&pool, "order_doubles")
+            .await
+            .expect("resume");
+        // The rebuild's discharge has promoted it and is enumerating.
+        raw.execute(
+            "update transform_definitions set status = 'backfilling' where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("promote as the discharge does");
+
+        let status = enqueue_one_to_one(&pool, id, &def, "public.orders")
+            .await
+            .expect("enqueue");
+        assert_eq!(status, TransformStatus::Backfilling);
+        assert_eq!(
+            status_of(&raw, id).await,
+            "backfilling",
+            "the discharge, not the install, takes a resumed definition live"
+        );
+    }
+
+    /// A pause that lands in the same gap without a resume still enqueues:
+    /// the frozen definition's chunks are withheld from dispatch, and a later
+    /// resume discards them as it does any paused definition's (#332).
+    #[tokio::test]
+    async fn a_pause_that_raced_the_install_still_enqueues_for_resume_to_discard() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_backfilling(&raw, "orders", "order_doubles", 3).await;
+
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+        let status = enqueue_one_to_one(&pool, id, &def, "public.orders")
+            .await
+            .expect("enqueue");
+        assert_eq!(status, TransformStatus::Backfilling);
+        assert_eq!(chunk_count(&raw, id).await, 1);
+
+        resume_transform(&pool, "order_doubles")
+            .await
+            .expect("resume");
+        assert_eq!(chunk_count(&raw, id).await, 0);
+    }
+
+    /// Enqueues `id`'s chunks, claims its one chunk for [`WORKER`], then
+    /// pauses and resumes the definition while that claim is held (#332
+    /// leaves a held chunk alone).
+    async fn hold_a_chunk_across_a_resume(
+        pool: &Pool,
+        raw: &tokio_postgres::Client,
+        id: i64,
+        def: &TransformDef,
+        target: &str,
+        source: &str,
+    ) -> ClaimedChunk {
+        enqueue_one_to_one(pool, id, def, source)
+            .await
+            .expect("enqueue");
+        let mut held = claim_chunks(raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1, "precondition: one chunk held");
+        let held = held.remove(0);
+        assert_eq!(held.definition_id, id);
+        pause_transform(pool, target).await.expect("pause");
+        resume_transform(pool, target).await.expect("resume");
+        assert_eq!(
+            chunk_count(raw, id).await,
+            1,
+            "precondition: resume leaves the held chunk to its worker"
+        );
+        held
+    }
+
+    /// Issue #360, race 1 (write failed): a chunk held across the resume and
+    /// then released is discarded, not handed out again. Its failed write may
+    /// have committed part of its range, so the catch-up marker the rerun's
+    /// completion would have parked is parked here instead.
+    #[tokio::test]
+    async fn releasing_a_chunk_held_across_a_resume_discards_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_backfilling(&raw, "orders", "order_doubles", 3).await;
+        let held =
+            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
+                .await;
+        let parked = marker_generation(&raw, "public.orders").await;
+        assert!(parked.is_some(), "precondition: resume parked a marker");
+
+        let released = release_chunk(&mut raw, held.id, WORKER)
+            .await
+            .expect("release");
+        assert_eq!(released, 1);
+
+        assert_eq!(chunk_count(&raw, id).await, 0, "the chunk was discarded");
+        assert!(
+            claim_chunks(&raw, WORKER, 100)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "nothing is claimable again"
+        );
+        assert!(
+            marker_generation(&raw, "public.orders").await > parked,
+            "the catch-up the rerun would have parked is parked"
+        );
+    }
+
+    /// Issue #360, race 1 (worker died): the stale-claim sweep discards a
+    /// chunk held across its definition's resume, and still frees a
+    /// never-resumed sibling's stale claim for another worker.
+    #[tokio::test]
+    async fn reclaiming_a_chunk_held_across_a_resume_discards_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_backfilling(&raw, "orders", "order_doubles", 3).await;
+        let held =
+            hold_a_chunk_across_a_resume(&pool, &raw, id, &def, "order_doubles", "public.orders")
+                .await;
+        let parked = marker_generation(&raw, "public.orders").await;
+
+        let (sibling, sibling_def) = seed_backfilling(&raw, "items", "item_doubles", 3).await;
+        enqueue_one_to_one(&pool, sibling, &sibling_def, "public.items")
+            .await
+            .expect("enqueue sibling");
+        let sibling_held = claim_chunks(&raw, WORKER, 1).await.expect("claim sibling");
+        assert_eq!(sibling_held.len(), 1);
+        assert_eq!(sibling_held[0].definition_id, sibling);
+
+        // A zero TTL makes every claim taken in an earlier transaction stale.
+        let reclaimed = reclaim_stale_chunks(&mut raw, Duration::ZERO)
+            .await
+            .expect("reclaim");
+        assert_eq!(reclaimed, 2, "both stale claims are dealt with");
+
+        assert_eq!(chunk_count(&raw, id).await, 0, "the chunk was discarded");
+        assert!(
+            marker_generation(&raw, "public.orders").await > parked,
+            "the catch-up the rerun would have parked is parked"
+        );
+        let reclaimable = claim_chunks(&raw, WORKER, 100).await.expect("claim");
+        assert_eq!(
+            reclaimable
+                .iter()
+                .map(|c| (c.id, c.definition_id))
+                .collect::<Vec<_>>(),
+            [(sibling_held[0].id, sibling)],
+            "only the never-resumed sibling's chunk is claimable again, not {held:?}"
+        );
+    }
 }

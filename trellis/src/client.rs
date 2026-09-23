@@ -1595,8 +1595,8 @@ async fn sweep_stale_chunks_if_due(
     if Instant::now() < *next_due {
         return;
     }
-    if let Ok(client) = pool.get().await {
-        let _ = chunk_queue::reclaim_stale_chunks(&**client, reclaim_ttl).await;
+    if let Ok(mut client) = pool.get().await {
+        let _ = chunk_queue::reclaim_stale_chunks(&mut **client, reclaim_ttl).await;
     }
     *next_due = Instant::now() + interval;
 }
@@ -1667,8 +1667,8 @@ async fn drain_backfill_chunks(
             let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
         }
         Err(_) => {
-            if let Ok(client) = pool.get().await {
-                let _ = chunk_queue::release_chunk(&**client, chunk.id, claimed_by).await;
+            if let Ok(mut client) = pool.get().await {
+                let _ = chunk_queue::release_chunk(&mut **client, chunk.id, claimed_by).await;
             }
         }
     }
