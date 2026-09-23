@@ -347,10 +347,15 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 }
                 if !result.generator_bound {
                     eprintln!(
-                        "fold-in {}:1 — T3 {} at {} rows/sec: folded {} (offered {:.0}/sec)",
+                        "fold-in {}:1 — T3 {} at {} rows/sec: folded {} while offered, {} \
+                         (offered {:.0}/sec)",
                         result.fold_in_ratio,
                         if result.kept_target_rate { "YES" } else { "NO" },
                         result.target_rows_per_sec,
+                        match result.in_window_folded_rows_per_sec {
+                            Some(rate) => format!("{rate:.0} rows/sec"),
+                            None => "(too few samples to fit)".to_string(),
+                        },
                         match result.folded_rows_per_sec {
                             Some(rate) => format!("{rate:.0} rows/sec end to end"),
                             None => "never caught up within the grace period".to_string(),
@@ -420,6 +425,14 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                     "intake ceiling: {:.0} rows/sec appended under {:.0} rows/sec offered",
                     result.append_achieved_rows_per_sec, result.offered_achieved_rows_per_sec
                 );
+                if result.target_rows_per_sec.is_none() {
+                    eprintln!(
+                        "  (flat out, the generator competes with intake for the same Postgres \
+                         and depresses this; re-run with --rate a little above it, e.g. --rate \
+                         {:.0}, for the ceiling itself)",
+                        result.append_achieved_rows_per_sec * 1.5
+                    );
+                }
             }
             if result.append_backlog > 0 {
                 eprintln!(

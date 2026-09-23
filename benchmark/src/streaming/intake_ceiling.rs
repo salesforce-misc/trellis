@@ -19,6 +19,12 @@
 //! testkit clusters live under `$TMPDIR` — a RAM-backed tmpfs on the dev box —
 //! so the default window is short, and `--rate` paces the generator just above
 //! the ceiling being measured rather than flat out.
+//!
+//! **Pace it for the real number, too.** The generator and intake share one
+//! Postgres, so a flat-out generator's own writes slow intake down: at 1
+//! row/commit, ~12.8k rows/sec appended under a 428k/sec flat-out offer vs
+//! ~18k under `--rate 50000` (issue #276). A [`Pace::Max`] run finds roughly
+//! where the ceiling is; re-run with `--rate` a little above it to measure it.
 
 use std::time::{Duration, Instant};
 
