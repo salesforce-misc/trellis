@@ -64,6 +64,10 @@ Supporting counters/gauges keep the histograms interpretable:
 * `staging_segments{state}` — a cheap system-level gauge counting segments by
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost.
+* `intake_restarts_total{outcome}` — times CDC intake stopped (`error`, or
+  `stream_ended`) and the client restarted it with capped exponential backoff.
+  Every stop is also logged (`error!`/`warn!`) with the cause. A sustained
+  non-zero rate means source changes aren't being staged, so alert on it.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.

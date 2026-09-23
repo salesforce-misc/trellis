@@ -115,6 +115,13 @@ const RELATIONSHIP_REVERSE_DEFERRED_METRIC: &str = "trellis_relationship_reverse
 const RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC: &str =
     "trellis_relationship_reverse_fairness_escalated_total";
 
+/// Issue #325: count of times the client's CDC intake stopped and was
+/// restarted, labeled `outcome` (`error`: `run()` returned an error, or a
+/// restart's reconnect failed; `stream_ended`: the replication stream closed).
+/// Any sustained non-zero rate means source changes are not being staged.
+/// The matching `error!`/`warn!` log line carries the actual error.
+const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
+
 /// The process-wide recorder handle, built and installed on first use. See
 /// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
@@ -174,6 +181,11 @@ fn describe_metrics() {
         "Count of to-one relationship reverse transitions that exhausted their guard-gated \
          retry budget and were resolved via the fairness-escalation fallback instead of \
          deferring again."
+    );
+    metrics::describe_counter!(
+        INTAKE_RESTARTS_METRIC,
+        "Count of times CDC intake stopped and was restarted, labeled by outcome \
+         (error/stream_ended). Source changes are not staged while intake is down."
     );
 }
 
@@ -269,6 +281,13 @@ pub fn increment_relationship_reverse_deferred(guard: &str) {
 pub fn increment_relationship_reverse_fairness_escalated() {
     ensure_installed();
     metrics::counter!(RELATIONSHIP_REVERSE_FAIRNESS_ESCALATED_METRIC).increment(1);
+}
+
+/// Increments [`INTAKE_RESTARTS_METRIC`] by one for `outcome` (issue #325).
+/// Called from `client::supervise_intake` each time intake stops.
+pub fn increment_intake_restarts(outcome: &str) {
+    ensure_installed();
+    metrics::counter!(INTAKE_RESTARTS_METRIC, "outcome" => outcome.to_string()).increment(1);
 }
 
 /// A handle onto this process's in-process metrics registry — the public,

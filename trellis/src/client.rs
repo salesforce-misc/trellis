@@ -552,7 +552,7 @@ async fn run(
                 return;
             }
         };
-        let mut intake =
+        let intake =
             match intake::Intake::connect(&intake_config, watermark.clone(), pool.clone()).await {
                 Ok(intake) => intake,
                 Err(err) => {
@@ -564,9 +564,27 @@ async fn run(
         // it's crash-safe and resumable (acked LSNs are durable, and a
         // fresh `Intake::connect` resumes from the last confirmed
         // position), so it's safe to `.abort()` outright on shutdown rather
-        // than needing a cooperative exit path.
+        // than needing a cooperative exit path. The same property lets
+        // `supervise_intake` restart it after it stops (issue #325).
+        let mut connected = Some(intake);
+        let intake_watermark = watermark.clone();
+        let intake_pool = pool.clone();
         intake_task = Some(tokio::spawn(async move {
-            let _ = intake.run().await;
+            let slot = intake_config.slot.clone();
+            supervise_intake(&slot, INTAKE_RESTART_BACKOFF, move || {
+                let connected = connected.take();
+                let config = intake_config.clone();
+                let watermark = intake_watermark.clone();
+                let pool = intake_pool.clone();
+                async move {
+                    let mut intake = match connected {
+                        Some(intake) => intake,
+                        None => intake::Intake::connect(&config, watermark, pool).await?,
+                    };
+                    intake.run().await
+                }
+            })
+            .await;
         }));
 
         let maintenance_config = MaintenanceConfig {
@@ -664,6 +682,111 @@ async fn run(
         && let Ok(conn) = pool.get().await
     {
         let _ = staging::deregister_worker(&**conn, &client_id).await;
+    }
+}
+
+/// [`supervise_intake`]'s production backoff: 1s doubling to a 60s cap.
+const INTAKE_RESTART_BACKOFF: RestartBackoff =
+    RestartBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
+
+/// Exponential delay between intake restarts, capped at `max`. An attempt
+/// that stayed up for at least `max` counts as healthy, so the streak (and
+/// the delay) resets: a transient blip hours after the last one retries
+/// after `initial`, not after whatever a long-past streak escalated to.
+#[derive(Debug, Clone, Copy)]
+struct RestartBackoff {
+    initial: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl RestartBackoff {
+    const fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            max,
+            current: initial,
+        }
+    }
+
+    /// The delay before the next restart, given how long the attempt that
+    /// just ended ran for.
+    fn next_delay(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= self.max {
+            self.current = self.initial;
+        }
+        let delay = self.current;
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+}
+
+/// Issue #325: runs CDC intake for the client's whole lifetime, restarting
+/// it whenever it stops. Never returns; the client stops it by aborting
+/// the task (see [`run`]).
+///
+/// `attempt` is one full intake lifetime: connect (the client passes its
+/// already-connected `Intake` to the first attempt, so a setup failure still
+/// fails [`Client::start`]) then `run()`. Intake's future used to be spawned
+/// as `let _ = intake.run().await`, so any terminal error ended the task with
+/// nothing logged: the process kept running maintenance and looked healthy
+/// while it had stopped consuming CDC for good.
+///
+/// Every stop is now logged (`error!` for an `Err`, `warn!` for the stream
+/// ending: the client never configures a stop LSN, so a clean end means the
+/// server closed the stream), counted in `trellis_intake_restarts_total`, and
+/// followed by a restart after a [`RestartBackoff`] delay. Restarting is
+/// safe for the same reason aborting on shutdown is: acked LSNs are durable
+/// and `Intake::connect` resumes from the last confirmed position, and a
+/// failed attempt's staging transaction was rolled back before `run()`
+/// returned. The previous attempt's `Intake` (its producer session and
+/// replication connection) is dropped before the backoff sleep, so the
+/// restart doesn't race its own predecessor for the producer lock or the
+/// slot. If the server still holds either briefly, that restart fails
+/// `connect`, which is logged and retried like any other failure.
+///
+/// A deterministic error (one the same WAL will reproduce on every replay)
+/// retries forever at the capped delay, logging every time. That's
+/// deliberate: it's the loud, actionable signal the issue asks for, and
+/// the same log-and-retry-next-tick stance [`maintenance_loop`] takes.
+async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), IntakeError>>,
+{
+    let mut restarts: u64 = 0;
+    loop {
+        let started = Instant::now();
+        let outcome = attempt().await;
+        let ran_for = started.elapsed();
+        let retry_in = backoff.next_delay(ran_for);
+        restarts += 1;
+        match outcome {
+            Err(err) => {
+                tracing::error!(
+                    slot = %slot,
+                    error = %err,
+                    code = ?err.code(),
+                    ran_for = ?ran_for,
+                    retry_in = ?retry_in,
+                    restarts,
+                    "CDC intake stopped with an error; source changes are not being staged \
+                     until it restarts"
+                );
+                crate::metrics::increment_intake_restarts("error");
+            }
+            Ok(()) => {
+                tracing::warn!(
+                    slot = %slot,
+                    ran_for = ?ran_for,
+                    retry_in = ?retry_in,
+                    restarts,
+                    "CDC intake's replication stream ended; restarting it"
+                );
+                crate::metrics::increment_intake_restarts("stream_ended");
+            }
+        }
+        tokio::time::sleep(retry_in).await;
     }
 }
 
@@ -1556,6 +1679,180 @@ async fn wake_listener(
         _client: client,
         _task: task,
     })
+}
+
+#[cfg(test)]
+mod intake_supervisor_tests {
+    //! Issue #325: intake's terminal outcome must never vanish silently.
+    //! These drive [`supervise_intake`] with a fake attempt closure (no
+    //! Postgres), capturing `tracing` events on the test thread.
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct FieldVisitor(HashMap<String, String>);
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    struct CaptureLayer(Captured);
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor(HashMap::new());
+            event.record(&mut visitor);
+            self.0.0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                fields: visitor.0,
+            });
+        }
+    }
+
+    fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
+        (tracing::subscriber::set_default(subscriber), captured)
+    }
+
+    const FAST: RestartBackoff =
+        RestartBackoff::new(Duration::from_millis(1), Duration::from_millis(4));
+
+    /// The regression: a failing intake run used to end the task with the
+    /// error discarded (`let _ = intake.run().await`) — no log, no retry.
+    /// Now every failure is logged at `error!` with the error text and slot,
+    /// and intake is restarted rather than left dead.
+    #[tokio::test]
+    async fn failed_run_is_logged_at_error_and_restarted() {
+        let (_guard, captured) = install_capture();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut resumed_tx = Some(resumed_tx);
+
+        let counter = attempts.clone();
+        let supervisor = supervise_intake("slot_325", FAST, move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let resumed = if n == 2 { resumed_tx.take() } else { None };
+            async move {
+                if let Some(tx) = resumed {
+                    // Third attempt: a healthy, long-running consumer.
+                    let _ = tx.send(());
+                    std::future::pending::<()>().await;
+                }
+                Err(IntakeError::MissingProgressRow {
+                    slot: format!("slot_325_attempt_{n}"),
+                })
+            }
+        });
+
+        tokio::select! {
+            _ = supervisor => panic!("supervise_intake must never return"),
+            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
+                got.expect("intake was never restarted after failing")
+                    .expect("sender dropped");
+            }
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let events = captured.0.lock().unwrap().clone();
+        let errors: Vec<_> = events
+            .iter()
+            .filter(|e| e.level == tracing::Level::ERROR)
+            .collect();
+        assert_eq!(errors.len(), 2, "one error! per failed attempt: {events:?}");
+        for (i, event) in errors.iter().enumerate() {
+            assert_eq!(
+                event.fields.get("slot").map(String::as_str),
+                Some("slot_325")
+            );
+            let error = event.fields.get("error").expect("error field");
+            assert!(
+                error.contains(&format!("slot_325_attempt_{i}")),
+                "error field must carry the intake error's text, got {error:?}"
+            );
+        }
+
+        let rendered = crate::metrics::Metrics::new().render_prometheus();
+        assert!(
+            rendered.contains("trellis_intake_restarts_total{outcome=\"error\"}"),
+            "restart counter missing from:\n{rendered}"
+        );
+    }
+
+    /// A clean `Ok(())` from `run()` means the replication stream ended —
+    /// the client never configures a stop LSN, so that's just as dead as an
+    /// error and must be surfaced and restarted too.
+    #[tokio::test]
+    async fn stream_end_is_logged_and_restarted() {
+        let (_guard, captured) = install_capture();
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut resumed_tx = Some(resumed_tx);
+        let mut first = true;
+
+        let supervisor = supervise_intake("slot_325_eos", FAST, move || {
+            let resumed = if first { None } else { resumed_tx.take() };
+            first = false;
+            async move {
+                if let Some(tx) = resumed {
+                    let _ = tx.send(());
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        });
+
+        tokio::select! {
+            _ = supervisor => panic!("supervise_intake must never return"),
+            got = tokio::time::timeout(Duration::from_secs(10), resumed_rx) => {
+                got.expect("intake was never restarted after its stream ended")
+                    .expect("sender dropped");
+            }
+        }
+
+        let events = captured.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.level == tracing::Level::WARN
+                && e.fields.get("slot").map(String::as_str) == Some("slot_325_eos")),
+            "a stream end must be logged at warn: {events:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_to_the_cap_and_resets_after_a_healthy_run() {
+        let mut backoff = RestartBackoff::new(Duration::from_secs(1), Duration::from_secs(8));
+        let short = Duration::from_millis(10);
+        let delays: Vec<_> = (0..5).map(|_| backoff.next_delay(short)).collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 8].map(Duration::from_secs).to_vec(),
+            "exponential, capped at max"
+        );
+        // An attempt that stayed up at least `max` counts as healthy: the
+        // next failure is treated as a fresh one, not the tail of a streak.
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(8)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(backoff.next_delay(short), Duration::from_secs(2));
+    }
 }
 
 #[cfg(test)]
