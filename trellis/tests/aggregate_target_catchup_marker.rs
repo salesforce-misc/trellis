@@ -221,7 +221,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
         Duration::ZERO,
     )
     .await
-        .expect("issue #308: discharging a marker on an aggregate target must not fail");
+    .expect("issue #308: discharging a marker on an aggregate target must not fail");
     assert!(
         pending_markers(&client).await.is_empty(),
         "the discharged marker is deleted, not left to wedge the next pass"
@@ -233,7 +233,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
         Duration::ZERO,
     )
     .await
-        .expect("a later pass is a clean no-op");
+    .expect("a later pass is a clean no-op");
 
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
@@ -310,7 +310,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         Duration::ZERO,
     )
     .await
-        .expect("issue #308: discharging a marker on an aggregate target must not fail");
+    .expect("issue #308: discharging a marker on an aggregate target must not fail");
     assert!(
         pending_markers(&client).await.is_empty(),
         "the discharged marker is deleted, not left to wedge the next pass"
