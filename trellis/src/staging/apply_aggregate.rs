@@ -2292,8 +2292,11 @@ async fn apply_forced_groups_bulk(
 
     // 1. Survivor ordinals: which forced groups still have a source row
     // whose (possibly relationship-resolved) group key matches.
+    // The keyset joins onto `source` *after* its relationship joins, since
+    // the match can read a relationship alias (issue #330's review found
+    // the other order, where the `ON` names an alias not yet in scope).
     let survivor_sql = format!(
-        "select distinct k.ord::bigint from {} join {source_ident} s on {}{rel_joins_sql}",
+        "select distinct k.ord::bigint from {source_ident} s{rel_joins_sql} join {} on {}",
         keyset_unnest(&plan.group_by_types, 1, true),
         keyset_match_source(plan, "s", &null_safe),
     );
@@ -2400,7 +2403,7 @@ async fn apply_forced_groups_bulk(
         // than rebuilding the identical list.
         let insert_sql = format!(
             "insert into {target_ident} ({}) \
-             select {} from {} join {source_ident} s on {}{rel_joins_sql} \
+             select {} from {source_ident} s{rel_joins_sql} join {} on {} \
              group by {} \
              on conflict ({}) do update set {}",
             insert_cols.join(", "),
@@ -2640,11 +2643,11 @@ async fn probe_recompute_fields_bulk(
     // `keyset_match_source`. Empty/plain for a relationship-free plan,
     // leaving this SQL byte-identical.
     let sql = format!(
-        "select k.ord::bigint, {} from {} join {source_ident} s on {}{} group by k.ord",
+        "select k.ord::bigint, {} from {source_ident} s{} join {} on {} group by k.ord",
         select_exprs.join(", "),
+        rel_joins_sql(plan),
         keyset_unnest(&plan.group_by_types, 1, true),
         keyset_match_source(plan, "s", null_safe),
-        rel_joins_sql(plan),
     );
     let params: Vec<&(dyn ToSql + Sync)> = key_arrays
         .iter()
