@@ -1846,3 +1846,60 @@ async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
 
     trellis.shutdown().await.expect("shut down");
 }
+
+/// Issue #379: a relationship's projection table lives in the target schema of
+/// the connection that declared it, and dropping the relationship through a
+/// connection with a different target schema must drop that table, not look
+/// for it in the dropping connection's own schema and leave it behind.
+#[tokio::test]
+async fn dropping_a_relationship_drops_its_projection_from_the_declaring_target_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create schema elsewhere; \
+         create table authors (id bigint primary key, name text); \
+         create table posts (id bigint primary key, author bigint); \
+         alter table authors replica identity full; \
+         alter table posts replica identity full;",
+    )
+    .await
+    .expect("seed a from/to pair and a second target schema");
+
+    let declaring = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string())
+            .expect("valid dsn")
+            .with_target_schema("elsewhere")
+            .expect("valid target schema"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis targeting `elsewhere`");
+    declaring
+        .apply("RELATIONSHIP author FROM posts.author TO authors.id")
+        .await
+        .expect("declare a to-one relationship");
+    let relationship_id: i64 = raw
+        .query_one("select id from relationship_definitions", &[])
+        .await
+        .expect("read the relationship's id")
+        .get(0);
+    let projection = format!("_trellis_rel_projection_{relationship_id}");
+    assert!(
+        table_exists(&raw, "elsewhere", &projection).await,
+        "the projection is created in the declaring connection's target schema"
+    );
+
+    let dropping = define_only(db.dsn()).await;
+    dropping
+        .apply("DROP RELATIONSHIP posts.author")
+        .await
+        .expect("nothing reads it, so it drops");
+    assert!(
+        !table_exists(&raw, "elsewhere", &projection).await,
+        "the projection is dropped from the schema it was created in"
+    );
+
+    declaring.shutdown().await.expect("shut down");
+    dropping.shutdown().await.expect("shut down");
+}

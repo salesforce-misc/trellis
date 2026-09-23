@@ -4544,12 +4544,24 @@ async fn assert_replica_identity_supports_projection(
 pub struct RelationshipProjection {
     pub id: i64,
     pub relationship_id: i64,
-    /// The physical table's bare name — schema-qualify it with
-    /// [`super::ddl::qualified_relationship_projection_table`] and this
-    /// [`Pool`]'s own `target_schema()` before querying it directly, the
-    /// same convention [`Definition::target_table`] documents for a
-    /// transform's own target.
+    /// The schema the projection table was created in: the `target_schema` of
+    /// the connection that declared the relationship, which need not be the
+    /// reading connection's (issue #379).
+    pub projection_schema: String,
+    /// The physical table's bare name. [`Self::qualified_table`] gives the
+    /// form to interpolate into SQL.
     pub projection_table: String,
+}
+
+impl RelationshipProjection {
+    /// `projection_schema.projection_table`, each part quoted for direct
+    /// interpolation into DDL/DML text.
+    pub fn qualified_table(&self) -> String {
+        ddl::qualified_relationship_projection_table(
+            &self.projection_schema,
+            &self.projection_table,
+        )
+    }
 }
 
 /// Reads back the settled parent projection for the relationship
@@ -4563,15 +4575,16 @@ pub async fn relationship_projection(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select id, relationship_id, projection_table from relationship_projections \
-             where relationship_id = $1",
+            "select id, relationship_id, projection_schema, projection_table \
+             from relationship_projections where relationship_id = $1",
             &[&relationship_id],
         )
         .await?;
     Ok(row.map(|row| RelationshipProjection {
         id: row.get(0),
         relationship_id: row.get(1),
-        projection_table: row.get(2),
+        projection_schema: row.get(2),
+        projection_table: row.get(3),
     }))
 }
 
@@ -4654,15 +4667,19 @@ async fn ensure_relationship_projection_in_txn(
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
     let to_col_ident = quote_ident(to_col);
 
+    // Issue #379: an existing projection is widened where it was created,
+    // whatever `target_schema` this caller runs under; `target_schema` only
+    // places a new one.
     let existing = txn
         .query_opt(
-            "select projection_table from relationship_projections where relationship_id = $1",
+            "select projection_schema, projection_table from relationship_projections \
+             where relationship_id = $1",
             &[&relationship_id],
         )
         .await?;
 
-    let projection_table = match existing {
-        Some(row) => row.get::<_, String>(0),
+    let (projection_schema, projection_table) = match existing {
+        Some(row) => (row.get::<_, String>(0), row.get::<_, String>(1)),
         None => {
             let projection_table = ddl::relationship_projection_table_name(relationship_id);
             let qualified_projection =
@@ -4690,18 +4707,18 @@ async fn ensure_relationship_projection_in_txn(
             .await?;
 
             txn.execute(
-                "insert into relationship_projections (relationship_id, projection_table) \
-                 values ($1, $2)",
-                &[&relationship_id, &projection_table],
+                "insert into relationship_projections \
+                 (relationship_id, projection_schema, projection_table) values ($1, $2, $3)",
+                &[&relationship_id, &target_schema, &projection_table],
             )
             .await?;
 
-            projection_table
+            (target_schema.to_string(), projection_table)
         }
     };
 
     let qualified_projection =
-        ddl::qualified_relationship_projection_table(target_schema, &projection_table);
+        ddl::qualified_relationship_projection_table(&projection_schema, &projection_table);
 
     // Every data column (i.e. excluding the key and the two bookkeeping
     // columns) the projection currently carries, in ordinal order — the
@@ -4719,7 +4736,7 @@ async fn ensure_relationship_projection_in_txn(
         .query(
             "select column_name from information_schema.columns \
              where table_schema = $1 and table_name = $2 order by ordinal_position",
-            &[&target_schema, &projection_table],
+            &[&projection_schema, &projection_table],
         )
         .await?
         .into_iter()

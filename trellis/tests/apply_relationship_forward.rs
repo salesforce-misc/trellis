@@ -38,7 +38,7 @@ use trellis::defs::{
     relationship_projection, source_primary_key,
 };
 use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
+use trellis::staging::{TRUNCATE_SENTINEL_KEY, has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -656,10 +656,14 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
 /// (`writers`, `vendors`) with distinguishable values, so this pins only the
 /// from-side keying #288 fixes; the to-side is still keyed bare (#372).
 ///
-/// Only `shop.posts` gets a transform: two transforms over same-named source
-/// tables in different schemas trip a separate, pre-existing bare-suffix
-/// lookup in the drain's version fence (`source_table_versions` matched on
-/// `split_part(source_table, '.', 2)`), unrelated to relationships.
+/// Each relationship is declared through a pool whose `target_schema` is its
+/// own schema, so its settled projection lives there, while everything else
+/// runs through `db.pool` and its default target schema. Issue #379: every
+/// projection reader (the definition's widening, the forward read, the reverse
+/// advance and the `TRUNCATE` clear) must find the projection in the schema it
+/// was created in, not the reading pool's. Issue #380: both `blog.posts` and
+/// `shop.posts` carry a transform, which the drain's version fence used to
+/// reject by matching `source_table_versions` on the bare table name.
 #[tokio::test]
 async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to_side() {
     let cluster = TestCluster::start();
@@ -708,33 +712,30 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
     .await
     .expect("shop.posts declares its own `author`");
 
-    // Each to-one relationship's settled projection was created in its
-    // declaring pool's `target_schema` (`blog`/`shop`), but a reader looks
-    // for it in the *reading* pool's — a separate, pre-existing limitation of
-    // pools with different target schemas sharing one catalog, not what this
-    // test is about. Move both to where `db.pool` (which installs and drains
-    // everything below) looks for them.
     for (schema, relationship_id) in [("blog", blog_rel.id), ("shop", shop_rel.id)] {
-        client
-            .batch_execute(&format!(
-                "alter table {schema}._trellis_rel_projection_{relationship_id} \
-                 set schema {DEFAULT_TARGET_SCHEMA}"
-            ))
+        let projection = relationship_projection(&db.pool, relationship_id)
             .await
-            .expect("move the projection to the reading pool's target schema");
+            .expect("read projection catalog row")
+            .expect("to-one relationship has a projection");
+        assert_eq!(
+            projection.projection_schema, schema,
+            "the projection records the declaring pool's target schema"
+        );
     }
 
-    install_definition(
-        &db.pool,
-        "TRANSFORM shop_feed FROM shop.posts SELECT author.name AS author_name",
-        &columns(&[
-            ("id", ValueType::Numeric),
-            ("author_id", ValueType::Numeric),
-        ]),
-        DEFAULT_TARGET_SCHEMA,
-    )
-    .await
-    .expect("install shop_feed");
+    for (target, schema) in [("blog_feed", "blog"), ("shop_feed", "shop")] {
+        install_definition(
+            &db.pool,
+            &format!("TRANSFORM {target} FROM {schema}.posts SELECT author.name AS author_name"),
+            &columns(&[
+                ("id", ValueType::Numeric),
+                ("author_id", ValueType::Numeric),
+            ]),
+            DEFAULT_TARGET_SCHEMA,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("install {target}: {e}"));
+    }
     // A bare to-one path isn't a shape the direct build renders, so the
     // definition falls back to the ring's enumeration of its existing rows
     // (`install_definition`'s `Unsupported` arm); drain it.
@@ -743,6 +744,11 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
         author_names(&client, "shop_feed").await,
         vec![(1, Some("vendor-1".to_string()))],
         "the initial enumeration must resolve shop.posts' own `author`, not blog.posts'"
+    );
+    assert_eq!(
+        author_names(&client, "blog_feed").await,
+        vec![(1, Some("writer-1".to_string()))],
+        "and blog.posts' own `author` for blog_feed"
     );
 
     // Forward: a new from-side row.
@@ -769,8 +775,8 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
         "the forward path must resolve shop.posts' own `author`, not blog.posts'"
     );
 
-    // Reverse, blog's to-side: recomputes `blog.posts`' rows, which no
-    // transform reads — shop_feed must not move.
+    // Reverse, blog's to-side: recomputes `blog.posts`' rows through
+    // blog's projection — shop_feed must not move.
     client
         .execute("update writers set name = 'writer-1b' where id = 1", &[])
         .await
@@ -792,6 +798,11 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
             (2, Some("vendor-1".to_string()))
         ],
         "a change to blog.posts' `author` to-side must not touch shop_feed"
+    );
+    assert_eq!(
+        author_names(&client, "blog_feed").await,
+        vec![(1, Some("writer-1b".to_string()))],
+        "the reverse recompute must re-derive blog.posts' rows through blog's own `author`"
     );
 
     // Reverse, shop's to-side: re-derives shop_feed's rows from `shop.posts`.
@@ -816,6 +827,45 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
             (2, Some("vendor-1b".to_string()))
         ],
         "the reverse recompute must re-derive shop.posts' rows through shop's own `author`"
+    );
+
+    // `TRUNCATE` on shop's to-side clears shop's projection, wherever it
+    // lives, and re-derives shop.posts' rows against the now-empty table.
+    client
+        .execute("truncate vendors", &[])
+        .await
+        .expect("truncate vendors");
+    stage_cdc(
+        &client,
+        "vendors",
+        TRUNCATE_SENTINEL_KEY,
+        "truncate",
+        None,
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        author_names(&client, "shop_feed").await,
+        vec![(1, None), (2, None)],
+        "a truncated to-side must clear shop's projection and every shop_feed value"
+    );
+    let shop_projection_rows: i64 = client
+        .query_one(
+            &format!(
+                "select count(*) from shop._trellis_rel_projection_{}",
+                shop_rel.id
+            ),
+            &[],
+        )
+        .await
+        .expect("count shop's projection rows")
+        .get(0);
+    assert_eq!(shop_projection_rows, 0, "shop's projection is cleared");
+    assert_eq!(
+        author_names(&client, "blog_feed").await,
+        vec![(1, Some("writer-1b".to_string()))],
+        "truncating shop's to-side must not touch blog_feed"
     );
 }
 

@@ -1117,12 +1117,9 @@ pub(crate) async fn build_relationship_context(
         match reldef.cardinality {
             RelationshipCardinality::ToOne => {
                 let projection = catalog::relationship_projection(pool, reldef.id).await?;
-                let qualified_projection = projection.as_ref().map(|p| {
-                    ddl::qualified_relationship_projection_table(
-                        pool.target_schema(),
-                        &p.projection_table,
-                    )
-                });
+                let qualified_projection = projection
+                    .as_ref()
+                    .map(catalog::RelationshipProjection::qualified_table);
 
                 let to_rows_by_key = match &qualified_projection {
                     Some(qualified_projection) => {
@@ -1288,9 +1285,10 @@ pub(crate) struct ReverseRelationshipShape {
     /// `information_schema.columns` (issue #131's own write path: which
     /// data columns to copy off the parent's new image).
     projection_table_bare: String,
-    /// The target schema `projection_table_bare` lives in — bare, for the
-    /// same `information_schema.columns` introspection.
-    target_schema: String,
+    /// The schema `projection_table_bare` lives in (the declaring
+    /// connection's `target_schema`, issue #379) — bare, for the same
+    /// `information_schema.columns` introspection.
+    projection_schema: String,
     to_col: String,
     from_table: String,
     from_col: String,
@@ -1592,11 +1590,8 @@ async fn build_reverse_relationship_shape(
     rel: &RelationshipDefinition,
 ) -> Result<ReverseRelationshipShape, ApplyError> {
     let projection = catalog::relationship_projection(pool, rel.id).await?;
-    let (qualified_projection, projection_table_bare) = match projection {
-        Some(p) => (
-            ddl::qualified_relationship_projection_table(pool.target_schema(), &p.projection_table),
-            p.projection_table,
-        ),
+    let (qualified_projection, projection_schema, projection_table_bare) = match projection {
+        Some(p) => (p.qualified_table(), p.projection_schema, p.projection_table),
         None => {
             tracing::error!(
                 relationship = %rel.def.name,
@@ -1605,10 +1600,9 @@ async fn build_reverse_relationship_shape(
                  reverse record for it will be treated as an ordering-check \
                  miss (should be unreachable — #129 creates one unconditionally)"
             );
-            (String::new(), String::new())
+            (String::new(), String::new(), String::new())
         }
     };
-    let target_schema = pool.target_schema().to_string();
     // `transforms_for_source` matches `schema_nodes.table_name` exactly
     // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
     // (`AggregateTargetPlan::source`, `from_side_rows_for_trigger_txn`'s
@@ -1803,7 +1797,7 @@ async fn build_reverse_relationship_shape(
         id: rel.id,
         qualified_projection,
         projection_table_bare,
-        target_schema,
+        projection_schema,
         to_col: rel.def.to_col.clone(),
         from_table: qualified_from_table,
         from_col: rel.def.from_col.clone(),
@@ -2723,7 +2717,7 @@ fn augment_row_with_relationship_value(
 /// function is private to `defs::catalog`.
 async fn projection_data_columns(
     txn: &Transaction<'_>,
-    target_schema: &str,
+    projection_schema: &str,
     projection_table_bare: &str,
     to_col: &str,
 ) -> Result<Vec<String>, ApplyError> {
@@ -2736,7 +2730,7 @@ async fn projection_data_columns(
         .query(
             "select column_name from information_schema.columns \
              where table_schema = $1 and table_name = $2 order by ordinal_position",
-            &[&target_schema, &projection_table_bare],
+            &[&projection_schema, &projection_table_bare],
         )
         .await?;
     Ok(rows
@@ -2801,7 +2795,7 @@ async fn apply_projection_advance(
     };
     let data_columns = projection_data_columns(
         txn,
-        &shape.target_schema,
+        &shape.projection_schema,
         &shape.projection_table_bare,
         &shape.to_col,
     )
@@ -5461,12 +5455,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             if rel.cardinality == RelationshipCardinality::ToOne
                 && let Some(projection) = catalog::relationship_projection(pool, rel.id).await?
             {
-                relationship_projection_clears.insert(
-                    ddl::qualified_relationship_projection_table(
-                        pool.target_schema(),
-                        &projection.projection_table,
-                    ),
-                );
+                relationship_projection_clears.insert(projection.qualified_table());
             }
             // Issue #267: canonicalized to qualified identity for the same
             // reason [`accumulate_from_side_recomputes`] does it — this shares

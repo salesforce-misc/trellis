@@ -433,13 +433,16 @@ pub(crate) async fn drop_relationship(
         });
     }
 
-    let projection: Option<String> = txn
+    // Issue #379: the projection lives in the schema it was created in (the
+    // declaring connection's `target_schema`), not necessarily this pool's.
+    let projection: Option<(String, String)> = txn
         .query_opt(
-            "select projection_table from relationship_projections where relationship_id = $1",
+            "select projection_schema, projection_table from relationship_projections \
+             where relationship_id = $1",
             &[&reldef.id],
         )
         .await?
-        .map(|row| row.get(0));
+        .map(|row| (row.get(0), row.get(1)));
 
     // The `relationship` edge is persisted parent -> child (`to_table ->
     // from_table`; see `create_relationship`'s own comment for why that
@@ -471,11 +474,11 @@ pub(crate) async fn drop_relationship(
     )
     .await?;
 
-    if let Some(projection) = projection {
+    if let Some((projection_schema, projection_table)) = projection {
         txn.batch_execute(&format!(
             "drop table if exists {}.{}",
-            quote_ident(pool.target_schema()),
-            quote_ident(&projection)
+            quote_ident(&projection_schema),
+            quote_ident(&projection_table)
         ))
         .await?;
     }
