@@ -69,6 +69,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Client, Pool, quote_ident};
+use crate::staging::target_mutations::TargetMutations;
+use tokio_postgres::GenericClient;
 
 use super::ast::{
     Expr, GroupByKey, KeySpace, Operator, RelationshipDef, TransformDef, ValueType,
@@ -117,6 +119,11 @@ pub enum BackfillError {
     /// ring path uses. Such definitions must keep going through
     /// [`super::catalog::create_definition`]'s ring enumeration.
     Unsupported(String),
+    /// Staging a changed row's downstream propagation through the
+    /// target-mutation seam failed (issue #315) — only reachable from
+    /// [`backfill_altered_columns`], the one writer here whose target can
+    /// already have readers.
+    Propagation(Box<crate::staging::ApplyError>),
 }
 
 impl BackfillError {
@@ -135,6 +142,7 @@ impl BackfillError {
             BackfillError::Pool(err) => err.code(),
             BackfillError::Ddl(err) => err.code(),
             BackfillError::Unsupported(_) => ErrorCode::Internal,
+            BackfillError::Propagation(err) => err.code(),
         }
     }
 }
@@ -151,6 +159,12 @@ impl std::fmt::Display for BackfillError {
             BackfillError::Unsupported(what) => {
                 write!(f, "direct backfill does not support {what}")
             }
+            BackfillError::Propagation(err) => {
+                write!(
+                    f,
+                    "staging the backfill's downstream propagation failed: {err}"
+                )
+            }
         }
     }
 }
@@ -166,6 +180,12 @@ impl From<tokio_postgres::Error> for BackfillError {
 impl From<crate::error::Error> for BackfillError {
     fn from(err: crate::error::Error) -> Self {
         BackfillError::Pool(err)
+    }
+}
+
+impl From<crate::staging::ApplyError> for BackfillError {
+    fn from(err: crate::staging::ApplyError) -> Self {
+        BackfillError::Propagation(Box::new(err))
     }
 }
 
@@ -518,7 +538,7 @@ async fn backfill_one_to_one(
     let client = pool.get().await?;
     for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
         write_one_to_one_range(
-            &client,
+            &**client,
             def,
             target_schema,
             source_table,
@@ -574,10 +594,36 @@ pub(crate) async fn backfill_altered_columns(
     let pk = source_primary_key(pool, source_table).await?;
     let substituted = substitute_all_fields(def)?;
     let source = ddl::qualified_source_table(source_table);
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
+    // Issue #315: unlike a first build, this rewrites a live target that
+    // other definitions may already read, so each chunk's changed rows go
+    // through the target-mutation seam in the chunk's own transaction.
+    let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)
+        .map_err(|err| BackfillError::Unsupported(err.to_string()))?;
     for (lo, hi) in discover_pk_ranges(&client, &source, &pk).await? {
-        write_one_to_one_range(
-            &client,
+        let txn = client.transaction().await?;
+        let mut mutations = TargetMutations::new();
+        let prior_image_expr = mutations.image_sql(&txn, &qualified_target, "t").await?;
+        let mut prior_images: HashMap<String, String> = HashMap::new();
+        if let Some(expr) = &prior_image_expr {
+            // Row-lock the chunk's existing target rows in ascending key
+            // order (a drain's own pre-lock order) and capture each one's
+            // prior image before the write below changes it.
+            let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+            let sql = format!(
+                "select {}, ({expr})::text from {} t where {} order by {} for update",
+                ddl::pk_key_sql_expr(&pk, Some("t")),
+                qualified_target_table(target_schema, def),
+                pk_range_where(&pk_idents, &pk, &lo),
+                pk_idents.join(", "),
+            );
+            let params = range_params(&lo, &hi);
+            for row in txn.query(&sql, &params).await? {
+                prior_images.insert(row.get(0), row.get(1));
+            }
+        }
+        let written = write_one_to_one_range(
+            &*txn,
             def,
             target_schema,
             source_table,
@@ -588,8 +634,29 @@ pub(crate) async fn backfill_altered_columns(
             &hi,
         )
         .await?;
+        if prior_image_expr.is_some() {
+            for key in written {
+                let prior = prior_images.remove(&key);
+                mutations.record(&qualified_target, key, prior, 0, None);
+            }
+        }
+        mutations.flush(&txn).await?;
+        txn.commit().await?;
     }
     Ok(())
+}
+
+/// The bind parameters [`pk_range_where`]'s clause expects for `(lo, hi]`:
+/// `lo`'s values (when there is a lower bound), then `hi`'s.
+fn range_params<'a>(
+    lo: &'a Option<Vec<String>>,
+    hi: &'a [String],
+) -> Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)> {
+    lo.iter()
+        .flatten()
+        .chain(hi.iter())
+        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect()
 }
 
 /// The same `column_status` lookup `staging::quarantine::paused_columns_for`
@@ -608,7 +675,7 @@ pub(crate) async fn backfill_altered_columns(
 /// dependency would be circular). Empty (the overwhelmingly common case) for
 /// a definition with nothing currently paused.
 async fn paused_columns_for(
-    client: &Client,
+    client: &impl GenericClient,
     transform_table: &str,
 ) -> Result<HashSet<String>, BackfillError> {
     let rows = client
@@ -630,7 +697,7 @@ async fn paused_columns_for(
 /// chunk beyond re-deriving the (cheap, pure) substitution itself.
 #[allow(clippy::too_many_arguments)]
 async fn write_one_to_one_range(
-    client: &Client,
+    client: &impl GenericClient,
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
@@ -646,7 +713,7 @@ async fn write_one_to_one_range(
     restrict_to: Option<&HashSet<String>>,
     lo: &Option<Vec<String>>,
     hi: &[String],
-) -> Result<(), BackfillError> {
+) -> Result<Vec<String>, BackfillError> {
     let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
@@ -712,32 +779,51 @@ async fn write_one_to_one_range(
             .map(|f| format!("{f} = excluded.{f}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("on conflict ({pk_col_list}) do update set {update_sets}")
+        // `ALTER TRANSFORM`'s rewrite of a live target (`restrict_to`) skips
+        // a row whose written columns already hold the new values, so only a
+        // real change is reported below (issue #315).
+        let unchanged_guard = if restrict_to.is_some() {
+            format!(
+                " where ({}) is distinct from ({})",
+                field_idents
+                    .iter()
+                    .map(|f| format!("{target}.{f}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                field_idents
+                    .iter()
+                    .map(|f| format!("excluded.{f}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        } else {
+            String::new()
+        };
+        format!("on conflict ({pk_col_list}) do update set {update_sets}{unchanged_guard}")
     };
 
     let where_clause = pk_range_where(&pk_idents, pk, lo);
+    let params = range_params(lo, hi);
+    // Only `ALTER TRANSFORM`'s rewrite (`restrict_to`) reports the keys it
+    // changed, for the target-mutation seam: a first build's target has no
+    // reader yet (`catalog::reject_non_live_upstream`).
+    if restrict_to.is_some() {
+        let insert_sql = format!(
+            "insert into {target} ({insert_cols}) \
+             select {select_exprs} from {source} where {where_clause} \
+             {on_conflict} returning {}",
+            ddl::pk_key_sql_expr(pk, None),
+        );
+        let rows = client.query(&insert_sql, &params).await?;
+        return Ok(rows.into_iter().map(|row| row.get(0)).collect());
+    }
     let insert_sql = format!(
         "insert into {target} ({insert_cols}) \
          select {select_exprs} from {source} where {where_clause} \
          {on_conflict}"
     );
-    match lo {
-        None => {
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                hi.iter().map(|v| v as _).collect();
-            client.execute(&insert_sql, &params).await?;
-        }
-        Some(lo) => {
-            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                lo.iter().map(|v| v as _).collect();
-            params.extend(
-                hi.iter()
-                    .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)),
-            );
-            client.execute(&insert_sql, &params).await?;
-        }
-    }
-    Ok(())
+    client.execute(&insert_sql, &params).await?;
+    Ok(Vec::new())
 }
 
 /// The read-only "planning" half of [`backfill_one_to_one`] (docs/decisions/0007's
@@ -805,7 +891,7 @@ pub(crate) async fn execute_one_to_one_chunk(
     let lo = lo.map(decode).transpose()?;
     let hi = decode(hi)?;
     write_one_to_one_range(
-        &client,
+        &**client,
         def,
         target_schema,
         source_table,
@@ -815,7 +901,8 @@ pub(crate) async fn execute_one_to_one_chunk(
         &lo,
         &hi,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
@@ -1866,7 +1953,7 @@ async fn backfill_relationship_one_to_one(
     // ADR-0003's amendment (column-level quarantine): exclude any column
     // this definition currently has paused, same as `write_one_to_one_range`
     // — see that function's `paused_columns_for` doc comment.
-    let paused = paused_columns_for(&client, &def.target).await?;
+    let paused = paused_columns_for(&**client, &def.target).await?;
 
     // Build the INSERT's column list, its per-field SELECT expression, and the
     // ON CONFLICT update set. The primary key comes first, then one column per

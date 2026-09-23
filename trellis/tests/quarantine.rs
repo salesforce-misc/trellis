@@ -1301,6 +1301,7 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         is_truncate: false,
         relationship_reverse_deferred: None,
         retry_count: 0,
+        prior_image: None,
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 0)
@@ -1370,6 +1371,7 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         is_truncate: false,
         relationship_reverse_deferred: Some(999),
         retry_count: 1,
+        prior_image: None,
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
@@ -1735,6 +1737,7 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         is_truncate: false,
         relationship_reverse_deferred: None,
         retry_count: 0,
+        prior_image: None,
     }
 }
 

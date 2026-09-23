@@ -51,6 +51,7 @@ use super::append::{self, CdcOp, StagedChange};
 use super::append::{RING_SIZE, ring_table_name};
 use super::apply::{self, ApplyError};
 use super::fold::FoldedChange;
+use super::target_mutations::TargetMutations;
 use super::watermark::StagedWatermark;
 
 /// The fuse threshold ADR-0003 left open, decided here: a key evicts once
@@ -251,6 +252,13 @@ pub(super) async fn park_batch_contribution(
 ) -> Result<(), ApplyError> {
     for change in changes {
         let op = folded_change_op(change);
+        // Issue #315: a recompute's prior-image hint rides in `old_image`,
+        // exactly as it does in the ring, so `release_key` replays it.
+        let old_image = if op == "recompute" {
+            &change.prior_image
+        } else {
+            &change.old_image
+        };
         txn.execute(
             "insert into poison_held \
                  (src_table, key, seg_seq, op, lsn, old_image, new_image, \
@@ -264,7 +272,7 @@ pub(super) async fn park_batch_contribution(
                 &seg_seq,
                 &op,
                 &change.lsn,
-                &change.old_image,
+                old_image,
                 &change.new_image,
                 &change.origin_lsn,
                 &change.src_changed,
@@ -1764,6 +1772,16 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             column: column.to_string(),
         });
     }
+    // Issue #315: an aggregate column has nothing to recompute here. The
+    // aggregate apply path never honors a column pause (only a 1-1 plan
+    // drops paused columns — see `apply::compute`), so the column was never
+    // frozen, and the catch-up marker `resume_column` parks re-derives every
+    // group through the ordinary drain path anyway. The per-row write-back
+    // below keys on the *source* primary key, which an aggregate target
+    // doesn't have: it used to fail the whole resume.
+    if matches!(def.def.key_space, KeySpace::Aggregate { .. }) {
+        return Ok(());
+    }
 
     // Issue #121: this resume path's write-back below now keys on the
     // *target*'s full (possibly composite) primary key, through the shared,
@@ -1790,7 +1808,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         .collect::<Vec<_>>()
         .join(" or ");
 
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     // Issue #248: an explicit per-column `jsonb_build_object`, not
     // `to_jsonb(t.*)` — see `apply::row_as_text_jsonb_sql`'s doc comment for
     // why: `to_jsonb`'s own ISO-8601 writer renders `timestamp`/`timestamptz`
@@ -1938,6 +1956,45 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let mut excluded = paused_columns_for(pool, &def.def.target).await?;
     excluded.remove(column);
 
+    // Issue #315: the write-back goes through the target-mutation seam, in
+    // one transaction, so a definition chained off this target hears about
+    // every row whose value actually changed (the `is distinct from` guard
+    // leaves an unchanged row untouched and unreported). The whole target is
+    // row-locked up front in ascending key order, the same order a drain's
+    // own pre-lock takes (`apply::apply_target`), so holding every row's lock
+    // until commit can't deadlock against one; the same statement captures
+    // each row's prior image when something reads the target.
+    let txn = client.transaction().await?;
+    let mut mutations = TargetMutations::new();
+    let image_expr = mutations.image_sql(&txn, &def.target_table, "t").await?;
+    let lock_order = pk
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(&c.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let locked = txn
+        .query(
+            &format!(
+                "select {}, {} from {target_ident} t order by {lock_order} for update",
+                ddl::pk_key_sql_expr(&pk, Some("t")),
+                match &image_expr {
+                    Some(expr) => format!("({expr})::text"),
+                    None => "null::text".to_string(),
+                },
+            ),
+            &[],
+        )
+        .await?;
+    let mut prior_images: HashMap<String, Option<String>> = locked
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let update_sql = format!(
+        "update {target_ident} t set {col_ident} = $1::text::{pg_type} \
+         where {} = $2 and t.{col_ident} is distinct from $1::text::{pg_type}",
+        ddl::pk_key_sql_expr(&pk, Some("t")),
+    );
+
     for pk_text in &order {
         let row = &rows_by_pk[pk_text];
         let Ok(mut evaluated) = eval::evaluate_with_relationships_excluding(
@@ -1951,17 +2008,13 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             continue;
         };
         let value: Option<String> = evaluated.remove(column).flatten().map(|v| v.to_string());
-        client
-            .execute(
-                &format!(
-                    "update {target_ident} set {col_ident} = $1::text::{pg_type} \
-                     where {} = $2",
-                    ddl::pk_key_sql_expr(&pk, None)
-                ),
-                &[&value, pk_text],
-            )
-            .await?;
+        if txn.execute(&update_sql, &[&value, pk_text]).await? > 0 {
+            let prior = prior_images.remove(pk_text).flatten();
+            mutations.record(&def.target_table, pk_text.clone(), prior, 0, None);
+        }
     }
+    mutations.flush(&txn).await?;
+    txn.commit().await?;
 
     Ok(())
 }
@@ -2027,6 +2080,9 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
                     hop_gen,
                     group_key,
                     src_changed,
+                    // `park_batch_contribution` parks a hinted recompute's
+                    // prior image in `old_image` (issue #315).
+                    prior_image: old_image,
                 }
             } else {
                 let cdc_op = match op.as_str() {

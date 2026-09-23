@@ -51,6 +51,7 @@ use super::error::StagingError;
 use super::fold::{self, FoldedChange};
 use super::liveness::FenceMissBackoff;
 use super::quarantine;
+use super::target_mutations::TargetMutations;
 use super::watermark::StagedWatermark;
 
 /// The absolute ceiling on [`FoldedChange::hop_gen`] propagation, a backstop
@@ -453,10 +454,8 @@ impl From<crate::error::Error> for ApplyError {
 /// tolerating. Note what #267 *did* change is narrower than "always
 /// qualified everywhere": [`crate::defs::ddl::neighbor_table_name`] still
 /// deliberately returns a bare `def.target`, and this module still keys its
-/// own in-memory bookkeeping (`changed`, `ApplyPlan::downstream_readers`,
-/// `ApplyPlan::targets`) on that bare name. Only the string that crosses
-/// into the ring is canonicalized — see
-/// [`ApplyPlan::downstream_readers`].
+/// own in-memory bookkeeping (`ApplyPlan::targets` and friends) on that bare
+/// name. Only the string that crosses into the ring is canonicalized.
 ///
 /// This function's output stays purely a *lookup key* (issue #76's own
 /// reviewer follow-up): every catalog read below it (`source_table_version`,
@@ -491,8 +490,8 @@ fn catalog_source_key(src_table: &str) -> &str {
 ///
 /// 1. A chained definition's own target, bare as
 ///    [`crate::defs::ddl::neighbor_table_name`] always returns it — the
-///    `changed`/[`ApplyPlan::downstream_readers`] bookkeeping key `compute`'s
-///    "Downstream propagation" reader lookup asks about. This is
+///    bookkeeping key `compute`'s downstream-reader lookup (terminal-target
+///    latency metrics) asks about. This is
 ///    `resolve_graph_identity`'s bare-target-suffix fallback (for a target
 ///    that isn't on the `search_path`): the name can only be some other live
 ///    definition's own target.
@@ -510,8 +509,7 @@ fn catalog_source_key(src_table: &str) -> &str {
 /// staging: this function's output is now what those rows carry into the ring
 /// in the first place, so a bare `src_table` reaching `compute` is no longer
 /// something this module itself produces. See
-/// [`ApplyPlan::downstream_readers`] and
-/// [`accumulate_from_side_recomputes`] for the two emission sites, and
+/// [`accumulate_from_side_recomputes`] for the emission site, and
 /// [`catalog_source_key`] for why the reading side still tolerates a bare
 /// name anyway.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
@@ -958,8 +956,9 @@ async fn accumulate_from_side_recomputes(
     // publication member), and the spelling the Phase 3
     // `relationship_reverse_fallback` twin of this path has always used
     // (`ReverseRelationshipShape::from_table` is already qualified). Two
-    // spellings of one table fold as two unrelated `(src_table, key)` groups;
-    // see `ApplyPlan::downstream_readers` for what that costs.
+    // spellings of one table fold as two unrelated `(src_table, key)` groups,
+    // and a batch that upserts both hands Postgres the same conflict key
+    // twice (issue #267's live-lock).
     let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
     let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
     let matches = from_side_keys(
@@ -995,7 +994,7 @@ async fn accumulate_from_side_recomputes(
 /// resolves this in Phase 2 (the same catalog read that finds the projection
 /// table to query), so Phase 3 ([`apply_and_mark_drained_many`]'s gen-bump
 /// step) needs no catalog/pool access of its own to apply it — the same
-/// "decide in Phase 2, apply in Phase 3" split [`ApplyPlan::downstream_readers`]
+/// "decide in Phase 2, apply in Phase 3" split the rest of [`ApplyPlan`]
 /// already uses.
 ///
 /// **Issue #133 (closed the gap this comment used to describe):**
@@ -3019,7 +3018,7 @@ pub(crate) async fn to_column_types(
 /// per applied change, same as the per-transform histogram observes. This
 /// is *not* itself gated on terminal-ness: at the point every call site
 /// below runs, `compute` hasn't yet determined which targets in this batch
-/// are terminal (that's [`ApplyPlan::downstream_readers`], computed once,
+/// are terminal (that's `compute`'s downstream-reader lookup, computed once,
 /// after every source's changes have been evaluated — see the end of
 /// [`compute`]). Buffering here and filtering to only the terminal targets'
 /// entries there reuses that one dedup'd downstream-reader lookup instead of
@@ -3189,6 +3188,11 @@ struct ClearPlan {
 struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
+    /// The aggregate target's own row identity — its `GROUP BY` columns, as
+    /// `ddl::source_primary_key` reports them — so the clear can report each
+    /// cleared group's key to the seam (issue #315).
+    pk: Vec<PrimaryKeyColumn>,
+    src_changed: Option<std::time::SystemTime>,
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
@@ -3248,42 +3252,6 @@ mod tests {
         assert_eq!(
             row_to_json_text(&row),
             r#"{"gone":null,"id":"1","literal":"null","note":"say \"hi\"\n\\"}"#
-        );
-    }
-
-    /// Issue #180's step-4 guard: a key this batch both deleted (with a
-    /// captured pre-delete image) and wrote — reachable when the forward
-    /// aggregate apply and a per-record reverse-relationship apply touch one
-    /// group inside a single batch — must be reported as written, so the
-    /// captured image never rides downstream and annihilates the write's own
-    /// image-less `Recompute` in the fold.
-    #[test]
-    fn a_key_both_deleted_and_written_in_one_batch_counts_as_written() {
-        let touched: Vec<ChangedKey> = vec![
-            (
-                "gone".to_string(),
-                0,
-                None,
-                Some(r#"{"g":"gone"}"#.to_string()),
-            ),
-            (
-                "moved".to_string(),
-                0,
-                None,
-                Some(r#"{"g":"moved"}"#.to_string()),
-            ),
-            ("moved".to_string(), 0, None, None),
-            ("fresh".to_string(), 0, None, None),
-        ];
-        let written = keys_written_without_image(&touched);
-        assert!(
-            written.contains("moved"),
-            "a key deleted and then rewritten in the same batch must count as written"
-        );
-        assert!(written.contains("fresh"), "a plain write counts as written");
-        assert!(
-            !written.contains("gone"),
-            "a key only ever deleted must keep its image-bearing propagation"
         );
     }
 
@@ -4007,20 +3975,15 @@ mod tests {
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
 /// transaction, with no further catalog reads of its own beyond the version
-/// fence.
+/// fence and the target-mutation seam's reader lookup.
 ///
 /// `versions` is the version-fence's read set: every source table this
 /// batch evaluated against, and the `source_table_versions.version` Phase 2
 /// loaded for it (`None` for a source with no definitions at all — still
 /// fenced, so a definition created against it mid-drain is caught too).
-/// `downstream_readers` records, per target table this batch wrote to,
-/// whether any definition currently reads it *and*, when one does, the
-/// fully-qualified identity to stage that target's propagated `src_table`
-/// under — both decided here (a catalog read, like the evaluation lookups
-/// above it) rather than in Phase 3, which holds no pool connection of its
-/// own and must stay a pure, txn-scoped function. See
-/// [`apply_and_mark_drained`]'s doc comment on the staleness this implies
-/// and why it's an accepted tradeoff.
+/// Which targets have downstream readers is *not* decided here: Phase 3's
+/// target-mutation seam (`staging::target_mutations`) resolves that inside
+/// its own transaction, for every target any step wrote.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyPlan {
     versions: HashMap<String, Option<i64>>,
@@ -4032,94 +3995,15 @@ pub struct ApplyPlan {
     /// vs. `apply_aggregate::apply_aggregate_target`'s sequential per-group
     /// upserts) are different enough not to share one plan type.
     aggregate_targets: HashMap<String, AggregateTargetPlan>,
-    /// Per target table this batch wrote to: `Some(qualified_identity)` when
-    /// some definition currently reads that target (so step 4 must stage a
-    /// downstream trigger for it), `None` when nothing does (propagation
-    /// stops). Issue #267: the payload is the *qualified* identity
-    /// ([`qualified_schema_node_key`] of the bare `def.def.target`), not the
-    /// bare key this map is itself keyed on, because the bare name is the one
-    /// thing Phase 3 must *not* stage — see step 4's own comment, and
-    /// [`catalog_source_key`]'s doc comment for the wider convention.
-    /// Resolved here rather than in Phase 3 for the same reason the
-    /// has-a-reader question is: it needs a catalog read, and it costs
-    /// nothing extra since the reader lookup already performs exactly this
-    /// resolution.
-    downstream_readers: HashMap<String, Option<String>>,
-    /// Issue #312: the qualified targets whose CDC copy of this batch's writes
-    /// is redundant with step 4's in-transaction propagation, which Phase 3
-    /// names in its `intake::PROPAGATED_TABLES_MESSAGE_PREFIX` message so
-    /// intake drops that copy. A target qualifies when it has a downstream
-    /// reader (so step 4 propagates every key it writes), is not cleared by
-    /// an aggregate truncate this batch (step 2b propagates nothing), and is
-    /// not an endpoint of any relationship: a relationship's to-side needs its
-    /// image-bearing CDC to advance the settled parent projection (#131), and
-    /// its from-side needs it for the ring's `group_key` (#133), neither of
-    /// which an image-less `Recompute` carries.
-    propagated_in_txn: Vec<String>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
     /// The aggregate-target counterpart to [`ApplyPlan::clears`]: a
-    /// truncate on an aggregate definition's source clears every group, but
-    /// (unlike a 1-1 target's single-column primary key) there is no single
-    /// column shape to `RETURNING`-project a physically-changed group key
-    /// out of generically — so this is applied as a plain `DELETE FROM
-    /// <target>` (every group atomically gone), counted toward
-    /// [`ApplyOutcome::keys_deleted`], but
-    /// *not* staged for downstream propagation. A documented gap, not an
-    /// oversight: closing it needs composite-key downstream propagation,
-    /// out of scope for this issue (see `staging::apply_aggregate`'s module
-    /// doc comment for the rest of what this issue does cover).
-    ///
-    /// Investigated (issue #11 review, corrected during #51/#52 review, and
-    /// again by issue #121): could a definition actually be *created*
-    /// reading from an aggregate target today, making this skip a live
-    /// correctness gap rather than a moot one? Yes — and, as of issue #121,
-    /// for *both* downstream key-space shapes, not just one. Issue #177's
-    /// `catalog::create_definition_inner` gate used to reject any `OneToOne`
-    /// definition whose source had more than one primary-key column, which
-    /// closed this specific gap for a `OneToOne` read of a multi-column-
-    /// `GROUP BY` aggregate target (a single-column `GROUP BY` still produced
-    /// a genuinely single-column aggregate-target PK, so that narrower gate
-    /// never actually fired for *this* case either — it was never load-
-    /// bearing here). Issue #121 removed that gate along with the narrowing
-    /// it existed to enforce, so a `OneToOne` definition chained onto a
-    /// multi-column `GROUP BY` aggregate target is now fully creatable and
-    /// live too — the same shape a downstream **`Aggregate`** definition
-    /// (this field's own real shape, and issue #171's actual repro) already
-    /// was, since that shape needs no PK narrowing at all and was never
-    /// touched by #177's gate in the first place.
-    /// Previously (**[#103](https://github.com/salesforce-misc/trellis/issues/103)**
-    /// for one grouping column,
-    /// **[#171](https://github.com/salesforce-misc/trellis/issues/171)** for
-    /// several — both before #177's gate existed, and #171's case remains
-    /// live today for the `Aggregate` shape the gate doesn't cover),
-    /// the encoded group-key text (`derive_group_key`'s locally-invented
-    /// `"{len}:{value}"` shape, `apply_aggregate.rs`) reached a real
-    /// evaluator via [`ApplyPlan::aggregate_targets`]' `written`/`deleted`
-    /// downstream-propagation path (step 3b in
-    /// `apply_and_mark_drained_many`) and got misread as a raw PK value —
-    /// confirmed to crash for a numeric-typed single group column, plausibly
-    /// silently corrupting downstream rows for a text-typed one, and failing
-    /// the whole batch with `DdlError::MalformedCompositeKey` for a
-    /// multi-column `GROUP BY`. Fixed: `derive_group_key` emits exactly
-    /// `ddl::pk_key_sql_expr`'s own row-identity encoding at either arity
-    /// (the bare value for one grouping column, the U+001F join for
-    /// several), matching the aggregate target's real PK shape exactly, so a
-    /// chained definition's live refetch reads the correct key. This
-    /// paragraph's own "moot" claim was itself already corrected once,
-    /// during #51/#52 review — left in place (rather than deleted) as the
-    /// historical record of all three corrections.
-    ///
-    /// The *other* half of this field's gap — a truncate clear on an
-    /// aggregate source not propagating downstream at all (this field's own
-    /// doc comment, above) — is a separate, still-open item: #103's/#171's
-    /// fixes only correct the key a chained definition's live refetch
-    /// resolves against once a write/delete *does* propagate; they do not
-    /// add propagation to the truncate-clear path. That path now has no
-    /// encoding obstacle left (a group key at any arity is a valid composite
-    /// row identity), only the missing `RETURNING`-projection of the cleared
-    /// group keys noted above — still out of scope here.
+    /// truncate on an aggregate definition's source clears every group.
+    /// Applied by the same `clear_target` as a 1-1 clear, keyed by the
+    /// target's `GROUP BY` columns, so each cleared group reaches the seam
+    /// and a transform chained off the aggregate target sees it (issue #315;
+    /// this used to be a documented propagation gap).
     aggregate_clears: HashMap<String, AggregateClearPlan>,
     /// Issue #16: the (non-truncate) folded records whose `(src_table,
     /// key)` is already in the `poison` marker table — excluded from every
@@ -4191,6 +4075,22 @@ pub struct ApplyPlan {
     /// own comment on why this can't reuse [`ApplyPlan::relationship_reverses`]
     /// (a `TRUNCATE`'s sentinel carries no image to upsert or delete with).
     relationship_projection_clears: std::collections::HashSet<String>,
+}
+
+/// The image [`compute`] decodes as a change's *old side*: its folded
+/// `old_image` when it carries real images, or, for an image-less recompute,
+/// its prior-image hint (issue #315, `FoldedChange::prior_image`) — the row
+/// as it stood before an upstream target write. An image-less change is
+/// still re-read live for its new side; the old side only tells a
+/// downstream aggregate which *other* group to re-derive (see
+/// `apply_aggregate::accumulate_changes`), and a relationship reader which
+/// parent the row moved away from.
+fn old_side_image(change: &FoldedChange) -> Option<&String> {
+    if change.old_image.is_none() && change.new_image.is_none() {
+        change.prior_image.as_ref()
+    } else {
+        change.old_image.as_ref()
+    }
 }
 
 /// Phase 2 (design doc: "no transaction, no locks"): evaluates every
@@ -4512,7 +4412,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
         if needs_old_rows {
             for change in &changes {
-                let old_row = match &change.old_image {
+                let old_row = match old_side_image(change) {
                     Some(image_text) => Some(decode_image(pool, image_text).await?),
                     None => None,
                 };
@@ -4551,7 +4451,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         } else {
             let mut decoded = Vec::with_capacity(changes.len());
             for change in &changes {
-                decoded.push(match &change.old_image {
+                decoded.push(match old_side_image(change) {
                     Some(image_text) => Some(decode_image(pool, image_text).await?),
                     None => None,
                 });
@@ -5280,15 +5180,22 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         for def in &defs {
             match &def.def.key_space {
                 KeySpace::Aggregate { .. } => {
-                    aggregate_clears
-                        .entry(def.def.target.clone())
-                        .and_modify(|existing| {
-                            existing.hop_gen = existing.hop_gen.max(change.hop_gen)
-                        })
-                        .or_insert(AggregateClearPlan {
-                            hop_gen: change.hop_gen,
-                            qualified_target: def.target_table.clone(),
-                        });
+                    if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {
+                        existing.hop_gen = existing.hop_gen.max(change.hop_gen);
+                        existing.src_changed =
+                            earliest_src_changed(existing.src_changed, change.src_changed);
+                    } else {
+                        let pk = ddl::source_primary_key(pool, &def.target_table).await?;
+                        aggregate_clears.insert(
+                            def.def.target.clone(),
+                            AggregateClearPlan {
+                                hop_gen: change.hop_gen,
+                                qualified_target: def.target_table.clone(),
+                                pk,
+                                src_changed: change.src_changed,
+                            },
+                        );
+                    }
                 }
                 KeySpace::OneToOne => {
                     // Issue #121/#126: same full, un-narrowed primary key as
@@ -5400,7 +5307,6 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     }
 
     let mut downstream_readers = HashMap::new();
-    let mut propagated_in_txn = Vec::new();
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
@@ -5448,17 +5354,6 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let has_downstream = !catalog::transforms_for_source(pool, &qualified_target)
             .await?
             .is_empty();
-        if has_downstream
-            && !aggregate_clears.contains_key(target)
-            && catalog::relationships_to_table(pool, target)
-                .await?
-                .is_empty()
-            && catalog::relationships_from_table(pool, target)
-                .await?
-                .is_empty()
-        {
-            propagated_in_txn.push(qualified_target.clone());
-        }
         downstream_readers.insert(target.clone(), has_downstream.then_some(qualified_target));
         // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
         // recorded for a *terminal* transform — one with no downstream
@@ -5486,8 +5381,6 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         versions,
         targets,
         aggregate_targets,
-        downstream_readers,
-        propagated_in_txn,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -5705,55 +5598,10 @@ fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> Vec<Vec<&'a
         .collect()
 }
 
-/// One physically-touched target key, as [`apply_and_mark_drained_many`]'s
-/// `changed` accumulator and downstream-propagation step track it: the key
-/// text, the `hop_gen` it carries forward, (issues #51/#52's multi-hop gap)
-/// the `src_changed` origin it carries forward — `None` for an aggregate
-/// target's group key (see the 3b step's doc comment) or any other touched
-/// key with no traceable origin — and (issues #180/#196) the key's
-/// pre-delete image, `Some` only when this entry is a genuine deletion whose
-/// prior row state was captured at delete time (an extinct aggregate
-/// group's `AggregateApplyResult::deleted` entry, or a deleted 1-1 target
-/// row's own `apply_target`-captured entry — 3b's and step 3's doc comments
-/// respectively), `None` for every written key and for a deletion no
-/// producer captures an image for yet (the truncate-clear case — see step
-/// 4's own doc comment on why that one stays image-less). Step 4 reads this
-/// to decide whether a downstream `Recompute` can stay image-less (safe
-/// whenever a live refetch would find the *right* row — true for every
-/// write, and true for a delete only once a downstream chain's own live
-/// refetch is known to correctly see "gone") or must become an
-/// image-bearing delete instead, so a chained aggregate can subtract the
-/// extinct row's last-known contribution rather than silently dropping the
-/// change (issue #180, widened to the 1-1 target case by issue #196).
-type ChangedKey = (String, i32, Option<std::time::SystemTime>, Option<String>);
-
-/// One row [`apply_target`]'s delete statement actually removed: its key,
-/// paired with the pre-delete image captured by that statement's own
-/// `RETURNING ...` (issue #196) — an explicit per-column
-/// `jsonb_build_object(..., <col>::text, ...)::text`, not `to_jsonb(t.*)::text`
-/// (issue #248: see `row_as_text_jsonb_sql`'s doc comment for why) — the
-/// 1-1-target counterpart to `apply_aggregate::AggregateApplyResult::deleted`'s
-/// tuple.
-type TargetDeletedKey = (String, String);
-
-/// What [`apply_target`] did to one target: the keys it physically wrote, the
-/// keys it deleted (with their pre-delete images), and the keys its issue
-/// #344 basis check re-staged instead of applying.
-type AppliedTarget = (Vec<String>, Vec<TargetDeletedKey>, Vec<Restage>);
-
-/// Every key in one target's [`ChangedKey`] accumulator that this batch
-/// *wrote* (no captured pre-delete image), as a lookup set — the guard
-/// [`apply_and_mark_drained_many`]'s step 4 checks before it lets a
-/// captured image ride downstream as a real delete. See that call site's own
-/// comment for why a key that is both deleted and written inside one batch
-/// must propagate image-less.
-fn keys_written_without_image(touched: &[ChangedKey]) -> std::collections::HashSet<&str> {
-    touched
-        .iter()
-        .filter(|(_, _, _, old_image)| old_image.is_none())
-        .map(|(key, _, _, _)| key.as_str())
-        .collect()
-}
+/// What [`apply_target`] did to one target: how many keys it physically
+/// wrote and deleted (the keys themselves went to its [`TargetMutations`]),
+/// and the keys its issue #344 basis check re-staged instead of applying.
+type AppliedTarget = (usize, usize, Vec<Restage>);
 
 /// One evaluated row's values in `field_names` order, rendered to the text
 /// [`TargetWrite::values`] carries — shared by [`compute`] and
@@ -6044,16 +5892,13 @@ async fn reconcile_with_source(
 }
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed
-/// upsert and delete, returning the keys Postgres actually wrote to vs.
-/// deleted (as opposed to every key this batch merely *proposed* — the
+/// upsert and delete, reporting every key Postgres actually wrote or deleted
+/// (as opposed to every key this batch merely *proposed* — the
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
-/// proposed write physically changes nothing). Issue #196: each deleted key
-/// is paired with its pre-delete image (`RETURNING ...`, an explicit
-/// per-column `jsonb_build_object` per issue #248 — see [`TargetDeletedKey`]'s
-/// doc comment — the same shape `apply_aggregate::delete_group_row`'s issue
-/// #180 fix captures for an extinct aggregate group), so `apply_and_mark_drained_many`
-/// can stage a real image-bearing delete for a deleted 1-1 target row
-/// instead of an image-less `Recompute` — see [`ChangedKey`]'s doc comment.
+/// proposed write physically changes nothing) to `mutations`, with the
+/// key's prior image (issue #315, which subsumes #196's image-bearing
+/// delete: a deleted row's prior image is what lets a downstream aggregate
+/// find the group it left). Returns only the counts.
 ///
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
@@ -6095,9 +5940,10 @@ async fn apply_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &TargetPlan,
+    mutations: &mut TargetMutations,
 ) -> Result<AppliedTarget, ApplyError> {
     if plan.writes.is_empty() && plan.deletes.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok((0, 0, Vec::new()));
     }
 
     // Issue #344: settle every change whose source row moved on since Phase
@@ -6120,20 +5966,17 @@ async fn apply_target(
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)`, for the delete `RETURNING` below — see
-    // `row_as_text_jsonb_sql`'s doc comment for why. This target's full
-    // column set is exactly `pk` plus `field_names` (`ddl::create_target_table`'s
-    // own DDL never declares any other column), so — unlike the read paths
-    // above, which read tables this function doesn't control the shape of —
-    // no live `pg_catalog` introspection is needed here.
-    let old_image_columns: Vec<String> = plan
-        .pk
-        .iter()
-        .map(|c| c.name.clone())
-        .chain(plan.field_names.iter().cloned())
-        .collect();
-    let old_image_expr = row_as_text_jsonb_sql("t", &old_image_columns);
+    // Issue #315: the pre-lock below doubles as the prior-image capture every
+    // changed key reports to `mutations` — see `staging::target_mutations`.
+    // `None` (nothing reads this target) captures nothing.
+    let prior_image_expr = mutations
+        .image_sql(txn, &plan.qualified_target, "t")
+        .await?;
+    let prior_select = match &prior_image_expr {
+        Some(expr) => format!(", ({expr})::text"),
+        None => String::new(),
+    };
+    let lock_key_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
 
     // Issue #205/#121: `write.pk_text`/`delete.pk_text` is this target's
     // shared key-contract text, not necessarily raw PK value(s) yet — decode
@@ -6169,20 +6012,20 @@ async fn apply_target(
     lock_key_parts.sort_unstable();
     lock_key_parts.dedup();
 
-    if arity == 1 {
-        // Byte-identical to before issue #121: a single bound `text[]` array.
+    let locked = if arity == 1 {
+        // A single bound `text[]` array.
         let pk_ident = &pk_idents[0];
         let pk_cast = plan.pk[0].data_type.as_str();
         let lock_keys: Vec<&str> = lock_key_parts.iter().map(|p| p[0].as_str()).collect();
         txn.query(
             &format!(
-                "select {pk_ident} from {target_ident} \
-                 where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                 order by {pk_ident} for update"
+                "select {lock_key_expr}{prior_select} from {target_ident} as t \
+                 where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
+                 order by t.{pk_ident} for update"
             ),
             &[&lock_keys],
         )
-        .await?;
+        .await?
     } else {
         // Issue #121: a composite key has no single column an `= any(...)`
         // array test could name, so the pre-lock instead joins the target to
@@ -6194,7 +6037,7 @@ async fn apply_target(
         let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
         txn.query(
             &format!(
-                "select 1 from {target_ident} as t join {} on ({}) \
+                "select {lock_key_expr}{prior_select} from {target_ident} as t join {} on ({}) \
                  order by {} for update of t",
                 pk_keyset_unnest(&plan.pk, 1),
                 pk_keyset_match(&plan.pk, "t"),
@@ -6206,8 +6049,16 @@ async fn apply_target(
             ),
             &params,
         )
-        .await?;
-    }
+        .await?
+    };
+    let prior_images: HashMap<String, String> = if prior_image_expr.is_some() {
+        locked
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     let field_pg_types: Vec<Cow<'static, str>> = plan
         .field_types
@@ -6340,30 +6191,19 @@ async fn apply_target(
         .filter(|k| !write_keys.contains(&join_pk_parts(k)))
         .collect();
     if !delete_key_parts.is_empty() {
-        // Issue #196: `as t` + `old_image_expr` (an explicit per-column
-        // `jsonb_build_object`, issue #248 — not `to_jsonb(t.*)`, see
-        // `row_as_text_jsonb_sql`'s doc comment) captures each deleted
-        // row's exact pre-delete state, the same `apply_aggregate`'s
-        // `delete_group_row` does for an extinct aggregate group (issue
-        // #180) — see this function's own doc comment and `ChangedKey`'s for
-        // why a 1-1 target's delete needed this same treatment. `t.`-qualified
-        // (issue #121: the composite branch's `exists (...)` subquery below
-        // introduces a second relation into scope, so an unqualified column
-        // reference would become ambiguous) — a no-op qualification at
-        // arity 1, where `t` is still the sole table.
+        // `t.`-qualified (issue #121: the composite branch's `exists (...)`
+        // subquery below introduces a second relation into scope, so an
+        // unqualified column reference would become ambiguous).
         let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
         let rows = if arity == 1 {
-            // Byte-identical to before issue #121: `pk_ident` stays
-            // unqualified (no `t.` prefix) since `t` is the sole table in
-            // scope, exactly like `delete_group_row`'s own `where_sql`.
             let pk_ident = &pk_idents[0];
             let pk_cast = plan.pk[0].data_type.as_str();
             let delete_keys: Vec<&str> = delete_key_parts.iter().map(|p| p[0].as_str()).collect();
             txn.query(
                 &format!(
                     "delete from {target_ident} as t \
-                     where {pk_ident} = any($1::text[]::{pk_cast}[]) \
-                     returning {returning_pk_expr} as pk, {old_image_expr}::text as old_image"
+                     where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
+                     returning {returning_pk_expr} as pk"
                 ),
                 &[&delete_keys],
             )
@@ -6380,7 +6220,7 @@ async fn apply_target(
                 &format!(
                     "delete from {target_ident} as t \
                      where exists (select 1 from {} where {}) \
-                     returning {returning_pk_expr} as pk, {old_image_expr}::text as old_image",
+                     returning {returning_pk_expr} as pk",
                     pk_keyset_unnest(&plan.pk, 1),
                     pk_keyset_match(&plan.pk, "t"),
                 ),
@@ -6388,16 +6228,84 @@ async fn apply_target(
             )
             .await?
         };
-        deleted.extend(
-            rows.into_iter()
-                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1))),
+        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+    }
+
+    // Issue #315: report every physically-changed key to the seam, with the
+    // `hop_gen`/`src_changed` of the change that produced it and the prior
+    // image the pre-lock captured (`None` for a key this call created). Keyed
+    // by the *decoded* PK text (issue #205/#121), which for a target chained
+    // off a nullable grouping key can differ from `write.pk_text`'s encoded
+    // form — so the lookups below decode it the same way. A deleted row's
+    // prior image is what lets a downstream aggregate find the group it left
+    // (issues #180/#196, now a recompute hint rather than a delta).
+    let mut origin_of: HashMap<String, (i32, Option<std::time::SystemTime>)> = HashMap::new();
+    for (pk_text, hop_gen, src_changed) in plan
+        .writes
+        .iter()
+        .map(|w| (&w.pk_text, w.hop_gen, w.src_changed))
+        .chain(
+            plan.deletes
+                .iter()
+                .map(|d| (&d.pk_text, d.hop_gen, d.src_changed)),
+        )
+    {
+        if let Some(decoded) = decode_target_pk_text(&plan.pk, target, pk_text)? {
+            origin_of.insert(decoded, (hop_gen, src_changed));
+        }
+    }
+    let mut prior_images = prior_images;
+    for key in written.iter().chain(deleted.iter()) {
+        let (hop_gen, src_changed) = origin_of.get(key).copied().unwrap_or((0, None));
+        mutations.record(
+            &plan.qualified_target,
+            key.clone(),
+            prior_images.remove(key),
+            hop_gen,
+            src_changed,
         );
     }
 
     let span = tracing::Span::current();
     span.record("written", written.len());
     span.record("deleted", deleted.len());
-    Ok((written, deleted, restage))
+    Ok((written.len(), deleted.len(), restage))
+}
+
+/// A source `TRUNCATE`'s clear of one target (issue #60 for a 1-1 target,
+/// every group of an aggregate one): a plain `DELETE FROM <target>`, each
+/// removed row's key (in `pk`'s shared key-contract encoding,
+/// `ddl::pk_key_sql_expr` — for an aggregate target its `GROUP BY` columns,
+/// matching `apply_aggregate::derive_group_key`) and, when something reads
+/// the target, its image reported to `mutations` as the key's prior image
+/// (issue #315). Returns how many rows it deleted.
+async fn clear_target(
+    txn: &Transaction<'_>,
+    qualified_target: &str,
+    pk: &[PrimaryKeyColumn],
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    mutations: &mut TargetMutations,
+) -> Result<usize, ApplyError> {
+    let pk_key_expr = ddl::pk_key_sql_expr(pk, Some("t"));
+    let target_ident = ddl::qualified_target_table_ident(qualified_target);
+    let image_expr = mutations.image_sql(txn, qualified_target, "t").await?;
+    let image_select = match &image_expr {
+        Some(expr) => format!(", ({expr})::text"),
+        None => String::new(),
+    };
+    let rows = txn
+        .query(
+            &format!("delete from {target_ident} as t returning {pk_key_expr}{image_select}"),
+            &[],
+        )
+        .await?;
+    let cleared = rows.len();
+    for row in rows {
+        let prior = image_expr.as_ref().map(|_| row.get::<_, String>(1));
+        mutations.record(qualified_target, row.get(0), prior, hop_gen, src_changed);
+    }
+    Ok(cleared)
 }
 
 /// Phase 3 (design doc: "apply ∪ mark-drained are one transaction"). Given
@@ -6429,19 +6337,16 @@ async fn apply_target(
 ///    `__trellis_gen` bumped by 1, in this same transaction — see that
 ///    step's own inline comment for the exact semantics and the #133 gap it
 ///    documents.
-/// 4. **Downstream propagation**: for every physically-changed key (write
-///    or delete — no-op-suppressed writes don't count) in a target table at
-///    least one definition currently reads, stages a `Recompute` row at
-///    `hop_gen + 1`, enforcing [`MAX_HOP_GEN`] first. Whether a target has
-///    downstream readers was decided back in Phase 2
-///    ([`ApplyPlan::downstream_readers`]), not re-checked here: Phase 3
-///    holds no pool connection, only `txn`, and re-deriving "does anything
-///    read this table" is a catalog read like the ones Phase 2 already did
-///    for evaluation. A definition created between Phase 2 and this commit
-///    that starts reading a target for the first time is not missed
-///    forever — definition creation is responsible for backfilling its own
-///    new consumer against current target state, a separate concern from
-///    this batch's propagation.
+/// 4. **Downstream propagation**: every key a step above physically changed
+///    (write or delete — no-op-suppressed writes don't count) was reported to
+///    a [`TargetMutations`] (issue #315); for every such target some `live`
+///    definition reads, it stages an image-less `Recompute` at `hop_gen + 1`
+///    carrying the key's prior image, enforcing [`MAX_HOP_GEN`] first. See
+///    `staging::target_mutations` for why this seam, not CDC, is how a
+///    chained hop hears about its upstream target. A definition created
+///    between Phase 2 and this commit that starts reading a target is not
+///    missed: its own backfill (or catch-up marker) derives it from current
+///    target state.
 /// 5. **The completion statement**: deletes this claim's `seg_claims` rows
 ///    and ORs their buckets into `segments.drained_mask`, flipping
 ///    `state` to `'drained'` once every bucket has drained — one statement,
@@ -6473,26 +6378,6 @@ pub async fn apply_and_mark_drained(
         deferral_counts: outcome.deferral_counts,
         fairness_escalations: outcome.fairness_escalations,
     })
-}
-
-/// Step 0 of [`apply_and_mark_drained_many`] (issue #312): emits the
-/// transactional `intake::PROPAGATED_TABLES_MESSAGE_PREFIX` message naming
-/// [`ApplyPlan::propagated_in_txn`], if there are any.
-async fn emit_propagated_tables(txn: &Transaction<'_>, plan: &ApplyPlan) -> Result<(), ApplyError> {
-    if plan.propagated_in_txn.is_empty() {
-        return Ok(());
-    }
-    let content =
-        crate::intake::encode_propagated_tables(plan.propagated_in_txn.iter().map(String::as_str));
-    txn.execute(
-        // `current_schema()` is the instance schema (the pool pins it first
-        // on `search_path`), which scopes the message to this instance's
-        // intake. See `intake::PROPAGATED_TABLES_MESSAGE_PREFIX`.
-        "select pg_logical_emit_message(true, $1 || current_schema(), $2::bytea)",
-        &[&crate::intake::PROPAGATED_TABLES_MESSAGE_PREFIX, &content],
-    )
-    .await?;
-    Ok(())
 }
 
 /// The [`apply_and_mark_drained`] steps generalized over `seg_seqs` — issue
@@ -6540,13 +6425,6 @@ pub async fn apply_and_mark_drained_many(
     wake_channel: &str,
     watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
-    // 0. Issue #312: name the targets whose writes step 4 propagates
-    // downstream inside this transaction, so intake drops the CDC copy of
-    // those same writes instead of staging each one a second time. See
-    // `intake::PROPAGATED_TABLES_MESSAGE_PREFIX`. First, so the message
-    // precedes every target write in the decoded stream.
-    emit_propagated_tables(txn, plan).await?;
-
     // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
     // comment); `source_table_versions.source_table` is qualified as of
     // issue #72, so this matches against its bare table-name suffix, same
@@ -6605,71 +6483,49 @@ pub async fn apply_and_mark_drained_many(
     // doc comment) — buffered under the exact same post-commit-only
     // contract as `deferral_counts` just above, for the same reason.
     let mut fairness_escalations: u64 = 0;
-    // `changed` accumulates rather than overwrites per target (`extend`,
-    // not `insert`): a target can appear in both `plan.clears` and
-    // `plan.targets` in the same batch — a truncate clear followed by a
-    // same-batch post-truncate write to the same target — and both halves'
-    // physically-touched keys must propagate downstream. The third tuple
-    // element (see [`ChangedKey`]) is `src_changed` (issues #51/#52's
-    // multi-hop gap), carried into the `Recompute` row step 4 stages for
-    // this key, so a downstream hop reached purely through automatic
-    // propagation still traces back to a real origin.
-    let mut changed: HashMap<&str, Vec<ChangedKey>> = HashMap::new();
+    // Issue #315: every target write below reports its physically-changed
+    // keys here, and step 4 turns them into downstream `Recompute` rows. See
+    // `staging::target_mutations` — no writer hands its keys back to this
+    // function, so none can skip propagation.
+    let mut mutations = TargetMutations::new();
 
     // 2. Truncate clears, before this target's own upsert/delete below —
     // see this function's doc comment on why "clear, then write" is safe
     // here specifically (single-bucket batch, barrier-drained).
-    for (target, clear) in &plan.clears {
-        // Issue #121: the truncate-cleared key text is this target's shared
-        // key-contract text at whatever arity `clear.pk` has (a bare
-        // `{col}::text` at arity 1, byte-identical to before this issue) —
-        // the same encoding a chained downstream definition's live re-fetch
-        // (`read_live_rows_batch`) already expects.
-        let pk_key_expr = ddl::pk_key_sql_expr(&clear.pk, None);
-        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
-        let cleared: Vec<String> = txn
-            .query(
-                &format!("delete from {target_ident} returning {pk_key_expr} as pk"),
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        keys_deleted += cleared.len();
-        if cleared.is_empty() {
-            continue;
-        }
-        // A truncate clear's own downstream propagation stays image-less
-        // (`None`, the 4th [`ChangedKey`] field) — that gap is #98/#165/#168's
-        // tracked territory, not issue #180's (which only threads an image
-        // through the aggregate-group-extinction case below).
-        let touched: Vec<ChangedKey> = cleared
-            .into_iter()
-            .map(|k| (k, clear.hop_gen, clear.src_changed, None))
-            .collect();
-        changed.entry(target.as_str()).or_default().extend(touched);
+    for clear in plan.clears.values() {
+        keys_deleted += clear_target(
+            txn,
+            &clear.qualified_target,
+            &clear.pk,
+            clear.hop_gen,
+            clear.src_changed,
+            &mut mutations,
+        )
+        .await?;
     }
 
-    // 2b. Aggregate truncate clears — see [`ApplyPlan::aggregate_clears`]'s
-    // doc comment on why these are a plain full-table delete with no
-    // downstream propagation, unlike every other clear/write/delete this
-    // function tracks via `changed`.
+    // 2b. Aggregate truncate clears: every group of an aggregate target
+    // whose source was truncated, the same `clear_target` as step 2 over the
+    // target's `GROUP BY` key (issue #315: each cleared group reaches the
+    // seam, where it used to go unpropagated).
     for clear in plan.aggregate_clears.values() {
-        let target_ident = ddl::qualified_target_table_ident(&clear.qualified_target);
-        let cleared = txn
-            .execute(&format!("delete from {target_ident}"), &[])
-            .await?;
-        keys_deleted += cleared as usize;
+        keys_deleted += clear_target(
+            txn,
+            &clear.qualified_target,
+            &clear.pk,
+            clear.hop_gen,
+            clear.src_changed,
+            &mut mutations,
+        )
+        .await?;
     }
 
     // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
     // to-one relationship's to-side table empties that relationship's
-    // projection too, same "whole table" shape as 2b just above (and for
-    // the same reason: nothing here can enumerate which specific keys the
-    // truncate removed, and every row this projection held for this
-    // relationship just vanished along with it). No downstream propagation
-    // of its own, same as 2b — the from-side recompute this same truncate
+    // projection too, as a whole-table delete: every row this projection held
+    // for this relationship just vanished along with the to-side's. No
+    // downstream propagation of its own — the projection is not a target
+    // table, and the from-side recompute this same truncate
     // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
     // definition; the projection is only ever read by
     // `build_relationship_context`/the reverse-guard machinery, never a
@@ -6684,132 +6540,32 @@ pub async fn apply_and_mark_drained_many(
     lock_one_to_one_keys(txn, &plan.targets).await?;
     let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
-        let (written, deleted, restage) = apply_target(txn, target, target_plan).await?;
+        let (written, deleted, restage) =
+            apply_target(txn, target, target_plan, &mut mutations).await?;
         restaged.extend(restage);
-        keys_written += written.len();
-        keys_deleted += deleted.len();
-
-        if written.is_empty() && deleted.is_empty() {
-            continue;
-        }
-
-        // Issue #205/#121: `written`/`deleted` are keyed by `apply_target`'s
-        // *decoded* PK text (the value actually stored/matched, per
-        // `decode_target_pk_text`), which for a target chained off a
-        // nullable grouping key can differ from `target_plan.writes`/
-        // `.deletes`' own `pk_text` (the shared key-contract's still-encoded
-        // form) — and, for a composite key, is the whole tuple's canonical
-        // joined text, not any one column alone. Re-decode here too, so this
-        // lookup is keyed the same way — for every not-null-PK target (the
-        // overwhelming majority) decoding is a no-op and this is
-        // byte-identical to a plain `pk_text` key, as before. A `None`
-        // decode is skipped: `apply_target` never returns such a key in
-        // `written`/`deleted` (see that function's own doc comment), so it
-        // would never be looked up anyway.
-        let mut hop_gen_of: HashMap<String, i32> = HashMap::new();
-        let mut src_changed_of: HashMap<String, Option<std::time::SystemTime>> = HashMap::new();
-        for w in &target_plan.writes {
-            if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &w.pk_text)? {
-                hop_gen_of.insert(decoded.clone(), w.hop_gen);
-                src_changed_of.insert(decoded, w.src_changed);
-            }
-        }
-        for d in &target_plan.deletes {
-            if let Some(decoded) = decode_target_pk_text(&target_plan.pk, target, &d.pk_text)? {
-                hop_gen_of.insert(decoded.clone(), d.hop_gen);
-                src_changed_of.insert(decoded, d.src_changed);
-            }
-        }
-
-        // Issue #196: a deleted 1-1 target row's downstream propagation used
-        // to stay image-less (`None`) here — the same "same failure family,
-        // different producer" gap issue #180 fixed for extinct aggregate
-        // groups, left unthreaded for this producer at the time. `deleted`
-        // now carries each row's pre-delete image straight from
-        // `apply_target`'s own `RETURNING` (an explicit per-column
-        // `jsonb_build_object`, issue #248), so it stages
-        // the same way 3b's extinct-group `deleted` entries do below —
-        // `Some(old_image)`, letting a chained downstream aggregate subtract
-        // this row's last-known contribution (`accumulate_changes`'s
-        // `(Some(old_row), None)` branch) instead of a live refetch finding
-        // nothing and silently dropping the change. Step 4's same-batch
-        // write-vs-delete guard (issue #180 hardening, `e28a89c`) already
-        // applies here for free: it reads generically off `changed`'s
-        // per-target `touched` vector, regardless of which step populated
-        // it, so this needs no guard logic of its own — see that guard's own
-        // comment at the step 4 call site.
-        let written_touched = written.into_iter().map(|key| {
-            let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
-            let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
-            (key, hop_gen, src_changed, None)
-        });
-        let deleted_touched = deleted.into_iter().map(|(key, old_image)| {
-            let hop_gen = hop_gen_of.get(key.as_str()).copied().unwrap_or(0);
-            let src_changed = src_changed_of.get(key.as_str()).copied().flatten();
-            (key, hop_gen, src_changed, Some(old_image))
-        });
-        let touched: Vec<ChangedKey> = written_touched.chain(deleted_touched).collect();
-        changed.entry(target.as_str()).or_default().extend(touched);
+        keys_written += written;
+        keys_deleted += deleted;
     }
 
     // 3b. Aggregate targets: same ordered-write step as 3, above, for
     // [`KeySpace::Aggregate`] definitions — see `apply_aggregate`'s doc
     // comment for the per-group delta/probe logic itself. Written/deleted
-    // groups fold into the same `changed` accounting as the 1-1 case, so
-    // downstream propagation below needs no branching of its own. This
-    // stages Recompute rows keyed by `apply_aggregate::derive_group_key`'s
-    // key, same as any 1-1 target — see [`ApplyPlan::aggregate_clears`]'s
-    // doc comment, corrected during #51/#52's review: chaining a definition
-    // onto an aggregate target *is* live and reachable, at any `GROUP BY`
-    // arity. That key used to be a locally-invented, length-prefixed
-    // encoding, which a chained definition's live refetch
-    // (`read_live_rows_batch`, above) would then try to bind as the target's
-    // real primary key — corrupting or crashing that refetch for a
-    // single-column `GROUP BY`
-    // ([#103](https://github.com/salesforce-misc/trellis/issues/103)) and
-    // failing it outright with `DdlError::MalformedCompositeKey` for a
-    // multi-column one
-    // ([#171](https://github.com/salesforce-misc/trellis/issues/171)). Both
-    // now fixed: `derive_group_key` emits exactly `ddl::pk_key_sql_expr`'s
-    // own identity encoding at either arity (the bare value for one column,
-    // the U+001F join for several), matching the target's real PK shape.
-    // `src_changed` (issue #104, follow-up to #51/#52 once #103 made
-    // aggregate-target chaining live rather than moot) is threaded from
-    // each touched [`apply_aggregate::GroupPlan`]'s own `src_changed` —
-    // folded there by `accumulate_changes` via the same
-    // [`earliest_src_changed`] fan-in tie-break this module's 1-1 path
-    // uses, so a `Recompute` staged for a transform chained off an
-    // aggregate target now carries a real origin instead of always
-    // reading `None`.
-    //
-    // Issue #180: `result.deleted` additionally carries each extinct group's
-    // pre-delete image (`AggregateApplyResult::deleted`'s own doc comment) —
-    // threaded through as this `ChangedKey`'s 4th field so step 4 below can
-    // stage a real image-bearing delete instead of an image-less `Recompute`
-    // for exactly this case, closing the gap
-    // `defs_aggregate_chained_composite_group_key.rs`'s
-    // `a_live_insert_and_an_extinct_composite_group_both_propagate_downstream`
-    // (formerly `..._hits_the_image_less_gap`) now pins as fixed.
-    for (target, agg_plan) in &plan.aggregate_targets {
-        // `&agg_plan.target` (issue #73's persisted identity), not the bare
-        // `target` map key — see `AggregateTargetPlan::target`'s doc
-        // comment. `target` itself stays bare here purely as the
-        // `changed`/`downstream_readers` bookkeeping key below.
-        let result =
-            apply_aggregate::apply_aggregate_target(txn, &agg_plan.target, agg_plan).await?;
-        keys_written += result.written.len();
-        keys_deleted += result.deleted.len();
-
-        if result.written.is_empty() && result.deleted.is_empty() {
-            continue;
-        }
-        changed.entry(target.as_str()).or_default().extend(
-            result
-                .written
-                .into_iter()
-                .map(|(key, hop_gen, src_changed)| (key, hop_gen, src_changed, None))
-                .chain(result.deleted),
-        );
+    // groups reach the seam keyed by `apply_aggregate::derive_group_key`,
+    // which emits exactly `ddl::pk_key_sql_expr`'s identity encoding at
+    // either arity (issues #103/#171), so a chained definition's live
+    // refetch reads the aggregate target's real key.
+    for agg_plan in plan.aggregate_targets.values() {
+        // `&agg_plan.target` (issue #73's persisted identity) — see
+        // `AggregateTargetPlan::target`'s doc comment.
+        let (written, deleted) = apply_aggregate::apply_aggregate_target(
+            txn,
+            &agg_plan.target,
+            agg_plan,
+            &mut mutations,
+        )
+        .await?;
+        keys_written += written;
+        keys_deleted += deleted;
     }
 
     // 3c. Relationship settled-parent projection gen bump (issue #130, epic
@@ -7246,34 +7002,20 @@ pub async fn apply_and_mark_drained_many(
             if target_plan.groups.is_empty() {
                 continue;
             }
-            let result =
-                apply_aggregate::apply_aggregate_target(txn, &agg_shape.target, &target_plan)
-                    .await?;
-            keys_written += result.written.len();
-            keys_deleted += result.deleted.len();
-            if !result.written.is_empty() || !result.deleted.is_empty() {
-                // Issue #180: same image-threading as the forward path's 3b
-                // step above — `result.deleted`'s pre-delete image lets step
-                // 4 stage a real image-bearing delete for an extinct group
-                // reached through the reverse-relationship fast path too.
-                // Issue #104: `result`'s own `src_changed` (folded into each
-                // touched `GroupPlan` above from this single `record`'s own
-                // `src_changed` — the diff_pass merges above) carries the
-                // same origin `record.src_changed` would, so no separate
-                // substitution is needed here, unlike before this fix, when
-                // `AggregateApplyResult`'s written/deleted shape carried no
-                // origin at all.
-                changed
-                    .entry(agg_shape.target.as_str())
-                    .or_default()
-                    .extend(
-                        result
-                            .written
-                            .into_iter()
-                            .map(|(key, hop_gen, src_changed)| (key, hop_gen, src_changed, None))
-                            .chain(result.deleted),
-                    );
-            }
+            // Issue #315: through the same seam as step 3b, so a transform
+            // chained off this aggregate target hears about the write. (This
+            // used to key its downstream bookkeeping by the qualified target,
+            // which Phase 2's bare-keyed reader map never matched, so the
+            // fast path's writes never propagated at all.)
+            let (written, deleted) = apply_aggregate::apply_aggregate_target(
+                txn,
+                &agg_shape.target,
+                &target_plan,
+                &mut mutations,
+            )
+            .await?;
+            keys_written += written;
+            keys_deleted += deleted;
         }
 
         // Fallback: anything the fast path doesn't cover for this
@@ -7319,120 +7061,15 @@ pub async fn apply_and_mark_drained_many(
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging
-    // anything.
-    let mut recompute_changes = Vec::new();
-    let mut hop_bound_tables = Vec::new();
-    let mut worst_hop_gen = 0;
-    for (target, touched) in &changed {
-        // Issue #267: `target` is the bare `def.def.target` this whole
-        // function keys its bookkeeping on, but the `src_table` staged below
-        // must be the qualified identity Phase 2 resolved for it — the same
-        // string CDC intake stages for this table if it is (or later becomes)
-        // a publication member in its own right, which every intermediate hop
-        // of a chain eventually does. `None` here means nothing reads this
-        // target, so propagation stops; see `ApplyPlan::downstream_readers`.
-        let Some(qualified_target) = plan
-            .downstream_readers
-            .get(*target)
-            .and_then(Option::as_ref)
-        else {
-            continue;
-        };
-        // Issue #180 hardening: one batch can physically touch the same
-        // target key more than once. The forward aggregate step (3b) and
-        // *each* per-record reverse-relationship fast-path apply (3d) extend
-        // this very same vector, so a group whose last from-side row moves
-        // away under one reverse record and whose first from-side row
-        // arrives under another is deleted by one apply and rewritten by
-        // the next, inside this one batch. Staging both an image-bearing
-        // delete and an image-less `Recompute` for such a key would be
-        // strictly worse than staging neither: [`fold::fold`]'s
-        // arg-extremes only ever consider image-bearing rows, so the
-        // delete's `old_image` (and its absent `new_image`) wins *both*
-        // halves and the recompute is annihilated — a chained downstream
-        // aggregate would then subtract a still-live group's contribution
-        // and never learn its new value. A key this batch also wrote
-        // therefore gives up its image and stays an ordinary `Recompute`,
-        // whose downstream live refetch finds the surviving row and
-        // re-derives the group correctly — exactly the pre-#180 behaviour,
-        // which was only ever wrong for a key that really is gone.
-        //
-        // Issue #196 reuses this exact guard for a deleted 1-1 target row's
-        // own image-bearing entry (step 3), with no changes needed here: the
-        // guard reads generically off `touched`, whichever step(s)
-        // contributed to it. Unlike the aggregate case above, step 3 cannot
-        // actually produce a key with *both* a written and a deleted entry
-        // in the first place — `apply_target` resolves that conflict itself
-        // before it ever reaches the database (see its own "never delete a
-        // key this same call just wrote" comment), and it is the only
-        // producer of a 1-1 target's `touched` entries besides the
-        // truncate-clear step (2, always image-less already) — but the
-        // guard still applies uniformly rather than needing a carve-out, so
-        // a future second producer of 1-1 target deletes/writes (there is
-        // none today) inherits the same safety automatically.
-        let rewritten = keys_written_without_image(touched);
-        for (key, hop_gen, src_changed, deleted_old_image) in touched {
-            let next_hop = hop_gen + 1;
-            if next_hop > MAX_HOP_GEN {
-                hop_bound_tables.push(qualified_target.clone());
-                worst_hop_gen = worst_hop_gen.max(next_hop);
-                continue;
-            }
-            // Issues #180/#196: a deletion whose pre-delete image was
-            // captured (an extinct aggregate group's `deleted` entry, or a
-            // deleted 1-1 target row's own captured entry — see
-            // [`ChangedKey`]'s doc comment) stages as a real image-bearing
-            // delete instead of an image-less `Recompute`, so
-            // a chained downstream aggregate can subtract the extinct row's
-            // last-known contribution (`accumulate_changes`'s `(Some(old_row),
-            // None)` branch) rather than have its live refetch find nothing
-            // and silently drop the change (the module doc comment's "A
-            // known gap: image-less changes"). An ordinary write still stays
-            // image-less — a downstream live refetch always finds the
-            // *right* current row for those, `NULL`-keyed groups included
-            // (issue #110 closed #195's gap: `derive_group_key`/
-            // `read_live_rows_batch` now resolve a `NULL` group key by its
-            // own real identity instead of mistaking it for "no row").
-            //
-            // `lsn: None`, like every other row this step stages: a
-            // propagated hop has no source LSN of its own. Two fold-side
-            // predicates read `lsn` and were written when "no `lsn`" implied
-            // "no images" — both stay sound for this row, but only by
-            // argument, so re-check them if either changes: [`fold::fold`]'s
-            // truncate-void filter (`(t.lsn, t.change_id) > (f.lsn,
-            // f.change_id)` is `NULL`, so a truncate on the target never
-            // voids this delete — harmless, since subtracting a group that a
-            // truncate also erased reaches the same answer), and
-            // [`from_side_change_in_flight`]'s `r.lsn <= $2` (this row is
-            // invisible to that in-flight probe, exactly as its pre-#180
-            // `Recompute` was).
-            match deleted_old_image {
-                Some(old_image) if !rewritten.contains(key.as_str()) => {
-                    recompute_changes.push(StagedChange::Cdc {
-                        src_table: qualified_target.clone(),
-                        key: key.clone(),
-                        op: append::CdcOp::Delete,
-                        lsn: None,
-                        old_image: Some(old_image.clone()),
-                        new_image: None,
-                        origin_lsn: None,
-                        src_changed: *src_changed,
-                        hop_gen: next_hop,
-                        group_key: None,
-                    });
-                }
-                _ => {
-                    recompute_changes.push(StagedChange::Recompute {
-                        src_table: qualified_target.clone(),
-                        key: key.clone(),
-                        hop_gen: next_hop,
-                        group_key: None,
-                        src_changed: *src_changed,
-                    });
-                }
-            }
-        }
-    }
+    // anything. Issue #315: every key a write above physically changed, for
+    // every target some `live` definition reads, becomes one image-less
+    // `Recompute` at `hop_gen + 1` carrying the key's prior image — see
+    // `staging::target_mutations`. `lsn: None`, like every row this step
+    // stages: a propagated hop has no source LSN of its own.
+    let propagation = mutations.into_staged(txn).await?;
+    let mut recompute_changes = propagation.changes;
+    let mut hop_bound_tables = propagation.hop_bound_tables;
+    let mut worst_hop_gen = propagation.worst_hop_gen;
 
     // Reverse recompute (issue #30): from-side rows a changed related row must
     // re-derive, resolved in Phase 2 and staged here as ordinary image-less
@@ -7450,6 +7087,7 @@ pub async fn apply_and_mark_drained_many(
             hop_gen: *hop_gen,
             group_key: None,
             src_changed: *src_changed,
+            prior_image: None,
         });
     }
 
@@ -7467,6 +7105,7 @@ pub async fn apply_and_mark_drained_many(
             hop_gen,
             group_key: None,
             src_changed,
+            prior_image: None,
         });
     }
 
@@ -7482,6 +7121,7 @@ pub async fn apply_and_mark_drained_many(
             hop_gen: *hop_gen,
             group_key: None,
             src_changed: *src_changed,
+            prior_image: None,
         });
     }
 

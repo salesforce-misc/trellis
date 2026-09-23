@@ -52,7 +52,7 @@ pub mod validate;
 // `cargo build` free of `unused_imports` rather than an `allow`.
 pub use ast::{AlterTransform, DefinitionRef, Statement, TransformRef, ValueType};
 pub use catalog::{
-    CatalogError, all_source_tables, alter_transform, create_relationship, install_definition,
+    CatalogError, alter_transform, create_relationship, install_definition, publication_tables,
 };
 pub use error::ParseError;
 pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
@@ -86,6 +86,8 @@ pub use ast::{
 };
 #[cfg(any(test, feature = "internals"))]
 pub use backfill::BackfillError;
+#[cfg(any(test, feature = "internals"))]
+pub use catalog::all_source_tables;
 #[cfg(any(test, feature = "internals"))]
 pub use catalog::{
     RelationshipProjection, create_definition, dependents_of, edges_from, node_for_table,

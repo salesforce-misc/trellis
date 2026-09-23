@@ -402,6 +402,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             hop_gen,
             group_key,
             src_changed,
+            prior_image,
         } => {
             w.write_all(&[TAG_RECOMPUTE])?;
             write_str(w, src_table)?;
@@ -415,7 +416,8 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
                         .unwrap_or(Duration::ZERO)
                         .as_micros() as u64
                 }),
-            )
+            )?;
+            write_opt_str(w, prior_image.as_deref())
         }
         StagedChange::Truncate {
             src_table,
@@ -533,12 +535,14 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let group_key = read_opt_str_vec(r)?;
             let src_changed = read_opt_u64(r)?
                 .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
+            let prior_image = read_opt_str(r)?;
             StagedChange::Recompute {
                 src_table,
                 key,
                 hop_gen,
                 group_key,
                 src_changed,
+                prior_image,
             }
         }
         TAG_TRUNCATE => {
@@ -642,6 +646,7 @@ mod tests {
             hop_gen: 1,
             group_key: None,
             src_changed: Some(SystemTime::UNIX_EPOCH + Duration::from_micros(123_456)),
+            prior_image: Some("{\"g\": \"a\"}".into()),
         };
         let mut buf = Vec::new();
         write_change(&mut buf, &change).unwrap();
@@ -652,8 +657,10 @@ mod tests {
                 hop_gen,
                 group_key,
                 src_changed,
+                prior_image,
                 ..
             } => {
+                assert_eq!(prior_image.as_deref(), Some("{\"g\": \"a\"}"));
                 assert_eq!(key, "k2");
                 assert_eq!(hop_gen, 1);
                 assert!(group_key.is_none());
@@ -674,6 +681,7 @@ mod tests {
             hop_gen: 0,
             group_key: None,
             src_changed: None,
+            prior_image: None,
         };
         let mut buf = Vec::new();
         write_change(&mut buf, &change).unwrap();

@@ -1,34 +1,24 @@
-//! Issue #267: multi-hop live transform chains driven through a real
-//! [`trellis::Client`], rather than the direct/ring-bypassing backfill path
-//! (`backfill_definition`, ADR-0007) every other chained-transform test in
-//! this suite uses.
+//! Multi-hop live transform chains driven through a real [`trellis::Client`],
+//! rather than the direct/ring-bypassing backfill path (`backfill_definition`,
+//! ADR-0007) or hand-run drains the other chained-transform tests use.
 //!
-//! The distinction is the whole point. A chain's intermediate hop (`h1` in
-//! `src -> h1 -> h2`) is two things at once: the *target* of the upstream
-//! definition — so a write to it gets a downstream `Recompute` staged
-//! directly, in the applying transaction, by `apply.rs`'s "4. Downstream
-//! propagation" step — and a *source* of the downstream definition, so
-//! `client::reconcile_source_tables` eventually adds it to the CDC
-//! publication, after which ordinary intake independently decodes and stages
-//! that very same write again.
+//! A chain's intermediate hop (`h1` in `src -> h1 -> h2`) is two things at
+//! once: the *target* of the upstream definition and a *source* of the
+//! downstream one. Issue #267 found that, while `h1` sat in the CDC
+//! publication, a write to it was staged twice under two spellings of the
+//! table — once by the applying transaction's own downstream propagation and
+//! once by intake — which live-locked the downstream apply. Issue #315 then
+//! took intermediate hops out of the publication altogether: every write to
+//! a target reaches its readers only through the target-mutation seam
+//! (`staging::target_mutations`), inside the writing transaction, so there is
+//! one staging and one spelling by construction. That also fixed an
+//! aggregate target feeding another transform, whose CDC could not be
+//! decoded at all (issue #315's original report: intake died on the first
+//! change).
 //!
-//! Before issue #267's fix those two stagings disagreed on how to spell the
-//! one logical table: propagation used the bare `TransformDef::target`
-//! (`"h1"`), intake used `publication::qualify`'s persisted identity
-//! (`"public.h1"`). `staging::fold` groups by `(src_table, key)` in SQL, on
-//! the raw strings, so the two never coalesced — they rode into `h2`'s apply
-//! as two independent changes for one key, and the batched `INSERT ... ON
-//! CONFLICT DO UPDATE` was handed the same conflict key twice:
-//!
-//! ```text
-//! ERROR: ON CONFLICT DO UPDATE command cannot affect row a second time
-//! ```
-//!
-//! which is a *permanent* live-lock, not a flake: every retry re-derives the
-//! identical pair from the identical still-present ring rows, so the segment
-//! stays `state = 'draining'` forever. These tests therefore assert real
-//! convergence with a generous-but-bounded timeout, and additionally that no
-//! segment is left stuck mid-drain.
+//! These tests assert real convergence with a generous-but-bounded timeout,
+//! that no segment is left stuck mid-drain, and that no hop is ever
+//! published.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -158,28 +148,62 @@ fn live_options() -> ClientOptions {
     }
 }
 
-/// Waits until `table` has actually joined the CDC publication. Every test
-/// here waits for this *before* writing, so the duplicate-staging window is
-/// guaranteed open rather than raced into: it is exactly the moment the
-/// propagation path and the intake path both start observing the same write.
-async fn wait_for_publication(raw: &Client, table: &str) {
+/// Waits until `table`'s definition is `live`: a plain 1-1 target builds
+/// through the chunk queue, and nothing may chain off it before it is live
+/// (issue #315).
+async fn wait_for_live(raw: &Client, table: &str) {
     poll_until(
         raw,
         Duration::from_secs(30),
-        &format!("{table} never joined the CDC publication"),
+        &format!("{table} never went live"),
         async || {
-            let published: i64 = raw
-                .query_one(
-                    "select count(*) from pg_publication_tables where tablename = $1",
-                    &[&table],
-                )
-                .await
-                .expect("read pg_publication_tables")
-                .get(0);
-            published > 0
+            raw.query_opt(
+                "select 1 from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1 and status = 'live'",
+                &[&table],
+            )
+            .await
+            .expect("read transform_definitions")
+            .is_some()
         },
     )
     .await;
+}
+
+/// Waits until the reconcile loop has published `public.src`, then asserts
+/// none of `hops` is published: a target's readers hear about it through
+/// the target-mutation seam, never CDC (issue #315).
+async fn assert_only_src_is_published(raw: &Client, hops: &[&str]) {
+    poll_until(
+        raw,
+        Duration::from_secs(30),
+        "src never joined the CDC publication",
+        async || {
+            raw.query_one(
+                "select count(*) from pg_publication_tables where tablename = 'src'",
+                &[],
+            )
+            .await
+            .expect("read pg_publication_tables")
+            .get::<_, i64>(0)
+                > 0
+        },
+    )
+    .await;
+    for hop in hops {
+        let published: i64 = raw
+            .query_one(
+                "select count(*) from pg_publication_tables where tablename = $1",
+                &[hop],
+            )
+            .await
+            .expect("read pg_publication_tables")
+            .get(0);
+        assert_eq!(
+            published, 0,
+            "{hop} is a target and must never be published"
+        );
+    }
 }
 
 /// Reads `table` as an `id -> value` map, for the convergence assertions.
@@ -195,10 +219,10 @@ async fn snapshot(raw: &Client, table: &str, value_col: &str) -> HashMap<String,
     .collect()
 }
 
-/// The issue's own repro, verbatim in shape: a 2-hop 1-1 passthrough chain,
-/// one insert, driven entirely through a live `Client`.
+/// Issue #267's repro, verbatim in shape: a 2-hop 1-1 passthrough chain, one
+/// insert, driven entirely through a live `Client`.
 #[tokio::test]
-async fn a_two_hop_one_to_one_chain_converges_once_the_middle_hop_joins_the_publication() {
+async fn a_two_hop_one_to_one_chain_converges_without_publishing_the_middle_hop() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -218,6 +242,7 @@ async fn a_two_hop_one_to_one_chain_converges_once_the_middle_hop_joins_the_publ
     )
     .await
     .expect("install h1");
+    wait_for_live(&raw, "h1").await;
     install_definition(
         &db.pool,
         "TRANSFORM h2 FROM public.h1 SELECT val AS val",
@@ -226,11 +251,8 @@ async fn a_two_hop_one_to_one_chain_converges_once_the_middle_hop_joins_the_publ
     )
     .await
     .expect("install h2");
-
-    // `h1` is an intermediate hop, so `reconcile_source_tables` derives it
-    // into the publication from `h2`'s `source_table`. Only after that is
-    // the bug's precondition met.
-    wait_for_publication(&raw, "h1").await;
+    wait_for_live(&raw, "h2").await;
+    assert_only_src_is_published(&raw, &["h1", "h2"]).await;
 
     raw.execute("insert into public.src (id, val) values (1, 1)", &[])
         .await
@@ -251,15 +273,10 @@ async fn a_two_hop_one_to_one_chain_converges_once_the_middle_hop_joins_the_publ
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// Issue #267 follow-up (the issue's repro is 1-1 only, 2 hops only): the
-/// same double-staging shape is not special to depth 2 or to passthrough
-/// hops. `h2` here is a *deeper* intermediate hop, and `h3` an aggregate
-/// reading it — so the duplicate lands on an aggregate's source (whose Phase
-/// 3 write shape is `apply_aggregate`'s sequential per-group upserts, not
-/// `apply_target`'s batched `ON CONFLICT`), and `h1`/`h2` both sit in the
-/// publication as intermediate hops simultaneously.
+/// Issue #267 follow-up (the issue's repro is 1-1 only, 2 hops only): `h2`
+/// here is a *deeper* intermediate hop, and `h3` an aggregate reading it.
 #[tokio::test]
-async fn a_three_hop_chain_ending_in_an_aggregate_converges_with_every_hop_published() {
+async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -271,27 +288,18 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges_with_every_hop_publi
     let client = TrellisClient::start(db.dsn(), live_options()).expect("client start");
 
     let columns = numeric_columns(&["id", "val"]);
-    for text in [
-        "TRANSFORM h1 FROM public.src SELECT val AS val",
-        "TRANSFORM h2 FROM public.h1 SELECT val AS val",
+    for (hop, text) in [
+        ("h1", "TRANSFORM h1 FROM public.src SELECT val AS val"),
+        ("h2", "TRANSFORM h2 FROM public.h1 SELECT val AS val"),
     ] {
         install_definition(&db.pool, text, &columns, "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
+        wait_for_live(&raw, hop).await;
     }
 
-    // A chained aggregate needs its source's old image to subtract a changed
-    // row's previous contribution, so the intermediate hop it reads must carry
-    // `REPLICA IDENTITY FULL` before `h3` will install at all — the same
-    // widening `defs_aggregate_group_by_relationship.rs` does for its own
-    // chained aggregate. Orthogonal to issue #267, just a precondition of the
-    // shape. (Issue #56 makes this safe for the key: `extract_key` reads the
-    // real primary key rather than trusting `pgoutput`'s `is_key` flags, which
-    // `FULL` sets on every column — so intake's key for an `h2` row is still
-    // its `id`, the same key the propagation path stages.)
-    raw.batch_execute("alter table public.h2 replica identity full")
-        .await
-        .expect("widen h2's replica identity");
+    // No `REPLICA IDENTITY FULL` on `h2`: an aggregate over a target never
+    // reads that target's CDC (issue #315).
     install_definition(
         &db.pool,
         "TRANSFORM h3 FROM public.h2 GROUP BY val SELECT COUNT(*) AS n",
@@ -300,9 +308,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges_with_every_hop_publi
     )
     .await
     .expect("install h3");
-
-    wait_for_publication(&raw, "h1").await;
-    wait_for_publication(&raw, "h2").await;
+    assert_only_src_is_published(&raw, &["h1", "h2", "h3"]).await;
 
     raw.execute(
         "insert into public.src (id, val) values (1, 7), (2, 7)",
@@ -325,6 +331,116 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges_with_every_hop_publi
                 .collect();
             groups == HashMap::from([("7".to_string(), Some("2".to_string()))])
         },
+    )
+    .await;
+
+    assert_no_stuck_segment(&raw).await;
+    client.shutdown().await.expect("clean shutdown");
+}
+
+/// Issue #315's original report: an aggregate target feeding another
+/// transform. While the aggregate target was published, its first CDC change
+/// killed intake (no primary key to decode a key from), so nothing
+/// downstream ever converged again. `hist` counts `agg`'s groups by their
+/// size, so moving a source row between `agg` groups also moves `agg` rows
+/// between `hist` groups — the prior image each `agg` write carries is what
+/// lets `hist` fix the group a row left.
+#[tokio::test]
+async fn an_aggregate_chained_off_an_aggregate_target_converges_and_follows_group_moves() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+
+    // A text group key: a transform chained off an aggregate target reads
+    // its group column as a primary key, which can't be `numeric`.
+    raw.batch_execute(
+        "create table public.src (id integer primary key, val text); \
+         alter table public.src replica identity full",
+    )
+    .await
+    .expect("create src");
+
+    let client = TrellisClient::start(db.dsn(), live_options()).expect("client start");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM agg FROM public.src GROUP BY val SELECT COUNT(*) AS n",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("val".to_string(), ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install agg");
+    wait_for_live(&raw, "agg").await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM hist FROM public.agg GROUP BY n SELECT COUNT(*) AS groups",
+        &HashMap::from([
+            ("val".to_string(), ValueType::Text),
+            ("n".to_string(), ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install hist");
+    assert_only_src_is_published(&raw, &["agg", "hist"]).await;
+
+    let hist = async || -> HashMap<String, Option<String>> {
+        raw.query("select n::text, groups::text from hist", &[])
+            .await
+            .expect("read hist")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    };
+
+    // agg: {a: 2 rows, b: 1 row} -> hist: {2: 1 group, 1: 1 group}.
+    raw.execute(
+        "insert into public.src (id, val) values (1, 'a'), (2, 'a'), (3, 'b')",
+        &[],
+    )
+    .await
+    .expect("insert into src");
+    poll_until(
+        &raw,
+        Duration::from_secs(45),
+        "hist never converged through the aggregate chain",
+        async || {
+            hist().await
+                == HashMap::from([
+                    ("2".to_string(), Some("1".to_string())),
+                    ("1".to_string(), Some("1".to_string())),
+                ])
+        },
+    )
+    .await;
+
+    // Move row 3 into group a: agg {a: 3 rows} (group b gone) -> hist
+    // {3: 1 group}. agg's group a leaves hist group 2 for hist group 3, and
+    // agg's group b leaves hist group 1 by going extinct: both old hist
+    // groups are only reachable through each agg write's prior image.
+    raw.execute("update public.src set val = 'a' where id = 3", &[])
+        .await
+        .expect("move row 3");
+    poll_until(
+        &raw,
+        Duration::from_secs(45),
+        "hist never followed agg's rows out of their old groups",
+        async || hist().await == HashMap::from([("3".to_string(), Some("1".to_string()))]),
+    )
+    .await;
+
+    // Delete a row: agg {a: 2 rows} -> hist {2: 1 group}.
+    raw.execute("delete from public.src where id = 1", &[])
+        .await
+        .expect("delete row 1");
+    poll_until(
+        &raw,
+        Duration::from_secs(45),
+        "hist never followed agg's shrunken group",
+        async || hist().await == HashMap::from([("2".to_string(), Some("1".to_string()))]),
     )
     .await;
 

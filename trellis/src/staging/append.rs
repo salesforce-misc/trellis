@@ -147,6 +147,16 @@ pub enum StagedChange {
         /// why it's meaningless here rather than merely unpopulated.
         group_key: Option<Vec<String>>,
         src_changed: Option<SystemTime>,
+        /// Issue #315: the key's row image as it stood before the write that
+        /// staged this recompute, when the producer knows it — only
+        /// `staging::target_mutations` sets it, for a key it changed in a
+        /// target table. It is a hint, not a delta: the recompute still
+        /// re-reads the key live. A downstream aggregate also re-derives the
+        /// group this image names, so a row that moved groups (or was
+        /// deleted) leaves its old group correct too. Stored in the ring's
+        /// `old_image` column under `op = 'recompute'`, which the fold keeps
+        /// apart from real images (`FoldedChange::prior_image`).
+        prior_image: Option<String>,
     },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
@@ -303,12 +313,13 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 hop_gen,
                 group_key,
                 src_changed,
+                prior_image,
             } => ChangeRow {
                 src_table,
                 key,
                 op: "recompute",
                 lsn: None,
-                old_image: None,
+                old_image: prior_image.as_deref(),
                 new_image: None,
                 origin_lsn: None,
                 src_changed: *src_changed,

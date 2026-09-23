@@ -190,17 +190,16 @@ knife-edged guards:
   overlapping delta in the same batch as the recompute or an earlier one. The
   discharge runs only once intake is running; setup leaves an existing slot's
   markers to the maintenance loop.
-- **Trellis's own writes to a published target stream only once.** A chain's
-  intermediate hop is written by an apply that already stages the downstream
-  change in the same transaction, and it is also in the publication because a
-  downstream transform reads it. The apply emits a transactional
-  `pg_logical_emit_message` (`trellis.propagated:<instance schema>`) naming
-  those targets before writing them, and intake drops that transaction's
-  changes to exactly those tables. The message reaches every slot in the
-  database, so the prefix carries the instance schema: another instance that
-  reads the same table has no in-transaction copy and keeps the CDC. The
-  in-transaction copy is the one kept: it commits with the write, and it
-  carries the upstream origin read-your-writes convergence relies on.
+- **Trellis's own writes to a target never stream at all.** A chain's
+  intermediate hop is a target Trellis writes and a source a downstream
+  transform reads. It stays out of the publication (issue #315): every write to
+  a target stages its downstream `Recompute` inside the writing transaction,
+  through one seam (`staging::target_mutations`), carrying the row's prior image
+  so a downstream aggregate can fix the group the row left. Publishing it as
+  well would stage every such write twice (issue #312), and an aggregate
+  target's CDC can't even be decoded. The one exception is a target that is
+  also a relationship endpoint: its settled parent projection is driven by
+  CDC, so it stays published.
 - **The initial snapshot handshake must be gap-free by construction**, not by
   overlap-and-dedup: create the slot with `EXPORT_SNAPSHOT`, backfill from that
   exact snapshot, then stream from the slot's consistent point.

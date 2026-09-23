@@ -1292,7 +1292,7 @@ async fn reconcile_source_tables(
 ) -> Result<(), ReconcileError> {
     let mut desired: std::collections::BTreeSet<String> =
         base_source_tables.iter().cloned().collect();
-    desired.extend(defs::all_source_tables(pool).await?);
+    desired.extend(defs::publication_tables(pool).await?);
     let desired: Vec<String> = desired.into_iter().collect();
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;

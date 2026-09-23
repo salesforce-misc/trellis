@@ -180,10 +180,9 @@ use crate::defs::pg_type::PgType;
 use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
-use super::apply::{
-    ApplyError, live_row_columns, row_as_text_jsonb_sql, substitute_relationship_path,
-};
+use super::apply::{ApplyError, substitute_relationship_path};
 use super::fold::FoldedChange;
+use super::target_mutations::TargetMutations;
 
 // ---------------------------------------------------------------------
 // Field classification
@@ -1135,9 +1134,10 @@ fn forward_row_contribution(
 /// change's *new*-side row (the decoded `new_image`, or `None` for a real
 /// delete, or a live re-read for an image-less change — the exact three
 /// shapes `compute`'s own doc comment enumerates), `old_rows[i]` is the
-/// decoded `old_image`, or `None` when the change carried none (including
-/// the image-less case, where the prior state is genuinely unknown — see
-/// the module doc comment).
+/// decoded `old_image`, or `None` when the change carried none. For an
+/// image-less change it is the decoded prior-image hint (issue #315) when
+/// the change has one, and `None` otherwise (the prior state is genuinely
+/// unknown — see the module doc comment).
 ///
 /// `rel_ctx` (issue #136) is the settled-parent-projection-backed
 /// [`eval::RelationshipContext`] `super::apply::compute`'s aggregate branch
@@ -1185,6 +1185,27 @@ pub(super) fn accumulate_changes(
         let new_row = &rows[i];
 
         if is_image_less {
+            // Issue #315: an image-less change can still carry the key's
+            // prior image (`FoldedChange::prior_image`, decoded into
+            // `old_row` by `compute`) when it was staged by an upstream
+            // target write. A row that moved groups, or was deleted, has to
+            // leave its old group correct too, and the live re-read below
+            // only names the new one — so the prior image's group is
+            // re-derived from live state as well. Idempotent either way.
+            if let Some(row) = old_row {
+                let augmented =
+                    augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
+                let (values, key) =
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+                let group = plan
+                    .groups
+                    .entry(key)
+                    .or_insert_with(|| GroupPlan::new(values));
+                group.force_full_recompute = true;
+                group.hop_gen = group.hop_gen.max(change.hop_gen);
+                group.src_changed =
+                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+            }
             if let Some(row) = new_row {
                 // Issue #137: even on the full-recompute path, this group's
                 // *key* — used below to bind the bulk recompute's keyset
@@ -1454,45 +1475,11 @@ pub(super) fn diff_contributions(
 // Phase 3: per-group apply
 // ---------------------------------------------------------------------
 
-/// What one [`apply_aggregate_target`] call did: every group it physically
-/// wrote or deleted. `written` is `(group_key_text, hop_gen, src_changed)`,
-/// the same shape [`super::apply::apply_and_mark_drained`]'s downstream-
-/// propagation step already consumed for the 1-1 case pre-issue #180 — a
-/// written group's new state is always recoverable by a downstream chain's
-/// own live refetch, so no image needs to ride along.
-///
-/// `deleted` additionally carries the group's target row exactly as it stood
-/// the instant before this call deleted it — an explicit per-column
-/// `jsonb_build_object(..., <col>::text, ...)::text` ([`delete_group_row`]'s
-/// doc comment; issue #248, not the `to_jsonb(t.*)::text` this used before),
-/// so every column, `timestamp`/`timestamptz` included, is encoded the same
-/// way a real CDC delete's pre-image is: by each column's own output
-/// function, not `to_jsonb`'s separate ISO-8601 writer — issue
-/// #180's fix: an extinct group's *key* alone is not enough for a chained
-/// downstream aggregate to know what to subtract, because by the time that
-/// downstream chain's own live refetch runs, the row is genuinely gone (see
-/// the module doc comment's "Image-less changes, and issue #180's fix for
-/// one producer of them" section, and
-/// `super::apply`'s downstream-propagation step, which now stages a real
-/// image-bearing delete for a `Some` entry here instead of an image-less
-/// `Recompute`). `None` only when [`delete_group_row`]/
-/// [`apply_forced_groups_bulk`]'s delete genuinely touched zero rows
-/// (already gone), which never accumulates a key into `deleted` at all in
-/// practice — kept as `Option` rather than `String` purely so both callers
-/// can build this tuple the same way they build a plain existence check.
-///
-/// Both tuples' `src_changed: Option<SystemTime>` (issue #104, follow-up to
-/// #51/#52 once #103 made aggregate-target chaining live rather than moot)
-/// is the written/deleted group's own [`GroupPlan::src_changed`] — the
-/// earliest origin among the changes that touched it, folded there by
-/// [`accumulate_changes`] via [`super::apply::earliest_src_changed`].
-/// `super::apply`'s 3b step threads this straight into the `Recompute` rows
-/// it stages for downstream propagation, closing the gap where a transform
-/// chained off an aggregate target always saw `src_changed: None`.
-pub(super) struct AggregateApplyResult {
-    pub written: Vec<(String, i32, Option<std::time::SystemTime>)>,
-    pub deleted: Vec<(String, i32, Option<std::time::SystemTime>, Option<String>)>,
-}
+/// One group [`apply_aggregate_target`]'s writers physically wrote or
+/// deleted: its [`derive_group_key`] text, and the [`GroupPlan::hop_gen`]/
+/// [`GroupPlan::src_changed`] its downstream `Recompute` carries forward
+/// (issue #104: the earliest origin among the changes that touched it).
+type TouchedGroup = (String, i32, Option<std::time::SystemTime>);
 
 /// A `col IS NOT DISTINCT FROM $n::text::<cast>` clause per `group_by`
 /// (**target**-side, plain column name) entry, starting at `$start` — `IS
@@ -1609,51 +1596,27 @@ async fn probe_group_exists(
     Ok(row.get(0))
 }
 
-/// Deletes this group's target row, if it still has one, returning its
-/// pre-delete image (`None` iff there was no row to delete) — issue #180: the
-/// caller (`apply_aggregate_target`) threads this through as the extinct
-/// group's `AggregateApplyResult::deleted` entry, so a chained downstream
-/// aggregate's `Recompute` can carry a real old image instead of asking a
-/// live refetch to find a row that, by construction (`probe_group_exists`
-/// already found no surviving source row for this group), is genuinely gone.
-///
-/// Issue #248: the image is an explicit per-column `jsonb_build_object(...,
-/// <col>::text, ...)`, not `to_jsonb(t.*)` — see
-/// `apply::row_as_text_jsonb_sql`'s doc comment for why (`to_jsonb`'s own
-/// ISO-8601 writer disagrees with the `timestamp`/`timestamptz` output
-/// function every other `::text` cast in this crate uses). The column list is
-/// this target's live `pg_catalog` columns ([`live_row_columns`]), not
-/// reconstructed from `group_by`/the calling `AggregateTargetPlan`'s own
-/// field list: an aggregate target's hidden `SUM`/`AVG` partial columns
-/// (issue #48's `__<field>_sum`/`__<field>_count`) are assembled by
-/// `apply_forced_groups_bulk`'s own dedup logic when it builds `insert_cols`,
-/// and re-deriving that same dedup here, a second time, purely to name
-/// columns for this `RETURNING`, would be a second place that shape can
-/// drift from `ddl::create_aggregate_target_table`'s actual DDL — introspecting
-/// the live table directly can't drift, by construction.
+/// Deletes this group's target row, if it still has one, returning whether
+/// it did. (The row's prior image, which a downstream aggregate needs to find
+/// the group it left, came from [`apply_aggregate_target`]'s pre-lock —
+/// issue #315.)
 async fn delete_group_row(
     txn: &Transaction<'_>,
     target: &str,
     group_by: &[String],
     group_by_types: &[ValueType],
     values: &[Option<String>],
-) -> Result<Option<String>, ApplyError> {
+) -> Result<bool, ApplyError> {
     let where_sql = group_where_clause(group_by, group_by_types, 1);
     // `target` is always [`AggregateTargetPlan::target`]'s qualified
     // identity by the time this is called (reviewer follow-up to issue #74)
     // — quoted component-independently via
-    // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`. `t`
-    // aliases the target for `old_image_expr` below; `where_sql`'s own column
-    // references stay unqualified, which still resolves correctly since `t`
-    // is the sole table in scope.
-    let row_columns = live_row_columns(txn, target).await?;
-    let old_image_expr = row_as_text_jsonb_sql("t", &row_columns);
+    // [`ddl::qualified_target_table_ident`], not a bare `quote_ident`.
     let sql = format!(
-        "delete from {} as t where {where_sql} returning {old_image_expr}::text as old_image",
+        "delete from {} where {where_sql}",
         ddl::qualified_target_table_ident(target)
     );
-    let rows = txn.query(&sql, &group_where_params(values)).await?;
-    Ok(rows.into_iter().next().map(|row| row.get(0)))
+    Ok(txn.execute(&sql, &group_where_params(values)).await? > 0)
 }
 
 /// Probes one [`AggFieldKind::RecomputeOnly`] (or, on the full-recompute
@@ -2299,13 +2262,7 @@ async fn apply_forced_groups_bulk(
     target: &str,
     plan: &AggregateTargetPlan,
     forced: &[(&String, &GroupPlan)],
-) -> Result<
-    (
-        Vec<(String, i32, Option<std::time::SystemTime>)>,
-        Vec<(String, i32, Option<std::time::SystemTime>, Option<String>)>,
-    ),
-    ApplyError,
-> {
+) -> Result<(Vec<TouchedGroup>, Vec<TouchedGroup>), ApplyError> {
     let arity = plan.group_by.len();
     let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
     let arrays = transpose_group_values(arity, &forced_groups);
@@ -2458,23 +2415,16 @@ async fn apply_forced_groups_bulk(
     }
 
     // 3. Extinct groups: touched, but no surviving source row — delete their
-    // target rows in one statement, `ord` telling us which we removed. Issue
-    // #180: also returns each deleted row's pre-delete image, the bulk-path
-    // counterpart to [`delete_group_row`]'s own per-group `RETURNING` — see
-    // [`AggregateApplyResult::deleted`]'s doc comment for why a downstream
-    // chain needs this rather than a bare key. Issue #248: an explicit
-    // per-column `jsonb_build_object` over this target's live columns, not
-    // `to_jsonb(t.*)` — see [`delete_group_row`]'s doc comment for why (same
-    // reasoning, same live-introspected column list, applies here too).
+    // target rows in one statement, `ord` telling us which we removed. (Their
+    // prior images, which a downstream aggregate needs to find the group they
+    // left, came from `apply_aggregate_target`'s pre-lock — issue #315.)
     let mut deleted = Vec::new();
     if !extinct_ords.is_empty() {
         let ord_param = arity + 1;
-        let row_columns = live_row_columns(txn, target).await?;
-        let old_image_expr = row_as_text_jsonb_sql("t", &row_columns);
         let delete_sql = format!(
             "delete from {target_ident} t using {} \
              where {} and k.ord = any(${ord_param}::bigint[]) \
-             returning k.ord::bigint, {old_image_expr}::text as old_image",
+             returning k.ord::bigint",
             keyset_unnest(&plan.group_by_types, 1, true),
             keyset_match(&plan.group_by, "t", &null_safe),
         );
@@ -2482,19 +2432,10 @@ async fn apply_forced_groups_bulk(
             arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
         delete_params.push(&extinct_ords);
         let rows = txn.query(&delete_sql, &delete_params).await?;
-        let deleted_images: HashMap<i64, String> = rows
-            .iter()
-            .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
-            .collect();
+        let deleted_ords: HashSet<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
         for (i, (key, group)) in forced.iter().enumerate() {
-            let ord = (i + 1) as i64;
-            if let Some(old_image) = deleted_images.get(&ord) {
-                deleted.push((
-                    (*key).clone(),
-                    group.hop_gen,
-                    group.src_changed,
-                    Some(old_image.clone()),
-                ));
+            if deleted_ords.contains(&((i + 1) as i64)) {
+                deleted.push(((*key).clone(), group.hop_gen, group.src_changed));
             }
         }
     }
@@ -3175,6 +3116,13 @@ async fn apply_delta_groups_bulk(
 /// not match the SQL column order) — the pre-lock, not the write order, is
 /// what fixes the acquisition order once every lock is held up front.
 ///
+/// **The seam (issue #315).** Every group written or deleted is reported to
+/// `mutations`, keyed by its [`derive_group_key`] text, with its prior image
+/// (the target row the pre-lock found, `None` for a new group) — the
+/// pre-lock returns each locked row's image when something reads this
+/// target. Only the counts come back to the caller. See
+/// `super::target_mutations`.
+///
 /// Issue #56/ADR-0009 decision 3: the aggregate-target counterpart to
 /// [`super::apply::apply_target`]'s per-transform span — same `transform`
 /// field convention, same place in the propagation tree (Phase 3, one span
@@ -3183,7 +3131,7 @@ async fn apply_delta_groups_bulk(
 /// [`crate::defs::ast::KeySpace::OneToOne`] one.
 #[tracing::instrument(
     name = "staging.apply_aggregate_target",
-    skip(txn, plan),
+    skip(txn, plan, mutations),
     fields(
         transform = %target,
         groups = plan.groups.len(),
@@ -3195,14 +3143,12 @@ pub(super) async fn apply_aggregate_target(
     txn: &Transaction<'_>,
     target: &str,
     plan: &AggregateTargetPlan,
-) -> Result<AggregateApplyResult, ApplyError> {
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
     let mut group_keys: Vec<&String> = plan.groups.keys().collect();
     group_keys.sort();
     if group_keys.is_empty() {
-        return Ok(AggregateApplyResult {
-            written: Vec::new(),
-            deleted: Vec::new(),
-        });
+        return Ok((0, 0));
     }
 
     // `target` — the caller's [`AggregateTargetPlan::target`] (reviewer
@@ -3232,13 +3178,30 @@ pub(super) async fn apply_aggregate_target(
         .iter()
         .map(|c| format!("t.{}", quote_ident(c)))
         .collect();
+    // Issue #315: when something reads this target, the pre-lock also
+    // returns each locked row's image, positioned by the keyset's own
+    // ordinality (so it maps back to `group_keys[ord - 1]` exactly, with no
+    // re-encoding of the group key in SQL).
+    let prior_image_expr = mutations.image_sql(txn, target, "t").await?;
+    let prior_select = match &prior_image_expr {
+        Some(expr) => format!("k.ord, ({expr})::text"),
+        None => "1".to_string(),
+    };
     let prelock_sql = format!(
-        "select 1 from {target_ident} t join {} on {} order by {} for update of t",
-        keyset_unnest(&plan.group_by_types, 1, false),
+        "select {prior_select} from {target_ident} t join {} on {} order by {} for update of t",
+        keyset_unnest(&plan.group_by_types, 1, prior_image_expr.is_some()),
         keyset_match(&plan.group_by, "t", &prelock_null_safe),
         order_by.join(", "),
     );
-    txn.query(&prelock_sql, &prelock_params).await?;
+    let locked = txn.query(&prelock_sql, &prelock_params).await?;
+    let mut prior_images: HashMap<&str, String> = HashMap::new();
+    if prior_image_expr.is_some() {
+        for row in locked {
+            let ord: i64 = row.get(0);
+            let key = group_keys[usize::try_from(ord - 1).expect("ordinality is 1-based")];
+            prior_images.insert(key.as_str(), row.get(1));
+        }
+    }
 
     let mut written = Vec::new();
     let mut deleted = Vec::new();
@@ -3263,21 +3226,16 @@ pub(super) async fn apply_aggregate_target(
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
 
         if !exists {
-            let old_image = delete_group_row(
+            if delete_group_row(
                 txn,
                 target,
                 &plan.group_by,
                 &plan.group_by_types,
                 &group.group_values,
             )
-            .await?;
-            if let Some(old_image) = old_image {
-                deleted.push((
-                    key.clone(),
-                    group.hop_gen,
-                    group.src_changed,
-                    Some(old_image),
-                ));
+            .await?
+            {
+                deleted.push((key.clone(), group.hop_gen, group.src_changed));
             }
             continue;
         }
@@ -3308,7 +3266,12 @@ pub(super) async fn apply_aggregate_target(
     let span = tracing::Span::current();
     span.record("written", written.len());
     span.record("deleted", deleted.len());
-    Ok(AggregateApplyResult { written, deleted })
+    let counts = (written.len(), deleted.len());
+    for (key, hop_gen, src_changed) in written.into_iter().chain(deleted) {
+        let prior = prior_images.remove(key.as_str());
+        mutations.record(target, key, prior, hop_gen, src_changed);
+    }
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -3707,14 +3670,9 @@ mod tests {
 
     /// The bulk-recompute path's extinct-group `DELETE` (step 3 of
     /// [`apply_forced_groups_bulk`]) removes a forced group's target row when
-    /// no source row survives. Today's producers can't actually stage this —
-    /// `accumulate_changes` only marks a group `force_full_recompute` when its
-    /// refetched row exists, so a forced group always has a live
-    /// representative and survives (the module doc's note that this scenario
-    /// "is not exercised by today's producers") — so this drives the branch
-    /// directly with a hand-built plan rather than through a drain, to keep
-    /// the defensive path covered against future producers that could stage a
-    /// genuinely extinct forced group.
+    /// no source row survives — reachable since issue #315, whenever a
+    /// prior-image hint forces the group a row just *left* (see
+    /// `accumulate_changes`). Driven directly with a hand-built plan here.
     #[tokio::test]
     async fn apply_forced_groups_bulk_deletes_an_extinct_forced_group() {
         let cluster = testkit::TestCluster::start();
@@ -3778,24 +3736,9 @@ mod tests {
             1,
             "the extinct forced group must be reported deleted"
         );
-        let (del_key, del_hop_gen, _del_src_changed, del_old_image) = &deleted[0];
+        let (del_key, del_hop_gen, _del_src_changed) = &deleted[0];
         assert_eq!(del_key, &key);
         assert_eq!(*del_hop_gen, 3);
-        // Issue #180: the deleted group's pre-delete row must ride along, so
-        // a chained downstream aggregate can subtract its last-known
-        // contribution instead of hitting the image-less gap.
-        let old_image = del_old_image
-            .as_deref()
-            .expect("a deleted group must carry its pre-delete image");
-        let old_total: String = client
-            .query_one("select $1::text::jsonb ->> 'total'", &[&old_image])
-            .await
-            .expect("read the pre-delete image's total")
-            .get(0);
-        assert_eq!(
-            old_total, "99.00",
-            "the pre-delete image must carry the extinct group's last total"
-        );
 
         let remaining: i64 = client
             .query_one("select count(*) from order_summary", &[])
@@ -3913,6 +3856,7 @@ mod tests {
             is_truncate: false,
             relationship_reverse_deferred: None,
             retry_count: 0,
+            prior_image: None,
         }
     }
 
@@ -4282,14 +4226,15 @@ mod tests {
         let mut bulk_plan = delta_plan();
         bulk_plan.groups = groups.clone().into_iter().collect();
         let txn = bulk_client.transaction().await.expect("begin bulk");
-        let result = apply_aggregate_target(&txn, "order_summary", &bulk_plan)
-            .await
-            .expect("bulk apply");
+        let mut mutations = TargetMutations::assuming_unread();
+        let (written, deleted) =
+            apply_aggregate_target(&txn, "order_summary", &bulk_plan, &mut mutations)
+                .await
+                .expect("bulk apply");
         txn.commit().await.expect("commit bulk");
-        assert!(result.deleted.is_empty(), "no group went extinct");
-        let mut written_keys: Vec<&str> =
-            result.written.iter().map(|(k, _, _)| k.as_str()).collect();
-        written_keys.sort();
+        assert_eq!(deleted, 0, "no group went extinct");
+        assert_eq!(written, 3);
+        let written_keys = mutations.recorded_keys("order_summary");
         assert_eq!(
             written_keys,
             vec!["g1", "g2", "g4"],
@@ -4315,9 +4260,14 @@ mod tests {
             let mut plan = delta_plan();
             plan.groups = HashMap::from([(key.clone(), group.clone())]);
             let txn = single_client.transaction().await.expect("begin single");
-            apply_aggregate_target(&txn, "order_summary", &plan)
-                .await
-                .expect("per-group apply");
+            apply_aggregate_target(
+                &txn,
+                "order_summary",
+                &plan,
+                &mut TargetMutations::assuming_unread(),
+            )
+            .await
+            .expect("per-group apply");
             txn.commit().await.expect("commit single");
         }
 
@@ -4415,14 +4365,16 @@ mod tests {
         plan.groups = HashMap::from([("g9".to_string(), group)]);
 
         let txn = client.transaction().await.expect("begin");
-        let result = apply_aggregate_target(&txn, "order_summary", &plan)
+        let mut mutations = TargetMutations::assuming_unread();
+        let (written, _) = apply_aggregate_target(&txn, "order_summary", &plan, &mut mutations)
             .await
             .expect("apply");
         txn.commit().await.expect("commit");
 
+        assert_eq!(written, 1);
         assert_eq!(
-            result.written,
-            vec![("g9".to_string(), 5, None)],
+            mutations.recorded_keys("order_summary"),
+            vec!["g9".to_string()],
             "the lone group must be reported written"
         );
 
@@ -4505,13 +4457,18 @@ mod tests {
         plan.groups = groups;
 
         let txn = client.transaction().await.expect("begin");
-        let result = apply_aggregate_target(&txn, "order_summary", &plan)
-            .await
-            .expect("bulk apply");
+        let (written, deleted) = apply_aggregate_target(
+            &txn,
+            "order_summary",
+            &plan,
+            &mut TargetMutations::assuming_unread(),
+        )
+        .await
+        .expect("bulk apply");
         txn.commit().await.expect("commit");
 
-        assert_eq!(result.written.len(), N as usize);
-        assert!(result.deleted.is_empty());
+        assert_eq!(written, N as usize);
+        assert_eq!(deleted, 0);
 
         let count: i64 = client
             .query_one("select count(*) from order_summary", &[])
@@ -4683,18 +4640,17 @@ mod tests {
 
         let run_b = async {
             let txn_b = client_b.transaction().await.expect("begin b");
-            let result = apply_aggregate_target(&txn_b, "order_summary", &plan_b)
+            let mut mutations = TargetMutations::assuming_unread();
+            apply_aggregate_target(&txn_b, "order_summary", &plan_b, &mut mutations)
                 .await
                 .expect("bulk apply must mop up the straggler");
             txn_b.commit().await.expect("commit b");
-            result
+            mutations
         };
 
-        let (_, result) = tokio::join!(release_a, run_b);
+        let (_, mutations) = tokio::join!(release_a, run_b);
 
-        let mut written_keys: Vec<&str> =
-            result.written.iter().map(|(k, _, _)| k.as_str()).collect();
-        written_keys.sort();
+        let written_keys = mutations.recorded_keys("order_summary");
         assert_eq!(
             written_keys,
             vec!["g42", "g43"],
@@ -4779,17 +4735,27 @@ mod tests {
         seed_group.hop_gen = 1;
         seed_plan.groups = HashMap::from([("g42".to_string(), seed_group)]);
         let txn = seq_client.transaction().await.expect("begin seed");
-        apply_aggregate_target(&txn, "order_summary", &seed_plan)
-            .await
-            .expect("seed a's delta sequentially");
+        apply_aggregate_target(
+            &txn,
+            "order_summary",
+            &seed_plan,
+            &mut TargetMutations::assuming_unread(),
+        )
+        .await
+        .expect("seed a's delta sequentially");
         txn.commit().await.expect("commit seed");
 
         let mut plan_b_seq = delta_plan();
         plan_b_seq.groups = plan_b.groups.clone();
         let txn = seq_client.transaction().await.expect("begin seq b");
-        apply_aggregate_target(&txn, "order_summary", &plan_b_seq)
-            .await
-            .expect("apply b sequentially");
+        apply_aggregate_target(
+            &txn,
+            "order_summary",
+            &plan_b_seq,
+            &mut TargetMutations::assuming_unread(),
+        )
+        .await
+        .expect("apply b sequentially");
         txn.commit().await.expect("commit seq b");
 
         let seq_rows = read_order_summary(&seq_client).await;

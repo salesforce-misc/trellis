@@ -969,7 +969,7 @@ impl Trellis {
             return Ok(());
         }
 
-        let desired = defs::all_source_tables(&self.pool)
+        let desired = defs::publication_tables(&self.pool)
             .await
             .map_err(TrellisError::Catalog)?;
 
@@ -1325,7 +1325,7 @@ impl Trellis {
 /// passes through to — the transitive source-table closure — is covered
 /// directly in `trellis/tests/app.rs` against `defs::all_source_tables`.
 pub(crate) async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
-    Ok(defs::all_source_tables(pool).await?)
+    Ok(defs::publication_tables(pool).await?)
 }
 
 /// One registered transform definition, as [`Trellis::definitions`] reports

@@ -284,6 +284,12 @@ pub enum CatalogError {
     /// and a row a still-running initial-backfill chunk inserts into the
     /// target *during* that window would never be revisited — so an edit
     /// only ever starts from a settled, fully-built target.
+    ///
+    /// Also returned (issue #315) when a new definition's source is another
+    /// definition's target that isn't live yet. A target's own initial build
+    /// writes it outside the target-mutation seam
+    /// (`staging::target_mutations`), so a reader attached mid-build would
+    /// never hear about the rows the rest of the build writes.
     TransformNotLive {
         transform: String,
         status: TransformStatus,
@@ -437,8 +443,8 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
-                "'{transform}' is {}, not live; ALTER TRANSFORM only edits a fully-built, live \
-                 definition",
+                "'{transform}' is {}, not live; only a fully-built, live definition can be \
+                 edited with ALTER TRANSFORM or read by another transform",
                 status.as_str()
             ),
             CatalogError::AlterFieldNotFound {
@@ -717,6 +723,9 @@ pub async fn install_definition(
     // doc comment for why this function needs its own copy rather than
     // waiting for `create_definition_inner`'s later, authoritative one.
     let qualified_source = resolve_source_for_install(pool, &def).await?;
+    // Issue #315: fail fast, before any DDL, on a source that is another
+    // definition's not-yet-live target (see `reject_non_live_upstream`).
+    reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
 
     match &def.key_space {
         KeySpace::OneToOne => {
@@ -840,6 +849,18 @@ pub async fn install_definition(
             definition.status = go_live_if_backfilling(&**client, definition.id)
                 .await?
                 .status();
+            // Issue #315: a source that is another definition's target never
+            // joins the publication, so there is no publication-join marker
+            // to catch this definition up on the upstream writes its build
+            // raced (the seam skips a reader until it is live). Park one
+            // explicitly once it is live, the same catch-up
+            // `complete_direct_backfill` parks for the chunked path.
+            if definition.status == TransformStatus::Live
+                && is_definition_target(&**client, &qualified_source).await?
+            {
+                crate::intake::publication::park_backfill_catchup(&**client, &qualified_source)
+                    .await?;
+            }
             Ok(definition)
         }
         Err(BackfillError::Unsupported(_)) => {
@@ -1034,6 +1055,11 @@ pub(crate) async fn complete_direct_backfill(
     // match anything and this would fail every time with
     // [`CatalogError::SourceTableNotFound`].
     let status = go_live_if_backfilling(txn, definition_id).await?.status();
+    if status == TransformStatus::Live {
+        // Issue #315: the chunks wrote this target outside the seam; a
+        // reader already attached to it (a resumed upstream's) re-derives.
+        crate::intake::publication::park_target_catchup_if_read(txn, definition_id).await?;
+    }
     if !status.is_frozen() {
         let qualified: String = txn
             .query_one(
@@ -1045,6 +1071,55 @@ pub(crate) async fn complete_direct_backfill(
         crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
     }
     Ok(status)
+}
+
+/// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
+/// source, `qualified_source`, is the target of another definition that
+/// isn't [`TransformStatus::Live`] yet (issue #315). A target's initial build
+/// (`defs::backfill`, the chunk queue) writes it directly, outside the
+/// target-mutation seam that tells a chained reader about every other target
+/// write, so a reader attached mid-build would silently miss whatever the
+/// rest of the build writes. Wait for the upstream definition to go live,
+/// then define the chained one.
+async fn reject_non_live_upstream(
+    client: &impl GenericClient,
+    qualified_source: &str,
+) -> Result<(), CatalogError> {
+    let Some(row) = client
+        .query_opt(
+            "select split_part(target_table, '.', 2), status from transform_definitions \
+             where target_table = $1",
+            &[&qualified_source],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let status_text: String = row.get(1);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    if status == TransformStatus::Live {
+        return Ok(());
+    }
+    Err(CatalogError::TransformNotLive {
+        transform: row.get(0),
+        status,
+    })
+}
+
+/// Whether `qualified_table` is some definition's target table.
+async fn is_definition_target(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<bool, CatalogError> {
+    Ok(client
+        .query_one(
+            "select exists (select 1 from transform_definitions where target_table = $1)",
+            &[&qualified_table],
+        )
+        .await?
+        .get(0))
 }
 
 /// Deletes a definition row by id (issue #55) — used by [`install_definition`]
@@ -2008,6 +2083,9 @@ async fn create_definition_inner(
         }
         None => resolve_graph_identity_in_txn(&txn, &def.source).await?,
     };
+    // Issue #315: the authoritative check (`install_definition` repeats it
+    // earlier, before any DDL, as a fail-fast).
+    reject_non_live_upstream(&*txn, &qualified_source).await?;
 
     // Issue #73 / #76, ADR-0007: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring
@@ -4106,6 +4184,15 @@ async fn assert_replica_identity_supports_aggregate(
         None => resolve_graph_identity_in_txn(txn, &def.source).await?,
     };
 
+    // Issue #315: a seam-only target never reaches this aggregate through
+    // CDC, so its replica identity is irrelevant — the seam stages each
+    // changed key with its prior image itself.
+    if seam_only_targets(txn, std::slice::from_ref(&qualified_source))
+        .await?
+        .contains(&qualified_source)
+    {
+        return Ok(());
+    }
     check_source_guarantees(
         txn,
         &crate::intake::ResolvedPlan::Transform {
@@ -5122,6 +5209,61 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
              )
              select table_name from reachable",
             &[],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
+/// The tables this instance's CDC publication should hold: every table
+/// [`all_source_tables`] reaches, minus the targets of this instance's own
+/// definitions (issue #315).
+///
+/// A chained definition reads another definition's target, but that target
+/// never needs CDC: every write to it goes through the target-mutation seam
+/// (`staging::target_mutations`), which stages each changed key for its
+/// readers in the writing transaction. Publishing it as well would stage each
+/// change twice (the double-apply class #312 patched with an intake-side
+/// filter), and an aggregate target's CDC can't even be decoded:
+/// `intake::extract_key` has no primary key to read, and without `REPLICA
+/// IDENTITY FULL` Postgres refuses the target's own updates once it is
+/// published.
+///
+/// **Exception: a target that is a relationship endpoint stays published.**
+/// A to-one relationship's settled parent projection and reverse deltas
+/// (issues #129-#136), and a from-side's `group_key` (#133), are driven by
+/// image-bearing CDC with its own LSN ordering, which the seam's image-less
+/// recompute does not provide. Such a target is still also fanned out by the
+/// seam, as before this issue. See the issue #315 PR for the open follow-up.
+pub async fn publication_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
+    let tables = all_source_tables(pool).await?;
+    let client = pool.get().await?;
+    let seam_only = seam_only_targets(&**client, &tables).await?;
+    Ok(tables
+        .into_iter()
+        .filter(|t| !seam_only.contains(t))
+        .collect())
+}
+
+/// Which of `tables` are *seam-only* targets (issue #315): the target of
+/// some definition in this instance, and not an endpoint of any
+/// relationship. Such a table's changes reach its readers only through the
+/// target-mutation seam, never CDC — see [`publication_tables`] for the rule
+/// and its relationship-endpoint exception.
+pub(crate) async fn seam_only_targets(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<std::collections::HashSet<String>, CatalogError> {
+    let rows = client
+        .query(
+            "select r.table_name from unnest($1::text[]) as r(table_name) \
+             where exists ( \
+                 select 1 from transform_definitions d where d.target_table = r.table_name \
+             ) and not exists ( \
+                 select 1 from schema_edges se \
+                 join schema_nodes n on n.id in (se.from_node_id, se.to_node_id) \
+                 where se.kind = 'relationship' and n.table_name = r.table_name \
+             )",
+            &[&tables],
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())

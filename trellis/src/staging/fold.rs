@@ -167,6 +167,17 @@ pub struct FoldedChange {
     /// this reverse has been deferred). `0` when
     /// `relationship_reverse_deferred` is `None`.
     pub retry_count: i32,
+    /// Issue #315: the FIRST (lowest `(lsn, change_id)`) prior image any of
+    /// the group's `recompute` rows carried — see
+    /// `StagedChange::Recompute::prior_image`. Kept apart from `old_image`/
+    /// `new_image`: a hinted recompute is still image-less (the fold's
+    /// image-bearing filter excludes `op = 'recompute'`), so it never wins
+    /// either image arg-extreme and is still re-read live. Only
+    /// `staging::target_mutations` produces these, for a target table's key.
+    /// The first one is the state downstream consumers last saw before this
+    /// batch's writes, which is the group a downstream aggregate must also
+    /// re-derive.
+    pub prior_image: Option<String>,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -209,6 +220,9 @@ pub async fn fold(
     // images NULL) never wins either extreme. `op` is deliberately not
     // filtered anywhere here as a row-level WHERE — the `truncate` sentinel
     // is image-less but load-bearing, and filtering `op` would fold it away.
+    // Issue #315: a `recompute` row is never image-bearing, even when its
+    // `old_image` column holds a prior-image hint (`StagedChange::Recompute::prior_image`);
+    // that hint is aggregated separately into `prior_image`.
     //
     // Both `new_image` (LAST, highest `(lsn, change_id)`) and `old_image`
     // (FIRST, lowest) use the `array_agg(... ORDER BY ...) FILTER (...))[1]`
@@ -280,9 +294,11 @@ pub async fn fold(
              filtered.src_table, \
              filtered.key, \
              (array_agg(new_image order by lsn desc, change_id desc) \
-                 filter (where old_image is not null or new_image is not null))[1] as new_image, \
+                 filter (where (old_image is not null or new_image is not null) \
+                           and op <> 'recompute'))[1] as new_image, \
              (array_agg(old_image order by lsn asc, change_id asc) \
-                 filter (where old_image is not null or new_image is not null))[1] as old_image, \
+                 filter (where (old_image is not null or new_image is not null) \
+                           and op <> 'recompute'))[1] as old_image, \
              max(src_changed) as src_changed, \
              min(origin_lsn) as origin_lsn, \
              max(lsn) as lsn, \
@@ -293,7 +309,9 @@ pub async fn fold(
              max(relationship_id) filter (where op = 'rel_reverse_deferred') \
                  as relationship_reverse_deferred, \
              coalesce(max(retry_count) filter (where op = 'rel_reverse_deferred'), 0) \
-                 as retry_count \
+                 as retry_count, \
+             (array_agg(old_image order by lsn asc, change_id asc) \
+                 filter (where op = 'recompute' and old_image is not null))[1] as prior_image \
          from filtered \
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
@@ -324,6 +342,7 @@ pub async fn fold(
             is_truncate: row.get(10),
             relationship_reverse_deferred: row.get(11),
             retry_count: row.get(12),
+            prior_image: row.get(13),
         })
         .collect())
 }
@@ -539,6 +558,10 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         // (not, say, sum) is the right merge here, and why every merged
         // deferred record is therefore guaranteed `retry_count >= 1`.
         retry_count: earlier.retry_count.max(later.retry_count),
+        // The earlier segment's hint, when it has one: it predates the later
+        // segment's writes, the same "first prior image wins" rule the SQL
+        // fold applies within one segment.
+        prior_image: earlier.prior_image.or(later.prior_image),
     }
 }
 
@@ -589,6 +612,7 @@ mod merge_tests {
             is_truncate: false,
             relationship_reverse_deferred: None,
             retry_count: 0,
+            prior_image: None,
         }
     }
 

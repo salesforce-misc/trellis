@@ -19,6 +19,7 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
         hop_gen: 0,
         group_key: None,
         src_changed: None,
+        prior_image: None,
     }
 }
 

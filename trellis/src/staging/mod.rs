@@ -62,6 +62,7 @@ pub mod seal;
 pub mod self_check;
 pub mod session;
 pub mod state;
+pub(crate) mod target_mutations;
 pub mod watermark;
 pub mod worker_registry;
 

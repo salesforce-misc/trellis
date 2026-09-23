@@ -7,9 +7,39 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
-    CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
+    CatalogError, ValidationError, ValueType, all_source_tables, chunk_queue, create_definition,
     create_relationship, install_definition, transforms_for_source,
 };
+
+/// Runs every queued `backfill_chunks` build to completion by hand, so a
+/// chunked 1-1 target goes `live` without a running drain worker — a
+/// definition can only chain off a live target (issue #315).
+async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, "defs_catalog_test", 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                target_schema,
+                "defs_catalog_test",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, "defs_catalog_test")
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
 
 fn columns(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -1653,6 +1683,10 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
+    // `custom`, not the configured `public`: the chunk runner takes the
+    // target schema from its caller and doesn't apply `custom.t`'s explicit
+    // schema itself.
+    drain_backfill_chunks(&db.pool, "custom").await;
 
     client
         .batch_execute("alter table custom.t replica identity full")
@@ -1675,14 +1709,12 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     );
 }
 
-/// The mirror of the test above: `custom.t` genuinely lacks `REPLICA
-/// IDENTITY FULL`, so the bare-chained aggregate must still be rejected —
-/// but with the real [`CatalogError::ReplicaIdentityRequired`], not the
-/// opaque `RowCount` resolution-miss error the gap produced before this fix
-/// (a totally unresolvable bare source hit the same `RowCount` failure,
-/// masking what should have been a clean identity rejection).
+/// The mirror of the test above, with `custom.t` left at its default
+/// replica identity: since issue #315 that is accepted too. A target's
+/// changes reach a chained definition through the target-mutation seam, never
+/// through CDC, so a seam-only target never needs an old image in WAL.
 #[tokio::test]
-async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_is_rejected_cleanly_when_not_full()
+async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_target_needs_no_full_identity()
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1704,59 +1736,21 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
+    // `custom`, not the configured `public`: the chunk runner takes the
+    // target schema from its caller and doesn't apply `custom.t`'s explicit
+    // schema itself.
+    drain_backfill_chunks(&db.pool, "custom").await;
     // `custom.t` is left at the default replica identity deliberately.
 
-    let err = create_definition(
+    create_definition(
         &db.pool,
         "TRANSFORM totals FROM t GROUP BY x SELECT x AS x, COUNT(*) AS n",
         &columns(&["x"]),
     )
     .await
-    .unwrap_err();
-
-    match &err {
-        CatalogError::ReplicaIdentityRequired(_) => {}
-        other => panic!(
-            "expected a clean ReplicaIdentityRequired rejection, got {other:?} \
-             (a RowCount error here would mean resolution never even reached \
-             custom.t)"
-        ),
-    }
-
-    let count: i64 = client
-        .query_one(
-            "select count(*) from transform_definitions \
-             where split_part(target_table, '.', 2) = 'totals'",
-            &[],
-        )
-        .await
-        .expect("count definitions")
-        .get(0);
-    assert_eq!(
-        count, 0,
-        "the wrongly-would-be-accepted aggregate definition must not persist"
-    );
+    .expect("an aggregate over a seam-only target needs no REPLICA IDENTITY FULL");
 }
 
-/// Issue #121: a `OneToOne` target's primary key used to be narrowed down to
-/// a single column, mirroring the source's own (issue #177's
-/// `create_definition_inner` gate, backed by the now-removed
-/// `ddl::require_single_column_pk`) — so a source with a genuinely composite
-/// primary key used to be rejected outright. This issue removed that
-/// narrowing: the target's own primary key now mirrors the source's in full,
-/// at whatever arity it has, so a composite-PK source is accepted instead.
-///
-/// [`create_definition`] is the ring-path entry point this test calls
-/// directly, deliberately bypassing [`install_definition`] entirely — the
-/// same entry point issue #177 found didn't run the (then-existing) arity
-/// check at all, so a composite-PK source reaching Postgres only via
-/// `create_definition`/`create_definition_without_backfill` used to skip
-/// straight through to `staging::apply`'s own machinery instead of being
-/// rejected up front; now there is nothing left to reject, so it drains
-/// cleanly through this same entry point (see `quarantine.rs`'s
-/// `a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt`
-/// for the fuller end-to-end pin of that, and
-/// `one_to_one_composite_primary_key.rs` for insert/update/delete coverage).
 #[tokio::test]
 async fn a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted() {
     let cluster = TestCluster::start();

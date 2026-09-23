@@ -160,6 +160,34 @@ pub async fn reconcile_publication(
     Ok(())
 }
 
+/// Parks a catch-up marker for `definition_id`'s *target* table when some
+/// `live` definition reads it (issue #315). Called wherever a definition goes
+/// live after a build that wrote its target outside the target-mutation seam
+/// (`staging::target_mutations`): a reader already attached (only possible
+/// for a rebuilt, resumed upstream, since `defs::catalog` refuses to attach a
+/// new one to a non-`live` target) re-derives from the rebuilt state once
+/// the marker discharges. A no-op for a target nothing reads.
+pub(crate) async fn park_target_catchup_if_read(
+    client: &impl GenericClient,
+    definition_id: i64,
+) -> Result<(), IntakeError> {
+    let target: Option<String> = client
+        .query_opt(
+            "select d.target_table from transform_definitions d \
+             where d.id = $1 and exists ( \
+                 select 1 from transform_definitions r \
+                 where r.source_table = d.target_table and r.status = 'live' \
+             )",
+            &[&definition_id],
+        )
+        .await?
+        .map(|row| row.get(0));
+    if let Some(target) = target {
+        park_backfill_catchup(client, &target).await?;
+    }
+    Ok(())
+}
+
 /// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
 /// `pending_backfill` mechanism [`reconcile_publication`] already relies on
 /// for a table newly joining the publication (docs/decisions/0007's
@@ -424,6 +452,7 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
                 // pre-existing row — nothing "changed" it; see
                 // `StagedChange::Recompute`'s doc comment.
                 src_changed: None,
+                prior_image: None,
             });
         }
         append::append(txn, &page).await?;
@@ -919,6 +948,9 @@ async fn mark_definitions_live(
             to = %TransformStatus::Live.as_str(),
             "transform status transition: backfill enumeration committed"
         );
+    }
+    for id in &flipped {
+        park_target_catchup_if_read(client, *id).await?;
     }
     if flipped.len() < ids.len() {
         let skipped: Vec<i64> = ids

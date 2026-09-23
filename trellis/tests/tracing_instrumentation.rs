@@ -518,6 +518,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         is_truncate: false,
         relationship_reverse_deferred: None,
         retry_count: 0,
+        prior_image: None,
     }];
 
     let result = isolate_and_evict(

@@ -1,18 +1,21 @@
-//! Issue #312: a write to a chain's intermediate hop must reach a downstream
-//! aggregate once, even when the hop is in the publication.
+//! Issues #312 and #315: a write to a chain's intermediate hop must reach a
+//! downstream aggregate exactly once, and must leave both the group a row
+//! left and the group it joined correct.
 //!
 //! `h1` below is the target of `src -> h1` and the source of the aggregate
-//! `h1 -> h3`, so it is published. The drain that writes `h1` stages its own
-//! downstream `Recompute` for `h3` inside the writing transaction, and intake
-//! would decode that same write again as CDC. When the two copies land in
-//! different batches, the aggregate re-derives the group from live state
-//! (which already holds the write) and then adds the CDC delta on top of it.
+//! `h1 -> h3`. Since issue #315 a target table is never published: the drain
+//! that writes `h1` stages its own downstream `Recompute` for `h3` inside the
+//! writing transaction (`staging::target_mutations`), and that is the only
+//! copy. Before, `h1` was published too, and intake decoded the same write a
+//! second time; when the two copies landed in different batches the
+//! aggregate re-derived the group from live state (which already held the
+//! write) and then added the CDC delta on top of it.
 //!
-//! The test drives intake and the drain by hand so the two copies are forced
-//! into separate batches every time, rather than relying on seal timing: it
-//! reads real `pgoutput` bytes off a second logical slot with
-//! `pg_logical_slot_get_binary_changes` and feeds them to a real
-//! [`intake::Intake`] through `handle_event`.
+//! The test drives intake and the drain by hand so every hop lands in its own
+//! batch, rather than relying on seal timing: it reads real `pgoutput` bytes
+//! off a second logical slot with `pg_logical_slot_get_binary_changes` and
+//! feeds them to a real [`intake::Intake`] through `handle_event`. The
+//! publication is exactly what [`trellis::defs::publication_tables`] asks for.
 
 use std::collections::HashMap;
 
@@ -186,10 +189,8 @@ impl Hop {
         )
         .await
         .expect("install h1");
-        // An aggregate over `h1` needs `h1`'s full old image.
-        raw.batch_execute("alter table public.h1 replica identity full")
-            .await
-            .expect("widen h1's replica identity");
+        // No `REPLICA IDENTITY FULL` on `h1`: an aggregate over a target
+        // never reads its CDC, so it has no old-image requirement (#315).
         install_definition(
             &db.pool,
             "TRANSFORM h3 FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
@@ -199,8 +200,17 @@ impl Hop {
         .await
         .expect("install h3");
 
+        let published = trellis::defs::publication_tables(&db.pool)
+            .await
+            .expect("publication_tables");
+        assert_eq!(
+            published,
+            vec!["public.src".to_string()],
+            "a chain's intermediate hop is a target, so it is never published"
+        );
         raw.batch_execute(&format!(
-            "create publication {PUBLICATION} for table public.src, public.h1"
+            "create publication {PUBLICATION} for table {}",
+            published.join(", ")
         ))
         .await
         .expect("create publication");
@@ -268,7 +278,7 @@ impl Hop {
 }
 
 #[tokio::test]
-async fn an_aggregate_counts_a_published_intermediate_hops_write_once() {
+async fn an_aggregate_counts_an_intermediate_hops_write_once() {
     let mut hop = Hop::start().await;
 
     hop.raw
@@ -285,48 +295,69 @@ async fn an_aggregate_counts_a_published_intermediate_hops_write_once() {
         "the in-transaction propagation alone must count the row once"
     );
 
-    // Intake now decodes the transaction that wrote `h1`. Its CDC copy of
-    // that write is the second producer: staged, it would drain as a delta
-    // on top of the group the `Recompute` already re-derived.
+    // Intake now decodes the transaction that wrote `h1`. `h1` isn't in the
+    // publication, so nothing of that write reaches the ring a second time.
     hop.feed_and_drain().await;
     assert_eq!(
         h3_groups(&hop.raw).await,
         HashMap::from([("7".to_string(), "1".to_string())]),
-        "the CDC copy of an already-propagated hop write must not be counted again"
+        "an intermediate hop's write must never be counted twice"
     );
 
     hop.finish().await;
 }
 
-/// A propagated-tables message reaches every slot in the database. One
-/// emitted by another Trellis instance must not make this instance's intake
-/// drop a write: that instance staged its downstream copy into its own ring,
-/// not this one's, so here the CDC copy is the only one there is.
+/// Issue #315's grain migration: `h3` groups by `h1.val`, a non-key column
+/// of an upstream target. Moving a row from group 7 to group 8 must leave
+/// group 7 correct as well as group 8. The recompute `h1`'s write stages is
+/// image-less (re-read live), so on its own it only names group 8; the prior
+/// image it carries is what tells `h3` to re-derive group 7 too. A delete is
+/// the same: only the prior image names the group the row left.
 #[tokio::test]
-async fn another_instances_propagated_message_does_not_drop_this_instances_cdc() {
+async fn an_aggregate_over_a_hop_follows_a_row_that_moves_groups_and_then_leaves() {
     let mut hop = Hop::start().await;
 
-    // What another instance's apply emits (`staging::apply`'s
-    // `emit_propagated_tables`, run under that instance's `search_path`)
-    // while it writes `public.h1`, a table this instance reads as a source.
     hop.raw
-        .batch_execute(
-            "create schema other_instance; \
-             begin; \
-             set local search_path to other_instance; \
-             select pg_logical_emit_message(true, 'trellis.propagated:' || current_schema(), \
-                                            'public.h1'::bytea); \
-             insert into public.h1 (id, val) values (2, 7); \
-             commit;",
-        )
+        .batch_execute("insert into public.src (id, val) values (1, 7), (2, 7), (3, 9)")
         .await
-        .expect("another instance writes h1");
-
+        .expect("seed src");
     hop.feed_and_drain().await;
     assert_eq!(
         h3_groups(&hop.raw).await,
-        HashMap::from([("7".to_string(), "1".to_string())]),
-        "this instance must stage the CDC of another instance's write to h1"
+        HashMap::from([
+            ("7".to_string(), "2".to_string()),
+            ("9".to_string(), "1".to_string()),
+        ]),
+    );
+
+    hop.raw
+        .execute("update public.src set val = 8 where id = 1", &[])
+        .await
+        .expect("move row 1 from group 7 to group 8");
+    hop.feed_and_drain().await;
+    assert_eq!(
+        h3_groups(&hop.raw).await,
+        HashMap::from([
+            ("7".to_string(), "1".to_string()),
+            ("8".to_string(), "1".to_string()),
+            ("9".to_string(), "1".to_string()),
+        ]),
+        "the row's old group must lose it, not only its new group gain it"
+    );
+
+    hop.raw
+        .execute("update public.src set val = 9 where id = 2", &[])
+        .await
+        .expect("move group 7's last row into group 9");
+    hop.raw
+        .execute("delete from public.src where id = 1", &[])
+        .await
+        .expect("delete group 8's only row");
+    hop.feed_and_drain().await;
+    assert_eq!(
+        h3_groups(&hop.raw).await,
+        HashMap::from([("9".to_string(), "2".to_string())]),
+        "a group every row left, by moving or by deletion, must be removed"
     );
 
     hop.finish().await;
