@@ -12,6 +12,12 @@ use trellis::defs::{
     relationship_by_name, source_primary_key,
 };
 
+/// The schema this file's bare `CREATE TABLE`s land in, and so the schema a
+/// bare relationship endpoint resolves to: the Trellis schema, first on every
+/// pooled connection's `search_path`. A relationship is looked up by its
+/// qualified from-table (issue #288).
+const SCHEMA: &str = "trellis";
+
 /// A bare table with an integer primary key named `pk_col` — good enough to
 /// stand in as a relationship's to-side when the test wants a `UNIQUE`/`PK`
 /// column present (cardinality `ToOne`). Carries `REPLICA IDENTITY FULL`
@@ -126,7 +132,7 @@ async fn a_relationship_round_trips_through_the_catalog() {
     assert_eq!(created.def.to_col, "id");
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 
-    let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
+    let read_back = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query")
         .expect("relationship should be found");
@@ -151,7 +157,7 @@ async fn relationship_by_name_returns_none_for_an_unknown_pair() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -243,7 +249,9 @@ async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
 
     match &err {
         CatalogError::Validate(ValidationError::DuplicateRelationshipName { from_table, name }) => {
-            assert_eq!(from_table, "posts");
+            // The qualified from-table: a name is unique per qualified
+            // from-table (issue #288), so that's what it collided on.
+            assert_eq!(from_table, "trellis.posts");
             assert_eq!(name, "author");
         }
         other => panic!("expected DuplicateRelationshipName, got {other:?}"),
@@ -277,11 +285,11 @@ async fn the_same_relationship_name_is_allowed_on_different_from_tables() {
     .await
     .expect("same name on a different from-table should be allowed");
 
-    let posts_owner = relationship_by_name(&db.pool, "posts", "owner")
+    let posts_owner = relationship_by_name(&db.pool, SCHEMA, "posts", "owner")
         .await
         .expect("read query")
         .expect("posts.owner should exist");
-    let comments_owner = relationship_by_name(&db.pool, "comments", "owner")
+    let comments_owner = relationship_by_name(&db.pool, SCHEMA, "comments", "owner")
         .await
         .expect("read query")
         .expect("comments.owner should exist");
@@ -333,7 +341,7 @@ async fn an_unparseable_relationship_is_rejected_and_leaves_no_row() {
         .unwrap_err();
     assert!(matches!(err, CatalogError::Parse(_)));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -374,7 +382,7 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
     let message = err.to_string();
     assert!(message.contains("not comparable"));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -418,7 +426,7 @@ async fn a_numeric_join_key_is_rejected() {
     let message = err.to_string();
     assert!(message.contains("numeric"));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -453,7 +461,7 @@ async fn a_character_n_join_key_is_rejected() {
         other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
     }
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -496,7 +504,7 @@ async fn a_timestamptz_join_key_is_accepted() {
     .await
     .expect("timestamptz is a text-stable join key as of issue #246");
 
-    let found = relationship_by_name(&db.pool, "order_line_items", "product")
+    let found = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(found.is_some());
@@ -527,7 +535,7 @@ async fn a_to_many_to_side_with_default_replica_identity_is_rejected() {
         CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
     ));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -564,7 +572,7 @@ async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
         CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
     ));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -655,7 +663,7 @@ async fn a_to_many_to_side_with_non_covering_replica_identity_index_is_rejected(
         CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
     ));
 
-    let missing = relationship_by_name(&db.pool, "order_line_items", "product")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -813,7 +821,7 @@ async fn a_primary_key_to_column_determines_to_one_cardinality() {
     .expect("valid relationship should be stored");
 
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
-    let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
+    let read_back = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query")
         .expect("relationship should be found");
@@ -864,7 +872,7 @@ async fn a_non_unique_to_column_determines_to_many_cardinality() {
     .expect("valid relationship should be stored, even though its to-side isn't unique");
 
     assert_eq!(created.cardinality, RelationshipCardinality::ToMany);
-    let read_back = relationship_by_name(&db.pool, "order_line_items", "product")
+    let read_back = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
         .expect("read query")
         .expect("relationship should be found");
@@ -1209,7 +1217,7 @@ async fn a_relationship_edge_that_would_close_a_cycle_is_rejected() {
         other => panic!("expected TableCycle, got {other:?}"),
     }
 
-    let missing = relationship_by_name(&db.pool, "b", "a")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "b", "a")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -1391,7 +1399,7 @@ async fn a_numeric_passthrough_on_a_calculated_table_is_still_rejected_as_a_join
         other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
     }
 
-    let missing = relationship_by_name(&db.pool, "posts_calc", "author")
+    let missing = relationship_by_name(&db.pool, SCHEMA, "posts_calc", "author")
         .await
         .expect("read query");
     assert!(missing.is_none());
@@ -1466,7 +1474,7 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
     assert_eq!(created.def.to_table, "t2");
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 
-    let read_back = relationship_by_name(&db.pool, "order_line_items", "t2")
+    let read_back = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "t2")
         .await
         .expect("read query")
         .expect("relationship should be found");
@@ -1581,4 +1589,129 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
         "enriched.total_copy must reflect custom.t2.total via the resolved relationship"
     );
     assert_eq!(def.def.target, "enriched");
+}
+
+/// Issue #288: a relationship name is unique per *schema-qualified* from-table,
+/// not per bare from-table name. `blog.posts` and `shop.posts` are unrelated
+/// tables that merely share a name, so each may declare its own `author`
+/// relationship — and each must then resolve, and drop, independently of the
+/// other.
+///
+/// The `RELATIONSHIP` grammar has no qualified endpoint spelling, so a bare
+/// `posts` resolves through the declaring connection's `search_path` — the
+/// same way it does everywhere else. Two pools whose `target_schema` (and so
+/// whose `search_path`) differ are how the same statement text reaches two
+/// different `posts` tables here, against one shared catalog.
+#[tokio::test]
+async fn same_named_relationships_on_same_named_tables_in_different_schemas_coexist() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute(
+                "create schema blog; create schema shop; \
+                 create table blog.users (id integer primary key); \
+                 create table shop.users (id integer primary key); \
+                 create table blog.posts (id integer primary key, author_id integer); \
+                 create table shop.posts (id integer primary key, author_id integer); \
+                 alter table blog.users replica identity full; \
+                 alter table shop.users replica identity full; \
+                 alter table blog.posts replica identity full; \
+                 alter table shop.posts replica identity full;",
+            )
+            .await
+            .expect("seed blog and shop");
+    }
+    let schema_pool = |target_schema: &str| {
+        let config = trellis::Config::from_dsn(db.dsn().to_string())
+            .expect("valid dsn")
+            .with_target_schema(target_schema)
+            .expect("valid target schema");
+        trellis::pool::Pool::new(&config).expect("build pool")
+    };
+    let blog_pool = schema_pool("blog");
+    let shop_pool = schema_pool("shop");
+
+    let statement = "RELATIONSHIP author FROM posts.author_id TO users.id";
+    let blog_rel = create_relationship(&blog_pool, statement)
+        .await
+        .expect("blog.posts may declare `author`");
+    let shop_rel = create_relationship(&shop_pool, statement)
+        .await
+        .expect("shop.posts may declare its own `author` — a different table entirely");
+    assert_ne!(blog_rel.id, shop_rel.id);
+
+    let count = |schema: &'static str| {
+        let pool = &db.pool;
+        async move {
+            let client = pool.get().await.expect("get connection");
+            client
+                .query_one(
+                    "select count(*) from relationship_definitions \
+                     where from_schema = $1 and from_table = 'posts' and name = 'author'",
+                    &[&schema],
+                )
+                .await
+                .expect("count")
+                .get::<_, i64>(0)
+        }
+    };
+    assert_eq!(count("blog").await, 1);
+    assert_eq!(count("shop").await, 1);
+
+    // Each resolves on its own qualified from-table, to its own row.
+    let blog_read = relationship_by_name(&db.pool, "blog", "posts", "author")
+        .await
+        .expect("read query")
+        .expect("blog.posts.author resolves");
+    let shop_read = relationship_by_name(&db.pool, "shop", "posts", "author")
+        .await
+        .expect("read query")
+        .expect("shop.posts.author resolves");
+    assert_eq!(blog_read.id, blog_rel.id);
+    assert_eq!(blog_read.from_schema, "blog");
+    assert_eq!(blog_read.qualified_from_table(), "blog.posts");
+    assert_eq!(shop_read.id, shop_rel.id);
+    assert_eq!(shop_read.from_schema, "shop");
+    assert_eq!(shop_read.qualified_from_table(), "shop.posts");
+
+    // A bare `DROP` address now matches two relationships, so it is refused
+    // rather than resolved through whichever `search_path` the caller has.
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    let err = trellis
+        .apply("DROP RELATIONSHIP posts.author")
+        .await
+        .expect_err("a bare address naming two relationships is ambiguous");
+    assert!(
+        matches!(
+            &err,
+            trellis::TrellisError::Catalog(CatalogError::AmbiguousRelationshipAddress {
+                schemas, ..
+            }) if schemas == &["blog".to_string(), "shop".to_string()]
+        ),
+        "expected AmbiguousRelationshipAddress naming both schemas, got {err:?}"
+    );
+    assert_eq!(count("blog").await, 1, "a refused drop drops nothing");
+    assert_eq!(count("shop").await, 1, "a refused drop drops nothing");
+
+    // Each qualified address drops exactly its own relationship.
+    trellis
+        .apply("DROP RELATIONSHIP shop.posts.author")
+        .await
+        .expect("drop shop.posts.author");
+    assert_eq!(count("shop").await, 0);
+    assert_eq!(count("blog").await, 1, "blog.posts.author is untouched");
+
+    // With only one left, the bare address is no longer ambiguous.
+    trellis
+        .apply("DROP RELATIONSHIP posts.author")
+        .await
+        .expect("a bare address naming one relationship drops it");
+    assert_eq!(count("blog").await, 0);
 }

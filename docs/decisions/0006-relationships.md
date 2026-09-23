@@ -33,6 +33,8 @@ expression language.
 
 * A relationship name is **unique per from-table**, not global. `posts` may
   declare both `author` and `editor` at `users` as independent relationships.
+  "From-table" means the fully-qualified table (issue #288): `blog.posts` and
+  `shop.posts` are different tables, so each may declare its own `author`.
 * Relationships may be declared in any order, as long as every endpoint
   resolves and the dependency graph stays acyclic.
 

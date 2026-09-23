@@ -189,7 +189,10 @@ DROP   RELATIONSHIP [<schema>.]<from_table>.<relationship_name>
 address means `<transform>.<column>` — pausing or resuming a single calculated
 field rather than the whole definition. A relationship, which only `DROP` names,
 is always scoped to its from-table (`posts.author`, or `blog.posts.author`),
-because a relationship name is unique only there.
+because a relationship name is unique only there. Two same-named tables in
+different schemas are different from-tables, so `blog.posts` and `shop.posts`
+can each declare an `author`; when both do, the bare `posts.author` is refused
+as ambiguous and the address must name the schema.
 
 **Semantics** are covered by
 [0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md).

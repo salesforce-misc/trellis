@@ -192,6 +192,13 @@ impl TransformStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipDefinition {
     pub id: i64,
+    /// The schema `def.from_table` resolved to when the relationship was
+    /// declared (`relationship_definitions.from_schema`, issues #285/#288).
+    /// `def.from_table` is the bare name as written; this is what makes it
+    /// one specific table. A relationship's identity is
+    /// `(from_schema, from_table, name)`, so `blog.posts.author` and
+    /// `shop.posts.author` are two different relationships.
+    pub from_schema: String,
     pub def: RelationshipDef,
     pub cardinality: RelationshipCardinality,
     /// Non-fatal caveats surfaced alongside this (still-successful)
@@ -201,6 +208,19 @@ pub struct RelationshipDefinition {
     /// `pg_catalog` state (an index dropped later) can drift from what was
     /// true at creation anyway.
     pub warnings: Vec<RelationshipWarning>,
+}
+
+impl RelationshipDefinition {
+    /// The from-table's fully-qualified `"schema.table"` identity, the same
+    /// spelling `transform_definitions.source_table`, `schema_nodes` and a
+    /// staged `src_table` all use. Anything that reads the from-side table,
+    /// or matches it against a transform's source, must use this rather than
+    /// the bare `def.from_table`: a bare name resolves through whatever
+    /// `search_path` the reading session has, which need not land on the
+    /// table this relationship was declared against.
+    pub fn qualified_from_table(&self) -> String {
+        format!("{}.{}", self.from_schema, self.def.from_table)
+    }
 }
 
 /// Whether a relationship's to-side is guaranteed at most one row per

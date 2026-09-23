@@ -1258,8 +1258,8 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// — see `trellis/tests/spikes/issue-102-PLAN-DRAFT.md` §2) —
 /// `_trellis_rel_projection_<id>`, named after the relationship's own
 /// catalog id rather than its declared name. A relationship name is unique
-/// only *per from-table* (`V16__relationship_definitions.sql`'s `unique
-/// (from_table, name)`), so two different from-tables can declare a
+/// only *per from-table* (`V38__relationship_definitions_schema_qualified_key.sql`'s
+/// `unique (from_schema, from_table, name)`), so two different from-tables can declare a
 /// same-named relationship; the id is the one thing already guaranteed
 /// globally unique by the time this is called
 /// (`catalog::create_relationship` names the projection right after
@@ -1447,7 +1447,7 @@ pub async fn create_target_table(
     // relationship metadata. Resolve it the same way `create_definition` does
     // (catalog + `pg_catalog` lookups); a relationship-free definition
     // resolves to an empty map and behaves exactly as before.
-    let relationships = super::catalog::resolve_relationships(pool, def)
+    let relationships = super::catalog::resolve_relationships(pool, def, source_table)
         .await
         .map_err(map_resolve_error)?;
     let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
@@ -1738,7 +1738,12 @@ pub async fn create_aggregate_target_table(
     // metadata the same way [`create_target_table`] does so type inference can
     // reach it; a relationship-free aggregate resolves to an empty map and
     // behaves exactly as before.
-    let relationships = super::catalog::resolve_relationships(pool, def)
+    //
+    // No qualified source is threaded in here, unlike `create_target_table`:
+    // this runs during install, before anything has recorded one, so it is
+    // resolved the same way `install_definition` resolves it (issue #288 —
+    // relationships are looked up on the qualified source).
+    let relationships = super::catalog::resolve_relationships_for_new_definition(pool, def)
         .await
         .map_err(map_resolve_error)?;
     let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;

@@ -523,8 +523,9 @@ impl Parser {
     /// remaining one or two are the from-table's own `[<schema>.]<table>`
     /// reference. A bare, unscoped name is refused
     /// ([`ParseError::UnscopedRelationshipAddress`]) — it identifies nothing,
-    /// since `relationship_definitions` is unique on `(from_table, name)`, not
-    /// on `name`. Four or more parts are refused naming the whole address.
+    /// since `relationship_definitions` is unique on
+    /// `(from_schema, from_table, name)`, not on `name`. Four or more parts
+    /// are refused naming the whole address.
     ///
     /// **Deliberately not [`Self::parse_table_ref`]** either: that helper
     /// errors on the third part as over-qualified, which is exactly the

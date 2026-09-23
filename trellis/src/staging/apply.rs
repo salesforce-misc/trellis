@@ -483,33 +483,23 @@ fn catalog_source_key(src_table: &str) -> &str {
 /// A no-op for the common case — `src_table` already contains a `.` — which
 /// covers every real CDC-staged or backfill-enumerated change (issue #76
 /// qualifies `change.src_table` unconditionally at the point it's staged).
-/// Two different shapes of bare name reach this function, needing two
-/// different resolutions — both handled by delegating to
-/// [`catalog::resolve_graph_identity`] rather than this function choosing
-/// between them itself:
+/// The one bare shape that still reaches it is a chained definition's own
+/// target, bare as [`crate::defs::ddl::neighbor_table_name`] always returns
+/// it — the bookkeeping key `compute`'s downstream-reader lookup
+/// (terminal-target latency metrics) asks about. That resolves through
+/// [`catalog::resolve_graph_identity`]'s bare-target-suffix fallback (for a
+/// target that isn't on the `search_path`): the name can only be some other
+/// live definition's own target. A relationship's from-side used to be the
+/// other bare shape; since issue #288 it carries its own recorded schema
+/// ([`crate::defs::RelationshipDefinition::qualified_from_table`]) and never
+/// comes through here.
 ///
-/// 1. A chained definition's own target, bare as
-///    [`crate::defs::ddl::neighbor_table_name`] always returns it — the
-///    bookkeeping key `compute`'s downstream-reader lookup (terminal-target
-///    latency metrics) asks about. This is
-///    `resolve_graph_identity`'s bare-target-suffix fallback (for a target
-///    that isn't on the `search_path`): the name can only be some other live
-///    definition's own target.
-/// 2. A relationship's from-side, `rel.def.from_table` —
-///    `relationship_definitions.from_table` is always bare (ADR-0007's
-///    "Scope" section leaves relationship endpoints unqualified) and is a
-///    genuine *source* table, never anyone's target, so the bare-target-
-///    suffix fallback above would never find it. This is
-///    `resolve_graph_identity`'s *first* step instead: a plain physical
-///    `search_path` lookup, exactly like resolving a fresh definition's own
-///    bare `FROM`.
-///
-/// Issue #267 turned both of those from after-the-fact repairs of an
-/// already-staged bare `src_table` into the canonicalization applied *before*
-/// staging: this function's output is now what those rows carry into the ring
-/// in the first place, so a bare `src_table` reaching `compute` is no longer
-/// something this module itself produces. See
-/// [`accumulate_from_side_recomputes`] for the emission site, and
+/// Issue #267 turned this from an after-the-fact repair of an already-staged
+/// bare `src_table` into the canonicalization applied *before* staging: this
+/// function's output is now what those rows carry into the ring in the first
+/// place, so a bare `src_table` reaching `compute` is no longer something
+/// this module itself produces. See [`accumulate_from_side_recomputes`] for
+/// the emission site, and
 /// [`catalog_source_key`] for why the reading side still tolerates a bare
 /// name anyway.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
@@ -898,7 +888,7 @@ async fn from_side_keys(
                  from {tbl} \
                  where {filter}",
                 pk = ddl::pk_key_sql_expr(from_pk, None),
-                tbl = quote_ident(from_table),
+                tbl = ddl::qualified_source_table(from_table),
             );
             let rows = client.query(&sql, &[join_keys]).await?;
             Ok(rows
@@ -912,7 +902,7 @@ async fn from_side_keys(
                 "select {pk} from {tbl} where {col} is not null",
                 pk = ddl::pk_key_sql_expr(from_pk, None),
                 col = quote_ident(from_col),
-                tbl = quote_ident(from_table),
+                tbl = ddl::qualified_source_table(from_table),
             );
             let rows = client.query(&sql, &[]).await?;
             Ok(rows
@@ -947,23 +937,25 @@ async fn accumulate_from_side_recomputes(
         return Ok(());
     }
     let join_keys: Vec<String> = key_hops.keys().cloned().collect();
-    // Issue #267: `relationship_definitions.from_table` is bare (ADR-0007's
-    // "Scope" leaves relationship endpoints unqualified), but this
-    // accumulator's entries become staged `src_table`s verbatim
-    // ([`apply_and_mark_drained_many`]'s step 4), so they are canonicalized to
-    // qualified identity here — the spelling CDC intake stages for this same
-    // from-side table (which, being a genuine source table, is normally a
-    // publication member), and the spelling the Phase 3
+    // Issue #267: this accumulator's entries become staged `src_table`s
+    // verbatim ([`apply_and_mark_drained_many`]'s step 4), so they carry the
+    // from-table's qualified identity — the spelling CDC intake stages for
+    // this same from-side table (which, being a genuine source table, is
+    // normally a publication member), and the spelling the Phase 3
     // `relationship_reverse_fallback` twin of this path has always used
     // (`ReverseRelationshipShape::from_table` is already qualified). Two
     // spellings of one table fold as two unrelated `(src_table, key)` groups,
     // and a batch that upserts both hands Postgres the same conflict key
-    // twice (issue #267's live-lock).
-    let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
-    let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+    // twice (issue #267's live-lock). Issue #288: taken from the
+    // relationship's own recorded `from_schema`, not by re-resolving the
+    // bare `from_table` through this session's `search_path`, which could
+    // land on a same-named table in another schema — and the from-side
+    // reads below use it for the same reason.
+    let qualified_from_table = rel.qualified_from_table();
+    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
     let matches = from_side_keys(
         pool,
-        &rel.def.from_table,
+        &qualified_from_table,
         &from_pk,
         &rel.def.from_col,
         &ReverseTrigger::Keys(&join_keys),
@@ -1036,8 +1028,9 @@ pub(crate) struct RelationshipGenBump {
 /// their `to_col` text, plus the referenced to-side columns' types. Join keys
 /// are the distinct `from_col` values of the from-side rows this batch will
 /// evaluate — so only the related rows those rows actually need are fetched.
-/// `from_table` is the definition's own source table (a relationship's
-/// `from_table`).
+/// `qualified_source` is the definition's own qualified source table
+/// ([`crate::defs::Definition::source_table`]) — a relationship's from-table,
+/// and the key its name is unique under (issue #288).
 ///
 /// **Issue #130, epic #127**: a to-one relationship (`RelationshipCardinality::ToOne`)
 /// resolves against the settled parent projection (#129's
@@ -1068,7 +1061,7 @@ pub(crate) struct RelationshipGenBump {
 /// pipeline) and, as above, discards the gen-bump map regardless.
 pub(crate) async fn build_relationship_context(
     pool: &Pool,
-    from_table: &str,
+    qualified_source: &str,
     def: &TransformDef,
     rows: &[Option<Row>],
     old_rows: Option<&[Option<Row>]>,
@@ -1089,7 +1082,9 @@ pub(crate) async fn build_relationship_context(
     let mut gen_bumps: HashMap<i64, RelationshipGenBump> = HashMap::new();
 
     for (rel_name, columns) in cols_by_rel {
-        let Some(reldef) = catalog::relationship_by_name(pool, from_table, &rel_name).await? else {
+        let Some(reldef) =
+            catalog::relationship_on_source(pool, qualified_source, &rel_name).await?
+        else {
             // Unknown relationship: leave it out and let the evaluator surface
             // `EvalError::UnknownRelationship`, the same as the pure path.
             continue;
@@ -1158,7 +1153,7 @@ pub(crate) async fn build_relationship_context(
                         // dangling join key) rather than panicking.
                         tracing::error!(
                             relationship = %rel_name,
-                            from_table = %from_table,
+                            from_table = %qualified_source,
                             "to-one relationship has no settled parent projection; \
                              resolving as empty (should be unreachable — #129 creates \
                              one unconditionally)"
@@ -1615,18 +1610,15 @@ async fn build_reverse_relationship_shape(
         }
     };
     let target_schema = pool.target_schema().to_string();
-    let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
     // `transforms_for_source` matches `schema_nodes.table_name` exactly
     // (ADR-0007's fully-qualified keying) and every SQL-emitting site below
     // (`AggregateTargetPlan::source`, `from_side_rows_for_trigger_txn`'s
-    // `ddl::qualified_source_table`) documents the same requirement — unlike
-    // `source_primary_key` above (a `to_regclass` resolution that already
-    // tolerates a bare name via `search_path`), so this shape stores the
-    // qualified form of `from_table` throughout, not `rel.def.from_table`
-    // verbatim (which the to-many arm elsewhere in this module can get away
-    // with, since it only ever feeds `source_primary_key`/
-    // `from_side_keys`).
-    let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
+    // `ddl::qualified_source_table`) documents the same requirement, so this
+    // shape stores the qualified form of `from_table` throughout — the
+    // relationship's own recorded one (issue #288), never `rel.def.from_table`
+    // re-resolved through this session's `search_path`.
+    let qualified_from_table = rel.qualified_from_table();
+    let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
     let defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
 
     let mut aggregate_shapes = Vec::new();
@@ -1656,7 +1648,8 @@ async fn build_reverse_relationship_shape(
             continue;
         }
 
-        let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+        let relationships =
+            catalog::resolve_relationships(pool, &def.def, &def.source_table).await?;
         let substituted_exprs = crate::defs::backfill::substituted_field_exprs(&def.def)?;
         let field_plans = apply_aggregate::classify_fields(
             &def.def,
@@ -4789,7 +4782,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 } else {
                     let (ctx, gen_bumps) = build_relationship_context(
                         pool,
-                        source_key,
+                        &def.source_table,
                         &def.def,
                         &rows,
                         Some(&old_rows),
@@ -4902,7 +4895,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // same catalog resolution `defs::catalog` validates against; a
             // relationship-free aggregate resolves to an empty map and costs
             // one cheap no-op.
-            let relationships = catalog::resolve_relationships(pool, &def.def).await?;
+            let relationships =
+                catalog::resolve_relationships(pool, &def.def, &def.source_table).await?;
             let group_by_types: Vec<ValueType> = group_by
                 .iter()
                 .map(|key| match key {
@@ -4931,7 +4925,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // relationship row; `ResolvedRelationship` carries only the
                 // to-side, since that's all the validator needs.
                 if let Some(reldef) =
-                    catalog::relationship_by_name(pool, &def.def.source, rel_name).await?
+                    catalog::relationship_on_source(pool, &def.source_table, rel_name).await?
                 {
                     // Mirrors `defs::backfill::resolve_to_one_joins`'s guard:
                     // the validator makes a to-many path in an aggregate
@@ -5002,7 +4996,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             } else {
                 let (ctx, gen_bumps) = build_relationship_context(
                     pool,
-                    source_key,
+                    &def.source_table,
                     &def.def,
                     &rows,
                     Some(&old_rows),
@@ -5283,11 +5277,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // reason [`accumulate_from_side_recomputes`] does it — this shares
             // that function's accumulator, and its entries are staged as
             // `src_table` verbatim.
-            let qualified_from_table = qualified_schema_node_key(pool, &rel.def.from_table).await?;
-            let from_pk = ddl::source_primary_key(pool, &rel.def.from_table).await?;
+            let qualified_from_table = rel.qualified_from_table();
+            let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
             let from_keys = from_side_keys(
                 pool,
-                &rel.def.from_table,
+                &qualified_from_table,
                 &from_pk,
                 &rel.def.from_col,
                 &ReverseTrigger::WholeKeyspace,

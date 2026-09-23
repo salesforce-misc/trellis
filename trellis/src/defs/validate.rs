@@ -270,6 +270,9 @@ pub enum ValidationError {
     /// per-from-table, not global) with an actionable message, ahead of the
     /// `relationship_definitions` unique constraint that backstops this
     /// check against a same-name race between concurrent callers.
+    /// `from_table` is the qualified `"schema.table"` it collided on — the
+    /// name is unique per qualified from-table (issue #288), so a same-named
+    /// table in another schema is no collision.
     DuplicateRelationshipName { from_table: String, name: String },
     /// A relationship's join key resolved to a Postgres type that isn't
     /// text-stable — one where `a::text = b::text` disagrees with the type's

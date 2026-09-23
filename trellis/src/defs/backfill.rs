@@ -1165,6 +1165,7 @@ fn agg_arg_expr(expr: &Expr) -> &Expr {
 async fn resolve_to_one_joins(
     pool: &Pool,
     def: &TransformDef,
+    source_table: &str,
 ) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
     let mut names: Vec<String> = super::eval::relationship_references(def)
         .into_iter()
@@ -1175,7 +1176,7 @@ async fn resolve_to_one_joins(
 
     let mut resolved = Vec::with_capacity(names.len());
     for rel in names {
-        let Some(reldef) = super::catalog::relationship_by_name(pool, &def.source, &rel)
+        let Some(reldef) = super::catalog::relationship_on_source(pool, source_table, &rel)
             .await
             .map_err(map_rel_lookup_err)?
         else {
@@ -1261,7 +1262,7 @@ async fn backfill_aggregate(
     // path here would be a nested aggregation, which the validator rejects; a
     // stored definition that somehow carries one falls back to the ring rather
     // than emitting SQL with different semantics.
-    let rel_joins = resolve_to_one_joins(pool, def).await?;
+    let rel_joins = resolve_to_one_joins(pool, def, source_table).await?;
     let joins_sql = super::oracle::to_one_join_clauses(
         rel_joins.iter().map(|(rel, d)| {
             (
@@ -1291,7 +1292,7 @@ async fn backfill_aggregate(
     // uses for the same reason (a relationship-free aggregate never resolves
     // any relationships, so this is a cheap no-op call for the overwhelmingly
     // common case).
-    let relationships = super::catalog::resolve_relationships(pool, def)
+    let relationships = super::catalog::resolve_relationships(pool, def, source_table)
         .await
         .map_err(map_rel_lookup_err)?;
     let group_by_value_type = |key: &GroupByKey| -> ValueType {
@@ -1823,7 +1824,7 @@ async fn backfill_relationship_one_to_one(
     pk: &[PrimaryKeyColumn],
 ) -> Result<(), BackfillError> {
     // Resolve every referenced relationship to its endpoints + cardinality the
-    // same way the rest of the catalog does (`relationship_by_name`), so this
+    // same way the rest of the catalog does (`relationship_on_source`), so this
     // build reads the identical join metadata the ring/oracle do.
     let mut rel_defs: HashMap<String, RelationshipDef> = HashMap::new();
     let mut rel_cardinality: HashMap<String, RelationshipCardinality> = HashMap::new();
@@ -1831,7 +1832,7 @@ async fn backfill_relationship_one_to_one(
         if rel_defs.contains_key(&rel) {
             continue;
         }
-        let Some(reldef) = super::catalog::relationship_by_name(pool, &def.source, &rel)
+        let Some(reldef) = super::catalog::relationship_on_source(pool, source_table, &rel)
             .await
             .map_err(map_rel_lookup_err)?
         else {

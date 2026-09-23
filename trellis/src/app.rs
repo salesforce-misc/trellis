@@ -262,18 +262,14 @@ impl Trellis {
     /// see [`defs::DefinitionRef`] for the reasoning behind each.
     ///
     /// A schema-qualified relationship address (`blog.posts.author`) is
-    /// accepted. `relationship_definitions` stores from-tables bare — the
-    /// `RELATIONSHIP` grammar has no qualified endpoint spelling to store —
-    /// but every relationship also records the schema its from-table actually
-    /// resolved to when it was declared (`from_schema`, issue #285), and the
-    /// qualifier is checked against *that* rather than joining the bare lookup
-    /// key. An address whose schema doesn't match names no registered
-    /// relationship, which `DROP` treats as its ordinary idempotent no-op
-    /// (exactly as it treats a name that was never declared). Checking the
-    /// qualifier against mere `schema_nodes` existence instead — what this did
-    /// before #285 — was satisfied by any registered same-named table in any
-    /// schema, so `DROP RELATIONSHIP shop.posts.author` would drop the
-    /// `author` declared on `blog.posts`.
+    /// accepted, and names exactly the relationship declared on that schema's
+    /// `posts` — the schema its from-table resolved to when it was declared
+    /// (`relationship_definitions.from_schema`, issues #285/#288). A
+    /// relationship name is unique per *qualified* from-table, so
+    /// `blog.posts.author` and `shop.posts.author` can both exist; a bare
+    /// `posts.author` then matches both and is refused as ambiguous rather
+    /// than guessed at. An address naming no registered relationship is
+    /// `DROP`'s ordinary idempotent no-op.
     ///
     /// # What each statement does
     ///
@@ -438,36 +434,19 @@ impl Trellis {
                 from_table,
                 name,
             } => {
-                if let Some(schema) = schema
-                    && !defs::catalog::relationship_declared_in_schema(
-                        &self.pool,
-                        &schema,
-                        &from_table,
-                        &name,
-                    )
-                    .await
-                    .map_err(TrellisError::Catalog)?
-                {
-                    // The qualifier names a different table than the one this
-                    // relationship was declared against (or one Trellis has
-                    // never seen), so the address names no registered
-                    // relationship — a drop's own idempotent no-op, the same
-                    // answer a never-declared name gets.
-                    //
-                    // Issue #285: checked against the relationship's *own*
-                    // recorded from-table schema
-                    // (`relationship_definitions.from_schema`), not against
-                    // whether some `schema_nodes` row named
-                    // `schema.from_table` exists — the latter is true for any
-                    // registered same-named table in any schema, so
-                    // `DROP RELATIONSHIP shop.posts.author` used to sail past
-                    // it and drop the `author` actually declared on
-                    // `blog.posts`.
-                    return Ok(Applied::Dropped);
-                }
-                defs::lifecycle::drop_relationship(&self.pool, &from_table, &name)
-                    .await
-                    .map_err(TrellisError::Catalog)?
+                // Issues #285/#288: a qualified address names exactly the
+                // relationship declared on `schema.from_table`; a bare one
+                // must match only one schema's `from_table`, and is refused as
+                // ambiguous otherwise. See
+                // `defs::catalog::relationship_at_address`.
+                defs::lifecycle::drop_relationship(
+                    &self.pool,
+                    schema.as_deref(),
+                    &from_table,
+                    &name,
+                )
+                .await
+                .map_err(TrellisError::Catalog)?
             }
         };
 
@@ -580,7 +559,8 @@ impl Trellis {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "select id, name, from_table, from_col, to_table, to_col, cardinality, created_at \
+                "select id, name, from_schema, from_table, from_col, to_table, to_col, \
+                 cardinality, created_at \
                  from relationship_definitions order by id",
                 &[],
             )
@@ -590,12 +570,13 @@ impl Trellis {
             .map(|row| RelationshipSummary {
                 id: row.get(0),
                 name: row.get(1),
-                from_table: row.get(2),
-                from_col: row.get(3),
-                to_table: row.get(4),
-                to_col: row.get(5),
-                cardinality: row.get(6),
-                created_at: row.get(7),
+                from_schema: row.get(2),
+                from_table: row.get(3),
+                from_col: row.get(4),
+                to_table: row.get(5),
+                to_col: row.get(6),
+                cardinality: row.get(7),
+                created_at: row.get(8),
             })
             .collect())
     }
@@ -1348,6 +1329,10 @@ pub struct DefinitionSummary {
 pub struct RelationshipSummary {
     pub id: i64,
     pub name: String,
+    /// The schema `from_table` resolved to when the relationship was declared
+    /// — part of the relationship's identity alongside `from_table` and
+    /// `name` (issue #288).
+    pub from_schema: String,
     pub from_table: String,
     pub from_col: String,
     pub to_table: String,

@@ -574,14 +574,11 @@ impl IntakeConfig {
 
 /// Issue #133's `src_table -> from_col` cache: the outbound-relationship
 /// column names [`touched_group_key`] needs, so [`Intake::handle_xlog_data`]
-/// never does a live catalog lookup per row. Keyed by the **bare** table
-/// name (`relation.name`, no schema) — `relationship_definitions.from_table`
-/// is itself persisted bare (`catalog::create_relationship`'s own doc
-/// comment: "a relationship endpoint gaining its own persisted qualified
-/// identity is... future work"), the same pre-ADR-0007 convention
-/// `staging::apply::catalog_source_key` already works around for this exact
-/// table. A schema-qualified lookup key here would silently never match and
-/// leave `group_key` permanently unpopulated for every real relationship.
+/// never does a live catalog lookup per row. Keyed by the relation's
+/// **schema and table** (`relation.namespace`, `relation.name`): a
+/// relationship is declared on one qualified from-table
+/// (`relationship_definitions.from_schema`/`from_table`, issue #288), so a
+/// same-named table in another schema must not pick up its `from_col`s.
 ///
 /// Refreshed lazily, per `src_table`, whenever an entry is missing or older
 /// than [`GROUP_KEY_CACHE_TTL`] — a plain refresh-on-miss/refresh-on-stale
@@ -601,7 +598,7 @@ impl IntakeConfig {
 /// reject something that should have applied.
 struct GroupKeyColumns {
     pool: Pool,
-    entries: std::collections::HashMap<String, (Vec<String>, Instant)>,
+    entries: std::collections::HashMap<(String, String), (Vec<String>, Instant)>,
 }
 
 /// How long a [`GroupKeyColumns`] entry stays fresh before the next lookup
@@ -618,25 +615,27 @@ impl GroupKeyColumns {
         }
     }
 
-    /// `src_table`'s outbound-relationship `from_col` names, sorted and
+    /// `relation`'s outbound-relationship `from_col` names, sorted and
     /// deduped — empty (not an error) for a table with no outbound
     /// relationship at all, the overwhelmingly common case.
-    async fn columns_for(&mut self, src_table: &str) -> Result<&[String], IntakeError> {
-        let stale = match self.entries.get(src_table) {
+    async fn columns_for(&mut self, relation: &Relation) -> Result<&[String], IntakeError> {
+        let key = (relation.namespace.clone(), relation.name.clone());
+        let stale = match self.entries.get(&key) {
             Some((_, refreshed_at)) => refreshed_at.elapsed() > GROUP_KEY_CACHE_TTL,
             None => true,
         };
         if stale {
-            let rels = catalog::relationships_from_table(&self.pool, src_table).await?;
+            let rels =
+                catalog::relationships_from_table(&self.pool, &relation.namespace, &relation.name)
+                    .await?;
             let mut cols: Vec<String> = rels.into_iter().map(|r| r.def.from_col).collect();
             cols.sort();
             cols.dedup();
-            self.entries
-                .insert(src_table.to_string(), (cols, Instant::now()));
+            self.entries.insert(key.clone(), (cols, Instant::now()));
         }
         Ok(&self
             .entries
-            .get(src_table)
+            .get(&key)
             .expect("just inserted or already fresh above")
             .0)
     }
@@ -984,11 +983,8 @@ impl Intake {
                 // Issue #133: `group_key_cols` before `pk`, so the
                 // `.await` below (the cache's only possible catalog round
                 // trip — a plain map read on a fresh entry) happens before
-                // any other field borrow is live. `relation.name` (bare),
-                // not a schema-qualified identity — see
-                // `GroupKeyColumns::columns_for`'s own doc comment for why
-                // `relationship_definitions.from_table` is keyed bare.
-                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
+                // any other field borrow is live.
+                let group_key_cols = self.group_key_columns.columns_for(relation).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
                     cdc_change(
@@ -1009,7 +1005,7 @@ impl Intake {
             } => {
                 let relation = self.relations.get(relation_id)?;
                 let old_tuple = old.as_ref().map(|(_, tuple)| tuple.as_slice());
-                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
+                let group_key_cols = self.group_key_columns.columns_for(relation).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
                     cdc_change(
@@ -1027,7 +1023,7 @@ impl Intake {
                 relation_id, old, ..
             } => {
                 let relation = self.relations.get(relation_id)?;
-                let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
+                let group_key_cols = self.group_key_columns.columns_for(relation).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
                     cdc_change(

@@ -66,7 +66,7 @@
 
 use tokio_postgres::Transaction;
 
-use super::catalog::{CatalogError, relationship_by_name};
+use super::catalog::{CatalogError, relationship_at_address};
 use super::model::{EdgeKind, TransformStatus};
 use crate::pool::{Pool, quote_ident};
 
@@ -359,13 +359,15 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     Ok(DropOutcome::Dropped)
 }
 
-/// Removes the relationship named `name` on `from_table` — a relationship is
-/// a definition too, and ADR-0014's inverse applies to it uniformly.
+/// Removes the relationship named `name` on `[schema.]from_table` — a
+/// relationship is a definition too, and ADR-0014's inverse applies to it
+/// uniformly.
 ///
-/// `(from_table, name)` because a relationship name is unique *per from-table*,
-/// not globally (`V16__relationship_definitions.sql`) — the same pair
-/// [`relationship_by_name`] takes and the same pair a calculated field's
-/// `<rel>.<column>` head resolves against.
+/// A relationship name is unique *per qualified from-table*, not globally
+/// (ADR-0006, issue #288), so `schema` narrows the address to one table; a
+/// bare address must match only one schema's `from_table` and is refused as
+/// [`CatalogError::AmbiguousRelationshipAddress`] otherwise — see
+/// [`relationship_at_address`] for the full addressing rule.
 ///
 /// **Refuses rather than cascades**, exactly like [`drop_transform`]: any
 /// registered transform whose text still references this relationship blocks
@@ -396,10 +398,11 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 )]
 pub(crate) async fn drop_relationship(
     pool: &Pool,
+    schema: Option<&str>,
     from_table: &str,
     name: &str,
 ) -> Result<DropOutcome, CatalogError> {
-    let Some(reldef) = relationship_by_name(pool, from_table, name).await? else {
+    let Some(reldef) = relationship_at_address(pool, schema, from_table, name).await? else {
         tracing::info!(
             relationship = %name,
             from_table = %from_table,
@@ -413,7 +416,8 @@ pub(crate) async fn drop_relationship(
 
     // Inside the transaction that does the removal, so a `define` of a fresh
     // reader cannot interleave between the check and the commit (issue #231).
-    let dependents = relationship_readers(&txn, from_table, name, None).await?;
+    let qualified_from = reldef.qualified_from_table();
+    let dependents = relationship_readers(&txn, &qualified_from, name, None).await?;
     if !dependents.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
             subject: format!("{from_table}.{name}"),
@@ -447,12 +451,14 @@ pub(crate) async fn drop_relationship(
          where e.kind = 'relationship' \
            and e.from_node_id = parent.id and e.to_node_id = child.id \
            and split_part(parent.table_name, '.', 2) = $1 \
-           and split_part(child.table_name, '.', 2) = $2 \
+           and child.table_name = $2 \
            and not exists ( \
                select 1 from relationship_definitions r \
-               where r.to_table = $1 and r.from_table = $2 and r.id <> $3 \
+               where r.to_table = $1 \
+                 and r.from_schema || '.' || r.from_table = $2 \
+                 and r.id <> $3 \
            )",
-        &[&reldef.def.to_table, &reldef.def.from_table, &reldef.id],
+        &[&reldef.def.to_table, &qualified_from, &reldef.id],
     )
     .await?;
 
@@ -532,9 +538,12 @@ async fn dependency_blockers(
     //    than instead of it, so the refusal shows the operator the whole
     //    subgraph still standing on this target rather than one layer of it
     //    at a time.
-    for (from_table, name) in relationships_pointing_at(txn, target).await? {
+    for (qualified_from, name) in relationships_pointing_at(txn, target).await? {
+        let from_table = qualified_from
+            .split_once('.')
+            .map_or(qualified_from.as_str(), |(_, table)| table);
         blockers.push(format!("{from_table}.{name}"));
-        blockers.extend(relationship_readers(txn, &from_table, &name, Some(target)).await?);
+        blockers.extend(relationship_readers(txn, &qualified_from, &name, Some(target)).await?);
     }
 
     blockers.sort();
@@ -622,22 +631,20 @@ async fn source_edge_dependents(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Every `(from_table, name)` relationship whose **to**-side is the bare
-/// table `target` — the relationships through which a transform over some
-/// other source can be reading `target`'s rows.
+/// Every relationship whose **to**-side is the bare table `target` — the
+/// relationships through which a transform over some other source can be
+/// reading `target`'s rows — as `(qualified from-table, name)`, the pair
+/// that identifies one (issue #288).
 ///
-/// `relationship_definitions.from_table`/`to_table` are persisted bare
-/// (`create_relationship` resolves them to qualified names only for its own
-/// `pg_catalog` checks and the shared `schema_nodes`/`schema_edges`; the
-/// declaration's own columns stay as written), so this matches bare — the
-/// same spelling `drop_relationship` addresses them by.
+/// `relationship_definitions.to_table` is persisted bare (the to-side has no
+/// schema of its own recorded), so this matches bare.
 async fn relationships_pointing_at(
     txn: &Transaction<'_>,
     target: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
     let rows = txn
         .query(
-            "select from_table, name from relationship_definitions \
+            "select from_schema || '.' || from_table, name from relationship_definitions \
              where to_table = $1 order by id",
             &[&target],
         )
@@ -646,14 +653,15 @@ async fn relationships_pointing_at(
 }
 
 /// The bare target names of every registered transform that still reads the
-/// relationship `name` declared on `from_table` — every status, not only
-/// `live` (issue #231: a frozen reader still needs the relationship the day
-/// it resumes, and resuming rebuilds from source).
+/// relationship `name` declared on the qualified `qualified_from` — every
+/// status, not only `live` (issue #231: a frozen reader still needs the
+/// relationship the day it resumes, and resuming rebuilds from source).
 ///
-/// Scoped to definitions whose own source *is* `from_table`: a relationship
-/// name is only resolvable from a definition over its from-table (that is
-/// what makes the name per-from-table unique in the first place), so a
-/// same-named relationship on a different from-table is a different
+/// Scoped to definitions whose own qualified source *is* `qualified_from`: a
+/// relationship name is only resolvable from a definition over its from-table
+/// (that is what makes the name per-from-table unique in the first place), so
+/// a same-named relationship on a different from-table — including a
+/// same-named table in another schema (issue #288) — is a different
 /// relationship and must not be counted as a dependent here.
 ///
 /// `exclude` drops one bare target name from the result — the definition
@@ -664,14 +672,15 @@ async fn relationships_pointing_at(
 /// frozen, so it never matched).
 async fn relationship_readers(
     txn: &Transaction<'_>,
-    from_table: &str,
+    qualified_from: &str,
     name: &str,
     exclude: Option<&str>,
 ) -> Result<Vec<String>, CatalogError> {
     let rows = txn
         .query(
-            "select definition_text from transform_definitions order by id",
-            &[],
+            "select definition_text from transform_definitions \
+             where source_table = $1 order by id",
+            &[&qualified_from],
         )
         .await?;
 
@@ -679,7 +688,7 @@ async fn relationship_readers(
     for row in rows {
         let text: String = row.get(0);
         let def = super::parse(&text)?;
-        if def.source != from_table || exclude == Some(def.target.as_str()) {
+        if exclude == Some(def.target.as_str()) {
             continue;
         }
         if super::eval::relationship_references(&def)

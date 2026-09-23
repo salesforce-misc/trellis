@@ -1910,7 +1910,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
         // rather than applied in any transaction (there isn't one spanning
         // this whole function to apply it in).
         let (ctx, _gen_bumps) =
-            apply::build_relationship_context(pool, &def.def.source, &def.def, &rows, None, None)
+            apply::build_relationship_context(pool, &def.source_table, &def.def, &rows, None, None)
                 .await?;
         ctx
     };

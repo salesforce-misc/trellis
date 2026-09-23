@@ -289,12 +289,14 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // per-definition edit counter `ALTER TRANSFORM` bumps). Issue #310 added
     // V36 (`slot_loss_pauses`, which transforms a lost replication slot paused).
     // Issue #315 added V37 (a `recompute` ring row may carry a prior-image
-    // hint in `old_image`).
+    // hint in `old_image`). Issue #288 added V38 (`relationship_definitions`'
+    // uniqueness key widened to the schema-qualified `(from_schema,
+    // from_table, name)`).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37
+            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
         ]
     );
 }

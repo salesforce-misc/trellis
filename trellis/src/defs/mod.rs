@@ -1092,7 +1092,8 @@ mod statement_grammar_tests {
     }
 
     /// Decision 1's refusal: a bare relationship name identifies nothing,
-    /// since `relationship_definitions` is unique on `(from_table, name)`.
+    /// since `relationship_definitions` is unique on
+    /// `(from_schema, from_table, name)`.
     #[test]
     fn drop_relationship_refuses_a_bare_unscoped_name() {
         let err = parse_statement("DROP RELATIONSHIP author").unwrap_err();

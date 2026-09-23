@@ -191,14 +191,15 @@ pub enum DefinitionRef {
     Transform(String),
     /// `[<schema>.]<from_table>.<relationship_name>`.
     ///
-    /// `schema` is the optional leading qualifier of the *from-table* — the
-    /// relationship catalog stores from-tables bare (the `RELATIONSHIP`
-    /// grammar has no schema-qualified endpoint spelling at all), so the
-    /// qualifier narrows *which* table the bare name must have resolved to
-    /// rather than joining the lookup key: it is checked against the schema
-    /// the relationship itself recorded at definition time
-    /// (`relationship_definitions.from_schema`, issue #285), and a mismatch
-    /// names no relationship at all; see [`crate::Trellis::apply`].
+    /// `schema` is the optional leading qualifier of the *from-table*. A
+    /// relationship's identity is `(from_schema, from_table, name)` (issues
+    /// #285/#288), where `from_schema` is the schema the bare `from_table`
+    /// resolved to when the relationship was declared — the `RELATIONSHIP`
+    /// grammar has no schema-qualified endpoint spelling of its own. A
+    /// qualified address names exactly that relationship; a bare one names
+    /// whichever single schema declares `from_table.name`, and is refused as
+    /// ambiguous when more than one does. See
+    /// `defs::catalog::relationship_at_address`.
     Relationship {
         schema: Option<String>,
         from_table: String,

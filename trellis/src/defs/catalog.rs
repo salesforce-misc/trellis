@@ -55,7 +55,10 @@
 //! `resolve_node_in_txn` calls as well as [`create_definition_inner`]'s,
 //! even though a relationship endpoint's own *persisted* identity
 //! (`relationship_definitions.from_table`/`to_table`) deliberately stays
-//! bare — out of this issue's scope, per ADR-0007's "Scope" section — since
+//! bare — out of this issue's scope, per ADR-0007's "Scope" section; the
+//! from-side has since gained its resolved schema alongside it
+//! (`from_schema`, issue #285), which is part of a relationship's identity
+//! as of issue #288, while the to-side is still bare — since
 //! both resolve into the one shared `schema_nodes` table a dual-role
 //! (transform-and-relationship-endpoint) table must land on consistently
 //! regardless of which grammar referenced it.
@@ -319,6 +322,17 @@ pub enum CatalogError {
     /// accepted by `define`); it's this operation's own, narrower coverage
     /// declining, with a message that says so.
     UnsupportedAlter(String),
+    /// A bare `DROP RELATIONSHIP <from_table>.<name>` address matched a
+    /// relationship on more than one same-named from-table — one per entry of
+    /// `schemas` (issue #288: `blog.posts.author` and `shop.posts.author` may
+    /// both exist). Refused rather than resolved through `search_path`; the
+    /// caller qualifies the address to say which one it means. See
+    /// [`relationship_at_address`].
+    AmbiguousRelationshipAddress {
+        from_table: String,
+        name: String,
+        schemas: Vec<String>,
+    },
 }
 
 impl CatalogError {
@@ -363,6 +377,9 @@ impl CatalogError {
             CatalogError::AlterFieldNotFound { .. } => ErrorCode::NotFound,
             CatalogError::AlterFieldAlreadyExists { .. } => ErrorCode::Conflict,
             CatalogError::UnsupportedAlter(_) => ErrorCode::Validation,
+            // The statement itself is under-specified — the fix is to
+            // rewrite it with a schema qualifier, not to change any state.
+            CatalogError::AmbiguousRelationshipAddress { .. } => ErrorCode::Validation,
         }
     }
 }
@@ -468,6 +485,17 @@ impl fmt::Display for CatalogError {
             CatalogError::UnsupportedAlter(detail) => {
                 write!(f, "unsupported ALTER TRANSFORM: {detail}")
             }
+            CatalogError::AmbiguousRelationshipAddress {
+                from_table,
+                name,
+                schemas,
+            } => write!(
+                f,
+                "relationship address '{from_table}.{name}' is ambiguous: a table named \
+                 '{from_table}' declares '{name}' in each of these schemas: {}; qualify it as \
+                 <schema>.{from_table}.{name}",
+                schemas.join(", ")
+            ),
         }
     }
 }
@@ -493,6 +521,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AlterFieldNotFound { .. } => None,
             CatalogError::AlterFieldAlreadyExists { .. } => None,
             CatalogError::UnsupportedAlter(_) => None,
+            CatalogError::AmbiguousRelationshipAddress { .. } => None,
         }
     }
 }
@@ -672,7 +701,7 @@ pub async fn install_definition(
     // behind for a definition that is then rejected. `create_definition`/
     // `create_definition_without_backfill` validate again below; that repeat is
     // cheap and keeps those entry points safe when called directly.
-    let relationships = resolve_relationships(pool, &def).await?;
+    let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
     validate(&def, source_columns, &relationships)?;
 
     // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
@@ -1271,18 +1300,15 @@ async fn commit_direct_backfill_coverage(
 /// * The first clause compares against `transform_definitions.source_table`,
 ///   which — since issue #72 — holds the *qualified* identity, so it needs
 ///   `qualified` to ever match.
-/// * The second clause's join compares against `relationship_definitions.from_table`,
-///   which still holds a *bare* name (relationship endpoints aren't
-///   qualified yet — a later issue's job), so it's matched against
-///   `split_part(d.source_table, '.', 2)` (d.source_table's bare table-name
-///   suffix) rather than `d.source_table` itself, and `r.to_table = $2` needs
-///   the bare `table`. This bare/qualified split is exactly the same
-///   conservative-is-fine tradeoff the doc comment above already accepts for
-///   this whole function: `split_part` can only ever *widen* a match (two
-///   same-named tables in different schemas both count as "has a reader"),
-///   never narrow one, so it can't turn a real "no other reader" into a
-///   false positive strong enough to under-cover — it can only ever push
-///   toward the always-safe `Clear` side.
+/// * The second clause joins a relationship to the definitions over its
+///   from-table by the relationship's qualified from-side
+///   (`from_schema || '.' || from_table`, issue #288) against
+///   `d.source_table`, but its to-side is still persisted bare, so
+///   `r.to_table = $2` needs the bare `table`. Matching the to-side bare can
+///   only ever *widen* a match (two same-named tables in different schemas
+///   both count as "has a reader"), never narrow one — the conservative
+///   direction the doc comment above already accepts for this whole
+///   function, pushing toward the always-safe `Clear` side.
 async fn table_has_other_reader(
     txn: &tokio_postgres::Transaction<'_>,
     table: &str,
@@ -1294,7 +1320,8 @@ async fn table_has_other_reader(
                exists(select 1 from transform_definitions where source_table = $1) \
                or exists( \
                  select 1 from relationship_definitions r \
-                 join transform_definitions d on split_part(d.source_table, '.', 2) = r.from_table \
+                 join transform_definitions d \
+                   on d.source_table = r.from_schema || '.' || r.from_table \
                  where r.to_table = $2 \
                )",
             &[&qualified, &table],
@@ -1506,7 +1533,7 @@ pub async fn alter_transform(
     // Reuse the exact validator (and, inside it, the exact column-cycle
     // detector) a first `define` runs — see this function's own doc comment
     // on why the table-level whole-graph check is deliberately not re-run.
-    let relationships = resolve_relationships(pool, &merged).await?;
+    let relationships = resolve_relationships(pool, &merged, &current.source_table).await?;
     validate(&merged, &current.source_columns, &relationships)?;
     let field_types = infer_field_types(&merged, &current.source_columns, &relationships)?;
 
@@ -2015,7 +2042,7 @@ async fn create_definition_inner(
     // to-one/to-many rules) and each referenced to-side column's type — which
     // the sync, DB-less validator can't fetch itself, so resolve it here (same
     // caller-supplies-context split as `source_columns`).
-    let relationships = resolve_relationships(pool, &def).await?;
+    let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
     validate(&def, source_columns, &relationships)?;
 
     let mut client = pool.get().await?;
@@ -2144,8 +2171,13 @@ async fn create_definition_inner(
     // reads. A relationship-free definition (by far the common case) costs
     // nothing extra here — [`super::eval::relationship_references`] returns
     // empty and the loop inside never runs a query.
-    widen_relationship_projections_for_definition_in_txn(&txn, &def, resolved_target_schema)
-        .await?;
+    widen_relationship_projections_for_definition_in_txn(
+        &txn,
+        &def,
+        &qualified_source,
+        resolved_target_schema,
+    )
+    .await?;
 
     // Issue #20: every definition's source and target resolve to a
     // first-class `SchemaNode`, created on first reference (a source node
@@ -2465,11 +2497,11 @@ fn is_target_suffix_index_violation(err: &tokio_postgres::Error) -> bool {
 /// Validates, in order: both endpoints' `table.column` exist and resolve to
 /// comparable Postgres types ([`column_type_in_txn`] /
 /// [`assert_comparable_types`], ADR-0006's "type-check the join"); the
-/// relationship's name is not already declared on `from_table`
-/// ([`ValidationError::DuplicateRelationshipName`], a friendlier
+/// relationship's name is not already declared on the qualified
+/// `from_table` ([`ValidationError::DuplicateRelationshipName`], a friendlier
 /// definition-time surfacing of the same rule
-/// `relationship_definitions_from_table_name_key` backstops at the DB
-/// level); and the new `Relationship` edge would not close a cycle
+/// `relationship_definitions_from_schema_from_table_name_key` backstops at
+/// the DB level); and the new `Relationship` edge would not close a cycle
 /// ([`reject_if_table_cycle`], generalized unchanged from
 /// [`create_definition`]'s `Source`-edge use). Cardinality
 /// ([`RelationshipCardinality`]) is determined via
@@ -2540,18 +2572,47 @@ pub async fn create_relationship(
     assert_comparable_types(&def, &from_type, &to_type)?;
     assert_join_key_type_supported(&txn, &def, &from_type, &to_type).await?;
 
+    // Issues #285/#288: the schema half of `qualified_from` is persisted
+    // alongside the bare `from_table` and is part of the relationship's
+    // identity — `(from_schema, from_table, name)` — so every later reader
+    // (a transform's `<rel>.<column>` path, a scoped `DROP RELATIONSHIP
+    // <schema>.<from_table>.<name>`, the reverse-recompute from-side reads)
+    // reaches the table this relationship was actually declared against. Read
+    // off `qualified_from` — the one resolution this function already trusts
+    // for `resolve_node_in_txn`/`reject_if_table_cycle` and every pg_catalog
+    // check above — rather than re-resolving `def.from_table` a second time,
+    // which could disagree with it.
+    //
+    // The `None` arm is unreachable from here:
+    // [`resolve_relationship_endpoint_in_txn`] returns an *unqualified* name
+    // only when `def.from_table` resolves to nothing at all, and that case
+    // always fails `column_type_in_txn` above and returns long before this
+    // insert. Surfaced as the same "from-table doesn't exist" error those
+    // checks would have raised rather than panicking over a state this crate's
+    // own writers cannot produce (same stance as
+    // [`super::lifecycle`]'s `quote_qualified`).
+    let from_schema = qualified_from
+        .split_once('.')
+        .map(|(schema, _)| schema.to_string())
+        .ok_or_else(|| CatalogError::SourceTableNotFound(def.from_table.clone()))?;
+
+    // Issue #288: a relationship name is unique per *qualified* from-table,
+    // so `shop.posts` may declare an `author` even when `blog.posts` already
+    // has one — the same `(from_schema, from_table, name)` key
+    // `relationship_definitions_from_schema_from_table_name_key` enforces.
     let already_declared: bool = txn
         .query_one(
             "select exists (
-                select 1 from relationship_definitions where from_table = $1 and name = $2
+                select 1 from relationship_definitions
+                where from_schema = $1 and from_table = $2 and name = $3
              )",
-            &[&def.from_table, &def.name],
+            &[&from_schema, &def.from_table, &def.name],
         )
         .await?
         .get(0);
     if already_declared {
         return Err(ValidationError::DuplicateRelationshipName {
-            from_table: def.from_table.clone(),
+            from_table: qualified_from.clone(),
             name: def.name.clone(),
         }
         .into());
@@ -2624,30 +2685,6 @@ pub async fn create_relationship(
         });
     }
 
-    // Issue #285: the schema half of `qualified_from` is persisted alongside
-    // the bare `from_table`, so a scoped `DROP RELATIONSHIP
-    // <schema>.<from_table>.<name>` can check its qualifier against the table
-    // *this* relationship was actually declared against (see
-    // [`relationship_declared_in_schema`]) instead of against mere
-    // `schema_nodes` existence, which any registered same-named table in any
-    // schema satisfies. Read off `qualified_from` — the one resolution this
-    // function already trusts for `resolve_node_in_txn`/`reject_if_table_cycle`
-    // and every pg_catalog check above — rather than re-resolving
-    // `def.from_table` a second time, which could disagree with it.
-    //
-    // The `None` arm is unreachable from here:
-    // [`resolve_relationship_endpoint_in_txn`] returns an *unqualified* name
-    // only when `def.from_table` resolves to nothing at all, and that case
-    // always fails `column_type_in_txn` above and returns long before this
-    // insert. Surfaced as the same "from-table doesn't exist" error those
-    // checks would have raised rather than panicking over a state this crate's
-    // own writers cannot produce (same stance as
-    // [`super::lifecycle`]'s `quote_qualified`).
-    let from_schema = qualified_from
-        .split_once('.')
-        .map(|(schema, _)| schema)
-        .ok_or_else(|| CatalogError::SourceTableNotFound(def.from_table.clone()))?;
-
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
@@ -2698,98 +2735,149 @@ pub async fn create_relationship(
 
     Ok(RelationshipDefinition {
         id,
+        from_schema,
         def,
         cardinality,
         warnings,
     })
 }
 
-/// Whether the relationship named `name` on `from_table` was declared against
-/// the `from_table` in `schema` specifically — the check a scoped `DROP
-/// RELATIONSHIP <schema>.<from_table>.<name>` address gets (issue #285).
-///
-/// `false` covers both halves of "this address names no such relationship":
-/// no relationship by that `(from_table, name)` pair at all, and one that
-/// exists but was declared against a same-named table in a *different* schema.
-/// A drop treats either as its own idempotent no-op — see
-/// [`crate::Trellis::apply`]'s drop arm, the one caller.
-///
-/// Compares against `relationship_definitions.from_schema` — the schema the
-/// declaring connection's `search_path` actually resolved `from_table` to,
-/// recorded by [`create_relationship`] — rather than asking whether some
-/// `schema_nodes` row named `schema.from_table` exists. The latter is what
-/// #227 did, and it is satisfied by *any* registered same-named table in any
-/// schema: with `blog.posts` and `shop.posts` both registered and `author`
-/// declared on `blog.posts`, `DROP RELATIONSHIP shop.posts.author` passed that
-/// check and silently dropped `blog.posts`' relationship.
-///
-/// The schema is compared literally, not case-folded or
-/// `search_path`-resolved: `from_schema` holds a real resolved schema name and
-/// the grammar's identifiers are already normalized by the parser, so the two
-/// spellings meet in the same form the rest of this module compares qualified
-/// identities in.
-pub async fn relationship_declared_in_schema(
-    pool: &Pool,
-    schema: &str,
-    from_table: &str,
-    name: &str,
-) -> Result<bool, CatalogError> {
-    let client = pool.get().await?;
-    Ok(client
-        .query_one(
-            "select exists (
-                select 1 from relationship_definitions
-                where from_schema = $1 and from_table = $2 and name = $3
-             )",
-            &[&schema, &from_table, &name],
-        )
-        .await?
-        .get(0))
-}
+/// The columns every relationship read-back below selects, in the order
+/// [`relationship_from_row`] expects them.
+const RELATIONSHIP_READ_COLUMNS: &str = "id, from_schema, definition_text, cardinality";
 
-/// Reads back the relationship named `name` declared on `from_table` — the
-/// pair a [`super::ast::Expr::RelationshipPath`]'s `rel` head resolves
-/// against (ADR-0006: a relationship name is unique per from-table, not
-/// global, so both are needed to identify one row). Re-parses the persisted
-/// `definition_text` rather than reconstructing [`RelationshipDef`] from the
-/// denormalized columns, matching [`dependents_of`]'s "reuse the grammar's
-/// own parser" convention; `cardinality` is read back from its own column
-/// instead, since it isn't part of the source text (issue #27: it's derived,
-/// not declared).
-pub async fn relationship_by_name(
-    pool: &Pool,
-    from_table: &str,
-    name: &str,
-) -> Result<Option<RelationshipDefinition>, CatalogError> {
-    let client = pool.get().await?;
-    let row = client
-        .query_opt(
-            "select id, definition_text, cardinality
-             from relationship_definitions
-             where from_table = $1 and name = $2",
-            &[&from_table, &name],
-        )
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-
-    let id: i64 = row.get(0);
-    let text: String = row.get(1);
-    let cardinality_text: String = row.get(2);
-    let def = parse_relationship(&text)?;
+/// Rebuilds a [`RelationshipDefinition`] from a row selected with
+/// [`RELATIONSHIP_READ_COLUMNS`]. Re-parses the persisted `definition_text`
+/// rather than reconstructing [`RelationshipDef`] from the denormalized
+/// columns, matching [`dependents_of`]'s "reuse the grammar's own parser"
+/// convention; `cardinality` is read back from its own column instead, since
+/// it isn't part of the source text (issue #27: it's derived, not declared).
+fn relationship_from_row(
+    row: &tokio_postgres::Row,
+) -> Result<RelationshipDefinition, CatalogError> {
+    let cardinality_text: String = row.get(3);
     let cardinality =
         RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
             panic!(
                 "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
             )
         });
-    Ok(Some(RelationshipDefinition {
-        id,
-        def,
+    Ok(RelationshipDefinition {
+        id: row.get(0),
+        from_schema: row.get(1),
+        def: parse_relationship(row.get(2))?,
         cardinality,
         // Creation-time guidance, not a fact about the persisted row — see
         // the field's doc comment on [`RelationshipDefinition`].
         warnings: Vec::new(),
-    }))
+    })
+}
+
+/// Reads back the relationship named `name` declared on the from-table
+/// `from_schema.from_table` — the key a [`super::ast::Expr::RelationshipPath`]'s
+/// `rel` head resolves against. A relationship name is unique per
+/// *qualified* from-table (ADR-0006, issue #288), so all three parts are
+/// needed to identify one row: `blog.posts.author` and `shop.posts.author`
+/// are two different relationships.
+///
+/// A transform's relationship references resolve against its own persisted,
+/// already-qualified `transform_definitions.source_table` — see
+/// [`relationship_on_source`], which splits that spelling for this call.
+pub async fn relationship_by_name(
+    pool: &Pool,
+    from_schema: &str,
+    from_table: &str,
+    name: &str,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
+                 where from_schema = $1 and from_table = $2 and name = $3"
+            ),
+            &[&from_schema, &from_table, &name],
+        )
+        .await?;
+    row.as_ref().map(relationship_from_row).transpose()
+}
+
+/// [`relationship_by_name`] for a transform whose source is the qualified
+/// `"schema.table"` `qualified_source` (`transform_definitions.source_table`,
+/// [`Definition::source_table`]) — the lookup every `<rel>.<column>` path in a
+/// transform's fields resolves through. A relationship declared on a
+/// same-named table in some other schema is a different relationship and is
+/// never returned here.
+///
+/// Every caller in this crate passes a persisted, already-qualified source.
+/// A bare one (the public DDL/backfill entry points take a caller-supplied
+/// source, and a caller may hand them a bare name) is resolved the way the
+/// `RELATIONSHIP` statement itself resolved its from-table —
+/// [`resolve_relationship_endpoint`], `search_path` first — and names no
+/// relationship if it resolves to nothing.
+pub(crate) async fn relationship_on_source(
+    pool: &Pool,
+    qualified_source: &str,
+    name: &str,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
+    let resolved;
+    let qualified_source = if qualified_source.contains('.') {
+        qualified_source
+    } else {
+        resolved = resolve_relationship_endpoint(pool, qualified_source).await?;
+        resolved.as_str()
+    };
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Ok(None);
+    };
+    relationship_by_name(pool, schema, table, name).await
+}
+
+/// Resolves a `DROP RELATIONSHIP [<schema>.]<from_table>.<name>` address to
+/// the one relationship it names, or `Ok(None)` when it names none (a drop's
+/// idempotent no-op).
+///
+/// A qualified address is an exact `(from_schema, from_table, name)` lookup
+/// ([`relationship_by_name`]). A qualifier naming a schema whose `from_table`
+/// declared no such relationship names nothing, even if a same-named table
+/// elsewhere did — the case #285 fixed, where `DROP RELATIONSHIP
+/// shop.posts.author` used to drop `blog.posts`' `author`.
+///
+/// A bare address names the relationship if exactly one from-table called
+/// `from_table` declares `name`, in whichever schema. Since issue #288 two
+/// can (`blog.posts.author` and `shop.posts.author`), and then the bare
+/// address is refused as [`CatalogError::AmbiguousRelationshipAddress`]
+/// rather than resolved through `search_path`: `DROP` is destructive, and
+/// which schema a session's `search_path` happens to reach first is not
+/// something the caller can see in the statement they wrote.
+pub(crate) async fn relationship_at_address(
+    pool: &Pool,
+    schema: Option<&str>,
+    from_table: &str,
+    name: &str,
+) -> Result<Option<RelationshipDefinition>, CatalogError> {
+    if let Some(schema) = schema {
+        return relationship_by_name(pool, schema, from_table, name).await;
+    }
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
+                 where from_table = $1 and name = $2 order by from_schema"
+            ),
+            &[&from_table, &name],
+        )
+        .await?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => relationship_from_row(row).map(Some),
+        rows => Err(CatalogError::AmbiguousRelationshipAddress {
+            from_table: from_table.to_string(),
+            name: name.to_string(),
+            schemas: rows.iter().map(|row| row.get(1)).collect(),
+        }),
+    }
 }
 
 /// Reads back the relationship whose `relationship_definitions.id` is `id` —
@@ -2797,11 +2885,12 @@ pub async fn relationship_by_name(
 /// `rel_reverse_deferred` ring row persists only the relationship's id (see
 /// `staging::append::StagedChange::RelationshipReverseDeferred`), so a later
 /// drain that finds one needs to look the relationship back up by id alone,
-/// not by `(from_table, name)` ([`relationship_by_name`]) or `to_table`
-/// ([`relationships_to_table`]) — neither of which a bare id lets it derive
-/// without an extra round trip. `Ok(None)` when the relationship no longer
-/// exists (dropped between the deferral and this retry) — the caller's job to
-/// decide what "nothing to retry against anymore" means, not this function's.
+/// not by `(from_schema, from_table, name)` ([`relationship_by_name`]) or
+/// `to_table` ([`relationships_to_table`]) — neither of which a bare id lets it
+/// derive without an extra round trip. `Ok(None)` when the relationship no
+/// longer exists (dropped between the deferral and this retry) — the caller's
+/// job to decide what "nothing to retry against anymore" means, not this
+/// function's.
 pub async fn relationship_by_id(
     pool: &Pool,
     id: i64,
@@ -2809,39 +2898,26 @@ pub async fn relationship_by_id(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select definition_text, cardinality
-             from relationship_definitions
-             where id = $1",
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions where id = $1"
+            ),
             &[&id],
         )
         .await?;
-    let Some(row) = row else { return Ok(None) };
-
-    let text: String = row.get(0);
-    let cardinality_text: String = row.get(1);
-    let def = parse_relationship(&text)?;
-    let cardinality =
-        RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
-            panic!(
-                "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
-            )
-        });
-    Ok(Some(RelationshipDefinition {
-        id,
-        def,
-        cardinality,
-        // Creation-time guidance, not a fact about the persisted row — see
-        // the field's doc comment on [`RelationshipDefinition`].
-        warnings: Vec::new(),
-    }))
+    row.as_ref().map(relationship_from_row).transpose()
 }
 
 /// Every relationship whose `to_table` is `to_table` — the reverse of
-/// [`relationship_by_name`]'s `from_table` lookup. The staging reverse
+/// [`relationship_by_name`]'s from-side lookup. The staging reverse
 /// recompute (issue #30) uses this to answer "a row in this table just
 /// changed; which relationships point *at* it, so which from-side targets must
-/// re-derive?". Re-parses each `definition_text` and reads `cardinality` from
-/// its own column, exactly like [`relationship_by_name`].
+/// re-derive?".
+///
+/// `to_table` is still matched bare: a relationship's to-side endpoint is
+/// persisted bare, with no schema of its own recorded (only the from-side
+/// gained one, #285). Each returned relationship does carry its from-side
+/// schema, so whatever a caller does on the from-side
+/// ([`RelationshipDefinition::qualified_from_table`]) reaches the right table.
 pub async fn relationships_to_table(
     pool: &Pool,
     to_table: &str,
@@ -2849,81 +2925,40 @@ pub async fn relationships_to_table(
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select id, definition_text, cardinality
-             from relationship_definitions
-             where to_table = $1
-             order by id",
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
+                 where to_table = $1 order by id"
+            ),
             &[&to_table],
         )
         .await?;
-
-    let mut result = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i64 = row.get(0);
-        let text: String = row.get(1);
-        let cardinality_text: String = row.get(2);
-        let def = parse_relationship(&text)?;
-        let cardinality = RelationshipCardinality::from_persisted(&cardinality_text)
-            .unwrap_or_else(|| {
-                panic!(
-                    "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
-                )
-            });
-        result.push(RelationshipDefinition {
-            id,
-            def,
-            cardinality,
-            // Creation-time guidance, not a fact about the persisted row — see
-            // the field's doc comment on [`RelationshipDefinition`].
-            warnings: Vec::new(),
-        });
-    }
-    Ok(result)
+    rows.iter().map(relationship_from_row).collect()
 }
 
-/// Every relationship whose `from_table` is `from_table` — the outbound
-/// mirror of [`relationships_to_table`], structured identically (same query
-/// shape, same read-back-and-reparse). Issue #133 (epic #127) uses this to
-/// build intake's `src_table -> from_col` cache: the columns a from-side
-/// row's own CDC images must be read to populate the ring's `group_key`
-/// column (the union of join-key values that row's change touched).
+/// Every relationship declared on the qualified from-table
+/// `from_schema.from_table` — the outbound mirror of
+/// [`relationships_to_table`]. Issue #133 (epic #127) uses this to build
+/// intake's `src_table -> from_col` cache: the columns a from-side row's own
+/// CDC images must be read to populate the ring's `group_key` column (the
+/// union of join-key values that row's change touched). Schema-scoped (issue
+/// #288) so a same-named table in another schema doesn't contribute its own
+/// relationships' `from_col`s.
 pub async fn relationships_from_table(
     pool: &Pool,
+    from_schema: &str,
     from_table: &str,
 ) -> Result<Vec<RelationshipDefinition>, CatalogError> {
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select id, definition_text, cardinality
-             from relationship_definitions
-             where from_table = $1
-             order by id",
-            &[&from_table],
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
+                 where from_schema = $1 and from_table = $2 order by id"
+            ),
+            &[&from_schema, &from_table],
         )
         .await?;
-
-    let mut result = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i64 = row.get(0);
-        let text: String = row.get(1);
-        let cardinality_text: String = row.get(2);
-        let def = parse_relationship(&text)?;
-        let cardinality = RelationshipCardinality::from_persisted(&cardinality_text)
-            .unwrap_or_else(|| {
-                panic!(
-                    "relationship_definitions.cardinality held unrecognized value '{cardinality_text}'"
-                )
-            });
-        result.push(RelationshipDefinition {
-            id,
-            def,
-            cardinality,
-            // Creation-time guidance, not a fact about the persisted row — see
-            // the field's doc comment on [`RelationshipDefinition`].
-            warnings: Vec::new(),
-        });
-    }
-    Ok(result)
+    rows.iter().map(relationship_from_row).collect()
 }
 
 /// Resolves every relationship a definition's calculated fields reference
@@ -2934,8 +2969,11 @@ pub async fn relationships_from_table(
 /// in.
 ///
 /// For each distinct relationship name used in `def` (via
-/// [`super::eval::relationship_references`]), looks it up on `def.source` and
-/// resolves the type of every to-side column those paths read. A referenced
+/// [`super::eval::relationship_references`]), looks it up on
+/// `qualified_source` — `def`'s own source as a qualified `"schema.table"`
+/// ([`Definition::source_table`]), since a relationship name is unique only
+/// per qualified from-table (issue #288) — and resolves the type of every
+/// to-side column those paths read. A referenced
 /// column that doesn't exist on the to-side is a hard
 /// [`ValidationError::UnknownRelationshipColumn`] here (ADR-0005: check, don't
 /// assume). An unknown relationship *name* is left absent from the map so the
@@ -2945,6 +2983,7 @@ pub async fn relationships_from_table(
 pub(crate) async fn resolve_relationships(
     pool: &Pool,
     def: &TransformDef,
+    qualified_source: &str,
 ) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
     let mut cols_by_rel: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, column) in super::eval::relationship_references(def) {
@@ -2953,7 +2992,7 @@ pub(crate) async fn resolve_relationships(
 
     let mut resolved = HashMap::with_capacity(cols_by_rel.len());
     for (rel, columns) in cols_by_rel {
-        let Some(reldef) = relationship_by_name(pool, &def.source, &rel).await? else {
+        let Some(reldef) = relationship_on_source(pool, qualified_source, &rel).await? else {
             // Unknown name: leave it out; the validator names the offending
             // field in `ValidationError::UnknownRelationship`.
             continue;
@@ -3004,6 +3043,32 @@ pub(crate) async fn resolve_relationships(
         );
     }
     Ok(resolved)
+}
+
+/// [`resolve_relationships`] for a definition not yet persisted — the define
+/// and `ALTER` paths, which validate `def` before they've resolved (or, for
+/// the ring-path entry points, recorded) its qualified source. Resolves it
+/// the same way [`install_definition`] does ([`resolve_source_for_install`]),
+/// but only when `def` references a relationship at all.
+///
+/// A source that doesn't resolve has no relationships to find, so it yields
+/// an empty map rather than an error: the validator then reports each
+/// relationship path as [`ValidationError::UnknownRelationship`] against its
+/// field, and the missing source itself is reported by whichever later step
+/// needs it — the same order these errors surfaced in before relationships
+/// were looked up by qualified source.
+pub(crate) async fn resolve_relationships_for_new_definition(
+    pool: &Pool,
+    def: &TransformDef,
+) -> Result<HashMap<String, ResolvedRelationship>, CatalogError> {
+    if super::eval::relationship_references(def).is_empty() {
+        return Ok(HashMap::new());
+    }
+    match resolve_source_for_install(pool, def).await {
+        Ok(qualified_source) => resolve_relationships(pool, def, &qualified_source).await,
+        Err(CatalogError::SourceTableNotFound(_)) => Ok(HashMap::new()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Resolves `source_table`'s actual schema the same way Postgres itself
@@ -4583,8 +4648,14 @@ async fn ensure_relationship_projection_in_txn(
 async fn widen_relationship_projections_for_definition_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     def: &TransformDef,
+    qualified_source: &str,
     target_schema: &str,
 ) -> Result<(), CatalogError> {
+    // Issue #288: `def`'s relationships are the ones declared on its own
+    // qualified source, not on any same-named table in another schema.
+    let Some((source_schema, source_table)) = qualified_source.split_once('.') else {
+        return Ok(());
+    };
     let mut columns_by_rel: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, column) in super::eval::relationship_references(def) {
         columns_by_rel.entry(rel).or_default().push(column);
@@ -4594,8 +4665,8 @@ async fn widen_relationship_projections_for_definition_in_txn(
         let Some(row) = txn
             .query_opt(
                 "select id, to_table, to_col, cardinality from relationship_definitions \
-                 where from_table = $1 and name = $2",
-                &[&def.source, &rel],
+                 where from_schema = $1 and from_table = $2 and name = $3",
+                &[&source_schema, &source_table, &rel],
             )
             .await?
         else {
@@ -5584,29 +5655,38 @@ async fn column_dependents_via(
             // instead would split that bookkeeping across two spellings of
             // the same transform depending on whether a row was reached
             // directly or via cascade.
-            "select split_part(target_table, '.', 2), definition_text from transform_definitions",
+            "select split_part(target_table, '.', 2), definition_text, source_table \
+             from transform_definitions",
             &[],
         )
         .await?;
     let rel_rows = client
         .query(
-            "select from_table, name, to_table from relationship_definitions",
+            "select from_schema || '.' || from_table, name, to_table \
+             from relationship_definitions",
             &[],
         )
         .await?;
 
+    // Keyed by the relationship's qualified from-table (issue #288): a
+    // relationship name is unique only per qualified from-table, so the bare
+    // `(from_table, name)` pair could name two different relationships.
     let mut rel_to_table: HashMap<(String, String), String> = HashMap::new();
     for row in rel_rows {
-        let from_table: String = row.get(0);
+        let qualified_from: String = row.get(0);
         let name: String = row.get(1);
         let to_table: String = row.get(2);
-        rel_to_table.insert((from_table, name), to_table);
+        rel_to_table.insert((qualified_from, name), to_table);
     }
 
     let mut deps = Vec::new();
     for row in def_rows {
         let target: String = row.get(0);
         let text: String = row.get(1);
+        // The definition's qualified source — what its relationship paths
+        // resolve against (issue #288); `def.source` below is the bare
+        // spelling this scan's table matching uses.
+        let qualified_source: String = row.get(2);
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
         // skip rather than fail this best-effort lineage scan on the
@@ -5628,7 +5708,7 @@ async fn column_dependents_via(
         for field in &def.fields {
             if expr_references_column(
                 &field.expr,
-                &def.source,
+                (&def.source, &qualified_source),
                 upstream_table,
                 upstream_column,
                 &rel_to_table,
@@ -5645,7 +5725,7 @@ async fn column_dependents_via(
             for key in group_by {
                 if expr_references_column(
                     &key.as_expr(),
-                    &def.source,
+                    (&def.source, &qualified_source),
                     upstream_table,
                     upstream_column,
                     &rel_to_table,
@@ -5659,21 +5739,21 @@ async fn column_dependents_via(
 }
 
 /// Whether `expr` (one calculated field's expression, belonging to a
-/// definition whose `FROM` is `def_source`) reads `(upstream_table,
-/// upstream_column)` — see [`column_dependents`].
+/// definition whose `FROM` is `def_source` — its bare and qualified spellings)
+/// reads `(upstream_table, upstream_column)` — see [`column_dependents`].
 fn expr_references_column(
     expr: &Expr,
-    def_source: &str,
+    def_source: (&str, &str),
     upstream_table: &str,
     upstream_column: &str,
     rel_to_table: &HashMap<(String, String), String>,
 ) -> bool {
     match expr {
-        Expr::Column(name) => def_source == upstream_table && name == upstream_column,
+        Expr::Column(name) => def_source.0 == upstream_table && name == upstream_column,
         Expr::RelationshipPath { rel, column } => {
             column == upstream_column
                 && rel_to_table
-                    .get(&(def_source.to_string(), rel.clone()))
+                    .get(&(def_source.1.to_string(), rel.clone()))
                     .is_some_and(|to_table| to_table == upstream_table)
         }
         Expr::BinaryOp { lhs, rhs, .. } => {

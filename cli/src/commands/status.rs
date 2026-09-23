@@ -175,9 +175,10 @@ fn format_relationships(relationships: &[RelationshipSummary]) -> String {
         .iter()
         .map(|rel| {
             format!(
-                "  id={} name={:?} {}.{} -> {}.{} cardinality={} created_at={}\n",
+                "  id={} name={:?} {}.{}.{} -> {}.{} cardinality={} created_at={}\n",
                 rel.id,
                 rel.name,
+                rel.from_schema,
                 rel.from_table,
                 rel.from_col,
                 rel.to_table,
@@ -314,6 +315,7 @@ mod tests {
         let rel = RelationshipSummary {
             id: 3,
             name: "posts_by_author".to_string(),
+            from_schema: "shop".to_string(),
             from_table: "authors".to_string(),
             from_col: "id".to_string(),
             to_table: "posts".to_string(),
@@ -324,7 +326,7 @@ mod tests {
         let formatted = format_relationships(std::slice::from_ref(&rel));
         assert!(formatted.contains("id=3"));
         assert!(formatted.contains("name=\"posts_by_author\""));
-        assert!(formatted.contains("authors.id -> posts.author_id"));
+        assert!(formatted.contains("shop.authors.id -> posts.author_id"));
         assert!(formatted.contains("cardinality=to_many"));
     }
 
