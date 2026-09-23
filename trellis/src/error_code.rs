@@ -95,8 +95,9 @@ impl fmt::Display for ErrorCode {
 /// The exception to "a `DbError` reached the server, so it isn't
 /// connectivity" is the server telling us the connection itself is gone or
 /// unavailable (issue #340): SQLSTATE class `08` (connection exception) and
-/// `57P01`/`57P02`/`57P03` (admin shutdown, which is what
-/// `pg_terminate_backend` sends; crash shutdown; cannot connect now) are
+/// `57P01`/`57P02`/`57P03`/`57P05` (admin shutdown, which is what
+/// `pg_terminate_backend` sends; crash shutdown; cannot connect now; the
+/// server closing a session past `idle_session_timeout`) are
 /// [`ErrorCode::Connectivity`]. Otherwise the same fault reads differently
 /// depending on whether the server's `FATAL` or the socket close reached the
 /// caller first.
@@ -115,6 +116,7 @@ fn classify_sqlstate(code: &tokio_postgres::error::SqlState) -> ErrorCode {
         || *code == SqlState::ADMIN_SHUTDOWN
         || *code == SqlState::CRASH_SHUTDOWN
         || *code == SqlState::CANNOT_CONNECT_NOW
+        || *code == SqlState::IDLE_SESSION_TIMEOUT
     {
         ErrorCode::Connectivity
     } else if *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::FOREIGN_KEY_VIOLATION {
@@ -141,6 +143,7 @@ mod tests {
             SqlState::ADMIN_SHUTDOWN,
             SqlState::CRASH_SHUTDOWN,
             SqlState::CANNOT_CONNECT_NOW,
+            SqlState::IDLE_SESSION_TIMEOUT,
             SqlState::CONNECTION_EXCEPTION,
             SqlState::CONNECTION_FAILURE,
             SqlState::CONNECTION_DOES_NOT_EXIST,

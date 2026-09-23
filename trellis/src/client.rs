@@ -763,18 +763,30 @@ impl RestartBackoff {
 /// the same log-and-retry-next-tick stance [`maintenance_loop`] takes.
 ///
 /// The exception is a restart refused with `ProducerAlreadyRunning` (issue
-/// #341): another producer session holds the staging producer lock, so this
-/// client is standing by, not failing, and keeps retrying so it takes over
-/// once that session goes away. The first refusal in a row logs at `info!`
-/// and repeats at `debug!`, rather than `error!` every 60s forever. The
-/// `producer_lock_held` restart outcome still counts every one.
+/// #341): some producer session holds the staging producer lock, and this
+/// client keeps retrying so it takes over once that session goes away. The
+/// first refusal in a row logs at `info!` and repeats at `debug!`, rather
+/// than `error!` every 60s forever. The `producer_lock_held` restart outcome
+/// still counts every one.
 ///
 /// Alongside the lifetime restart counter, `trellis_intake_consecutive_failures`
-/// (issue #342) tracks the current streak: failures in a row since an
-/// attempt last stayed up for [`RestartBackoff::healthy_after`], the same
+/// (issue #342) tracks the current streak: attempts in a row that ended
+/// without staying up for [`RestartBackoff::healthy_after`], the same
 /// window that resets the backoff. It's cleared as soon as a running attempt
 /// passes that window, so a recovered intake reads `0` rather than whatever
-/// its last streak reached. Lock refusals neither extend nor clear it.
+/// its last streak reached.
+///
+/// Lock refusals count toward that streak, because this client's intake
+/// isn't running during them, and the lock's holder may be nobody live. The
+/// first attempt reuses the connection [`Client::start`] made, and that start
+/// fails outright if the lock is held, so a refusal here always follows this
+/// client's own intake stopping. The usual holder is then this client's own
+/// previous producer session, which the server hasn't yet noticed is gone.
+/// After a network partition, that can last until the server's TCP
+/// keepalive gives up on it (hours, with OS defaults), and all staging is
+/// down meanwhile. A second `staging_worker` client that took the lock over
+/// is the other possibility; it reads `0` while this one climbs, so a fleet
+/// that deliberately runs one aggregates with `min by (slot)`.
 async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
 where
     A: FnMut() -> Fut,
@@ -806,9 +818,7 @@ where
             outcome,
             Err(IntakeError::Staging(StagingError::ProducerAlreadyRunning))
         );
-        if !lock_held {
-            consecutive_failures += 1;
-        }
+        consecutive_failures += 1;
         crate::metrics::set_intake_consecutive_failures(slot, consecutive_failures);
         match outcome {
             Err(_) if lock_held => {
@@ -817,6 +827,7 @@ where
                         slot = %slot,
                         retry_in = ?retry_in,
                         restarts,
+                        consecutive_failures,
                         "CDC intake still standing by: another producer session holds the \
                          staging producer lock"
                     );
@@ -825,9 +836,12 @@ where
                         slot = %slot,
                         retry_in = ?retry_in,
                         restarts,
+                        consecutive_failures,
                         "CDC intake standing by: another producer session holds the staging \
                          producer lock, so this client isn't staging source changes; it will \
-                         keep retrying and take over once that session ends"
+                         keep retrying and take over once that session ends. The holder may be \
+                         another staging worker, or this client's own previous session that \
+                         the server hasn't yet noticed is gone"
                     );
                 }
                 crate::metrics::increment_intake_restarts("producer_lock_held");
@@ -1973,6 +1987,12 @@ mod intake_supervisor_tests {
         assert_eq!(backoff.next_delay(short), Duration::from_secs(2));
     }
 
+    /// For tests that assert on the streak gauge: a healthy window wide
+    /// enough that an instantly-failing attempt never outlasts it, even on a
+    /// loaded box (FAST's 4ms could, which would reset the streak mid-test).
+    const STREAK: RestartBackoff =
+        RestartBackoff::new(Duration::from_millis(1), Duration::from_millis(500));
+
     fn lock_held() -> IntakeError {
         IntakeError::Staging(StagingError::ProducerAlreadyRunning)
     }
@@ -1989,10 +2009,11 @@ mod intake_supervisor_tests {
     }
 
     /// Issue #341: another producer session holding the staging producer
-    /// lock is a standby state, not a failure, so it must not log `error!`
-    /// on every retry. The first refusal of a run is `info!` (visible at the
-    /// default level, marking the transition), repeats are `debug!`, and the
-    /// restart counter records them under their own outcome.
+    /// lock must not log `error!` on every retry. The first refusal of a run
+    /// is `info!` (visible at the default level, marking the transition),
+    /// repeats are `debug!`, and the restart counter records them under their
+    /// own outcome. Intake still isn't running, so the streak gauge counts
+    /// them.
     #[tokio::test]
     async fn producer_lock_contention_logs_below_error() {
         let (_guard, captured) = install_capture();
@@ -2000,7 +2021,7 @@ mod intake_supervisor_tests {
         let mut resumed_tx = Some(resumed_tx);
         let mut n = 0;
 
-        let supervisor = supervise_intake("slot_341", FAST, move || {
+        let supervisor = supervise_intake("slot_341", STREAK, move || {
             n += 1;
             let resumed = if n == 4 { resumed_tx.take() } else { None };
             async move {
@@ -2042,15 +2063,16 @@ mod intake_supervisor_tests {
         );
         assert_eq!(
             consecutive_failures("slot_341"),
-            Some(0.0),
-            "standing by is not a failure"
+            Some(3.0),
+            "the lock's holder may be this client's own dead session, so refusals must stay \
+             visible to a streak alert"
         );
     }
 
-    /// Issue #342: the consecutive-failures gauge climbs with each failed
-    /// attempt in a row, ignores lock contention, and drops back to 0 once a
-    /// running attempt passes the healthy window, without waiting for that
-    /// attempt to end.
+    /// Issue #342: the consecutive-failures gauge climbs with each attempt in
+    /// a row that ends (error, stream end or lock refusal), and drops back to
+    /// 0 once a running attempt passes the healthy window, without waiting
+    /// for that attempt to end.
     #[tokio::test]
     async fn consecutive_failures_tracks_the_streak_and_clears_while_healthy() {
         const SLOT: &str = "slot_342";
@@ -2060,7 +2082,7 @@ mod intake_supervisor_tests {
         let mut n = 0;
 
         let seen = seen_at_attempt_start.clone();
-        let supervisor = supervise_intake(SLOT, FAST, move || {
+        let supervisor = supervise_intake(SLOT, STREAK, move || {
             seen.lock().unwrap().push(consecutive_failures(SLOT));
             n += 1;
             let resumed = if n == 6 { resumed_tx.take() } else { None };
@@ -2080,14 +2102,14 @@ mod intake_supervisor_tests {
         });
 
         tokio::select! {
-            // Polled first, so by the time the second branch's sleep (far
-            // past FAST's 4ms healthy window) completes, the supervisor has
+            // Polled first, so by the time the second branch's sleep (past
+            // STREAK's 500ms healthy window) completes, the supervisor has
             // already been woken for its own, earlier healthy-window timer.
             biased;
             _ = supervisor => panic!("supervise_intake must never return"),
             got = tokio::time::timeout(Duration::from_secs(10), async {
                 resumed_rx.await.expect("sender dropped");
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(700)).await;
             }) => got.expect("intake was never restarted"),
         }
 
@@ -2098,10 +2120,10 @@ mod intake_supervisor_tests {
                 Some(1.0),
                 Some(2.0),
                 Some(3.0),
-                Some(3.0),
-                Some(4.0)
+                Some(4.0),
+                Some(5.0)
             ],
-            "failures (errors and stream ends) count, lock contention doesn't"
+            "errors, stream ends and lock refusals all extend the streak"
         );
         assert_eq!(
             consecutive_failures(SLOT),

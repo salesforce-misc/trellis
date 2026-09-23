@@ -75,7 +75,13 @@ Supporting counters/gauges keep the histograms interpretable:
   last stayed up for 60s. It reads `0` while intake is healthy and climbs while
   it's stuck restarting. Alert on this (say, `>= 3`) rather than on the
   lifetime counter, which can't tell an occasional blip from a stuck loop.
-  `producer_lock_held` restarts don't count toward it.
+  `producer_lock_held` restarts count toward it, because the lock's holder
+  can be this client's own previous session that Postgres hasn't yet noticed
+  is dead (after a network partition that can last until the server's TCP
+  keepalive gives up, which is hours with OS defaults), and then nothing is
+  staging. If you deliberately run a second `staging_worker` client as a
+  standby, its value climbs while the active one reads `0`, so alert on
+  `min by (slot)` across processes.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.

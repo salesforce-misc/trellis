@@ -131,10 +131,10 @@ const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
 /// healthy window, not only when the next one fails. Unlike the lifetime
 /// [`INTAKE_RESTARTS_METRIC`], this tells an occasional blip (1, then back to
 /// 0) from a stuck restart loop (climbing), so alerts can key off "N failures
-/// in a row". A `producer_lock_held` restart neither counts nor resets it:
-/// another session producing is standing by, not failing. Labeled by slot
-/// because a gauge, unlike a counter, can't be summed across two clients in
-/// one process.
+/// in a row". A `producer_lock_held` restart counts too: intake isn't running
+/// during one, and the lock's holder may be this client's own dead session
+/// (see `client::supervise_intake`). Labeled by slot because a gauge, unlike
+/// a counter, can't be summed across two clients in one process.
 const INTAKE_CONSECUTIVE_FAILURES_METRIC: &str = "trellis_intake_consecutive_failures";
 
 /// The process-wide recorder handle, built and installed on first use. See
