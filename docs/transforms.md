@@ -115,7 +115,9 @@ reusable statement. Either endpoint may be a source table or a transform
 target, 1-1 or aggregate. A source-table endpoint needs a primary key (or
 `REPLICA IDENTITY USING INDEX`), like any table Trellis reads over logical
 replication. A target endpoint needs neither: Trellis's own writes to it reach
-the relationship directly (issue #375). The referencing table keeps its own primary
+the relationship directly (issue #375), so it must be `live` when the
+relationship is declared: its initial build writes it outside that path. The
+referencing table keeps its own primary
 key and granularity — a 1-1 table stays 1-1 — and calculated fields on it
 reference the related table's columns
 through paths whose head is the relationship name. How depends on **cardinality**:

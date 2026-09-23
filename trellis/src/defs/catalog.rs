@@ -309,8 +309,8 @@ pub enum CatalogError {
     /// writes it outside the target-mutation seam
     /// (`staging::target_mutations`), so a reader attached mid-build would
     /// never hear about the rows the rest of the build writes. The same
-    /// goes for a relationship naming a still-`backfilling` target as an
-    /// endpoint (issue #403), since the seam is that endpoint's only feed.
+    /// goes for a relationship naming a non-`live` target as an endpoint
+    /// (issue #403), since the seam is that endpoint's only feed.
     TransformNotLive {
         transform: String,
         status: TransformStatus,
@@ -1147,7 +1147,9 @@ pub(crate) async fn complete_direct_backfill(
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
 /// source, `qualified_source`, is the target of another definition that
-/// isn't [`TransformStatus::Live`] yet (issue #315). A target's initial build
+/// isn't [`TransformStatus::Live`] yet (issue #315), and likewise a
+/// relationship endpoint that is such a target ([`create_relationship`],
+/// issue #403). A target's initial build
 /// (`defs::backfill`, the chunk queue) writes it directly, outside the
 /// target-mutation seam that tells a chained reader about every other target
 /// write, so a reader attached mid-build would silently miss whatever the
@@ -2633,8 +2635,13 @@ pub async fn create_relationship(
     assert_join_key_type_supported(&txn, &def, &from_type, &to_type).await?;
     reject_unkeyed_relationship_endpoint(&*txn, &qualified_from).await?;
     reject_unkeyed_relationship_endpoint(&*txn, &qualified_to).await?;
-    reject_building_target_endpoint(&*txn, &qualified_from).await?;
-    reject_building_target_endpoint(&*txn, &qualified_to).await?;
+    // Issue #403: an endpoint that is one of this instance's targets must be
+    // `live`, for the reason `reject_non_live_upstream` gives a chained
+    // reader: the seam is now such an endpoint's only change feed, and a
+    // build's writes (the chunk queue's, including a chunk a worker still
+    // holds across a pause) land outside it.
+    reject_non_live_upstream(&*txn, &qualified_from).await?;
+    reject_non_live_upstream(&*txn, &qualified_to).await?;
 
     // Issues #285/#288: the schema half of `qualified_from` is persisted
     // alongside the bare `from_table` and is part of the relationship's
@@ -4301,42 +4308,6 @@ async fn reject_unkeyed_relationship_endpoint(
     }
     Err(CatalogError::RelationshipEndpointNotChangeKeyed {
         endpoint: qualified_endpoint.to_string(),
-    })
-}
-
-/// Refuses (with [`CatalogError::TransformNotLive`]) a relationship endpoint
-/// that is one of this instance's targets while its definition is still
-/// `backfilling` (issue #403). The target-mutation seam is such an
-/// endpoint's only change feed, and a target's initial build (`defs::backfill`,
-/// the chunk queue) writes it outside the seam, so the relationship's
-/// projection and reverse paths would never hear about the rows the rest of
-/// the build writes. The same reason [`reject_non_live_upstream`] refuses a
-/// reader attached mid-build. A paused endpoint is fine: its rebuild on
-/// `RESUME` runs through the ring, and so through the seam.
-async fn reject_building_target_endpoint(
-    client: &impl GenericClient,
-    qualified_endpoint: &str,
-) -> Result<(), CatalogError> {
-    let Some(row) = client
-        .query_opt(
-            "select split_part(target_table, '.', 2), status from transform_definitions \
-             where target_table = $1",
-            &[&qualified_endpoint],
-        )
-        .await?
-    else {
-        return Ok(());
-    };
-    let status_text: String = row.get(1);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
-    if status != TransformStatus::Backfilling {
-        return Ok(());
-    }
-    Err(CatalogError::TransformNotLive {
-        transform: row.get(0),
-        status,
     })
 }
 

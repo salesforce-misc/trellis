@@ -47,6 +47,9 @@ expression language.
     target-mutation seam, which stages it CDC-shaped: prior and new image, and
     a write token that orders one key's writes the way commit LSNs do. So
     such an endpoint needs no primary key and no particular replica identity.
+    It must be `live` when the relationship is declared, the same rule a
+    transform reading it follows: its build (the chunk queue) writes it
+    outside the seam (issue #403).
   * An endpoint the instance doesn't own, including another instance's
     aggregate target, is read over logical replication. It must be keyable by
     intake, the same rule a transform's source follows, and source-table

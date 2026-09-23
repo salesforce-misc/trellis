@@ -45,8 +45,8 @@
 //! which run while that definition is not yet `live`. Nothing can read a
 //! target in that state: `defs::catalog::create_definition_inner` refuses a
 //! definition whose source is a non-`live` target (`CatalogError::TransformNotLive`),
-//! `create_relationship` refuses a still-`backfilling` target as an endpoint
-//! the same way (#403), and a target that goes `live` with readers already attached (a resumed
+//! `create_relationship` refuses a non-`live` target as an endpoint the
+//! same way (#403), and a target that goes `live` with readers already attached (a resumed
 //! upstream) parks a catch-up marker for itself so those readers re-derive
 //! from its rebuilt state.
 //!
