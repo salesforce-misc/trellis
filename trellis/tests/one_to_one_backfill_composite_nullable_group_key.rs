@@ -61,7 +61,7 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "composite_nullable_group_key_backfill_test_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -73,15 +73,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -166,7 +160,7 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     .await
     .expect("install the chained OneToOne");
 
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     retire_drained_segments(&mut client)
         .await

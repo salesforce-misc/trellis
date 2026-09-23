@@ -136,15 +136,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                DEFAULT_TARGET_SCHEMA,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -1155,15 +1149,9 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
         .expect("pause the backfilling definition");
 
     for chunk in &held {
-        chunk_queue::run_claimed_chunk(
-            &db.pool,
-            chunk,
-            DEFAULT_TARGET_SCHEMA,
-            WORKER,
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("an in-flight chunk runs to completion");
+        chunk_queue::run_claimed_chunk(&db.pool, chunk, WORKER, Duration::from_secs(5))
+            .await
+            .expect("an in-flight chunk runs to completion");
         chunk_queue::finish_chunk(&db.pool, chunk, WORKER)
             .await
             .expect("an in-flight chunk finishes");

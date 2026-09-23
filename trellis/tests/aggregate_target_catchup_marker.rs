@@ -35,7 +35,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 
 const TEST_NAME: &str = "aggregate_target_catchup_marker_test";
 
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     loop {
         let client = pool.get().await.expect("acquire connection");
         let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)
@@ -46,15 +46,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                TEST_NAME,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, TEST_NAME, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, TEST_NAME)
                 .await
                 .expect("finish_chunk");
@@ -197,7 +191,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
     )
     .await
     .expect("install the 1-1 chained onto the aggregate");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
@@ -271,7 +265,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
     )
     .await
     .expect("install the aggregate chained onto the aggregate");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
         by_sku(&client, "sku_totals_v2", "total2").await,

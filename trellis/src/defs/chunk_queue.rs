@@ -338,10 +338,17 @@ pub async fn release_chunk(
 /// [`crate::client::Client`] pass its `ClientOptions::heartbeat`'s own
 /// interval, matching the same margin the ring's own
 /// [`crate::staging::HeartbeatDaemon`] keeps against `reclaim_ttl` there.
+///
+/// The target schema comes from the definition's own persisted, qualified
+/// `target_table` identity, never from the running worker's configuration
+/// (issue #370): `install_definition` resolved it once, honoring an explicit
+/// `TRANSFORM custom.t` spelling over `Config::target_schema`, and created
+/// the table there. A chunk re-deriving it from whatever schema the worker
+/// happens to be configured with would write into the wrong (usually
+/// nonexistent) table. Same derivation `catalog::alter_transform` uses.
 pub async fn run_claimed_chunk(
     pool: &Pool,
     chunk: &ClaimedChunk,
-    target_schema: &str,
     claimed_by: &str,
     heartbeat_interval: Duration,
 ) -> Result<(), ChunkQueueError> {
@@ -350,6 +357,10 @@ pub async fn run_claimed_chunk(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
+    let (target_schema, _) = definition
+        .target_table
+        .split_once('.')
+        .expect("target_table is always schema-qualified (issue #73)");
 
     // Dropped (aborting the background task) as soon as this function
     // returns, one way or another — see [`ChunkHeartbeat`]'s doc comment.

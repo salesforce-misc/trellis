@@ -49,7 +49,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// chunk. `order_view` (this file's 1-1 mirror) needs this; `customer_totals`
 /// (an aggregate) still backfills synchronously in-call and needs no chunk
 /// draining. Mirrors `defs_install_definition.rs`'s helper of the same name.
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "oneone_deleted_target_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -61,15 +61,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -242,7 +236,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, ORDER_VIEW, &orders_columns(), "public")
         .await
         .expect("install the 1-1 order_view mirror");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     client

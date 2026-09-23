@@ -95,7 +95,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Drives the durable backfill chunk queue to completion, standing in for a
 /// running drain worker (copied from `defs_exact_integers.rs`).
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "float_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -107,15 +107,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -374,7 +368,7 @@ async fn derived_float_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     for (name, expr) in SCALAR_CASES {
         let declared = column_pg_type(&client, "t", name).await;
@@ -427,7 +421,7 @@ async fn float_aggregate_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     for (name, expr) in AGGREGATE_CASES {
         let declared = column_pg_type(&client, "t", name).await;
@@ -728,7 +722,7 @@ async fn a_float_aggregate_target_matches_a_hand_written_sql_query() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let differences: i64 = client
         .query_one(
@@ -805,7 +799,7 @@ async fn min_and_max_over_nan_follow_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let row = client
         .query_one(

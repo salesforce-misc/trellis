@@ -211,7 +211,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 /// Claims and executes every pending direct-build backfill chunk until none
 /// remain — the harness stand-in for a running drain worker, matching
 /// `defs_install_definition.rs`'s `drain_backfill_chunks`.
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "status_lifecycle_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -223,15 +223,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -608,7 +602,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     // `complete_direct_backfill` — which the next `run_pending_backfills`
     // call below discharges so it can't be mistaken for the marker
     // `resume_transform` parks later).
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     publication::run_pending_backfills(
         &mut raw,
         "wake",
@@ -721,7 +715,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     publication::run_pending_backfills(
         &mut raw,
         "wake",
@@ -872,7 +866,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     publication::run_pending_backfills(
         &mut raw,
         "wake",
@@ -1057,7 +1051,7 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     .await
     .expect("install_definition (chunked path)");
     assert_eq!(plain.status, TransformStatus::Backfilling);
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
     // Direct/set-based path: an aggregate definition.

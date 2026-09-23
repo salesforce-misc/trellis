@@ -90,7 +90,7 @@ async fn connect_raw(dsn: &str) -> Client {
 
 /// Drives the durable backfill chunk queue to completion, standing in for a
 /// running drain worker (copied from `defs_typed_literals.rs`).
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "exact_integer_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -102,15 +102,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -227,7 +221,7 @@ async fn derived_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     for (name, expr, sql) in SCALAR_CASES {
         let declared = column_pg_type(&client, "t", name).await;
@@ -282,7 +276,7 @@ async fn aggregate_column_types_match_postgres() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     // The `GROUP BY` key itself is a derived column too, and it must keep
     // the source column's exact width — that is the "exact key round-trip"
@@ -514,7 +508,7 @@ async fn an_integer_group_by_target_matches_a_hand_written_sql_query() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let differences: i64 = client
         .query_one(
@@ -575,7 +569,7 @@ async fn an_oid_column_is_a_valid_group_by_key() {
     )
     .await
     .expect("an oid GROUP BY key must be accepted");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     assert_eq!(column_pg_type(&client, "t", "o").await, "oid");
 

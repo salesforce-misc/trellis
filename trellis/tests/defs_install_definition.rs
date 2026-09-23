@@ -42,7 +42,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// `expect`) rather than swallowing an error, matching this file's other
 /// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
 /// means the test itself is broken, not something to retry past.
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "install_def_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -54,15 +54,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -232,7 +226,7 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     // executed in-call (docs/decisions/0007's amendment) — drive it to
     // completion the way a running `application_threads` drain worker would
     // before asserting on the target's contents.
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let mismatches: i64 = client
         .query_one(
@@ -333,7 +327,7 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
          not silently over-chunked by a boundary-discovery bug"
     );
 
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let mismatches: i64 = client
         .query_one(
@@ -424,7 +418,7 @@ async fn install_definition_fast_path_reads_the_explicitly_qualified_source_not_
     // The fast path's chunk work is enumerated, not executed in-call
     // (docs/decisions/0007's amendment) — drive it to completion the way a
     // real drain worker would.
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let row_count: i64 = client
         .query_one("select count(*) from order_totals", &[])
@@ -498,7 +492,7 @@ async fn install_definition_honors_an_explicitly_qualified_target_schema() {
     .await
     .expect("install_definition should honor the explicit target schema");
 
-    drain_backfill_chunks(&db.pool, "custom").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let target_table: String = client
         .query_one(
@@ -607,7 +601,7 @@ async fn install_definition_fast_path_ends_up_live() {
 
     // Driving the chunk queue to completion (the `application_threads` drain
     // worker's job in a real fleet) must flip it the rest of the way to live.
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
     let rows = client
         .query(
             &format!(
@@ -732,7 +726,7 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 
     // The direct build's chunk work is enumerated/persisted, not executed
     // in-call — drive it to completion before reading the target.
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     // The direct build populates the target and stages nothing in the ring
     // — the fast-path signature (see the sibling fast-path test).
@@ -1474,7 +1468,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool, "custom").await;
+    drain_backfill_chunks(&db.pool).await;
 
     // Def B: a bare `FROM t` must still resolve to def A's `custom.t` — a
     // plain `search_path` walk alone would report "t" not found, even though
@@ -1490,7 +1484,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
         "def B's bare FROM must resolve to def A's explicitly-qualified custom.t \
          target, not fail as 'not found on the search path'",
     );
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     let source_table: String = client
         .query_one(
@@ -1567,7 +1561,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    drain_backfill_chunks(&db.pool, "custom").await;
+    drain_backfill_chunks(&db.pool).await;
 
     // `t.id` (def A's target's own PK) is a real, integer-family column —
     // this relationship's `from_table` is itself the chained, non-default-

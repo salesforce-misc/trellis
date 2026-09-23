@@ -631,7 +631,6 @@ async fn run(
             pool: pool.clone(),
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
-            target_schema: config.target_schema().to_string(),
             claimed_by,
             worker_id: client_id.clone(),
             wake_channel: options.wake_channel.clone(),
@@ -1342,13 +1341,6 @@ struct AppWorkerConfig {
     pool: Pool,
     dsn: String,
     schema: String,
-    /// Schema `defs::chunk_queue::run_claimed_chunk` renders a claimed
-    /// backfill chunk's target-table SQL against — the same value
-    /// `install_definition` was called with (`Config::target_schema`), not
-    /// `schema` above (the Trellis catalog schema). Every drain worker in a
-    /// fleet is expected to share this, exactly like `MaintenanceConfig`'s
-    /// own `target_schema` field.
-    target_schema: String,
     claimed_by: String,
     /// This `Client`'s own worker-registry key (issue #144) — the same
     /// `client_id` every app-worker task of this `Client` shares, distinct
@@ -1407,7 +1399,6 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         pool,
         dsn,
         schema,
-        target_schema,
         claimed_by,
         worker_id,
         wake_channel,
@@ -1476,8 +1467,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // getting stuck behind the segment path's own early `continue`s
         // below.
         let backfill_progress =
-            drain_backfill_chunks(&pool, &claimed_by, &target_schema, chunk_heartbeat_interval)
-                .await;
+            drain_backfill_chunks(&pool, &claimed_by, chunk_heartbeat_interval).await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -1662,7 +1652,6 @@ async fn heartbeat_worker_if_due(
 async fn drain_backfill_chunks(
     pool: &Pool,
     claimed_by: &str,
-    target_schema: &str,
     heartbeat_interval: Duration,
 ) -> bool {
     let claimed = match pool.get().await {
@@ -1673,15 +1662,7 @@ async fn drain_backfill_chunks(
         return false;
     };
 
-    match chunk_queue::run_claimed_chunk(
-        pool,
-        &chunk,
-        target_schema,
-        claimed_by,
-        heartbeat_interval,
-    )
-    .await
-    {
+    match chunk_queue::run_claimed_chunk(pool, &chunk, claimed_by, heartbeat_interval).await {
         Ok(()) => {
             let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
         }
@@ -2307,13 +2288,7 @@ mod backfill_chunk_claim_tests {
 
         let worker_pool = pool.clone();
         let worker = tokio::spawn(async move {
-            drain_backfill_chunks(
-                &worker_pool,
-                "gated-worker",
-                "public",
-                Duration::from_secs(5),
-            )
-            .await
+            drain_backfill_chunks(&worker_pool, "gated-worker", Duration::from_secs(5)).await
         });
 
         // Wait for the chunk write to park on the gate: an event, not a
@@ -2379,11 +2354,9 @@ mod backfill_chunk_claim_tests {
             "one call finishes exactly the chunk it claimed"
         );
 
+        assert!(drain_backfill_chunks(&pool, "gated-worker", Duration::from_secs(5)).await);
         assert!(
-            drain_backfill_chunks(&pool, "gated-worker", "public", Duration::from_secs(5)).await
-        );
-        assert!(
-            !drain_backfill_chunks(&pool, "gated-worker", "public", Duration::from_secs(5)).await,
+            !drain_backfill_chunks(&pool, "gated-worker", Duration::from_secs(5)).await,
             "nothing is left to claim"
         );
         let status: String = raw

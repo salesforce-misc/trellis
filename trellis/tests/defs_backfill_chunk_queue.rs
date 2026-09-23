@@ -186,7 +186,6 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
     chunk_queue::run_claimed_chunk(
         &db.pool,
         &re_claimed[0],
-        "public",
         "fresh-worker",
         Duration::from_secs(5),
     )
@@ -224,6 +223,71 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         status, "live",
         "finishing the one remaining chunk must flip the definition to live"
     );
+}
+
+/// Issue #370: a chunk of a definition whose `TRANSFORM` clause names its own
+/// target schema (`custom.t`) must be written into that schema, whatever the
+/// running worker's configured default target schema is (`public` here, the
+/// common case: a fleet that never changed `Config::target_schema` but
+/// redirected just this one definition). The chunk executor used to render
+/// its `INSERT` against the worker's configured schema instead, failing with
+/// `relation "public.t" does not exist`.
+#[tokio::test]
+async fn a_chunk_of_an_explicitly_schema_qualified_target_is_written_into_that_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema custom; \
+             create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) values (1, 10), (2, 20), (3, 30)",
+        )
+        .await
+        .expect("seed source and create the custom schema");
+
+    let def = install_definition(
+        &db.pool,
+        "TRANSFORM custom.t FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition enumerates chunk work and returns");
+    assert_eq!(def.status, TransformStatus::Backfilling);
+
+    let claimed = chunk_queue::claim_chunks(&client, "worker", 10)
+        .await
+        .expect("claim_chunks");
+    assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker", Duration::from_secs(5))
+        .await
+        .expect("run_claimed_chunk must write into the definition's own declared schema");
+    chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker")
+        .await
+        .expect("finish_chunk");
+
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s left join custom.t on custom.t.id = s.id \
+             where custom.t.id is null or custom.t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .expect("compare custom.t against the source")
+        .get(0);
+    assert_eq!(mismatches, 0, "every source row must land in custom.t");
+
+    let status: String = client
+        .query_one(
+            "select status from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read back status")
+        .get(0);
+    assert_eq!(status, "live");
 }
 
 /// Issue #297: the composite-key counterpart of
@@ -306,7 +370,6 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
     chunk_queue::run_claimed_chunk(
         &db.pool,
         &re_claimed[0],
-        "public",
         "fresh-worker",
         Duration::from_secs(5),
     )
@@ -418,14 +481,8 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     let pool = db.pool.clone();
     let chunk_for_task = chunk.clone();
     let run_task = tokio::spawn(async move {
-        chunk_queue::run_claimed_chunk(
-            &pool,
-            &chunk_for_task,
-            "public",
-            "slow-worker",
-            heartbeat_interval,
-        )
-        .await
+        chunk_queue::run_claimed_chunk(&pool, &chunk_for_task, "slow-worker", heartbeat_interval)
+            .await
     });
 
     // While the chunk write is (slowly) in flight, repeatedly sweep for
@@ -529,7 +586,6 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
     chunk_queue::run_claimed_chunk(
         &db.pool,
         &re_claimed[0],
-        "public",
         "fresh-worker",
         Duration::from_secs(5),
     )
@@ -598,15 +654,9 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim A's chunk");
     assert_eq!(claimed_a.len(), 1);
-    chunk_queue::run_claimed_chunk(
-        &db.pool,
-        &claimed_a[0],
-        "public",
-        "worker-a",
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("run A's chunk");
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed_a[0], "worker-a", Duration::from_secs(5))
+        .await
+        .expect("run A's chunk");
     chunk_queue::finish_chunk(&db.pool, &claimed_a[0], "worker-a")
         .await
         .expect("finish A's chunk");
@@ -643,15 +693,9 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim B's chunk");
     assert_eq!(claimed_b.len(), 1);
-    chunk_queue::run_claimed_chunk(
-        &db.pool,
-        &claimed_b[0],
-        "public",
-        "worker-b",
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("run B's chunk");
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed_b[0], "worker-b", Duration::from_secs(5))
+        .await
+        .expect("run B's chunk");
     // Deliberately not finished yet.
 
     let pre_delta_y: i64 = client
@@ -839,15 +883,9 @@ async fn alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_bac
         .await
         .expect("claim the chunk");
     assert_eq!(claimed.len(), 1);
-    chunk_queue::run_claimed_chunk(
-        &db.pool,
-        &claimed[0],
-        "public",
-        "worker",
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("run the chunk");
+    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker", Duration::from_secs(5))
+        .await
+        .expect("run the chunk");
     chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker")
         .await
         .expect("finish the chunk");

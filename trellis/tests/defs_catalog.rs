@@ -14,7 +14,7 @@ use trellis::defs::{
 /// Runs every queued `backfill_chunks` build to completion by hand, so a
 /// chunked 1-1 target goes `live` without a running drain worker — a
 /// definition can only chain off a live target (issue #315).
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     loop {
         let client = pool.get().await.expect("acquire connection");
         let claimed = chunk_queue::claim_chunks(&**client, "defs_catalog_test", 1000)
@@ -28,7 +28,6 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             chunk_queue::run_claimed_chunk(
                 pool,
                 chunk,
-                target_schema,
                 "defs_catalog_test",
                 std::time::Duration::from_secs(5),
             )
@@ -1683,10 +1682,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    // `custom`, not the configured `public`: the chunk runner takes the
-    // target schema from its caller and doesn't apply `custom.t`'s explicit
-    // schema itself.
-    drain_backfill_chunks(&db.pool, "custom").await;
+    drain_backfill_chunks(&db.pool).await;
 
     client
         .batch_execute("alter table custom.t replica identity full")
@@ -1736,10 +1732,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-    // `custom`, not the configured `public`: the chunk runner takes the
-    // target schema from its caller and doesn't apply `custom.t`'s explicit
-    // schema itself.
-    drain_backfill_chunks(&db.pool, "custom").await;
+    drain_backfill_chunks(&db.pool).await;
     // `custom.t` is left at the default replica identity deliberately.
 
     create_definition(

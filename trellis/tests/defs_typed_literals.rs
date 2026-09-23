@@ -151,7 +151,7 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 /// Drives the durable backfill chunk queue to completion, standing in for a
 /// running `application_threads` drain worker (copied from
 /// `defs_install_definition.rs`).
-async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
     const CLAIMED_BY: &str = "typed_literal_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -163,15 +163,9 @@ async fn drain_backfill_chunks(pool: &trellis::Pool, target_schema: &str) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(
-                pool,
-                chunk,
-                target_schema,
-                CLAIMED_BY,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");
@@ -430,7 +424,7 @@ async fn install_and_backfill_produce_real_typed_columns() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool, "public").await;
+    drain_backfill_chunks(&db.pool).await;
 
     // The columns are genuinely their own Postgres types — this is the
     // "computed 1-1 target" claim. Before #109 the only way to get a `date`
@@ -699,7 +693,7 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     )
     .await
     .expect("install_definition under a hostile DateStyle");
-    drain_backfill_chunks(&pool, "public").await;
+    drain_backfill_chunks(&pool).await;
 
     for (name, _, text, _) in CASES {
         let persisted: Option<String> = client
