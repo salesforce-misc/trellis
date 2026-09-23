@@ -640,11 +640,15 @@ async fn single_pass_backfill_stays_consistent_under_concurrent_writes() {
     stop.store(true, Ordering::Relaxed);
     writer.await.expect("writer task");
 
-    // Drain whatever the writer's last few updates staged before asserting a
-    // final, settled state.
+    // Drain everything staged so far before asserting a final, settled state.
+    // That is far more than the writer's last few updates: `wait_for_live`
+    // doesn't wait for the ring, so the define's own enumeration and its
+    // catch-up re-enumeration (150k rows each) can still be queued here.
+    // Locally that takes ~10s to drain; CI runs this suite ~2.5x slower, so
+    // the budget is sized well past that.
     let token = trellis.watermark_token().await.expect("watermark");
     trellis
-        .await_converged(token, Duration::from_secs(30))
+        .await_converged(token, Duration::from_secs(120))
         .await
         .expect("convergence");
 
