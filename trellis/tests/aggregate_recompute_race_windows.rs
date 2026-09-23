@@ -24,8 +24,9 @@
 //!   concurrent delete emptied; the group is then recreated, and the delete's
 //!   own delta lands on the recreated group.
 //! - **Chained W1**: the aggregate reads a 1-1 target that is also a
-//!   relationship endpoint, so it is still published (#315's exception) and
-//!   both the seam's `Recompute` and the target's own CDC reach the ring.
+//!   relationship endpoint, published (today by the engine, under #315's
+//!   exception; here by the test itself, see the test) so both the seam's
+//!   `Recompute` and the target's own CDC reach the ring.
 //!
 //! Everything is driven by hand, as `intermediate_hop_cdc.rs` does: `pgoutput`
 //! bytes are read off a second logical slot and fed to a real
@@ -44,9 +45,10 @@
 //! five windows don't reach on their own: a row the delta path creates
 //! inheriting the extinct horizon, and the fold comparing a telescoped
 //! delta by its *earliest* commit. Then come issue #322's definition-time
-//! enumeration, which the same rule closes, and two cases found in review:
-//! an extinction with no row to delete, and a delta that reaches the
-//! aggregate through a relationship's reverse fast path.
+//! enumeration, which the same rule closes, two cases found in review (an
+//! extinction with no row to delete, and a delta that reaches the aggregate
+//! through a relationship's reverse fast path), and a seam-style writer whose
+//! ordering token is taken before it commits (#375's direction 1).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -62,7 +64,7 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::{create_relationship, install_definition};
 use trellis::intake::{self, spill};
 use trellis::staging::{
-    MIN_ROWS_TO_SPLIT, SEG_BUCKETS, StagedChange, StagedWatermark, apply, has_pending,
+    CdcOp, MIN_ROWS_TO_SPLIT, SEG_BUCKETS, StagedChange, StagedWatermark, apply, has_pending,
     retire_drained_segments,
 };
 
@@ -153,6 +155,11 @@ enum Setup<'a> {
     Transform(&'a str),
     Relationship(&'a str),
     Sql(&'a str),
+    /// Adds a table to the test's own publication on top of whatever the
+    /// engine's [`trellis::defs::publication_tables`] lists, so a test that
+    /// needs a table's CDC does not depend on the engine choosing to publish
+    /// it.
+    Publish(&'a str),
 }
 
 /// A source, the definitions over it, and a real [`intake::Intake`] fed by
@@ -177,6 +184,7 @@ impl Harness {
         raw.batch_execute(setup_sql).await.expect("setup sql");
 
         let columns = numeric_columns(&["id", "g", "v"]);
+        let mut also_published = Vec::new();
         for step in steps {
             match step {
                 Setup::Transform(text) => {
@@ -190,12 +198,18 @@ impl Harness {
                         .unwrap_or_else(|e| panic!("create {text}: {e}"));
                 }
                 Setup::Sql(sql) => raw.batch_execute(sql).await.expect("setup step sql"),
+                Setup::Publish(table) => also_published.push(table.to_string()),
             }
         }
 
-        let published = trellis::defs::publication_tables(&db.pool)
+        let mut published = trellis::defs::publication_tables(&db.pool)
             .await
             .expect("publication_tables");
+        for table in also_published {
+            if !published.contains(&table) {
+                published.push(table);
+            }
+        }
         raw.batch_execute(&format!(
             "create publication {PUBLICATION} for table {}",
             published.join(", ")
@@ -303,6 +317,32 @@ impl Harness {
             .expect("seal")
             .expect("the active segment holds rows, so it seals")
             .sealed_seg_seq
+    }
+
+    /// The distinct ring `op`s sealed segment `seg_seq` holds for
+    /// `src_table`, read before the segment drains.
+    async fn staged_ops(&self, seg_seq: i64, src_table: &str) -> Vec<String> {
+        let ring_slot: i16 = self
+            .raw
+            .query_one(
+                "select ring_slot from segments where seg_seq = $1",
+                &[&seg_seq],
+            )
+            .await
+            .expect("read ring_slot")
+            .get(0);
+        self.raw
+            .query(
+                &format!(
+                    "select distinct op from seg_{ring_slot} where src_table = $1 order by op"
+                ),
+                &[&src_table],
+            )
+            .await
+            .expect("read staged ops")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
     }
 
     /// One `drain_once` against a specific segment, as worker `worker`.
@@ -745,13 +785,40 @@ async fn w5_extinct_then_recreated_group_double_subtracts_the_absorbed_delete() 
 }
 
 /// Chained W1: `h3` aggregates `h1`, a 1-1 target of `src` that is also a
-/// relationship endpoint. #315 keeps such a target in the publication, so a
-/// write to `h1` reaches `h3` twice: as the seam's image-less `Recompute`
-/// (staged in the apply that wrote `h1`) and as `h1`'s own CDC (staged when
-/// intake decodes that apply). The `Recompute` drains first and re-derives
-/// the group from live `h1`, which already holds the write; the CDC delta
-/// then adds it again. This is W1 with intake's lag behind the apply as the
-/// window, which is structural rather than a race.
+/// relationship endpoint. A write to `h1` reaches `h3` twice: as the seam's
+/// image-less `Recompute` (staged in the apply that wrote `h1`) and as `h1`'s
+/// own CDC (staged when intake decodes that apply). The `Recompute` drains
+/// first and re-derives the group from live `h1`, which already holds the
+/// write; the CDC delta then adds it again. This is W1 with intake's lag
+/// behind the apply as the window, which is structural rather than a race.
+///
+/// # What this pins, and what it leans on
+///
+/// Two separate things meet here, and only the second is under test:
+///
+/// 1. **The double feed.** `h1`'s CDC exists only because `h1` is published.
+///    Today the engine publishes it itself (#315 keeps a relationship
+///    endpoint in [`trellis::defs::publication_tables`]). Once #375's
+///    direction 1 lands, the seam is the only feed for every target the
+///    instance owns and the engine unpublishes `h1`; the double feed then
+///    survives only in direction 1's transition window, where `h1` CDC
+///    already in the slot before the `ALTER PUBLICATION ... DROP TABLE`
+///    still arrives.
+/// 2. **The recompute horizon** (the regression this pins): the
+///    `Recompute`'s forced re-derive stamps group 1's horizon after its live
+///    read, and `h1`'s CDC delta, whose commit that read already saw, lands
+///    at or below it and re-derives instead of adding.
+///
+/// So the test publishes `h1` itself ([`Setup::Publish`]) instead of relying
+/// on the engine's list, and it keeps producing the double feed after
+/// direction 1. It also asserts the shape of both feeds as it goes: an
+/// image-less `recompute` for `h1` from the seam, then an image-bearing
+/// `insert` from CDC. If the seam's row for an aggregate reader becomes
+/// image-bearing (#375's caution 3 leaves that open), the first of those
+/// fails on purpose. Two image-bearing rows for one write are two deltas with
+/// no forced re-derive between them, which no horizon absorbs, so this test
+/// would no longer be pinning the horizon and needs revisiting, not
+/// loosening.
 #[tokio::test]
 async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_counts() {
     let mut h = Harness::start(
@@ -768,17 +835,13 @@ async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_coun
             Setup::Transform(
                 "TRANSFORM h3 FROM public.h1 GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
             ),
+            // The double feed's second half, published by the test rather
+            // than left to the engine: see this test's doc comment.
+            Setup::Publish("public.h1"),
         ],
         "h3",
     )
     .await;
-    let published = trellis::defs::publication_tables(&h.db.pool)
-        .await
-        .expect("publication_tables");
-    assert!(
-        published.iter().any(|t| t == "public.h1"),
-        "a target that is a relationship endpoint stays published (#315): {published:?}"
-    );
     // The source starts empty: a seeded row would put `h1` on the chunk-queue
     // build, and `h3` can only be installed over a `live` `h1`.
     //
@@ -790,6 +853,11 @@ async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_coun
     h.drain(k0, "worker-1", 1).await;
 
     let k = h.seal().await;
+    assert_eq!(
+        h.staged_ops(k, "public.h1").await,
+        ["recompute"],
+        "feed 1: the seam stages an image-less recompute of h1 for h3"
+    );
     h.drain(k, "worker-1", 1).await;
     assert_eq!(
         h.target().await,
@@ -799,6 +867,12 @@ async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_coun
 
     // Intake now decodes the apply that wrote `h1`, so `h1`'s own CDC stages.
     h.feed().await;
+    let k1 = h.seal().await;
+    assert_eq!(
+        h.staged_ops(k1, "public.h1").await,
+        ["insert"],
+        "feed 2: h1's own CDC carries the same write as an image-bearing insert"
+    );
     h.settle().await;
     h.assert_matches_oracle("h1's CDC delta must not count C a second time")
         .await;
@@ -1016,5 +1090,188 @@ async fn w1_a_relationship_reverse_delta_is_judged_against_the_horizon() {
         h.groups(oracle_sql).await,
         "the parent change's reverse delta must not count it again"
     );
+    h.finish().await;
+}
+
+/// A group row's recompute horizon (`ddl::RECOMPUTE_LSN_COLUMN`).
+async fn horizon_of(raw: &Client, group: i32) -> PgLsn {
+    raw.query_one(
+        "select __trellis_recompute_lsn from public.agg where g = $1::integer",
+        &[&group],
+    )
+    .await
+    .expect("read the group's recompute horizon")
+    .get(0)
+}
+
+/// One seam-style write, in the shape #375's direction 1 gives the target
+/// mutation seam: inside the writer's own transaction, insert the row, read
+/// `pg_current_wal_insert_lsn()` as the ordering token *after* the write's
+/// row lock, and stage an image-bearing `Cdc` row carrying that token as its
+/// `lsn`. The token is below the transaction's commit LSN, unlike a CDC
+/// row's `end_lsn`. Returns the token; the caller decides when to commit.
+async fn seam_write(txn: &tokio_postgres::Transaction<'_>, id: i32, g: i32, v: i32) -> PgLsn {
+    txn.batch_execute(&format!("insert into public.src values ({id}, {g}, {v})"))
+        .await
+        .expect("seam writer's write");
+    let token: PgLsn = txn
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the seam token")
+        .get(0);
+    trellis::staging::append(
+        txn,
+        &[StagedChange::Cdc {
+            src_table: SRC.to_string(),
+            key: id.to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(token),
+            old_image: None,
+            new_image: Some(format!(r#"{{"id":"{id}","g":"{g}","v":"{v}"}}"#)),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the seam row");
+    token
+}
+
+/// #375's direction 1 makes the target mutation seam stage CDC-shaped rows
+/// whose `lsn` is an ordering token read *before* the writer commits, not a
+/// commit `end_lsn`. For the horizon, all that matters is that the token is
+/// no later than the writer's commit (reading it after the row locks is what
+/// orders one key's rows in the fold, a separate concern):
+///
+/// - token above the horizon H: the token was read after H, so the writer
+///   committed after H, and the live read behind H could not see it. The
+///   delta applies.
+/// - token at or below H: the writer may or may not have been visible to
+///   the read, so the group re-derives, which is right either way.
+///
+/// Three seam-style writers ([`seam_write`]), one per group, straddle one
+/// batch of forced recomputes of groups 1, 2 and 3. The test never feeds
+/// intake, so each write's only feed is its own seam row, as for an
+/// unpublished target under direction 1:
+///
+/// - **absorbed** (group 1): token and commit before the recompute's read.
+///   The read counts it; its delta must not count it again.
+/// - **straddling** (group 2): token before the read, commit after. The
+///   read does not see it, yet its token is at or below H. The group must
+///   re-derive, not skip: this is the case a pre-commit token makes common.
+/// - **after** (group 3): token read after the recompute committed, so above
+///   H. It applies as a plain delta, leaving the group's horizon alone.
+///
+/// Each premise (token against H, what the read saw) is asserted, and each
+/// group's horizon afterwards shows which path it took.
+#[tokio::test]
+async fn a_seam_writer_with_a_pre_commit_token_straddling_a_forced_recompute() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10), (3, 2, 20), (5, 3, 30)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+    h.assert_matches_oracle("after the initial build").await;
+
+    h.append_recomputes(&[1, 3, 5]).await;
+    let k = h.seal().await;
+
+    // Absorbed: token and commit both before batch k's read.
+    let mut absorbed = connect_raw(h.db.dsn()).await;
+    let txn = absorbed.transaction().await.expect("begin absorbed writer");
+    let absorbed_token = seam_write(&txn, 2, 1, 5).await;
+    txn.commit().await.expect("commit absorbed writer");
+
+    // Straddling: token now, commit only after batch k's read.
+    let mut straddling = connect_raw(h.db.dsn()).await;
+    let straddling_txn = straddling
+        .transaction()
+        .await
+        .expect("begin straddling writer");
+    let straddling_token = seam_write(&straddling_txn, 4, 2, 7).await;
+
+    h.drain(k, "worker-1", 1).await;
+    let horizon = [
+        horizon_of(&h.raw, 1).await,
+        horizon_of(&h.raw, 2).await,
+        horizon_of(&h.raw, 3).await,
+    ];
+    assert_eq!(
+        h.target().await,
+        BTreeMap::from([
+            (
+                "1".to_string(),
+                (Some("15".to_string()), Some("2".to_string()))
+            ),
+            (
+                "2".to_string(),
+                (Some("20".to_string()), Some("1".to_string()))
+            ),
+            (
+                "3".to_string(),
+                (Some("30".to_string()), Some("1".to_string()))
+            ),
+        ]),
+        "batch k's live read counts the absorbed writer and not the uncommitted straddling one"
+    );
+    assert!(
+        absorbed_token <= horizon[0],
+        "premise: the absorbed writer's token ({absorbed_token}) is at or below group 1's \
+         horizon ({})",
+        horizon[0]
+    );
+    assert!(
+        straddling_token <= horizon[1],
+        "premise: the straddling writer's token ({straddling_token}) is at or below group 2's \
+         horizon ({}) although the read did not see it",
+        horizon[1]
+    );
+
+    straddling_txn
+        .commit()
+        .await
+        .expect("commit straddling writer");
+
+    // After: token read once batch k has committed.
+    let mut after = connect_raw(h.db.dsn()).await;
+    let txn = after.transaction().await.expect("begin after writer");
+    let after_token = seam_write(&txn, 6, 3, 9).await;
+    txn.commit().await.expect("commit after writer");
+    assert!(
+        after_token > horizon[2],
+        "premise: the after writer's token ({after_token}) is above group 3's horizon ({})",
+        horizon[2]
+    );
+
+    let k1 = h.seal().await;
+    assert_eq!(
+        h.staged_ops(k1, SRC).await,
+        ["insert"],
+        "the batch holds the seam rows and nothing else for src"
+    );
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle(
+        "each seam write counts once: absorbed not twice, straddling not zero times",
+    )
+    .await;
+
+    assert!(
+        horizon_of(&h.raw, 1).await > horizon[0],
+        "group 1's delta was at or below its horizon, so the group re-derived"
+    );
+    assert!(
+        horizon_of(&h.raw, 2).await > horizon[1],
+        "group 2's delta was at or below its horizon, so the group re-derived rather than \
+         skipping the write its read never saw"
+    );
+    assert_eq!(
+        horizon_of(&h.raw, 3).await,
+        horizon[2],
+        "group 3's delta was above its horizon, so it applied as a delta"
+    );
+
     h.finish().await;
 }

@@ -3162,6 +3162,14 @@ async fn apply_delta_groups_bulk(
 /// A delta above the horizon therefore was not counted and applies as is; one
 /// at or below *may* have been, so the group is re-derived. Re-deriving is
 /// idempotent, so this errs toward re-evaluating, never toward skipping.
+///
+/// All this needs from `lsn` is that it is no later than the writer's
+/// commit. A commit `end_lsn` is, and so is a token the writer reads from
+/// `pg_current_wal_insert_lsn()` before it commits (#375's seam rows): a
+/// token above the horizon was read after it, so its writer committed after
+/// it too. A pre-commit token only makes "at or below" cover more writers
+/// the read never saw, and those re-derive. Pinned by
+/// `a_seam_writer_with_a_pre_commit_token_straddling_a_forced_recompute`.
 fn delta_may_be_absorbed(min_image_lsn: Option<PgLsn>, horizon: Option<PgLsn>) -> bool {
     matches!((min_image_lsn, horizon), (Some(lsn), Some(horizon)) if lsn <= horizon)
 }
