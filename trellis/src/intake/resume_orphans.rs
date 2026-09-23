@@ -141,7 +141,10 @@ pub(super) async fn delete_orphaned_target_rows(
         let target: String = row.get(1);
         let def =
             parse(&text).unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
-        let key_cols = ddl::identity_key_columns(txn, &target).await?;
+        // Quoted: `identity_key_columns` resolves its argument with
+        // `to_regclass`, which would case-fold a bare mixed-case name.
+        let key_cols =
+            ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(&target)).await?;
         if key_cols.is_empty() {
             // Only a target dropped since the catalog read above: every
             // target Trellis creates has a key.

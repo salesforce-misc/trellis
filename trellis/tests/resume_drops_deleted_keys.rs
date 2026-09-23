@@ -860,3 +860,51 @@ async fn resume_after_a_slot_loss_drops_rows_deleted_in_the_gap() {
         .expect("drop the recreated slot");
     operator.shutdown().await.expect("shut down");
 }
+
+/// Mixed-case target names (the lexer keeps an identifier's case, and the
+/// target is created quoted). The orphan delete must find their keys, not
+/// case-fold the name and skip the target as if it were gone.
+#[tokio::test]
+async fn resume_drops_orphans_from_mixed_case_targets() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_orders(&client).await;
+    let operator = define_only(db.dsn()).await;
+    apply_all(
+        &operator,
+        &[
+            "TRANSFORM OrderDoubles FROM orders SELECT a + a AS x",
+            "TRANSFORM OrderRollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        ],
+    )
+    .await;
+    settle(&db.pool, &mut client).await;
+
+    pause_write_resume(
+        &db,
+        &mut client,
+        &operator,
+        &["OrderDoubles", "OrderRollup"],
+        "delete from orders where g = 0",
+    )
+    .await;
+
+    assert_eq!(
+        text_rows(
+            &client,
+            r#"select id::text from "OrderDoubles" order by id"#
+        )
+        .await,
+        text(&[&[Some("1")], &[Some("3")], &[Some("5")]]),
+    );
+    assert_eq!(
+        text_rows(
+            &client,
+            r#"select g::text, total::text from "OrderRollup" order by g"#
+        )
+        .await,
+        text(&[&[Some("1"), Some("9")]]),
+    );
+    operator.shutdown().await.expect("shut down");
+}
