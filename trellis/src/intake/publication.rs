@@ -743,25 +743,55 @@ async fn advance_deferred_definitions(
 /// `backfilling` promotion, run once the marker's enumeration has committed.
 /// A no-op for an empty `ids` (the common case: no definition was deferred
 /// against this particular marker).
+///
+/// Scoped `status = 'backfilling'` (issue #331): the promotion and this flip
+/// are separate transactions, and an operator pause (or a quarantine) can land
+/// on one of `ids` in between. That definition stays frozen — its resume
+/// re-parks a marker of its own and rebuilds by a fresh backfill — rather than
+/// being forced `live` behind the operator's back. Returns the ids actually
+/// flipped.
 async fn mark_definitions_live(
     client: &impl GenericClient,
     ids: &[i64],
-) -> Result<(), IntakeError> {
+) -> Result<Vec<i64>, IntakeError> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    client
-        .execute(
-            "update transform_definitions set status = $1 where id = any($2)",
-            &[&TransformStatus::Live.as_str(), &ids],
+    let flipped: Vec<i64> = client
+        .query(
+            "update transform_definitions set status = $1 \
+             where id = any($2) and status = $3 \
+             returning id",
+            &[
+                &TransformStatus::Live.as_str(),
+                &ids,
+                &TransformStatus::Backfilling.as_str(),
+            ],
         )
-        .await?;
-    tracing::info!(
-        ids = ?ids,
-        to = %TransformStatus::Live.as_str(),
-        "transform status transition: backfill enumeration committed"
-    );
-    Ok(())
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if !flipped.is_empty() {
+        tracing::info!(
+            ids = ?flipped,
+            to = %TransformStatus::Live.as_str(),
+            "transform status transition: backfill enumeration committed"
+        );
+    }
+    if flipped.len() < ids.len() {
+        let skipped: Vec<i64> = ids
+            .iter()
+            .filter(|id| !flipped.contains(id))
+            .copied()
+            .collect();
+        tracing::info!(
+            ids = ?skipped,
+            "backfill enumeration committed, but these definitions left `backfilling` \
+             meanwhile; leaving their status as it is"
+        );
+    }
+    Ok(flipped)
 }
 
 /// The initial snapshot handshake: creates `slot` and backfills every one of
@@ -987,6 +1017,66 @@ mod tests {
         // (e.g. the ADD's own transaction) can land on.
         assert!(!Snapshot::parse("20:30:").unwrap().settled_since(&fence));
         assert!(Snapshot::parse("21:31:").unwrap().settled_since(&fence));
+    }
+
+    /// Issue #331: `run_pending_backfills` promotes deferred definitions to
+    /// `backfilling` and flips them `live` in separate transactions, so an
+    /// operator pause (or a quarantine) can land on one in between. The flip
+    /// must only move definitions still `backfilling`, and report exactly
+    /// those — never force a frozen definition `live` behind the operator.
+    #[tokio::test]
+    async fn mark_definitions_live_leaves_a_definition_that_left_backfilling_alone() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+
+        client
+            .execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1)",
+                &[],
+            )
+            .await
+            .expect("seed source_table_versions");
+        let mut ids = Vec::new();
+        for (target, status) in [
+            ("public.still_backfilling", "backfilling"),
+            ("public.paused_meanwhile", "paused"),
+            ("public.quarantined_meanwhile", "quarantined"),
+        ] {
+            let id: i64 = client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, 'public.orders', 1, '', $2) returning id",
+                    &[&target, &status],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0);
+            ids.push(id);
+        }
+
+        let flipped = mark_definitions_live(&**client, &ids)
+            .await
+            .expect("mark_definitions_live");
+
+        let statuses: Vec<String> = client
+            .query(
+                "select status from transform_definitions where id = any($1) order by id",
+                &[&ids],
+            )
+            .await
+            .expect("read statuses")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            statuses,
+            ["live", "paused", "quarantined"],
+            "only the definition still backfilling goes live; a frozen one stays frozen"
+        );
+        assert_eq!(flipped, [ids[0]], "reports exactly the ids it flipped");
     }
 
     #[test]

@@ -836,8 +836,10 @@ pub async fn install_definition(
             // live, so the redundant publication-join catch-up enumeration of
             // those tables can be skipped.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
-            mark_definition_status(pool, definition.id, TransformStatus::Live).await?;
-            definition.status = TransformStatus::Live;
+            let client = pool.get().await?;
+            definition.status = go_live_if_backfilling(&**client, definition.id)
+                .await?
+                .status();
             Ok(definition)
         }
         Err(BackfillError::Unsupported(_)) => {
@@ -905,21 +907,68 @@ async fn install_plain_one_to_one(
     }
 }
 
-/// Flips an already-persisted definition row to `status` in place (issue
-/// #55) — used by [`install_definition`] once its direct build finishes.
-async fn mark_definition_status(
-    pool: &Pool,
+/// What [`go_live_if_backfilling`] did to a definition whose build finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoLive {
+    /// It was still `backfilling`, and is now `live`.
+    Flipped,
+    /// It had already left `backfilling` (paused, quarantined, or resumed back
+    /// to `waiting_to_backfill`), and was left in this status untouched.
+    LeftAs(TransformStatus),
+}
+
+impl GoLive {
+    /// The status the definition is in afterward.
+    fn status(self) -> TransformStatus {
+        match self {
+            GoLive::Flipped => TransformStatus::Live,
+            GoLive::LeftAs(status) => status,
+        }
+    }
+}
+
+/// Flips an already-persisted definition row `backfilling` -> `live` once its
+/// build finishes (issue #55) — but only if it is *still* `backfilling`
+/// (issue #331). A build runs unlocked against the definition row for as long
+/// as it takes, and an operator pause, the poison fuse, or a resume can move
+/// the row on meanwhile; an unconditional flip would silently undo that. A
+/// definition that moved on is left where it is: whatever moved it owns its
+/// way back to `live` (a frozen definition's resume rebuilds it by a fresh
+/// backfill; a `waiting_to_backfill` one already sits behind a marker).
+async fn go_live_if_backfilling(
+    client: &impl GenericClient,
     id: i64,
-    status: TransformStatus,
-) -> Result<(), CatalogError> {
-    let client = pool.get().await?;
-    client
+) -> Result<GoLive, CatalogError> {
+    let flipped = client
         .execute(
-            "update transform_definitions set status = $1 where id = $2",
-            &[&status.as_str(), &id],
+            "update transform_definitions set status = $1 where id = $2 and status = $3",
+            &[
+                &TransformStatus::Live.as_str(),
+                &id,
+                &TransformStatus::Backfilling.as_str(),
+            ],
         )
         .await?;
-    Ok(())
+    if flipped == 1 {
+        return Ok(GoLive::Flipped);
+    }
+    let status_text: String = client
+        .query_one(
+            "select status from transform_definitions where id = $1",
+            &[&id],
+        )
+        .await?
+        .get(0);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    tracing::info!(
+        definition_id = id,
+        status = %status.as_str(),
+        "backfill finished, but the definition is no longer backfilling; \
+         leaving its status as it is"
+    );
+    Ok(GoLive::LeftAs(status))
 }
 
 /// Flips `definition_id` from [`TransformStatus::Backfilling`] to
@@ -945,18 +994,25 @@ async fn mark_definition_status(
 /// Only ever called for the plain (non-relationship) 1-1 chunk-queue path
 /// today — a relationship-enriched 1-1 or aggregate definition still flips
 /// `Backfilling` -> `Live` synchronously inside [`install_definition`] itself
-/// via [`mark_definition_status`], since neither is chunked into
+/// via [`go_live_if_backfilling`], since neither is chunked into
 /// `backfill_chunks` (see this crate's `defs::backfill` module docs on why).
+///
+/// **Only a still-`backfilling` definition completes (issue #331).** The
+/// pause gates new chunk claims, not a chunk a worker already holds, so the
+/// last chunk can finish after the definition has been paused or quarantined
+/// (or, once resumed, dropped back to `waiting_to_backfill` with leftover
+/// chunks re-dispatched). [`go_live_if_backfilling`] leaves a definition that
+/// has moved on exactly as it is, and no catch-up marker is parked for it
+/// either: the chunk itself is still retired by the caller, and resume
+/// ([`crate::staging::quarantine::resume_transform`]) re-parks a marker of
+/// its own and rebuilds by a fresh backfill.
+///
+/// Returns the status the definition is left in: [`TransformStatus::Live`]
+/// when this call completed it, its unchanged current status otherwise.
 pub(crate) async fn complete_direct_backfill(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
-) -> Result<(), CatalogError> {
-    txn.execute(
-        "update transform_definitions set status = $1 where id = $2",
-        &[&TransformStatus::Live.as_str(), &definition_id],
-    )
-    .await?;
-
+) -> Result<TransformStatus, CatalogError> {
     // Issue #72 / ADR-0007: `transform_definitions.source_table` is already
     // the fully-qualified `schema.table` identity persisted at
     // definition-acceptance time (`create_definition_inner`) — read it back
@@ -966,15 +1022,18 @@ pub(crate) async fn complete_direct_backfill(
     // so handing it an already-qualified `"schema.table"` string would never
     // match anything and this would fail every time with
     // [`CatalogError::SourceTableNotFound`].
-    let qualified: String = txn
-        .query_one(
-            "select source_table from transform_definitions where id = $1",
-            &[&definition_id],
-        )
-        .await?
-        .get(0);
-    crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
-    Ok(())
+    let outcome = go_live_if_backfilling(txn, definition_id).await?;
+    if outcome == GoLive::Flipped {
+        let qualified: String = txn
+            .query_one(
+                "select source_table from transform_definitions where id = $1",
+                &[&definition_id],
+            )
+            .await?
+            .get(0);
+        crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
+    }
+    Ok(outcome.status())
 }
 
 /// Deletes a definition row by id (issue #55) — used by [`install_definition`]
@@ -5425,6 +5484,63 @@ fn expr_references_column(
             )
         }),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => false,
+    }
+}
+
+/// Issue #331: every build-finished flip (`install_definition`'s synchronous
+/// build, and the chunk queue's last-chunk completion) goes through
+/// [`go_live_if_backfilling`], which must only ever move a definition that is
+/// still `backfilling` — never one paused, quarantined or resumed meanwhile.
+#[cfg(test)]
+mod go_live_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_a_still_backfilling_definition_goes_live() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        client
+            .execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1)",
+                &[],
+            )
+            .await
+            .expect("seed source_table_versions");
+
+        for status in TransformStatus::ALL {
+            let id: i64 = client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, 'public.orders', 1, '', $2) returning id",
+                    &[&format!("public.t_{}", status.as_str()), &status.as_str()],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0);
+
+            let outcome = go_live_if_backfilling(&**client, id)
+                .await
+                .expect("go_live_if_backfilling");
+            let persisted: String = client
+                .query_one(
+                    "select status from transform_definitions where id = $1",
+                    &[&id],
+                )
+                .await
+                .expect("read status")
+                .get(0);
+
+            if status == TransformStatus::Backfilling {
+                assert_eq!(outcome, GoLive::Flipped);
+                assert_eq!(persisted, "live");
+            } else {
+                assert_eq!(outcome, GoLive::LeftAs(status));
+                assert_eq!(persisted, status.as_str(), "{status:?} is left untouched");
+            }
+        }
     }
 }
 

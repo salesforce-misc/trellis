@@ -12,6 +12,9 @@
 //!
 //! - pause is idempotent, and reaching a paused definition it didn't create
 //!   is a success (`pausing_twice_is_a_no_op_success`)
+//! - a pause landing while a worker holds the last backfill chunk survives
+//!   that chunk finishing — issue #331
+//!   (`a_chunk_finishing_after_the_pause_does_not_unpause_the_definition`)
 //! - resume rebuilds by a fresh backfill rather than catching up over
 //!   buffered changes, and a paused definition never pins the ring for its
 //!   siblings (`resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring`)
@@ -1004,6 +1007,100 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         count(&raw, "select count(*) from backfill_chunks").await,
         0,
         "per-definition chunk rows cascade off the definition"
+    );
+}
+
+/// Issue #331: the pause gates *new* chunk claims, but a chunk a worker already
+/// holds is left to finish (see `claim_chunks`' own comment). Finishing the last
+/// of them used to run the `backfilling` -> `live` completion unconditionally,
+/// so a pause landing while a worker held the final chunk was silently undone
+/// the moment that worker finished: the definition went `live` and its fold
+/// resumed as if nobody had paused it.
+///
+/// The completion must leave a definition that is no longer `backfilling`
+/// exactly where it is, while still retiring the chunk — a paused definition's
+/// finished chunks are done, not re-queued, and resume rebuilds it by a fresh
+/// backfill of its own regardless.
+#[tokio::test]
+async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
+    const WORKER: &str = "issue-331-worker";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 40).await;
+    raw.batch_execute("create publication trellis_pub")
+        .await
+        .expect("create publication");
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
+        .await
+        .expect("define a chunked 1-1 transform");
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("backfilling"),
+        "precondition: a chunked 1-1 definition is backfilling behind its queue"
+    );
+
+    // The worker takes every chunk *before* the pause, so the pause's dispatch
+    // gate has nothing left to withhold: this is exactly a worker already
+    // holding the definition's last chunk when the operator pauses.
+    let held = chunk_queue::claim_chunks(&raw, WORKER, 100)
+        .await
+        .expect("claim every chunk");
+    assert!(!held.is_empty(), "precondition: there were chunks to hold");
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from backfill_chunks where not done and claimed_by is null"
+        )
+        .await,
+        0,
+        "precondition: the worker holds every chunk"
+    );
+
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause the backfilling definition");
+
+    for chunk in &held {
+        chunk_queue::run_claimed_chunk(
+            &db.pool,
+            chunk,
+            DEFAULT_TARGET_SCHEMA,
+            WORKER,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("an in-flight chunk runs to completion");
+        chunk_queue::finish_chunk(&db.pool, chunk, WORKER)
+            .await
+            .expect("an in-flight chunk finishes");
+    }
+
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("paused"),
+        "finishing the last in-flight chunk must not undo the pause"
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from backfill_chunks where not done").await,
+        0,
+        "the finished chunks are retired all the same, not left to be re-run"
+    );
+
+    // And the pause is still an ordinary one: resume hands the definition back
+    // to the backfill lifecycle rather than finding it already `live`.
+    trellis
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume the still-paused definition");
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("waiting_to_backfill"),
+        "resume rebuilds by backfill"
     );
 }
 

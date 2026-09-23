@@ -176,10 +176,13 @@ pub(crate) async fn enqueue_one_to_one(
         // exists for this definition yet — but reusing the exact path keeps
         // there being exactly one way a direct-build definition ever
         // completes).
-        complete_if_no_chunks_remain(pool, definition_id)
+        // Reports what the completion actually left the definition in: an
+        // operator can already pause it by now (issue #331), and that pause
+        // stands rather than being reported — or forced — `live`.
+        let status = complete_if_no_chunks_remain(pool, definition_id)
             .await
             .map_err(catalog_completion_err_to_backfill)?;
-        return Ok(TransformStatus::Live);
+        return Ok(status.unwrap_or(TransformStatus::Backfilling));
     }
 
     let mut client = pool.get().await?;
@@ -481,7 +484,7 @@ pub async fn finish_chunk(
 async fn complete_if_no_chunks_remain(
     pool: &Pool,
     definition_id: i64,
-) -> Result<(), ChunkQueueError> {
+) -> Result<Option<TransformStatus>, ChunkQueueError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     txn.query_opt(
@@ -489,9 +492,9 @@ async fn complete_if_no_chunks_remain(
         &[&definition_id],
     )
     .await?;
-    complete_if_no_chunks_remain_in_txn(&txn, definition_id).await?;
+    let status = complete_if_no_chunks_remain_in_txn(&txn, definition_id).await?;
     txn.commit().await?;
-    Ok(())
+    Ok(status)
 }
 
 /// Maps a [`ChunkQueueError`] from the zero-chunk completion path back into a
@@ -513,11 +516,14 @@ fn catalog_completion_err_to_backfill(err: ChunkQueueError) -> BackfillError {
 
 /// The shared "no chunks left? then flip to live" check both
 /// [`finish_chunk`] and [`complete_if_no_chunks_remain`] run once they
-/// already hold the definition row's `for update` lock.
+/// already hold the definition row's `for update` lock. Returns the status
+/// the completion left the definition in, or `None` while chunks remain —
+/// "flip to live" only ever happens from `backfilling` (issue #331; see
+/// `complete_direct_backfill`).
 async fn complete_if_no_chunks_remain_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
-) -> Result<(), ChunkQueueError> {
+) -> Result<Option<TransformStatus>, ChunkQueueError> {
     let remaining: bool = txn
         .query_one(
             "select exists(select 1 from backfill_chunks where definition_id = $1 and not done)",
@@ -525,8 +531,10 @@ async fn complete_if_no_chunks_remain_in_txn(
         )
         .await?
         .get(0);
-    if !remaining {
-        catalog::complete_direct_backfill(txn, definition_id).await?;
+    if remaining {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(
+        catalog::complete_direct_backfill(txn, definition_id).await?,
+    ))
 }
