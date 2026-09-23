@@ -2116,6 +2116,24 @@ impl ReverseGuardFailure {
 /// "what to actually do" list's to-many/`rel_joins` exclusion, and no
 /// existing test exercises a to-one relationship's from-side table being
 /// truncated mid-flight).
+///
+/// **Seam rows (issue #402).** A from-side that is one of this instance's
+/// targets can reach the ring as the target-mutation seam's CDC-shaped rows,
+/// whose `lsn` is the writer's pre-commit write token, not its commit. Guard
+/// (a)'s premise, "once intake has staged through `X`, every change at or
+/// below `X` is in the ring", does not hold for them: a row with a token at
+/// or below `X` can belong to a writer that has not committed, so this scan
+/// can't see it. The check is still no weaker than it is against the same
+/// writes' CDC. A token is below its writer's commit, so a write whose CDC
+/// row would be at or below `X` has a seam row at or below `X` too, and a
+/// writer that committed before this scan committed its seam row with it
+/// (no intake lag to wait out). A seam row this scan can't see belongs to a
+/// writer that commits after the scan, so after `X` was captured: its CDC
+/// row would be above `X` and excluded as well. The argument only uses
+/// "token below commit", so it does not matter that `X` is a WAL *write*
+/// position while the token is an *insert* position. What does change is
+/// that a seam row can match here although its writer committed after `X`,
+/// which only defers more.
 async fn from_side_change_in_flight(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -2236,6 +2254,16 @@ async fn from_side_change_in_flight(
 /// explicitly out of #136's scope (see that issue), and closing this sliver
 /// would need the same "bump gen from inside the bulk recompute" follow-up
 /// this comment used to describe for the pre-#136 case generally.
+///
+/// **Seam rows (issue #402).** The upper bound `lsn <= X` is no weaker for a
+/// from-side target's seam rows than for CDC, for the reason
+/// [`from_side_change_in_flight`] gives. The exclusive lower bound is the one
+/// comparison that goes the other way: a seam row's token can be at or below
+/// `since_lsn` while its writer committed after it, where the same write's
+/// CDC row would be above `since_lsn` and route to the fallback. Unreachable
+/// while endpoint targets stay published (the seam does not feed them, see
+/// `staging::target_mutations`); #403 has to settle it before it switches
+/// the seam on.
 async fn relationship_fast_path_precondition_holds(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -5552,7 +5580,7 @@ fn join_pk_parts(parts: &[String]) -> String {
 /// own small copy here, not shared, since the two modules' keysets differ in
 /// what types they cast to — [`PrimaryKeyColumn::data_type`] here, a
 /// [`ValueType`] there).
-fn pk_keyset_col(i: usize) -> String {
+pub(super) fn pk_keyset_col(i: usize) -> String {
     format!("c{i}")
 }
 
@@ -7071,8 +7099,10 @@ pub async fn apply_and_mark_drained_many(
     // anything. Issue #315: every key a write above physically changed, for
     // every target some `live` definition reads, becomes one image-less
     // `Recompute` at `hop_gen + 1` carrying the key's prior image — see
-    // `staging::target_mutations`. `lsn: None`, like every row this step
-    // stages: a propagated hop has no source LSN of its own.
+    // `staging::target_mutations`. `lsn: None`, like every other row this
+    // step stages: a propagated hop has no source LSN of its own. (A target
+    // the seam feeds as a relationship endpoint gets a CDC-shaped row with
+    // the write token as its `lsn` instead, issue #402.)
     let propagation = mutations.into_staged(txn).await?;
     let mut recompute_changes = propagation.changes;
     let mut hop_bound_tables = propagation.hop_bound_tables;

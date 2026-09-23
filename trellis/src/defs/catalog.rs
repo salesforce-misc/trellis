@@ -3043,6 +3043,18 @@ pub async fn relationships_from_table(
     from_table: &str,
 ) -> Result<Vec<RelationshipDefinition>, CatalogError> {
     let client = pool.get().await?;
+    relationships_from_table_in(&**client, from_schema, from_table).await
+}
+
+/// [`relationships_from_table`] on a caller-supplied client, for a caller
+/// already inside a transaction (`staging::target_mutations`, which resolves
+/// a from-side endpoint target's join-key columns in the writing
+/// transaction).
+pub(crate) async fn relationships_from_table_in(
+    client: &impl GenericClient,
+    from_schema: &str,
+    from_table: &str,
+) -> Result<Vec<RelationshipDefinition>, CatalogError> {
     let rows = client
         .query(
             &format!(
@@ -5587,6 +5599,27 @@ pub(crate) async fn seam_only_targets(
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
+/// Whether the qualified `table` is an endpoint, on either side, of any
+/// relationship: the same test [`seam_only_targets`] excludes a target on.
+/// `staging::target_mutations` asks it of a target it wrote, to decide
+/// whether its seam rows must stand in for that target's CDC (issue #402).
+pub(crate) async fn is_relationship_endpoint(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, CatalogError> {
+    Ok(client
+        .query_one(
+            "select exists ( \
+                 select 1 from schema_edges se \
+                 join schema_nodes n on n.id in (se.from_node_id, se.to_node_id) \
+                 where se.kind = 'relationship' and n.table_name = $1 \
+             )",
+            &[&table],
+        )
+        .await?
+        .get(0))
 }
 
 /// The current version of `source_table`, or `None` if no definition has

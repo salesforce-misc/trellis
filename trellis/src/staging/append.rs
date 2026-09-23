@@ -92,7 +92,11 @@ pub const TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-truncate-sentinel";
 /// reaches Postgres.
 #[derive(Debug, Clone)]
 pub enum StagedChange {
-    /// CDC intake's shape: an image-bearing decoded change.
+    /// CDC intake's shape: an image-bearing decoded change. The
+    /// target-mutation seam stages this shape too, for a relationship-endpoint
+    /// target it feeds (issue #402, `staging::target_mutations`): `lsn` is
+    /// then the writer's pre-commit write token, not a commit `end_lsn`, and
+    /// `origin_lsn` stays `None`.
     Cdc {
         src_table: String,
         key: String,
@@ -108,7 +112,8 @@ pub enum StagedChange {
         /// `from_col`, read from `old_image` (if present) and `new_image`
         /// (if present). Populated by intake (`intake::mod::Intake`'s
         /// `handle_xlog_data`, using a cached outbound-relationship column
-        /// map) or backfill's replay of a spilled/parked change; `None`
+        /// map), backfill's replay of a spilled/parked change, or the
+        /// target-mutation seam for a from-side endpoint target; `None`
         /// when this row's `src_table` has no outbound relationship at all,
         /// or (rare, transient) the catalog cache hasn't observed one yet.
         /// See `staging::fold`'s doc comment for the union merge rule this
