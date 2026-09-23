@@ -21,8 +21,11 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{CatalogError, ValueType, install_definition, publication_tables};
+use trellis::defs::{
+    CatalogError, ValueType, create_relationship, install_definition, publication_tables,
+};
 use trellis::intake::publication::reconcile_publication;
+use trellis::integer::IntWidth;
 use trellis::{Config, Pool, migrate};
 
 const INSTANCE_B: &str = "instance_b";
@@ -268,6 +271,111 @@ async fn another_instances_one_to_one_target_is_still_accepted() {
 
     reconcile_b(&pool_b, &mut b).await;
     assert!(b_publishes(&b, "sales_copy").await);
+}
+
+/// Issue #375: a relationship endpoint reaches instance B's publication through
+/// `all_source_tables`' relationship walk, not as a definition's source, so it
+/// must pass the same keying rule. Instance A's aggregate target fails it
+/// whichever side of the relationship it is on; a plain table without a
+/// primary key fails it too. A 1-1 target of A's has a key and is accepted.
+#[tokio::test]
+async fn a_relationship_endpoint_intake_cant_key_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (pool_b, mut b) = two_instances(&db).await;
+    let a = connect_raw(db.dsn(), DEFAULT_SCHEMA).await;
+    a.batch_execute(
+        "create table public.visits (id integer primary key, region integer); \
+         alter table public.visits replica identity full; \
+         create table public.stores (id integer primary key, region integer); \
+         alter table public.stores replica identity full; \
+         create table public.keyless (region integer not null unique, name text); \
+         alter table public.keyless replica identity full",
+    )
+    .await
+    .expect("create instance A's tables");
+    let int_columns = columns(&[
+        ("id", ValueType::Integer(IntWidth::Int4)),
+        ("region", ValueType::Integer(IntWidth::Int4)),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM region_visits FROM visits GROUP BY region SELECT COUNT(*) AS n",
+        &int_columns,
+        "public",
+    )
+    .await
+    .expect("instance A installs an aggregate grouped on an integer");
+    a.batch_execute("alter table public.region_visits replica identity full")
+        .await
+        .expect("widen region_visits's replica identity");
+    install_definition(
+        &db.pool,
+        "TRANSFORM stores_copy FROM stores SELECT region AS region",
+        &int_columns,
+        "public",
+    )
+    .await
+    .expect("instance A installs a 1-1");
+
+    for (text, endpoint) in [
+        (
+            "RELATIONSHIP visits FROM stores.region TO region_visits.region",
+            "public.region_visits",
+        ),
+        (
+            "RELATIONSHIP store FROM region_visits.region TO stores.region",
+            "public.region_visits",
+        ),
+        (
+            "RELATIONSHIP named FROM stores.region TO keyless.region",
+            "public.keyless",
+        ),
+    ] {
+        match create_relationship(&pool_b, text).await {
+            Err(CatalogError::RelationshipEndpointNotChangeKeyed { endpoint: got }) => {
+                assert_eq!(got, endpoint, "{text}");
+            }
+            other => {
+                panic!("expected RelationshipEndpointNotChangeKeyed for {text}, got {other:?}")
+            }
+        }
+    }
+
+    // A's 1-1 target is keyed, so B may relate to it. It is a plain table to
+    // B, though, so B only checks its replica identity and never sets it:
+    // `REPLICA IDENTITY FULL` on an endpoint is set only on the instance's own
+    // targets.
+    const COPY: &str = "RELATIONSHIP copy FROM stores.id TO stores_copy.id";
+    match create_relationship(&pool_b, COPY).await {
+        Err(CatalogError::ReplicaIdentityRequired(_)) => {}
+        other => panic!("expected ReplicaIdentityRequired for A's target, got {other:?}"),
+    }
+    let identity: String = b
+        .query_one(
+            "select relreplident::text from pg_class where oid = 'public.stores_copy'::regclass",
+            &[],
+        )
+        .await
+        .expect("read relreplident")
+        .get(0);
+    assert_eq!(identity, "d");
+    a.batch_execute("alter table public.stores_copy replica identity full")
+        .await
+        .expect("widen stores_copy's replica identity");
+    create_relationship(&pool_b, COPY)
+        .await
+        .expect("instance B relates to A's 1-1 target");
+    install_definition(
+        &pool_b,
+        "TRANSFORM store_view FROM public.stores SELECT copy.region AS copied_region",
+        &int_columns,
+        "public",
+    )
+    .await
+    .expect("instance B reads through the relationship");
+    let desired = reconcile_b(&pool_b, &mut b).await;
+    assert!(b_publishes(&b, "stores_copy").await, "{desired:?}");
 }
 
 /// The rule is about the table, not its owner, so a plain source table intake

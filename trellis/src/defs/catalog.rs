@@ -236,6 +236,19 @@ pub enum CatalogError {
     /// target: this instance's own targets are exempt, since their writes
     /// reach their readers in the writing transaction rather than over CDC.
     SourceNotChangeKeyed { source_table: String },
+    /// Issue #375: a relationship endpoint is one of this instance's
+    /// aggregate targets. A relationship endpoint stays in the CDC
+    /// publication (see [`publication_tables`]), which makes it a CDC source,
+    /// and an aggregate target has no primary key to key its changes by.
+    /// Interim: lifted once endpoint targets propagate through the
+    /// target-mutation seam alone (#375's direction 1).
+    RelationshipEndpointIsAggregateTarget { endpoint: String },
+    /// Issue #375: a relationship endpoint that isn't one of this instance's
+    /// targets fails [`crate::intake::change_keyed`]. The relationship walk in
+    /// [`all_source_tables`] publishes it, so it is held to the same rule as a
+    /// definition's source ([`CatalogError::SourceNotChangeKeyed`]); the case
+    /// that motivated it is another instance's aggregate target.
+    RelationshipEndpointNotChangeKeyed { endpoint: String },
     /// [`install_definition`]'s target-table DDL (run before either backfill
     /// path) failed.
     Ddl(DdlError),
@@ -373,6 +386,8 @@ impl CatalogError {
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::ReplicaIdentityRequired(err) => err.code(),
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
+            CatalogError::RelationshipEndpointIsAggregateTarget { .. } => ErrorCode::Validation,
+            CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::Ddl(err) => err.code(),
             CatalogError::DirectBackfill(err) => err.code(),
             CatalogError::TransformNotFound { .. } => ErrorCode::NotFound,
@@ -447,6 +462,19 @@ impl fmt::Display for CatalogError {
                  REPLICA IDENTITY USING INDEX. If it is another Trellis instance's aggregate \
                  target, define this transform in that instance instead: an instance propagates \
                  writes to its own targets without logical replication"
+            ),
+            CatalogError::RelationshipEndpointIsAggregateTarget { endpoint } => write!(
+                f,
+                "relationship endpoint \"{endpoint}\" is an aggregate transform's target: a \
+                 relationship endpoint is read over logical replication, and an aggregate \
+                 target has no primary key to identify its changes by"
+            ),
+            CatalogError::RelationshipEndpointNotChangeKeyed { endpoint } => write!(
+                f,
+                "Trellis can't key relationship endpoint \"{endpoint}\"'s changes from logical \
+                 replication: it needs a primary key under REPLICA IDENTITY DEFAULT or FULL, or \
+                 REPLICA IDENTITY USING INDEX. If it is another Trellis instance's aggregate \
+                 target, it can't be a relationship endpoint here"
             ),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
@@ -532,6 +560,8 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
             CatalogError::SourceNotChangeKeyed { .. } => None,
+            CatalogError::RelationshipEndpointIsAggregateTarget { .. } => None,
+            CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
             CatalogError::Ddl(err) => Some(err),
             CatalogError::DirectBackfill(err) => Some(err),
             CatalogError::TransformNotFound { .. } => None,
@@ -2538,6 +2568,14 @@ fn is_target_suffix_index_violation(err: &tokio_postgres::Error) -> bool {
 /// deferred past this issue since no such reference resolves yet (see
 /// [`super::ast::Expr::RelationshipPath`]).
 ///
+/// Issue #375's interim guards, while an endpoint target stays in the CDC
+/// publication: each endpoint must be keyable over CDC
+/// ([`reject_unkeyed_relationship_endpoint`], which refuses this instance's
+/// aggregate targets outright), and an endpoint that is this instance's
+/// target is put on `REPLICA IDENTITY FULL`
+/// ([`set_replica_identity_full_on_own_target`]) before the replica-identity
+/// checks run, so those only ever reject a plain source table.
+///
 /// Node-kind resolution: a relationship's endpoints may each be "a source
 /// table or a transform target, in any combination" (ADR-0006), and nothing
 /// here can tell which without cross-referencing `transform_definitions`.
@@ -2598,6 +2636,8 @@ pub async fn create_relationship(
     let to_type = column_type_in_txn(&txn, &qualified_to, &def.to_table, &def.to_col).await?;
     assert_comparable_types(&def, &from_type, &to_type)?;
     assert_join_key_type_supported(&txn, &def, &from_type, &to_type).await?;
+    reject_unkeyed_relationship_endpoint(&*txn, &qualified_from).await?;
+    reject_unkeyed_relationship_endpoint(&*txn, &qualified_to).await?;
 
     // Issues #285/#288: the schema half of `qualified_from` is persisted
     // alongside the bare `from_table` and is part of the relationship's
@@ -2678,6 +2718,13 @@ pub async fn create_relationship(
     persist_edge_in_txn(&txn, to_node.id, from_node.id, EdgeKind::Relationship).await?;
 
     let cardinality = to_col_cardinality_in_txn(&txn, &qualified_to, &def.to_col).await?;
+
+    // Issue #375: an endpoint that is one of this instance's targets gets
+    // `REPLICA IDENTITY FULL` here, ahead of the checks below, which then
+    // only ever reject a plain source table (ADR-0005 leaves those to the
+    // operator).
+    set_replica_identity_full_on_own_target(&txn, &qualified_from).await?;
+    set_replica_identity_full_on_own_target(&txn, &qualified_to).await?;
 
     // To-many's join key is a non-PK column on the to-side; reverse recompute
     // reads it from delete/re-parent pre-images, which the default (PK)
@@ -4206,6 +4253,100 @@ async fn reject_unkeyed_source(
     })
 }
 
+/// Issue #375: rejects a relationship endpoint that would reach this
+/// instance's publication with changes intake can't key. A target that is a
+/// relationship endpoint stays published (see [`publication_tables`]), and
+/// [`all_source_tables`]' relationship walk publishes a plain endpoint, so
+/// either way the endpoint is a CDC source.
+///
+/// - One of this instance's aggregate targets is refused outright
+///   ([`CatalogError::RelationshipEndpointIsAggregateTarget`]): it has no
+///   primary key. This narrows ADR-0006's "either endpoint may be a
+///   transform target" to 1-1 targets for now. It is lifted for this
+///   instance's own targets once the target-mutation seam becomes their only
+///   change feed and endpoints leave the publication (#375's direction 1).
+/// - This instance's other targets mirror their source's primary key, so
+///   they are always keyed.
+/// - Anything else, including another instance's aggregate target, must
+///   pass [`crate::intake::change_keyed`]
+///   ([`CatalogError::RelationshipEndpointNotChangeKeyed`]), the rule
+///   [`reject_unkeyed_source`] holds a definition's source to. This part is
+///   permanent: direction 1 changes nothing about a table this instance
+///   doesn't own.
+async fn reject_unkeyed_relationship_endpoint(
+    client: &impl GenericClient,
+    qualified_endpoint: &str,
+) -> Result<(), CatalogError> {
+    let own_target: Option<String> = client
+        .query_opt(
+            "select definition_text from transform_definitions where target_table = $1",
+            &[&qualified_endpoint],
+        )
+        .await?
+        .map(|row| row.get(0));
+    if let Some(text) = own_target {
+        return match parse(&text)?.key_space {
+            KeySpace::Aggregate { .. } => {
+                Err(CatalogError::RelationshipEndpointIsAggregateTarget {
+                    endpoint: qualified_endpoint.to_string(),
+                })
+            }
+            _ => Ok(()),
+        };
+    }
+    let keyed = match qualified_endpoint.split_once('.') {
+        Some((schema, table)) => crate::intake::change_keyed(client, schema, table).await?,
+        None => false,
+    };
+    if keyed {
+        return Ok(());
+    }
+    Err(CatalogError::RelationshipEndpointNotChangeKeyed {
+        endpoint: qualified_endpoint.to_string(),
+    })
+}
+
+/// Issue #375, point (c): puts `qualified_endpoint` on `REPLICA IDENTITY
+/// FULL` if it is one of this instance's targets and isn't already.
+///
+/// A relationship endpoint target stays in the CDC publication (see
+/// [`publication_tables`]), while an aggregate reading a seam-only target
+/// never needed `FULL` ([`assert_replica_identity_supports_aggregate`]). So a
+/// relationship that makes an existing target an endpoint would otherwise
+/// publish it with its default identity, and a to-many from-side is the one
+/// endpoint the relationship checks let through that way. The aggregate over
+/// it would then receive CDC updates with no old image and count each as an
+/// insert. Setting `FULL` here, in the relationship's own transaction, closes
+/// that without asking the operator: targets are Trellis-owned, and ADR-0005
+/// protects only source tables. A plain source endpoint is never altered.
+///
+/// Interim, like the endpoint exception in [`publication_tables`] it
+/// compensates for: once endpoint targets leave the publication (#375's
+/// direction 1), the extra identity is harmless.
+async fn set_replica_identity_full_on_own_target(
+    txn: &tokio_postgres::Transaction<'_>,
+    qualified_endpoint: &str,
+) -> Result<(), CatalogError> {
+    if !is_definition_target(txn, qualified_endpoint).await? {
+        return Ok(());
+    }
+    let is_full: bool = txn
+        .query_one(
+            "select relreplident = 'f' from pg_class where oid = pg_catalog.to_regclass($1)",
+            &[&qualified_endpoint],
+        )
+        .await?
+        .get(0);
+    if !is_full {
+        txn.batch_execute(&format!(
+            "alter table {} replica identity full",
+            ddl::qualified_target_table_ident(qualified_endpoint)
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 /// Checks every guarantee [`crate::intake::required_source_guarantees`]
 /// derives for `plan` against the live catalog, in order, returning the
 /// first violation — issue #173 phase 2's single checker. Before this, each
@@ -5390,6 +5531,9 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
 /// image-bearing CDC with its own LSN ordering, which the seam's image-less
 /// recompute does not provide. Such a target is still also fanned out by the
 /// seam, as before this issue. See the issue #315 PR for the open follow-up.
+/// Until then [`create_relationship`] keeps the exception safe to publish
+/// (issue #375): an endpoint can't be an aggregate target, and a target
+/// endpoint is put on `REPLICA IDENTITY FULL`.
 pub async fn publication_tables(pool: &Pool) -> Result<Vec<String>, CatalogError> {
     let tables = all_source_tables(pool).await?;
     let client = pool.get().await?;

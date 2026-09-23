@@ -121,7 +121,10 @@ to identify a change by, so `CREATE TRANSFORM` rejects the definition with
 `SourceNotChangeKeyed` (issue #376). Publishing the table would also make
 Postgres refuse the owning instance's own updates to it, since it has no replica
 identity. To chain off an aggregate target, define the downstream transform in
-the instance that owns it.
+the instance that owns it. The same goes for a relationship: `CREATE
+RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
+with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
+would publish it just the same.
 
 One behaviour to expect rather than debug: convergence latency is coupled
 across co-tenant instances. `staging::watermark_token` is

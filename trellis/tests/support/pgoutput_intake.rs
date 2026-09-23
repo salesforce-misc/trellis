@@ -13,7 +13,8 @@
 //!
 //! The publication is exactly what [`trellis::defs::publication_tables`]
 //! asks for, and [`Pipeline::attach`] asserts that set up front: since issue
-//! #315 no Trellis-owned target is ever published.
+//! #315 no Trellis-owned target is ever published, unless it is a
+//! relationship endpoint (issue #375).
 
 use std::collections::HashMap;
 
@@ -168,7 +169,7 @@ impl Pipeline {
             .expect("publication_tables");
         assert_eq!(
             published, expected_published,
-            "only true sources are published; a Trellis-owned target never is (issue #315)"
+            "only true sources and relationship endpoints are published (issues #315, #375)"
         );
         raw.batch_execute(&format!(
             "create publication {PUBLICATION} for table {}",
@@ -237,8 +238,9 @@ impl Pipeline {
     }
 
     /// Consumes everything committed on [`BYTES_SLOT`] since the last call
-    /// and feeds it to intake, which stages it into the ring.
-    async fn feed_intake(&mut self) {
+    /// and feeds it to intake, which stages it into the ring. Nothing is
+    /// sealed or drained, so a test can inspect what intake staged.
+    pub async fn feed_intake(&mut self) {
         let rows = self
             .raw
             .query(

@@ -111,8 +111,9 @@ related table — order lines decorated with `product.category_name`.
 
 A relationship is a named, directed link from one table to another, defined by a
 join key (`order_line_items.product_id -> products.id`) and declared as its own
-reusable statement. Either endpoint may be a source table or a transform target.
-The referencing table keeps its own primary key and granularity — a 1-1 table
+reusable statement. Either endpoint may be a source table or a 1-1 transform
+target, but not an aggregate target for now (issue #375). A target endpoint is
+put on `REPLICA IDENTITY FULL` when the relationship is created. The referencing table keeps its own primary key and granularity — a 1-1 table
 stays 1-1 — and calculated fields on it reference the related table's columns
 through paths whose head is the relationship name. How depends on **cardinality**:
 

@@ -46,7 +46,9 @@ async fn create_table_with_pk(pool: &trellis::pool::Pool, name: &str, pk_col: &s
 async fn create_table_with_plain_column(pool: &trellis::pool::Pool, name: &str, col: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} ({col} integer)"))
+        .batch_execute(&format!(
+            "create table {name} (row_id serial primary key, {col} integer)"
+        ))
         .await
         .expect("create table with plain column");
 }
@@ -58,7 +60,7 @@ async fn create_table_with_unique_column(pool: &trellis::pool::Pool, name: &str,
     let client = pool.get().await.expect("get connection");
     client
         .batch_execute(&format!(
-            "create table {name} ({col} integer unique, other_col integer); \
+            "create table {name} (row_id serial primary key, {col} integer unique, other_col integer); \
              alter table {name} replica identity full"
         ))
         .await
@@ -69,7 +71,9 @@ async fn create_table_with_unique_column(pool: &trellis::pool::Pool, name: &str,
 async fn create_table_with_text_column(pool: &trellis::pool::Pool, name: &str, col: &str) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} ({col} text)"))
+        .batch_execute(&format!(
+            "create table {name} (row_id serial primary key, {col} text)"
+        ))
         .await
         .expect("create table with text column");
 }
@@ -88,7 +92,9 @@ async fn create_table_with_typed_column(
 ) {
     let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(&format!("create table {name} ({col} {sql_type})"))
+        .batch_execute(&format!(
+            "create table {name} (row_id serial primary key, {col} {sql_type})"
+        ))
         .await
         .expect("create table with typed column");
 }
@@ -225,7 +231,7 @@ async fn a_duplicate_name_on_the_same_from_table_is_rejected() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table posts (author_id integer, editor_id integer); \
+            "create table posts (id serial primary key, author_id integer, editor_id integer); \
              alter table posts replica identity full",
         )
         .await
@@ -318,7 +324,8 @@ async fn creating_a_relationship_issues_no_ddl_against_the_source_tables() {
     let client = db.pool.get().await.expect("get connection");
     let index_count: i64 = client
         .query_one(
-            "select count(*) from pg_indexes where tablename = 'order_line_items'",
+            "select count(*) from pg_index \
+             where indrelid = 'order_line_items'::regclass and not indisprimary",
             &[],
         )
         .await
@@ -543,9 +550,10 @@ async fn a_to_many_to_side_with_default_replica_identity_is_rejected() {
 
 /// Issue #41: `REPLICA IDENTITY NOTHING` (`relreplident = 'n'`) is rejected too
 /// — it omits *every* column from pre-images, so the non-PK join key is just as
-/// absent as under the default identity. Shares the gate's false branch with
-/// the default (`'d'`) case above; pinned separately so a future SQL change
-/// can't silently start accepting `'n'`.
+/// absent as under the default identity. Pinned separately so a future SQL
+/// change can't silently start accepting `'n'`. Since issue #375 the endpoint
+/// keying guard catches it first: intake can't key a table with no replica
+/// identity at all, whatever the relationship's cardinality.
 #[tokio::test]
 async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
     let cluster = TestCluster::start();
@@ -567,10 +575,14 @@ async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
     .await
     .unwrap_err();
 
-    assert!(matches!(
-        &err,
-        CatalogError::Validate(ValidationError::RelationshipToManyRequiresReplicaIdentity { .. })
-    ));
+    assert!(
+        matches!(
+            &err,
+            CatalogError::RelationshipEndpointNotChangeKeyed { endpoint }
+                if endpoint == "trellis.products"
+        ),
+        "{err:?}"
+    );
 
     let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
@@ -737,7 +749,7 @@ async fn varchar_columns_with_different_lengths_are_accepted() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (sku character varying(50));
+            "create table order_line_items (id serial primary key, sku character varying(50));
              alter table order_line_items replica identity full;
              create table products (sku character varying(255) primary key);
              alter table products replica identity full",
@@ -942,7 +954,8 @@ async fn a_missing_from_side_index_surfaces_a_performance_warning() {
     let client = db.pool.get().await.expect("get connection");
     let index_count: i64 = client
         .query_one(
-            "select count(*) from pg_indexes where tablename = 'order_line_items'",
+            "select count(*) from pg_index \
+             where indrelid = 'order_line_items'::regclass and not indisprimary",
             &[],
         )
         .await
@@ -1009,7 +1022,7 @@ async fn an_index_where_the_join_column_is_not_leading_still_warns() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (other_col integer, product_id integer); \
+            "create table order_line_items (id serial primary key, other_col integer, product_id integer); \
              alter table order_line_items replica identity full",
         )
         .await
@@ -1048,7 +1061,7 @@ async fn a_composite_index_led_by_the_join_column_suppresses_the_warning() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (product_id integer, other_col integer); \
+            "create table order_line_items (id serial primary key, product_id integer, other_col integer); \
              alter table order_line_items replica identity full",
         )
         .await
@@ -1081,7 +1094,7 @@ async fn a_partial_index_on_the_join_column_still_warns() {
     let client = db.pool.get().await.expect("get connection");
     client
         .batch_execute(
-            "create table order_line_items (product_id integer, active boolean); \
+            "create table order_line_items (id serial primary key, product_id integer, active boolean); \
              alter table order_line_items replica identity full",
         )
         .await
