@@ -1751,6 +1751,25 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     .expect("an aggregate over a seam-only target needs no REPLICA IDENTITY FULL");
 }
 
+/// Issue #121: a `OneToOne` target's primary key used to be narrowed down to
+/// a single column, mirroring the source's own (issue #177's
+/// `create_definition_inner` gate, backed by the now-removed
+/// `ddl::require_single_column_pk`) — so a source with a genuinely composite
+/// primary key used to be rejected outright. This issue removed that
+/// narrowing: the target's own primary key now mirrors the source's in full,
+/// at whatever arity it has, so a composite-PK source is accepted instead.
+///
+/// [`create_definition`] is the ring-path entry point this test calls
+/// directly, deliberately bypassing [`install_definition`] entirely — the
+/// same entry point issue #177 found didn't run the (then-existing) arity
+/// check at all, so a composite-PK source reaching Postgres only via
+/// `create_definition`/`create_definition_without_backfill` used to skip
+/// straight through to `staging::apply`'s own machinery instead of being
+/// rejected up front; now there is nothing left to reject, so it drains
+/// cleanly through this same entry point (see `quarantine.rs`'s
+/// `a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt`
+/// for the fuller end-to-end pin of that, and
+/// `one_to_one_composite_primary_key.rs` for insert/update/delete coverage).
 #[tokio::test]
 async fn a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted() {
     let cluster = TestCluster::start();

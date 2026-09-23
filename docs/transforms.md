@@ -124,6 +124,14 @@ aggregated, cross-joined, or referenced through a relationship. Trellis builds a
 dependency graph spanning columns within a table and tables across chained
 transforms, and evaluates in dependency order.
 
+A transform can only chain off a target once that target's own transform is
+`live`. Defining it while the upstream is still building (for example, a plain
+1-1 target whose chunked backfill hasn't finished) is refused with
+`TransformNotLive`: wait for the upstream to go live, then define the chained
+transform. Each write to a target reaches the transforms reading it inside the
+same transaction as the write; a target is never part of the CDC publication
+itself (unless it is also a relationship endpoint).
+
 **Cycles are rejected at definition time across the whole graph.** A definition
 that would introduce a cycle, directly or transitively, is invalid and rejected
 before it runs, keeping evaluation order well-defined.

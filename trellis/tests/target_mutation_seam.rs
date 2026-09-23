@@ -10,6 +10,7 @@
 //! waits on convergence timing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
@@ -19,6 +20,7 @@ use trellis::defs::{
     CatalogError, Statement, alter_transform, create_definition, create_relationship,
     install_definition, parse_statement, publication_tables,
 };
+use trellis::intake::publication;
 use trellis::staging::quarantine;
 use trellis::staging::{
     StagedChange, StagedWatermark, append, apply, has_pending, retire_drained_segments,
@@ -466,4 +468,230 @@ async fn an_altered_column_propagates_to_a_chained_reader() {
         ]),
         "d must follow t's altered column"
     );
+}
+
+/// A to-side change re-derives a relationship-reading aggregate through the
+/// reverse-relationship fast path, which writes the aggregate target itself.
+/// Those writes have to reach a transform chained off that target like any
+/// other: before the seam, the fast path's bookkeeping was keyed differently
+/// from the reader lookup, so its writes were never propagated in the
+/// applying transaction.
+#[tokio::test]
+async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_reader() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.posts (id integer primary key, word_count integer); \
+         create table public.post_tags (id integer primary key, post integer, tag text); \
+         alter table public.post_tags replica identity full; \
+         alter table public.posts replica identity full; \
+         create index on public.post_tags (post); \
+         insert into public.posts values (1, 100), (2, 250); \
+         insert into public.post_tags values (10, 1, 'rust'), (11, 2, 'rust'), (12, 1, 'db')",
+    )
+    .await
+    .expect("create tables");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create the relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.tag_totals FROM public.post_tags GROUP BY tag \
+         SELECT SUM(post.word_count) AS total_words",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("post".to_string(), ValueType::Numeric),
+            ("tag".to_string(), ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install tag_totals");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.tag_view FROM public.tag_totals GROUP BY tag \
+         SELECT SUM(total_words) AS total_words",
+        &HashMap::from([
+            ("tag".to_string(), ValueType::Text),
+            ("total_words".to_string(), ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install tag_view");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.execute("update public.posts set word_count = 400 where id = 1", &[])
+        .await
+        .expect("update the related post");
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: "public.posts".to_string(),
+            key: "1".to_string(),
+            op: trellis::staging::CdcOp::Update,
+            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            old_image: Some(r#"{"id":"1","word_count":"100"}"#.to_string()),
+            new_image: Some(r#"{"id":"1","word_count":"400"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the to-side update");
+    txn.commit().await.expect("commit");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let expected = BTreeMap::from([
+        ("db".to_string(), "400".to_string()),
+        ("rust".to_string(), "650".to_string()),
+    ]);
+    assert_eq!(
+        rows(&raw, "select tag, total_words::text from public.tag_totals").await,
+        expected,
+    );
+    assert_eq!(
+        rows(&raw, "select tag, total_words::text from public.tag_view").await,
+        expected,
+        "tag_view must follow the reverse fast path's write to tag_totals"
+    );
+}
+
+/// A definition created through the ring path enumerates its source inside
+/// its creating transaction. When that source is another definition's
+/// target, a write to it that commits after the enumeration's read, by a
+/// writer whose seam checked for readers before the new definition
+/// existed, stages nothing, and the target has no CDC to fall back on. The
+/// catch-up parked after the creating transaction commits is what catches
+/// it. The racing write is a raw insert standing in for that writer.
+#[tokio::test]
+async fn a_target_write_racing_a_chained_definitions_creation_is_caught_up() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.src (id integer primary key, v numeric); \
+         insert into public.src values (1, 1); \
+         create table public.t (id integer primary key, doubled numeric); \
+         create table public.d (id integer primary key, doubled numeric)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
+        &numeric_columns(&["id", "v"]),
+    )
+    .await
+    .expect("define t");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let mut racer = connect_raw(db.dsn()).await;
+    let racing = racer.transaction().await.expect("begin the racing write");
+    racing
+        .execute("insert into public.t values (99, 42)", &[])
+        .await
+        .expect("racing insert");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.d FROM public.t SELECT doubled AS doubled",
+        &numeric_columns(&["id", "doubled"]),
+    )
+    .await
+    .expect("define d while the write is in flight");
+    racing.commit().await.expect("commit the racing write");
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::run_pending_backfills(
+        &mut raw,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run pending backfills");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert_eq!(
+        rows(&raw, "select id::text, doubled::text from public.d").await,
+        BTreeMap::from([
+            ("1".to_string(), "2".to_string()),
+            ("99".to_string(), "42".to_string()),
+        ]),
+        "the write that raced d's creation must still reach d"
+    );
+}
+
+/// `recompute_column` writes back in bounded transactions, one per chunk of
+/// keys, so a resume never holds row locks (and an xid) across the whole
+/// target. Every changed row in every chunk still reaches a chained reader.
+#[tokio::test]
+async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.src (id integer primary key, v numeric); \
+         insert into public.src select g, g from generate_series(1, 2500) g; \
+         create table public.t (id integer primary key, doubled numeric); \
+         create table public.d (id integer primary key, quad numeric)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
+        &numeric_columns(&["id", "v"]),
+    )
+    .await
+    .expect("define t");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.d FROM public.t SELECT doubled + doubled AS quad",
+        &numeric_columns(&["id", "doubled"]),
+    )
+    .await
+    .expect("define d");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.batch_execute(
+        "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+         values ('t', 'doubled', 'synthetic pause', true); \
+         update public.t set doubled = -1 where id % 2 = 0",
+    )
+    .await
+    .expect("freeze t.doubled");
+    quarantine::resume_column(&db.pool, "t", "doubled")
+        .await
+        .expect("resume t.doubled");
+
+    let staged = staged_recomputes(&raw, "public.t").await;
+    assert_eq!(staged.len(), 1250, "exactly the rows the resume changed");
+    assert!(
+        staged
+            .values()
+            .all(|img| img.as_deref().is_some_and(|img| img.contains("\"-1\""))),
+        "each carries its pre-resume image"
+    );
+    let wrong: i64 = raw
+        .query_one(
+            "select count(*) from public.t join public.src using (id) where doubled <> v + v",
+            &[],
+        )
+        .await
+        .expect("count wrong rows")
+        .get(0);
+    assert_eq!(wrong, 0, "every chunk wrote its rows back");
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let wrong: i64 = raw
+        .query_one(
+            "select count(*) from public.d join public.src using (id) where quad <> 4 * v",
+            &[],
+        )
+        .await
+        .expect("count wrong downstream rows")
+        .get(0);
+    assert_eq!(wrong, 0, "d follows every resumed row");
 }

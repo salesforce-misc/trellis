@@ -48,6 +48,15 @@
 //! upstream) parks a catch-up marker for itself so those readers re-derive
 //! from its rebuilt state.
 //!
+//! The seam only stages for readers that are already `live` when the writer
+//! checks, so a *new* reader parks a catch-up on its source target once it
+//! goes live, whichever way it was built (`defs::catalog::install_definition`,
+//! `create_definition_inner`, `complete_direct_backfill`, or
+//! `intake::publication`'s deferred-backfill flip). A write that raced the
+//! reader's build reaches it through that catch-up: its fence is captured
+//! after the reader is visibly live, so it waits out every writer that
+//! checked before then.
+//!
 //! # What gets staged
 //!
 //! One `StagedChange::Recompute` per changed key, for every target at least

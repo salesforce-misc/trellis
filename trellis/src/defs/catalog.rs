@@ -2405,6 +2405,23 @@ async fn create_definition_inner(
 
     txn.commit().await?;
 
+    // Issue #315: the enumeration above read `qualified_source` inside this
+    // transaction, but when that source is another definition's target, a
+    // write to it that commits after the enumeration read and before this
+    // commit reaches nobody: its writer's target-mutation seam didn't see
+    // this definition as a live reader yet, and the target is never in the
+    // publication, so no CDC copy follows either. Park a catch-up for the
+    // source *after* commit: its fence then waits out every such writer (a
+    // drain holds an xid from its version fence on), and its discharge
+    // re-derives this definition from the target's settled state.
+    // `install_definition`'s direct build does the same once it goes live.
+    if backfill
+        && status == TransformStatus::Live
+        && is_definition_target(&**client, &qualified_source).await?
+    {
+        crate::intake::publication::park_backfill_catchup(&**client, &qualified_source).await?;
+    }
+
     Ok(Definition {
         id,
         source_version: version,

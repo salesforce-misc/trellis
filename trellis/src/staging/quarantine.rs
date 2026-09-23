@@ -1756,10 +1756,12 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 /// `defs::backfill::write_one_to_one_range`) — reusing it inside an `update
 /// target ... from source` would risk an ambiguous-column error whenever a
 /// passthrough field shares its name with a source column that also exists
-/// on the target. Trade-off: no chunking, so a resume against a very large
-/// source table runs as one long-lived pass rather than resumable steps —
+/// on the target. Trade-off: no durable chunking, so a resume against a very
+/// large source table runs as one pass rather than resumable steps —
 /// acceptable for a rare, bounded, operator-invoked action; flagged here as
-/// a follow-up if that ever stops being true.
+/// a follow-up if that ever stops being true. (The write-back itself is
+/// split into short transactions of [`RECOMPUTE_COLUMN_CHUNK`] keys, so the
+/// pass never holds row locks across the whole target.)
 ///
 /// A row that still fails to evaluate (the underlying data problem isn't
 /// actually fixed for it) is skipped rather than aborting the whole resume —
@@ -1956,45 +1958,9 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     let mut excluded = paused_columns_for(pool, &def.def.target).await?;
     excluded.remove(column);
 
-    // Issue #315: the write-back goes through the target-mutation seam, in
-    // one transaction, so a definition chained off this target hears about
-    // every row whose value actually changed (the `is distinct from` guard
-    // leaves an unchanged row untouched and unreported). The whole target is
-    // row-locked up front in ascending key order, the same order a drain's
-    // own pre-lock takes (`apply::apply_target`), so holding every row's lock
-    // until commit can't deadlock against one; the same statement captures
-    // each row's prior image when something reads the target.
-    let txn = client.transaction().await?;
-    let mut mutations = TargetMutations::new();
-    let image_expr = mutations.image_sql(&txn, &def.target_table, "t").await?;
-    let lock_order = pk
-        .iter()
-        .map(|c| format!("t.{}", quote_ident(&c.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let locked = txn
-        .query(
-            &format!(
-                "select {}, {} from {target_ident} t order by {lock_order} for update",
-                ddl::pk_key_sql_expr(&pk, Some("t")),
-                match &image_expr {
-                    Some(expr) => format!("({expr})::text"),
-                    None => "null::text".to_string(),
-                },
-            ),
-            &[],
-        )
-        .await?;
-    let mut prior_images: HashMap<String, Option<String>> = locked
-        .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect();
-    let update_sql = format!(
-        "update {target_ident} t set {col_ident} = $1::text::{pg_type} \
-         where {} = $2 and t.{col_ident} is distinct from $1::text::{pg_type}",
-        ddl::pk_key_sql_expr(&pk, Some("t")),
-    );
-
+    // Evaluate first (pure, no database), so each write-back transaction
+    // below holds its row locks only for its own statements.
+    let mut values: Vec<(&String, Option<String>)> = Vec::with_capacity(order.len());
     for pk_text in &order {
         let row = &rows_by_pk[pk_text];
         let Ok(mut evaluated) = eval::evaluate_with_relationships_excluding(
@@ -2008,16 +1974,75 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
             continue;
         };
         let value: Option<String> = evaluated.remove(column).flatten().map(|v| v.to_string());
-        if txn.execute(&update_sql, &[&value, pk_text]).await? > 0 {
-            let prior = prior_images.remove(pk_text).flatten();
-            mutations.record(&def.target_table, pk_text.clone(), prior, 0, None);
-        }
+        values.push((pk_text, value));
     }
-    mutations.flush(&txn).await?;
-    txn.commit().await?;
+
+    // Issue #315: the write-back goes through the target-mutation seam, so a
+    // definition chained off this target hears about every row whose value
+    // actually changed (the `is distinct from` guard leaves an unchanged row
+    // untouched and unreported).
+    //
+    // One bounded transaction per chunk of keys, not one for the whole
+    // target: a transaction holding row locks has an xid, and a long-lived
+    // xid holds the ring's seal gate (docs/staging-and-claiming/03) shut for
+    // every definition until it commits, besides blocking this target's own
+    // drains the whole time. Each chunk row-locks its existing target rows in
+    // ascending key order, the order a drain's own pre-lock takes
+    // (`apply::apply_target`), so it can't deadlock against one; the same
+    // statement captures each row's prior image when something reads the
+    // target, and its `ctid`, which the lock keeps stable until commit and
+    // which lets each update find its row without re-scanning the table.
+    let lock_order = pk
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(&c.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target_pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
+    let update_sql = format!(
+        "update {target_ident} t set {col_ident} = $1::text::{pg_type} \
+         where t.ctid = $2::text::tid and t.{col_ident} is distinct from $1::text::{pg_type}",
+    );
+    for chunk in values.chunks(RECOMPUTE_COLUMN_CHUNK) {
+        let txn = client.transaction().await?;
+        let mut mutations = TargetMutations::new();
+        let image_expr = mutations.image_sql(&txn, &def.target_table, "t").await?;
+        let keys: Vec<&str> = chunk.iter().map(|(k, _)| k.as_str()).collect();
+        let locked = txn
+            .query(
+                &format!(
+                    "select {target_pk_expr}, t.ctid::text, {} from {target_ident} t \
+                     where {target_pk_expr} = any($1::text[]) \
+                     order by {lock_order} for update",
+                    match &image_expr {
+                        Some(expr) => format!("({expr})::text"),
+                        None => "null::text".to_string(),
+                    },
+                ),
+                &[&keys],
+            )
+            .await?;
+        let mut locked_rows: HashMap<String, (String, Option<String>)> = locked
+            .into_iter()
+            .map(|row| (row.get(0), (row.get(1), row.get(2))))
+            .collect();
+        for (pk_text, value) in chunk {
+            // No target row for this key (nothing to update, as before).
+            let Some((ctid, prior)) = locked_rows.remove(pk_text.as_str()) else {
+                continue;
+            };
+            if txn.execute(&update_sql, &[value, &ctid]).await? > 0 {
+                mutations.record(&def.target_table, (*pk_text).clone(), prior, 0, None);
+            }
+        }
+        mutations.flush(&txn).await?;
+        txn.commit().await?;
+    }
 
     Ok(())
 }
+
+/// How many keys [`recompute_column`] writes back per transaction.
+const RECOMPUTE_COLUMN_CHUNK: usize = 1000;
 
 // ---------------------------------------------------------------------
 // Release
