@@ -529,6 +529,96 @@ async fn explicitly_qualified_target_receives_a_live_cdc_write() {
     );
 }
 
+/// Issue #380: two definitions over same-named source tables in different
+/// schemas (`blog.posts`, `shop.posts`) must each drain against their own
+/// source. The drain's version fence used to look `source_table_versions` up
+/// by the bare table-name suffix, which matched both rows and failed every
+/// drain touching either source with `RowCount`. `compute` also bucketed
+/// changes by that bare suffix, so both tables' changes shared one bucket
+/// and were evaluated against whichever table staged first.
+///
+/// One batch carries a change to each table under the same key, with
+/// different values, so each target must end up holding its own table's
+/// value.
+#[tokio::test]
+async fn same_named_sources_in_different_schemas_each_drain_against_their_own_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create schema blog; create schema shop; \
+             create table blog.posts (id integer primary key, score numeric); \
+             create table shop.posts (id integer primary key, score numeric);",
+        )
+        .await
+        .expect("seed blog.posts and shop.posts");
+
+    let source_columns = numeric_columns(&["id", "score"]);
+    for (schema, target) in [("blog", "blog_feed"), ("shop", "shop_feed")] {
+        let def_text = format!("TRANSFORM {target} FROM {schema}.posts SELECT score AS s");
+        let def = trellis::defs::parse(&def_text).expect("parse the definition");
+        let source = format!("{schema}.posts");
+        let pk = source_primary_key(&db.pool, &source)
+            .await
+            .expect("introspect the source's primary key");
+        create_target_table(&db.pool, &def, "public", &pk, &source_columns, &source)
+            .await
+            .expect("materialize the target ahead of create_definition");
+        create_definition(&db.pool, &def_text, &source_columns)
+            .await
+            .expect("create definition");
+    }
+
+    client
+        .batch_execute(
+            "insert into blog.posts (id, score) values (1, 10); \
+             insert into shop.posts (id, score) values (1, 20);",
+        )
+        .await
+        .expect("seed source rows after the definitions exist");
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "blog.posts",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":1,"score":"10"}"#),
+    )
+    .await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "shop.posts",
+        "1",
+        "insert",
+        None,
+        Some(r#"{"id":1,"score":"20"}"#),
+    )
+    .await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let outcome = drain(&db.pool, seg_seq, "worker").await;
+    assert_eq!(outcome.keys_written, 2, "one write per target");
+
+    for (target, expected) in [("blog_feed", "10"), ("shop_feed", "20")] {
+        let rows: Vec<(i32, Option<String>)> = client
+            .query(&format!("select id, s::text from {target}"), &[])
+            .await
+            .expect("read target")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, Some(expected.to_string()))],
+            "{target} must hold its own source's value"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     let cluster = TestCluster::start();
@@ -785,7 +875,9 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     .await
     .expect_err("orders' version moved since compute; the fence must trip");
     match &err {
-        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "orders"),
+        ApplyError::VersionFenceMiss { src_table } => {
+            assert_eq!(src_table, &format!("{DEFAULT_SCHEMA}.orders"))
+        }
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
     txn.rollback().await.expect("rollback phase 3");

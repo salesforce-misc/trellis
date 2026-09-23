@@ -433,14 +433,12 @@ impl From<crate::error::Error> for ApplyError {
 ///
 /// Note this produces a *bare* key even though, as of issue #72,
 /// `transform_definitions.source_table`/`source_table_versions.source_table`
-/// themselves now persist the fully-qualified form — those columns' own
-/// read sites (e.g. [`crate::defs::source_table_version`]) match against
-/// their bare table-name suffix precisely so this function's output, and
-/// every internal key this whole apply path builds from it (`by_source`,
-/// `ApplyPlan::versions`, etc.), can stay unchanged rather than needing this
-/// hot path to thread real schema identity through. See
-/// [`crate::defs::source_table_version`]'s doc comment for the full
-/// bare-vs-qualified rationale.
+/// themselves persist the fully-qualified form. Issue #380 moved `by_source`,
+/// `ApplyPlan::versions` and [`crate::defs::source_table_version`] off this
+/// bare key and onto the canonical qualified identity
+/// ([`quarantine::CanonicalSrcTables`]), because a bare key merges same-named
+/// tables in different schemas. What is left keyed on it is
+/// `relationships_to_table`, whose `to_table` is still bare (#372).
 ///
 /// Since issue #267 this module no longer *emits* a bare `src_table` at all:
 /// every row it stages carries a qualified identity, so as a matter of fact
@@ -458,16 +456,11 @@ impl From<crate::error::Error> for ApplyError {
 /// name. Only the string that crosses into the ring is canonicalized.
 ///
 /// This function's output stays purely a *lookup key* (issue #76's own
-/// reviewer follow-up): every catalog read below it (`source_table_version`,
-/// `transforms_for_source`, `relationships_to_table`) keeps using this bare
-/// form, matching the bare-suffix indexes those tables are keyed on. The
-/// *physical* SQL builders that actually read a live source row
-/// (`ddl::source_primary_key`, [`read_live_rows_batch`], the source string
-/// embedded in an [`AggregateTargetPlan`]) use the qualified
+/// reviewer follow-up). The *physical* SQL builders that actually read a live
+/// source row (`ddl::source_primary_key`, [`read_live_rows_batch`], the source
+/// string embedded in an [`AggregateTargetPlan`]) use the qualified
 /// `change.src_table` each bucket's own changes already carry instead — see
-/// `compute`'s `by_source` loop — never this bare key, so a same-named table
-/// in a different schema can't make one of those builders read the wrong
-/// physical relation.
+/// `compute`'s `by_source` loop — never this bare key.
 fn catalog_source_key(src_table: &str) -> &str {
     match src_table.rsplit_once('.') {
         Some((_, table)) => table,
@@ -4308,12 +4301,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // `applied_keys` (`clear_key_deaths`) and `poisoned_park`
     // (`park_batch_contribution`) all use below. Matching raw would miss a key
     // already poisoned under the other spelling of its own table and
-    // re-evaluate (then re-poison) it. Nothing else in this function changes
-    // spelling: `by_source` and everything downstream of it still key on
-    // `catalog_source_key`, exactly as before.
+    // re-evaluate (then re-poison) it.
+    //
+    // Issue #380: `by_source` and the version fence (`versions`) key on the
+    // same canonical identity, so truncates are resolved here too (their
+    // fence entry needs it). Keying either on the bare table-name suffix
+    // merged same-named tables in different schemas into one bucket and one
+    // fence row.
     let mut canonical_srcs = quarantine::CanonicalSrcTables::default();
     for change in folded {
-        if change.is_truncate || change.relationship_reverse_deferred.is_some() {
+        if change.relationship_reverse_deferred.is_some() {
             continue;
         }
         canonical_srcs.get(pool, &change.src_table).await?;
@@ -4336,7 +4333,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let poisoned = quarantine::poisoned_keys_among(pool, &candidates).await?;
     tracing::Span::current().record("poisoned", poisoned.len());
 
-    let mut by_source: HashMap<&str, Vec<&FoldedChange>> = HashMap::new();
+    let mut by_source: HashMap<String, Vec<&FoldedChange>> = HashMap::new();
     // Truncate sentinels (issue #60) never enter the keyed by-source
     // evaluation loop below — they carry no key of their own (see
     // `append::TRUNCATE_SENTINEL_KEY`) and produce no write/delete;
@@ -4379,11 +4376,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             poisoned_park.push(parked);
             continue;
         }
-        applied_keys.push((canonical_src_table, change.key.clone()));
         by_source
-            .entry(catalog_source_key(&change.src_table))
+            .entry(canonical_src_table.clone())
             .or_default()
             .push(change);
+        applied_keys.push((canonical_src_table, change.key.clone()));
     }
     if !poisoned_park.is_empty() {
         tracing::warn!(
@@ -4458,20 +4455,15 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             changes = changes.len(),
             "evaluating a source table's folded changes"
         );
-        let version = catalog::source_table_version(pool, source_key).await?;
-        versions.insert(source_key.to_string(), version);
+        let version = catalog::source_table_version(pool, &source_key).await?;
+        versions.insert(source_key.clone(), version);
 
-        // The fully-qualified source identity this batch's own CDC producer
-        // staged (issue #76, ADR-0007) — `change.src_table`, not `source_key`
-        // (that stays bare purely as the catalog lookup key, per
-        // `catalog_source_key`'s own doc comment). Every change in this
-        // bucket shares the same bare suffix by construction (`by_source`
-        // grouped on it); they're expected to also share this qualified form
-        // (the same physical table), so any one of them gives the right
-        // answer for the physical reads below — used in place of a bare
-        // `source_key` so `source_primary_key`/`read_live_rows_batch` don't
-        // leave the schema to resolve against whatever `search_path` the
-        // executing session happens to carry.
+        // The source identity this batch's own CDC producer staged (issue
+        // #76, ADR-0007) — the ring's own spelling of `change.src_table`,
+        // which `SourceTableDropped` below must echo back verbatim. Every
+        // change in this bucket resolves to the same canonical `source_key`
+        // by construction (`by_source` grouped on it, issue #380), so any one
+        // of them names the right physical table for the reads below.
         let qualified_source = changes[0].src_table.as_str();
 
         // `source_key` alone determines the source table's primary key, not
@@ -4483,7 +4475,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // not an ordinary DDL error) — see [`ApplyError::SourceTableDropped`].
         //
         // Issue #267: reported as `qualified_source` (the ring's own spelling)
-        // rather than the bare `source_key`. This error's two consumers —
+        // rather than the canonical `source_key`. This error's two consumers —
         // `quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
         // `folded.retain(|c| c.src_table != source_table)` — both compare it
         // to a ring row's `src_table` as an exact string, so a bare name
@@ -4554,8 +4546,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // thin `dependents_of` wrapper) needs an exact qualified match
         // here, not the bare catalog-lookup key `catalog_source_key`'s own
         // doc comment already explains stays bare for
-        // `source_table_version`/`relationships_to_table` below (both still
-        // bare-suffix-keyed, unaffected by #74). `qualified_source` is
+        // `relationships_to_table` below (still bare-keyed, unaffected by
+        // #74). `qualified_source` is
         // usually already fully-qualified (real CDC/backfill), but a
         // downstream-propagation hop's `src_table` is a bare target name
         // this same apply path staged — `qualified_schema_node_key` resolves
@@ -4614,7 +4606,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
-        let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
+        let inbound_rels =
+            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
         // Decode each change's pre-image once, reused across every inbound
         // relationship below (the join key lives in the pre-image for a
         // delete/re-parent). Skipped entirely when this table is nobody's
@@ -5316,18 +5309,18 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     let mut clears: HashMap<String, ClearPlan> = HashMap::new();
     let mut aggregate_clears: HashMap<String, AggregateClearPlan> = HashMap::new();
     for change in &truncated {
-        let source_key = catalog_source_key(&change.src_table);
+        let source_key = canonical_of(&change.src_table);
         // Fence this source too, even though nothing evaluated against it —
         // a definition change against a truncated source, landing mid-drain,
         // must trip Phase 3's version fence exactly like it would for a
         // source this batch actually evaluated `f()` against.
-        let version = catalog::source_table_version(pool, source_key).await?;
-        versions.entry(source_key.to_string()).or_insert(version);
+        let version = catalog::source_table_version(pool, &source_key).await?;
+        versions.entry(source_key.clone()).or_insert(version);
 
         let pk = match ddl::source_primary_key(pool, &change.src_table).await {
             Ok(pk) => pk,
             Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-                // Issue #267: the ring's own spelling, not the bare
+                // Issue #267: the ring's own spelling, not the canonical
                 // `source_key` — see the by-source loop above's identical
                 // comment on this same arm.
                 return Err(ApplyError::SourceTableDropped {
@@ -5341,7 +5334,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             }
             Err(err) => return Err(err.into()),
         };
-        // `&change.src_table` (qualified), not `source_key` (bare) — see
+        // `&change.src_table` (qualified), not `source_key` — see
         // the by-source loop above's identical comment on its own
         // `transforms_for_source` call. A `TRUNCATE` is always a real
         // physical CDC event (never a bare, internally-synthesized
@@ -5439,7 +5432,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // accumulator the row-driven path uses, so it's deduped the same way
         // (issue #79) and drained through the same image-less `Recompute`
         // pipeline below — no separate emission path needed.
-        let inbound_rels = catalog::relationships_to_table(pool, source_key).await?;
+        let inbound_rels =
+            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
         for rel in &inbound_rels {
             // Issue #168: for a to-one relationship, the staged recompute
             // above only re-derives the from-side row's enrichment — it
@@ -6622,21 +6616,16 @@ pub async fn apply_and_mark_drained_many(
     wake_channel: &str,
     watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
-    // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
-    // comment); `source_table_versions.source_table` is qualified as of
-    // issue #72, so this matches against its bare table-name suffix, same
-    // as `defs::source_table_version`'s own read — see that function's doc
-    // comment for why neither issue #73 nor issue #267 retires this (short
-    // version: #267 made every *newly* emitted ring `src_table` qualified,
-    // but `catalog_source_key` still strips unconditionally — durable
-    // pre-#267 ring rows and this crate's bare-by-hand test fixtures — so
-    // `source_key` is bare here either way and an exact match would never
-    // hit).
+    // 1. Version fence. `source_key` is the canonical (qualified, where
+    // resolvable) source identity `compute` keyed `plan.versions` on, and
+    // `source_table_versions.source_table` is qualified (issue #72), so this
+    // matches exactly — see `defs::source_table_version`, which reads the same
+    // row the same way.
     for (source_key, loaded_version) in &plan.versions {
         let row = txn
             .query_opt(
                 "select version from source_table_versions \
-                 where split_part(source_table, '.', 2) = $1 for share",
+                 where source_table = $1 for share",
                 &[source_key],
             )
             .await?;

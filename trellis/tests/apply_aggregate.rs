@@ -817,7 +817,9 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
     .await
     .expect_err("order_items' version moved since compute; the fence must trip");
     match &err {
-        ApplyError::VersionFenceMiss { src_table } => assert_eq!(src_table, "order_items"),
+        ApplyError::VersionFenceMiss { src_table } => {
+            assert_eq!(src_table, &format!("{DEFAULT_SCHEMA}.order_items"))
+        }
         other => panic!("expected VersionFenceMiss, got {other:?}"),
     }
     txn.rollback().await.expect("rollback phase 3");

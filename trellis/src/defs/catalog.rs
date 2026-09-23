@@ -5550,42 +5550,14 @@ pub(crate) async fn is_relationship_endpoint(
 /// The current version of `source_table`, or `None` if no definition has
 /// ever been created against it.
 ///
-/// `source_table` is matched against `source_table_versions.source_table`'s
-/// bare table-name suffix (`split_part(..., '.', 2)`), not the qualified
-/// column directly, because this function's one caller
-/// (`staging::apply::apply_and_mark_drained_many`'s `plan.versions` loop, fed
-/// by `apply::catalog_source_key`) still hands it a bare name — see that
-/// function's own doc comment for why: a CDC-staged `FoldedChange::src_table`
-/// is qualified and gets stripped to bare before reaching here, and a
-/// downstream (target-table-as-source) one was already bare. Since
-/// `source_table_versions.source_table` is qualified as of issue #72,
-/// matching it exactly against that already-bare key would never succeed;
-/// the `split_part` match restores the pre-#72 bare-vs-bare comparison this
-/// call site depends on.
-///
-/// **Not resolved by issue #73.** An earlier draft of this comment predicted
-/// #73 (persisting `transform_definitions.target_table` qualified) would let
-/// `apply.rs` pass a qualified key straight through here once it landed. It
-/// didn't: a chained definition's downstream `Recompute` trigger — what
-/// actually stages a "target-table-as-source" change into this apply path —
-/// got its `src_table` from [`super::ddl::neighbor_table_name`], which issue
-/// #73 deliberately leaves bare (see that function's own doc comment: it's
-/// read live, over a connection whose `search_path` already resolves it, not
-/// compared as a persisted identity string). Catalog persistence and
-/// emitted-statement qualification are two different jobs — ADR-0007 splits
-/// them into separate decision points (1) and (3) — and only the first was
-/// #72's or #73's.
-///
-/// **Issue #267 closed the emission side, but this match stays a
-/// `split_part`.** That issue canonicalized every `src_table`
-/// `staging::apply` writes into the ring to qualified identity, so no
-/// *newly* staged row reaches here bare. The bare-suffix comparison is kept
-/// regardless, for the same two reasons `staging::apply::catalog_source_key`
-/// keeps its strip: ring rows are durable, so a segment staged before that
-/// fix can still be drained after it, and this crate's own integration
-/// fixtures stage bare `src_table`s by hand. `catalog_source_key` strips
-/// unconditionally either way, so what arrives here is always bare and the
-/// exact-match form would still never succeed.
+/// `source_table` is the qualified identity `source_table_versions` persists
+/// (issue #72) and is matched exactly. Its one caller
+/// (`staging::apply::compute`) passes the canonical identity it also keys
+/// `ApplyPlan::versions` on, and Phase 3's version fence re-reads the same row
+/// by the same key. Issue #380: this used to match the bare table-name suffix
+/// (`split_part(source_table, '.', 2)`), which returned two rows, and so
+/// failed every drain, once two schemas each had a source table of the same
+/// name.
 pub async fn source_table_version(
     pool: &Pool,
     source_table: &str,
@@ -5593,8 +5565,7 @@ pub async fn source_table_version(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select version from source_table_versions \
-             where split_part(source_table, '.', 2) = $1",
+            "select version from source_table_versions where source_table = $1",
             &[&source_table],
         )
         .await?;
