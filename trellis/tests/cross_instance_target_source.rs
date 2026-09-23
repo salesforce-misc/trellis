@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{CatalogError, ValueType, all_source_tables, install_definition};
+use trellis::defs::{CatalogError, ValueType, install_definition, publication_tables};
 use trellis::intake::publication::reconcile_publication;
 use trellis::{Config, Pool, migrate};
 
@@ -93,10 +93,11 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
     (pool_b, b)
 }
 
-/// Reconciles instance B's publication to its catalog's source set, exactly
-/// as B's maintenance loop would (`client::reconcile_source_tables`).
+/// Reconciles instance B's publication to the tables its catalog says to
+/// publish, exactly as B's maintenance loop would
+/// (`client::reconcile_source_tables`, via `defs::publication_tables`).
 async fn reconcile_b(pool_b: &Pool, b: &mut Client) -> Vec<String> {
-    let desired = all_source_tables(pool_b)
+    let desired = publication_tables(pool_b)
         .await
         .expect("instance B's source tables");
     reconcile_publication(b, B_PUBLICATION, &desired)
@@ -267,4 +268,62 @@ async fn another_instances_one_to_one_target_is_still_accepted() {
 
     reconcile_b(&pool_b, &mut b).await;
     assert!(b_publishes(&b, "sales_copy").await);
+}
+
+/// The rule is about the table, not its owner, so a plain source table intake
+/// can't key is held to it too. Each rejected shape here used to be accepted,
+/// then fail at runtime once published: with no primary key under `FULL`,
+/// intake stops on the first change (`MissingKeyValue`); under `NOTHING`,
+/// Postgres refuses the table's own updates. `source_primary_key`'s unique-index
+/// fallback (issue #128) admits the first, so only this check catches it.
+/// `REPLICA IDENTITY USING INDEX` is keyed by pgoutput's own flags and stays
+/// accepted.
+#[tokio::test]
+async fn a_plain_source_is_held_to_the_same_keying_rule() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let a = connect_raw(db.dsn(), DEFAULT_SCHEMA).await;
+    a.batch_execute(
+        "create table public.full_no_pk (code text not null unique, amount integer); \
+         alter table public.full_no_pk replica identity full; \
+         create table public.pk_nothing (id integer primary key, amount integer); \
+         alter table public.pk_nothing replica identity nothing; \
+         create table public.using_index (code text not null, amount integer); \
+         create unique index using_index_code on public.using_index (code); \
+         alter table public.using_index replica identity using index using_index_code",
+    )
+    .await
+    .expect("create plain sources");
+    let coded = columns(&[("code", ValueType::Text), ("amount", ValueType::Numeric)]);
+
+    for (source, cols) in [
+        ("full_no_pk", &coded),
+        (
+            "pk_nothing",
+            &columns(&[("id", ValueType::Numeric), ("amount", ValueType::Numeric)]),
+        ),
+    ] {
+        let result = install_definition(
+            &db.pool,
+            &format!("TRANSFORM {source}_copy FROM {source} SELECT amount AS amount_copy"),
+            cols,
+            "public",
+        )
+        .await;
+        match result {
+            Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
+                assert_eq!(source_table, format!("public.{source}"));
+            }
+            other => panic!("expected SourceNotChangeKeyed for {source}, got {other:?}"),
+        }
+    }
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM using_index_copy FROM using_index SELECT amount AS amount_copy",
+        &coded,
+        "public",
+    )
+    .await
+    .expect("a REPLICA IDENTITY USING INDEX source is keyed");
 }
