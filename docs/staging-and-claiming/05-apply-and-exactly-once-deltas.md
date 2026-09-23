@@ -179,8 +179,10 @@ So the live read records its basis as a WAL position, and a delta checks it:
    commit record before it became visible, so its `end_lsn` (the `lsn` intake
    stamps on its ring rows) is at or below the stamped value.
 2. **The extinct horizon.** A deleted row can't hold a horizon, so each batch
-   that deletes group rows raises its target's single row in
-   `aggregate_extinct_horizon` to the insert position after those reads. A row
+   whose live reads find a group empty raises its target's single row in
+   `aggregate_extinct_horizon` to the insert position after those reads. That
+   includes a group with no row to delete: its delta for this batch is dropped
+   just the same, so the read may have absorbed a delete still in flight. A row
    that the delta path later creates starts with that value as its own horizon,
    since the empty group it grew from was the result of a live read too.
 3. **The check.** The fold keeps each key's *earliest* image-bearing `lsn`

@@ -847,6 +847,40 @@ async fn w5_a_group_recreated_by_a_delta_inherits_the_extinct_horizon() {
     h.finish().await;
 }
 
+/// W5 with no row to delete: group 5 has no target row when an insert's
+/// delta drains, and the existence probe finds the group already emptied by
+/// a delete whose CDC hasn't staged yet. The probe drops the insert's delta,
+/// which accounts for the delete, but deletes nothing, since there is no row.
+/// The extinct horizon has to rise anyway: once r' recreates group 5, the
+/// delete's delta would otherwise land on it and subtract r, which was never
+/// added.
+#[tokio::test]
+async fn w5_an_absorbed_delete_with_no_row_to_remove_still_raises_the_extinct_horizon() {
+    let mut h = Harness::start(SRC_DDL, &[Setup::Transform(AGG)], "agg").await;
+
+    // r's insert, staged; r's delete, committed but not yet staged.
+    h.commit("insert into public.src values (1, 5, 10)").await;
+    h.feed().await;
+    h.commit("delete from public.src where id = 1").await;
+    let k = h.seal().await;
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        BTreeMap::new(),
+        "the insert's existence probe sees group 5 empty, so it creates no row"
+    );
+
+    // r' recreates group 5; the delete's CDC stages alongside it.
+    h.commit("insert into public.src values (3, 5, 4)").await;
+    h.feed().await;
+    let k1 = h.seal().await;
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle("group 5 must be f(r'), not f(r') - f(r)")
+        .await;
+
+    h.finish().await;
+}
+
 /// W1 with a second commit to C's key after the recompute: both of C's
 /// changes fold into one delta whose *latest* commit is above group 1's
 /// horizon but whose earliest (C itself) is below it. The delta telescopes

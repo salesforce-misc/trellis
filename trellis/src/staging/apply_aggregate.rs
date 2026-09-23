@@ -176,8 +176,9 @@
 //!
 //! So [`apply_forced_groups_bulk`] stamps each row it re-derives with
 //! `pg_current_wal_insert_lsn()` in [`ddl::RECOMPUTE_LSN_COLUMN`], and any
-//! batch that deletes a group row raises the target's extinct horizon
-//! (`aggregate_extinct_horizon`) the same way. A commit the read could see
+//! batch whose live reads find a group empty (deleting its row, if it had
+//! one) raises the target's extinct horizon (`aggregate_extinct_horizon`)
+//! the same way. A commit the read could see
 //! has an `end_lsn` at or below that value. [`apply_aggregate_target`] reads
 //! each delta group's horizon under its pre-lock (the extinct horizon when
 //! the group has no row) and compares it against the group's earliest
@@ -3158,8 +3159,8 @@ fn delta_may_be_absorbed(min_image_lsn: Option<PgLsn>, horizon: Option<PgLsn>) -
 }
 
 /// The target's extinct horizon (issue #321, `aggregate_extinct_horizon`):
-/// the WAL insert position after the latest live read that deleted one of
-/// its group rows, or `None` if none ever has.
+/// the WAL insert position after the latest live read that found one of its
+/// groups empty, or `None` if none ever has.
 async fn read_extinct_horizon(
     txn: &Transaction<'_>,
     target: &str,
@@ -3174,10 +3175,11 @@ async fn read_extinct_horizon(
 }
 
 /// Raises the target's extinct horizon to the current WAL insert position.
-/// Called once per batch, after every live read that deleted a group row.
-/// Holds this target's horizon row lock until commit, so concurrent batches
-/// that both delete groups of one target serialize from here on; that only
-/// happens on extinction, never on the ordinary delta path.
+/// Called once per batch, after every live read that found a group empty
+/// (and deleted its row, if it had one). Holds this target's horizon row
+/// lock until commit, so concurrent batches that both find groups of one
+/// target empty serialize from here on; that only happens on extinction,
+/// never on the ordinary delta path.
 async fn raise_extinct_horizon(txn: &Transaction<'_>, target: &str) -> Result<(), ApplyError> {
     txn.execute(
         "insert into aggregate_extinct_horizon (target_table, lsn) \
@@ -3207,8 +3209,9 @@ async fn raise_extinct_horizon(txn: &Transaction<'_>, target: &str) -> Result<()
 ///   `upsert_group` call each (issue #63 M4).
 /// - A delta group whose earliest image-bearing commit is at or below its
 ///   recompute horizon (issue #321, see the module doc comment) joins the
-///   forced groups for this batch instead. A batch that deletes any group
-///   row raises the target's extinct horizon once, after every such delete.
+///   forced groups for this batch instead. A batch whose live reads find
+///   any group empty raises the target's extinct horizon once, after every
+///   such read.
 ///
 /// **Deadlock avoidance.** [`super::apply::apply_target`]'s 1-1 path takes
 /// every target row it will touch `FOR UPDATE` in ascending key order, in one
@@ -3351,6 +3354,10 @@ pub(super) async fn apply_aggregate_target(
 
     let mut written = Vec::new();
     let mut deleted = Vec::new();
+    // Issue #321: whether a live read in this batch found some group empty,
+    // whether or not that group had a row left to delete. See the extinct
+    // horizon raise below.
+    let mut found_extinct = false;
 
     let forced: Vec<(&String, &GroupPlan)> = group_keys
         .iter()
@@ -3359,6 +3366,9 @@ pub(super) async fn apply_aggregate_target(
         .collect();
     if !forced.is_empty() {
         let (w, d) = apply_forced_groups_bulk(txn, target, plan, &forced).await?;
+        // `w` holds exactly the survivors, so anything short of every forced
+        // group is one the survivor probe found empty.
+        found_extinct |= w.len() < forced.len();
         written.extend(w);
         deleted.extend(d);
     }
@@ -3372,6 +3382,7 @@ pub(super) async fn apply_aggregate_target(
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
 
         if !exists {
+            found_extinct = true;
             if delete_group_row(
                 txn,
                 target,
@@ -3409,11 +3420,15 @@ pub(super) async fn apply_aggregate_target(
         }
     }
 
-    // Issue #321: every row deleted above was deleted because a live read
-    // (the forced path's survivor probe, or `probe_group_exists`) found its
-    // group empty, so it may have absorbed commits whose deltas are still in
-    // flight. Taken after those reads, like the forced path's own horizon.
-    if !deleted.is_empty() {
+    // Issue #321: a live read (the forced path's survivor probe, or
+    // `probe_group_exists`) that found a group empty discarded this batch's
+    // delta for it, so it may have absorbed commits whose deltas are still in
+    // flight. That holds whether or not the group had a row to delete: an
+    // insert's delta dropped because a not-yet-staged delete already emptied
+    // the group leaves no row either way, and the delete's delta must not
+    // later land on a recreated group. Taken after those reads, like the
+    // forced path's own horizon.
+    if found_extinct {
         raise_extinct_horizon(txn, target).await?;
     }
 
