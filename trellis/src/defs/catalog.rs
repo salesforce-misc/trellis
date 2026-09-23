@@ -4291,7 +4291,7 @@ async fn reject_unkeyed_relationship_endpoint(
                     endpoint: qualified_endpoint.to_string(),
                 })
             }
-            _ => Ok(()),
+            KeySpace::OneToOne => Ok(()),
         };
     }
     let keyed = match qualified_endpoint.split_once('.') {

@@ -1649,6 +1649,73 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     trellis.shutdown().await.expect("shut down");
 }
 
+/// Issue #375: a relationship whose **from**-side is the target blocks the
+/// drop as well. Surviving it, the relationship would keep the target's name
+/// a relationship endpoint, so a definition re-creating that target (as an
+/// aggregate, say) would be published as an endpoint without ever passing
+/// `create_relationship`'s endpoint guards.
+#[tokio::test]
+async fn dropping_is_refused_by_a_relationship_declared_from_the_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 9).await;
+    raw.batch_execute(
+        "create table categories (id bigint primary key, oid bigint); \
+         alter table categories replica identity full;",
+    )
+    .await
+    .expect("seed the relationship's to-side");
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
+        .await
+        .expect("define the upstream target");
+    drain_backfill_chunks(&db.pool).await;
+    trellis
+        .apply("RELATIONSHIP cats FROM order_doubles.id TO categories.oid")
+        .await
+        .expect("a relationship whose from-side is a Trellis-owned target table");
+
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause");
+    match trellis.apply("DROP TRANSFORM order_doubles").await {
+        Err(TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+            ..
+        })) => {
+            assert_eq!(subject, "order_doubles");
+            assert_eq!(
+                dependents,
+                vec![format!("{DEFAULT_TARGET_SCHEMA}.order_doubles.cats")]
+            );
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+    assert!(
+        table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_doubles").await,
+        "the refused drop wrote nothing"
+    );
+
+    trellis
+        .apply(&format!(
+            "DROP RELATIONSHIP {DEFAULT_TARGET_SCHEMA}.order_doubles.cats"
+        ))
+        .await
+        .expect("nothing reads it, so it drops");
+    trellis
+        .apply("DROP TRANSFORM order_doubles")
+        .await
+        .expect("with no relationship left naming it, the target drops");
+    assert!(!table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_doubles").await);
+
+    trellis.shutdown().await.expect("shut down");
+}
+
 /// A relationship is a definition too, and the same refuse-don't-cascade rule
 /// applies: a live transform whose text still reads it blocks the drop and is
 /// named. Once nothing reads it, it drops — along with the Trellis-owned

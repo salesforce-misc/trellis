@@ -112,9 +112,15 @@ related table — order lines decorated with `product.category_name`.
 A relationship is a named, directed link from one table to another, defined by a
 join key (`order_line_items.product_id -> products.id`) and declared as its own
 reusable statement. Either endpoint may be a source table or a 1-1 transform
-target, but not an aggregate target for now (issue #375). A target endpoint is
-put on `REPLICA IDENTITY FULL` when the relationship is created. The referencing table keeps its own primary key and granularity — a 1-1 table
-stays 1-1 — and calculated fields on it reference the related table's columns
+target, but not an aggregate target for now (issue #375). A source-table
+endpoint needs a primary key (or `REPLICA IDENTITY USING INDEX`), like any
+table Trellis reads over logical replication. A target endpoint is put on
+`REPLICA IDENTITY FULL` when the relationship is created. The first time, that
+holds an `ACCESS EXCLUSIVE` lock on the target until the declaration commits,
+which for a to-one relationship onto it includes reading every row to seed the
+relationship's projection. The referencing table keeps its own primary
+key and granularity — a 1-1 table stays 1-1 — and calculated fields on it
+reference the related table's columns
 through paths whose head is the relationship name. How depends on **cardinality**:
 
 * **To-one** (the to-side join key is a primary key or `UNIQUE`): at most one
@@ -271,7 +277,8 @@ In short: `PAUSE` and `DROP` are idempotent; `RESUME` rebuilds by a fresh
 backfill rather than catching up on changes that happened during the pause;
 `DROP` removes the target table's data along with the definition, and is refused
 — naming the blockers — while another registered definition still chains off the
-subject, so a chain is retired from the leaves inward.
+subject, so a chain is retired from the leaves inward. A relationship with the
+target at either end counts as one.
 
 **Pause and resume apply to transforms only.** That list of statements is
 complete — there is no `PAUSE RELATIONSHIP`/`RESUME RELATIONSHIP`. A

@@ -540,7 +540,12 @@ async fn dependency_blockers(
     //    than instead of it, so the refusal shows the operator the whole
     //    subgraph still standing on this target rather than one layer of it
     //    at a time.
-    for (qualified_from, name) in relationships_pointing_at(txn, target).await? {
+    //
+    // A relationship declared `FROM <target>.<col>` blocks too (issue #375),
+    // for the reason [`relationships_naming`] gives. Its readers are
+    // transforms over the target itself, which `source_edge_dependents`
+    // already names; the dedup below folds them.
+    for (qualified_from, name) in relationships_naming(txn, target, qualified_target).await? {
         // The qualified address (issue #288): `blog.posts.author` and
         // `shop.posts.author` are two blockers, and a bare `posts.author`
         // would both collapse them into one below and name a `DROP
@@ -634,22 +639,31 @@ async fn source_edge_dependents(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Every relationship whose **to**-side is the bare table `target` — the
-/// relationships through which a transform over some other source can be
-/// reading `target`'s rows — as `(qualified from-table, name)`, the pair
-/// that identifies one (issue #288).
+/// Every relationship that names the target as either endpoint, as
+/// `(qualified from-table, name)`, the pair that identifies one (issue #288).
 ///
-/// `relationship_definitions.to_table` is persisted bare (the to-side has no
-/// schema of its own recorded), so this matches bare.
-async fn relationships_pointing_at(
+/// A relationship whose **to**-side is the bare table `target` is one
+/// through which a transform over some other source can be reading
+/// `target`'s rows. `relationship_definitions.to_table` is persisted bare
+/// (the to-side has no schema of its own recorded), so this matches bare.
+///
+/// A relationship whose **from**-side is `qualified_target` (issue #375)
+/// has no reader to strand, but surviving the drop would leave the name a
+/// relationship endpoint with no definition behind it. A later definition
+/// re-creating that target would inherit the endpoint, and with it a place
+/// in the CDC publication, without passing `create_relationship`'s endpoint
+/// guards: an aggregate target endpoint, or a 1-1 one without `REPLICA
+/// IDENTITY FULL`.
+async fn relationships_naming(
     txn: &Transaction<'_>,
     target: &str,
+    qualified_target: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
     let rows = txn
         .query(
             "select from_schema || '.' || from_table, name from relationship_definitions \
-             where to_table = $1 order by id",
-            &[&target],
+             where to_table = $1 or from_schema || '.' || from_table = $2 order by id",
+            &[&target, &qualified_target],
         )
         .await?;
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
