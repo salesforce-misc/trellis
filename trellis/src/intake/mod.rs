@@ -263,6 +263,45 @@ fn extract_key(
     Ok(crate::defs::ddl::join_pk_key(parts))
 }
 
+/// Whether intake can key the changes of `schema.table` once it is published — the
+/// definition-time mirror of the `Relation` handling in [`Intake`]'s decode
+/// loop, which keys a change by:
+///
+/// - the table's primary key ([`primary_key_columns`]) under `REPLICA
+///   IDENTITY DEFAULT` or `FULL`, and
+/// - `pgoutput`'s own key flags, i.e. the index's columns, under `REPLICA
+///   IDENTITY USING INDEX`.
+///
+/// Anything else has no key: `DEFAULT` without a primary key, `FULL` without
+/// one (issue #315's aggregate-target case), and `NOTHING`. Such a table is
+/// worse than undecodable once published: Postgres refuses its updates and
+/// deletes outright when it has no replica identity at all. Issue #376 checks
+/// this before accepting a definition whose source isn't one of the
+/// instance's own targets (`defs::catalog::reject_unkeyed_source`); `false`
+/// for a table that doesn't exist.
+pub(crate) async fn change_keyed(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let regclass = format!(
+        "{}.{}",
+        crate::pool::quote_ident(schema),
+        crate::pool::quote_ident(table)
+    );
+    let keyed: Option<bool> = client
+        .query_opt(
+            "select c.relreplident = 'i' \
+                 or (c.relreplident in ('d', 'f') and exists ( \
+                       select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary)) \
+             from pg_class c where c.oid = pg_catalog.to_regclass($1)",
+            &[&regclass],
+        )
+        .await?
+        .map(|row| row.get(0));
+    Ok(keyed.unwrap_or(false))
+}
+
 /// Looks up `namespace.name`'s actual primary-key column names from
 /// `pg_catalog`, in the primary key's own **declared** column order
 /// (`array_position(i.indkey, a.attnum)`, matching
