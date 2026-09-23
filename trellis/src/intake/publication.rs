@@ -1740,9 +1740,9 @@ mod catch_up_tests {
             .query_one(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.nokey', 1, '', 'waiting_to_backfill') \
+                 values ('public.d', 'public.nokey', 1, $1, 'waiting_to_backfill') \
                  returning id",
-                &[],
+                &[&"TRANSFORM d FROM nokey SELECT id AS x"],
             )
             .await
             .expect("seed a deferred definition")
@@ -1822,9 +1822,9 @@ mod catch_up_tests {
                 .query_one(
                     "insert into transform_definitions \
                      (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, 'public.t', 1, '', 'waiting_to_backfill') \
+                     values ($1, 'public.t', 1, $2, 'waiting_to_backfill') \
                      returning id",
-                    &[&target],
+                    &[&target, &"TRANSFORM d FROM t SELECT id AS x"],
                 )
                 .await
                 .expect("seed a deferred definition")
