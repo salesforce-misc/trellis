@@ -1560,6 +1560,30 @@ pub async fn alter_transform(
             quote_ident(field)
         ))
         .await?;
+        // ADR-0014's "quarantine state follows its owner", at column
+        // granularity — the same bookkeeping `lifecycle::drop_transform`
+        // clears for a whole target. A pause left behind here would outlive
+        // its column and silently apply to a later `ADD` of the same name,
+        // since that `ADD`'s own pause below only ever undoes a pause it
+        // created itself (issue #309). Cascade edges *out of* this column
+        // can't exist once the dependents check above has passed (every
+        // downstream reader would have refused the drop); edges *into* it
+        // are cleared so resuming the upstream column never tries to
+        // recompute a column that is gone.
+        for table in ["column_status", "column_deaths", "column_failures"] {
+            txn.execute(
+                &format!("delete from {table} where transform_table = $1 and column_name = $2"),
+                &[&alter.target, field],
+            )
+            .await?;
+        }
+        txn.execute(
+            "delete from column_pause_cascades \
+             where (downstream_transform = $1 and downstream_column = $2) \
+                or (upstream_transform = $1 and upstream_column = $2)",
+            &[&alter.target, field],
+        )
+        .await?;
     }
     for field in &real_adds {
         let pg_type = ddl::pg_type_name(
@@ -1587,17 +1611,23 @@ pub async fn alter_transform(
     // apply (and from any other concurrent backfill) until this call's own
     // single-pass recompute below finishes and clears it. `on conflict do
     // nothing`: a field already paused for some other reason (an operator
-    // pause, a tripped column fuse) simply stays paused through this edit
-    // too; this call's own unpause step at the end only ever clears the rows
-    // it is certain it itself parked here (`written_fields`, below).
+    // pause, a tripped column fuse, a cascade from a paused upstream column)
+    // simply stays paused through this edit too. Only the rows this insert
+    // actually created land in `self_paused`, and those are the only ones
+    // the unpause step at the end may clear (issue #309).
+    let mut self_paused: Vec<String> = Vec::new();
     for field in real_adds.iter().chain(real_alters.iter()) {
-        txn.execute(
-            "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
-             values ($1, $2, now(), false) \
-             on conflict (transform_table, column_name) do nothing",
-            &[&alter.target, &field.name],
-        )
-        .await?;
+        let inserted = txn
+            .execute(
+                "insert into column_status (transform_table, column_name, paused_at, local_fuse) \
+                 values ($1, $2, now(), false) \
+                 on conflict (transform_table, column_name) do nothing",
+                &[&alter.target, &field.name],
+            )
+            .await?;
+        if inserted > 0 {
+            self_paused.push(field.name.clone());
+        }
     }
 
     let new_text = render_definition_text(&merged);
@@ -1645,11 +1675,25 @@ pub async fn alter_transform(
         // (and its enumeration applied) while the fields were still paused,
         // re-opening exactly this gap; a crash between two separate commits
         // would lose the catch-up outright.
+        //
+        // Only this call's own pauses are cleared (issue #309), and only if
+        // nothing else claimed them while the backfill ran: an operator
+        // pause or fuse trip in that window upgrades the row to `local_fuse`
+        // (`staging::quarantine::pause_column`/`trip_column_fuse` upsert onto
+        // it), and an upstream pause cascading onto it records an edge in
+        // `column_pause_cascades`. Either way the row now belongs to that
+        // other reason, and its `RESUME` is what recovers the column.
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        for field in &written_fields {
+        for field in &self_paused {
             txn.execute(
-                "delete from column_status where transform_table = $1 and column_name = $2",
+                "delete from column_status s \
+                 where s.transform_table = $1 and s.column_name = $2 \
+                   and not s.local_fuse \
+                   and not exists ( \
+                       select 1 from column_pause_cascades c \
+                       where c.downstream_transform = s.transform_table \
+                         and c.downstream_column = s.column_name)",
                 &[&alter.target, field],
             )
             .await?;

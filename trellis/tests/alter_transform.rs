@@ -812,6 +812,165 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// `(local_fuse, cascade edges into it)` for `transform.column`'s
+/// `column_status` row, or `None` when the column isn't paused at all.
+async fn column_pause_state(raw: &Client, transform: &str, column: &str) -> Option<(bool, i64)> {
+    raw.query_opt(
+        "select s.local_fuse, \
+                (select count(*) from column_pause_cascades c \
+                 where c.downstream_transform = s.transform_table \
+                   and c.downstream_column = s.column_name) \
+         from column_status s \
+         where s.transform_table = $1 and s.column_name = $2",
+        &[&transform, &column],
+    )
+    .await
+    .expect("read column_status")
+    .map(|row| (row.get(0), row.get(1)))
+}
+
+/// Issue #309: `ALTER TRANSFORM`'s own column pause (held while it backfills
+/// a changed field) must only ever be undone for a field whose pause *it*
+/// created. A field an operator paused, or one paused by cascade from an
+/// upstream column, stays paused through an `ALTER` of that same field —
+/// its recovery belongs to `RESUME`, not to an unrelated edit.
+#[tokio::test]
+async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_TARGET_SCHEMA}.order_calc replica identity full"
+    ))
+    .await
+    .expect("a chained target's source needs a full replica identity");
+    trellis
+        .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
+        .await
+        .expect("define the chained 1-1 target");
+    wait_for_live(&raw, "order_next").await;
+
+    // An operator pause on `order_calc.total`, which cascades onto
+    // `order_next.t2` (the only field reading it).
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.total")
+        .await
+        .expect("pause the column");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0))
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1))
+    );
+
+    // ALTER the operator-paused field, together with an ADD whose pause is
+    // this call's own.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a + b + b, ADD a + a AS double_a")
+        .await
+        .expect("alter a paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0)),
+        "the operator's pause must survive an ALTER of the same field"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "double_a").await,
+        None,
+        "the ALTER's own pause on the field it added must be cleared"
+    );
+
+    // ALTER the cascade-paused field downstream.
+    trellis
+        .apply("ALTER TRANSFORM order_next ALTER t2 AS total + 1")
+        .await
+        .expect("alter a cascade-paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1)),
+        "a pause cascaded from a still-paused upstream column must survive an ALTER"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `ALTER TRANSFORM ... DROP <field>` takes the dropped column's quarantine
+/// bookkeeping with it, the same "quarantine state follows its owner" rule
+/// `DROP TRANSFORM` applies to a whole target. Otherwise a stale pause would
+/// outlive its column and silently land on a later `ADD` of the same name,
+/// now that an `ALTER` no longer clears pauses it didn't create (#309).
+#[tokio::test]
+async fn dropping_a_paused_field_clears_its_quarantine_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.b")
+        .await
+        .expect("pause the column");
+    raw.batch_execute(
+        "insert into column_deaths (transform_table, column_name, deaths) \
+             values ('order_calc', 'b', 1); \
+         insert into column_failures (transform_table, column_name, src_table, key, error) \
+             values ('order_calc', 'b', 'orders', '1', 'boom');",
+    )
+    .await
+    .expect("seed column-fuse bookkeeping for b");
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("drop the paused field");
+    for table in ["column_status", "column_deaths", "column_failures"] {
+        let n: i64 = raw
+            .query_one(
+                &format!(
+                    "select count(*) from {table} \
+                     where transform_table = 'order_calc' and column_name = 'b'"
+                ),
+                &[],
+            )
+            .await
+            .expect("count bookkeeping rows")
+            .get(0);
+        assert_eq!(n, 0, "{table} must not outlive the dropped column");
+    }
+
+    // Re-adding the same name starts clean and live.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD b AS b")
+        .await
+        .expect("re-add the field");
+    assert_eq!(column_pause_state(&raw, "order_calc", "b").await, None);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Lock order against a concurrent drain. Apply's version fence takes the
 /// `source_table_versions` row `for share` and then row-locks the target;
 /// `alter_transform` must take that same row *before* its DDL locks the
