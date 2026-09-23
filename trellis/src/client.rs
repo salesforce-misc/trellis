@@ -511,7 +511,7 @@ async fn run(
     };
 
     if options.staging_worker
-        && let Err(err) = setup_staging(&dsn, &config, &options).await
+        && let Err(err) = setup_staging(&dsn, &config, &options, &pool).await
     {
         let _ = ready_tx.send(Err(err));
         return;
@@ -684,12 +684,14 @@ fn uniqueish_id() -> String {
 
 /// Reconciles the publication's membership against
 /// `options.source_tables`, then runs the initial snapshot handshake if the
-/// slot is fresh (no `replication_progress` row yet). An existing slot's
-/// backfill markers are left for the maintenance loop (issue #312; see the
-/// comment in the body). Not safe to call concurrently with another
-/// client's own staging setup against the same slot — callers are expected
-/// to run exactly one staging worker per fleet, per this module's doc
-/// comment.
+/// slot is fresh (no `replication_progress` row yet). For an existing slot,
+/// first recovers from that slot's loss if it has been lost
+/// ([`intake::slot_loss::pause_if_slot_lost`], issue #310); the slot's
+/// backfill markers themselves are left for the maintenance loop (issue
+/// #312; see the comment in the body). Not safe to call concurrently with
+/// another client's own staging setup against the same slot — callers are
+/// expected to run exactly one staging worker per fleet, per this module's
+/// doc comment.
 ///
 /// Uses a dedicated [`ProducerSession`] (not the pool): the session guards
 /// (`synchronous_commit`, the producer singleton advisory lock) are
@@ -701,6 +703,7 @@ async fn setup_staging(
     dsn: &str,
     config: &Config,
     options: &ClientOptions,
+    pool: &Pool,
 ) -> Result<(), ClientError> {
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
 
@@ -721,14 +724,28 @@ async fn setup_staging(
         .await?
         .get(0);
 
-    // An existing slot's pending backfill markers are deliberately *not*
-    // discharged here. Intake isn't running yet, so an enumeration now would
-    // stage `Recompute` rows ahead of the CDC it is about to replay for
-    // changes that enumeration already saw, and an aggregate would count
-    // those changes twice (issue #312). The maintenance loop's first pass,
-    // which runs as soon as intake is up, discharges them behind
-    // `run_pending_backfills`'s wait for intake instead.
-    if !has_progress {
+    if has_progress {
+        // Issue #310: a slot this instance confirmed work against may be gone
+        // (retention-cap invalidation, a pre-PG-17 failover, a restore of the
+        // source database). Checked here, before anything else runs against
+        // it, so a lost slot pauses every transform it fed and recreates
+        // itself instead of `Intake::connect` refusing to start — see
+        // `intake::slot_loss`. Nothing resumes until an operator says so.
+        intake::slot_loss::pause_if_slot_lost(
+            &mut session,
+            pool,
+            &options.slot,
+            &options.publication,
+        )
+        .await?;
+        // An existing slot's pending backfill markers are deliberately *not*
+        // discharged here. Intake isn't running yet, so an enumeration now
+        // would stage `Recompute` rows ahead of the CDC it is about to
+        // replay for changes that enumeration already saw, and an aggregate
+        // would count those changes twice (issue #312). The maintenance
+        // loop's first pass, which runs as soon as intake is up, discharges
+        // them behind `run_pending_backfills`'s wait for intake instead.
+    } else {
         intake::publication::initial_snapshot_handshake(
             &mut session,
             &options.slot,
@@ -874,6 +891,10 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
+    // Issue #310: due immediately too, so a restart with transforms still
+    // paused by an earlier slot loss names them right away rather than a
+    // minute in.
+    let mut next_slot_loss_reminder = Instant::now();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -929,6 +950,13 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                         crate::metrics::set_staging_segments(state.as_sql(), count as u64);
                     }
                 }
+            }
+            if !failed && Instant::now() >= next_slot_loss_reminder {
+                // Best-effort like the gauge above: a failed read skips one
+                // reminder, and the next is at most a minute away.
+                let _ = intake::slot_loss::log_slot_loss_reminder(&*c).await;
+                next_slot_loss_reminder =
+                    Instant::now() + intake::slot_loss::SLOT_LOSS_REMINDER_INTERVAL;
             }
             if !failed && Instant::now() >= next_reconcile {
                 // A backfill enumeration can sit waiting for intake to catch

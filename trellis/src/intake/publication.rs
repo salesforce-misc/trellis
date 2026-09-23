@@ -954,9 +954,11 @@ async fn mark_definitions_live(
 ///
 /// Callers on a fresh install run this once, before ever calling
 /// [`super::Intake::connect`]; an existing install with a `replication_progress`
-/// row for `slot` should never call this again (see [`require_slot_healthy`] —
-/// recovery from slot loss is this same function, run explicitly by an
-/// operator, never automatically).
+/// row for `slot` never calls this again. Recovery from losing that slot is
+/// not a re-run of this handshake (which would re-enumerate every table at
+/// once): [`super::slot_loss::pause_if_slot_lost`] pauses every transform the
+/// slot fed and recreates the slot, and each transform is rebuilt by its own
+/// fresh backfill when an operator resumes it (issue #310).
 ///
 /// Also seeds `replication_progress` for `slot` at its own consistent point —
 /// this is "whatever first uses the slot's name" that `V4__replication_progress.sql`
@@ -1113,9 +1115,11 @@ async fn slot_health(client: &impl GenericClient, slot: &str) -> Result<SlotHeal
 /// still exist and not be marked `lost`. Invalidation (retention cap
 /// exceeded) and loss on failover (pre-PG17 doesn't preserve slots across a
 /// promotion) both mean everything between `last_confirmed_lsn` and any new
-/// slot's start position is unrecoverable short of a fresh
-/// [`initial_snapshot_handshake`] — so this errors loudly at startup rather
-/// than silently resuming into a gap.
+/// slot's start position is unrecoverable by streaming — so this errors
+/// rather than let intake silently resume into a gap. It is also the detector
+/// [`super::slot_loss::pause_if_slot_lost`] runs during a staging worker's
+/// setup, which turns the error into pausing every transform the slot fed
+/// (issue #310).
 pub async fn require_slot_healthy(
     client: &impl GenericClient,
     slot: &str,

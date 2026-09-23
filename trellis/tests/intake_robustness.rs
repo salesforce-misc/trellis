@@ -518,7 +518,10 @@ async fn a_backfill_enumeration_waits_for_intake_to_stage_what_its_snapshot_saw(
 /// A slot this instance previously confirmed work against, but which is now
 /// missing or invalidated (retention exceeded, or lost across a pre-PG17
 /// failover), must fail `Intake::connect` loudly, naming the slot and the
-/// last confirmed position — never resume silently into a gap.
+/// last confirmed position — never resume silently into a gap. A `Client`
+/// never reaches this in practice: its staging setup recovers from the loss
+/// first (issue #310, `intake::slot_loss`), so this guards `Intake` used
+/// directly and a slot vanishing between that setup and the connect.
 #[tokio::test]
 async fn a_missing_slot_with_prior_confirmed_progress_is_a_loud_startup_error() {
     let cluster = TestCluster::start();
@@ -872,7 +875,7 @@ async fn another_databases_healthy_slot_does_not_make_a_lost_slot_look_healthy()
 /// written. A dedicated `TestCluster` because this flips a cluster-wide GUC;
 /// nothing else shares this instance.
 #[tokio::test]
-async fn an_invalidated_slot_with_prior_confirmed_progress_is_a_loud_startup_error() {
+async fn an_invalidated_slot_is_detected_and_recovered_by_recreating_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -970,4 +973,48 @@ async fn an_invalidated_slot_with_prior_confirmed_progress_is_a_loud_startup_err
         Err(other) => panic!("expected SlotLost, got {other:?}"),
         Ok(()) => panic!("an invalidated slot must not be reported healthy"),
     }
+
+    // Issue #310: the staging worker's recovery replaces the invalidated
+    // slot — which can never stream again — with a fresh one and moves the
+    // durable watermark to its start. Restore a real retention budget first
+    // so the new slot isn't invalidated again by the next checkpoint.
+    setup
+        .execute("alter system reset max_slot_wal_keep_size", &[])
+        .await
+        .expect("reset max_slot_wal_keep_size");
+    setup
+        .execute("select pg_reload_conf()", &[])
+        .await
+        .expect("reload config");
+    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("open a producer session");
+    let recovery =
+        intake::slot_loss::pause_if_slot_lost(&mut session, &db.pool, "lossy_slot", "no_pub")
+            .await
+            .expect("recover from the invalidated slot")
+            .expect("an invalidated slot is a loss to recover from");
+    assert!(recovery.paused.is_empty() && recovery.already_frozen.is_empty());
+    let wal_status: String = setup
+        .query_one(
+            "select wal_status from pg_replication_slots where slot_name = 'lossy_slot'",
+            &[],
+        )
+        .await
+        .expect("the slot exists again")
+        .get(0);
+    assert_ne!(wal_status, "lost", "the invalidated slot must be replaced");
+    assert_eq!(
+        confirmed_lsn(&setup, "lossy_slot").await,
+        Some(u64::from(recovery.new_slot_lsn)),
+        "the durable watermark moves to the recreated slot's start"
+    );
+    publication::require_slot_healthy(&setup, "lossy_slot", recovery.new_slot_lsn)
+        .await
+        .expect("the recreated slot is healthy");
+    drop(session);
+    setup
+        .execute("select pg_drop_replication_slot('lossy_slot')", &[])
+        .await
+        .expect("clean up the recreated slot");
 }

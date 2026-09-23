@@ -1686,6 +1686,13 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // would reject it outright (`DottedIdentifierComponent`).
     crate::intake::publication::clear_backfill_coverage(&*txn, &source_table).await?;
     crate::intake::publication::park_backfill_catchup(&*txn, &source_table).await?;
+    // Issue #310: a transform paused by a lost replication slot stops being
+    // reported as such the moment it is resumed.
+    txn.execute(
+        "delete from slot_loss_pauses where transform_id = $1",
+        &[&id],
+    )
+    .await?;
 
     txn.commit().await?;
     tracing::info!(

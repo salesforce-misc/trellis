@@ -56,8 +56,12 @@ pub enum IntakeError {
     /// A replication slot this instance has previously confirmed work
     /// against (a `replication_progress` row exists for it) is missing or
     /// invalidated. Changes between `last_confirmed_lsn` and any new slot's
-    /// start position are unrecoverable without an operator-triggered
-    /// re-snapshot — a hard, loud startup error, never a silent resume.
+    /// start position are unrecoverable by streaming, so [`super::Intake::connect`]
+    /// refuses rather than resume silently into the gap. A `Client`'s staging
+    /// setup handles the loss before it gets here (issue #310,
+    /// [`super::slot_loss::pause_if_slot_lost`]: pause every transform the
+    /// slot fed and recreate the slot), so this surfaces only for `Intake`
+    /// connected directly, or a slot lost between that setup and the connect.
     SlotLost {
         slot: String,
         last_confirmed_lsn: u64,
@@ -175,10 +179,10 @@ impl fmt::Display for IntakeError {
                 last_confirmed_lsn,
             } => write!(
                 f,
-                "replication slot {slot} is missing or invalidated; changes between confirmed \
-                 position {last_confirmed_lsn} and any new slot's start position are \
-                 unrecoverable without an operator-triggered re-snapshot backfill — refusing to \
-                 start silently"
+                "replication slot {slot} is missing or invalidated; changes after confirmed \
+                 position {last_confirmed_lsn} are unrecoverable by streaming — refusing to \
+                 resume silently into the gap (a restarted staging worker pauses every transform \
+                 the slot fed and recreates it; resume each to rebuild it by a fresh backfill)"
             ),
             IntakeError::InvalidTableName(name) => {
                 write!(f, "expected a \"schema.table\" name, got {name:?}")

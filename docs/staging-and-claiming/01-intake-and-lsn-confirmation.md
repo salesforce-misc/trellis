@@ -158,8 +158,8 @@ knife-edged guards:
 | crash before the stage commit | nothing staged, slot unmoved | server replays the whole transaction |
 | crash between stage commit and the acknowledgment | staged, slot unmoved | server replays; **the replay re-stages duplicate rows**, which the fold collapses per key. This is the one at-least-once seam, and why the fold's merge rules must be idempotent under duplication ([04](04-claiming-and-the-fold.md)) |
 | stage transaction fails | rollback, watermark untouched | consumer errors out; next connection resumes at the old position |
-| slot invalidated (retention cap exceeded) | changes between the old confirmed position and any new slot are unrecoverable | **must re-run the snapshot backfill** — recreating the slot alone loses the gap |
-| slot lost on failover (pre-PG-17) | same shape as above | hard, loud startup error naming the window; recovery is an explicit operator-triggered re-snapshot, never automatic |
+| slot invalidated (retention cap exceeded) | changes between the old confirmed position and any new slot are unrecoverable, so every target the slot fed is stale | at the next staging-worker start Trellis **pauses every transform the slot fed** (directly or through a chain), recreates the slot and keeps running. It logs the slot, the lost position and the paused transforms, and repeats that about once a minute until each is resumed. Nothing resumes automatically: the operator runs `RESUME TRANSFORM` per transform, which rebuilds it by a fresh backfill. Recreating the slot alone would lose the gap |
+| slot lost on failover (pre-PG-17), or the source database restored from a backup | same shape as above | same as above. The pause holds until the operator has finished the recovery and chooses when, and in what order, to rebuild |
 | decoder wedge (server-side decode bug) | walsender dies before a byte arrives; reconnecting dies at the same record | unreachable from the client — name the condition instead of retrying forever |
 
 ## Adjacent invariants that are easy to miss

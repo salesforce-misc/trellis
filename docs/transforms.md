@@ -147,7 +147,11 @@ Every defined transform carries an observable **status**:
 * **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the
   fuse. The same frozen state `quarantined` is, reached by the other trigger: the
   target stops being written to and holds its current, now-stale value. Resuming
-  likewise re-runs the backfill from `waiting_to_backfill`.
+  likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
+  transforms itself when the replication slot feeding them is lost, for
+  example after the source database is restored from a backup. It logs which
+  transforms it paused and why until each one is resumed
+  ([intake failure modes](staging-and-claiming/01-intake-and-lsn-confirmation.md#failure-modes)).
 
 An application can list defined transforms and read each one's status — enough to
 tell a newly-defined transform is still populating, without a metrics pipeline.
