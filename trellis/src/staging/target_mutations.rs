@@ -109,7 +109,9 @@
 //! is not a commit `end_lsn`. A consumer may rely on "token above a position
 //! read by another transaction means the writer committed after that read",
 //! and on per-key order, but never on "a token at or below X means the writer
-//! had committed by X". It is never an `origin_lsn` either: a seam row's
+//! had committed by X": the gap to the commit can be long (a rebuild's orphan
+//! delete, `intake::resume_orphans`, waits on intake before committing). It
+//! is never an `origin_lsn` either: a seam row's
 //! origin stays the conservative "unknown" `await_converged` already gates on
 //! (see `staging::converge::converged_through`).
 //!
@@ -306,7 +308,12 @@ impl TargetMutations {
     ///
     /// Also reads [`Propagation::write_token`]. The caller must not take any
     /// further row lock on a target after this (see the module doc's "The
-    /// write token"); every caller calls it last, just before commit.
+    /// write token"). Every caller calls it after its last target write: the
+    /// drain's Phase 3, `quarantine::recompute_column` and
+    /// `defs::backfill::backfill_altered_columns` just before commit, and
+    /// `intake::resume_orphans` at the start of a discharge that then writes
+    /// the ring and catalog (no target) and may wait on intake before it
+    /// commits.
     pub(crate) async fn into_staged(
         mut self,
         txn: &Transaction<'_>,
