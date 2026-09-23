@@ -1375,6 +1375,105 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
     }
 }
 
+/// Issue #377: `recompute_column`'s write-back matches each chunk of keys
+/// against the target's own primary-key columns (an indexed keyset join)
+/// rather than against the computed key-contract text. Resuming over a
+/// composite key, across more than one write-back chunk, with key parts that
+/// hold the key contract's own separator and escape characters, must still
+/// land every recomputed value on exactly its own row, and must not invent a
+/// row for a source key the target doesn't have.
+#[tokio::test]
+async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table comp_src (region text, id integer, price numeric, \
+                                    primary key (region, id)); \
+             insert into comp_src (region, id, price) \
+             select 'r' || (g % 3), g, g from generate_series(1, 2500) g; \
+             insert into comp_src (region, id, price) values \
+             ('a' || chr(31) || 'b', 1, 7), ('c' || chr(30) || 'd', 1, 8)",
+        )
+        .await
+        .expect("seed source table");
+
+    let source_columns = numeric_columns(&["id", "price"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM comp FROM comp_src SELECT price + price AS doubled",
+        &source_columns,
+    )
+    .await
+    .expect("create comp definition");
+    let comp_def = TransformDef {
+        target: "comp".to_string(),
+        source: "comp_src".to_string(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "doubled".to_string(),
+            expr: Expr::BinaryOp {
+                op: Operator::Add,
+                lhs: Box::new(Expr::Column("price".to_string())),
+                rhs: Box::new(Expr::Column("price".to_string())),
+            },
+        }],
+        predicate: Predicate::True,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    };
+    let pk = source_primary_key(&db.pool, "comp_src")
+        .await
+        .expect("introspect source primary key");
+    assert_eq!(pk.len(), 2, "the fixture must exercise a composite key");
+    create_target_table(
+        &db.pool,
+        &comp_def,
+        "public",
+        &pk,
+        &source_columns,
+        &comp_def.source,
+    )
+    .await
+    .expect("create comp table");
+
+    // Sentinel values for every source row but one, which the target
+    // deliberately lacks.
+    client
+        .batch_execute(
+            "insert into comp (region, id, doubled) \
+             select region, id, -999 from comp_src where not (region = 'r1' and id = 7); \
+             insert into column_status (transform_table, column_name, last_error, local_fuse) \
+             values ('comp', 'doubled', 'synthetic pause', true)",
+        )
+        .await
+        .expect("seed sentinel target rows and the pause");
+
+    quarantine::resume_column(&db.pool, "comp", "doubled")
+        .await
+        .expect("resume_column");
+
+    let row = client
+        .query_one(
+            "select count(*), \
+                    count(*) filter (where t.doubled is distinct from s.price * 2), \
+                    count(*) filter (where s.id is null) \
+             from comp t left join comp_src s using (region, id)",
+            &[],
+        )
+        .await
+        .expect("compare target to source");
+    let (total, wrong, orphans): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(total, 2501, "no row may be added for the missing key");
+    assert_eq!(
+        wrong, 0,
+        "every existing row must hold its own recomputed value"
+    );
+    assert_eq!(orphans, 0);
+}
+
 // ---------------------------------------------------------------------
 // (j) Regression: ambiguous field-name attribution must fall back to no
 //     column-level attribution (should-fix 4).

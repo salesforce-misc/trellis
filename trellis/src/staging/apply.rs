@@ -5507,7 +5507,7 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// apply's answer — "this group has no row in the target" — consistent with
 /// backfill's, rather than attempting an insert Postgres's own `NOT NULL`
 /// constraint would reject anyway.
-fn decode_target_pk_parts(
+pub(super) fn decode_target_pk_parts(
     pk: &[PrimaryKeyColumn],
     target: &str,
     key: &str,
@@ -5563,8 +5563,10 @@ fn pk_keyset_col(i: usize) -> String {
 /// column match [`apply_target`] needs once a composite (arity > 1) primary
 /// key means a plain `= any($1::text[]::cast[])` no longer identifies a row
 /// on its own (issue #121) — arity 1 keeps that simpler, pre-existing form
-/// instead (see [`apply_target`]'s own arity branch).
-fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
+/// instead (see [`apply_target`]'s own arity branch). `quarantine`'s
+/// `recompute_column` uses it at every arity (issue #377), since joining on
+/// the target's own key columns is what lets its write-back use the index.
+pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
     let arrays: Vec<String> = pk
         .iter()
         .enumerate()
@@ -5581,7 +5583,7 @@ fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
 /// real `primary key`, which Postgres makes `NOT NULL` unconditionally),
 /// unlike `apply_aggregate`'s `GROUP BY` keyset match, which does need the
 /// null-safe form for a nullable grouping column.
-fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
+pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
     pk.iter()
         .enumerate()
         .map(|(i, c)| format!("{alias}.{} = k.{}", quote_ident(&c.name), pk_keyset_col(i)))
@@ -5594,7 +5596,7 @@ fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// own declared column order) so column `j`'s array is every row's `j`th
 /// part — mirrors `apply_aggregate::transpose_group_values`'s identical
 /// shape for its own `GROUP BY` keyset.
-fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> Vec<Vec<&'a str>> {
+pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[&'a Vec<String>]) -> Vec<Vec<&'a str>> {
     (0..arity)
         .map(|j| rows.iter().map(|r| r[j].as_str()).collect())
         .collect()

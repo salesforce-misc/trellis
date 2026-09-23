@@ -36,11 +36,12 @@ use std::time::SystemTime;
 
 #[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::PgLsn;
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{GenericClient, Transaction};
 
 use crate::defs::ast::{KeySpace, ValueType};
 use crate::defs::catalog;
-use crate::defs::ddl::{self, DdlError};
+use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::eval::{self, RelationshipContext, Row};
 use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::validate;
@@ -2000,33 +2001,34 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
     // statement captures each row's prior image when something reads the
     // target, and its `ctid`, which the lock keeps stable until commit and
     // which lets each update find its row without re-scanning the table.
-    let lock_order = pk
-        .iter()
-        .map(|c| format!("t.{}", quote_ident(&c.name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let target_pk_expr = ddl::pk_key_sql_expr(&pk, Some("t"));
     let update_sql = format!(
         "update {target_ident} t set {col_ident} = $1::text::{pg_type} \
          where t.ctid = $2::text::tid and t.{col_ident} is distinct from $1::text::{pg_type}",
     );
     for chunk in values.chunks(RECOMPUTE_COLUMN_CHUNK) {
+        // Every key here decodes to real values: a NULL-keyed row was already
+        // dropped (`pk_has_null`, above) before it reached `values`.
+        let mut key_parts: Vec<Vec<String>> = Vec::with_capacity(chunk.len());
+        for (pk_text, _) in chunk {
+            if let Some(parts) = apply::decode_target_pk_parts(&pk, &def.def.target, pk_text)? {
+                key_parts.push(parts);
+            }
+        }
+        let key_refs: Vec<&Vec<String>> = key_parts.iter().collect();
+        let arrays = apply::transpose_pk_parts(pk.len(), &key_refs);
+        let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+
         let txn = client.transaction().await?;
         let mut mutations = TargetMutations::new();
         let image_expr = mutations.image_sql(&txn, &def.target_table, "t").await?;
-        let keys: Vec<&str> = chunk.iter().map(|(k, _)| k.as_str()).collect();
+        let image_select = match &image_expr {
+            Some(expr) => format!("({expr})::text"),
+            None => "null::text".to_string(),
+        };
         let locked = txn
             .query(
-                &format!(
-                    "select {target_pk_expr}, t.ctid::text, {} from {target_ident} t \
-                     where {target_pk_expr} = any($1::text[]) \
-                     order by {lock_order} for update",
-                    match &image_expr {
-                        Some(expr) => format!("({expr})::text"),
-                        None => "null::text".to_string(),
-                    },
-                ),
-                &[&keys],
+                &recompute_lock_sql(&target_ident, &pk, &image_select),
+                &params,
             )
             .await?;
         let mut locked_rows: HashMap<String, (String, Option<String>)> = locked
@@ -2051,6 +2053,31 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
 
 /// How many keys [`recompute_column`] writes back per transaction.
 const RECOMPUTE_COLUMN_CHUNK: usize = 1000;
+
+/// The statement each [`recompute_column`] write-back chunk locks its target
+/// rows with, in ascending key order: every row's key-contract text, `ctid`
+/// and `image_select`, bound to `pk.len()` per-column key arrays
+/// ([`apply::transpose_pk_parts`]).
+///
+/// Issue #377: the chunk's keys are matched through a bound keyset relation
+/// joined on the target's own primary-key columns, so each key is an index
+/// probe. The earlier `pk_key_sql_expr(...) = any($1::text[])` compared a
+/// computed text expression that no index covers, which made every chunk a
+/// full scan of the target.
+fn recompute_lock_sql(target_ident: &str, pk: &[PrimaryKeyColumn], image_select: &str) -> String {
+    let target_pk_expr = ddl::pk_key_sql_expr(pk, Some("t"));
+    let lock_order = pk
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(&c.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "select {target_pk_expr}, t.ctid::text, {image_select} from {target_ident} t \
+         join {} on ({}) order by {lock_order} for update of t",
+        apply::pk_keyset_unnest(pk, 1),
+        apply::pk_keyset_match(pk, "t"),
+    )
+}
 
 // ---------------------------------------------------------------------
 // Release
@@ -2343,5 +2370,108 @@ mod unit_tests {
         // an unattributable isolate-classified error still surfaces rather
         // than getting blamed on something.)
         assert_eq!(classify(&ApplyError::ClaimLost), FailureClass::Isolate);
+    }
+    /// `EXPLAIN`'s plan text for `sql` with `params` bound, one line per row.
+    async fn explain_plan(
+        client: &tokio_postgres::Client,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> String {
+        client
+            .query(&format!("explain {sql}"), params)
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Issue #377: a `recompute_column` write-back chunk locks its target rows
+    /// through an index, at both a single-column and a composite primary key,
+    /// for a full chunk of keys. The pre-#377 shape, matching the computed
+    /// key-contract text, run against the same tables and keys, can only plan
+    /// a sequential scan (proving the plan difference is real, not just that
+    /// both shapes happen to allow an index).
+    #[tokio::test]
+    async fn recompute_lock_matches_a_chunk_of_keys_through_the_primary_key_index() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table single_pk (id bigint primary key, v integer); \
+                 insert into single_pk select g, g from generate_series(1, 1000000) g; \
+                 analyze single_pk; \
+                 create table composite_pk (a bigint, b text, v integer, primary key (a, b)); \
+                 insert into composite_pk select g, 'k' || g, g from generate_series(1, 1000000) g; \
+                 analyze composite_pk;",
+            )
+            .await
+            .expect("seed large indexed targets");
+
+        let col = |name: &str, data_type: &str| PrimaryKeyColumn {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: false,
+        };
+        // A full chunk of keys spread across the table, as a resume would bind.
+        let ids: Vec<i64> = (0..RECOMPUTE_COLUMN_CHUNK as i64)
+            .map(|i| i * 997 + 1)
+            .collect();
+        let cases = [
+            (
+                "single_pk",
+                vec![col("id", "bigint")],
+                ids.iter().map(|i| vec![i.to_string()]).collect::<Vec<_>>(),
+            ),
+            (
+                "composite_pk",
+                vec![col("a", "bigint"), col("b", "text")],
+                ids.iter()
+                    .map(|i| vec![i.to_string(), format!("k{i}")])
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        for (table, pk, keys) in cases {
+            let target_ident = quote_ident(table);
+            let key_refs: Vec<&Vec<String>> = keys.iter().collect();
+            let arrays = apply::transpose_pk_parts(pk.len(), &key_refs);
+            let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
+            let plan = explain_plan(
+                &client,
+                &recompute_lock_sql(&target_ident, &pk, "null::text"),
+                &params,
+            )
+            .await;
+            assert!(
+                plan.contains("Index") && !plan.contains("Seq Scan"),
+                "{table}: the keyset match should probe the primary-key index, got:\n{plan}"
+            );
+
+            let key_texts: Vec<String> = keys
+                .iter()
+                .map(|parts| ddl::join_pk_key(parts.iter().map(|s| s.as_str())))
+                .collect();
+            let old_plan = explain_plan(
+                &client,
+                &format!(
+                    "select 1 from {target_ident} t where {} = any($1::text[])",
+                    ddl::pk_key_sql_expr(&pk, Some("t"))
+                ),
+                &[&key_texts],
+            )
+            .await;
+            assert!(
+                old_plan.contains("Seq Scan"),
+                "{table}: sanity check, the pre-#377 key-text match can't use an index, \
+                 got:\n{old_plan}"
+            );
+        }
     }
 }
