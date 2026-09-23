@@ -36,7 +36,10 @@
 //!   and the single place they're mapped onto [`trellis::ClientOptions`].
 //!   This is the documented extension point for epic #269's later children.
 //! - [`chain`]: the N-hop 1-1 chain builder, plus liveness/warm-up/oracle.
-//! - [`load`]: controlled-offered-rate and max-rate load generators.
+//! - [`load`]: the single-connection paced generator, the multi-connection
+//!   paced-or-max-rate one, and the generator-bound self-check (#276).
+//! - [`generator_reach`]: the multi-connection generator alone, no engine —
+//!   how much load the instrument itself can offer.
 //! - [`scrape`]: `render_prometheus()` readers — T1's bucket-fraction
 //!   convention, exact per-hop means, plain counters.
 //! - [`hop_latency`]: the hop-depth latency ladder (V-LAT / T1).
@@ -51,6 +54,7 @@
 pub mod chain;
 pub mod cli;
 pub mod fold_in;
+pub mod generator_reach;
 pub mod hop_latency;
 pub mod idle_cost;
 pub mod intake_ceiling;

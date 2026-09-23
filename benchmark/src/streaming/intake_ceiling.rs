@@ -11,6 +11,14 @@
 //! there is no target table to check, and the measured quantity *is* the ring
 //! row count. The equivalent integrity check is the offered-vs-appended
 //! comparison this already reports (`append_backlog`).
+//!
+//! **Mind the volume.** At [`Pace::Max`] the multi-connection generator
+//! offers millions of rows/sec at large commit shapes (issue #276), and
+//! nothing drains the ring, so every offered row is stored twice (source and
+//! ring) plus its WAL, which the replication slot retains while intake lags.
+//! testkit clusters live under `$TMPDIR` — a RAM-backed tmpfs on the dev box —
+//! so the default window is short, and `--rate` paces the generator just above
+//! the ceiling being measured rather than flat out.
 
 use std::time::{Duration, Instant};
 
@@ -21,14 +29,19 @@ use trellis::config::DEFAULT_SCHEMA;
 
 use crate::scenario::connect_raw;
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
-use crate::streaming::load::run_max_rate_load;
+use crate::streaming::load::{
+    GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
+};
 
 const SOURCE_TABLE: &str = "intake_src";
 
 /// Total rows across every physical ring table (`seg_0..seg_<RING_SIZE-1>`),
 /// discovered via `pg_tables` rather than hardcoding `RING_SIZE` — a private
 /// staging constant this crate has no access to by ADR-0012 design. Counts
-/// every ring table whatever its state, sealed or active.
+/// every ring table whatever its state, sealed or active, in **one**
+/// statement, so the total is a single snapshot: the ring as of the moment the
+/// statement started, which is what lets [`run`] sample it at the instant the
+/// offer window closes.
 async fn total_ring_rows(raw: &RawClient) -> i64 {
     let tables: Vec<String> = raw
         .query(
@@ -45,37 +58,54 @@ async fn total_ring_rows(raw: &RawClient) -> i64 {
         "expected at least one seg_N ring table after migration"
     );
 
-    let mut total = 0i64;
-    for table in tables {
-        let count: i64 = raw
-            .query_one(
-                &format!("select count(*) from {DEFAULT_SCHEMA}.{table}"),
-                &[],
-            )
-            .await
-            .unwrap_or_else(|e| panic!("count ring table {table}: {e}"))
-            .get(0);
-        total += count;
-    }
-    total
+    let sum = tables
+        .iter()
+        .map(|table| format!("(select count(*) from {DEFAULT_SCHEMA}.{table})"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    raw.query_one(&format!("select ({sum})::bigint"), &[])
+        .await
+        .expect("count ring rows")
+        .get(0)
 }
 
 #[derive(Debug)]
 pub struct IntakeCeilingResult {
+    /// Writer connections the generator used ([`run_parallel_load`]).
+    pub connections: usize,
+    /// The paced target, or `None` for a max-rate run.
+    pub target_rows_per_sec: Option<f64>,
     pub rows_per_commit: usize,
     pub offered_duration_secs: f64,
     pub rows_offered: u64,
     pub offered_achieved_rows_per_sec: f64,
-    pub ring_rows_appended: i64,
+    /// Rows in the ring at the instant the offer window closed — what intake
+    /// had actually decoded and appended *while* load was arriving.
+    pub ring_rows_appended_in_window: i64,
+    /// `ring_rows_appended_in_window` over the window: intake's append rate
+    /// under load. When intake was the limiter (it fell behind during the
+    /// window) this **is** the intake ceiling; when it kept up, it equals the
+    /// offered rate and `generator_bound` says so.
+    ///
+    /// Deliberately not `ring_rows_appended` over the window: rows appended
+    /// during the grace period, after the generator stopped, would credit a
+    /// slower intake with the generator's rate whenever it merely drained its
+    /// backlog in time.
     pub append_achieved_rows_per_sec: f64,
+    /// Rows in the ring once the grace period ended (or everything arrived).
+    pub ring_rows_appended: i64,
     /// Rows offered but not yet in the ring when the grace period expired.
-    /// Positive means the reported append rate is a **floor**, not a ceiling:
-    /// intake never caught up, so all that's known is that it sustained at
-    /// least this much.
+    /// Positive means intake never even drained what was offered — the
+    /// integrity side of this probe, since nothing else checks the ring.
     pub append_backlog: i64,
-    /// True when the offered and append rates came out essentially equal —
-    /// meaning the *generator*, not intake, was the limiter, and this number
-    /// is again a floor rather than the engine's ceiling.
+    /// Intake appended (within tolerance) everything offered while it was
+    /// being offered. When false, `append_achieved_rows_per_sec` is intake's
+    /// ceiling.
+    pub intake_kept_pace: bool,
+    /// Issue #276's self-check ([`generator_bound`]): intake appended
+    /// (within tolerance) everything offered while it was being offered, so
+    /// the *generator* was the limiter and `append_achieved_rows_per_sec` is a
+    /// floor on intake's ceiling, not the ceiling. Raise `--connections`.
     pub generator_bound: bool,
     /// Issue #274: `pg_current_wal_lsn()` delta over the whole run, divided
     /// by `rows_offered` — a per-source-row WAL cost, comparable across a
@@ -89,34 +119,53 @@ pub struct IntakeCeilingResult {
 impl IntakeCeilingResult {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"scenario\":\"intake-ceiling\",\"rows_per_commit\":{},\
-             \"offered_duration_secs\":{},\"rows_offered\":{},\
-             \"offered_achieved_rows_per_sec\":{:.1},\"ring_rows_appended\":{},\
-             \"append_achieved_rows_per_sec\":{:.1},\"append_backlog\":{},\
-             \"generator_bound\":{},\"wal_bytes_per_source_row\":{:.2}}}",
+            "{{\"scenario\":\"intake-ceiling\",\"connections\":{},\"target_rows_per_sec\":{},\
+             \"rows_per_commit\":{},\
+             \"offered_duration_secs\":{:.3},\"rows_offered\":{},\
+             \"offered_achieved_rows_per_sec\":{:.1},\"ring_rows_appended_in_window\":{},\
+             \"append_achieved_rows_per_sec\":{:.1},\"ring_rows_appended\":{},\
+             \"append_backlog\":{},\"intake_kept_pace\":{},\"generator_bound\":{},\"wal_bytes_per_source_row\":{:.2}}}",
+            self.connections,
+            match self.target_rows_per_sec {
+                Some(rate) => rate.to_string(),
+                None => "null".to_string(),
+            },
             self.rows_per_commit,
             self.offered_duration_secs,
             self.rows_offered,
             self.offered_achieved_rows_per_sec,
-            self.ring_rows_appended,
+            self.ring_rows_appended_in_window,
             self.append_achieved_rows_per_sec,
+            self.ring_rows_appended,
             self.append_backlog,
+            self.intake_kept_pace,
             self.generator_bound,
             self.wal_bytes_per_source_row,
         )
     }
 }
 
-/// Runs the probe: pushes `rows_per_commit`-sized batches back to back with no
-/// pacing for `offered_duration`, then polls up to `catch_up_grace` for the
-/// ring's row count to catch up with what was offered (decode lags commit, so
-/// this isn't instantaneous) before reporting the append-side rate.
+/// Whether intake kept pace with the offered load *during* the window:
+/// appended at least `1 - GENERATOR_UNDERSHOOT_TOLERANCE` of it by the time
+/// the window closed. The slack absorbs intake's normal in-flight lag (a
+/// group-commit batch plus decode) at the window's edge.
+fn intake_kept_pace(rows_offered: u64, appended_in_window: i64) -> bool {
+    appended_in_window as f64 >= rows_offered as f64 * (1.0 - GENERATOR_UNDERSHOOT_TOLERANCE)
+}
+
+/// Runs the probe: offers `load` (its `groups` is ignored — this source
+/// table has none), samples the ring the moment the window closes (the
+/// append rate under load), then polls up to `catch_up_grace` for the ring to
+/// hold everything offered.
 pub async fn run(
-    rows_per_commit: usize,
-    offered_duration: Duration,
+    load: ParallelLoad,
     catch_up_grace: Duration,
     group_commit: Option<trellis::GroupCommitConfig>,
 ) -> IntakeCeilingResult {
+    let cfg = ParallelLoad {
+        groups: None,
+        ..load
+    };
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -148,7 +197,8 @@ pub async fn run(
 
     let baseline_ring_rows = total_ring_rows(&raw).await;
     let wal_lsn_before = wal_lsn(&raw).await;
-    let load = run_max_rate_load(&raw, SOURCE_TABLE, 1, rows_per_commit, offered_duration).await;
+    let load = run_parallel_load(db.dsn(), SOURCE_TABLE, 1, &cfg).await;
+    let appended_in_window = total_ring_rows(&raw).await - baseline_ring_rows;
 
     let deadline = Instant::now() + catch_up_grace;
     let ring_rows_now = loop {
@@ -164,18 +214,53 @@ pub async fn run(
 
     let appended = ring_rows_now - baseline_ring_rows;
     let offered_rate = load.achieved_rows_per_sec();
-    let append_rate = appended as f64 / load.elapsed.as_secs_f64();
+    let kept_pace = intake_kept_pace(load.rows_issued, appended_in_window);
+    let target_rows_per_sec = match cfg.pace {
+        Pace::Max => None,
+        Pace::RowsPerSec(rate) => Some(rate),
+    };
     IntakeCeilingResult {
-        rows_per_commit,
-        offered_duration_secs: offered_duration.as_secs_f64(),
+        connections: cfg.connections,
+        target_rows_per_sec,
+        rows_per_commit: cfg.rows_per_commit,
+        offered_duration_secs: load.elapsed.as_secs_f64(),
         rows_offered: load.rows_issued,
         offered_achieved_rows_per_sec: offered_rate,
+        ring_rows_appended_in_window: appended_in_window,
+        append_achieved_rows_per_sec: appended_in_window as f64 / load.elapsed.as_secs_f64(),
         ring_rows_appended: appended,
-        append_achieved_rows_per_sec: append_rate,
         append_backlog: load.rows_issued as i64 - appended,
-        // Within 2%: intake kept up with everything offered, so the offered
-        // rate is the binding constraint, not the append path.
-        generator_bound: (append_rate - offered_rate).abs() <= offered_rate * 0.02,
+        intake_kept_pace: kept_pace,
+        generator_bound: generator_bound(target_rows_per_sec, offered_rate, kept_pace),
         wal_bytes_per_source_row: wal_bytes as f64 / load.rows_issued as f64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intake_that_fell_behind_during_the_window_is_the_measurement() {
+        // #266's E3 failure mode, the other way round: 20M offered, only 12M
+        // in the ring when the window closed. Even if the grace period later
+        // drains the rest, intake was the limiter.
+        assert!(!intake_kept_pace(20_000_000, 12_000_000));
+        assert!(!generator_bound(
+            None,
+            1_000_000.0,
+            intake_kept_pace(20_000_000, 12_000_000)
+        ));
+    }
+
+    #[test]
+    fn intake_that_kept_pace_makes_the_run_generator_bound() {
+        // Within the in-flight slack at the window's edge.
+        assert!(intake_kept_pace(10_000_000, 9_950_000));
+        assert!(generator_bound(
+            None,
+            500_000.0,
+            intake_kept_pace(10_000_000, 9_950_000)
+        ));
     }
 }

@@ -8,7 +8,9 @@
 use std::time::Duration;
 
 use crate::streaming::tuning::EngineTuning;
-use crate::streaming::{fold_in, hop_latency, idle_cost, intake_ceiling, throughput};
+use crate::streaming::{
+    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, throughput,
+};
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
 pub const SCENARIOS: &[&str] = &[
@@ -19,6 +21,7 @@ pub const SCENARIOS: &[&str] = &[
     "fold-in-ratio",
     "intake-ceiling",
     "idle-cost",
+    "generator-reach",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -48,9 +51,7 @@ const SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 const FOLD_IN_DEFAULT_TARGET_RATE: f64 = 400_000.0;
 const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 /// Longer than every other scenario's 30s grace (issue #270 review): at
-/// 400k rows/sec offered against a single-connection generator that tops out
-/// well below that (see `load`'s own doc comment, #276), every ratio starts
-/// the grace window already backlogged, and a low fold-in ratio's target
+/// 400k rows/sec every ratio starts the grace window already backlogged, and a low fold-in ratio's target
 /// write count is close to the row count — near the same write load as a 1-1
 /// chain, whose own knee sits at ~210-230k rows/sec. Measured directly: ratio
 /// 1000:1 needs on the order of 90-120s to fully drain and pass its oracle;
@@ -64,7 +65,11 @@ const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(120);
 
 const INTAKE_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
-const INTAKE_DEFAULT_DURATION: Duration = Duration::from_secs(20);
+/// Short, because at max rate the generator writes millions of rows/sec that
+/// nothing drains, into a cluster on `$TMPDIR` (see [`intake_ceiling`]'s
+/// "mind the volume"): 20s at 1,000 rows/commit exhausted the dev box's 16GB
+/// tmpfs. 5s still spans many seal/group-commit cycles.
+const INTAKE_DEFAULT_DURATION: Duration = Duration::from_secs(5);
 const INTAKE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 
 /// Idle cost's defaults: 8 drain threads (#269's own "staging worker + 8 drain
@@ -74,6 +79,30 @@ const INTAKE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 /// than a handful.
 const IDLE_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_DEFAULT_DURATION: Duration = Duration::from_secs(60);
+
+const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
+
+/// `--connections <n>`: the multi-connection generator's
+/// ([`load::run_parallel_load`]) writer count, for every scenario that uses
+/// it — everything except the latency ladder, which stays on the
+/// single-connection paced generator by design. Absent, the caller falls back
+/// to [`load::DEFAULT_CONNECTIONS`].
+fn connections(args: &[String]) -> Option<usize> {
+    number(args, "--connections").map(|n| {
+        assert!(n >= 1.0, "--connections must be at least 1, got {n}");
+        n as usize
+    })
+}
+
+/// The `--connections`/`--duration-secs`/`--grace-secs` trio every
+/// throughput probe shares, over the scenario's own defaults.
+fn offer(args: &[String], duration: Duration, grace: Duration) -> throughput::Offer {
+    throughput::Offer {
+        connections: connections(args).unwrap_or(load::DEFAULT_CONNECTIONS),
+        duration: secs(args, "--duration-secs").unwrap_or(duration),
+        grace: secs(args, "--grace-secs").unwrap_or(grace),
+    }
+}
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
@@ -249,17 +278,21 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
         "throughput-ramp" => {
             let rates = number_list(args, "--rates").unwrap_or_else(|| RAMP_DEFAULT_RATES.to_vec());
-            let duration = secs(args, "--duration-secs").unwrap_or(RAMP_DEFAULT_DURATION);
-            let grace = secs(args, "--grace-secs").unwrap_or(RAMP_DEFAULT_GRACE);
+            let offer = offer(args, RAMP_DEFAULT_DURATION, RAMP_DEFAULT_GRACE);
             let tuning = throughput_tuning(args);
 
-            let probes = runtime().block_on(throughput::run_ramp(&rates, duration, grace, &tuning));
+            let probes = runtime().block_on(throughput::run_ramp(&rates, offer, &tuning));
             let ok = report_probes(&probes, "throughput-ramp");
             match probes.iter().rev().find(|p| p.sustained) {
                 Some(knee) => eprintln!(
-                    "knee: {} rows/sec sustained (achieved {:.0}/sec){}",
+                    "knee: {} rows/sec sustained (achieved {:.0}/sec{}){}",
                     knee.target_rows_per_sec,
                     knee.achieved_rows_per_sec,
+                    if knee.generator_bound {
+                        " — GENERATOR-BOUND, so the knee is a floor"
+                    } else {
+                        ""
+                    },
                     match probes.last() {
                         Some(last) if !last.sustained => format!(
                             ", {} rows/sec not (backlog {} after grace)",
@@ -281,15 +314,13 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         "transaction-shape" => {
             let shapes = usize_list(args, "--shapes", throughput::DEFAULT_SHAPES);
             let target_rate = number(args, "--target-rate").unwrap_or(SHAPE_DEFAULT_TARGET_RATE);
-            let duration = secs(args, "--duration-secs").unwrap_or(SHAPE_DEFAULT_DURATION);
-            let grace = secs(args, "--grace-secs").unwrap_or(SHAPE_DEFAULT_GRACE);
+            let offer = offer(args, SHAPE_DEFAULT_DURATION, SHAPE_DEFAULT_GRACE);
             let tuning = throughput_tuning(args);
 
             let probes = runtime().block_on(throughput::run_shape_sweep(
                 &shapes,
                 target_rate,
-                duration,
-                grace,
+                offer,
                 &tuning,
             ));
             Some(report_probes(&probes, "transaction-shape"))
@@ -298,17 +329,11 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         "fold-in-ratio" => {
             let ratios = usize_list(args, "--ratios", fold_in::DEFAULT_RATIOS);
             let target_rate = number(args, "--target-rate").unwrap_or(FOLD_IN_DEFAULT_TARGET_RATE);
-            let duration = secs(args, "--duration-secs").unwrap_or(FOLD_IN_DEFAULT_DURATION);
-            let grace = secs(args, "--grace-secs").unwrap_or(FOLD_IN_DEFAULT_GRACE);
+            let offer = offer(args, FOLD_IN_DEFAULT_DURATION, FOLD_IN_DEFAULT_GRACE);
             let tuning = throughput_tuning(args);
 
-            let results = runtime().block_on(fold_in::run_sweep(
-                &ratios,
-                target_rate,
-                duration,
-                grace,
-                &tuning,
-            ));
+            let results =
+                runtime().block_on(fold_in::run_sweep(&ratios, target_rate, offer, &tuning));
             let mut ok = true;
             for result in &results {
                 println!("{}", result.to_json());
@@ -320,10 +345,24 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                     );
                     ok = false;
                 }
-                if result.achieved_rows_per_sec < result.target_rows_per_sec * 0.98 {
+                if !result.generator_bound {
                     eprintln!(
-                        "fold-in {}:1 — generator offered only {:.0} of {} rows/sec, so this \
-                         row is a floor on the engine, not a measurement of it (#276)",
+                        "fold-in {}:1 — T3 {} at {} rows/sec: folded {} (offered {:.0}/sec)",
+                        result.fold_in_ratio,
+                        if result.kept_target_rate { "YES" } else { "NO" },
+                        result.target_rows_per_sec,
+                        match result.folded_rows_per_sec {
+                            Some(rate) => format!("{rate:.0} rows/sec end to end"),
+                            None => "never caught up within the grace period".to_string(),
+                        },
+                        result.achieved_rows_per_sec,
+                    );
+                }
+                if result.generator_bound {
+                    eprintln!(
+                        "GENERATOR-BOUND: fold-in {}:1 — generator offered only {:.0} of {} \
+                         rows/sec and the aggregate drained all of it, so this row says nothing \
+                         about T3 at the target; raise --connections",
                         result.fold_in_ratio,
                         result.achieved_rows_per_sec,
                         result.target_rows_per_sec
@@ -334,6 +373,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         }
 
         "intake-ceiling" => {
+            let connections = connections(args).unwrap_or(load::DEFAULT_CONNECTIONS);
             let rows_per_commit = number(args, "--rows-per-commit")
                 .map(|v| v as usize)
                 .unwrap_or(INTAKE_DEFAULT_ROWS_PER_COMMIT);
@@ -345,28 +385,48 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             // `rows_per_commit`.
             let group_commit = group_commit(args, Some(trellis::GroupCommitConfig::default()));
 
+            // `--rate <rows/sec>` paces the generator instead of running it
+            // flat out — enough to exceed the ceiling without writing (and
+            // storing) everything the generator could.
+            let pace = number(args, "--rate").map_or(load::Pace::Max, load::Pace::RowsPerSec);
+
             let result = runtime().block_on(intake_ceiling::run(
-                rows_per_commit,
-                duration,
+                load::ParallelLoad {
+                    connections,
+                    rows_per_commit,
+                    duration,
+                    groups: None,
+                    pace,
+                },
                 grace,
                 group_commit,
             ));
             println!("{}", result.to_json());
+            if result.generator_bound {
+                eprintln!(
+                    "GENERATOR-BOUND: intake appended everything offered while it was offered \
+                     ({:.0} rows/sec from {} connections) — a floor on intake, not its ceiling; \
+                     raise --connections",
+                    result.append_achieved_rows_per_sec, result.connections
+                );
+            } else if result.intake_kept_pace {
+                eprintln!(
+                    "intake kept pace with the full {:.0} rows/sec offered — its ceiling is above \
+                     that; raise --rate",
+                    result.offered_achieved_rows_per_sec
+                );
+            } else {
+                eprintln!(
+                    "intake ceiling: {:.0} rows/sec appended under {:.0} rows/sec offered",
+                    result.append_achieved_rows_per_sec, result.offered_achieved_rows_per_sec
+                );
+            }
             if result.append_backlog > 0 {
                 eprintln!(
-                    "intake never caught up within the grace period ({} of {} rows appended, \
-                     {} behind) — {:.0} rows/sec is a floor, not the ceiling; retry with a \
-                     shorter --duration-secs or a longer --grace-secs",
-                    result.ring_rows_appended,
-                    result.rows_offered,
-                    result.append_backlog,
-                    result.append_achieved_rows_per_sec
-                );
-            } else if result.generator_bound {
-                eprintln!(
-                    "append kept pace with everything offered ({:.0} rows/sec) — the generator \
-                     was the limiter, so this is a floor on intake, not its ceiling (#276)",
-                    result.append_achieved_rows_per_sec
+                    "intake never drained within the grace period ({} of {} rows appended, {} \
+                     behind) — the window's append rate stands, but retry with a longer \
+                     --grace-secs to confirm every row arrives",
+                    result.ring_rows_appended, result.rows_offered, result.append_backlog
                 );
             }
             Some(true)
@@ -386,6 +446,19 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 result.wal_bytes_per_sec / 1024.0,
                 result.seals_per_sec,
             );
+            Some(true)
+        }
+
+        "generator-reach" => {
+            let connections = connections(args).unwrap_or(load::DEFAULT_CONNECTIONS);
+            let rows_per_commit = number(args, "--rows-per-commit")
+                .map(|v| v as usize)
+                .unwrap_or(INTAKE_DEFAULT_ROWS_PER_COMMIT);
+            let duration = secs(args, "--duration-secs").unwrap_or(REACH_DEFAULT_DURATION);
+
+            let result =
+                runtime().block_on(generator_reach::run(connections, rows_per_commit, duration));
+            println!("{}", result.to_json());
             Some(true)
         }
 
@@ -420,11 +493,12 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
             );
             ok = false;
         }
-        if probe.achieved_rows_per_sec < probe.target_rows_per_sec * 0.98 {
+        if probe.generator_bound {
             eprintln!(
-                "{} at {} rows/sec: generator offered only {:.0}/sec — read this row as a \
-                 statement about the generator, not the engine (#276)",
-                scenario, probe.target_rows_per_sec, probe.achieved_rows_per_sec
+                "GENERATOR-BOUND: {} at {} rows/sec — generator offered only {:.0}/sec from {} \
+                 connections and the engine drained all of it; this row measured the \
+                 generator, not the engine (raise --connections)",
+                scenario, probe.target_rows_per_sec, probe.achieved_rows_per_sec, probe.connections
             );
         }
     }
@@ -551,6 +625,32 @@ mod tests {
             number_list(&argv(&["r", "--rates", "1000,2.5e5"]), "--rates"),
             Some(vec![1000.0, 250_000.0])
         );
+    }
+
+    #[test]
+    fn offer_defaults_to_the_parallel_generators_connection_count() {
+        let o = offer(
+            &argv(&["fold-in-ratio"]),
+            Duration::from_secs(20),
+            Duration::from_secs(120),
+        );
+        assert_eq!(o.connections, load::DEFAULT_CONNECTIONS);
+        assert_eq!(o.duration, Duration::from_secs(20));
+        assert_eq!(o.grace, Duration::from_secs(120));
+
+        let o = offer(
+            &argv(&["fold-in-ratio", "--connections", "16", "--grace-secs", "5"]),
+            Duration::from_secs(20),
+            Duration::from_secs(120),
+        );
+        assert_eq!(o.connections, 16);
+        assert_eq!(o.grace, Duration::from_secs(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "--connections must be at least 1")]
+    fn zero_connections_is_rejected() {
+        connections(&argv(&["intake-ceiling", "--connections", "0"]));
     }
 
     #[test]

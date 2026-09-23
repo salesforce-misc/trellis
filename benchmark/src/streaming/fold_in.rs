@@ -12,6 +12,12 @@
 //! `groups = target_rows_per_sec / fold_in_ratio`: at 10:1 offering 400k
 //! rows/sec that's 40,000 groups each taking ~10 rows/sec; at 1000:1, 400
 //! groups each taking ~1,000 rows/sec.
+//!
+//! Load comes from the multi-connection generator, paced at the target
+//! ([`run_parallel_load`]): before issue #276 a single connection offered
+//! this scenario's 400k rows/sec target, undershot it at every ratio, and
+//! still reported `sustained: true` — a verdict on the generator that read
+//! like one on T3. `generator_bound` now flags exactly that combination.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,11 +27,14 @@ use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
-use crate::streaming::load::{LoadConfig, run_controlled_load};
+use crate::streaming::load::{
+    GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
+};
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
     T1_BOUNDS, counter_value, scrape,
 };
+use crate::streaming::throughput::Offer;
 use crate::streaming::tuning::EngineTuning;
 
 /// A mid-sized commit shape — deliberately neither of the transaction-shape
@@ -45,13 +54,30 @@ pub struct FoldInResult {
     pub fold_in_ratio: usize,
     pub groups: usize,
     pub target_rows_per_sec: f64,
+    /// Generator writer connections.
+    pub connections: usize,
     pub offered_duration_secs: f64,
     pub rows_issued: u64,
     pub achieved_rows_per_sec: f64,
+    /// Issue #276's self-check: the generator undershot the target and the
+    /// aggregate still drained everything it got — `sustained` then says
+    /// nothing about T3 at `target_rows_per_sec`.
+    pub generator_bound: bool,
     pub changes_applied: u64,
     /// Whether apply activity went quiet before the grace deadline — see
     /// [`run_probe`] on why this scenario can't use a row-count backlog.
     pub sustained: bool,
+    /// Source rows over the time from the offer window opening until the
+    /// target had folded in every one of them — the rate the aggregate
+    /// actually kept, which is what T3 asks about. `sustained` alone can't
+    /// answer that: it only says the backlog drained within `grace`, and a
+    /// long grace lets a pipeline running at a fraction of the target pass.
+    /// `None` when the target never caught up within the grace period.
+    pub folded_rows_per_sec: Option<f64>,
+    /// Whether `folded_rows_per_sec` kept up with the target (within
+    /// [`GENERATOR_UNDERSHOOT_TOLERANCE`]): T3's yes-or-no at this ratio.
+    /// Only meaningful when `generator_bound` is false.
+    pub kept_target_rate: bool,
     pub e2e_count: u64,
     pub e2e_p50_bucket_frac: f64,
     pub e2e_p99_bucket_frac: f64,
@@ -67,19 +93,28 @@ impl FoldInResult {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"scenario\":\"fold-in-ratio\",\"fold_in_ratio\":{},\"groups\":{},\
-             \"target_rows_per_sec\":{},\"offered_duration_secs\":{:.3},\"rows_issued\":{},\
-             \"achieved_rows_per_sec\":{:.1},\"changes_applied\":{},\"sustained\":{},\
+             \"target_rows_per_sec\":{},\"connections\":{},\"offered_duration_secs\":{:.3},\
+             \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
+             \"changes_applied\":{},\"sustained\":{},\"folded_rows_per_sec\":{},\
+             \"kept_target_rate\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{}}}",
             self.fold_in_ratio,
             self.groups,
             self.target_rows_per_sec,
+            self.connections,
             self.offered_duration_secs,
             self.rows_issued,
             self.achieved_rows_per_sec,
+            self.generator_bound,
             self.changes_applied,
             self.sustained,
+            match self.folded_rows_per_sec {
+                Some(rate) => format!("{rate:.1}"),
+                None => "null".to_string(),
+            },
+            self.kept_target_rate,
             self.e2e_count,
             self.e2e_p50_bucket_frac,
             self.e2e_p99_bucket_frac,
@@ -161,9 +196,9 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
 }
 
 /// One probe: installs a single `SUM`/`COUNT` aggregate over a fresh source
-/// table, offers `target_rows_per_sec` for `offered_duration` spread across
-/// `groups` group keys, then waits up to `grace` for apply activity to go
-/// quiet.
+/// table, offers `target_rows_per_sec` for `offer.duration` from
+/// `offer.connections` writers, spread across `groups` group keys, then waits
+/// up to `offer.grace` for the target to fold in every row.
 ///
 /// "Caught up" here can't wait for `changes_applied` to reach `rows_issued`
 /// the way the 1-1 probes do: an aggregate's applied-change count is bounded
@@ -173,12 +208,10 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
 pub async fn run_probe(
     fold_in_ratio: usize,
     target_rows_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> FoldInResult {
     let groups = ((target_rows_per_sec / fold_in_ratio as f64).round() as usize).max(1);
-    let commits_per_sec = target_rows_per_sec / ROWS_PER_COMMIT as f64;
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -216,15 +249,17 @@ pub async fn run_probe(
         HistogramSnapshot::capture(&before, END_TO_END_LATENCY_METRIC, &terminal, &T1_BOUNDS);
     let changes_before = counter_value(&before, CHANGES_APPLIED_METRIC, &terminal);
 
-    let load = run_controlled_load(
-        &raw,
+    let offer_start = Instant::now();
+    let load = run_parallel_load(
+        db.dsn(),
         SOURCE_TABLE,
         1,
-        &LoadConfig {
-            commits_per_sec,
+        &ParallelLoad {
+            connections: offer.connections,
             rows_per_commit: ROWS_PER_COMMIT,
-            duration: offered_duration,
+            duration: offer.duration,
             groups: Some(groups),
+            pace: Pace::RowsPerSec(target_rows_per_sec),
         },
     )
     .await;
@@ -243,15 +278,16 @@ pub async fn run_probe(
     // also why its aggregate runs carried no oracle check that could have
     // caught it.
     let expected_rows = load.rows_issued as i64 + 1; // + the warm-up row
-    let grace_deadline = Instant::now() + grace;
-    let mut drained = false;
+    let grace_deadline = Instant::now() + offer.grace;
+    let mut drained_after = None;
     while Instant::now() < grace_deadline {
         if folded_rows(&raw, &terminal).await >= expected_rows {
-            drained = true;
+            drained_after = Some(offer_start.elapsed());
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    let drained = drained_after.is_some();
 
     let after = scrape();
     let changes_now = counter_value(&after, CHANGES_APPLIED_METRIC, &terminal);
@@ -263,15 +299,24 @@ pub async fn run_probe(
 
     client.shutdown().await.expect("client shutdown");
 
+    let achieved_rows_per_sec = load.achieved_rows_per_sec();
+    let folded_rows_per_sec =
+        drained_after.map(|elapsed| load.rows_issued as f64 / elapsed.as_secs_f64());
     FoldInResult {
         fold_in_ratio,
         groups,
         target_rows_per_sec,
+        connections: offer.connections,
         offered_duration_secs: load.elapsed.as_secs_f64(),
         rows_issued: load.rows_issued,
-        achieved_rows_per_sec: load.achieved_rows_per_sec(),
+        achieved_rows_per_sec,
+        generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, drained),
         changes_applied: changes_now.saturating_sub(changes_before),
         sustained: drained,
+        folded_rows_per_sec,
+        kept_target_rate: folded_rows_per_sec.is_some_and(|rate| {
+            rate >= target_rows_per_sec * (1.0 - GENERATOR_UNDERSHOOT_TOLERANCE)
+        }),
         e2e_count: window.count,
         e2e_p50_bucket_frac: window.fraction(LE_P50),
         e2e_p99_bucket_frac: window.fraction(LE_P99),
@@ -286,13 +331,12 @@ pub async fn run_probe(
 pub async fn run_sweep(
     ratios: &[usize],
     target_rows_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> Vec<FoldInResult> {
     let mut results = Vec::with_capacity(ratios.len());
     for &ratio in ratios {
-        results.push(run_probe(ratio, target_rows_per_sec, offered_duration, grace, tuning).await);
+        results.push(run_probe(ratio, target_rows_per_sec, offer, tuning).await);
     }
     results
 }

@@ -17,10 +17,12 @@
 //! but it is not a T2 confirmation. Once the ramp identifies a knee,
 //! confirming it over T2's real window is a separate, longer run.
 //!
-//! Also read `achieved_rows_per_sec` next to `target_rows_per_sec`, always: at
-//! high commit rates the single-connection generator saturates before the
-//! engine does, and a `sustained: true` there says more about the generator
-//! than about Trellis (see [`crate::streaming::load`]).
+//! Load comes from the multi-connection generator
+//! ([`crate::streaming::load::run_parallel_load`]) paced at the target on a
+//! shared schedule, so a high target is actually offered rather than capped
+//! by one connection. Every probe still reports `generator_bound`
+//! ([`generator_bound`]): a `sustained: true` whose achieved rate undershot
+//! the target says nothing about the engine at that target.
 
 use std::time::{Duration, Instant};
 
@@ -31,7 +33,7 @@ use crate::streaming::chain::{
     ChainOracle, check_chain_oracle, create_chain_source_table, install_chain_hops,
     wait_for_chain_live, warm_up,
 };
-use crate::streaming::load::{LoadConfig, run_controlled_load};
+use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
     T1_BOUNDS, counter_value, scrape,
@@ -60,11 +62,18 @@ pub struct ThroughputProbe {
     pub target_rows_per_sec: f64,
     pub rows_per_commit: usize,
     pub commits_per_sec: f64,
+    /// Generator writer connections.
+    pub connections: usize,
     pub offered_duration_secs: f64,
     pub rows_issued: u64,
     /// What the generator actually managed — compare against
     /// `target_rows_per_sec` before reading anything else here.
     pub achieved_rows_per_sec: f64,
+    /// Issue #276's self-check: the generator undershot the target and the
+    /// engine drained everything it did get, so this probe measured the
+    /// generator. Its `sustained` says nothing about the engine at
+    /// `target_rows_per_sec`.
+    pub generator_bound: bool,
     pub changes_applied: u64,
     pub backlog_after_grace: i64,
     pub sustained: bool,
@@ -79,8 +88,9 @@ impl ThroughputProbe {
     pub fn to_json(&self, scenario: &str) -> String {
         format!(
             "{{\"scenario\":\"{}\",\"target_rows_per_sec\":{},\"rows_per_commit\":{},\
-             \"commits_per_sec\":{:.2},\"offered_duration_secs\":{},\"rows_issued\":{},\
-             \"achieved_rows_per_sec\":{:.1},\"changes_applied\":{},\
+             \"commits_per_sec\":{:.2},\"connections\":{},\"offered_duration_secs\":{},\
+             \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
+             \"changes_applied\":{},\
              \"backlog_after_grace\":{},\"sustained\":{},\"e2e_count\":{},\
              \"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_source_rows\":{},\
@@ -90,9 +100,11 @@ impl ThroughputProbe {
             self.target_rows_per_sec,
             self.rows_per_commit,
             self.commits_per_sec,
+            self.connections,
             self.offered_duration_secs,
             self.rows_issued,
             self.achieved_rows_per_sec,
+            self.generator_bound,
             self.changes_applied,
             self.backlog_after_grace,
             self.sustained,
@@ -109,18 +121,28 @@ impl ThroughputProbe {
     }
 }
 
+/// How a probe's load is offered — the generator's writer count, the offer
+/// window, and the drain grace after it — shared by every probe in a ramp or
+/// sweep (and by [`crate::streaming::fold_in`]'s).
+#[derive(Debug, Clone, Copy)]
+pub struct Offer {
+    pub connections: usize,
+    pub duration: Duration,
+    pub grace: Duration,
+}
+
 /// Runs one probe against a fresh, isolated single-hop chain: offers
 /// `rows_per_commit`-shaped commits at `commits_per_sec` (target rate =
-/// their product) for `offered_duration`, waits up to `grace` for the backlog
-/// to drain, and reports whether it did plus the latency fractions observed
-/// over the window.
+/// their product) for `offer.duration`, waits up to `offer.grace` for the
+/// backlog to drain, and reports whether it did plus the latency fractions
+/// observed over the window.
 pub async fn run_probe(
     rows_per_commit: usize,
     commits_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> ThroughputProbe {
+    let target_rows_per_sec = commits_per_sec * rows_per_commit as f64;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -142,11 +164,17 @@ pub async fn run_probe(
         HistogramSnapshot::capture(&before, END_TO_END_LATENCY_METRIC, terminal, &T1_BOUNDS);
     let changes_before = counter_value(&before, CHANGES_APPLIED_METRIC, terminal);
 
-    let load = run_controlled_load(
-        &raw,
+    let load = run_parallel_load(
+        db.dsn(),
         &chain.source,
         1,
-        &LoadConfig::plain(commits_per_sec, rows_per_commit, offered_duration),
+        &ParallelLoad {
+            connections: offer.connections,
+            rows_per_commit,
+            duration: offer.duration,
+            groups: None,
+            pace: Pace::RowsPerSec(target_rows_per_sec),
+        },
     )
     .await;
 
@@ -172,7 +200,7 @@ pub async fn run_probe(
     // counter is running ahead, rather than one per poll.
     const CONFIRM_INTERVAL: Duration = Duration::from_secs(2);
     let expected_rows = load.rows_issued as i64 + 1; // + the warm-up row
-    let grace_deadline = Instant::now() + grace;
+    let grace_deadline = Instant::now() + offer.grace;
     let mut next_confirm = Instant::now();
     while Instant::now() < grace_deadline {
         let applied = counter_value(&scrape(), CHANGES_APPLIED_METRIC, terminal)
@@ -210,13 +238,20 @@ pub async fn run_probe(
     // includes the warm-up row, which the generator's `rows_issued` doesn't.
     let landed = oracle.terminal_rows - 1;
     let backlog = load.rows_issued as i64 - landed;
+    let achieved_rows_per_sec = load.achieved_rows_per_sec();
     ThroughputProbe {
-        target_rows_per_sec: commits_per_sec * rows_per_commit as f64,
+        target_rows_per_sec,
         rows_per_commit,
         commits_per_sec,
-        offered_duration_secs: offered_duration.as_secs_f64(),
+        connections: offer.connections,
+        offered_duration_secs: offer.duration.as_secs_f64(),
         rows_issued: load.rows_issued,
-        achieved_rows_per_sec: load.achieved_rows_per_sec(),
+        achieved_rows_per_sec,
+        generator_bound: generator_bound(
+            Some(target_rows_per_sec),
+            achieved_rows_per_sec,
+            backlog <= 0,
+        ),
         changes_applied,
         backlog_after_grace: backlog,
         sustained: backlog <= 0,
@@ -234,22 +269,14 @@ pub async fn run_probe(
 /// first `false` one the rate that broke it.
 pub async fn run_ramp(
     candidate_rates: &[f64],
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> Vec<ThroughputProbe> {
     let mut probes = Vec::new();
     for &target_rows_per_sec in candidate_rates {
         let rows_per_commit =
             ((target_rows_per_sec / RAMP_COMMITS_PER_SEC).round() as usize).max(1);
-        let probe = run_probe(
-            rows_per_commit,
-            RAMP_COMMITS_PER_SEC,
-            offered_duration,
-            grace,
-            tuning,
-        )
-        .await;
+        let probe = run_probe(rows_per_commit, RAMP_COMMITS_PER_SEC, offer, tuning).await;
         let sustained = probe.sustained;
         probes.push(probe);
         if !sustained {
@@ -271,8 +298,7 @@ pub async fn run_ramp(
 pub async fn run_shape_sweep(
     shapes: &[usize],
     target_rows_per_sec: f64,
-    offered_duration: Duration,
-    grace: Duration,
+    offer: Offer,
     tuning: &EngineTuning,
 ) -> Vec<ThroughputProbe> {
     let mut probes = Vec::with_capacity(shapes.len());
@@ -281,8 +307,7 @@ pub async fn run_shape_sweep(
             run_probe(
                 rows_per_commit,
                 target_rows_per_sec / rows_per_commit as f64,
-                offered_duration,
-                grace,
+                offer,
                 tuning,
             )
             .await,

@@ -38,10 +38,27 @@
 //! cargo run -p benchmark --features engine-access --release -- fold-in-ratio --ratios 10,100,1000 --target-rate 400000
 //! # the ceiling every throughput number sits under, and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 5
+//! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1 --rate 300000
 //! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --duration-secs 60
+//! # the load generator's own reach, no engine running (issue #276)
+//! cargo run -p benchmark --features engine-access --release -- generator-reach --connections 8 --rows-per-commit 1
 //! ```
 //!
-//! All seven accept `--application-threads`, `--poll-interval-ms`,
+//! ### Load generators, and the generator-bound flag (issue #276)
+//!
+//! The latency ladder (`hop-ladder`/`hop-latency`) offers load from one
+//! precisely paced connection, unchanged since #270 so its numbers stay
+//! comparable. Every other scenario that offers load uses the multi-connection
+//! generator ([`streaming::load::run_parallel_load`]): `--connections <n>`
+//! writers (default [`streaming::load::DEFAULT_CONNECTIONS`]) paced on one
+//! shared schedule at the scenario's target, or flat out for
+//! `intake-ceiling`/`generator-reach` (`intake-ceiling --rate` paces it).
+//! Every result carrying a target reports `generator_bound`
+//! ([`streaming::load::generator_bound`]): true when the achieved rate
+//! materially undershot the target while the engine kept up, i.e. the row
+//! measured the generator. Read it before reading `sustained`.
+//!
+//! All the engine scenarios accept `--application-threads`, `--poll-interval-ms`,
 //! `--maintenance-interval-ms`, `--reconcile-interval-ms` and
 //! `--group-commit <max_rows>,<max_delay_ms>|off` (issue #274; the last
 //! defaults to stock `ClientOptions::default()`'s shipped-on group-commit,

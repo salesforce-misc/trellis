@@ -16,7 +16,7 @@ use crate::streaming::chain::{
     ChainOracle, check_chain_oracle, create_chain_source_table, install_chain_hops,
     wait_for_chain_live, warm_up,
 };
-use crate::streaming::load::{LoadConfig, run_controlled_load};
+use crate::streaming::load::{LoadConfig, generator_bound, run_controlled_load};
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, T1_BOUNDS, T1Evaluation,
     counter_value, per_hop_baseline, per_hop_json, per_hop_mean_ms, scrape,
@@ -52,6 +52,11 @@ pub struct HopLatencyResult {
     /// number that looks fast because most changes were never observed fails
     /// here rather than passing quietly.
     pub changes_match_committed: bool,
+    /// Issue #276's self-check ([`generator_bound`]): the single-connection
+    /// generator undershot `offered_commits_per_sec` while the chain still
+    /// converged. At the ladder's low default rate this should never fire; if
+    /// it does, the depth was measured at a lower rate than it claims.
+    pub generator_bound: bool,
     pub e2e_count: u64,
     pub e2e_p50_bucket_frac: f64,
     pub e2e_p99_bucket_frac: f64,
@@ -78,7 +83,7 @@ impl HopLatencyResult {
              \"poll_interval_ms\":{},\"reconcile_interval_ms\":{},\"application_threads\":{},\
              \"offered_commits_per_sec\":{},\"duration_secs\":{},\"commits_issued\":{},\
              \"rows_issued\":{},\"actual_elapsed_secs\":{:.3},\"changes_applied_terminal\":{},\
-             \"changes_match_committed\":{},\"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\
+             \"changes_match_committed\":{},\"generator_bound\":{},\"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\
              \"e2e_p99_bucket_frac\":{:.4},\"e2e_max_under_1s\":{},\"t1_p50_pass\":{},\
              \"t1_p99_pass\":{},\"t1_all_pass\":{},\"per_hop_mean_ms\":[{}],\
              \"per_hop_increment_ms\":{},\"oracle_ok\":{},\"oracle_source_rows\":{},\
@@ -96,6 +101,7 @@ impl HopLatencyResult {
             self.actual_elapsed_secs,
             self.changes_applied_terminal,
             self.changes_match_committed,
+            self.generator_bound,
             self.e2e_count,
             self.e2e_p50_bucket_frac,
             self.e2e_p99_bucket_frac,
@@ -224,6 +230,12 @@ pub async fn run_depth(
         actual_elapsed_secs: load.elapsed.as_secs_f64(),
         changes_applied_terminal: changes_applied,
         changes_match_committed: changes_applied >= load.rows_issued,
+        // 1 row per commit, so the target rows/sec is the commit rate.
+        generator_bound: generator_bound(
+            Some(commits_per_sec),
+            load.achieved_rows_per_sec(),
+            oracle.fully_converged,
+        ),
         e2e_count: eval.count,
         e2e_p50_bucket_frac: eval.p50_frac,
         e2e_p99_bucket_frac: eval.p99_frac,
