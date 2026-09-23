@@ -1466,6 +1466,24 @@ pub async fn alter_transform(
         .await?;
     }
 
+    // The same version-fence bump `create_definition_inner` makes for a
+    // brand-new definition — see this function's own doc comment. It runs
+    // *before* the DDL below, not after it: a drain's Phase 3 takes this
+    // row `for share` and then row-locks the target, so taking the target's
+    // `ACCESS EXCLUSIVE` lock first and this row second is the opposite
+    // order and deadlocks against any drain in flight. In this order, a
+    // drain that already holds the row finishes first, and one that arrives
+    // later waits for this commit and then misses the fence.
+    txn.query_one(
+        "insert into source_table_versions (source_table, version) \
+         values ($1, 1) \
+         on conflict (source_table) \
+         do update set version = source_table_versions.version + 1 \
+         returning version",
+        &[&current.source_table],
+    )
+    .await?;
+
     for field in &real_drops {
         txn.batch_execute(&format!(
             "alter table {target_ident} drop column if exists {}",
@@ -1518,18 +1536,6 @@ pub async fn alter_transform(
          set definition_text = $1, definition_version = $2 \
          where id = $3",
         &[&new_text, &new_version, &current.id],
-    )
-    .await?;
-
-    // The same version-fence bump `create_definition_inner` makes for a
-    // brand-new definition — see this function's own doc comment.
-    txn.query_one(
-        "insert into source_table_versions (source_table, version) \
-         values ($1, 1) \
-         on conflict (source_table) \
-         do update set version = source_table_versions.version + 1 \
-         returning version",
-        &[&current.source_table],
     )
     .await?;
 

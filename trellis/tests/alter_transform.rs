@@ -766,6 +766,88 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// Lock order against a concurrent drain. Apply's version fence takes the
+/// `source_table_versions` row `for share` and then row-locks the target;
+/// `alter_transform` must take that same row *before* its DDL locks the
+/// target, or the two deadlock. This test stands in for the drain with a raw
+/// transaction that takes the same two locks in the same order. It holds the
+/// version row until the ALTER is blocked behind it, then locks target rows.
+#[tokio::test]
+async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = Arc::new(running(db.dsn()).await);
+    wait_for_live(&raw, "order_calc").await;
+
+    let mut drain = connect_raw(db.dsn()).await;
+    let txn = drain.transaction().await.expect("begin");
+    txn.query_one(
+        "select version from source_table_versions \
+         where split_part(source_table, '.', 2) = 'orders' for share",
+        &[],
+    )
+    .await
+    .expect("take the version fence row for share");
+
+    let alter = {
+        let trellis = Arc::clone(&trellis);
+        tokio::spawn(async move {
+            trellis
+                .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+                .await
+        })
+    };
+
+    poll_until(
+        Duration::from_secs(30),
+        "the ALTER must block on the version fence row",
+        async || {
+            raw.query_one(
+                "select count(*) from pg_stat_activity \
+                 where wait_event_type = 'Lock' \
+                   and query like 'insert into source_table_versions%'",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get::<_, i64>(0)
+                > 0
+        },
+    )
+    .await;
+
+    txn.query(
+        &format!("select id from {DEFAULT_TARGET_SCHEMA}.order_calc order by id for update"),
+        &[],
+    )
+    .await
+    .expect("a drain holding the version fence must still be able to lock target rows");
+    txn.commit().await.expect("commit the drain");
+
+    let applied = alter
+        .await
+        .expect("join the ALTER")
+        .expect("the ALTER completes once the drain commits");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["double_a".to_string()]);
+
+    Arc::into_inner(trellis)
+        .expect("the ALTER task released its handle")
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
+
 // ---------------------------------------------------------------------
 // Idempotency
 // ---------------------------------------------------------------------
