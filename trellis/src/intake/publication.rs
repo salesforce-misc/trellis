@@ -1266,10 +1266,10 @@ enum SlotHealth {
     Missing,
     Invalidated,
     /// Present and not `lost`, but its `confirmed_flush_lsn` is past the
-    /// position this instance last confirmed (issue #406). See
-    /// [`slot_health`] for why that means the slot isn't the one this
-    /// instance was acknowledging.
-    AheadOfConfirmed,
+    /// position this instance last confirmed, or not set yet because another
+    /// session is still creating it (issue #406). See [`slot_health`] for why
+    /// either means the slot isn't the one this instance was acknowledging.
+    Recreated,
 }
 
 /// Scoped to `database = current_database()` for the same reason
@@ -1321,11 +1321,15 @@ async fn slot_health(
         return Ok(SlotHealth::Invalidated);
     }
     // NULL only for a physical slot (filtered out by the `database` scope) or
-    // a logical slot another session is still creating.
+    // a logical slot another session is still creating, which Postgres gives
+    // a position once it reaches its consistent point. The slot this instance
+    // acknowledged had one from the moment its creation returned, so a NULL
+    // one is a recreate in progress; called healthy, intake could start
+    // streaming from it, past the gap, as soon as the creation finished.
     let confirmed_flush: Option<PgLsn> = row.get(1);
     Ok(match confirmed_flush {
-        Some(position) if position > last_confirmed_lsn => SlotHealth::AheadOfConfirmed,
-        _ => SlotHealth::Healthy,
+        Some(position) if position <= last_confirmed_lsn => SlotHealth::Healthy,
+        _ => SlotHealth::Recreated,
     })
 }
 
@@ -1348,7 +1352,7 @@ pub async fn require_slot_healthy(
 ) -> Result<(), IntakeError> {
     match slot_health(client, slot, last_confirmed_lsn).await? {
         SlotHealth::Healthy => Ok(()),
-        SlotHealth::Missing | SlotHealth::Invalidated | SlotHealth::AheadOfConfirmed => {
+        SlotHealth::Missing | SlotHealth::Invalidated | SlotHealth::Recreated => {
             Err(IntakeError::SlotLost {
                 slot: slot.to_string(),
                 last_confirmed_lsn: u64::from(last_confirmed_lsn),

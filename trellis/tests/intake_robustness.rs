@@ -966,6 +966,97 @@ async fn a_slot_recreated_under_the_same_name_is_not_healthy() {
         .expect("clean up the slot");
 }
 
+/// Issue #406: a slot another session is still creating under the name this
+/// instance confirmed work against has no `confirmed_flush_lsn` yet (Postgres
+/// sets it only once the new slot reaches its consistent point, which waits
+/// for every transaction running at creation to finish). The slot this
+/// instance acknowledged always has one, so a NULL position is a recreate in
+/// progress, not a healthy slot. Called healthy, intake could start streaming
+/// the moment the creation finished, from past the gap.
+#[tokio::test]
+async fn a_slot_another_session_is_still_creating_is_not_healthy() {
+    const SLOT: &str = "creating_slot";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let setup = connect_raw(db.dsn()).await;
+
+    let confirmed: PgLsn = setup
+        .query_one(
+            "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&SLOT],
+        )
+        .await
+        .expect("create the original slot")
+        .get(0);
+    setup
+        .execute("select pg_drop_replication_slot($1)", &[&SLOT])
+        .await
+        .expect("drop the original slot");
+
+    // An open transaction with an xid holds the new slot's creation short of
+    // its consistent point until it ends.
+    let blocker = connect_raw(db.dsn()).await;
+    blocker
+        .batch_execute("begin; select pg_current_xact_id();")
+        .await
+        .expect("open a transaction with an xid");
+    let creator = connect_raw(db.dsn()).await;
+    let creating = tokio::spawn(async move {
+        creator
+            .query_one(
+                "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&SLOT],
+            )
+            .await
+            .map(|_| ())
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let in_creation: bool = setup
+            .query_one(
+                "select exists(select 1 from pg_replication_slots where slot_name = $1 \
+                 and database = current_database() and confirmed_flush_lsn is null)",
+                &[&SLOT],
+            )
+            .await
+            .expect("look for the slot in creation")
+            .get(0);
+        if in_creation {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot never showed up mid-creation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let health = publication::require_slot_healthy(&setup, SLOT, confirmed).await;
+
+    blocker
+        .batch_execute("commit")
+        .await
+        .expect("end the blocking transaction");
+    creating
+        .await
+        .expect("join the creating task")
+        .expect("the slot's creation finishes once the blocker ends");
+    setup
+        .execute("select pg_drop_replication_slot($1)", &[&SLOT])
+        .await
+        .expect("clean up the slot");
+
+    match health {
+        Err(IntakeError::SlotLost { slot, .. }) => assert_eq!(slot, SLOT),
+        Err(other) => panic!("expected SlotLost, got {other:?}"),
+        Ok(()) => panic!(
+            "a slot still being created under this instance's slot name is a recreate, not the \
+             slot this instance acknowledged, and must not be reported healthy"
+        ),
+    }
+}
+
 /// Item 6 (issue #32): the `wal_status = 'lost'` branch of
 /// `require_slot_healthy` — a slot the server actively invalidated because
 /// its retained WAL blew past `max_slot_wal_keep_size`, as distinct from
