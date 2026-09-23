@@ -399,6 +399,77 @@ impl NoisePlan {
     }
 }
 
+/// How a [`DbAdminAction::RestartPostgres`] stops the server before starting
+/// it again (issue #236).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartMode {
+    /// An orderly shutdown: open transactions roll back, clients are
+    /// disconnected, a shutdown checkpoint is written.
+    Fast,
+    /// No shutdown checkpoint, so the next start replays WAL through crash
+    /// recovery — what a power loss or an OOM kill of the postmaster leaves.
+    Immediate,
+}
+
+/// How a [`DbAdminAction::LoseSlot`] takes the replication slot away
+/// (issue #236). These are the two shapes of loss issue #310 recovers from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotLossKind {
+    /// The slot is gone: a manual drop, a pre-PG-17 failover, or the source
+    /// restored from a backup that carries no slot.
+    Dropped,
+    /// The slot still exists but the server invalidated it
+    /// (`wal_status = 'lost'`) because its retained WAL passed
+    /// `max_slot_wal_keep_size`.
+    Invalidated,
+}
+
+/// A database-administration action (issue #236, layer-3 bucket 5 in
+/// `docs/generative-test-suite.md` §7). Each one leaves the correct
+/// converged state unchanged, so the oracle needs no changes: the run
+/// quiesces after the op the action is anchored to and compares as usual.
+/// What each action adds is a demand on the engine, stated per variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DbAdminAction {
+    /// `CHECKPOINT`, fired after the anchor op is applied and before the
+    /// run waits for it, so the op's change is usually still in flight.
+    Checkpoint,
+    /// Restarts the Postgres server, at the same point as `Checkpoint`.
+    /// Every connection the engine holds (replication stream, producer
+    /// session, pool, wake listener) is severed while work is in flight, and
+    /// the engine has to reconnect by itself: the harness never restarts the
+    /// engine client for it.
+    RestartPostgres(RestartMode),
+    /// Loses the replication slot while the engine is stopped, with the
+    /// anchor op landing in the gap no stream will deliver. The harness
+    /// stops the engine, loses the slot, applies the op, and starts the
+    /// engine again. Issue #310's contract is then checked before anything
+    /// else: every installed transform must come up `paused` (the loss was
+    /// detected and nothing carried on over the gap). The harness then acts
+    /// as the operator and `RESUME`s every transform, and the rebuilt targets
+    /// must converge to the oracle like any other op.
+    LoseSlot(SlotLossKind),
+}
+
+/// One [`DbAdminAction`], anchored to `ops[op]` (so `op < ops.len()`). See
+/// each action for where exactly around that op it fires. Several events
+/// may share an anchor. They fire in the order they appear in
+/// [`DbAdminPlan::events`], except that a `LoseSlot` always brackets the
+/// op's apply and the others follow it, and a second `LoseSlot` on the same
+/// op adds nothing to the first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbAdminEvent {
+    pub op: usize,
+    pub action: DbAdminAction,
+}
+
+/// The database-administration schedule for one program run (issue #236),
+/// interleaved with its ops by `crate::run::run_convergence_with_db_admin`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DbAdminPlan {
+    pub events: Vec<DbAdminEvent>,
+}
+
 /// The composite row-key convention for an [`trellis::dev::defs::ast::KeySpace::Aggregate`]
 /// target (improvement-plan task B4): every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1

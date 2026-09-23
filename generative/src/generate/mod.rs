@@ -2430,6 +2430,7 @@ pub fn adversarial_noise_table() -> Table {
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
+    use crate::model::{DbAdminAction, DbAdminEvent, DbAdminPlan, RestartMode, SlotLossKind};
     use proptest::prelude::*;
 
     /// One in this many awkward-value draws comes back `None` (SQL `NULL`)
@@ -3155,6 +3156,70 @@ mod strategy {
         })
     }
 
+    /// Issue #236: one [`DbAdminAction`] other than a slot loss, weighted
+    /// toward the cheap ones.
+    fn db_admin_in_place_action() -> impl Strategy<Value = DbAdminAction> {
+        prop_oneof![
+            2 => Just(DbAdminAction::Checkpoint),
+            2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
+            1 => Just(DbAdminAction::RestartPostgres(RestartMode::Immediate)),
+        ]
+    }
+
+    fn slot_loss_kind() -> impl Strategy<Value = SlotLossKind> {
+        prop_oneof![
+            // Invalidating writes and checkpoints ~20MB of WAL per round, so
+            // it's drawn less often than a plain drop.
+            2 => Just(SlotLossKind::Dropped),
+            1 => Just(SlotLossKind::Invalidated),
+        ]
+    }
+
+    /// Issue #236: a database-administration plan for `program`, 0-3 events
+    /// anchored anywhere in its ops.
+    ///
+    /// At most three, because every [`RestartMode`] restart makes the
+    /// engine's intake supervisor wait out a backoff that doubles from 1s
+    /// and resets only after an attempt stays up for 60s. Four restarts in
+    /// one short program already cost 1+2+4+8s.
+    ///
+    /// **A slot loss is anchored only on an op that removes no source row**
+    /// (an insert or an update, never a delete or truncate). The loss puts
+    /// that op in the gap, and the recovery is a `RESUME`, which rebuilds
+    /// from the source rows that exist and never visits a key the gap
+    /// deleted. That stale target row is issue #330. Once #330 is fixed,
+    /// widen this to every op; `generative/tests/db_admin.rs` keeps an
+    /// ignored pin for exactly that case.
+    pub fn db_admin_plan_for(program: &Program) -> impl Strategy<Value = DbAdminPlan> + use<> {
+        let op_count = program.ops.len();
+        let gap_candidates: Vec<usize> = program
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                matches!(
+                    op,
+                    Op::Insert { .. } | Op::BulkInsert { .. } | Op::Update { .. }
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let in_place = (0..op_count, db_admin_in_place_action())
+            .prop_map(|(op, action)| DbAdminEvent { op, action });
+        let event = if gap_candidates.is_empty() {
+            in_place.boxed()
+        } else {
+            let slot_loss = (proptest::sample::select(gap_candidates), slot_loss_kind()).prop_map(
+                |(op, kind)| DbAdminEvent {
+                    op,
+                    action: DbAdminAction::LoseSlot(kind),
+                },
+            );
+            prop_oneof![3 => in_place, 2 => slot_loss].boxed()
+        };
+        prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
+    }
+
     /// Improvement-plan task E2: draws a [`trivial_program_with`] program,
     /// then defers exactly one of its definitions' installs
     /// ([`defer_def_install`]) to some point strictly after the first seed
@@ -3336,9 +3401,9 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    bulk_insert_program, checkpoint_plan_for, noise_plan_for, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, trivial_one_to_one_program_with,
-    trivial_program, trivial_program_with,
+    bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, noise_plan_for,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]

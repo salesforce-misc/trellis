@@ -17,10 +17,12 @@
 //! programs can reuse it.
 
 mod coverage;
+mod db_admin;
 mod noise;
 mod two_instance;
 
 pub use coverage::Coverage;
+pub use db_admin::{check_slot_loss_detected, run_convergence_with_db_admin};
 pub use noise::run_convergence_with_noise;
 pub use two_instance::{
     InstanceLabel, InstanceRun, TwoInstanceError, run_two_instance_convergence,
@@ -33,7 +35,7 @@ use trellis::Pool;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 use crate::backend::{Backend, Snapshot};
-use crate::model::{Op, OpOutcome, Program};
+use crate::model::{DbAdminAction, Op, OpOutcome, Program};
 use crate::oracle::{self, ThreeWayReport};
 
 /// Classifies whether a property run counted as evidence at all (design doc
@@ -143,6 +145,22 @@ pub enum RunError {
     Restart(String),
     /// A scheduled [`Backend::scale_out`] (improvement-plan task E3) failed.
     ScaleOut(String),
+    /// Issue #236: carrying out a database-administration action failed
+    /// (the harness's side of it: restarting the server, reconnecting,
+    /// stopping or starting the engine, losing the slot, resuming).
+    DbAdmin {
+        op_index: usize,
+        action: DbAdminAction,
+        error: String,
+    },
+    /// Issue #236: after a lost replication slot the engine came back up
+    /// with these `(target, status)` definitions not `paused`, so it carried
+    /// on over a gap its stream never delivered instead of pausing them
+    /// (issue #310's contract).
+    SlotLossUndetected {
+        op_index: usize,
+        not_paused: Vec<(String, String)>,
+    },
 }
 
 /// Installs `program`, then applies each op and checks convergence after it.

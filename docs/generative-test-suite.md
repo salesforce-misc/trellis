@@ -289,7 +289,14 @@ Sequencing, cheapest-first (each its own future story under the epic):
 4. **Transaction shapes** (bucket 3) — a transaction held open across a batch
    boundary (via `OpenTransaction`).
 5. **Database administration** (bucket 1) — restart PG, checkpoint, slot
-   drop/invalidation.
+   drop/invalidation. Built (issue #236): `model::DbAdminAction`, driven by
+   `run::run_convergence_with_db_admin`, swept by
+   `tests/db_admin.rs`. A restart or checkpoint fires with the anchor op's
+   change still in flight and the engine must reconnect by itself. A slot
+   loss puts the anchor op in the gap and restarts the engine, which must
+   pause every transform (issue #310) before the harness resumes them as the
+   operator would. Not built yet: backup/restore with a cloned oracle, and
+   losing the slot while the engine is running.
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
    tables; promotes the auditor's negative wiring test to a swept property.
 

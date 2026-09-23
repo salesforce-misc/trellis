@@ -40,6 +40,10 @@
 //! (design doc §6: don't assert what you haven't run), not just a restated
 //! assumption.
 //!
+//! Since then the engine restarts intake on its own (issue #325) and a lost
+//! slot pauses transforms instead of wedging (issue #310), and issue #236
+//! built both follow-ups: see `tests/db_admin.rs`.
+//!
 //! Reuses the shared-cluster/isolated-database-per-case `Harness` pattern
 //! from `tests/convergence.rs` (see that file's module doc comment for why
 //! the cluster is a `thread_local`).

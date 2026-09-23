@@ -91,7 +91,10 @@ pub struct TestCluster {
     data_dir: PathBuf,
     socket_dir: PathBuf,
     port: u16,
-    server: Child,
+    // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
+    // through a shared reference: the generative suite keeps its cluster in
+    // a `thread_local` and only ever hands out `&TestCluster`.
+    server: Mutex<Child>,
     // Released after `Drop` stops the server (fields drop after the explicit
     // `Drop::drop` body), so a freed permit means a freed shmem segment.
     _permit: ClusterPermit,
@@ -145,67 +148,14 @@ impl TestCluster {
         );
 
         let log_path = root.join("postgres.log");
-        let log_file = fs::File::create(&log_path).expect("create postgres log file");
-        let server = Command::new("postgres")
-            .arg("-D")
-            .arg(&data_dir)
-            .arg("-h")
-            .arg("") // no TCP listener; unix socket only
-            .arg("-k")
-            .arg(&socket_dir)
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("-c")
-            .arg("wal_level=logical")
-            // Headroom, not a tuning knob: a `TestDatabase`'s `dropdb
-            // --force` fails silently while that database still has an
-            // *active* logical slot (see `TestDatabase::drop`), so a case
-            // whose `trellis::Client` hasn't finished its best-effort
-            // shutdown leaves both behind. Issue #188 gives every
-            // shared-cluster generative case its own slot *name*, which
-            // removes the cross-case collision but means such leaks
-            // accumulate rather than reusing one name — and a deep nightly
-            // run puts hundreds of cases on one cluster. 10 left only a
-            // handful of leaks' worth of room before
-            // `pg_create_logical_replication_slot` would start failing with
-            // "all replication slots are in use"; 50 is still trivial
-            // shared memory (a slot is a small fixed struct) and takes that
-            // off the table.
-            .arg("-c")
-            .arg("max_replication_slots=50")
-            .arg("-c")
-            .arg("max_wal_senders=50")
-            // Tests that assert on what the server logged (`log_statement =
-            // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
-            // file the two `Stdio::from` handles below point at. That only
-            // works while the server writes to its inherited stderr: with the
-            // logging collector on, the postmaster hands logging to a
-            // collector subprocess that writes its own rotated files under
-            // `$PGDATA/log` instead, and everything those tests want to scrape
-            // lands there rather than in the file they read.
-            //
-            // `logging_collector` defaults to `off` in vanilla Postgres, but
-            // some distributions ship a `postgresql.conf.sample` that turns it
-            // on (Fedora's does), and `initdb` copies that sample verbatim into
-            // the cluster it creates — so whether those tests pass depended on
-            // the packaging of whichever Postgres happened to be on `PATH`.
-            // Pinning it here makes the cluster's logging behaviour a property
-            // of the harness rather than of the host. It is a postmaster-level
-            // setting, so passing it on the command line also outranks both
-            // `postgresql.conf` and any later `ALTER SYSTEM`.
-            .arg("-c")
-            .arg("logging_collector=off")
-            .stdout(Stdio::from(log_file.try_clone().expect("clone log handle")))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .expect("spawn postgres");
+        let server = spawn_server(&data_dir, &socket_dir, port, &log_path);
 
         let cluster = Self {
             root,
             data_dir,
             socket_dir,
             port,
-            server,
+            server: Mutex::new(server),
             _permit: permit,
         };
         cluster.wait_ready(&log_path);
@@ -250,7 +200,39 @@ impl TestCluster {
     /// of the harness itself can assert the process has exited after
     /// teardown.
     pub fn server_pid(&self) -> u32 {
-        self.server.id()
+        self.server.lock().expect("server lock").id()
+    }
+
+    /// Stops the server and starts it again on the same data directory,
+    /// socket and port, waiting until it accepts connections. Every open
+    /// connection is severed, the way a real Postgres restart severs them;
+    /// data, replication slots and configuration survive.
+    ///
+    /// [`StopMode::Fast`] is an orderly shutdown (a shutdown checkpoint, then
+    /// exit). [`StopMode::Immediate`] skips the checkpoint, so the next start
+    /// runs crash recovery from WAL — the same path a power loss takes.
+    ///
+    /// Panics if the server doesn't stop or doesn't come back, like the rest
+    /// of this module.
+    pub fn restart(&self, mode: StopMode) {
+        let mut server = self.server.lock().expect("server lock");
+        run_to_completion(
+            Command::new("pg_ctl")
+                .arg("stop")
+                .arg("-D")
+                .arg(&self.data_dir)
+                .arg("-m")
+                .arg(mode.as_pg_ctl_arg())
+                .arg("-w")
+                .arg("-t")
+                .arg("30"),
+            "pg_ctl stop",
+        );
+        let _ = server.wait();
+        let log_path = self.root.join("postgres.log");
+        *server = spawn_server(&self.data_dir, &self.socket_dir, self.port, &log_path);
+        drop(server);
+        self.wait_ready(&log_path);
     }
 
     /// Creates a fresh, uniquely-named, otherwise-empty database on this
@@ -329,6 +311,7 @@ impl Drop for TestCluster {
             .map(|status| status.success())
             .unwrap_or(false);
 
+        let server = self.server.get_mut().unwrap_or_else(|e| e.into_inner());
         if !stopped_gracefully {
             // The graceful stop timed out; SIGKILL can't clean up, so free the
             // segment ourselves from the pidfile before it's lost. Log it: a
@@ -337,13 +320,13 @@ impl Drop for TestCluster {
             eprintln!(
                 "testkit: `pg_ctl stop` did not stop postgres cleanly (pid {}); \
                  falling back to SIGKILL and reaping its shmem segment",
-                self.server.id()
+                server.id()
             );
-            let _ = self.server.kill();
-            let _ = self.server.wait();
+            let _ = server.kill();
+            let _ = server.wait();
             reap_shmem_segment(&self.data_dir);
         } else {
-            let _ = self.server.wait();
+            let _ = server.wait();
         }
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -405,6 +388,89 @@ impl Drop for TestDatabase {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// How [`TestCluster::restart`] stops the server (`pg_ctl stop -m <mode>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopMode {
+    /// Roll back open transactions, disconnect clients, write a shutdown
+    /// checkpoint, exit.
+    Fast,
+    /// Exit without a shutdown checkpoint. The next start replays WAL from
+    /// the last checkpoint, as after a crash.
+    Immediate,
+}
+
+impl StopMode {
+    fn as_pg_ctl_arg(self) -> &'static str {
+        match self {
+            StopMode::Fast => "fast",
+            StopMode::Immediate => "immediate",
+        }
+    }
+}
+
+/// Starts `postgres` on `data_dir`, appending its output to `log_path` (so a
+/// [`TestCluster::restart`] keeps the log from before the restart).
+fn spawn_server(data_dir: &Path, socket_dir: &Path, port: u16, log_path: &Path) -> Child {
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .expect("create postgres log file");
+    Command::new("postgres")
+        .arg("-D")
+        .arg(data_dir)
+        .arg("-h")
+        .arg("") // no TCP listener; unix socket only
+        .arg("-k")
+        .arg(socket_dir)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-c")
+        .arg("wal_level=logical")
+        // Headroom, not a tuning knob: a `TestDatabase`'s `dropdb
+        // --force` fails silently while that database still has an
+        // *active* logical slot (see `TestDatabase::drop`), so a case
+        // whose `trellis::Client` hasn't finished its best-effort
+        // shutdown leaves both behind. Issue #188 gives every
+        // shared-cluster generative case its own slot *name*, which
+        // removes the cross-case collision but means such leaks
+        // accumulate rather than reusing one name — and a deep nightly
+        // run puts hundreds of cases on one cluster. 10 left only a
+        // handful of leaks' worth of room before
+        // `pg_create_logical_replication_slot` would start failing with
+        // "all replication slots are in use"; 50 is still trivial
+        // shared memory (a slot is a small fixed struct) and takes that
+        // off the table.
+        .arg("-c")
+        .arg("max_replication_slots=50")
+        .arg("-c")
+        .arg("max_wal_senders=50")
+        // Tests that assert on what the server logged (`log_statement =
+        // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
+        // file the two `Stdio::from` handles below point at. That only
+        // works while the server writes to its inherited stderr: with the
+        // logging collector on, the postmaster hands logging to a
+        // collector subprocess that writes its own rotated files under
+        // `$PGDATA/log` instead, and everything those tests want to scrape
+        // lands there rather than in the file they read.
+        //
+        // `logging_collector` defaults to `off` in vanilla Postgres, but
+        // some distributions ship a `postgresql.conf.sample` that turns it
+        // on (Fedora's does), and `initdb` copies that sample verbatim into
+        // the cluster it creates — so whether those tests pass depended on
+        // the packaging of whichever Postgres happened to be on `PATH`.
+        // Pinning it here makes the cluster's logging behaviour a property
+        // of the harness rather than of the host. It is a postmaster-level
+        // setting, so passing it on the command line also outranks both
+        // `postgresql.conf` and any later `ALTER SYSTEM`.
+        .arg("-c")
+        .arg("logging_collector=off")
+        .stdout(Stdio::from(log_file.try_clone().expect("clone log handle")))
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .expect("spawn postgres")
 }
 
 /// Runs [`reap_orphans_in`] against the system temp dir exactly once per

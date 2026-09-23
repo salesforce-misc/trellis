@@ -16,13 +16,13 @@ mod manual;
 mod sql;
 mod subprocess;
 
-pub use manual::{ManualBackend, ManualBackendError};
+pub use manual::{ManualBackend, ManualBackendError, await_pool_usable};
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
 use std::collections::BTreeMap;
 use std::future::Future;
 
-use crate::model::{Op, Program};
+use crate::model::{Op, Program, RestartMode};
 
 /// Merged source+derived state, read back deterministically: `table -> pk
 /// (rendered text) -> column -> value (rendered text, `None` is SQL
@@ -90,4 +90,24 @@ pub trait Backend {
     /// per fleet), demonstrating multiple clients can coexist draining the
     /// same ring (improvement-plan task E3).
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Control over the Postgres server itself, as opposed to a database on it
+/// (issue #236): what a [`crate::model::DbAdminAction::RestartPostgres`]
+/// needs. A trait rather than a `testkit` type so `run` names no cluster
+/// type (its module doc comment), and so a harness that drives some other
+/// server can supply its own.
+pub trait ClusterControl {
+    /// Stops the server in `mode` and starts it again, returning once it
+    /// accepts connections. Every open connection is severed.
+    fn restart_postgres(&self, mode: RestartMode);
+}
+
+impl ClusterControl for testkit::TestCluster {
+    fn restart_postgres(&self, mode: RestartMode) {
+        self.restart(match mode {
+            RestartMode::Fast => testkit::StopMode::Fast,
+            RestartMode::Immediate => testkit::StopMode::Immediate,
+        });
+    }
 }

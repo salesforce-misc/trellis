@@ -1,9 +1,10 @@
 //! Tests of the harness itself (issue #21): that it spins up and tears down
 //! cleanly, that isolated databases don't bleed into each other, and that
-//! the instance is genuinely configured for logical replication.
+//! the instance is genuinely configured for logical replication, and that a
+//! restart keeps the data while severing every connection (issue #236).
 
 use std::process::{Command, Stdio};
-use testkit::{TestCluster, fixtures};
+use testkit::{StopMode, TestCluster, fixtures};
 
 #[tokio::test]
 async fn harness_starts_runs_a_query_and_tears_down_cleanly() {
@@ -130,4 +131,74 @@ async fn logical_replication_slot_can_be_created_and_consumed() {
         .batch_execute("select pg_drop_replication_slot('trellis_test_slot')")
         .await
         .expect("drop replication slot");
+}
+
+/// Issue #236: `restart` in either mode brings the same cluster back — a new
+/// server process, every existing connection severed, and the data (tables
+/// and replication slots alike) intact.
+///
+/// Multi-threaded so each pooled connection's driver task observes the
+/// server closing it while `restart` blocks this thread: a pooled
+/// connection whose close nobody has observed yet looks healthy to the
+/// pool's recycle check and fails its first query.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_severs_connections_and_keeps_data_and_slots() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    fixtures::create_source_table(&db.pool, "widgets").await;
+    fixtures::insert_row(&db.pool, "widgets", 1, "before").await;
+
+    let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    raw.query_one(
+        "select pg_create_logical_replication_slot('restart_slot', 'pgoutput')",
+        &[],
+    )
+    .await
+    .expect("create a slot");
+
+    for mode in [StopMode::Fast, StopMode::Immediate] {
+        let pid = cluster.server_pid();
+        cluster.restart(mode);
+        assert_ne!(cluster.server_pid(), pid, "{mode:?}: a new server process");
+        fixtures::insert_row(&db.pool, "widgets", 2 + mode as i64, "after").await;
+    }
+
+    assert!(
+        raw.query_one("select 1", &[]).await.is_err(),
+        "a connection opened before the restart must be severed"
+    );
+    let rows = fixtures::read_rows(&db.pool, "widgets").await;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "before".to_string()),
+            (2, "after".to_string()),
+            (3, "after".to_string()),
+        ]
+    );
+    let slots: i64 = db
+        .pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select count(*) from pg_replication_slots where slot_name = 'restart_slot'",
+            &[],
+        )
+        .await
+        .expect("count slots")
+        .get(0);
+    assert_eq!(slots, 1, "a replication slot survives both restarts");
+    db.pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .execute("select pg_drop_replication_slot('restart_slot')", &[])
+        .await
+        .expect("drop the slot");
 }

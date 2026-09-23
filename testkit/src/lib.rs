@@ -18,4 +18,4 @@ pub mod cluster;
 pub mod crash;
 pub mod fixtures;
 
-pub use cluster::{TestCluster, TestDatabase};
+pub use cluster::{StopMode, TestCluster, TestDatabase};
