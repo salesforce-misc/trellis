@@ -673,19 +673,46 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// If intake doesn't get there within `catch_up_timeout`, the enumeration
 /// rolls back, the marker stays, and any definition this pass promoted to
 /// `backfilling` returns to `waiting_to_backfill`, so the next pass retries
-/// cleanly. A caller with no intake running yet must not call this at all
+/// cleanly. The pass then stops rather than waiting again on the remaining
+/// markers: each later horizon is at least as far ahead, so every one would
+/// most likely time out too, and the maintenance loop seals nothing while
+/// this waits. A caller with no intake running yet must not call this at all
 /// (see `client::setup_staging`); tests with no CDC stream pass
 /// [`crate::staging::StagedWatermark::saturated`].
-#[tracing::instrument(
-    name = "intake.run_pending_backfills",
-    skip(client, wake_channel, watermark),
-    fields(pending = tracing::field::Empty, settled = tracing::field::Empty)
-)]
+// The maintenance loop calls [`run_pending_backfills_until`] so it can stop
+// the wait on shutdown. This no-stop form is the tests' entry point, so
+// nothing in the crate calls it unless `internals` exposes it.
+#[allow(dead_code)]
 pub async fn run_pending_backfills(
     client: &mut tokio_postgres::Client,
     wake_channel: &str,
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
+) -> Result<(), IntakeError> {
+    run_pending_backfills_until(client, wake_channel, watermark, catch_up_timeout, &|| false).await
+}
+
+/// [`run_pending_backfills`], with `stop` checked while an enumeration waits
+/// for intake. When `stop` returns `true` the wait gives up early, through
+/// the same rollback-and-revert path as a timeout.
+///
+/// This is how the maintenance loop shuts down promptly. It must not drop
+/// the future mid-wait instead: the `waiting_to_backfill -> backfilling`
+/// promotion is already committed by then, so dropping would skip the revert
+/// and leave the definition in `backfilling` for good, since a later pass
+/// only promotes `waiting_to_backfill` definitions and so never flips it to
+/// `live`.
+#[tracing::instrument(
+    name = "intake.run_pending_backfills",
+    skip(client, wake_channel, watermark, stop),
+    fields(pending = tracing::field::Empty, settled = tracing::field::Empty)
+)]
+pub(crate) async fn run_pending_backfills_until(
+    client: &mut tokio_postgres::Client,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    catch_up_timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), IntakeError> {
     let pending = fetch_pending_backfills(client).await?;
     tracing::Span::current().record("pending", pending.len());
@@ -726,7 +753,7 @@ pub async fn run_pending_backfills(
                 .query_one("select pg_current_wal_insert_lsn()", &[])
                 .await?
                 .get(0);
-            if !intake_caught_up(watermark, horizon, catch_up_timeout).await {
+            if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
                 txn.rollback().await?;
                 revert_to_waiting(client, &advancing).await?;
                 tracing::debug!(
@@ -735,7 +762,7 @@ pub async fn run_pending_backfills(
                     staged_through = %watermark.get(),
                     "backfill enumeration deferred: intake has not staged through its snapshot yet"
                 );
-                continue;
+                break;
             }
             append_enumeration(&txn, &marker.table).await?;
             true
@@ -761,16 +788,21 @@ pub async fn run_pending_backfills(
 /// is a bare atomic load, so this only bounds how late the wait notices.
 const CATCH_UP_POLL: Duration = Duration::from_millis(5);
 
-/// Waits until `watermark` reaches `horizon`, or `timeout` elapses. Returns
-/// whether intake got there — see [`run_pending_backfills`]'s "Waiting for
-/// intake before staging".
-async fn intake_caught_up(watermark: &StagedWatermark, horizon: PgLsn, timeout: Duration) -> bool {
+/// Waits until `watermark` reaches `horizon`, `timeout` elapses, or `stop`
+/// returns `true`. Returns whether intake got there — see
+/// [`run_pending_backfills`]'s "Waiting for intake before staging".
+async fn intake_caught_up(
+    watermark: &StagedWatermark,
+    horizon: PgLsn,
+    timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if watermark.get() >= horizon {
             return true;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if stop() || tokio::time::Instant::now() >= deadline {
             return false;
         }
         tokio::time::sleep(CATCH_UP_POLL).await;
@@ -1127,5 +1159,76 @@ mod tests {
         let joined = qualify("public", "widgets").unwrap();
         assert_eq!(joined, "public.widgets");
         assert_eq!(split_qualified(&joined).unwrap(), ("public", "widgets"));
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Issue #312 review: once one enumeration gives up waiting for intake,
+    /// the pass ends instead of waiting again on each remaining marker. The
+    /// maintenance loop seals nothing while a pass waits, so waiting per
+    /// marker would multiply that stall by the number of pending markers.
+    /// Counting `stop` calls pins it without timing: a `stop` that always
+    /// says "give up" is consulted once per wait.
+    #[tokio::test]
+    async fn a_deferred_enumeration_ends_the_pass() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public; \
+                 create table public.a (id bigint primary key); \
+                 create table public.b (id bigint primary key); \
+                 insert into public.a values (1); \
+                 insert into public.b values (1); \
+                 create publication test_pub;",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("seed two source tables");
+        reconcile_publication(
+            &mut client,
+            "test_pub",
+            &["public.a".to_string(), "public.b".to_string()],
+        )
+        .await
+        .expect("reconcile leaves two settled markers");
+
+        let waits = AtomicUsize::new(0);
+        let give_up = || {
+            waits.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::new(),
+            Duration::from_secs(600),
+            &give_up,
+        )
+        .await
+        .expect("run_pending_backfills_until");
+
+        assert_eq!(
+            waits.load(Ordering::Relaxed),
+            1,
+            "only the first marker's enumeration should wait"
+        );
+        let markers: i64 = client
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count markers")
+            .get(0);
+        assert_eq!(markers, 2, "both markers must survive for the next pass");
     }
 }
