@@ -1,0 +1,804 @@
+//! Issue #321: an aggregate's forced recompute double counts a concurrent
+//! source commit.
+//!
+//! A group on the forced path (`apply_aggregate::apply_forced_groups_bulk`)
+//! is re-derived from the *live* source in Phase 3. Nothing records what that
+//! read saw. A source commit that was visible to it, but whose own CDC delta
+//! commits to the target afterwards, is counted twice: once by the live read,
+//! once by the delta. Each test below drives one window in which that
+//! happens, and asserts the target against a from-scratch `GROUP BY` over the
+//! source:
+//!
+//! - **W1, later batch** (the issue as filed): the commit's CDC seals into a
+//!   batch after the recompute's. Its variant commits before the seal but
+//!   stages after it, the wider window from the issue's first comment.
+//! - **W2, earlier batch drained later**: the CDC sits in an earlier batch
+//!   that a second worker applies after the recompute's batch.
+//! - **W3, same batch, different bucket**: a split batch puts the image-less
+//!   recompute and the image-bearing change in different buckets, drained by
+//!   different workers.
+//! - **W4, grain migration**: the recompute's key moves to another group
+//!   between Phase 2 (which picked the group) and Phase 3 (which re-derives
+//!   it), so the old group loses the row twice.
+//! - **W5, extinction**: the delta path's existence probe deletes a group a
+//!   concurrent delete emptied; the group is then recreated, and the delete's
+//!   own delta lands on the recreated group.
+//! - **Chained W1**: the aggregate reads a 1-1 target that is also a
+//!   relationship endpoint, so it is still published (#315's exception) and
+//!   both the seam's `Recompute` and the target's own CDC reach the ring.
+//!
+//! Everything is driven by hand, as `intermediate_hop_cdc.rs` does: `pgoutput`
+//! bytes are read off a second logical slot and fed to a real
+//! [`intake::Intake`] exactly when a test says so, and seal and claim are
+//! explicit, so no test polls for convergence (#297). The one wait (W4's)
+//! waits for a backend to block on a row lock the test holds, which is a
+//! forced interleaving, not a race.
+//!
+//! **Every test here is `#[ignore]`d on purpose.** They are pinned pre-fix
+//! repros: each fails on the current tree with the double count described on
+//! it. #321's second step (the recompute horizon) removes the `#[ignore]`s.
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use pgwire_replication::{Lsn, ReplicationEvent};
+use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::ValueType;
+use trellis::defs::{create_relationship, install_definition};
+use trellis::intake::{self, spill};
+use trellis::staging::{
+    MIN_ROWS_TO_SPLIT, SEG_BUCKETS, StagedChange, StagedWatermark, apply, has_pending,
+    retire_drained_segments,
+};
+
+const PUBLICATION: &str = "race_pub";
+/// The slot [`intake::Intake::connect`] requires to exist and be healthy.
+/// Nothing reads its stream: the test feeds intake from [`BYTES_SLOT`].
+const INTAKE_SLOT: &str = "race_intake";
+/// The slot the test reads `pgoutput` bytes from.
+const BYTES_SLOT: &str = "race_bytes";
+const WAKE: &str = "race_wake";
+const SRC: &str = "public.src";
+
+/// The source every test uses: `id` is the key, `g` the group, `v` the summed
+/// value. `REPLICA IDENTITY FULL` so an update or delete carries the old
+/// image the aggregate subtracts.
+const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, v numeric); \
+                       alter table public.src replica identity full";
+const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n";
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'"
+        ))
+        .await
+        .expect("set search_path");
+    client
+}
+
+fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
+    names
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect()
+}
+
+fn be_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"))
+}
+
+/// Turns one `pgoutput` protocol-v1 message into the event the replication
+/// transport would have handed intake (copied from `intermediate_hop_cdc.rs`).
+fn to_event(data: &[u8]) -> ReplicationEvent {
+    match data[0] {
+        b'B' => ReplicationEvent::Begin {
+            final_lsn: Lsn::from(be_u64(&data[1..])),
+            commit_time_micros: be_u64(&data[9..]) as i64,
+            xid: u32::from_be_bytes(data[17..21].try_into().expect("4 bytes")),
+        },
+        b'C' => ReplicationEvent::Commit {
+            lsn: Lsn::from(be_u64(&data[2..])),
+            end_lsn: Lsn::from(be_u64(&data[10..])),
+            commit_time_micros: be_u64(&data[18..]) as i64,
+        },
+        b'M' => {
+            let transactional = data[1] & 1 == 1;
+            let lsn = Lsn::from(be_u64(&data[2..]));
+            let rest = &data[10..];
+            let nul = rest
+                .iter()
+                .position(|b| *b == 0)
+                .expect("prefix terminator");
+            let prefix = String::from_utf8(rest[..nul].to_vec()).expect("utf-8 prefix");
+            let body = &rest[nul + 1..];
+            let len = u32::from_be_bytes(body[..4].try_into().expect("4 bytes")) as usize;
+            ReplicationEvent::Message {
+                transactional,
+                lsn,
+                prefix,
+                content: Bytes::copy_from_slice(&body[4..4 + len]),
+            }
+        }
+        _ => ReplicationEvent::XLogData {
+            wal_start: Lsn::from(0),
+            wal_end: Lsn::from(0),
+            server_time_micros: 0,
+            data: Bytes::copy_from_slice(data),
+        },
+    }
+}
+
+/// One definition-time step, run in order by [`Harness::start`].
+enum Setup<'a> {
+    Transform(&'a str),
+    Relationship(&'a str),
+    Sql(&'a str),
+}
+
+/// A source, the definitions over it, and a real [`intake::Intake`] fed by
+/// hand from [`BYTES_SLOT`].
+struct Harness {
+    raw: Client,
+    intake: intake::Intake,
+    db: testkit::TestDatabase,
+    /// The aggregate target the test checks.
+    agg: &'static str,
+    _cluster: TestCluster,
+}
+
+impl Harness {
+    /// Runs `setup_sql` (which creates and seeds the source), then `steps`,
+    /// then creates the publication and both slots. Rows seeded by
+    /// `setup_sql` reach the aggregate through its initial build, not CDC.
+    async fn start(setup_sql: &str, steps: &[Setup<'_>], agg: &'static str) -> Self {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = connect_raw(db.dsn()).await;
+        raw.batch_execute(setup_sql).await.expect("setup sql");
+
+        let columns = numeric_columns(&["id", "g", "v"]);
+        for step in steps {
+            match step {
+                Setup::Transform(text) => {
+                    install_definition(&db.pool, text, &columns, "public")
+                        .await
+                        .unwrap_or_else(|e| panic!("install {text}: {e}"));
+                }
+                Setup::Relationship(text) => {
+                    create_relationship(&db.pool, text)
+                        .await
+                        .unwrap_or_else(|e| panic!("create {text}: {e}"));
+                }
+                Setup::Sql(sql) => raw.batch_execute(sql).await.expect("setup step sql"),
+            }
+        }
+
+        let published = trellis::defs::publication_tables(&db.pool)
+            .await
+            .expect("publication_tables");
+        raw.batch_execute(&format!(
+            "create publication {PUBLICATION} for table {}",
+            published.join(", ")
+        ))
+        .await
+        .expect("create publication");
+        for slot in [INTAKE_SLOT, BYTES_SLOT] {
+            raw.query_one(
+                "select slot_name from pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&slot],
+            )
+            .await
+            .expect("create slot");
+        }
+        raw.execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
+            &[&INTAKE_SLOT, &PgLsn::from(0)],
+        )
+        .await
+        .expect("seed replication_progress");
+
+        let config = intake::IntakeConfig {
+            dsn: db.dsn().to_string(),
+            schema: DEFAULT_SCHEMA.to_string(),
+            host: db.socket_dir().display().to_string(),
+            port: db.port(),
+            user: "postgres".to_string(),
+            password: String::new(),
+            database: db.name().to_string(),
+            slot: INTAKE_SLOT.to_string(),
+            publication: PUBLICATION.to_string(),
+            wake_channel: WAKE.to_string(),
+            spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
+            hard_cap: spill::DEFAULT_HARD_CAP,
+            group_commit: None,
+        };
+        let intake = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+            .await
+            .expect("connect intake");
+
+        Self {
+            raw,
+            intake,
+            db,
+            agg,
+            _cluster: cluster,
+        }
+    }
+
+    /// Runs `sql` as its own committed source transaction. Intake does not
+    /// see it until the next [`Harness::feed`].
+    async fn commit(&self, sql: &str) {
+        self.raw
+            .batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Consumes everything committed on [`BYTES_SLOT`] since the last call and
+    /// feeds it to intake, which stages it into the active segment.
+    async fn feed(&mut self) {
+        let rows = self
+            .raw
+            .query(
+                "select data from pg_logical_slot_get_binary_changes($1, null, null, \
+                 'proto_version', '1', 'publication_names', $2, 'messages', 'true')",
+                &[&BYTES_SLOT, &PUBLICATION],
+            )
+            .await
+            .expect("read pgoutput bytes");
+        for row in rows {
+            let data: Vec<u8> = row.get(0);
+            self.intake
+                .handle_event(to_event(&data))
+                .await
+                .expect("intake handles the event");
+        }
+    }
+
+    /// Appends one bare, image-less `Recompute` per key of [`SRC`], the shape
+    /// every catch-up enumeration and marker stages, in its own transaction.
+    async fn append_recomputes(&mut self, keys: &[i32]) {
+        let changes: Vec<StagedChange> = keys
+            .iter()
+            .map(|k| StagedChange::Recompute {
+                src_table: SRC.to_string(),
+                key: k.to_string(),
+                hop_gen: 0,
+                group_key: None,
+                src_changed: None,
+                prior_image: None,
+            })
+            .collect();
+        let txn = self.raw.transaction().await.expect("begin append");
+        trellis::staging::append(&txn, &changes)
+            .await
+            .expect("append recomputes");
+        txn.commit().await.expect("commit append");
+    }
+
+    /// Seals the active segment and returns its `seg_seq`.
+    async fn seal(&mut self) -> i64 {
+        trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
+            .await
+            .expect("seal")
+            .expect("the active segment holds rows, so it seals")
+            .sealed_seg_seq
+    }
+
+    /// One `drain_once` against a specific segment, as worker `worker`.
+    async fn drain(&self, seg_seq: i64, worker: &str, live_workers: i64) {
+        let outcome = apply::drain_once(
+            &self.db.pool,
+            seg_seq,
+            worker,
+            live_workers,
+            WAKE,
+            &StagedWatermark::saturated(),
+        )
+        .await
+        .expect("drain_once");
+        assert!(
+            outcome.is_some(),
+            "{worker} must claim at least one bucket of segment {seg_seq}"
+        );
+    }
+
+    /// Seals and drains until nothing is pending, each round its own batch.
+    async fn settle(&mut self) {
+        let watermark = StagedWatermark::saturated();
+        for _ in 0..16 {
+            trellis::staging::seal_if_active_nonempty(&mut self.raw, WAKE)
+                .await
+                .expect("seal");
+            while let Some(seg) = apply::next_claimable_segment(&self.raw)
+                .await
+                .expect("next claimable segment")
+            {
+                apply::drain_once(&self.db.pool, seg, "settle", 1, WAKE, &watermark)
+                    .await
+                    .expect("drain_once");
+            }
+            retire_drained_segments(&mut self.raw)
+                .await
+                .expect("retire drained segments");
+            if !has_pending(&self.raw).await.expect("has_pending") {
+                return;
+            }
+        }
+        panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+    }
+
+    /// The aggregate target, `group -> (total, n)`.
+    async fn target(&self) -> BTreeMap<String, (Option<String>, Option<String>)> {
+        let sql = format!(
+            "select trim_scale(g::numeric)::text, trim_scale(total::numeric)::text, \
+             trim_scale(n::numeric)::text from public.{}",
+            self.agg
+        );
+        self.groups(&sql).await
+    }
+
+    /// The same aggregate recomputed from scratch over the source.
+    async fn oracle(&self) -> BTreeMap<String, (Option<String>, Option<String>)> {
+        self.groups(
+            "select trim_scale(g::numeric)::text, trim_scale(sum(v))::text, \
+             trim_scale(count(*)::numeric)::text from public.src group by g",
+        )
+        .await
+    }
+
+    async fn groups(&self, sql: &str) -> BTreeMap<String, (Option<String>, Option<String>)> {
+        self.raw
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .into_iter()
+            .map(|row| (row.get(0), (row.get(1), row.get(2))))
+            .collect()
+    }
+
+    async fn assert_matches_oracle(&self, context: &str) {
+        let target = self.target().await;
+        let oracle = self.oracle().await;
+        assert_eq!(
+            target, oracle,
+            "{context}: the aggregate (left) must equal a from-scratch GROUP BY over the source \
+             (right), as group -> (total, n)"
+        );
+    }
+
+    async fn finish(self) {
+        // Intake's own stream was never read, so its walsender would hold up
+        // cluster shutdown waiting for a flush confirmation that never comes.
+        self.raw
+            .execute(
+                "select pg_terminate_backend(active_pid) from pg_replication_slots \
+                 where slot_name = $1 and active_pid is not null",
+                &[&INTAKE_SLOT],
+            )
+            .await
+            .expect("terminate intake's walsender");
+    }
+}
+
+/// The bucket a ring row for `key` of [`SRC`] lands in once a batch is split
+/// into [`SEG_BUCKETS`], using the ring's own `route` expression.
+async fn bucket_of(raw: &Client, key: i32) -> i64 {
+    raw.query_one(
+        "select (hashtextextended($1 || E'\\x1f' || $2, 0) & 2147483647) % $3",
+        &[&SRC, &key.to_string(), &SEG_BUCKETS],
+    )
+    .await
+    .expect("compute bucket")
+    .get(0)
+}
+
+/// W1, the issue as filed: a forced recompute of group 1 seals into batch k,
+/// a source commit C lands in group 1 afterwards, batch k's live read counts
+/// C, and then C's own CDC delta seals into batch k+1 and counts it again.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w1_later_batch_double_counts_a_concurrent_commit() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+    h.assert_matches_oracle("after the initial build").await;
+
+    h.append_recomputes(&[1]).await;
+    let k = h.seal().await;
+
+    // C: a new key in the recomputed group, committed after batch k sealed.
+    h.commit("insert into public.src values (2, 1, 5)").await;
+
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "batch k's forced recompute reads live state, so it already counts C"
+    );
+
+    h.feed().await;
+    let k1 = h.seal().await;
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle("C's delta in batch k+1 must not count C a second time")
+        .await;
+
+    h.finish().await;
+}
+
+/// W1's wider window (the issue's first comment): C commits *before* batch
+/// k seals, but intake has not staged it yet, so its CDC still lands after
+/// batch k. The window starts at intake's staged position, not at the seal.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w1_later_batch_double_counts_a_commit_made_before_the_seal_but_staged_after() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+
+    h.append_recomputes(&[1]).await;
+    h.commit("insert into public.src values (2, 1, 5)").await;
+    let k = h.seal().await;
+
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "batch k's forced recompute reads live state, so it already counts C"
+    );
+
+    h.feed().await;
+    let k1 = h.seal().await;
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle(
+        "C committed before the seal but staged after it must still be counted once",
+    )
+    .await;
+
+    h.finish().await;
+}
+
+/// W2: C's delta is staged into batch j, and a forced recompute of the same
+/// group into a later batch k. Batches are not drained in order, so worker 1
+/// applies k first (counting C from live state) and worker 2 then applies j.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w2_earlier_batch_drained_later_double_counts_its_delta() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+
+    h.commit("insert into public.src values (2, 1, 5)").await;
+    h.feed().await;
+    let j = h.seal().await;
+
+    h.append_recomputes(&[1]).await;
+    let k = h.seal().await;
+    assert!(j < k, "C's batch must be the earlier one");
+
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "batch k's forced recompute reads live state, so it already counts C"
+    );
+
+    h.drain(j, "worker-2", 1).await;
+    h.assert_matches_oracle("batch j's delta, applied after batch k, must not count C again")
+        .await;
+
+    h.finish().await;
+}
+
+/// W3: one batch, split into buckets. Key A's image-less recompute and key
+/// B's image-bearing insert are in the same group but route to different
+/// buckets, so two workers each claim one of them. Worker 2's plan never
+/// marks the group forced, so it adds B's delta on top of worker 1's live
+/// re-derive, which already counted B.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w3_same_batch_different_bucket_double_counts_a_change() {
+    let mut h = Harness::start(SRC_DDL, &[Setup::Transform(AGG)], "agg").await;
+
+    // With 8 buckets and `live_workers = 2`, the first claim takes buckets
+    // 0-3 and the second takes half of what is left, 4-5. Pick A for the
+    // first and B for the second.
+    let mut a = None;
+    let mut b = None;
+    for id in 1..1000 {
+        let bucket = bucket_of(&h.raw, id).await;
+        if a.is_none() && bucket < 4 {
+            a = Some(id);
+        } else if b.is_none() && (4..6).contains(&bucket) {
+            b = Some(id);
+        }
+        if a.is_some() && b.is_some() {
+            break;
+        }
+    }
+    let (a, b) = (
+        a.expect("a key in buckets 0-3"),
+        b.expect("a key in buckets 4-5"),
+    );
+
+    h.commit(&format!("insert into public.src values ({a}, 1, 10)"))
+        .await;
+    h.feed().await;
+    h.settle().await;
+    h.assert_matches_oracle("after A is counted").await;
+
+    // C: B's insert into A's group, staged as CDC.
+    h.commit(&format!("insert into public.src values ({b}, 1, 5)"))
+        .await;
+    h.feed().await;
+    // A's recompute, plus enough recomputes of keys that don't exist to
+    // split the batch. They re-read nothing, so they touch no group.
+    let mut keys = vec![a];
+    keys.extend(1_000_000..1_000_000 + MIN_ROWS_TO_SPLIT as i32 + 44);
+    h.append_recomputes(&keys).await;
+    let s = h.seal().await;
+
+    let bucket_count: i16 = h
+        .raw
+        .query_one(
+            "select bucket_count from segments where seg_seq = $1",
+            &[&s],
+        )
+        .await
+        .expect("read bucket_count")
+        .get(0);
+    assert_eq!(i64::from(bucket_count), SEG_BUCKETS, "the batch must split");
+    // The routes actually stored on the ring rows, not just the prediction.
+    let ring_slot: i16 = h
+        .raw
+        .query_one("select ring_slot from segments where seg_seq = $1", &[&s])
+        .await
+        .expect("read ring_slot")
+        .get(0);
+    let staged: BTreeMap<String, (String, i64)> = h
+        .raw
+        .query(
+            &format!(
+                "select key, op, route % $2 from seg_{ring_slot} \
+                 where src_table = $1 and key in ($3, $4)"
+            ),
+            &[&SRC, &SEG_BUCKETS, &a.to_string(), &b.to_string()],
+        )
+        .await
+        .expect("read staged routes")
+        .into_iter()
+        .map(|row| (row.get(0), (row.get(1), row.get(2))))
+        .collect();
+    assert_eq!(
+        staged,
+        BTreeMap::from([
+            (
+                a.to_string(),
+                ("recompute".to_string(), bucket_of(&h.raw, a).await)
+            ),
+            (
+                b.to_string(),
+                ("insert".to_string(), bucket_of(&h.raw, b).await)
+            ),
+        ]),
+        "A's recompute and B's insert must sit in the batch, in different workers' buckets"
+    );
+
+    h.drain(s, "worker-1", 2).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "worker 1 holds A's bucket, and its forced recompute already counts B"
+    );
+    h.drain(s, "worker-2", 2).await;
+    // Whatever buckets are left (only fillers) go to a third claim.
+    h.settle().await;
+    h.assert_matches_oracle("worker 2's delta for B must not count B again")
+        .await;
+
+    h.finish().await;
+}
+
+/// W4: Phase 2 reads key A live and puts its recompute on group 1. Before
+/// Phase 3 runs, a commit moves A to group 2. Phase 3 re-derives group 1
+/// from live state, already without A. The move's own CDC delta then
+/// subtracts A from group 1 a second time.
+///
+/// Phase 2 and Phase 3 are split without a hook: the test holds a
+/// `FOR UPDATE` lock on group 1's target row. Phase 2 only reads, so it runs
+/// through; Phase 3's ascending pre-lock (`apply_aggregate_target`) blocks on
+/// it. Once the drain's backend is seen blocked on the test's connection,
+/// the test commits the move and releases the lock.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w4_grain_migration_between_phase_2_and_phase_3_double_subtracts_the_old_group() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 1, 10), (3, 1, 7)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+    h.assert_matches_oracle("after the initial build").await;
+
+    h.append_recomputes(&[1]).await;
+    let k = h.seal().await;
+
+    let holder = connect_raw(h.db.dsn()).await;
+    let holder_pid: i32 = holder
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("holder pid")
+        .get(0);
+    holder
+        .batch_execute("begin; select 1 from public.agg where g = 1 for update")
+        .await
+        .expect("lock group 1's target row");
+
+    let drain = h.drain(k, "worker-1", 1);
+    let interleave = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let blocked: bool = h
+                .raw
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity \
+                     where $1 = any(pg_blocking_pids(pid)))",
+                    &[&holder_pid],
+                )
+                .await
+                .expect("poll pg_stat_activity")
+                .get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the drain never blocked on group 1's target row"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.commit("update public.src set g = 2 where id = 1").await;
+        holder
+            .batch_execute("rollback")
+            .await
+            .expect("release group 1's target row");
+    };
+    tokio::join!(drain, interleave);
+    assert_eq!(
+        h.target().await,
+        BTreeMap::from([(
+            "1".to_string(),
+            (Some("7".to_string()), Some("1".to_string()))
+        )]),
+        "Phase 3 re-derived group 1 after the move committed, so it already lost A"
+    );
+
+    h.feed().await;
+    h.settle().await;
+    h.assert_matches_oracle("group 1 must lose A once, and group 2 must gain it once")
+        .await;
+
+    h.finish().await;
+}
+
+/// W5: group 5's only row r is deleted. Before that delete's CDC is staged,
+/// a delta for group 5 (an earlier update of r) drains, and its existence
+/// probe finds the group empty and deletes the group's row, which already
+/// accounts for the delete. A new row r' then recreates group 5, and the
+/// delete's delta lands on the recreated group, subtracting r a second time.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn w5_extinct_then_recreated_group_double_subtracts_the_absorbed_delete() {
+    let mut h = Harness::start(
+        &format!("{SRC_DDL}; insert into public.src values (1, 5, 10)"),
+        &[Setup::Transform(AGG)],
+        "agg",
+    )
+    .await;
+    h.assert_matches_oracle("after the initial build").await;
+
+    // A delta-path change for group 5, staged.
+    h.commit("update public.src set v = 11 where id = 1").await;
+    h.feed().await;
+    // r's delete, committed but not yet staged.
+    h.commit("delete from public.src where id = 1").await;
+    let k = h.seal().await;
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "the update's existence probe sees group 5 empty and deletes its row"
+    );
+
+    // r' recreates group 5; the delete's CDC stages alongside it.
+    h.commit("insert into public.src values (3, 5, 4)").await;
+    h.feed().await;
+    let k1 = h.seal().await;
+    h.drain(k1, "worker-1", 1).await;
+    h.assert_matches_oracle("group 5 must be f(r'), not f(r') - f(r)")
+        .await;
+
+    h.finish().await;
+}
+
+/// Chained W1: `h3` aggregates `h1`, a 1-1 target of `src` that is also a
+/// relationship endpoint. #315 keeps such a target in the publication, so a
+/// write to `h1` reaches `h3` twice: as the seam's image-less `Recompute`
+/// (staged in the apply that wrote `h1`) and as `h1`'s own CDC (staged when
+/// intake decodes that apply). The `Recompute` drains first and re-derives
+/// the group from live `h1`, which already holds the write; the CDC delta
+/// then adds it again. This is W1 with intake's lag behind the apply as the
+/// window, which is structural rather than a race.
+#[tokio::test]
+#[ignore = "pre-fix repro for #321; Step 2 (the recompute horizon) removes this"]
+async fn chained_w1_aggregate_over_a_published_relationship_endpoint_double_counts() {
+    let mut h = Harness::start(
+        &format!(
+            "{SRC_DDL}; \
+             create table public.labels (id integer primary key, name text); \
+             alter table public.labels replica identity full; \
+             insert into public.labels values (1, 'one')"
+        ),
+        &[
+            Setup::Transform("TRANSFORM h1 FROM public.src SELECT g AS g, v AS v"),
+            Setup::Sql("alter table public.h1 replica identity full"),
+            Setup::Relationship("RELATIONSHIP label FROM h1.g TO labels.id"),
+            Setup::Transform(
+                "TRANSFORM h3 FROM public.h1 GROUP BY g SELECT SUM(v) AS total, COUNT(*) AS n",
+            ),
+        ],
+        "h3",
+    )
+    .await;
+    let published = trellis::defs::publication_tables(&h.db.pool)
+        .await
+        .expect("publication_tables");
+    assert!(
+        published.iter().any(|t| t == "public.h1"),
+        "a target that is a relationship endpoint stays published (#315): {published:?}"
+    );
+    // The source starts empty: a seeded row would put `h1` on the chunk-queue
+    // build, and `h3` can only be installed over a `live` `h1`.
+    //
+    // C: a new source row in group 1. Its drain writes `h1` and stages the
+    // seam's `Recompute` for `h3` into the next batch.
+    h.commit("insert into public.src values (2, 1, 5)").await;
+    h.feed().await;
+    let k0 = h.seal().await;
+    h.drain(k0, "worker-1", 1).await;
+
+    let k = h.seal().await;
+    h.drain(k, "worker-1", 1).await;
+    assert_eq!(
+        h.target().await,
+        h.oracle().await,
+        "the seam's recompute re-derives group 1 from live h1, which already holds C"
+    );
+
+    // Intake now decodes the apply that wrote `h1`, so `h1`'s own CDC stages.
+    h.feed().await;
+    h.settle().await;
+    h.assert_matches_oracle("h1's CDC delta must not count C a second time")
+        .await;
+
+    h.finish().await;
+}
