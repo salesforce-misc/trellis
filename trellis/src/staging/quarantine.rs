@@ -1604,6 +1604,11 @@ pub async fn resume_column(
 /// that would otherwise let the discharge skip enumeration cannot be
 /// trusted here — full re-enumeration is the safe default.
 ///
+/// Deletes the definition's unclaimed, undone `backfill_chunks` rows too
+/// (issue #332): the fresh backfill makes them redundant, and a pause only
+/// withheld them from dispatch. Chunks a worker still holds are left for that
+/// worker to finish.
+///
 /// **The trip half of this contract** lives in
 /// [`trip_transform_fuse_if_crossed`], called from [`isolate_and_evict`]
 /// once a batch of evictions lands: when `src_table`'s distinct-evicted-key
@@ -1677,6 +1682,24 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     txn.execute(
         "update transform_definitions set status = $1, fuse_rearmed_at = now() where id = $2",
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+
+    // Discard the definition's leftover unclaimed backfill chunks (issue
+    // #332). The pause only withheld them from `claim_chunks`; unfrozen, they
+    // would be handed out again and re-run work the fresh backfill parked
+    // below already does. In the same transaction as the status drop, so no
+    // claim can see the definition dispatchable with them still present, and
+    // `claim_chunks`' `for update skip locked` never waits on these rows.
+    //
+    // A chunk a worker still holds is left alone, as a pause leaves it: that
+    // worker may still be writing its range, and it is `finish_chunk`'s
+    // completion that parks the catch-up marker repairing the target should
+    // that write land after the rebuild has already gone live (#331).
+    txn.execute(
+        "delete from backfill_chunks \
+         where definition_id = $1 and not done and claimed_by is null",
+        &[&id],
     )
     .await?;
 

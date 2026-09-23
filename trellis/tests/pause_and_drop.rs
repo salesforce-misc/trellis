@@ -17,7 +17,9 @@
 //!   (`a_chunk_finishing_after_the_pause_does_not_unpause_the_definition`)
 //! - resume rebuilds by a fresh backfill rather than catching up over
 //!   buffered changes, and a paused definition never pins the ring for its
-//!   siblings (`resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring`)
+//!   siblings (`resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring`),
+//!   and the paused definition's unclaimed chunks don't re-run on top of it —
+//!   issue #332 (`resuming_discards_the_paused_definitions_unclaimed_chunks`)
 //! - a drop always takes the target table and its data with it
 //!   (`dropping_takes_the_target_table_and_its_data_with_it`)
 //! - a live dependent refuses the drop and is named
@@ -1101,6 +1103,86 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
         persisted_status(&raw, "order_doubles").await.as_deref(),
         Some("waiting_to_backfill"),
         "resume rebuilds by backfill"
+    );
+}
+
+/// Issue #332: resume rebuilds the target with a fresh backfill, so a paused
+/// definition's leftover unclaimed chunks are redundant work and must not
+/// become claimable again once it is unfrozen. A chunk a worker still holds
+/// is left alone: its completion is what parks the catch-up marker that
+/// repairs the target should its write land after the rebuild (#331).
+#[tokio::test]
+async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    // One row past a single chunk's 50,000-row bound, so the queue holds one
+    // chunk to keep in flight and one to leave unclaimed.
+    seed_source(&raw, "orders", 50_001).await;
+    raw.batch_execute("create publication trellis_pub")
+        .await
+        .expect("create publication");
+
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
+        .await
+        .expect("define a chunked 1-1 transform");
+    assert_eq!(
+        count(&raw, "select count(*) from backfill_chunks").await,
+        2,
+        "precondition: the queue was enumerated as two chunks"
+    );
+
+    let in_flight = chunk_queue::claim_chunks(&raw, "issue-332-worker", 1)
+        .await
+        .expect("claim one chunk");
+    assert_eq!(in_flight.len(), 1, "precondition: one chunk is in flight");
+    let in_flight = &in_flight[0];
+
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause the backfilling definition");
+    trellis
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume it");
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("waiting_to_backfill"),
+        "precondition: resume re-parked the definition for a fresh backfill"
+    );
+
+    let reclaimed = chunk_queue::claim_chunks(&raw, "issue-332-worker", 100)
+        .await
+        .expect("claim after resume");
+    assert!(
+        reclaimed.is_empty(),
+        "no pre-pause chunk is claimable after resume, since the fresh backfill \
+         rebuilds the target anyway: {reclaimed:?}"
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from backfill_chunks where not done and claimed_by is null"
+        )
+        .await,
+        0,
+        "the unclaimed chunk was discarded, not merely withheld"
+    );
+    let still_held: i64 = raw
+        .query_one(
+            "select count(*) from backfill_chunks \
+             where id = $1 and claimed_by = 'issue-332-worker' and not done",
+            &[&in_flight.id],
+        )
+        .await
+        .expect("read the in-flight chunk")
+        .get(0);
+    assert_eq!(
+        still_held, 1,
+        "the chunk a worker still holds is left for that worker to finish"
     );
 }
 
