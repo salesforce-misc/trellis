@@ -180,7 +180,13 @@ knife-edged guards:
   `pending_backfill` marker in one transaction, deletes the marker in the same
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
-  flight at `ADD` time has settled.
+  flight at `ADD` time has settled. This discharge is the **only** capture path:
+  every definition's initial build, resume and catch-up reads its source through
+  it, and registration reads nothing
+  ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
+  staging worker runs the `ALTER`. The inventory in
+  [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
+  lists the paths that don't go through it yet.
 - **A marker is deleted only by the discharge that read it.** A table has one
   marker, and the catch-ups that park one (a direct build going live, a column
   resume, `ALTER TRANSFORM`) can land while that table's marker is mid-discharge,
@@ -201,8 +207,9 @@ knife-edged guards:
   parallel: what actually prevents the double count is the aggregate recompute
   horizon ([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon),
   issue #321). The wait only makes the resulting re-derivations rarer. The
-  discharge runs only once intake is running; setup leaves an existing slot's
-  markers to the maintenance loop.
+  discharge runs only once intake is running, so setup leaves every marker to
+  the maintenance loop. *Planned (#417):* that holds for an existing slot today,
+  but a fresh install still reads its tables during setup (below).
 - **Trellis's own writes to a target never stream at all.** A chain's
   intermediate hop is a target Trellis writes and a source a downstream
   transform reads. It stays out of the publication (issue #315): every write to
@@ -213,9 +220,24 @@ knife-edged guards:
   target's CDC can't even be decoded. The one exception is a target that is
   also a relationship endpoint: its settled parent projection is driven by
   CDC, so it stays published.
-- **The initial snapshot handshake must be gap-free by construction**, not by
-  overlap-and-dedup: create the slot with `EXPORT_SNAPSHOT`, backfill from that
-  exact snapshot, then stream from the slot's consistent point.
+- **A fresh install reads nothing while it creates the slot.** It creates the
+  slot, seeds `replication_progress` at the slot's consistent point, and makes
+  sure every published table has a `pending_backfill` marker. The first
+  discharge then reads each table at a snapshot taken after the slot exists, so
+  anything that read misses commits after the consistent point and is streamed.
+  Slot-loss recovery already works this way (`intake::slot_loss`). Reading
+  inside the slot-creation transaction is not gap-free:
+  `pg_create_logical_replication_slot` exports no snapshot, and the
+  transaction's own snapshot is taken before slot creation waits for in-flight
+  transactions, so a commit in between is neither read nor streamed (#393).
+  Exporting the slot's snapshot over the replication protocol
+  (`CREATE_REPLICATION_SLOT … (SNAPSHOT 'export')`) would close that gap, but
+  only by keeping a second capture path for fresh installs, and neither
+  replication client Trellis uses supports it
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
+  *Planned (#417):* `initial_snapshot_handshake` still reads every table in the
+  slot-creation transaction. The join markers `reconcile_publication` leaves
+  behind repair #393's gap on the first maintenance pass, by accident.
 
 ## The load-bearing invariants
 

@@ -205,7 +205,10 @@ seam's `Recompute` and as CDC, so every such CDC delta re-derives its group.
 The same rule covers a definition's inline enumeration at `DEFINE` time
 (issue #322), which has no intake to wait on. The #312 watermark wait in
 [01](01-intake-and-lsn-confirmation.md) is now an optimization that makes these
-re-derivations rarer, not a correctness requirement.
+re-derivations rarer, not a correctness requirement. ADR-0016 retires that
+inline enumeration: every capture moves to the backfill discharge, behind the
+#312 wait ([data-flow](../data-flow.md#capturing-a-tables-existing-rows);
+*Planned, #418*).
 
 ## What this replaced
 

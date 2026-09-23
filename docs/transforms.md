@@ -224,8 +224,11 @@ aggregate target may not be read that way (see [Source tables](#source-tables)).
 
 Every defined transform carries an observable **status**:
 
-* **`waiting_to_backfill`** — defined, but pre-existing source rows not yet enumerated.
-* **`backfilling`** — those rows are being enumerated and staged.
+* **`waiting_to_backfill`** — defined, but pre-existing source rows not yet read.
+  Every new transform starts here: defining one returns before any source row
+  is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows);
+  *Planned, #418/#419*).
+* **`backfilling`** — those rows have been read and the target is being built.
 * **`live`** — backfill complete; tracking live changes only. The steady state.
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
   resuming re-runs the backfill, returning it to `waiting_to_backfill`.

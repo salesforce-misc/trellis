@@ -119,6 +119,10 @@ reconciles the publication against the definitions that remain, which removes a 
 table from replication only when nothing derives from it any longer. Correct by
 construction, and applied at drop time rather than deferred to a maintenance pass.
 
+> [ADR-0016](0016-single-background-capture-path.md) moves this reconcile to the
+> staging worker's maintenance pass, since only the staging worker changes the
+> publication. The reconciliation itself is unchanged. Not yet implemented.
+
 ### Pause and drop are idempotent
 
 Defining runs on Trellis's own connections, not inside a host application's migration

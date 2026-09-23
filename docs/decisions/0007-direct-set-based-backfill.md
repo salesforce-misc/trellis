@@ -109,6 +109,13 @@ since it writes directly to the target rather than through the ring.
 
 ## Wiring
 
+> [ADR-0016](0016-single-background-capture-path.md) moves every build
+> described in this ADR out of registration: the backfill discharge dispatches
+> it after the source's marker fence settles. The build algorithms and the
+> chunk queue are unchanged. The registration-time wiring below, and the
+> registration-time chunk enqueue in "Backgrounding and resumability", are what
+> that ADR retires.
+
 `trellis::defs::install_definition` is the real entry point: it creates the
 target table, tries `backfill_definition` (direct path), persists via
 `create_definition_without_backfill` on success, and falls back to

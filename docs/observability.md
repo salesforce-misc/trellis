@@ -22,8 +22,9 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   right-sized answer to the silent-stall problem (#14).
 * **Fleet-level drain-worker liveness** — `Trellis::has_live_drain_workers`
   (issue #144) answers the coarser, fleet-wide question a per-transform status
-  can't: is *anything* running that would ever move a transform out of
-  `waiting_to_backfill` in the first place. See
+  can't: is *any* drain worker running to build and maintain targets. It
+  doesn't cover the staging worker, which is what moves a new transform out of
+  `waiting_to_backfill`. See
   [docs/embedding.md](embedding.md#the-silent-stall-hazard-issue-144) for the
   embedded-deployment misconfiguration this exists to catch.
 
@@ -168,11 +169,20 @@ quarantine are two arcs of one lifecycle:
                           └──────────── quarantined ◄─────────┘
 ```
 
-* **`waiting_to_backfill`** — defined and its backfill marker is durable, but
-  pre-existing rows aren't enumerated yet. Where a transform sits while its
-  transaction fence is unsettled (see caveat below).
-* **`backfilling`** — pre-existing source rows are being enumerated and staged.
-* **`live`** — backfill complete; tracking live changes only. The steady state.
+* **`waiting_to_backfill`** — defined, but its source's existing rows haven't
+  been read yet. Every new transform starts here, and registration returns
+  with it here. It stays until the staging worker has joined its source
+  (published it if needed and parked a `pending_backfill` marker), the
+  marker's transaction fence has settled (see caveat below), and intake has
+  caught up to the read's snapshot
+  ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
+  *Planned (#418, #419):* today only a transform whose source already has an
+  unsettled marker starts here. The rest are read or built during
+  registration.
+* **`backfilling`** — the backfill discharge has captured the source and the
+  transform's build is running: a ring enumeration, chunks on drain threads,
+  or a direct set-based build. The target is partial.
+* **`live`** — build complete; tracking live changes only. The steady state.
 * **`quarantined`** — the fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**
@@ -182,11 +192,15 @@ quarantine are two arcs of one lifecycle:
 
 ### Backfill status and the `xmin` caveat
 
-Adding a source table triggers a backfill of its pre-existing rows, gated on a
-conservative transaction-fence settlement (`now.xmin > fence.xmax`,
-`trellis/src/intake/publication.rs`). Because `xmin` is **cluster-global**, any
-unrelated long-running transaction *anywhere in the cluster* pins it and holds
-every waiting backfill in `waiting_to_backfill` until that transaction ends.
+Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
+source only once a conservative transaction fence settles (`now.xmin >
+fence.xmax`, `trellis/src/intake/publication.rs`). Because `xmin` is
+**cluster-global**, any unrelated long-running transaction *anywhere in the
+cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
+until that transaction ends. Since every new transform goes through this wait
+([ADR-0016](decisions/0016-single-background-capture-path.md)), a long
+transaction delays every registration from going live, not only the ones on a
+newly published table.
 
 This wait is **safe, not a fault**: the apply loop and every `live` transform are
 unaffected, and even the new table's *new* changes stream through — only its

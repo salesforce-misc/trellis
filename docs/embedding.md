@@ -27,6 +27,24 @@ let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()
 trellis.apply("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total").await?;
 ```
 
+Defining a transform is cheap wherever it runs. `apply` validates the
+definition, creates the target table, records the transform as
+`waiting_to_backfill`, and returns. It doesn't read the source table's rows and
+doesn't touch the replication publication or slot, so it takes the same time
+against an empty table as against a billion-row one. The dedicated worker does
+the rest in the background: it publishes the source, reads its existing rows,
+builds the target, and flips the transform to `live`
+([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
+So a web process needs no publication ownership or replication privileges; only
+the worker does. Code that needs the target populated polls `status()` until
+the transform is `live`.
+
+*Planned (#418, #419):* today `apply` still reads the source while
+registering. An aggregate or relationship-enriched 1-1 transform is built
+completely before `apply` returns, which is slow against a large table.
+*Planned (no child issue yet):* `DROP` still changes the publication from the
+process that applies it.
+
 ```rust
 // The one dedicated worker process for this fleet.
 let worker = Trellis::connect(
@@ -42,7 +60,8 @@ This shape has one sharp edge: **if the dedicated worker process is never
 deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
 still succeeds, every transform still gets registered — it just sits in
 `TransformStatus::WaitingToBackfill` forever, because nothing in the fleet
-is running with `drain_threads > 0` to pick the work up. Read paths against
+runs the staging worker that captures its source's rows, or the drain
+workers (`drain_threads > 0`) that build and maintain its target. Read paths against
 the target table quietly return nothing (or stale data, for a transform that
 was already live before the worker process disappeared), with no exception,
 timeout, or log line pointing at the actual cause.
@@ -82,7 +101,10 @@ same window, no separate cleanup pass required. See
 
 **This is a liveness check, not a backlog check.** `true` means at least one
 worker is alive and heartbeating; it says nothing about whether that worker
-is keeping up. Use `Trellis::status`/`Trellis::watermark_token` +
+is keeping up. It also counts drain workers only. A fleet whose drain workers
+run but whose staging worker doesn't passes this check while every new
+transform stays in `WaitingToBackfill`, so a transform that never leaves that
+status is worth alerting on too. Use `Trellis::status`/`Trellis::watermark_token` +
 `await_converged` to reason about an individual transform's own progress.
 
 ### Wiring it into a host health check

@@ -37,6 +37,11 @@ never backfill. `define()` blocks just long enough to create the target table,
 capture the coverage fence, and persist the definition / enumerate its backfill
 work — then returns before a single target row is built.
 
+> [ADR-0016](0016-single-background-capture-path.md) narrows this further:
+> `define()` creates the target table and persists the definition as
+> `waiting_to_backfill`, and nothing else. It captures no fence and enumerates
+> nothing. The backfill discharge does both in the background.
+
 The reason is scale: even the chunked direct-build path
 ([ADR-0007](0007-direct-set-based-backfill.md)) takes real wall-clock time on a
 billion-row table, and blocking that long means an interrupted process loses
