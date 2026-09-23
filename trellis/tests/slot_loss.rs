@@ -11,6 +11,10 @@
 //! - which transforms count as "fed by the slot": everything sourced from a
 //!   published table, directly or through a chain of targets, and nothing else
 //!   (`fed_transforms_include_chained_targets_and_exclude_unpublished_sources`)
+//! - the recovery called directly: prior freezes are left alone and not
+//!   recorded, only orphaned backfill markers are discarded, a second pass over
+//!   the same loss is a no-op, and a resume drops the record
+//!   (`recovery_leaves_prior_freezes_alone_and_discards_only_orphaned_markers`)
 
 use std::time::Duration;
 
@@ -305,4 +309,135 @@ async fn fed_transforms_include_chained_targets_and_exclude_unpublished_sources(
         .expect("enumerate the transforms the publication feeds");
     let names: Vec<&str> = fed.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, vec!["order_rollup", "rollup_copy"]);
+}
+
+/// `pause_if_slot_lost` run directly against a slot that was never created,
+/// covering what the facade test above can't observe:
+///
+/// - a transform that was already frozen before the loss is left as it was
+///   and is not recorded as a slot-loss pause, so resuming it later is not
+///   attributed to the loss;
+/// - a pending backfill marker is discarded only when its table has nothing
+///   unfrozen left to feed (a marker on an unpublished table whose transform
+///   keeps running survives);
+/// - a second pass over the same loss (the state a crash between the pauses
+///   and the slot's recreation leaves) pauses nothing new and keeps the
+///   original record;
+/// - `RESUME TRANSFORM` deletes the record itself, so a later operator
+///   `PAUSE` of the same transform is not reported as a slot-loss pause.
+#[tokio::test]
+async fn recovery_leaves_prior_freezes_alone_and_discards_only_orphaned_markers() {
+    const LOST: &str = "lost_slot";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 4).await;
+    seed_source(&raw, "refunds", 4).await;
+
+    let definer = define_only(db.dsn()).await;
+    for statement in [
+        "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        "TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total",
+        "TRANSFORM refund_rollup FROM refunds GROUP BY g SELECT sum(a) AS total",
+        "PAUSE TRANSFORM order_echo",
+    ] {
+        definer.apply(statement).await.expect(statement);
+    }
+
+    raw.batch_execute(&format!(
+        "create publication only_orders for table orders; \
+         insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
+         insert into pending_backfill (table_name, fence_snapshot) values \
+             ('{DEFAULT_SCHEMA}.orders', pg_current_snapshot()), \
+             ('{DEFAULT_SCHEMA}.refunds', pg_current_snapshot());"
+    ))
+    .await
+    .expect("stage a lost slot with pending markers on both tables");
+
+    let mut session = trellis::staging::session::ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("open a producer session");
+    let recovery = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "only_orders")
+        .await
+        .expect("recover from the lost slot")
+        .expect("a slot that doesn't exist is lost");
+    assert_eq!(recovery.paused, vec!["order_rollup"]);
+    assert_eq!(recovery.already_frozen, vec!["order_echo"]);
+    assert_eq!(
+        persisted_status(&raw, "refund_rollup").await.as_deref(),
+        Some("live"),
+        "a transform over an unpublished table was never fed by the slot"
+    );
+    let markers: Vec<String> = raw
+        .query("select table_name from pending_backfill order by 1", &[])
+        .await
+        .expect("read markers")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        markers,
+        vec![format!("{DEFAULT_SCHEMA}.refunds")],
+        "only the marker whose table has nothing unfrozen left is discarded"
+    );
+    let recorded = |pauses: Vec<slot_loss::SlotLossPause>| -> Vec<(String, String)> {
+        pauses
+            .into_iter()
+            .map(|p| (p.transform, p.lost_confirmed_lsn.to_string()))
+            .collect()
+    };
+    let expected = vec![("order_rollup".to_string(), "0/10".to_string())];
+    assert_eq!(
+        recorded(slot_loss::slot_loss_paused_transforms(&raw).await.unwrap()),
+        expected,
+        "the transform paused before the loss is not recorded as paused by it"
+    );
+
+    // The same loss seen again: roll the watermark back and drop the new
+    // slot, which is where a crash after the pauses but before the recreated
+    // slot committed would leave things.
+    raw.batch_execute(&format!(
+        "update replication_progress set confirmed_lsn = '0/10' where slot_name = '{LOST}'; \
+         select pg_drop_replication_slot('{LOST}');"
+    ))
+    .await
+    .expect("lose the slot again");
+    let again = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "only_orders")
+        .await
+        .expect("recover again")
+        .expect("still lost");
+    assert!(again.paused.is_empty(), "nothing new to pause: {again:?}");
+    assert_eq!(again.already_frozen, vec!["order_rollup", "order_echo"]);
+    assert_eq!(
+        recorded(slot_loss::slot_loss_paused_transforms(&raw).await.unwrap()),
+        expected
+    );
+    assert!(
+        slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "only_orders")
+            .await
+            .expect("check the recreated slot")
+            .is_none(),
+        "the recreated slot is healthy"
+    );
+
+    // Resume, then an ordinary operator pause: the record went with the
+    // resume, so the new pause is not reported as a slot-loss one.
+    for statement in [
+        "RESUME TRANSFORM order_rollup",
+        "PAUSE TRANSFORM order_rollup",
+    ] {
+        definer.apply(statement).await.expect(statement);
+    }
+    assert!(
+        slot_loss::slot_loss_paused_transforms(&raw)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(session);
+    definer.shutdown().await.expect("shut the definer down");
+    raw.execute("select pg_drop_replication_slot($1)", &[&LOST])
+        .await
+        .expect("clean up the recreated slot");
 }
