@@ -50,7 +50,6 @@
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
@@ -74,14 +73,24 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
-    client
+/// Seeds `slot`'s `replication_progress` row at the slot's own starting
+/// position, as `initial_snapshot_handshake` does. A row behind the slot
+/// would read as a slot recreated past this instance's confirmed position
+/// (issue #406) and fail `Intake::connect`.
+async fn seed_progress_at_slot(client: &Client, slot: &str) {
+    let seeded = client
         .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-            &[&slot, &PgLsn::from(confirmed_lsn)],
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             select slot_name, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
+            &[&slot],
         )
         .await
-        .expect("seed replication_progress");
+        .expect("seed replication_progress at the slot's start");
+    assert_eq!(
+        seeded, 1,
+        "slot {slot} must exist before seeding its progress"
+    );
 }
 
 /// The exact GUCs `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins, each set here
@@ -180,7 +189,7 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         )
         .await
         .expect("create replication slot");
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // The change intake should pick up, made *after* the slot exists so it
     // is guaranteed to be in the stream. The GUCs above are all pure

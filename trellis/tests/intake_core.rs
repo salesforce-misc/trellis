@@ -57,6 +57,26 @@ async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
         .expect("seed replication_progress");
 }
 
+/// Seeds `slot`'s `replication_progress` row at the slot's own starting
+/// position, as `initial_snapshot_handshake` does. A row behind the slot
+/// would read as a slot recreated past this instance's confirmed position
+/// (issue #406) and fail `Intake::connect`.
+async fn seed_progress_at_slot(client: &Client, slot: &str) {
+    let seeded = client
+        .execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             select slot_name, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
+            &[&slot],
+        )
+        .await
+        .expect("seed replication_progress at the slot's start");
+    assert_eq!(
+        seeded, 1,
+        "slot {slot} must exist before seeding its progress"
+    );
+}
+
 async fn confirmed_lsn(client: &Client, slot: &str) -> Option<u64> {
     client
         .query_opt(
@@ -348,7 +368,7 @@ async fn end_to_end_happy_path_stages_a_change_and_advances_the_watermark() {
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // The change intake should pick up, made *after* the slot exists so it
     // is guaranteed to be in the stream.
@@ -451,7 +471,7 @@ async fn group_commit_batches_several_source_transactions_into_fewer_ring_commit
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // Three separate single-row transactions (three implicit-autocommit
     // `execute` calls, matching this crate's own "one INSERT == one
@@ -561,7 +581,7 @@ async fn a_full_replica_identity_change_extracts_the_primary_key_not_the_whole_r
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // The change intake should pick up, made *after* the slot exists so it
     // is guaranteed to be in the stream.
@@ -675,7 +695,7 @@ async fn a_composite_key_declared_out_of_physical_column_order_stages_in_declare
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     setup
         .execute(
@@ -794,7 +814,7 @@ async fn a_dropped_default_identity_table_still_stages_its_pending_change() {
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     setup
         .execute(
@@ -887,7 +907,7 @@ async fn a_truncate_message_becomes_a_staged_sentinel_not_dropped() {
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // A TRUNCATE made after the slot exists, so it's guaranteed to be in the
     // stream — publications publish TRUNCATE by default (`publish` defaults
@@ -996,7 +1016,7 @@ async fn intake_populates_group_key_for_a_from_side_row_with_an_outbound_relatio
         .await
         .expect("create replication slot");
     let _: String = slot_row.get(0);
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     // Declared before intake connects, so `GroupKeyColumns`' first (empty)
     // cache lookup for `articles` is a genuine catalog miss that finds it —

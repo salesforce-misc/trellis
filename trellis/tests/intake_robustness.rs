@@ -37,6 +37,26 @@ async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
         .expect("seed replication_progress");
 }
 
+/// Seeds `slot`'s `replication_progress` row at the slot's own starting
+/// position, as `initial_snapshot_handshake` does. A row behind the slot
+/// would read as a slot recreated past this instance's confirmed position
+/// (issue #406) and fail `Intake::connect`.
+async fn seed_progress_at_slot(client: &Client, slot: &str) {
+    let seeded = client
+        .execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             select slot_name, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
+            &[&slot],
+        )
+        .await
+        .expect("seed replication_progress at the slot's start");
+    assert_eq!(
+        seeded, 1,
+        "slot {slot} must exist before seeding its progress"
+    );
+}
+
 async fn confirmed_lsn(client: &Client, slot: &str) -> Option<u64> {
     client
         .query_opt(
@@ -185,7 +205,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         )
         .await
         .expect("create replication slot");
-    seed_progress(&setup, "intake_slot", 0).await;
+    seed_progress_at_slot(&setup, "intake_slot").await;
 
     let config = intake::IntakeConfig {
         dsn: db.dsn().to_string(),
@@ -205,13 +225,18 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
     let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
         .expect("connect intake");
+    // Every position below is an offset from where the slot (and so the
+    // seeded watermark) starts.
+    let base = confirmed_lsn(&setup, "intake_slot")
+        .await
+        .expect("seeded watermark");
 
     // Guard (a): a keepalive whose wal_end is ahead of an open transaction's
     // Begin must not move the watermark — those changes are still only
     // buffered, not staged.
     consumer
         .handle_event(ReplicationEvent::Begin {
-            final_lsn: Lsn::from(1_000),
+            final_lsn: Lsn::from(base + 1_000),
             xid: 42,
             commit_time_micros: 0,
         })
@@ -219,7 +244,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         .expect("handle Begin");
     consumer
         .handle_event(ReplicationEvent::KeepAlive {
-            wal_end: Lsn::from(5_000),
+            wal_end: Lsn::from(base + 5_000),
             reply_requested: false,
             server_time_micros: 0,
         })
@@ -227,7 +252,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         .expect("handle KeepAlive");
     assert_eq!(
         confirmed_lsn(&setup, "intake_slot").await,
-        Some(0),
+        Some(base),
         "a keepalive received mid-transaction must not advance the watermark"
     );
 
@@ -235,19 +260,22 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
     // in) — the commit's own watermark advance still applies.
     consumer
         .handle_event(ReplicationEvent::Commit {
-            lsn: Lsn::from(900),
-            end_lsn: Lsn::from(1_000),
+            lsn: Lsn::from(base + 900),
+            end_lsn: Lsn::from(base + 1_000),
             commit_time_micros: 0,
         })
         .await
         .expect("handle Commit");
-    assert_eq!(confirmed_lsn(&setup, "intake_slot").await, Some(1_000));
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 1_000)
+    );
 
     // Guard (b): a keepalive behind the already-confirmed position is a
     // silent no-op, not a regression.
     consumer
         .handle_event(ReplicationEvent::KeepAlive {
-            wal_end: Lsn::from(500),
+            wal_end: Lsn::from(base + 500),
             reply_requested: false,
             server_time_micros: 0,
         })
@@ -255,7 +283,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         .expect("handle KeepAlive");
     assert_eq!(
         confirmed_lsn(&setup, "intake_slot").await,
-        Some(1_000),
+        Some(base + 1_000),
         "a keepalive behind the confirmed position must never regress it"
     );
 
@@ -264,19 +292,7 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
     // the case the whole feature exists for.
     consumer
         .handle_event(ReplicationEvent::KeepAlive {
-            wal_end: Lsn::from(2_000),
-            reply_requested: false,
-            server_time_micros: 0,
-        })
-        .await
-        .expect("handle KeepAlive");
-    assert_eq!(confirmed_lsn(&setup, "intake_slot").await, Some(2_000));
-
-    // Guard (d): the very next keepalive, still within the rate-limit
-    // window, must not re-persist even though its wal_end is higher still.
-    consumer
-        .handle_event(ReplicationEvent::KeepAlive {
-            wal_end: Lsn::from(3_000),
+            wal_end: Lsn::from(base + 2_000),
             reply_requested: false,
             server_time_micros: 0,
         })
@@ -284,7 +300,22 @@ async fn keepalive_watermark_advance_is_guarded_on_every_axis() {
         .expect("handle KeepAlive");
     assert_eq!(
         confirmed_lsn(&setup, "intake_slot").await,
-        Some(2_000),
+        Some(base + 2_000)
+    );
+
+    // Guard (d): the very next keepalive, still within the rate-limit
+    // window, must not re-persist even though its wal_end is higher still.
+    consumer
+        .handle_event(ReplicationEvent::KeepAlive {
+            wal_end: Lsn::from(base + 3_000),
+            reply_requested: false,
+            server_time_micros: 0,
+        })
+        .await
+        .expect("handle KeepAlive");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 2_000),
         "a second persist inside the rate-limit window must be suppressed"
     );
 }
@@ -862,6 +893,77 @@ async fn another_databases_healthy_slot_does_not_make_a_lost_slot_look_healthy()
         .execute("select pg_drop_replication_slot('shared_health_slot')", &[])
         .await
         .expect("clean up db_a's slot so it doesn't leak");
+}
+
+/// Issue #406: a slot that exists and isn't `lost` is still not healthy if it
+/// was dropped and recreated under the same name, because everything committed
+/// between the drop and the recreate is gone. The recreated slot starts past
+/// the position this instance last confirmed; a slot it has been
+/// acknowledging never gets there, since the acknowledgment only goes out
+/// after the position is persisted. Both halves are pinned here: a slot at or
+/// behind the confirmed position is healthy (behind is the crash window
+/// between persisting a position and acknowledging it), and one ahead of it
+/// is lost.
+#[tokio::test]
+async fn a_slot_recreated_under_the_same_name_is_not_healthy() {
+    const SLOT: &str = "reborn_slot";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let setup = connect_raw(db.dsn()).await;
+
+    let created: PgLsn = setup
+        .query_one(
+            "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&SLOT],
+        )
+        .await
+        .expect("create the slot")
+        .get(0);
+    publication::require_slot_healthy(&setup, SLOT, created)
+        .await
+        .expect("a slot at exactly the confirmed position is healthy");
+    let persisted_ahead = PgLsn::from(u64::from(created) + 0x10_0000);
+    publication::require_slot_healthy(&setup, SLOT, persisted_ahead)
+        .await
+        .expect("a slot behind the confirmed position (acknowledgment not yet sent) is healthy");
+
+    setup
+        .execute("select pg_drop_replication_slot($1)", &[&SLOT])
+        .await
+        .expect("drop the slot");
+    setup
+        .batch_execute(
+            "create table gap_writes (id int primary key); insert into gap_writes values (1);",
+        )
+        .await
+        .expect("commit a write no stream will deliver");
+    setup
+        .query_one(
+            "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&SLOT],
+        )
+        .await
+        .expect("recreate the slot under the same name");
+
+    match publication::require_slot_healthy(&setup, SLOT, created).await {
+        Err(IntakeError::SlotLost {
+            slot,
+            last_confirmed_lsn,
+        }) => {
+            assert_eq!(slot, SLOT);
+            assert_eq!(last_confirmed_lsn, u64::from(created));
+        }
+        Err(other) => panic!("expected SlotLost, got {other:?}"),
+        Ok(()) => panic!(
+            "a slot recreated past the confirmed position has lost the writes in between and \
+             must not be reported healthy"
+        ),
+    }
+
+    setup
+        .execute("select pg_drop_replication_slot($1)", &[&SLOT])
+        .await
+        .expect("clean up the slot");
 }
 
 /// Item 6 (issue #32): the `wal_status = 'lost'` branch of

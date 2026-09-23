@@ -255,8 +255,10 @@ async fn intake_commit_transaction_span_records_slot_and_change_count() {
         .expect("create replication slot");
     setup
         .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-            &[&"intake_slot", &PgLsn::from(0u64)],
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             select slot_name, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
+            &[&"intake_slot"],
         )
         .await
         .expect("seed replication_progress");

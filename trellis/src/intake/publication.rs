@@ -14,7 +14,7 @@
 //!   watched table from the exact snapshot the slot's creation exports —
 //!   gap-free by construction.
 //! - [`require_slot_healthy`] is the loud startup check for slot
-//!   invalidation/loss.
+//!   invalidation/loss, including a slot recreated under the same name.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -1259,11 +1259,17 @@ async fn slot_is_orphaned(client: &impl GenericClient, slot: &str) -> Result<boo
     Ok(!has_progress_row)
 }
 
-/// The slot's observed health, per `pg_replication_slots.wal_status`.
+/// The slot's observed health, per `pg_replication_slots.wal_status` and
+/// its `confirmed_flush_lsn` against this instance's last confirmed position.
 enum SlotHealth {
     Healthy,
     Missing,
     Invalidated,
+    /// Present and not `lost`, but its `confirmed_flush_lsn` is past the
+    /// position this instance last confirmed (issue #406). See
+    /// [`slot_health`] for why that means the slot isn't the one this
+    /// instance was acknowledging.
+    AheadOfConfirmed,
 }
 
 /// Scoped to `database = current_database()` for the same reason
@@ -1275,33 +1281,62 @@ enum SlotHealth {
 /// `Healthy`, defeating [`require_slot_healthy`]'s whole purpose (refusing to
 /// resume into an unrecoverable WAL gap) on the strength of a slot that isn't
 /// ours and that intake could never actually stream from.
-async fn slot_health(client: &impl GenericClient, slot: &str) -> Result<SlotHealth, IntakeError> {
+///
+/// **A slot recreated under the same name (issue #406).** Existence and
+/// `wal_status` can't tell a slot that was dropped and recreated while
+/// Trellis was down from the one it was streaming from, and every change
+/// committed between the drop and the recreate is gone. Postgres gives a slot
+/// no creation identity, but its position is enough: the slot's
+/// `confirmed_flush_lsn` moves only when a consumer acknowledges a position,
+/// and intake acknowledges only positions it has already persisted to
+/// `replication_progress` (the linchpin commits first, and
+/// [`super::Intake::connect`] relies on the same invariant to resume from
+/// `last_confirmed`). So the slot this instance has been feeding never sits
+/// past `last_confirmed`. It can sit behind it, in the window between
+/// persisting a position and the acknowledgment reaching the server. A
+/// freshly created slot starts at the WAL position of its creation, which is
+/// past anything this instance could have confirmed before the drop. The
+/// check is conservative. A slot dropped and recreated with nothing
+/// committed in between is still reported, as is a slot some other consumer
+/// advanced (`pg_replication_slot_advance`, `pg_logical_slot_get_changes`),
+/// but that consumer took changes this instance never saw, so it's a real
+/// gap too.
+async fn slot_health(
+    client: &impl GenericClient,
+    slot: &str,
+    last_confirmed_lsn: PgLsn,
+) -> Result<SlotHealth, IntakeError> {
     let row = client
         .query_opt(
-            "select wal_status from pg_replication_slots where slot_name = $1 and \
-             database = current_database()",
+            "select wal_status, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
             &[&slot],
         )
         .await?;
-    Ok(match row {
-        None => SlotHealth::Missing,
-        Some(r) => {
-            let wal_status: String = r.get(0);
-            if wal_status == "lost" {
-                SlotHealth::Invalidated
-            } else {
-                SlotHealth::Healthy
-            }
-        }
+    let Some(row) = row else {
+        return Ok(SlotHealth::Missing);
+    };
+    let wal_status: Option<String> = row.get(0);
+    if wal_status.as_deref() == Some("lost") {
+        return Ok(SlotHealth::Invalidated);
+    }
+    // NULL only for a physical slot (filtered out by the `database` scope) or
+    // a logical slot another session is still creating.
+    let confirmed_flush: Option<PgLsn> = row.get(1);
+    Ok(match confirmed_flush {
+        Some(position) if position > last_confirmed_lsn => SlotHealth::AheadOfConfirmed,
+        _ => SlotHealth::Healthy,
     })
 }
 
 /// Checked at [`super::Intake::connect`] whenever `last_confirmed_lsn` shows
 /// this instance has confirmed work against `slot` before: the slot must
-/// still exist and not be marked `lost`. Invalidation (retention cap
-/// exceeded) and loss on failover (pre-PG17 doesn't preserve slots across a
-/// promotion) both mean everything between `last_confirmed_lsn` and any new
-/// slot's start position is unrecoverable by streaming — so this errors
+/// still exist, not be marked `lost`, and not have been recreated under the
+/// same name, which shows up as a position past `last_confirmed_lsn` (issue
+/// #406, see [`slot_health`]). Invalidation (retention cap exceeded), loss on
+/// failover (pre-PG17 doesn't preserve slots across a promotion) and a
+/// drop-and-recreate all mean everything between `last_confirmed_lsn` and the
+/// new slot's start position is unrecoverable by streaming — so this errors
 /// rather than let intake silently resume into a gap. It is also the detector
 /// [`super::slot_loss::pause_if_slot_lost`] runs during a staging worker's
 /// setup, which turns the error into pausing every transform the slot fed
@@ -1309,14 +1344,16 @@ async fn slot_health(client: &impl GenericClient, slot: &str) -> Result<SlotHeal
 pub async fn require_slot_healthy(
     client: &impl GenericClient,
     slot: &str,
-    last_confirmed_lsn: tokio_postgres::types::PgLsn,
+    last_confirmed_lsn: PgLsn,
 ) -> Result<(), IntakeError> {
-    match slot_health(client, slot).await? {
+    match slot_health(client, slot, last_confirmed_lsn).await? {
         SlotHealth::Healthy => Ok(()),
-        SlotHealth::Missing | SlotHealth::Invalidated => Err(IntakeError::SlotLost {
-            slot: slot.to_string(),
-            last_confirmed_lsn: u64::from(last_confirmed_lsn),
-        }),
+        SlotHealth::Missing | SlotHealth::Invalidated | SlotHealth::AheadOfConfirmed => {
+            Err(IntakeError::SlotLost {
+                slot: slot.to_string(),
+                last_confirmed_lsn: u64::from(last_confirmed_lsn),
+            })
+        }
     }
 }
 

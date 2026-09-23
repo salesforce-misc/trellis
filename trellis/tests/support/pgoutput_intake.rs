@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use pgwire_replication::{Lsn, ReplicationEvent};
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::intake::{self, spill};
@@ -186,8 +185,10 @@ impl Pipeline {
             .expect("create slot");
         }
         raw.execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-            &[&INTAKE_SLOT, &PgLsn::from(0)],
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             select slot_name, confirmed_flush_lsn from pg_replication_slots \
+             where slot_name = $1 and database = current_database()",
+            &[&INTAKE_SLOT],
         )
         .await
         .expect("seed replication_progress");

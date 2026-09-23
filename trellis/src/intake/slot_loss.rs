@@ -1,7 +1,10 @@
 //! Issue #310: what the staging worker does when the replication slot it has
 //! confirmed work against is gone — missing (a pre-PG-17 failover, a restore
-//! of the source database from a backup or PITR, a manual drop) or
-//! invalidated (`wal_status = 'lost'`, the retention cap).
+//! of the source database from a backup or PITR, a manual drop), invalidated
+//! (`wal_status = 'lost'`, the retention cap), or dropped and recreated under
+//! the same name before Trellis looked (issue #406; detected by the slot's
+//! position being past the last confirmed one, see
+//! [`super::publication::require_slot_healthy`]).
 //!
 //! Every change between the slot's last confirmed position and whatever a new
 //! slot starts from is unrecoverable by streaming, so every target the slot
@@ -42,10 +45,11 @@
 //! before the slot is recreated, so a crash anywhere in the sequence leaves the
 //! slot still missing and the next startup redoes the rest (every step is
 //! idempotent). A crash after the slot is created but before the new position
-//! commits leaves `replication_progress` at the old position; streaming from an
-//! older `start_lsn` than a logical slot's own position starts at the slot's
-//! position, and every fed transform is already paused, so nothing is lost
-//! that wasn't already lost.
+//! commits leaves `replication_progress` at the old position, behind the new
+//! slot's, which is exactly how a slot recreated under the same name looks
+//! (issue #406). The next startup treats it as lost again and redoes the
+//! recovery: every fed transform is already paused, so it pauses nothing new,
+//! and it replaces the slot once more and aligns the watermark this time.
 
 use std::time::Duration;
 
@@ -150,8 +154,9 @@ pub async fn transforms_fed_by_publication(
 }
 
 /// Checks `slot` (which has a `replication_progress` row, so this instance has
-/// confirmed work against it) and, if it is missing or invalidated, runs the
-/// recovery the module doc describes. `Ok(None)` for a healthy slot.
+/// confirmed work against it) and, if it is missing, invalidated or recreated
+/// under the same name, runs the recovery the module doc describes.
+/// `Ok(None)` for a healthy slot.
 ///
 /// Uses `session`, the staging worker's own [`ProducerSession`], for the slot
 /// work (the producer singleton lock it holds is what makes this the only
@@ -230,12 +235,13 @@ pub async fn pause_if_slot_lost(
         new_slot_lsn = %new_slot_lsn,
         paused = ?paused,
         already_frozen = ?already_frozen,
-        "replication slot {slot} was missing or invalidated; every change after its last \
-         confirmed position {last_confirmed} is unrecoverable by streaming, so every transform \
-         it fed is paused rather than left silently stale. Paused now: [{}]; already frozen: \
-         [{}]. Trellis recreated the slot (streaming from {new_slot_lsn}) and will not resume \
-         these on its own: once the source database is stable, run RESUME TRANSFORM <name> for \
-         each, which rebuilds it by a fresh backfill from current source data",
+        "replication slot {slot} was missing, invalidated, or recreated under the same name; \
+         every change after its last confirmed position {last_confirmed} is unrecoverable by \
+         streaming, so every transform it fed is paused rather than left silently stale. Paused \
+         now: [{}]; already frozen: [{}]. Trellis recreated the slot (streaming from \
+         {new_slot_lsn}) and will not resume these on its own: once the source database is \
+         stable, run RESUME TRANSFORM <name> for each, which rebuilds it by a fresh backfill \
+         from current source data",
         paused.join(", "),
         already_frozen.join(", "),
     );
@@ -247,8 +253,9 @@ pub async fn pause_if_slot_lost(
     }))
 }
 
-/// Drops `slot` if an invalidated copy of it is still registered in this
-/// database (it can never stream again, so dropping it loses nothing), creates
+/// Drops `slot` if a copy of it is still registered in this database (an
+/// invalidated one can never stream again, and one recreated under the same
+/// name starts past the gap, so dropping either loses nothing), creates
 /// it fresh, and moves `replication_progress` to the new slot's start in the
 /// same transaction as the create.
 ///

@@ -441,3 +441,99 @@ async fn recovery_leaves_prior_freezes_alone_and_discards_only_orphaned_markers(
         .await
         .expect("clean up the recreated slot");
 }
+
+/// Issue #406: the slot is dropped while Trellis is down, the source takes a
+/// write nothing will ever stream, and then something recreates the slot
+/// under the same name before Trellis restarts. The slot is present and not
+/// `lost`, so a check that only asks "does it exist?" calls it healthy and
+/// the transform silently misses the write. The recreated slot starts past
+/// the position this instance last confirmed, which a slot it has been
+/// acknowledging never does, so it is recovered as a loss: the fed transform
+/// is paused and recorded, and the slot and watermark end up realigned.
+#[tokio::test]
+async fn a_slot_recreated_under_the_same_name_is_recovered_as_lost() {
+    const REBORN: &str = "reborn_slot";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 4).await;
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
+        .await
+        .expect("define the transform under test");
+    definer.shutdown().await.expect("shut the definer down");
+
+    raw.batch_execute("create publication only_orders for table orders")
+        .await
+        .expect("create the publication");
+    let created: tokio_postgres::types::PgLsn = raw
+        .query_one(
+            "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&REBORN],
+        )
+        .await
+        .expect("create the slot")
+        .get(0);
+    raw.execute(
+        "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
+        &[&REBORN, &created],
+    )
+    .await
+    .expect("seed progress at the slot's start, as the handshake does");
+
+    let mut session = trellis::staging::session::ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("open a producer session");
+    assert!(
+        slot_loss::pause_if_slot_lost(&mut session, &db.pool, REBORN, "only_orders")
+            .await
+            .expect("check the original slot")
+            .is_none(),
+        "a slot sitting exactly at the confirmed position is healthy"
+    );
+
+    raw.execute("select pg_drop_replication_slot($1)", &[&REBORN])
+        .await
+        .expect("drop the slot");
+    raw.batch_execute(
+        "insert into orders (id, g, a) select s, s % 2, s from generate_series(5, 8) s",
+    )
+    .await
+    .expect("write to the source while the slot is gone");
+    raw.query_one(
+        "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&REBORN],
+    )
+    .await
+    .expect("recreate the slot under the same name");
+
+    let recovery = slot_loss::pause_if_slot_lost(&mut session, &db.pool, REBORN, "only_orders")
+        .await
+        .expect("recover from the recreated slot")
+        .expect("a slot recreated past the confirmed position has lost the writes in between");
+    assert_eq!(recovery.paused, vec!["order_rollup"]);
+    assert_eq!(
+        persisted_status(&raw, "order_rollup").await.as_deref(),
+        Some("paused")
+    );
+    let recorded = slot_loss::slot_loss_paused_transforms(&raw)
+        .await
+        .expect("read the slot-loss pause record");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].lost_confirmed_lsn, created);
+
+    assert!(
+        slot_loss::pause_if_slot_lost(&mut session, &db.pool, REBORN, "only_orders")
+            .await
+            .expect("check the slot recovery made")
+            .is_none(),
+        "recovery leaves the slot and the watermark aligned, so the next check passes"
+    );
+
+    drop(session);
+    raw.execute("select pg_drop_replication_slot($1)", &[&REBORN])
+        .await
+        .expect("clean up the slot");
+}

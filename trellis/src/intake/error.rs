@@ -54,9 +54,11 @@ pub enum IntakeError {
     /// The txn-buffer spill file (issue #8) failed to write or read back.
     Io(std::io::Error),
     /// A replication slot this instance has previously confirmed work
-    /// against (a `replication_progress` row exists for it) is missing or
-    /// invalidated. Changes between `last_confirmed_lsn` and any new slot's
-    /// start position are unrecoverable by streaming, so [`super::Intake::connect`]
+    /// against (a `replication_progress` row exists for it) is missing,
+    /// invalidated, or was recreated under the same name (issue #406: its
+    /// position is past `last_confirmed_lsn`). Changes between
+    /// `last_confirmed_lsn` and any new slot's start position are
+    /// unrecoverable by streaming, so [`super::Intake::connect`]
     /// refuses rather than resume silently into the gap. A `Client`'s staging
     /// setup handles the loss before it gets here (issue #310,
     /// [`super::slot_loss::pause_if_slot_lost`]: pause every transform the
@@ -186,10 +188,11 @@ impl fmt::Display for IntakeError {
                 last_confirmed_lsn,
             } => write!(
                 f,
-                "replication slot {slot} is missing or invalidated; changes after confirmed \
-                 position {last_confirmed_lsn} are unrecoverable by streaming — refusing to \
-                 resume silently into the gap (a restarted staging worker pauses every transform \
-                 the slot fed and recreates it; resume each to rebuild it by a fresh backfill)"
+                "replication slot {slot} is missing, invalidated, or was recreated; changes \
+                 after confirmed position {last_confirmed_lsn} are unrecoverable by streaming — \
+                 refusing to resume silently into the gap (a restarted staging worker pauses \
+                 every transform the slot fed and recreates it; resume each to rebuild it by a \
+                 fresh backfill)"
             ),
             IntakeError::InvalidTableName(name) => {
                 write!(f, "expected a \"schema.table\" name, got {name:?}")
