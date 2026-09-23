@@ -194,10 +194,13 @@ knife-edged guards:
   intermediate hop is written by an apply that already stages the downstream
   change in the same transaction, and it is also in the publication because a
   downstream transform reads it. The apply emits a transactional
-  `pg_logical_emit_message` (`trellis.propagated`) naming those targets before
-  writing them, and intake drops that transaction's changes to exactly those
-  tables. The in-transaction copy is the one kept: it commits with the write, and
-  it carries the upstream origin read-your-writes convergence relies on.
+  `pg_logical_emit_message` (`trellis.propagated:<instance schema>`) naming
+  those targets before writing them, and intake drops that transaction's
+  changes to exactly those tables. The message reaches every slot in the
+  database, so the prefix carries the instance schema: another instance that
+  reads the same table has no in-transaction copy and keeps the CDC. The
+  in-transaction copy is the one kept: it commits with the write, and it
+  carries the upstream origin read-your-writes convergence relies on.
 - **The initial snapshot handshake must be gap-free by construction**, not by
   overlap-and-dedup: create the slot with `EXPORT_SNAPSHOT`, backfill from that
   exact snapshot, then stream from the slot's consistent point.

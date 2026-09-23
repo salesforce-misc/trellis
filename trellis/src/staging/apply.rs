@@ -6485,7 +6485,10 @@ async fn emit_propagated_tables(txn: &Transaction<'_>, plan: &ApplyPlan) -> Resu
     let content =
         crate::intake::encode_propagated_tables(plan.propagated_in_txn.iter().map(String::as_str));
     txn.execute(
-        "select pg_logical_emit_message(true, $1, $2::bytea)",
+        // `current_schema()` is the instance schema (the pool pins it first
+        // on `search_path`), which scopes the message to this instance's
+        // intake. See `intake::PROPAGATED_TABLES_MESSAGE_PREFIX`.
+        "select pg_logical_emit_message(true, $1 || current_schema(), $2::bytea)",
         &[&crate::intake::PROPAGATED_TABLES_MESSAGE_PREFIX, &content],
     )
     .await?;

@@ -680,6 +680,9 @@ pub struct Intake {
     /// its [`PROPAGATED_TABLES_MESSAGE_PREFIX`] message. Their changes are
     /// dropped rather than buffered. Cleared on `Begin` and `Commit`.
     propagated_in_txn: std::collections::HashSet<String>,
+    /// This instance's [`propagated_tables_prefix`]. A message under any
+    /// other prefix, including another instance's, is ignored.
+    propagated_prefix: String,
     /// The in-memory half of the watermark, advanced only after its durable
     /// write returns — mirrors the linchpin's own acknowledgment discipline
     /// for the keepalive path, which has no `pgwire_replication` metrics
@@ -748,7 +751,21 @@ pub struct Intake {
 /// The message is transactional, so it is decoded only if the apply commits,
 /// and it is emitted before the apply's first target write, so intake sees it
 /// before any change it covers.
-pub(crate) const PROPAGATED_TABLES_MESSAGE_PREFIX: &str = "trellis.propagated";
+///
+/// A logical-decoding message reaches every slot in the database, not just
+/// this instance's, so the full prefix ends with the emitting instance's
+/// schema ([`propagated_tables_prefix`]). Another instance may read one of
+/// this instance's hops as a source, and it has no in-transaction copy of
+/// the write, so its intake must keep the CDC. The apply appends the schema
+/// in SQL as `current_schema()`, which the pool's `search_path` pins to the
+/// instance schema.
+pub(crate) const PROPAGATED_TABLES_MESSAGE_PREFIX: &str = "trellis.propagated:";
+
+/// The full [`PROPAGATED_TABLES_MESSAGE_PREFIX`] an apply in the instance
+/// owning `schema` emits.
+fn propagated_tables_prefix(schema: &str) -> String {
+    format!("{PROPAGATED_TABLES_MESSAGE_PREFIX}{schema}")
+}
 
 /// Encodes qualified table names as the content of a
 /// [`PROPAGATED_TABLES_MESSAGE_PREFIX`] message: NUL-separated, since NUL is
@@ -889,6 +906,7 @@ impl Intake {
             current_xid: None,
             in_txn: false,
             propagated_in_txn: std::collections::HashSet::new(),
+            propagated_prefix: propagated_tables_prefix(&config.schema),
             last_confirmed,
             // Zero-initialized rather than `Instant::now()`, so the very
             // first keepalive after connecting is never held back by the
@@ -986,7 +1004,7 @@ impl Intake {
                 prefix,
                 content,
                 ..
-            } if prefix == PROPAGATED_TABLES_MESSAGE_PREFIX => {
+            } if prefix == self.propagated_prefix => {
                 self.propagated_in_txn
                     .extend(decode_propagated_tables(&content));
             }

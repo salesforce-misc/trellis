@@ -159,86 +159,128 @@ async fn h3_groups(raw: &Client) -> HashMap<String, String> {
         .collect()
 }
 
-#[tokio::test]
-async fn an_aggregate_counts_a_published_intermediate_hops_write_once() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+/// `src -> h1 -> h3` with `h1` published, and a real [`intake::Intake`] fed
+/// by hand from [`BYTES_SLOT`].
+struct Hop {
+    raw: Client,
+    intake: intake::Intake,
+    db: testkit::TestDatabase,
+    _cluster: TestCluster,
+}
 
-    raw.batch_execute("create table public.src (id integer primary key, val numeric)")
-        .await
-        .expect("create src");
-    let columns = numeric_columns(&["id", "val"]);
-    install_definition(
-        &db.pool,
-        "TRANSFORM h1 FROM public.src SELECT val AS val",
-        &columns,
-        "public",
-    )
-    .await
-    .expect("install h1");
-    // An aggregate over `h1` needs `h1`'s full old image.
-    raw.batch_execute("alter table public.h1 replica identity full")
-        .await
-        .expect("widen h1's replica identity");
-    install_definition(
-        &db.pool,
-        "TRANSFORM h3 FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
-        &columns,
-        "public",
-    )
-    .await
-    .expect("install h3");
+impl Hop {
+    async fn start() -> Self {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = connect_raw(db.dsn()).await;
 
-    raw.batch_execute(&format!(
-        "create publication {PUBLICATION} for table public.src, public.h1"
-    ))
-    .await
-    .expect("create publication");
-    for slot in [INTAKE_SLOT, BYTES_SLOT] {
-        raw.query_one(
-            "select slot_name from pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
+        raw.batch_execute("create table public.src (id integer primary key, val numeric)")
+            .await
+            .expect("create src");
+        let columns = numeric_columns(&["id", "val"]);
+        install_definition(
+            &db.pool,
+            "TRANSFORM h1 FROM public.src SELECT val AS val",
+            &columns,
+            "public",
         )
         .await
-        .expect("create slot");
-    }
-    raw.execute(
-        "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-        &[&INTAKE_SLOT, &PgLsn::from(0)],
-    )
-    .await
-    .expect("seed replication_progress");
-
-    let config = intake::IntakeConfig {
-        dsn: db.dsn().to_string(),
-        schema: DEFAULT_SCHEMA.to_string(),
-        host: db.socket_dir().display().to_string(),
-        port: db.port(),
-        user: "postgres".to_string(),
-        password: String::new(),
-        database: db.name().to_string(),
-        slot: INTAKE_SLOT.to_string(),
-        publication: PUBLICATION.to_string(),
-        wake_channel: WAKE.to_string(),
-        spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
-        hard_cap: spill::DEFAULT_HARD_CAP,
-        group_commit: None,
-    };
-    let mut intake = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+        .expect("install h1");
+        // An aggregate over `h1` needs `h1`'s full old image.
+        raw.batch_execute("alter table public.h1 replica identity full")
+            .await
+            .expect("widen h1's replica identity");
+        install_definition(
+            &db.pool,
+            "TRANSFORM h3 FROM public.h1 GROUP BY val SELECT COUNT(*) AS n",
+            &columns,
+            "public",
+        )
         .await
-        .expect("connect intake");
+        .expect("install h3");
 
-    raw.execute("insert into public.src (id, val) values (1, 7)", &[])
+        raw.batch_execute(&format!(
+            "create publication {PUBLICATION} for table public.src, public.h1"
+        ))
+        .await
+        .expect("create publication");
+        for slot in [INTAKE_SLOT, BYTES_SLOT] {
+            raw.query_one(
+                "select slot_name from pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&slot],
+            )
+            .await
+            .expect("create slot");
+        }
+        raw.execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
+            &[&INTAKE_SLOT, &PgLsn::from(0)],
+        )
+        .await
+        .expect("seed replication_progress");
+
+        let config = intake::IntakeConfig {
+            dsn: db.dsn().to_string(),
+            schema: DEFAULT_SCHEMA.to_string(),
+            host: db.socket_dir().display().to_string(),
+            port: db.port(),
+            user: "postgres".to_string(),
+            password: String::new(),
+            database: db.name().to_string(),
+            slot: INTAKE_SLOT.to_string(),
+            publication: PUBLICATION.to_string(),
+            wake_channel: WAKE.to_string(),
+            spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
+            hard_cap: spill::DEFAULT_HARD_CAP,
+            group_commit: None,
+        };
+        let intake = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
+            .await
+            .expect("connect intake");
+
+        Self {
+            raw,
+            intake,
+            db,
+            _cluster: cluster,
+        }
+    }
+
+    /// Feeds intake everything committed since the last call, then seals and
+    /// drains until nothing is pending.
+    async fn feed_and_drain(&mut self) {
+        feed_intake(&self.raw, &mut self.intake).await;
+        drain_to_quiescence(&self.db.pool, &mut self.raw).await;
+    }
+
+    async fn finish(self) {
+        // Intake's own stream was never read, so its walsender would hold up
+        // cluster shutdown waiting for a flush confirmation that never comes.
+        self.raw
+            .execute(
+                "select pg_terminate_backend(active_pid) from pg_replication_slots \
+                 where slot_name = $1 and active_pid is not null",
+                &[&INTAKE_SLOT],
+            )
+            .await
+            .expect("terminate intake's walsender");
+    }
+}
+
+#[tokio::test]
+async fn an_aggregate_counts_a_published_intermediate_hops_write_once() {
+    let mut hop = Hop::start().await;
+
+    hop.raw
+        .execute("insert into public.src (id, val) values (1, 7)", &[])
         .await
         .expect("insert into src");
 
     // The `src` insert reaches the ring, and draining it writes `h1`, whose
     // own downstream `Recompute` then drains into `h3` in a later batch.
-    feed_intake(&raw, &mut intake).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    hop.feed_and_drain().await;
     assert_eq!(
-        h3_groups(&raw).await,
+        h3_groups(&hop.raw).await,
         HashMap::from([("7".to_string(), "1".to_string())]),
         "the in-transaction propagation alone must count the row once"
     );
@@ -246,21 +288,46 @@ async fn an_aggregate_counts_a_published_intermediate_hops_write_once() {
     // Intake now decodes the transaction that wrote `h1`. Its CDC copy of
     // that write is the second producer: staged, it would drain as a delta
     // on top of the group the `Recompute` already re-derived.
-    feed_intake(&raw, &mut intake).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    hop.feed_and_drain().await;
     assert_eq!(
-        h3_groups(&raw).await,
+        h3_groups(&hop.raw).await,
         HashMap::from([("7".to_string(), "1".to_string())]),
         "the CDC copy of an already-propagated hop write must not be counted again"
     );
 
-    // Intake's own stream was never read, so its walsender would hold up
-    // cluster shutdown waiting for a flush confirmation that never comes.
-    raw.execute(
-        "select pg_terminate_backend(active_pid) from pg_replication_slots \
-         where slot_name = $1 and active_pid is not null",
-        &[&INTAKE_SLOT],
-    )
-    .await
-    .expect("terminate intake's walsender");
+    hop.finish().await;
+}
+
+/// A propagated-tables message reaches every slot in the database. One
+/// emitted by another Trellis instance must not make this instance's intake
+/// drop a write: that instance staged its downstream copy into its own ring,
+/// not this one's, so here the CDC copy is the only one there is.
+#[tokio::test]
+async fn another_instances_propagated_message_does_not_drop_this_instances_cdc() {
+    let mut hop = Hop::start().await;
+
+    // What another instance's apply emits (`staging::apply`'s
+    // `emit_propagated_tables`, run under that instance's `search_path`)
+    // while it writes `public.h1`, a table this instance reads as a source.
+    hop.raw
+        .batch_execute(
+            "create schema other_instance; \
+             begin; \
+             set local search_path to other_instance; \
+             select pg_logical_emit_message(true, 'trellis.propagated:' || current_schema(), \
+                                            'public.h1'::bytea); \
+             insert into public.h1 (id, val) values (2, 7); \
+             commit;",
+        )
+        .await
+        .expect("another instance writes h1");
+
+    hop.feed_and_drain().await;
+    assert_eq!(
+        h3_groups(&hop.raw).await,
+        HashMap::from([("7".to_string(), "1".to_string())]),
+        "this instance must stage the CDC of another instance's write to h1"
+    );
+
+    hop.finish().await;
 }
