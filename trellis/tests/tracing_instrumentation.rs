@@ -438,13 +438,16 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
 
     // A per-source `tracing::debug!` event, not a nested span (see
     // `compute`'s own doc comment on why) — still visible as a captured
-    // event with the source table's name.
+    // event with the source table's qualified name (issue #380 keys
+    // `compute`'s per-source loop on it).
     let events = captured.events();
+    let qualified_orders = format!("{DEFAULT_SCHEMA}.orders");
     assert!(
         events
             .iter()
             .any(|e| e.message().contains("evaluating a source table")
-                && e.fields.get("src_table").map(String::as_str) == Some("orders")),
+                && e.fields.get("src_table").map(String::as_str)
+                    == Some(qualified_orders.as_str())),
         "expected a per-source debug event naming orders: {events:#?}"
     );
 }
