@@ -81,9 +81,14 @@ async fn covered_and_unchanged_table_skips_enumeration() {
         .expect("reconcile adds widgets and leaves a marker");
     assert_eq!(pending_marker_count(&client).await, 1);
 
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, &table).await,
@@ -131,9 +136,14 @@ async fn a_write_after_the_coverage_fence_forces_full_enumeration() {
     publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
         .await
         .expect("reconcile adds widgets");
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, &table).await,
@@ -165,9 +175,14 @@ async fn a_table_with_no_coverage_is_enumerated_as_before() {
     publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
         .await
         .expect("reconcile adds widgets");
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, &table).await,
@@ -213,9 +228,14 @@ async fn an_update_after_the_coverage_fence_forces_full_enumeration() {
     publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
         .await
         .expect("reconcile adds widgets");
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, &table).await,
@@ -271,9 +291,14 @@ async fn a_write_during_the_build_window_forces_full_enumeration() {
     publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
         .await
         .expect("reconcile adds widgets");
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, &table).await,
@@ -360,9 +385,14 @@ async fn install_definition_records_coverage_and_a_to_side_join_skips() {
     publication::reconcile_publication(&mut client, "test_pub", &["public.posts".to_string()])
         .await
         .expect("reconcile adds public.posts");
-    publication::run_pending_backfills(&mut client, "wake")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
 
     assert_eq!(
         recompute_count(&client, "public.posts").await,

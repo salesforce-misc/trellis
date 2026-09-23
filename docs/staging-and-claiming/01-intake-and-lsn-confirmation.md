@@ -180,6 +180,24 @@ knife-edged guards:
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
   flight at `ADD` time has settled.
+- **That enumeration overlaps the stream, so it must not get ahead of intake.** A
+  change committed after the `ADD` but before the enumeration is both streamed and
+  enumerated. The enumeration's image-less `Recompute` makes an aggregate re-derive
+  the group from live state, so if it drains before that change's CDC delta, the
+  delta counts the change a second time (issue #312). The enumeration therefore
+  captures `pg_current_wal_insert_lsn()` right after declaring its cursor and does
+  not append until intake's staged-through watermark reaches it, which puts every
+  overlapping delta in the same batch as the recompute or an earlier one. The
+  discharge runs only once intake is running; setup leaves an existing slot's
+  markers to the maintenance loop.
+- **Trellis's own writes to a published target stream only once.** A chain's
+  intermediate hop is written by an apply that already stages the downstream
+  change in the same transaction, and it is also in the publication because a
+  downstream transform reads it. The apply emits a transactional
+  `pg_logical_emit_message` (`trellis.propagated`) naming those targets before
+  writing them, and intake drops that transaction's changes to exactly those
+  tables. The in-transaction copy is the one kept: it commits with the write, and
+  it carries the upstream origin read-your-writes convergence relies on.
 - **The initial snapshot handshake must be gap-free by construction**, not by
   overlap-and-dedup: create the slot with `EXPORT_SNAPSHOT`, backfill from that
   exact snapshot, then stream from the slot's consistent point.

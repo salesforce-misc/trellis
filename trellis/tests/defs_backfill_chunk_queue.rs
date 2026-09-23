@@ -730,9 +730,14 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     // Discharge the parked marker (the same `run_pending_backfills` event
     // the ring-fallback path already relies on) and drain the resulting
     // enumeration through the ring.
-    publication::run_pending_backfills(&mut client, "trellis_chunk_queue_test")
-        .await
-        .expect("run_pending_backfills");
+    publication::run_pending_backfills(
+        &mut client,
+        "trellis_chunk_queue_test",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let b_y_after_discharge: i64 = client
@@ -765,9 +770,14 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
 async fn discharge_pending_backfills(pool: &trellis::Pool, client: &mut Client) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        publication::run_pending_backfills(client, "trellis_chunk_queue_test")
-            .await
-            .expect("run_pending_backfills");
+        publication::run_pending_backfills(
+            client,
+            "trellis_chunk_queue_test",
+            &trellis::staging::StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("run_pending_backfills");
         let remaining: i64 = client
             .query_one("select count(*) from pending_backfill", &[])
             .await

@@ -1996,6 +1996,7 @@ dependencies = [
 name = "trellis"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "deadpool-postgres",
  "metrics",
  "metrics-exporter-prometheus",

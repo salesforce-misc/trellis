@@ -8,7 +8,8 @@
 //! - [`run_pending_backfills`] discharges the `pending_backfill` markers
 //!   [`reconcile_publication`] leaves behind: a newly-added table's
 //!   pre-existing rows, staged by enumeration once the marker's transaction
-//!   fence has settled.
+//!   fence has settled and intake has staged everything the enumeration's
+//!   snapshot sees (issue #312).
 //! - [`initial_snapshot_handshake`] creates a slot and backfills every
 //!   watched table from the exact snapshot the slot's creation exports —
 //!   gap-free by construction.
@@ -16,6 +17,7 @@
 //!   invalidation/loss.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{GenericClient, Transaction};
@@ -25,6 +27,7 @@ use crate::defs::model::TransformStatus;
 use crate::pool::quote_ident;
 use crate::staging::append::{self, StagedChange};
 use crate::staging::session::ProducerSession;
+use crate::staging::watermark::StagedWatermark;
 
 /// Joins `schema` and `table` into the `"schema.table"` shape
 /// [`StagedChange::src_table`] uses throughout this crate — the *only* place
@@ -339,6 +342,18 @@ pub(crate) async fn enumerate_and_append(
     txn: &Transaction<'_>,
     src_table: &str,
 ) -> Result<(), IntakeError> {
+    declare_enumeration(txn, src_table).await?;
+    append_enumeration(txn, src_table).await
+}
+
+/// The first half of [`enumerate_and_append`]: declares the enumeration
+/// cursor over `src_table`'s identity key.
+///
+/// Split out for issue #312: the cursor's snapshot is fixed here, at
+/// `DECLARE`, so [`run_pending_backfills`] can capture the WAL position that
+/// bounds everything that snapshot sees, and wait for intake to stage up to
+/// it, *before* [`append_enumeration`] writes a single `Recompute` row.
+async fn declare_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<(), IntakeError> {
     let (schema, table) = split_qualified(src_table)?;
     let from = format!("{}.{}", quote_ident(schema), quote_ident(table));
     // Issue #308: the table's row-identity key as `ddl` defines it — its
@@ -368,6 +383,13 @@ pub(crate) async fn enumerate_and_append(
         "declare {BACKFILL_CURSOR} cursor for select {key_expr} from {from}"
     ))
     .await?;
+    Ok(())
+}
+
+/// The second half of [`enumerate_and_append`]: pages the cursor
+/// [`declare_enumeration`] opened into the active ring segment as
+/// image-less `Recompute` rows, then closes it.
+async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<(), IntakeError> {
     loop {
         let rows = txn
             .query(
@@ -626,14 +648,44 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// definition's own catch-up marker, or a concurrently-running
 /// `backfill_chunks` build), since those were never `waiting_to_backfill` in
 /// the first place.
+///
+/// # Waiting for intake before staging (issue #312)
+///
+/// A marker's table is already in the publication when its enumeration runs,
+/// so a change committed between the `ALTER` and the enumeration reaches the
+/// ring twice: once as its own CDC delta, and once inside the enumeration's
+/// image-less `Recompute`, which an aggregate turns into a full re-derive of
+/// the group from live state. That is harmless only if the delta lands in
+/// the same batch as the recompute, or an earlier one. If the recompute's
+/// batch seals first, the aggregate re-derives a value that already includes
+/// the change, and the delta arriving in a later batch adds it a second time.
+/// Intake lags the source, so without a gate the recompute rows routinely
+/// reach the ring ahead of the CDC for changes the enumeration already saw.
+///
+/// So the enumeration does not append until intake has staged everything
+/// its cursor can see. The cursor's snapshot is fixed at `DECLARE`; every
+/// commit visible to it ends before `pg_current_wal_insert_lsn()` read right
+/// after. Once `watermark` (intake's in-process staged-through position)
+/// reaches that LSN, those commits' CDC rows are committed in the ring, so
+/// the `Recompute` rows appended afterward resolve the ring pointer later
+/// and commit later: they land in the same batch as that CDC or a later one.
+///
+/// If intake doesn't get there within `catch_up_timeout`, the enumeration
+/// rolls back, the marker stays, and any definition this pass promoted to
+/// `backfilling` returns to `waiting_to_backfill`, so the next pass retries
+/// cleanly. A caller with no intake running yet must not call this at all
+/// (see `client::setup_staging`); tests with no CDC stream pass
+/// [`crate::staging::StagedWatermark::saturated`].
 #[tracing::instrument(
     name = "intake.run_pending_backfills",
-    skip(client, wake_channel),
+    skip(client, wake_channel, watermark),
     fields(pending = tracing::field::Empty, settled = tracing::field::Empty)
 )]
 pub async fn run_pending_backfills(
     client: &mut tokio_postgres::Client,
     wake_channel: &str,
+    watermark: &StagedWatermark,
+    catch_up_timeout: Duration,
 ) -> Result<(), IntakeError> {
     let pending = fetch_pending_backfills(client).await?;
     tracing::Span::current().record("pending", pending.len());
@@ -669,7 +721,23 @@ pub async fn run_pending_backfills(
         let staged = if coverage_covers(&txn, &marker.table).await? {
             false
         } else {
-            enumerate_and_append(&txn, &marker.table).await?;
+            declare_enumeration(&txn, &marker.table).await?;
+            let horizon: PgLsn = txn
+                .query_one("select pg_current_wal_insert_lsn()", &[])
+                .await?
+                .get(0);
+            if !intake_caught_up(watermark, horizon, catch_up_timeout).await {
+                txn.rollback().await?;
+                revert_to_waiting(client, &advancing).await?;
+                tracing::debug!(
+                    table = %marker.table,
+                    horizon = %horizon,
+                    staged_through = %watermark.get(),
+                    "backfill enumeration deferred: intake has not staged through its snapshot yet"
+                );
+                continue;
+            }
+            append_enumeration(&txn, &marker.table).await?;
             true
         };
         txn.execute(
@@ -686,6 +754,47 @@ pub async fn run_pending_backfills(
         mark_definitions_live(client, &advancing).await?;
     }
     tracing::Span::current().record("settled", settled);
+    Ok(())
+}
+
+/// How often [`intake_caught_up`] re-reads the in-process watermark. The read
+/// is a bare atomic load, so this only bounds how late the wait notices.
+const CATCH_UP_POLL: Duration = Duration::from_millis(5);
+
+/// Waits until `watermark` reaches `horizon`, or `timeout` elapses. Returns
+/// whether intake got there — see [`run_pending_backfills`]'s "Waiting for
+/// intake before staging".
+async fn intake_caught_up(watermark: &StagedWatermark, horizon: PgLsn, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if watermark.get() >= horizon {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(CATCH_UP_POLL).await;
+    }
+}
+
+/// Undoes [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
+/// `backfilling` promotion for exactly `ids`, when the enumeration that
+/// promotion announced was deferred instead of run. Scoped to `ids` and to
+/// the `backfilling` status for the same reason that function is.
+async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    client
+        .execute(
+            "update transform_definitions set status = $1 where id = any($2) and status = $3",
+            &[
+                &TransformStatus::WaitingToBackfill.as_str(),
+                &ids,
+                &TransformStatus::Backfilling.as_str(),
+            ],
+        )
+        .await?;
     Ok(())
 }
 

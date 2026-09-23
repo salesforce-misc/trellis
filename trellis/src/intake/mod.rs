@@ -675,6 +675,11 @@ pub struct Intake {
     /// keepalive's watermark advance must never straddle (see
     /// [`Self::advance_watermark_on_keepalive`]).
     in_txn: bool,
+    /// Issue #312: tables whose writes in the transaction currently being
+    /// decoded were already propagated inside that transaction, as named by
+    /// its [`PROPAGATED_TABLES_MESSAGE_PREFIX`] message. Their changes are
+    /// dropped rather than buffered. Cleared on `Begin` and `Commit`.
+    propagated_in_txn: std::collections::HashSet<String>,
     /// The in-memory half of the watermark, advanced only after its durable
     /// write returns — mirrors the linchpin's own acknowledgment discipline
     /// for the keepalive path, which has no `pgwire_replication` metrics
@@ -715,6 +720,69 @@ pub struct Intake {
     /// replication event so a partially-filled batch still flushes promptly
     /// even if no new source commit arrives to trigger it synchronously.
     batch_deadline: Option<Instant>,
+}
+
+/// Prefix of the transactional logical-decoding message an apply
+/// transaction emits to name the tables whose writes it propagates
+/// downstream itself (issue #312).
+///
+/// A chain's intermediate hop is a target Trellis writes and also a source a
+/// downstream transform reads, so it sits in the publication. Each write to
+/// it would then reach the ring twice: once as the `Recompute` (or captured
+/// delete) that `staging::apply`'s step 4 stages inside the writing
+/// transaction, and again as the CDC copy intake decodes afterward. A 1-1
+/// reader absorbs that. An aggregate reader does not when the two land in
+/// different batches: the in-transaction `Recompute` re-derives the group
+/// from live state, which already holds the write, and the later CDC delta
+/// adds it again.
+///
+/// The in-transaction copy is the one to keep. It commits with the write, so
+/// it is never late, and it carries the upstream origin that read-your-writes
+/// convergence depends on; the CDC copy's origin is the hop's own later
+/// commit. So the applying transaction names the tables it propagated, and
+/// intake drops that transaction's changes to exactly those tables. Changes
+/// to any other table in the transaction, and writes to the same tables by
+/// anything other than an apply (a direct backfill build, say), still stream
+/// as usual.
+///
+/// The message is transactional, so it is decoded only if the apply commits,
+/// and it is emitted before the apply's first target write, so intake sees it
+/// before any change it covers.
+pub(crate) const PROPAGATED_TABLES_MESSAGE_PREFIX: &str = "trellis.propagated";
+
+/// Encodes qualified table names as the content of a
+/// [`PROPAGATED_TABLES_MESSAGE_PREFIX`] message: NUL-separated, since NUL is
+/// the one character a Postgres identifier cannot contain.
+pub(crate) fn encode_propagated_tables<'a>(tables: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+    let mut content = Vec::new();
+    for (i, table) in tables.into_iter().enumerate() {
+        if i > 0 {
+            content.push(0);
+        }
+        content.extend_from_slice(table.as_bytes());
+    }
+    content
+}
+
+/// The inverse of [`encode_propagated_tables`]. Empty and non-UTF-8 segments
+/// are skipped: neither can name a table [`publication::qualify`] produces.
+fn decode_propagated_tables(content: &[u8]) -> impl Iterator<Item = String> + '_ {
+    content
+        .split(|b| *b == 0)
+        .filter(|segment| !segment.is_empty())
+        .filter_map(|segment| std::str::from_utf8(segment).ok().map(str::to_string))
+}
+
+/// Whether `relation`'s changes in the current transaction were already
+/// propagated inside it — see [`PROPAGATED_TABLES_MESSAGE_PREFIX`].
+fn already_propagated(
+    propagated: &std::collections::HashSet<String>,
+    relation: &Relation,
+) -> Result<bool, IntakeError> {
+    if propagated.is_empty() {
+        return Ok(false);
+    }
+    Ok(propagated.contains(&publication::qualify(&relation.namespace, &relation.name)?))
 }
 
 /// How often a quiet stream's keepalive-driven watermark advance may persist
@@ -820,6 +888,7 @@ impl Intake {
             hard_cap: config.hard_cap,
             current_xid: None,
             in_txn: false,
+            propagated_in_txn: std::collections::HashSet::new(),
             last_confirmed,
             // Zero-initialized rather than `Instant::now()`, so the very
             // first keepalive after connecting is never held back by the
@@ -887,6 +956,7 @@ impl Intake {
                 // Defensive: Commit already clears the buffer, so nothing
                 // should be carried over from a prior transaction.
                 self.buffer.clear();
+                self.propagated_in_txn.clear();
                 self.current_xid = Some(xid);
                 self.in_txn = true;
             }
@@ -900,6 +970,7 @@ impl Intake {
             } => {
                 self.commit_transaction(end_lsn, commit_time_micros).await?;
                 self.in_txn = false;
+                self.propagated_in_txn.clear();
                 // Defensive: `handle_xlog_data` falls back to xid 0 if this
                 // is unset, so a stray XLogData arriving between this Commit
                 // and the next Begin — unreachable under normal protocol
@@ -909,6 +980,15 @@ impl Intake {
             }
             ReplicationEvent::KeepAlive { wal_end, .. } => {
                 self.advance_watermark_on_keepalive(wal_end).await?;
+            }
+            ReplicationEvent::Message {
+                transactional: true,
+                prefix,
+                content,
+                ..
+            } if prefix == PROPAGATED_TABLES_MESSAGE_PREFIX => {
+                self.propagated_in_txn
+                    .extend(decode_propagated_tables(&content));
             }
             ReplicationEvent::Message { .. } => {}
             ReplicationEvent::StoppedAt { .. } => {}
@@ -980,6 +1060,9 @@ impl Intake {
             }
             Message::Insert { relation_id, new } => {
                 let relation = self.relations.get(relation_id)?;
+                if already_propagated(&self.propagated_in_txn, relation)? {
+                    return Ok(());
+                }
                 // Issue #133: `group_key_cols` before `pk`, so the
                 // `.await` below (the cache's only possible catalog round
                 // trip — a plain map read on a fresh entry) happens before
@@ -1007,6 +1090,9 @@ impl Intake {
                 new,
             } => {
                 let relation = self.relations.get(relation_id)?;
+                if already_propagated(&self.propagated_in_txn, relation)? {
+                    return Ok(());
+                }
                 let old_tuple = old.as_ref().map(|(_, tuple)| tuple.as_slice());
                 let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
@@ -1026,6 +1112,9 @@ impl Intake {
                 relation_id, old, ..
             } => {
                 let relation = self.relations.get(relation_id)?;
+                if already_propagated(&self.propagated_in_txn, relation)? {
+                    return Ok(());
+                }
                 let group_key_cols = self.group_key_columns.columns_for(&relation.name).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
@@ -1054,6 +1143,9 @@ impl Intake {
             Message::Truncate { relation_ids, .. } => {
                 for relation_id in relation_ids {
                     let relation = self.relations.get(relation_id)?;
+                    if already_propagated(&self.propagated_in_txn, relation)? {
+                        continue;
+                    }
                     let src_table = publication::qualify(&relation.namespace, &relation.name)?;
                     self.buffer.push(
                         StagedChange::Truncate {
@@ -1345,6 +1437,25 @@ impl Intake {
 mod tests {
     use super::*;
     use pgoutput::ColumnInfo;
+
+    #[test]
+    fn propagated_tables_round_trip_through_the_message_content() {
+        let content = encode_propagated_tables(["public.h1", "odd schema.a,b"]);
+        let decoded: Vec<String> = decode_propagated_tables(&content).collect();
+        assert_eq!(decoded, vec!["public.h1", "odd schema.a,b"]);
+        assert_eq!(decode_propagated_tables(&[]).count(), 0);
+    }
+
+    #[test]
+    fn only_a_named_relation_counts_as_already_propagated() {
+        let widgets = relation(vec![("id", true)]);
+        let mut propagated = std::collections::HashSet::new();
+        assert!(!already_propagated(&propagated, &widgets).unwrap());
+        propagated.insert("public.gadgets".to_string());
+        assert!(!already_propagated(&propagated, &widgets).unwrap());
+        propagated.insert("public.widgets".to_string());
+        assert!(already_propagated(&propagated, &widgets).unwrap());
+    }
 
     fn relation(columns: Vec<(&str, bool)>) -> Relation {
         Relation {

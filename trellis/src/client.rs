@@ -579,6 +579,7 @@ async fn run(
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
             reconcile_interval: options.reconcile_interval,
+            watermark: watermark.clone(),
         };
         maintenance_task = Some(tokio::spawn(maintenance_loop(
             maintenance_config,
@@ -681,12 +682,13 @@ fn uniqueish_id() -> String {
 // ---------------------------------------------------------------------
 
 /// Reconciles the publication's membership against
-/// `options.source_tables`, then either runs the initial snapshot handshake
-/// (fresh slot — no `replication_progress` row yet) or discharges any
-/// settled backfill markers (a slot this client has already set up, e.g.
-/// restarted). Not safe to call concurrently with another client's own
-/// staging setup against the same slot — callers are expected to run
-/// exactly one staging worker per fleet, per this module's doc comment.
+/// `options.source_tables`, then runs the initial snapshot handshake if the
+/// slot is fresh (no `replication_progress` row yet). An existing slot's
+/// backfill markers are left for the maintenance loop (issue #312; see the
+/// comment in the body). Not safe to call concurrently with another
+/// client's own staging setup against the same slot — callers are expected
+/// to run exactly one staging worker per fleet, per this module's doc
+/// comment.
 ///
 /// Uses a dedicated [`ProducerSession`] (not the pool): the session guards
 /// (`synchronous_commit`, the producer singleton advisory lock) are
@@ -718,10 +720,14 @@ async fn setup_staging(
         .await?
         .get(0);
 
-    if has_progress {
-        intake::publication::run_pending_backfills(session.client_mut(), &options.wake_channel)
-            .await?;
-    } else {
+    // An existing slot's pending backfill markers are deliberately *not*
+    // discharged here. Intake isn't running yet, so an enumeration now would
+    // stage `Recompute` rows ahead of the CDC it is about to replay for
+    // changes that enumeration already saw, and an aggregate would count
+    // those changes twice (issue #312). The maintenance loop's first pass,
+    // which runs as soon as intake is up, discharges them behind
+    // `run_pending_backfills`'s wait for intake instead.
+    if !has_progress {
         intake::publication::initial_snapshot_handshake(
             &mut session,
             &options.slot,
@@ -827,6 +833,10 @@ struct MaintenanceConfig {
     interval: Duration,
     reclaim_ttl: Duration,
     reconcile_interval: Duration,
+    /// Intake's staged-through watermark, which a backfill enumeration waits
+    /// on before staging (issue #312; see
+    /// [`intake::publication::run_pending_backfills`]).
+    watermark: staging::StagedWatermark,
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
@@ -850,6 +860,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         interval,
         reclaim_ttl,
         reconcile_interval,
+        watermark,
     } = config;
 
     let seal_config = SealConfig::default();
@@ -916,15 +927,23 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
             }
             if !failed && Instant::now() >= next_reconcile {
-                failed = reconcile_source_tables(
+                // Raced against shutdown because a backfill enumeration can
+                // sit waiting for intake to catch up (issue #312), and intake
+                // is the first task shutdown stops. Dropping the future
+                // mid-enumeration rolls its transaction back, leaving the
+                // marker for the next start.
+                let reconcile = reconcile_source_tables(
                     c,
                     &pool,
                     &publication,
                     &base_source_tables,
                     &wake_channel,
-                )
-                .await
-                .is_err();
+                    &watermark,
+                );
+                tokio::select! {
+                    result = reconcile => failed = result.is_err(),
+                    _ = shutdown_rx.changed() => return,
+                }
                 next_reconcile = Instant::now() + reconcile_interval;
             }
             if failed {
@@ -975,6 +994,14 @@ impl From<IntakeError> for ReconcileError {
     }
 }
 
+/// How long one discharge pass lets a backfill enumeration wait for intake
+/// to stage through the enumeration's snapshot before deferring it to the
+/// next pass (issue #312; see [`intake::publication::run_pending_backfills`]).
+/// Intake normally trails the source by milliseconds. The wait only runs this
+/// long when intake is replaying a backlog, and the maintenance loop does no
+/// sealing while it waits, so it stays short of the reconcile cadence.
+const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Issue #14: re-derives the desired source-table set as the union of
 /// `base_source_tables` (whatever [`ClientOptions::source_tables`] was at
 /// [`Client::start`] time — kept so an embedder that only ever passes an
@@ -982,10 +1009,10 @@ impl From<IntakeError> for ReconcileError {
 /// gets exactly the old, static behavior) and every source table
 /// [`defs::all_source_tables`] finds registered in the catalog right now,
 /// then reconciles the publication and discharges any resulting backfill
-/// against that set — the same two calls [`setup_staging`] makes once at
-/// startup, just re-run periodically so a transform registered against a
+/// against that set, re-run periodically so a transform registered against a
 /// new table while this client is already running is picked up without a
-/// restart.
+/// restart. [`setup_staging`] reconciles once at startup but leaves the
+/// discharge to this function's first run, once intake is up.
 ///
 /// Issue #75, ADR-0007: [`defs::all_source_tables`] returns each table's own
 /// actual, already-persisted qualified identity — this used to instead
@@ -1008,6 +1035,7 @@ async fn reconcile_source_tables(
     publication: &str,
     base_source_tables: &[String],
     wake_channel: &str,
+    watermark: &staging::StagedWatermark,
 ) -> Result<(), ReconcileError> {
     let mut desired: std::collections::BTreeSet<String> =
         base_source_tables.iter().cloned().collect();
@@ -1015,7 +1043,13 @@ async fn reconcile_source_tables(
     let desired: Vec<String> = desired.into_iter().collect();
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;
-    intake::publication::run_pending_backfills(client, wake_channel).await?;
+    intake::publication::run_pending_backfills(
+        client,
+        wake_channel,
+        watermark,
+        BACKFILL_CATCH_UP_TIMEOUT,
+    )
+    .await?;
     Ok(())
 }
 

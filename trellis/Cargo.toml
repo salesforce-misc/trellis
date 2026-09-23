@@ -124,6 +124,10 @@ internals = ["test-util"]
 
 [dev-dependencies]
 testkit = { path = "../testkit" }
+# `tests/intermediate_hop_cdc.rs` builds `pgwire_replication` events by hand,
+# and their payloads are `bytes::Bytes`. Already in the tree via
+# `pgwire-replication` itself.
+bytes = "1"
 # Turns on `internals` (see above) for this crate's own test targets only —
 # `tests/*.rs` are separate compilation units and cannot otherwise see the
 # tier-3 engine modules ADR-0012 made `pub(crate)`. Exactly the self

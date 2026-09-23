@@ -453,9 +453,14 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     // A second run_pending_backfills pass while the straggler is still open
     // must leave the definition exactly where it was — no flicker, no
     // partial progress.
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills (unsettled)");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (unsettled)");
     assert_eq!(
         status_of(&raw, "t").await,
         TransformStatus::WaitingToBackfill,
@@ -465,9 +470,14 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     // The straggler settles.
     straggler.commit().await;
 
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills (settled)");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (settled)");
 
     // `run_pending_backfills` only *stages* the enumeration into the ring;
     // draining it is what actually populates the target and is where the
@@ -494,6 +504,71 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         mismatches, 0,
         "the deferred backfill must populate every pre-existing source row correctly"
     );
+}
+
+/// Issue #312: when the settled marker's enumeration has to wait for intake
+/// and gives up, the definition it promoted to `backfilling` goes back to
+/// `waiting_to_backfill`. Left in `backfilling`, the next pass (which only
+/// promotes `waiting_to_backfill` definitions) would never flip it to `live`.
+#[tokio::test]
+async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+
+    raw.batch_execute(
+        "create table s (id bigint primary key, a numeric); \
+         insert into s (id, a) select g, g from generate_series(1, 5) g; \
+         create publication test_pub;",
+    )
+    .await
+    .expect("seed source table and publication");
+
+    let straggler = OpenTransaction::begin(db.dsn()).await;
+    straggler.execute("select txid_current()").await;
+    publication::reconcile_publication(&mut raw, "test_pub", &[format!("{DEFAULT_SCHEMA}.s")])
+        .await
+        .expect("reconcile leaves an unsettled marker");
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition defers");
+    assert_eq!(
+        status_of(&raw, "t").await,
+        TransformStatus::WaitingToBackfill
+    );
+    straggler.commit().await;
+
+    // The fence has settled, but intake is behind the enumeration's
+    // snapshot, so the enumeration defers.
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::new(),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("run_pending_backfills (intake behind)");
+    assert_eq!(
+        status_of(&raw, "t").await,
+        TransformStatus::WaitingToBackfill,
+        "a deferred enumeration must not leave its definition in backfilling"
+    );
+
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (intake caught up)");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
 }
 
 /// Whole-transform quarantine resume (ADR-0003's coarser fuse tier):
@@ -534,9 +609,14 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     // call below discharges so it can't be mistaken for the marker
     // `resume_transform` parks later).
     drain_backfill_chunks(&db.pool, "public").await;
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("discharge the post-build catch-up marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("discharge the post-build catch-up marker");
     assert_eq!(status_of(&raw, "t2").await, TransformStatus::Live);
 
     // Break it: mutate a source row so the target visibly diverges, then
@@ -567,9 +647,14 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
 
     // No concurrent transaction pins the fence this time, so a single
     // discharge pass both settles and processes the re-parked marker.
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills discharges the resume's own marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills discharges the resume's own marker");
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -637,9 +722,14 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool, "public").await;
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("discharge the post-build catch-up marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("discharge the post-build catch-up marker");
     // The post-build catch-up marker only *stages* its recompute triggers
     // into the still-active (unsealed) ring segment — draining it to
     // quiescence here (rather than leaving those triggers pending) keeps
@@ -704,9 +794,14 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
         "resume must drop straight to waiting_to_backfill, never directly to backfilling/live"
     );
 
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills discharges the resume's own marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills discharges the resume's own marker");
     // Not `drain_to_quiescence`: the five bad-key evictions above parked
     // permanently-unreleasable `poison_held` rows (their key can never cast
     // to `s4.id`'s `bigint`, so releasing them would just fail identically),
@@ -778,9 +873,14 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     .await
     .expect("install_definition");
     drain_backfill_chunks(&db.pool, "public").await;
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("discharge the post-build catch-up marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("discharge the post-build catch-up marker");
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t6").await, TransformStatus::Live);
 
@@ -807,9 +907,14 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     quarantine::resume_transform(&db.pool, "t6")
         .await
         .expect("resume_transform");
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills discharges the resume's own marker");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills discharges the resume's own marker");
     drain_until_live(&db.pool, &mut raw, "t6").await;
     // Flush whatever the re-backfill's own catch-up left staged, so the
     // eviction rounds below start from a segment holding only their own

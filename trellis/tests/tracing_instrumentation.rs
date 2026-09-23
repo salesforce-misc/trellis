@@ -604,9 +604,14 @@ async fn backfill_status_transitions_emit_info_events() {
     // above is `publication::reconcile_publication`/`install_definition`,
     // neither of which is `run_pending_backfills` — nothing to capture yet.
     let (_guard, captured) = install_capture();
-    publication::run_pending_backfills(&mut raw, "wake")
-        .await
-        .expect("run_pending_backfills (settled)");
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (settled)");
 
     let events = captured.events();
     let to_backfilling = events.iter().find(|e| {

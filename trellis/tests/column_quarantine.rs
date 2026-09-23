@@ -2294,9 +2294,14 @@ async fn resume_column_parks_a_catch_up_that_repairs_a_row_changed_mid_recompute
     // drain the enumeration it stages.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        publication::run_pending_backfills(&mut client, "trellis_column_quarantine_test")
-            .await
-            .expect("run_pending_backfills");
+        publication::run_pending_backfills(
+            &mut client,
+            "trellis_column_quarantine_test",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("run_pending_backfills");
         let remaining: i64 = client
             .query_one("select count(*) from pending_backfill", &[])
             .await

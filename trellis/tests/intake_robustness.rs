@@ -340,9 +340,14 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
 
     // The fence hasn't settled — the straggler is still open — so this pass
     // must leave the marker untouched and stage nothing.
-    publication::run_pending_backfills(session.client_mut(), "wake")
-        .await
-        .expect("run_pending_backfills (unsettled)");
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (unsettled)");
     let seg_0_count_before: i64 = setup
         .query_one("select count(*) from seg_0", &[])
         .await
@@ -367,9 +372,14 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
 
     // Now the fence has settled: this pass backfills the 3 pre-existing rows
     // and discharges the marker, atomically.
-    publication::run_pending_backfills(session.client_mut(), "wake")
-        .await
-        .expect("run_pending_backfills (settled)");
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (settled)");
 
     let staged: Vec<String> = setup
         .query(
@@ -395,9 +405,14 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
     // Re-running the setup pass with the marker already gone (the crash
     // scenario where a *later* pass finds nothing left to do) must be a
     // harmless no-op, never a duplicate backfill.
-    publication::run_pending_backfills(session.client_mut(), "wake")
-        .await
-        .expect("run_pending_backfills (idempotent no-op)");
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills (idempotent no-op)");
     let seg_0_count_after: i64 = setup
         .query_one("select count(*) from seg_0", &[])
         .await
@@ -406,6 +421,97 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
     assert_eq!(
         seg_0_count_after, 3,
         "retrying after the marker is gone must not re-stage anything"
+    );
+}
+
+/// Issue #312: a backfill enumeration must not stage its `Recompute` rows
+/// until intake has staged everything the enumeration's snapshot can see.
+/// Otherwise the recompute can seal and drain ahead of the CDC for a change
+/// it already reflects, and an aggregate counts that change twice. While
+/// intake is behind, the pass stages nothing and keeps the marker; once
+/// intake catches up during the wait, the same pass goes ahead.
+#[tokio::test]
+async fn a_backfill_enumeration_waits_for_intake_to_stage_what_its_snapshot_saw() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table widgets (id bigint primary key);
+             insert into widgets (id) values (1), (2), (3);
+             create publication test_pub;",
+        )
+        .await
+        .expect("create source table with pre-existing rows");
+
+    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("connect producer session");
+    publication::reconcile_publication(
+        session.client_mut(),
+        "test_pub",
+        &[format!("{DEFAULT_SCHEMA}.widgets")],
+    )
+    .await
+    .expect("reconcile adds widgets and leaves a pending_backfill marker");
+
+    let staged_count = async || -> i64 {
+        setup
+            .query_one("select count(*) from seg_0", &[])
+            .await
+            .expect("count seg_0")
+            .get(0)
+    };
+    let marker_count = async || -> i64 {
+        setup
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count pending_backfill")
+            .get(0)
+    };
+
+    // Intake has staged nothing: the enumeration must defer, not stage.
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &StagedWatermark::new(),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("run_pending_backfills (intake behind)");
+    assert_eq!(
+        staged_count().await,
+        0,
+        "an enumeration must not stage while intake is behind its snapshot"
+    );
+    assert_eq!(marker_count().await, 1, "the deferred marker must survive");
+
+    // Intake catches up while the enumeration is waiting on it.
+    let watermark = StagedWatermark::new();
+    let intake_side = watermark.clone();
+    let catch_up = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        intake_side.advance(PgLsn::from(u64::MAX));
+    });
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &watermark,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("run_pending_backfills (intake catches up)");
+    catch_up.await.expect("catch-up task");
+    assert_eq!(
+        staged_count().await,
+        3,
+        "once intake catches up, the enumeration must stage every row"
+    );
+    assert_eq!(
+        marker_count().await,
+        0,
+        "the discharged marker must be deleted"
     );
 }
 

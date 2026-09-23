@@ -4045,6 +4045,17 @@ pub struct ApplyPlan {
     /// nothing extra since the reader lookup already performs exactly this
     /// resolution.
     downstream_readers: HashMap<String, Option<String>>,
+    /// Issue #312: the qualified targets whose CDC copy of this batch's writes
+    /// is redundant with step 4's in-transaction propagation, which Phase 3
+    /// names in its `intake::PROPAGATED_TABLES_MESSAGE_PREFIX` message so
+    /// intake drops that copy. A target qualifies when it has a downstream
+    /// reader (so step 4 propagates every key it writes), is not cleared by
+    /// an aggregate truncate this batch (step 2b propagates nothing), and is
+    /// not an endpoint of any relationship: a relationship's to-side needs its
+    /// image-bearing CDC to advance the settled parent projection (#131), and
+    /// its from-side needs it for the ring's `group_key` (#133), neither of
+    /// which an image-less `Recompute` carries.
+    propagated_in_txn: Vec<String>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// issue #60's truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -5389,6 +5400,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     }
 
     let mut downstream_readers = HashMap::new();
+    let mut propagated_in_txn = Vec::new();
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(aggregate_targets.keys());
@@ -5436,6 +5448,17 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         let has_downstream = !catalog::transforms_for_source(pool, &qualified_target)
             .await?
             .is_empty();
+        if has_downstream
+            && !aggregate_clears.contains_key(target)
+            && catalog::relationships_to_table(pool, target)
+                .await?
+                .is_empty()
+            && catalog::relationships_from_table(pool, target)
+                .await?
+                .is_empty()
+        {
+            propagated_in_txn.push(qualified_target.clone());
+        }
         downstream_readers.insert(target.clone(), has_downstream.then_some(qualified_target));
         // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
         // recorded for a *terminal* transform — one with no downstream
@@ -5464,6 +5487,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         targets,
         aggregate_targets,
         downstream_readers,
+        propagated_in_txn,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -6451,6 +6475,23 @@ pub async fn apply_and_mark_drained(
     })
 }
 
+/// Step 0 of [`apply_and_mark_drained_many`] (issue #312): emits the
+/// transactional `intake::PROPAGATED_TABLES_MESSAGE_PREFIX` message naming
+/// [`ApplyPlan::propagated_in_txn`], if there are any.
+async fn emit_propagated_tables(txn: &Transaction<'_>, plan: &ApplyPlan) -> Result<(), ApplyError> {
+    if plan.propagated_in_txn.is_empty() {
+        return Ok(());
+    }
+    let content =
+        crate::intake::encode_propagated_tables(plan.propagated_in_txn.iter().map(String::as_str));
+    txn.execute(
+        "select pg_logical_emit_message(true, $1, $2::bytea)",
+        &[&crate::intake::PROPAGATED_TABLES_MESSAGE_PREFIX, &content],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The [`apply_and_mark_drained`] steps generalized over `seg_seqs` — issue
 /// #63 Milestone 2's segment-coalescing seam. `plan` (Phase 2's output) was
 /// computed once over every coalesced segment's *merged* folded changes
@@ -6496,6 +6537,13 @@ pub async fn apply_and_mark_drained_many(
     wake_channel: &str,
     watermark: &StagedWatermark,
 ) -> Result<ManyApplyOutcome, ApplyError> {
+    // 0. Issue #312: name the targets whose writes step 4 propagates
+    // downstream inside this transaction, so intake drops the CDC copy of
+    // those same writes instead of staging each one a second time. See
+    // `intake::PROPAGATED_TABLES_MESSAGE_PREFIX`. First, so the message
+    // precedes every target write in the decoded stream.
+    emit_propagated_tables(txn, plan).await?;
+
     // 1. Version fence. `source_key` is bare (see `catalog_source_key`'s doc
     // comment); `source_table_versions.source_table` is qualified as of
     // issue #72, so this matches against its bare table-name suffix, same
