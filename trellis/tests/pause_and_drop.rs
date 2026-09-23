@@ -1,12 +1,20 @@
 //! Integration tests for issue #142 / ADR-0014 — the other half of a
 //! definition's lifecycle: **pause**, **resume**, and **drop**.
 //!
-//! Everything here drives the public [`trellis::Trellis`] facade (ADR-0012:
-//! the sibling crates and these suites reach the engine the way a user does,
-//! not through internals), and verifies against Postgres directly — reading
-//! `transform_definitions`, `information_schema`, the quarantine tables and
-//! `pg_publication_tables` with a raw connection rather than re-asking the
-//! engine what it thinks it did.
+//! Every pause, resume and drop here goes through the public
+//! [`trellis::Trellis`] facade (ADR-0012: the sibling crates and these suites
+//! reach the engine the way a user does, not through internals), and is
+//! verified against Postgres directly — reading `transform_definitions`,
+//! `information_schema`, the quarantine tables and `pg_publication_tables`
+//! with a raw connection rather than re-asking the engine what it thinks it
+//! did.
+//!
+//! No test runs a live pipeline (issue #301). Where a scenario needs work a
+//! running `Client` would do — running a 1-1 target's backfill chunks,
+//! draining CDC changes, discharging a resume's backfill marker — the test
+//! does that step itself through the same engine function the `Client`
+//! calls, then asserts. Nothing waits for a pipeline to converge under a
+//! wall-clock budget.
 //!
 //! The scenarios, one per ADR-0014 decision:
 //!
@@ -45,13 +53,18 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-// The one internals reach in this otherwise facade-only suite (ADR-0012's
-// `internals` feature, on for this crate's own test targets): the durable
-// chunk queue's dispatch gate has no facade spelling, and asserting it through
-// a hand-written copy of its own `where` clause is what issue #231 called out.
+// Internals reaches (ADR-0012's `internals` feature, on for this crate's own
+// test targets), for two reasons. The durable chunk queue's dispatch gate has
+// no facade spelling, and asserting it through a hand-written copy of its own
+// `where` clause is what issue #231 called out. And the ring, the chunk queue
+// and the backfill discharge are driven by hand in place of a running
+// pipeline (issue #301); see the module doc.
 use trellis::defs::chunk_queue;
+use trellis::intake::publication;
+use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`) with `search_path`
@@ -67,26 +80,6 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("set search_path");
     client
-}
-
-/// Polls `predicate` until it holds or `timeout` elapses, then panics with
-/// `message`. Mirrors `client_e2e.rs`'s helper of the same name: no wait in
-/// this file is a bare `sleep`, and none is unbounded.
-async fn poll_until<F>(timeout: Duration, message: &str, mut predicate: F)
-where
-    F: AsyncFnMut() -> bool,
-{
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if predicate().await {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out after {timeout:?}: {message}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// A define-only facade connection: no staging worker, no drain threads.
@@ -125,6 +118,125 @@ async fn table_exists(raw: &Client, schema: &str, table: &str) -> bool {
 
 async fn count(raw: &Client, sql: &str) -> i64 {
     raw.query_one(sql, &[]).await.expect("count query").get(0)
+}
+
+/// Claims, runs, and finishes every pending backfill chunk until none remain:
+/// the hand-driven stand-in for a drain worker (`alter_transform.rs`'s helper
+/// of the same name). A chunked 1-1 target reaches `live` this way with no
+/// running pipeline and nothing to wait for.
+async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    const CLAIMED_BY: &str = "pause_and_drop_test_backfill_worker";
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                DEFAULT_TARGET_SCHEMA,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+/// Stages the CDC row intake would stage for `insert into orders (id, g, a)
+/// values (id, g, a)`, into the active ring segment.
+async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
+    let active: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    let image = format!(r#"{{"id":"{id}","g":"{g}","a":"{a}"}}"#);
+    raw.execute(
+        &format!(
+            "insert into seg_{active} (src_table, key, op, lsn, new_image, hop_gen) \
+             values ($1, $2, 'insert', $3, $4::text::jsonb, 0)"
+        ),
+        &[
+            &format!("{DEFAULT_SCHEMA}.orders"),
+            &id.to_string(),
+            &PgLsn::from(1u64),
+            &image,
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("stage cdc for orders row {id}: {e}"));
+}
+
+/// Seals and drains through the engine's own apply path until nothing is
+/// pending anywhere in the ring: the hand-driven stand-in for a running
+/// `Client`'s maintenance loop and drain workers.
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    // No live `Intake` stages anything here, so there is no real staged
+    // watermark to hold apply back. A saturated one never does.
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        while apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "pause_and_drop_test",
+            1,
+            "trellis_pause_and_drop_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
+}
+
+/// Discharges every parked `pending_backfill` marker, the step a running
+/// `Client`'s maintenance loop takes. A marker only discharges once every
+/// transaction in flight when it was parked has finished (its `xmin` fence),
+/// so this retries until none remain. Nothing else runs on this test's own
+/// cluster, so that is normally the first pass; the ceiling only turns a
+/// wedged fence into a failure rather than a hang.
+async fn discharge_pending_backfills(client: &mut Client) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        publication::run_pending_backfills(
+            client,
+            "trellis_pause_and_drop_test",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("run_pending_backfills");
+        if count(client, "select count(*) from pending_backfill").await == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a pending_backfill marker never settled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Seeds a source table carrying `REPLICA IDENTITY FULL`, which both the
@@ -252,33 +364,24 @@ async fn pausing_an_unregistered_transform_reports_not_found() {
 async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 4).await;
 
-    let definer = define_only(db.dsn()).await;
-    definer
+    // No live pipeline (issue #301): every change below is staged by hand and
+    // drained through the engine's own apply path, and the resume's backfill
+    // marker is discharged by hand, so each claim is checked the moment its
+    // precondition holds instead of polled for under a wall-clock budget.
+    let trellis = define_only(db.dsn()).await;
+    trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the transform under test");
-    definer
+    trellis
         .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
-    definer.shutdown().await.expect("shut the definer down");
 
-    // The live pipeline: CDC intake, ring maintenance, and drain workers.
-    let running = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions {
-            staging: true,
-            drain_threads: 2,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start the live pipeline");
-
-    running
+    trellis
         .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause one of the two siblings");
@@ -286,79 +389,63 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // Where the ring stood before any of the pause-window changes reached it
     // — the baseline the retention assertion below is measured against, so
     // "nothing is held" can't pass by nothing ever having been staged.
-    //
-    // `segment_pointer.active_seq`, not `max(segments.seg_seq)`: the pointer
-    // is monotonic and survives retirement, while `segments` rows are deleted
-    // by `retire::retire_drained_segments` as they drain, so a `max()` over it
-    // is a racy proxy for "did the ring cycle".
     let active_seq_before = count(&raw, "select active_seq from segment_pointer").await;
 
-    // Changes that arrive while `order_rollup` is paused. Its share of these
-    // is drained for `order_echo` and is not recoverable by replay.
+    // Changes that arrive while `order_rollup` is paused, each mirrored by the
+    // CDC row intake would stage for it. Its share of these is drained for
+    // `order_echo` and is not recoverable by replay.
     raw.batch_execute(
         "insert into orders (id, g, a) select s, s % 2, s from generate_series(5, 12) s",
     )
     .await
     .expect("write to the source while one reader is paused");
+    for id in 5..=12i64 {
+        stage_orders_insert(&raw, id, id % 2, id).await;
+    }
 
-    // Claim 1: the sibling converges anyway. If the paused definition pinned
-    // the ring, these changes would never drain and this would time out.
-    let expected_total: i64 = (1..=12).sum();
-    poll_until(
-        Duration::from_secs(60),
-        "a paused definition must not wedge the ring for its siblings",
-        async || {
-            count(
-                &raw,
-                &format!(
-                    "select coalesce(sum(total), 0)::bigint from {DEFAULT_TARGET_SCHEMA}.order_echo"
-                ),
-            )
-            .await
-                == expected_total
-        },
-    )
-    .await;
-
-    // Claim 1, mechanism — the half this test used to leave implied. "Never
-    // pins the ring" is a statement about *segment retention*, so assert on
-    // the retention bookkeeping itself: a segment sits in `sealed`/`draining`
-    // until every bucket of it has been applied-and-marked-drained
+    // Claim 1: the sibling converges anyway, and nothing is left holding the
+    // slots its rows arrived in. `drain_to_quiescence` only returns once the
+    // ring has nothing pending, so a paused definition that pinned its share
+    // of the ring fails it outright. The retention bookkeeping is then
+    // asserted directly: a segment sits in `sealed`/`draining` until every
+    // bucket of it has been applied-and-marked-drained
     // (`segments.drained_mask`, `V10__drained_mask.sql`), and `seg_claims`
     // holds a row for every bucket a worker still owns. If a paused
-    // definition's share of the change stream were held open for its eventual
-    // resume — the thing ADR-0014's "Resume rebuilds by backfill, not by
-    // catch-up" section rules out — these segments could never finish
-    // draining, and the ring would fill and wedge for `order_echo` too.
-    // Convergence above shows the sibling got its rows; this shows nothing is
-    // still holding the slots they arrived in.
-    //
-    // All three conditions are *polled together*, deliberately. Asserting the
-    // ring advanced as a one-shot check right after a separate convergence
-    // poll is a race: `order_echo` can be observed at its final value before
-    // the seal/drain bookkeeping behind it has settled, and under parallel
-    // load that ordering flips often enough to make the test flaky. Waiting
-    // for the conjunction — the ring cycled, *and* it is holding nothing —
-    // has no such window, because that is a terminal state: once the last
-    // segment drains, nothing moves it back into `sealed`/`draining` or
-    // re-takes a claim. The anti-vacuity half stays real: if a paused
-    // definition pinned its share, `sealed`/`draining` would never clear and
-    // this would time out rather than pass on an idle ring.
-    poll_until(
-        Duration::from_secs(60),
-        "a paused definition must not hold its share of the ring open",
-        async || {
-            count(&raw, "select active_seq from segment_pointer").await > active_seq_before
-                && count(
-                    &raw,
-                    "select count(*) from segments where state in ('sealed', 'draining')",
-                )
-                .await
-                    == 0
-                && count(&raw, "select count(*) from seg_claims").await == 0
-        },
-    )
-    .await;
+    // definition's share were held open for its eventual resume — the thing
+    // ADR-0014's "Resume rebuilds by backfill, not by catch-up" section rules
+    // out — those segments could never finish draining, and the ring would
+    // fill and wedge for `order_echo` too.
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let expected_total: i64 = (1..=12).sum();
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select coalesce(sum(total), 0)::bigint from {DEFAULT_TARGET_SCHEMA}.order_echo"
+            ),
+        )
+        .await,
+        expected_total,
+        "a paused definition must not keep its sibling from converging"
+    );
+    assert!(
+        count(&raw, "select active_seq from segment_pointer").await > active_seq_before,
+        "the pause-window changes must actually have cycled through the ring"
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from segments where state in ('sealed', 'draining')"
+        )
+        .await,
+        0,
+        "a paused definition must not hold its share of the ring open"
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from seg_claims").await,
+        0,
+        "no bucket may still be claimed once the ring has drained"
+    );
 
     // ...while the paused target held its stale, pre-pause value throughout.
     assert_eq!(
@@ -373,42 +460,42 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         "the paused target must hold its pre-pause value, not keep folding"
     );
 
-    running
+    trellis
         .apply("RESUME TRANSFORM order_rollup")
         .await
         .expect("resume the paused definition");
 
     // Claim 2, mechanism: resume hands the target to the ordinary
     // fresh-backfill path rather than replaying anything.
-    assert!(
-        matches!(
-            persisted_status(&raw, "order_rollup").await.as_deref(),
-            Some("waiting_to_backfill") | Some("backfilling") | Some("live")
-        ),
+    assert_eq!(
+        persisted_status(&raw, "order_rollup").await.as_deref(),
+        Some("waiting_to_backfill"),
         "resume drops the definition back into the backfill lifecycle it was defined through"
     );
 
     // Claim 2, outcome: the target comes back reconciled against the *current*
     // source — including the eight rows written while it was paused, whose
     // change records were drained for the sibling and never held for it.
-    poll_until(
-        Duration::from_secs(60),
-        "a resumed target must be rebuilt from current source data, not from buffered changes",
-        async || {
-            count(
-                &raw,
-                &format!(
-                    "select coalesce(sum(total), 0)::bigint from \
-                     {DEFAULT_TARGET_SCHEMA}.order_rollup"
-                ),
-            )
-            .await
-                == expected_total
-        },
-    )
-    .await;
+    discharge_pending_backfills(&mut raw).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select coalesce(sum(total), 0)::bigint from {DEFAULT_TARGET_SCHEMA}.order_rollup"
+            ),
+        )
+        .await,
+        expected_total,
+        "a resumed target must be rebuilt from current source data, not from buffered changes"
+    );
+    assert_eq!(
+        persisted_status(&raw, "order_rollup").await.as_deref(),
+        Some("live"),
+        "the rebuild must finish the backfill lifecycle it re-entered"
+    );
 
-    running.shutdown().await.expect("shut the pipeline down");
+    trellis.shutdown().await.expect("shut down");
 }
 
 // ---------------------------------------------------------------------
@@ -1382,32 +1469,21 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
     .await
     .expect("seed the relationship's from-side");
 
-    let definer = define_only(db.dsn()).await;
-    definer
+    // A 1-1 target builds through the durable chunk queue, so something has
+    // to run its chunks before it reaches `live` — and it has to be live for
+    // the relationship's to-side type check to see its columns. Nothing
+    // below needs a running pipeline, so the chunks are run by hand.
+    let trellis = define_only(db.dsn()).await;
+    trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
-    definer.shutdown().await.expect("shut the definer down");
-
-    // A 1-1 target builds through the durable chunk queue, so it needs drain
-    // workers to reach `live` — and it has to be live for the relationship's
-    // to-side type check to see its columns.
-    let trellis = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions {
-            staging: true,
-            drain_threads: 2,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start the live pipeline");
-    poll_until(
-        Duration::from_secs(60),
-        "the chunked 1-1 target must finish its backfill",
-        async || persisted_status(&raw, "order_doubles").await.as_deref() == Some("live"),
-    )
-    .await;
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("live"),
+        "the chunked 1-1 target must have finished its backfill"
+    );
     raw.batch_execute(&format!(
         "alter table {DEFAULT_TARGET_SCHEMA}.order_doubles replica identity full"
     ))
@@ -1453,7 +1529,7 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
         "the refused drop wrote nothing"
     );
 
-    trellis.shutdown().await.expect("shut the pipeline down");
+    trellis.shutdown().await.expect("shut down");
 }
 
 /// Issue #231: a relationship whose **to**-side is the target blocks that
@@ -1488,30 +1564,18 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
     // Same shape as the reader-blocked case above, and for the same reason: a
     // relationship's join key has to be an integral column, which rules out an
     // aggregate's `numeric` group key — so the to-side is a chunked 1-1
-    // target, and reaching `live` needs real drain workers.
-    let definer = define_only(db.dsn()).await;
-    definer
+    // target, whose chunks are run by hand to reach `live`.
+    let trellis = define_only(db.dsn()).await;
+    trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
-    definer.shutdown().await.expect("shut the definer down");
-
-    let trellis = Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions {
-            staging: true,
-            drain_threads: 2,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start the live pipeline");
-    poll_until(
-        Duration::from_secs(60),
-        "the chunked 1-1 target must finish its backfill",
-        async || persisted_status(&raw, "order_doubles").await.as_deref() == Some("live"),
-    )
-    .await;
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("live"),
+        "the chunked 1-1 target must have finished its backfill"
+    );
     raw.batch_execute(&format!(
         "alter table {DEFAULT_TARGET_SCHEMA}.order_doubles replica identity full"
     ))
@@ -1591,7 +1655,7 @@ async fn dropping_is_refused_by_a_relationship_pointing_at_the_target_with_no_re
          `all_source_tables` cannot keep naming a dropped table"
     );
 
-    trellis.shutdown().await.expect("shut the pipeline down");
+    trellis.shutdown().await.expect("shut down");
 }
 
 /// A relationship is a definition too, and the same refuse-don't-cascade rule

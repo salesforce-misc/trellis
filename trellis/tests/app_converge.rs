@@ -13,17 +13,13 @@
 //! &raw, token, TIMEOUT).await`) through the public `Trellis`/`BlockingTrellis`
 //! facade instead.
 //!
-//! `await_converged_observes_a_real_write_only_after_a_deliberately_delayed_drain_worker_applies_it`
-//! is the real end-to-end proof: a genuine CDC write through the full
-//! `Trellis` pipeline, raced against a *deliberately delayed* drain worker so
-//! a too-early `await_converged` return is a visible assertion failure, not a
-//! coincidence of timing — then the target table is read back directly to
-//! confirm the write actually landed (not just that the predicate flipped
-//! true). `await_converged_times_out_with_a_named_staging_error` and the
-//! `BlockingTrellis` test below use the same direct-ring-manipulation style
-//! `trellis/tests/converge.rs` already established, to cheaply exercise the
-//! timeout path and the synchronous wrapper without needing a full live
-//! pipeline for those.
+//! None of them runs a live `Client` (issue #301). They manipulate the ring
+//! directly, the style `trellis/tests/converge.rs` established, so every
+//! ordering they assert on is controlled by the test rather than raced
+//! against real intake/apply timing under a wall-clock budget.
+//! `await_converged_waits_for_a_sealed_write_until_it_is_applied` stages a
+//! real write's CDC row by hand and drains it through the engine's own apply
+//! path, so the target value it reads back is one the engine computed.
 
 use std::time::{Duration, Instant};
 
@@ -31,7 +27,9 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::StagingError;
+use trellis::staging::{
+    StagedWatermark, StagingError, apply, has_pending, retire_drained_segments, seal,
+};
 use trellis::{BlockingTrellis, Config, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -73,106 +71,148 @@ async fn insert_pending_row(client: &Client, key: &str, origin_lsn: PgLsn) {
         .expect("insert pending row with origin_lsn");
 }
 
-/// The real end-to-end proof: `Trellis::watermark_token`/
-/// `Trellis::await_converged` against the full live pipeline (real CDC
-/// intake, real ring maintenance, real apply), not a hand-staged ring.
+/// Seals the active segment and drains it through the engine's own apply
+/// path, repeating until nothing is pending: the hand-driven stand-in for a
+/// running `Client`'s drain workers (`self_check.rs`'s helper of the same
+/// name).
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    for _ in 0..16 {
+        let sealed = seal_active_segment(client).await;
+        drain_segment(pool, sealed).await;
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+}
+
+/// Drains every bucket of the sealed segment `seg_seq` through the engine's
+/// own apply path.
+async fn drain_segment(pool: &trellis::Pool, seg_seq: i64) {
+    // No live `Intake` stages anything here, so there is no real staged
+    // watermark to hold apply back. A saturated one never does.
+    let watermark = StagedWatermark::saturated();
+    while apply::drain_once(
+        pool,
+        seg_seq,
+        "app_converge_test",
+        1,
+        "trellis_app_converge_test",
+        &watermark,
+    )
+    .await
+    .expect("drain_once")
+    .is_some()
+    {}
+}
+
+/// Seals the active segment (both phases), returning the sealed `seg_seq`.
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// `Trellis::watermark_token`/`Trellis::await_converged` against a real
+/// write that is staged and sealed but not yet applied: the facade must
+/// keep waiting while it is pending, return `Ok` once it has been applied,
+/// and by then the value must actually be in the target table (not just a
+/// flipped predicate).
 ///
-/// Starts a staging-only connection (CDC intake + ring maintenance, zero
-/// drain workers) so a written row is genuinely staged and sealed but *never
-/// applied* until a second, drain-capable connection is started — and that
-/// second connection is only started after a deliberate delay, from a
-/// background task. `await_converged` is called concurrently with that
-/// delay: if it returned before the delay elapsed, nothing could possibly
-/// have applied the write yet, so `elapsed >= delay` below is a genuine
-/// correctness assertion, not a coincidence of timing — a predicate that
-/// reported `converged` too early (or a facade that raced ahead of it) would
-/// fail this test, not just run fast.
+/// No live `Client` (issue #301). This used to run a staging-only pipeline
+/// and start a drain-capable one after a 400ms delay, asserting
+/// `await_converged` took at least that long. That shape rests on real CDC
+/// intake advancing `replication_progress` past the token, which on a quiet
+/// stream waits on intake's 10s-paced keepalive persist (see
+/// `Trellis::await_converged`'s doc comment), all under a fixed 30s budget.
+/// Here the CDC insert is staged by hand, the same text-valued image intake
+/// stages (NULL `origin_lsn`, as intake leaves it, so it gates every token),
+/// and intake's confirmed position is seeded at the token. The ordering is
+/// then controlled rather than timed: nothing drains the row until the test
+/// itself does, so a return during the window before that is a false
+/// `converged`, however slow the box is.
+///
+/// The facade over a live pipeline stays covered where a live pipeline is
+/// the subject: `app.rs`'s
+/// `the_background_client_runs_in_the_configured_schema_not_the_process_default`,
+/// and `defs_floats.rs`/`defs_exact_integers.rs`'s live round-trips.
 #[tokio::test]
-async fn await_converged_observes_a_real_write_only_after_a_deliberately_delayed_drain_worker_applies_it()
- {
+async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-
-    db.pool
-        .get()
-        .await
-        .expect("connection")
-        .batch_execute("create table widgets (id integer primary key, price integer)")
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute("create table widgets (id integer primary key, price integer)")
         .await
         .expect("create source table");
 
-    // Register the transform through the same facade under test, with no
-    // background work attached yet (module doc's "Lifecycle" two-connection
-    // pattern: define first, run the live pipeline separately).
-    let definer_config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let definer = Trellis::connect(definer_config, TrellisOptions::default())
-        .await
-        .expect("connect definer");
-    definer
-        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
-        .await
-        .expect("define");
-    definer.shutdown().await.expect("shutdown definer");
-
-    // Staging only: CDC intake + ring maintenance (seal on its normal
-    // cadence), but zero drain workers — nothing here will ever apply or
-    // mark-drained on its own (mirrors `client_e2e.rs`'s documented
-    // "staging_worker and application_threads are genuinely independent
-    // knobs" contract).
-    let running_config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let running = Trellis::connect(
-        running_config,
-        TrellisOptions {
-            staging: true,
-            drain_threads: 0,
-            ..Default::default()
-        },
+    // No background work: nothing but this test ever seals or drains.
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
     )
     .await
-    .expect("connect running (staging only)");
+    .expect("connect");
+    trellis
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define over an empty source, so it goes live without a backfill");
 
-    let raw = connect_raw(db.dsn()).await;
     raw.execute("insert into widgets (id, price) values (1, 9)", &[])
         .await
         .expect("insert source row");
+    let active: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    raw.execute(
+        &format!(
+            "insert into seg_{active} (src_table, key, op, lsn, new_image, hop_gen) \
+             values ($1, '1', 'insert', $2, $3::text::jsonb, 0)"
+        ),
+        &[
+            &format!("{DEFAULT_SCHEMA}.widgets"),
+            &PgLsn::from(1u64),
+            &r#"{"id":"1","price":"9"}"#,
+        ],
+    )
+    .await
+    .expect("stage the insert's CDC row");
 
     // Per `Trellis::watermark_token`'s contract: taken after the write's own
-    // commit (the `execute` above) has already returned.
-    let token = running.watermark_token().await.expect("watermark_token");
+    // commit has returned. Intake has confirmed through it; only the ring
+    // stands between the token and convergence.
+    let token = trellis.watermark_token().await.expect("watermark_token");
+    seed_progress(&raw, "slot1", token).await;
+    // Sealed but not drained, as a staging-only pipeline would leave it.
+    let sealed = seal_active_segment(&mut raw).await;
 
-    let dsn = db.dsn().to_string();
-    let delay = Duration::from_millis(400);
-    let drain_started = tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let config = Config::from_dsn(dsn).expect("valid dsn");
-        Trellis::connect(
-            config,
-            TrellisOptions {
-                staging: false,
-                drain_threads: 2,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("connect delayed drain-only trellis")
-    });
+    {
+        let converged = trellis.await_converged(token, Duration::from_secs(30));
+        tokio::pin!(converged);
+        // Long enough for several polls (5ms backoff, doubling). Every one
+        // must see the sealed row pending. Nothing can drain it during this
+        // window, so a slow box only means fewer polls, never a false failure.
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut converged).await;
+        assert!(
+            early.is_err(),
+            "await_converged returned {early:?} while the write was still sealed and undrained; \
+             nothing could have applied it yet"
+        );
 
-    let started = Instant::now();
-    let converge_result = running
-        .await_converged(token, Duration::from_secs(30))
-        .await;
-    let elapsed = started.elapsed();
-
-    converge_result
-        .expect("await_converged should succeed once the delayed drain worker applies the write");
-    assert!(
-        elapsed >= delay,
-        "await_converged returned after {elapsed:?}, before the deliberately delayed drain \
-         worker even started (at {delay:?}) — nothing could have applied the write yet, so this \
-         must not have reported convergence"
-    );
-
-    let drain = drain_started.await.expect("delayed-drain task");
+        // The same in-flight call, resumed after the drain: it has to notice
+        // on a later poll, not just on a fresh call.
+        drain_segment(&db.pool, sealed).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        converged
+            .await
+            .expect("await_converged should succeed once the write has been applied");
+    }
 
     let price: Option<i32> = raw
         .query_opt("select price from widget_prices where id = 1", &[])
@@ -186,8 +226,7 @@ async fn await_converged_observes_a_real_write_only_after_a_deliberately_delayed
          not merely have flipped a predicate"
     );
 
-    drain.shutdown().await.expect("shutdown drain trellis");
-    running.shutdown().await.expect("shutdown running trellis");
+    trellis.shutdown().await.expect("shutdown");
 }
 
 /// [`Trellis::await_converged`] must propagate a real timeout as the named

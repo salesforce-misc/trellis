@@ -1,17 +1,28 @@
 //! Repro: a 1-1 target's stored primary key must be the source row's *raw*
 //! primary-key text, byte-for-byte — never the staging ring's encoded key
 //! text.
+//!
+//! No live `Client` (issue #301): each source change is mirrored by the CDC
+//! row intake would stage for it, staged by hand and drained through the
+//! engine's own apply path, so nothing here waits on a pipeline under a
+//! wall-clock budget. The staged key is the raw key text, which is what
+//! intake stages for a not-null primary key. That half, intake's own key
+//! encoding, is pinned directly by `intake::tests`'
+//! `extract_key_keeps_a_control_character_in_a_key_value_verbatim`
+//! (`trellis/src/intake/mod.rs`). This file covers the apply half: the live
+//! re-fetch, the target write, and the update/delete lookups all have to
+//! agree on that raw text.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
+use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table};
-use trellis::{Client as TrellisClient, ClientOptions};
+use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -25,20 +36,77 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn poll_until<F>(timeout: Duration, interval: Duration, message: &str, mut predicate: F)
-where
-    F: AsyncFnMut() -> bool,
-{
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if predicate().await {
+/// Stages one CDC change for `orders` into the active ring segment, shaped
+/// the way intake stages it: the raw key text, and text-valued JSON images.
+async fn stage_cdc(
+    client: &Client,
+    key: &str,
+    op: &str,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let active: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    client
+        .execute(
+            &format!(
+                "insert into seg_{active} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[
+                &format!("{DEFAULT_SCHEMA}.orders"),
+                &key,
+                &op,
+                &PgLsn::from(1u64),
+                &old_image,
+                &new_image,
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage cdc {key:?}: {e}"));
+}
+
+/// Seals and drains through the engine's own apply path until nothing is
+/// pending: the hand-driven stand-in for a running `Client`'s drain workers.
+async fn drain_to_quiescence(pool: &Pool, client: &mut Client) {
+    // No live `Intake` stages anything here, so there is no real staged
+    // watermark to hold apply back. A saturated one never does.
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        while apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "control_char_pk_test",
+            1,
+            "trellis_control_char_pk_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
             return;
         }
-        if std::time::Instant::now() >= deadline {
-            panic!("poll_until timed out after {timeout:?}: {message}");
-        }
-        tokio::time::sleep(interval).await;
     }
+    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+}
+
+async fn target_count(raw: &Client) -> i64 {
+    raw.query_one("select count(*) from totals", &[])
+        .await
+        .expect("count target")
+        .get(0)
 }
 
 fn totals_def() -> TransformDef {
@@ -104,17 +172,9 @@ async fn setup(pool: &Pool, raw: &Client) {
 async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_character() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
 
     setup(&db.pool, &raw).await;
-
-    let options = ClientOptions {
-        staging_worker: true,
-        application_threads: 2,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
-        ..Default::default()
-    };
-    let client = TrellisClient::start(db.dsn(), options).expect("client start");
 
     let soh_id = "a\u{1}b".to_string();
     let plain_id = "plain".to_string();
@@ -124,21 +184,24 @@ async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_charac
     )
     .await
     .expect("insert source rows");
-
-    poll_until(
-        Duration::from_secs(20),
-        Duration::from_millis(200),
-        "the two source rows never drained into the target",
-        async || {
-            let n: i64 = raw
-                .query_one("select count(*) from totals", &[])
-                .await
-                .expect("count target")
-                .get(0);
-            n == 2
-        },
+    // JSON's `\u0001` escape decodes to the same U+0001 `soh_id` holds.
+    stage_cdc(
+        &raw,
+        &soh_id,
+        "insert",
+        None,
+        Some(r#"{"id":"a\u0001b","a":"1.00","b":"2.00"}"#),
     )
     .await;
+    stage_cdc(
+        &raw,
+        &plain_id,
+        "insert",
+        None,
+        Some(r#"{"id":"plain","a":"3.00","b":"4.00"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
 
     let ids: Vec<String> = raw
         .query("select id from totals order by id", &[])
@@ -162,46 +225,49 @@ async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_charac
     raw.execute("update orders set a = 10.00 where id = $1", &[&soh_id])
         .await
         .expect("update source row");
-
-    poll_until(
-        Duration::from_secs(20),
-        Duration::from_millis(200),
-        "the updated row never converged",
-        async || {
-            let total: Option<String> = raw
-                .query_opt("select total::text from totals where id = $1", &[&soh_id])
-                .await
-                .expect("read target row")
-                .map(|r| r.get(0));
-            total == Some("12.00".to_string())
-        },
+    stage_cdc(
+        &raw,
+        &soh_id,
+        "update",
+        None,
+        Some(r#"{"id":"a\u0001b","a":"10.00","b":"2.00"}"#),
     )
     .await;
-    let n: i64 = raw
-        .query_one("select count(*) from totals", &[])
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let total: Option<String> = raw
+        .query_opt("select total::text from totals where id = $1", &[&soh_id])
         .await
-        .expect("count target")
-        .get(0);
-    assert_eq!(n, 2, "the update must not have inserted a duplicate row");
+        .expect("read target row")
+        .map(|r| r.get(0));
+    assert_eq!(
+        total.as_deref(),
+        Some("12.00"),
+        "the update must land on the row the insert wrote"
+    );
+    assert_eq!(
+        target_count(&raw).await,
+        2,
+        "the update must not have inserted a duplicate row"
+    );
 
     // A delete must remove the row it originally wrote, not miss it.
     raw.execute("delete from orders where id = $1", &[&soh_id])
         .await
         .expect("delete source row");
-    poll_until(
-        Duration::from_secs(20),
-        Duration::from_millis(200),
-        "the deleted row was never removed from the target",
-        async || {
-            let n: i64 = raw
-                .query_one("select count(*) from totals", &[])
-                .await
-                .expect("count target")
-                .get(0);
-            n == 1
-        },
-    )
-    .await;
+    stage_cdc(&raw, &soh_id, "delete", Some(r#"{"id":"a\u0001b"}"#), None).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
 
-    client.shutdown().await.expect("clean shutdown");
+    let ids: Vec<String> = raw
+        .query("select id from totals", &[])
+        .await
+        .expect("read target ids")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![plain_id],
+        "the delete must remove exactly the row the insert wrote"
+    );
 }
