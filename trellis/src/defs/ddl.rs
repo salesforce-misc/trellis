@@ -432,6 +432,47 @@ pub(crate) async fn source_primary_key_in_txn(
     client: &impl GenericClient,
     source_table: &str,
 ) -> Result<Vec<PrimaryKeyColumn>, DdlError> {
+    let columns = identity_key_columns(client, source_table).await?;
+    if columns.is_empty() {
+        return Err(DdlError::NoPrimaryKey {
+            source_table: source_table.to_string(),
+        });
+    }
+    for column in &columns {
+        // Issue #117: a live enum type joins the static allowlist above via
+        // the same dynamic `to_regtype`-based check `assert_join_key_type_supported`
+        // uses for the relationship join-key role — see
+        // `catalog::is_enum_type_name`'s own doc comment for why admitting
+        // it is safe.
+        if !super::catalog::is_text_stable_join_key_type(&column.data_type)
+            && !super::catalog::is_enum_type_name(client, &column.data_type).await?
+        {
+            return Err(DdlError::UnsupportedPrimaryKeyType {
+                source_table: source_table.to_string(),
+                column: column.name.clone(),
+                pg_type: column.data_type.clone(),
+            });
+        }
+    }
+    Ok(columns)
+}
+
+/// The catalog half of [`source_primary_key_in_txn`], with none of its
+/// definition-time policy: `table`'s row-identity key columns (its `PRIMARY
+/// KEY`, else the qualifying `UNIQUE` index — an aggregate target's `UNIQUE
+/// NULLS NOT DISTINCT` grouping columns, issue #128), in declared order, each
+/// with its nullability. Empty when `table` has no such index; no key-type
+/// gate. `table` is anything `to_regclass` resolves.
+///
+/// Split out for `intake::publication::enumerate_and_append` (issue #308),
+/// which must enumerate every table a catch-up marker can name — aggregate
+/// targets included — under exactly the key [`pk_key_sql_expr`] renders for
+/// that table everywhere else. It has never type-gated the tables it
+/// enumerates, and a catch-up marker is not the place to start.
+pub(crate) async fn identity_key_columns(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<PrimaryKeyColumn>, tokio_postgres::Error> {
     let rows = client
         .query(
             "with chosen_index as (
@@ -471,41 +512,17 @@ pub(crate) async fn source_primary_key_in_txn(
                on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
              where i.indrelid = pg_catalog.to_regclass($1)
              order by array_position(i.indkey, a.attnum)",
-            &[&source_table],
+            &[&table],
         )
         .await?;
-
-    if rows.is_empty() {
-        return Err(DdlError::NoPrimaryKey {
-            source_table: source_table.to_string(),
-        });
-    }
-    let mut columns = Vec::with_capacity(rows.len());
-    for row in rows {
-        let name: String = row.get(0);
-        let data_type: String = row.get(1);
-        let nullable: bool = row.get(2);
-        // Issue #117: a live enum type joins the static allowlist above via
-        // the same dynamic `to_regtype`-based check `assert_join_key_type_supported`
-        // uses for the relationship join-key role — see
-        // `catalog::is_enum_type_name`'s own doc comment for why admitting
-        // it is safe.
-        if !super::catalog::is_text_stable_join_key_type(&data_type)
-            && !super::catalog::is_enum_type_name(client, &data_type).await?
-        {
-            return Err(DdlError::UnsupportedPrimaryKeyType {
-                source_table: source_table.to_string(),
-                column: name,
-                pg_type: data_type,
-            });
-        }
-        columns.push(PrimaryKeyColumn {
-            name,
-            data_type,
-            nullable,
-        });
-    }
-    Ok(columns)
+    Ok(rows
+        .into_iter()
+        .map(|row| PrimaryKeyColumn {
+            name: row.get(0),
+            data_type: row.get(1),
+            nullable: row.get(2),
+        })
+        .collect())
 }
 
 /// The separator a composite primary-key identity string joins its column
@@ -982,10 +999,10 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// or [`pk_key_sql_expr`] (whichever side of the wire it's on):
 /// [`crate::intake::extract_key`] for a row arriving over real CDC,
 /// `staging::apply_aggregate::derive_group_key` for an aggregate group's
-/// downstream-propagated identity (issue #171),
-/// `intake::publication::enumerate_and_append` for a backfill enumeration's
-/// image-less `Recompute` triggers, and the SQL form for
-/// everything computed in the database. Keeping them one function each —
+/// downstream-propagated identity (issue #171), and the SQL form for
+/// everything computed in the database — including
+/// `intake::publication::enumerate_and_append`'s backfill enumeration, which
+/// selects its keys through [`pk_key_sql_expr`] (issue #308). Keeping them one function each —
 /// rather than a hand-rolled `join` per site — is what makes the
 /// "producers and consumers agree on one shape" claim in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.

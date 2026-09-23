@@ -304,25 +304,6 @@ async fn fetch_pending_backfills(
         .collect()
 }
 
-async fn primary_key_columns(
-    txn: &Transaction<'_>,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<String>, IntakeError> {
-    let rows = txn
-        .query(
-            "select a.attname \
-             from pg_index i \
-             join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) \
-             where i.indrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
-               and i.indisprimary \
-             order by array_position(i.indkey, a.attnum)",
-            &[&schema, &table],
-        )
-        .await?;
-    Ok(rows.into_iter().map(|r| r.get(0)).collect())
-}
-
 /// Page size for [`enumerate_and_append`]'s server-side cursor. Bounds one
 /// backfill enumeration pass to O(page) memory rather than O(table) — the
 /// same class of fix issue #8 gave the CDC stream path via [`super::spill`],
@@ -359,21 +340,32 @@ pub(crate) async fn enumerate_and_append(
     src_table: &str,
 ) -> Result<(), IntakeError> {
     let (schema, table) = split_qualified(src_table)?;
-    let pk_cols = primary_key_columns(txn, schema, table).await?;
-    if pk_cols.is_empty() {
+    let from = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    // Issue #308: the table's row-identity key as `ddl` defines it — its
+    // `PRIMARY KEY`, or, for an aggregate target (which has none), the
+    // `UNIQUE NULLS NOT DISTINCT` grouping columns. Looking only for a
+    // primary key used to fail every catch-up marker parked on an aggregate
+    // target with `MissingKeyValue`, which left the marker in place to fail
+    // every later pass the same way.
+    let key_cols = crate::defs::ddl::identity_key_columns(txn, &from).await?;
+    if key_cols.is_empty() {
         return Err(IntakeError::MissingKeyValue {
             table: src_table.to_string(),
         });
     }
-    let select_list = pk_cols
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Rendered SQL-side by `ddl::pk_key_sql_expr`, the same expression every
+    // other producer of this table's key text uses, so the staged key is
+    // byte-identical to what the live path stages for the same row: raw
+    // `col::text` for a NOT NULL column (every real primary key; see
+    // `ddl::encode_key_part`'s "`PrimaryKeyColumn::nullable` selects the
+    // encoding" for why that must stay raw), the NULL-sentinel encoding for
+    // a nullable grouping column (matching
+    // `staging::apply_aggregate::derive_group_key`, issue #110), and the
+    // composite separator escape at arity > 1 (issue #200), all in declared
+    // key order (issue #163).
+    let key_expr = crate::defs::ddl::pk_key_sql_expr(&key_cols, None);
     txn.batch_execute(&format!(
-        "declare {BACKFILL_CURSOR} cursor for select {select_list} from {}.{}",
-        quote_ident(schema),
-        quote_ident(table)
+        "declare {BACKFILL_CURSOR} cursor for select {key_expr} from {from}"
     ))
     .await?;
     loop {
@@ -388,28 +380,8 @@ pub(crate) async fn enumerate_and_append(
         }
         let mut page = Vec::with_capacity(rows.len());
         for row in &rows {
-            // Through `ddl::join_pk_key`, not a local `join`, so this third
-            // producer of an encoded composite key provably shares the one
-            // separator and the one declared-order convention the SQL-side
-            // producer (`ddl::pk_key_sql_expr`) and `intake::extract_key`
-            // use — `primary_key_columns` above already reports the key's
-            // columns in `array_position(i.indkey, a.attnum)` order for
-            // exactly that reason (issue #163).
-            //
-            // The raw column text, *not* `ddl::encode_key_part` (issue
-            // #110): `primary_key_columns` above filters on
-            // `pg_index.indisprimary`, so every column here is a real
-            // PRIMARY KEY column and therefore NOT NULL — nothing for the
-            // NULL sentinel to encode, and `ddl::pk_key_sql_expr` renders a
-            // not-null key column raw for the same reason, so this producer
-            // and that one agree byte-for-byte. Encoding here would also
-            // double a genuine U+0001 into the text a 1-1 target stores as
-            // its own literal primary-key value (`apply::apply_target`),
-            // which `defs::backfill`/`staging::quarantine`/`defs::oracle`
-            // write and read raw — see `ddl::encode_key_part`'s
-            // "`PrimaryKeyColumn::nullable` selects the encoding" section.
-            let key =
-                crate::defs::ddl::join_pk_key((0..pk_cols.len()).map(|i| row.get::<_, &str>(i)));
+            // Already fully encoded by `key_expr` above.
+            let key: String = row.get(0);
             page.push(StagedChange::Recompute {
                 src_table: src_table.to_string(),
                 key,
