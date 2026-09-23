@@ -184,7 +184,10 @@ const GATE_LOCK_KEY: i64 = 300;
 /// has to comfortably exceed the skew between the releaser's convergence
 /// observation and `quiesce`'s own (both poll with a 250ms backoff ceiling),
 /// so that a `quiesce` which only waits on the ring reliably returns before
-/// the release.
+/// the release. It only affects how reliably the test catches that
+/// regression. A correct `quiesce` passes whatever the margin is, because the
+/// backfill cannot commit until the unlock, and `released_at` is recorded
+/// before the unlock is sent.
 const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 
 /// public-api-design review gap: [`ManualBackend::quiesce`] used to only
@@ -213,8 +216,9 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 /// `local_docs/transit-comparison.md` §3.3 describes), independent of how
 /// slow the chunk write is. A fixed sleep shorter than that stall lets a
 /// `quiesce` that only waits on ring convergence pass by the very
-/// coincidence this test exists to rule out: issue #300 measured a 1.5s
-/// sleep passing with `await_definitions_settled` deleted. So the gate is
+/// coincidence this test exists to rule out. Issue #300 proposed shrinking
+/// the old `pg_sleep(13.0)` to 1-2s, but a 1.5s sleep was measured to pass
+/// even with `await_definitions_settled` deleted from `quiesce`. So the gate is
 /// released on an *event*, not a clock: a helper task waits for the ring to
 /// converge on its own connection, lets [`RELEASE_MARGIN`] pass, and only
 /// then releases the lock. A `quiesce` that really waits on the backfill
