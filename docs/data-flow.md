@@ -100,18 +100,20 @@ call), execute on drain threads.
    - If the table isn't in the publication yet, the staging worker's reconcile
      pass (`reconcile_publication`) adds it and parks the marker in the same
      transaction. The fence has to cover every transaction that could have
-     written the table before the join committed. *Known gap:* a fence taken
-     inside the `ALTER`'s own transaction misses a writer that starts between
-     the fence and the commit
-     ([ADR-0016](decisions/0016-single-background-capture-path.md#left-for-the-children-to-record-here)).
+     written the table before the join committed. A fence taken inside the
+     `ALTER`'s own transaction falls short of a writer that starts between the
+     fence and the commit, so the discharge re-fences a marker the first time it
+     sees it, at a snapshot that postdates the commit
+     ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence);
+     *Planned (#431)*).
    - If the source needs no publication change, registration parks the marker
      itself, in the catalog row's transaction. That covers a table that is
      already published and a source that is another definition's target, which
      is never published (#315). *Planned (#418):* registration doesn't park
      one yet.
 
-   Only the staging worker changes the publication (`DROP` is an open
-   exception, #427). A table has at most one
+   Only the staging worker changes the publication, including the shrink after
+   a `DROP` (*Planned (#427)*). A table has at most one
    marker, and a second park merges into it, keeping the later fence
    ([intake](staging-and-claiming/01-intake-and-lsn-confirmation.md#adjacent-invariants-that-are-easy-to-miss)).
 2. **Wait.** The discharge (`run_pending_backfills_until`, once per maintenance
@@ -213,17 +215,17 @@ so its gap stays open until #417.
   started. After `live` it does wait for a ring enumeration's staged rows to
   drain. Neither signal waits for a chunked or direct build's go-live catch-up,
   which a later maintenance pass discharges
-  ([ADR-0016](decisions/0016-single-background-capture-path.md#left-for-the-children-to-record-here)).
+  ([ADR-0016](decisions/0016-single-background-capture-path.md#consequences)).
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
   live without its maintenance loop. Chunked builds also need drain threads
   ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).
 - **Only the staging worker needs publication and replication privileges.** A
   process that only registers transforms needs catalog access and the right to
-  create target tables. *Open (#427):* `DROP` still reconciles the publication
+  create target tables. *Planned (#427):* `DROP` still reconciles the publication
   from whichever process applies it
-  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#the-publication-shrinks-by-reconciliation)).
-  Whether that moves to the staging worker or stays an explicit exception
-  needs a design decision.
+  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#the-publication-shrinks-by-reconciliation));
+  the decided design moves that shrink to the staging worker's reconcile pass,
+  driven from the catalog.
 
 ## Staging and batching
 

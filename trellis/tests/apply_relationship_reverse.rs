@@ -3212,3 +3212,110 @@ async fn an_image_less_recompute_on_the_to_side_table_is_not_a_parent_insert() {
         "and, specifically, nothing about the target may have moved at all"
     );
 }
+
+/// Issue #403 review: a to-one relationship's to-side join column may be a
+/// nullable `UNIQUE` column on a plain source (any single-column unique
+/// index makes it to-one), so a to-side change can carry a NULL `to_col`.
+/// A NULL is no projection key: the reverse path must drop the old key's
+/// projection row and write none for the new one, not upsert a NULL into the
+/// projection's `NOT NULL` key (which failed the drain with 23502 before
+/// `apply_projection_advance` skipped it). A NULL join key never matches a
+/// from-side row, so the target loses the parent's contribution.
+#[tokio::test]
+async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table accounts (id integer primary key, code integer unique, \
+                                    credit integer); \
+             create table orders (id integer primary key, acct_code integer); \
+             alter table accounts replica identity full; \
+             alter table orders replica identity full; \
+             insert into accounts values (1, 5, 100), (2, 6, 200); \
+             insert into orders values (10, 5), (11, 6)",
+        )
+        .await
+        .expect("create the tables");
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP acct FROM orders.acct_code TO accounts.code",
+    )
+    .await
+    .expect("a nullable UNIQUE to_col is a to-one relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_credit FROM orders SELECT acct.credit AS credit",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("acct_code", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("a reader through the relationship");
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    async fn codes(client: &Client, projection_table: &str) -> Vec<i32> {
+        client
+            .query(
+                &format!("select code from {projection_table} order by code"),
+                &[],
+            )
+            .await
+            .expect("read the projection")
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+    assert_eq!(codes(&client, &projection_table).await, vec![5, 6]);
+
+    // Account 1's code goes NULL, and a new account arrives with no code.
+    client
+        .batch_execute(
+            "update accounts set code = null where id = 1; \
+             insert into accounts values (3, null, 300)",
+        )
+        .await
+        .expect("write the to-side");
+    stage_cdc_at_lsn(
+        &client,
+        "accounts",
+        "1",
+        "update",
+        Some(r#"{"id":1,"code":5,"credit":100}"#),
+        Some(r#"{"id":1,"code":null,"credit":100}"#),
+        50,
+    )
+    .await;
+    stage_cdc_at_lsn(
+        &client,
+        "accounts",
+        "3",
+        "insert",
+        None,
+        Some(r#"{"id":3,"code":null,"credit":300}"#),
+        60,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        codes(&client, &projection_table).await,
+        vec![6],
+        "code 5's row is gone and no NULL-keyed row was written"
+    );
+    let credits: Vec<(i32, Option<String>)> = client
+        .query("select id, credit::text from order_credit order by id", &[])
+        .await
+        .expect("read order_credit")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        credits,
+        vec![(10, None), (11, Some("200".to_string()))],
+        "order 10's account no longer carries code 5"
+    );
+}

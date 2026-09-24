@@ -113,13 +113,12 @@ async fn setup() -> (TestCluster, TestDatabase, Client) {
     (cluster, db, raw)
 }
 
-/// A seam-only target (some definition's target, no relationship touching
-/// it) is never in the publication, even while another definition reads it:
-/// its readers hear about it through the seam. A target that is a
-/// relationship endpoint stays published — its settled parent projection is
-/// driven by CDC.
+/// A target is never in the publication, even while another definition
+/// reads it: its readers hear about it through the seam. Since #403 that
+/// includes a target that is a relationship endpoint, whose settled parent
+/// projection the seam's CDC-shaped rows drive.
 #[tokio::test]
-async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoint() {
+async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
     let (_cluster, db, raw) = setup().await;
     raw.batch_execute(
         "create table public.src (id integer primary key, k integer, v numeric); \
@@ -163,13 +162,11 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
         "agg is hist's source, but a seam-only target is never published"
     );
 
-    // A relationship endpoint keeps CDC. `t` is a plain 1-1 target.
-    raw.batch_execute(
-        "create table public.t (id integer primary key, doubled numeric); \
-         alter table public.t replica identity full",
-    )
-    .await
-    .expect("create t");
+    // A relationship endpoint is no exception. `t` is a plain 1-1 target, on
+    // its default replica identity.
+    raw.batch_execute("create table public.t (id integer primary key, doubled numeric)")
+        .await
+        .expect("create t");
     create_definition(
         &db.pool,
         "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
@@ -192,13 +189,10 @@ async fn a_chained_target_is_never_published_unless_it_is_a_relationship_endpoin
     .expect("define a reader through the relationship");
     let mut published = publication_tables(&db.pool).await.expect("publication");
     published.sort();
-    assert!(
-        published.contains(&"public.t".to_string()),
-        "a relationship endpoint target stays published: {published:?}"
-    );
-    assert!(
-        !published.contains(&"public.agg".to_string()),
-        "{published:?}"
+    assert_eq!(
+        published,
+        vec!["public.reports".to_string(), "public.src".to_string()],
+        "only true sources are published, not the endpoint target t"
     );
 }
 
@@ -426,6 +420,66 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
             .await
             .is_empty(),
         "every cleared group must reach d"
+    );
+}
+
+/// Issue #385: the same truncate clear over an aggregate grouped by a
+/// `numeric` column. `numeric` is an admitted `GROUP BY` type (only the
+/// *source's* key type is gated, issue #371), so the aggregate installs, but
+/// the clear used to look up its target's identity through the key-type-gated
+/// `ddl::source_primary_key`, got `UnsupportedPrimaryKeyType`, and halted the
+/// instance. The clear only needs the identity's column names to report each
+/// cleared group; it must not care about their type.
+#[tokio::test]
+async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.src (id integer primary key, p numeric, q integer); \
+         alter table public.src replica identity full; \
+         insert into public.src values (1, 1.5, 10), (2, 1.5, 20), (3, 2, 5)",
+    )
+    .await
+    .expect("create tables");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.agg FROM public.src GROUP BY p SELECT SUM(q) AS t",
+        &numeric_columns(&["id", "p", "q"]),
+        "public",
+    )
+    .await
+    .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select p::text, t::text from public.agg").await,
+        BTreeMap::from([
+            ("1.5".to_string(), "30".to_string()),
+            ("2".to_string(), "5".to_string()),
+        ]),
+    );
+
+    raw.batch_execute("truncate public.src")
+        .await
+        .expect("truncate src");
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Truncate {
+            src_table: "public.src".to_string(),
+            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            origin_lsn: None,
+            src_changed: None,
+        }],
+    )
+    .await
+    .expect("stage the truncate");
+    txn.commit().await.expect("commit");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert!(
+        rows(&raw, "select p::text, t::text from public.agg")
+            .await
+            .is_empty(),
+        "the truncate must clear every group"
     );
 }
 

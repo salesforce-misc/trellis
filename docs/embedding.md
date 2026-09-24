@@ -45,9 +45,10 @@ chunked or direct build's go-live catch-up can still be pending
 *Planned (#418, #419):* today `apply` still reads the source while
 registering. An aggregate or relationship-enriched 1-1 transform is built
 completely before `apply` returns, which is slow against a large table.
-*Open (#427):* `DROP` still changes the publication from the process that
+*Planned (#427):* `DROP` still changes the publication from the process that
 applies it, so a process that drops transforms still needs publication
-privileges.
+privileges; the decided design moves that shrink to the staging worker's
+reconcile pass, driven from the catalog.
 
 ```rust
 // The one dedicated worker process for this fleet.

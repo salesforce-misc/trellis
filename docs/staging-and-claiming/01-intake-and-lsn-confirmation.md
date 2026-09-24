@@ -180,18 +180,21 @@ knife-edged guards:
   `pending_backfill` marker in one transaction, deletes the marker in the same
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
-  flight at `ADD` time has settled. The fence is taken inside the `ALTER`'s
-  transaction, so a writer that starts between the fence and the commit isn't
-  covered, a known gap
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#left-for-the-children-to-record-here)).
-  This discharge is the **only** capture path:
+  flight at `ADD` time has settled. A fence taken inside the `ALTER`'s
+  transaction falls slightly short — a writer that starts between the fence and
+  the commit is neither covered nor streamed — so the discharge re-fences a
+  marker the first time it sees it, at a snapshot that postdates the commit
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#the-join-fence);
+  *Planned, #431*). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
   ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
-  staging worker runs the `ALTER`, apart from `DROP`'s reconcile, which is an
-  open question (#427). The inventory in
+  staging worker runs the `ALTER`, including the shrink after a `DROP`: a `DROP`
+  removes catalog rows and the worker's reconcile pass takes the table back out
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences);
+  *Planned, #427*). The inventory in
   [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
-  lists the paths that don't go through it yet.
+  lists every capture path and its role.
 - **A marker is deleted only by the discharge that read it.** A table has one
   marker, and the catch-ups that park one (a direct build going live, a column
   resume, `ALTER TRANSFORM`) can land while that table's marker is mid-discharge,
@@ -222,9 +225,11 @@ knife-edged guards:
   through one seam (`staging::target_mutations`), carrying the row's prior image
   so a downstream aggregate can fix the group the row left. Publishing it as
   well would stage every such write twice (issue #312), and an aggregate
-  target's CDC can't even be decoded. The one exception is a target that is
-  also a relationship endpoint: its settled parent projection is driven by
-  CDC, so it stays published.
+  target's CDC can't even be decoded. A target that is also a relationship
+  endpoint is no exception (issue #375): its settled parent projection, reverse
+  deltas and from-side `group_key` need image-bearing, ordered changes, so the
+  seam stages that target's rows CDC-shaped instead, with the row's new image
+  and, as the `lsn`, a write token read after the writer's last row lock.
 - **A fresh install reads nothing while it creates the slot.** It creates the
   slot, seeds `replication_progress` at the slot's consistent point, and makes
   sure every published table has a `pending_backfill` marker. The first

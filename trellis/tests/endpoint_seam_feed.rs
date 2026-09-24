@@ -1,9 +1,8 @@
-//! Issue #402 (step 2 of #375's direction 1): the target-mutation seam can
-//! stand in for CDC on a target that is a relationship endpoint. Every test
-//! here turns the seam feed on (`set_endpoint_targets_seam_fed`, off in a
-//! production build until #403 unpublishes endpoint targets) and runs no
-//! intake at all, so the seam is each endpoint target's only change feed, as
-//! it will be once #403 lands.
+//! Issues #402/#403 (#375's direction 1): the target-mutation seam is the
+//! only change feed for a target that is a relationship endpoint, standing in
+//! for the CDC such a target no longer gets (endpoint targets are never
+//! published). No test here runs intake at all: the seam alone has to drive
+//! the relationship machinery.
 //!
 //! Drains run by hand (seal, drain, retire), so nothing waits on convergence
 //! timing (#297).
@@ -22,7 +21,7 @@ use trellis::defs::{
 use trellis::integer::IntWidth;
 use trellis::staging::{
     CdcOp, StagedChange, StagedWatermark, TargetMutations, append, apply, has_pending,
-    retire_drained_segments, set_endpoint_targets_seam_fed,
+    retire_drained_segments,
 };
 
 const WAKE: &str = "endpoint_seam_wake";
@@ -42,7 +41,6 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn setup() -> (TestCluster, TestDatabase, Client) {
-    set_endpoint_targets_seam_fed(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -531,4 +529,313 @@ async fn seam_write(raw: &mut Client, key: &str, lock_prior: bool, writes: &[&st
     mutations.record("public.children", key.to_string(), prior_image, 0, None);
     mutations.flush(&txn).await.expect("flush the seam");
     txn.commit().await.expect("commit the writer");
+}
+
+/// A hand-staged source insert, standing in for intake.
+async fn stage_source_insert(raw: &mut Client, src_table: &str, key: &str, new: &str) {
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: src_table.to_string(),
+            key: key.to_string(),
+            op: CdcOp::Insert,
+            lsn: Some(PgLsn::from(1)),
+            old_image: None,
+            new_image: Some(new.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the source change");
+    txn.commit().await.expect("commit");
+}
+
+/// An aggregate target as a to-one relationship's to-side (issue #403 lifted
+/// #400's refusal): its seam rows are CDC-shaped like a 1-1 target's, the
+/// NULL group included, whose row the seam has to re-read NULL-safely (a
+/// plain `=` would find no row and stage the update as a delete). Those rows
+/// alone carry a new group and a changed one through the projection to a
+/// definition reading through the relationship.
+#[tokio::test]
+async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.sales (id integer primary key, region integer, amount integer); \
+         insert into public.sales values (1, 1, 10), (2, null, 5); \
+         create table public.stores (id integer primary key, region integer); \
+         create table public.store_view (id integer primary key, total integer); \
+         insert into public.stores values (100, 1), (101, null), (102, 2); \
+         alter table public.sales replica identity full; \
+         alter table public.stores replica identity full",
+    )
+    .await
+    .expect("create sources");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.region_totals FROM public.sales GROUP BY region \
+         SELECT SUM(amount) AS total",
+        &int_columns(&["id", "region", "amount"]),
+        "public",
+    )
+    .await
+    .expect("install region_totals");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP totals FROM stores.region TO region_totals.region",
+    )
+    .await
+    .expect("a relationship whose to-side is an aggregate target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.store_view FROM public.stores SELECT totals.total AS total",
+        &int_columns(&["id", "region"]),
+    )
+    .await
+    .expect("install a reader through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    projection_table(&db.pool, &relationship).await;
+    let view = "select id::text, coalesce(total::text, 'null') from public.store_view";
+    assert_eq!(
+        rows(&raw, view).await,
+        BTreeMap::from([
+            ("100".to_string(), "10".to_string()),
+            ("101".to_string(), "null".to_string()),
+            ("102".to_string(), "null".to_string()),
+        ]),
+    );
+
+    // A new group 2, and a change to the NULL group.
+    raw.batch_execute(
+        "insert into public.sales values (3, 2, 7); \
+         update public.sales set amount = 8 where id = 2",
+    )
+    .await
+    .expect("write the source");
+    stage_source_insert(
+        &mut raw,
+        "public.sales",
+        "3",
+        r#"{"id":"3","region":"2","amount":"7"}"#,
+    )
+    .await;
+    stage_source_update(
+        &mut raw,
+        "public.sales",
+        "2",
+        r#"{"id":"2","region":null,"amount":"5"}"#,
+        r#"{"id":"2","region":null,"amount":"8"}"#,
+    )
+    .await;
+    drain_round(&db.pool, &mut raw).await;
+
+    let staged = staged_rows(&raw, "public.region_totals").await;
+    let mut shape: Vec<(&str, Option<&str>, Option<&str>)> = staged
+        .iter()
+        .map(|r| {
+            (
+                r.op.as_str(),
+                r.old_image.as_deref(),
+                r.new_image.as_deref(),
+            )
+        })
+        .collect();
+    shape.sort();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                "insert",
+                None,
+                Some(
+                    r#"{"total": "7", "region": "2", "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                )
+            ),
+            (
+                "update",
+                Some(
+                    r#"{"total": "5", "region": null, "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                ),
+                Some(
+                    r#"{"total": "8", "region": null, "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                )
+            ),
+        ],
+        "{staged:?}"
+    );
+    assert!(
+        staged.iter().all(|r| r.lsn.is_some()),
+        "every image-bearing seam row carries the token: {staged:?}"
+    );
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, view).await,
+        BTreeMap::from([
+            ("100".to_string(), "10".to_string()),
+            ("101".to_string(), "null".to_string()),
+            ("102".to_string(), "7".to_string()),
+        ]),
+        "a NULL join key never matches, and group 2's insert reached store 102"
+    );
+}
+
+/// A source `TRUNCATE` clears a 1-1 target that is a to-one relationship's
+/// to-side. The clear goes through the seam like any other write, so the
+/// endpoint's readers see no key-less sentinel for it: each cleared key is a
+/// CDC-shaped delete carrying its prior image, and the reader through the
+/// relationship loses every enrichment.
+#[tokio::test]
+async fn a_truncate_clear_of_an_endpoint_target_stages_per_key_deletes() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.src (id integer primary key, v integer); \
+         create table public.t (id integer primary key, doubled integer); \
+         create table public.report_view (id integer primary key, doubled integer); \
+         insert into public.src values (1, 5), (2, 7); \
+         create table public.reports (id integer primary key, oid integer); \
+         insert into public.reports values (10, 1), (11, 2); \
+         alter table public.src replica identity full; \
+         alter table public.reports replica identity full",
+    )
+    .await
+    .expect("create sources");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
+        &int_columns(&["id", "v"]),
+    )
+    .await
+    .expect("install t");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    create_relationship(&db.pool, "RELATIONSHIP rollup FROM reports.oid TO t.id")
+        .await
+        .expect("a relationship whose to-side is a target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.report_view FROM public.reports SELECT rollup.doubled AS doubled",
+        &int_columns(&["id", "oid"]),
+    )
+    .await
+    .expect("install a reader through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    raw.execute("truncate public.src", &[])
+        .await
+        .expect("truncate the source");
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Truncate {
+            src_table: "public.src".to_string(),
+            lsn: Some(PgLsn::from(1)),
+            origin_lsn: None,
+            src_changed: None,
+        }],
+    )
+    .await
+    .expect("stage the truncate");
+    txn.commit().await.expect("commit");
+    drain_round(&db.pool, &mut raw).await;
+
+    let staged = staged_rows(&raw, "public.t").await;
+    let shape: Vec<(&str, Option<&str>, bool)> = staged
+        .iter()
+        .map(|r| (r.op.as_str(), r.old_image.as_deref(), r.new_image.is_some()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("delete", Some(r#"{"id": "1", "doubled": "10"}"#), false),
+            ("delete", Some(r#"{"id": "2", "doubled": "14"}"#), false),
+        ],
+        "{staged:?}"
+    );
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, coalesce(doubled::text, 'null') from public.report_view"
+        )
+        .await,
+        BTreeMap::from([
+            ("10".to_string(), "null".to_string()),
+            ("11".to_string(), "null".to_string()),
+        ]),
+    );
+}
+
+/// A 1-1 target that is the from-side of two relationships: each seam row's
+/// `group_key` unions both relationships' `from_col` values, across both
+/// images, as intake's `touched_group_key` does for a decoded change.
+#[tokio::test]
+async fn a_from_side_target_of_two_relationships_unions_both_join_keys() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.items_src (id integer primary key, parent_id integer, \
+                                        owner_id integer); \
+         create table public.items (id integer primary key, parent_id integer, \
+                                    owner_id integer); \
+         insert into public.items_src values (1, 10, 20); \
+         create table public.parents (id integer primary key); \
+         create table public.owners (id integer primary key); \
+         alter table public.items_src replica identity full; \
+         alter table public.parents replica identity full; \
+         alter table public.owners replica identity full",
+    )
+    .await
+    .expect("create sources");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.items FROM public.items_src \
+         SELECT parent_id AS parent_id, owner_id AS owner_id",
+        &int_columns(&["id", "parent_id", "owner_id"]),
+    )
+    .await
+    .expect("install items");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for text in [
+        "RELATIONSHIP parent FROM items.parent_id TO parents.id",
+        "RELATIONSHIP owner FROM items.owner_id TO owners.id",
+    ] {
+        create_relationship(&db.pool, text)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+    }
+
+    raw.execute(
+        "update public.items_src set parent_id = 11, owner_id = 21 where id = 1",
+        &[],
+    )
+    .await
+    .expect("update the source");
+    stage_source_update(
+        &mut raw,
+        "public.items_src",
+        "1",
+        r#"{"id":"1","parent_id":"10","owner_id":"20"}"#,
+        r#"{"id":"1","parent_id":"11","owner_id":"21"}"#,
+    )
+    .await;
+    drain_round(&db.pool, &mut raw).await;
+
+    let staged = staged_rows(&raw, "public.items").await;
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert_eq!(
+        staged[0].group_key.as_deref(),
+        Some(
+            &[
+                "10".to_string(),
+                "11".to_string(),
+                "20".to_string(),
+                "21".to_string()
+            ][..]
+        ),
+        "{staged:?}"
+    );
 }

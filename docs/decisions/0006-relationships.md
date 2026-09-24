@@ -40,21 +40,21 @@ expression language.
 
 ### Endpoints
 
-* Either endpoint may be a **source table or a transform target**, in any
-  combination.
-  * **Narrowed (issue #375): not an aggregate target.** A relationship
-    endpoint is read over logical replication, so it needs a primary key to
-    identify its changes by, and an aggregate target has none. For this
-    instance's own aggregate targets this is interim: it is lifted once the
-    target-mutation seam becomes the only change feed for every target the
-    instance owns, and endpoint targets leave the publication. An endpoint the
-    instance doesn't own, including another instance's aggregate target, must
-    always be keyable by intake, the same rule a transform's source follows.
-  * An endpoint that is one of the instance's own targets is put on
-    `REPLICA IDENTITY FULL` when the relationship is created (issue #375).
-    Targets are Trellis-owned, so [ADR-0005](0005-source-schema-is-user-owned.md)
-    doesn't apply to them; source-table endpoints are only checked, never
-    altered.
+* Either endpoint may be a **source table or a transform target** (1-1 or
+  aggregate), in any combination.
+  * An endpoint that is one of the instance's own targets is never published
+    (issue #375). Every write to it reaches the relationship through the
+    target-mutation seam, which stages it CDC-shaped: prior and new image, and
+    a write token that orders one key's writes the way commit LSNs do. So
+    such an endpoint needs no primary key and no particular replica identity.
+    It must be `live` when the relationship is declared, the same rule a
+    transform reading it follows: its build (the chunk queue) writes it
+    outside the seam (issue #403).
+  * An endpoint the instance doesn't own, including another instance's
+    aggregate target, is read over logical replication. It must be keyable by
+    intake, the same rule a transform's source follows, and source-table
+    endpoints are only checked, never altered
+    ([ADR-0005](0005-source-schema-is-user-owned.md)).
 * **No FK auto-discovery.** Every relationship names its join key explicitly.
 
 ## Referencing a relationship

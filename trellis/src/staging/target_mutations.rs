@@ -3,13 +3,13 @@
 //!
 //! # Why a seam, not a publication
 //!
-//! A target table is not a member of this instance's CDC publication (see
-//! `defs::catalog::publication_tables`; the one exception, a target that is
-//! also a relationship endpoint, is documented there). A definition that reads another
+//! A target table is never a member of this instance's CDC publication (see
+//! `defs::catalog::publication_tables`). A definition that reads another
 //! definition's target (a chained hop) learns about that target's changes
-//! only from the image-less `Recompute` rows the writer stages here, inside
-//! the same transaction as the write itself. That gives three properties CDC
-//! could not:
+//! only from the rows the writer stages here, inside the same transaction as
+//! the write itself: image-less `Recompute` rows, or CDC-shaped rows for a
+//! relationship endpoint (see the last section). That gives three properties
+//! CDC could not:
 //!
 //! - **The key is correct by construction.** Each staged key is the target's
 //!   own row identity (`ddl::pk_key_sql_expr`, or the aggregate
@@ -45,7 +45,8 @@
 //! which run while that definition is not yet `live`. Nothing can read a
 //! target in that state: `defs::catalog::create_definition_inner` refuses a
 //! definition whose source is a non-`live` target (`CatalogError::TransformNotLive`),
-//! and a target that goes `live` with readers already attached (a resumed
+//! `create_relationship` refuses a non-`live` target as an endpoint the
+//! same way (#403), and a target that goes `live` with readers already attached (a resumed
 //! upstream) parks a catch-up marker for itself so those readers re-derive
 //! from its rebuilt state.
 //!
@@ -122,16 +123,17 @@
 //! target a `live` definition reads, or that the seam feeds as an
 //! endpoint), so a terminal target pays no extra round trip.
 //!
-//! # Standing in for a relationship endpoint's CDC (issue #402)
+//! # Standing in for a relationship endpoint's CDC (issues #402, #403)
 //!
 //! A relationship's settled parent projection, its reverse deltas and a
 //! from-side's `group_key` (issues #129-#136) are driven by image-bearing,
-//! LSN-ordered changes. A target that is a relationship endpoint gets those
-//! from CDC today (the publication exception above). Step 2 of #375's
-//! direction 1 lets the seam produce them instead, so step 3 (#403) can
-//! unpublish endpoint targets. When the seam feeds a target's endpoints
-//! ([`TargetInfo::endpoint_feed`]), each changed key is staged as a
-//! [`StagedChange::Cdc`] row rather than a `Recompute`:
+//! LSN-ordered changes. A plain source endpoint gets those from CDC. A
+//! target that is a relationship endpoint gets them from the seam alone
+//! (#375's direction 1): endpoint targets are unpublished like every other
+//! target. For such a target ([`TargetInfo::endpoint_feed`], any relationship
+//! naming it on either side, whether or not a live definition reads through
+//! it yet), each changed key is staged as a [`StagedChange::Cdc`] row rather
+//! than a `Recompute`:
 //!
 //! - **`old_image`** is the key's prior image (above), and **`new_image`**
 //!   is the row as this transaction left it, re-read by key in
@@ -152,18 +154,37 @@
 //!
 //! Every consumer of the target then sees the same rows it would from CDC,
 //! a direct transform reader included: it applies a delta from the images
-//! instead of re-reading. That is not a change for a transform reader of an
-//! endpoint target, which already gets the endpoint's CDC images today, and
-//! it only happens for endpoint targets; every other target keeps the
-//! image-less `Recompute`.
+//! instead of re-reading. Only endpoint targets get these rows; every other
+//! target keeps the image-less `Recompute`. An aggregate target qualifies
+//! too: its NULL-able grouping key is re-read NULL-safely.
 //!
-//! **The seam does not feed endpoints yet.** While endpoint targets stay
-//! published, their CDC still reaches the ring, and a seam row for the same
-//! write would be a second delta: a reverse delta or an aggregate reader's
-//! delta applied twice when the two rows land in different batches.
-//! [`endpoint_targets_seam_fed`] is therefore `false` until #403 removes
-//! endpoint targets from the publication and the switch with them. Tests
-//! turn it on to drive the seam as an endpoint's only feed.
+//! **One feed per target.** A seam row and a CDC row for the same write
+//! would be two deltas, applied twice when they land in different batches,
+//! which is why the seam only took this over once endpoint targets left the
+//! publication (#403). The one place both can still exist is the upgrade
+//! that unpublished them: an endpoint target's CDC already in the slot
+//! before intake's `ALTER PUBLICATION ... DROP TABLE` still arrives. A write
+//! staged by the previous binary reached the ring as a `Recompute` plus that
+//! CDC, which #321's recompute horizon absorbs for an aggregate reader
+//! (`aggregate_recompute_race_windows.rs`'s chained W1 pins it). A write this
+//! binary made before the drop committed would reach it as two deltas;
+//! pre-release, that window is accepted rather than migrated.
+//!
+//! **A target becoming an endpoint.** [`TargetInfo`] is resolved once per
+//! transaction, so a writer that resolved it before a `create_relationship`
+//! naming the target committed stages its `Recompute` (or nothing, with no
+//! reader), not a CDC-shaped row. That write is invisible to the
+//! relationship's own projection seed as well, so its projection misses
+//! it. The miss is bounded: no definition can read through a relationship
+//! before the relationship commits, and the first one to do so re-seeds the
+//! projection's missing rows, and every column it reads, from the live table
+//! (`catalog::ensure_relationship_projection_in_txn`). What that catch-up
+//! can't undo (it only adds rows) is a projection row for a to-side row the
+//! writer deleted or re-keyed. That is the drift a plain source to-side's
+//! projection already accumulates before any consumer publishes the table,
+//! and narrower than the published-endpoint design it replaces, where every
+//! write between the relationship's commit and intake's `ADD TABLE` was
+//! missed the same way.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -173,40 +194,12 @@ use tokio_postgres::types::{PgLsn, ToSql};
 
 use super::append::{self, CdcOp, StagedChange};
 use super::apply::{
-    ApplyError, MAX_HOP_GEN, decode_target_pk_parts, earliest_src_changed, live_row_columns,
-    pk_keyset_col, pk_keyset_match, row_as_text_jsonb_sql,
+    ApplyError, MAX_HOP_GEN, earliest_src_changed, live_row_columns, pk_keyset_col,
+    row_as_text_jsonb_sql,
 };
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::pool::{quote_ident, quote_literal};
-
-/// Test-only switch behind [`endpoint_targets_seam_fed`].
-#[cfg(any(test, feature = "internals"))]
-static ENDPOINT_TARGETS_SEAM_FED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Whether the seam stands in for CDC on relationship-endpoint targets (see
-/// the module doc). Always `false` in a production build until #403
-/// unpublishes those targets; a test build can turn it on with
-/// [`set_endpoint_targets_seam_fed`].
-fn endpoint_targets_seam_fed() -> bool {
-    #[cfg(any(test, feature = "internals"))]
-    {
-        ENDPOINT_TARGETS_SEAM_FED.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(not(any(test, feature = "internals")))]
-    {
-        false
-    }
-}
-
-/// Makes the seam the change feed for every relationship-endpoint target in
-/// this process (see the module doc). Process-wide, so only for a test
-/// binary whose every test wants it, with no CDC running.
-#[cfg(any(test, feature = "internals"))]
-pub fn set_endpoint_targets_seam_fed(on: bool) {
-    ENDPOINT_TARGETS_SEAM_FED.store(on, std::sync::atomic::Ordering::Relaxed);
-}
 
 /// One changed key's accumulated state — see [`TargetMutations::record`].
 #[derive(Debug, Clone)]
@@ -244,23 +237,28 @@ struct EndpointFeed {
     group_key_columns: Vec<String>,
 }
 
-/// Resolves the seam's [`EndpointFeed`] for `target`, or `None` when the seam
-/// does not feed it: the switch is off, it is no relationship's endpoint, or
-/// its row identity has a nullable column (an aggregate target, which
-/// `create_relationship` refuses as an endpoint anyway, #400), so a key
-/// can't be matched back to its row with a plain `=`.
+/// Resolves the seam's [`EndpointFeed`] for `target`, or `None` when it is no
+/// relationship's endpoint.
+///
+/// An aggregate target qualifies like any other: its row identity is its
+/// `UNIQUE NULLS NOT DISTINCT` grouping columns, which [`read_new_images`]
+/// matches NULL-safely.
 async fn resolve_endpoint_feed(
     txn: &Transaction<'_>,
     target: &str,
 ) -> Result<Option<EndpointFeed>, ApplyError> {
-    if !endpoint_targets_seam_fed() || !catalog::is_relationship_endpoint(txn, target).await? {
+    if !catalog::is_relationship_endpoint(txn, target).await? {
         return Ok(None);
     }
     // Quoted: `identity_key_columns` resolves its argument with
     // `to_regclass`, which would case-fold a bare mixed-case name.
     let key_columns =
         ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(target)).await?;
-    if key_columns.is_empty() || key_columns.iter().any(|c| c.nullable) {
+    if key_columns.is_empty() {
+        // Unreachable for a table Trellis created: a 1-1 target has a
+        // primary key and an aggregate target its grouping-column
+        // constraint. With no identity there is nothing to re-read a key by,
+        // so the target falls back to image-less recomputes.
         return Ok(None);
     }
     let mut group_key_columns = match target.split_once('.') {
@@ -363,8 +361,7 @@ impl TargetMutations {
             // Any relationship, not only one a live definition reads: a
             // to-one relationship's settled parent projection is maintained
             // from the moment the relationship exists, so a reader that goes
-            // live later finds it current. It is also exactly the set of
-            // targets `catalog::publication_tables` keeps published today.
+            // live later finds it current.
             let endpoint_feed = resolve_endpoint_feed(txn, target).await?;
             let has_readers = direct_readers || endpoint_feed.is_some();
             let image_columns = if has_readers {
@@ -568,6 +565,13 @@ struct NewImage {
 ///
 /// Every key comes back: an absent row is a deleted one (this transaction
 /// holds the deleted row's lock, so nothing else can have re-created it).
+///
+/// An aggregate target's key can carry a NULL grouping component (issue
+/// #110's encoding, decoded by `ddl::split_pk_key`). A column that binds a
+/// NULL in this call is matched with `is not distinct from`; every other
+/// column keeps the indexable `=` (the same per-column choice as
+/// `apply_aggregate::keyset_match`). Presence is read off `t.ctid`, since a
+/// key column can itself be NULL on a row that exists.
 async fn read_new_images(
     txn: &Transaction<'_>,
     target: &str,
@@ -578,24 +582,32 @@ async fn read_new_images(
     let pk = &feed.key_columns;
     let mut key_texts: Vec<&str> = Vec::with_capacity(keys.len());
     let mut priors: Vec<Option<&str>> = Vec::with_capacity(keys.len());
-    let mut parts: Vec<Vec<String>> = vec![Vec::with_capacity(keys.len()); pk.len()];
+    let mut parts: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(keys.len()); pk.len()];
     for (key, m) in keys {
-        // `key_columns` has no nullable column, so every part decodes.
-        let Some(decoded) = decode_target_pk_parts(pk, target, key)? else {
-            continue;
-        };
+        let decoded = ddl::split_pk_key(pk, target, key)?;
         key_texts.push(key);
         priors.push(m.prior_image.as_deref());
         for (column, part) in parts.iter_mut().zip(decoded) {
-            column.push(part);
+            column.push(part.map(|p| p.into_owned()));
         }
     }
 
     let mut arrays = vec!["$1::text[]".to_string(), "$2::text[]".to_string()];
     let mut aliases = vec!["key".to_string(), "prior".to_string()];
-    for (i, column) in pk.iter().enumerate() {
+    let mut matched = Vec::with_capacity(pk.len());
+    for (i, (column, values)) in pk.iter().zip(&parts).enumerate() {
         arrays.push(format!("${}::text[]::{}[]", i + 3, column.data_type));
         aliases.push(pk_keyset_col(i));
+        let op = if values.iter().any(Option::is_none) {
+            "is not distinct from"
+        } else {
+            "="
+        };
+        matched.push(format!(
+            "t.{} {op} k.{}",
+            quote_ident(&column.name),
+            pk_keyset_col(i)
+        ));
     }
     let group_key_sql = if feed.group_key_columns.is_empty() {
         "null::text[]".to_string()
@@ -618,17 +630,16 @@ async fn read_new_images(
     };
     let sql = format!(
         "select k.key, \
-                case when t.{first_key} is null then null \
+                case when t.ctid is null then null \
                      else ({image})::text end, \
                 {group_key_sql} \
          from unnest({arrays}) as k({aliases}) \
          left join {target_ident} t on {matched}",
-        first_key = quote_ident(&pk[0].name),
         image = row_as_text_jsonb_sql("t", image_columns),
         arrays = arrays.join(", "),
         aliases = aliases.join(", "),
         target_ident = ddl::qualified_target_table_ident(target),
-        matched = pk_keyset_match(pk, "t"),
+        matched = matched.join(" and "),
     );
     let mut params: Vec<&(dyn ToSql + Sync)> = vec![&key_texts, &priors];
     for column in &parts {
@@ -942,5 +953,86 @@ mod tests {
         assert_eq!(deleted.image, None);
         assert_eq!(deleted.group_key, Some(vec!["2".to_string()]));
         assert!(got.is_empty());
+    }
+
+    /// `read_new_images` over an aggregate target's row identity: `UNIQUE
+    /// NULLS NOT DISTINCT` grouping columns whose keys carry NULL components
+    /// (issue #110's encoding). A plain `=` match would never find a NULL
+    /// group's row, and a presence test on a key column would read the row
+    /// as deleted; either way an existing NULL group would stage as a delete.
+    #[tokio::test]
+    async fn read_new_images_matches_null_grouping_components() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table t (g int, h text, total int, unique nulls not distinct (g, h)); \
+                 insert into t values (null, 'a', 1), (1, null, 2), (null, null, 3), (2, 'b', 4)",
+            )
+            .await
+            .expect("create t");
+        let txn = client.transaction().await.expect("begin");
+        let key_columns = ddl::identity_key_columns(&txn, "public.t")
+            .await
+            .expect("identity");
+        assert!(
+            key_columns.iter().all(|c| c.nullable),
+            "an aggregate-style identity"
+        );
+        let columns = live_row_columns(&txn, "public.t").await.expect("columns");
+        let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
+        let image = row_as_text_jsonb_sql("t", &columns);
+        let before: Vec<(String, String)> = txn
+            .query(
+                &format!("select {key_sql}, ({image})::text from t order by total for update"),
+                &[],
+            )
+            .await
+            .expect("pre-lock")
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        txn.batch_execute(
+            "update t set total = 10 where g is null and h = 'a'; \
+             delete from t where g = 1 and h is null; \
+             update t set total = 30 where g is null and h is null; \
+             update t set total = 40 where g = 2",
+        )
+        .await
+        .expect("write");
+        let keys: BTreeMap<String, KeyMutation> = before
+            .iter()
+            .map(|(key, prior)| {
+                (
+                    key.clone(),
+                    KeyMutation {
+                        prior_image: Some(prior.clone()),
+                        hop_gen: 0,
+                        src_changed: None,
+                    },
+                )
+            })
+            .collect();
+        let feed = EndpointFeed {
+            key_columns,
+            group_key_columns: Vec::new(),
+        };
+        let got = read_new_images(&txn, "public.t", &columns, &feed, &keys)
+            .await
+            .expect("re-read");
+        let images: Vec<Option<&str>> = before
+            .iter()
+            .map(|(key, _)| got[key].image.as_deref())
+            .collect();
+        assert_eq!(
+            images,
+            vec![
+                Some(r#"{"g": null, "h": "a", "total": "10"}"#),
+                None,
+                Some(r#"{"g": null, "h": null, "total": "30"}"#),
+                Some(r#"{"g": "2", "h": "b", "total": "40"}"#),
+            ],
+        );
     }
 }

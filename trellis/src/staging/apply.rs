@@ -2255,15 +2255,18 @@ async fn from_side_change_in_flight(
 /// would need the same "bump gen from inside the bulk recompute" follow-up
 /// this comment used to describe for the pre-#136 case generally.
 ///
-/// **Seam rows (issue #402).** The upper bound `lsn <= X` is no weaker for a
-/// from-side target's seam rows than for CDC, for the reason
+/// **Seam rows (issues #402, #403).** The upper bound `lsn <= X` is no weaker
+/// for a from-side target's seam rows than for CDC, for the reason
 /// [`from_side_change_in_flight`] gives. The exclusive lower bound is the one
 /// comparison that goes the other way: a seam row's token can be at or below
 /// `since_lsn` while its writer committed after it, where the same write's
-/// CDC row would be above `since_lsn` and route to the fallback. Unreachable
-/// while endpoint targets stay published (the seam does not feed them, see
-/// `staging::target_mutations`); #403 has to settle it before it switches
-/// the seam on.
+/// CDC row would be above `since_lsn` and route to the fallback. A token
+/// says nothing about how long after it its writer committed, so no lower
+/// bound on it is sound: for a from-side that is one of this instance's
+/// targets (fed by the seam alone, `staging::target_mutations`) the scan
+/// drops the lower bound and counts every matching row the ring still holds
+/// at or below `X`. That only sends more records to the always-correct
+/// fallback, and only until the rows retire.
 async fn relationship_fast_path_precondition_holds(
     txn: &Transaction<'_>,
     from_table: &str,
@@ -2281,12 +2284,17 @@ async fn relationship_fast_path_precondition_holds(
              where r.src_table = $1 \
                and r.op in ('insert', 'update', 'delete') \
                and r.lsn <= $2 \
-               and ($5::pg_lsn is null or r.lsn > $5) \
+               and ($5::pg_lsn is null or r.lsn > $5 or (select seam_fed from from_side)) \
                and (r.old_image ->> $3 = any($4::text[]) \
                     or r.new_image ->> $3 = any($4::text[]))"
         )
     });
-    let sql = format!("select exists ({arms})");
+    let sql = format!(
+        "with from_side as (select exists ( \
+             select 1 from transform_definitions d where d.target_table = $1 \
+         ) as seam_fed) \
+         select exists ({arms})"
+    );
     let row = txn
         .query_one(
             &sql,
@@ -2790,7 +2798,12 @@ async fn apply_projection_advance(
         .await?;
     }
 
-    let Some(new_image) = new_image else {
+    // A NULL `to_col` is no projection key (the key column is `not null`,
+    // and a NULL never joins a from-side row anyway), the same exclusion
+    // `catalog::ensure_relationship_projection_in_txn`'s seed makes. A
+    // nullable `UNIQUE` to-side column can hold one, and an aggregate
+    // target's NULL group routinely does (issue #403).
+    let (Some(_), Some(new_image)) = (new_key, new_image) else {
         return Ok(());
     };
     let data_columns = projection_data_columns(
@@ -3225,9 +3238,9 @@ struct ClearPlan {
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
-/// [`ApplyPlan::aggregate_clears`]'s doc comment for why this carries no
-/// [`PrimaryKeyColumn`] of its own (a plain full-table `DELETE`, no
-/// `RETURNING`-projected key shape needed). `qualified_target` plays the
+/// [`ApplyPlan::aggregate_clears`]'s doc comment. Unlike [`ClearPlan`], its
+/// `pk` is the target's own `GROUP BY` identity, not the truncated source's
+/// key. `qualified_target` plays the
 /// same role [`ClearPlan::qualified_target`]/[`TargetPlan::qualified_target`]
 /// do: the persisted, fully-qualified identity the `DELETE FROM` must bind,
 /// not the bare map key this is stored under.
@@ -3236,8 +3249,9 @@ struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
     /// The aggregate target's own row identity — its `GROUP BY` columns, as
-    /// `ddl::source_primary_key` reports them — so the clear can report each
-    /// cleared group's key to the seam (issue #315).
+    /// `ddl::identity_key_columns` reports them (ungated by key type, issue
+    /// #385) — so the clear can report each cleared group's key to the seam
+    /// (issue #315).
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
 }
@@ -4034,6 +4048,101 @@ mod tests {
                  arm must stay a typed error, not a panic and not a silent empty result"
             ),
         }
+    }
+
+    /// Issue #403: [`relationship_fast_path_precondition_holds`]'s exclusive
+    /// lower bound (`lsn > since_lsn`) is only sound for a commit LSN. A
+    /// from-side that is one of this instance's targets is fed by the seam,
+    /// whose `lsn` is a pre-commit token, so a row of it at or below
+    /// `since_lsn` still counts. A plain source's CDC row at the same `lsn`
+    /// stays excluded.
+    #[tokio::test]
+    async fn the_fast_path_precondition_ignores_since_lsn_for_a_seam_fed_from_side() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public; \
+                 create table public.children_src (id integer primary key, parent_id integer); \
+                 create table public.children (id integer primary key, parent_id integer); \
+                 create table public.plain (id integer primary key, parent_id integer)",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("create the sources");
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+        let columns = HashMap::from([
+            (
+                "id".to_string(),
+                crate::defs::ast::ValueType::Integer(crate::integer::IntWidth::Int4),
+            ),
+            (
+                "parent_id".to_string(),
+                crate::defs::ast::ValueType::Integer(crate::integer::IntWidth::Int4),
+            ),
+        ]);
+        catalog::create_definition(
+            &pool,
+            "TRANSFORM public.children FROM public.children_src SELECT parent_id AS parent_id",
+            &columns,
+        )
+        .await
+        .expect("children is a target");
+
+        let row = |src_table: &str| StagedChange::Cdc {
+            src_table: src_table.to_string(),
+            key: "1".to_string(),
+            op: append::CdcOp::Insert,
+            lsn: Some(PgLsn::from(100)),
+            old_image: None,
+            new_image: Some(r#"{"id": "1", "parent_id": "7"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        };
+        let txn = client.transaction().await.expect("begin");
+        append::append(&txn, &[row("public.children"), row("public.plain")])
+            .await
+            .expect("stage one row per from-side");
+        let since = Some(PgLsn::from(200));
+        let watermark = PgLsn::from(1000);
+        assert!(
+            !relationship_fast_path_precondition_holds(
+                &txn,
+                "public.children",
+                "parent_id",
+                &["7"],
+                since,
+                watermark
+            )
+            .await
+            .expect("check the seam-fed from-side"),
+            "a seam row's token at or below since_lsn may belong to a writer that committed \
+             after it, so it still sends the record to the fallback"
+        );
+        assert!(
+            relationship_fast_path_precondition_holds(
+                &txn,
+                "public.plain",
+                "parent_id",
+                &["7"],
+                since,
+                watermark
+            )
+            .await
+            .expect("check the CDC-fed from-side"),
+            "a CDC row at or below since_lsn committed at its lsn, so it stays excluded"
+        );
+        txn.rollback().await.expect("rollback");
     }
 }
 
@@ -5252,7 +5361,26 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         existing.src_changed =
                             earliest_src_changed(existing.src_changed, change.src_changed);
                     } else {
-                        let pk = ddl::source_primary_key(pool, &def.target_table).await?;
+                        // Issue #385: the ungated `identity_key_columns`, not
+                        // `source_primary_key`. The clear only renders this
+                        // identity through `pk_key_sql_expr` (a `::text` of
+                        // each column) to report cleared groups to the seam,
+                        // so the key-type gate buys nothing here — and a
+                        // `numeric` `GROUP BY` is still admitted, so the gate
+                        // halted the instance on every such truncate. A
+                        // chained reader can't depend on this key's text
+                        // being stable: #371 refuses to chain off an
+                        // aggregate whose identity fails the gate.
+                        let pk = {
+                            let client = pool.get().await?;
+                            ddl::identity_key_columns(&**client, &def.target_table).await?
+                        };
+                        if pk.is_empty() {
+                            return Err(DdlError::NoPrimaryKey {
+                                source_table: def.target_table.clone(),
+                            }
+                            .into());
+                        }
                         aggregate_clears.insert(
                             def.def.target.clone(),
                             AggregateClearPlan {

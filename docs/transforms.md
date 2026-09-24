@@ -111,14 +111,13 @@ related table — order lines decorated with `product.category_name`.
 
 A relationship is a named, directed link from one table to another, defined by a
 join key (`order_line_items.product_id -> products.id`) and declared as its own
-reusable statement. Either endpoint may be a source table or a 1-1 transform
-target, but not an aggregate target for now (issue #375). A source-table
-endpoint needs a primary key (or `REPLICA IDENTITY USING INDEX`), like any
-table Trellis reads over logical replication. A target endpoint is put on
-`REPLICA IDENTITY FULL` when the relationship is created. The first time, that
-holds an `ACCESS EXCLUSIVE` lock on the target until the declaration commits,
-which for a to-one relationship onto it includes reading every row to seed the
-relationship's projection. The referencing table keeps its own primary
+reusable statement. Either endpoint may be a source table or a transform
+target, 1-1 or aggregate. A source-table endpoint needs a primary key (or
+`REPLICA IDENTITY USING INDEX`), like any table Trellis reads over logical
+replication. A target endpoint needs neither: Trellis's own writes to it reach
+the relationship directly (issue #375), so it must be `live` when the
+relationship is declared: its initial build writes it outside that path. The
+referencing table keeps its own primary
 key and granularity — a 1-1 table stays 1-1 — and calculated fields on it
 reference the related table's columns
 through paths whose head is the relationship name. How depends on **cardinality**:
@@ -167,7 +166,7 @@ A transform can only chain off a target once that target's own transform is
 `TransformNotLive`: wait for the upstream to go live, then define the chained
 transform. Each write to a target reaches the transforms reading it inside the
 same transaction as the write; a target is never part of the CDC publication
-itself (unless it is also a relationship endpoint). That in-transaction hand-off
+itself, not even one that is a relationship endpoint. That in-transaction hand-off
 is why an aggregate target, which has no primary key, can be chained off at all
 (see [Source tables](#source-tables)). It does not cross into another instance.
 
@@ -205,7 +204,7 @@ undefined. Treat a target as read-only, and specifically:
   primary key and an aggregate target's unique grouping constraint are how
   Trellis addresses a row when it upserts or deletes it. The replica identity
   matters once the table is in a publication, which is the case for a target
-  that is a relationship endpoint or that another instance reads as a source:
+  that another instance reads as a source:
   `REPLICA IDENTITY NOTHING` makes Postgres refuse Trellis's own updates.
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition

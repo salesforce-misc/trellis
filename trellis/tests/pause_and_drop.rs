@@ -1796,3 +1796,53 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         .await
         .expect("a replayed relationship drop is a no-op success");
 }
+
+/// Issue #403 review: a target paused mid-build can't become a relationship
+/// endpoint. The seam is an endpoint target's only change feed, and a chunk a
+/// worker holds across the pause still writes the target outside it. Before
+/// this was refused, that chunk's rows reached neither the relationship's
+/// projection (seeded before they landed) nor the ring, and a `RESUME`
+/// rebuild re-deriving them to the same values stages nothing either. So a
+/// reader through the relationship never saw them, where the published
+/// endpoint this replaced got them over CDC.
+#[tokio::test]
+async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 3).await;
+    raw.batch_execute(
+        "create table reports (id bigint primary key, oid bigint); \
+         alter table reports replica identity full",
+    )
+    .await
+    .expect("seed the relationship's from-side");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
+        .await
+        .expect("define the upstream target");
+    let client = db.pool.get().await.expect("acquire connection");
+    let held = chunk_queue::claim_chunks(&**client, "held_across_pause", 1000)
+        .await
+        .expect("claim the build's chunk");
+    drop(client);
+    assert!(!held.is_empty(), "the build runs through the chunk queue");
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause mid-build");
+
+    match trellis
+        .apply("RELATIONSHIP rollup FROM reports.oid TO order_doubles.id")
+        .await
+    {
+        Err(TrellisError::Catalog(CatalogError::TransformNotLive { transform, status })) => {
+            assert_eq!(transform, "order_doubles");
+            assert_eq!(status, TransformStatus::Paused);
+        }
+        other => panic!("expected TransformNotLive, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shut down");
+}

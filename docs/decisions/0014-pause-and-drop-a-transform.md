@@ -119,14 +119,13 @@ reconciles the publication against the definitions that remain, which removes a 
 table from replication only when nothing derives from it any longer. Correct by
 construction, and applied at drop time rather than deferred to a maintenance pass.
 
-> **Unresolved (#427).** [ADR-0016](0016-single-background-capture-path.md)
-> makes the staging worker the only process that changes the publication, and
-> this drop-time reconcile conflicts with that: it runs from whichever process
-> applies the `DROP`. Either the reconcile moves to the staging worker's
-> maintenance pass, which already re-reconciles on its own cadence and would
-> replace "applied at drop time" above, or `DROP` stays an explicit exception
-> and any process that drops transforms keeps needing publication privileges.
-> #427 decides. Until then this section describes the current behavior.
+> **Superseded by [ADR-0016](0016-single-background-capture-path.md) (#427).**
+> ADR-0016 makes the staging worker the only process that changes the
+> publication. The drop-time reconcile described here moves to the staging
+> worker's maintenance pass, which reconciles from the catalog on its own
+> cadence; `reconcile_publication_after_drop` goes away, and dropping a
+> transform no longer needs publication privileges. Code is *Planned (#427)*;
+> this section describes the pre-ADR-0016 behavior.
 
 ### Pause and drop are idempotent
 
