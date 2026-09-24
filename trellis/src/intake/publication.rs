@@ -169,10 +169,16 @@ pub async fn reconcile_publication(
 /// it any earlier could discharge before the table joined the stream, and a
 /// commit between that read and the join would be neither read nor streamed.
 ///
-/// Only the staging worker runs this, and it runs the discharge itself right
-/// after, so no discharge of an existing marker is in flight: an existing
-/// marker is one the next discharge will run, promoting every
-/// `waiting_to_backfill` definition on its table.
+/// A source that already has a marker is skipped: that marker's discharge
+/// dispatches every `waiting_to_backfill` definition on the table. If the
+/// marker is mid-discharge and that discharge read the table's definitions
+/// before this one registered, it deletes the marker without dispatching
+/// this one. The definition is then left without a marker only until the
+/// staging worker's next pass, which parks one here. The staging worker
+/// runs this every reconcile pass, right before its discharge. The process
+/// that applies a `DROP` also runs it, through
+/// `Trellis::reconcile_publication_after_drop`, until #427 moves that
+/// reconcile to the staging worker.
 pub(crate) async fn park_registration_markers(
     client: &impl GenericClient,
     published: &[String],
@@ -2659,6 +2665,126 @@ mod dispatch_tests {
         discharge(&mut client).await;
         assert_eq!(status(&client, id).await, "live");
         assert!(staged(&client).await);
+    }
+
+    /// A ring-built definition has never read its table, so a coverage
+    /// record an earlier direct build left behind can't stand in for its
+    /// enumeration: the discharge enumerates even though the coverage vouches
+    /// that the table hasn't changed since. Skipping it would flip the
+    /// definition `live` over an empty target.
+    #[tokio::test]
+    async fn a_ring_built_definition_is_enumerated_even_where_coverage_covers_the_table() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        define(
+            &client,
+            "public.orders",
+            "public.rollup",
+            "TRANSFORM rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "live",
+        )
+        .await;
+        record_backfill_coverage(&client, "public.orders")
+            .await
+            .expect("record the live aggregate's coverage");
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT b + 1 AS a, a + 1 AS b",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "live");
+        assert!(
+            staged(&client).await,
+            "the ring-built definition's enumeration isn't skipped for coverage"
+        );
+    }
+
+    /// Issue #444, closed by construction: a ring-built definition's flip to
+    /// `live` and the catch-ups it calls for commit in the discharge's own
+    /// transaction. A park that fails (a trigger rejecting the catch-up on
+    /// `public.d`, which a `live` definition reads) rolls the whole discharge
+    /// back: the definition stays `waiting_to_backfill`, the marker and the
+    /// ring are as they were, and the next pass takes it `live`.
+    #[tokio::test]
+    async fn a_failed_catchup_park_rolls_the_whole_discharge_back() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT b + 1 AS a, a + 1 AS b",
+            "waiting_to_backfill",
+        )
+        .await;
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.d', 1); \
+                 create function reject_d_marker() returns trigger \
+                 language plpgsql as $$ \
+                 begin raise exception 'injected: cannot park a marker on %', new.table_name; end $$; \
+                 create trigger reject_d_marker before insert on pending_backfill \
+                   for each row when (new.table_name = 'public.d') \
+                   execute function reject_d_marker()",
+            )
+            .await
+            .expect("seed public.d's version row and the park-failure trigger");
+        define(
+            &client,
+            "public.d",
+            "public.r",
+            "TRANSFORM r FROM d SELECT a AS y",
+            "live",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+        client
+            .batch_execute("select txid_current()")
+            .await
+            .expect("consume an xid");
+
+        let outcome = run_pending_backfills(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(outcome.is_err(), "the injected park failure surfaces");
+        assert_eq!(
+            status(&client, id).await,
+            "waiting_to_backfill",
+            "a definition whose catch-up didn't park must not be live"
+        );
+        assert_eq!(
+            markers(&client).await,
+            ["public.orders"],
+            "the marker survives, and no catch-up is half-parked"
+        );
+        assert!(!staged(&client).await, "the enumeration rolled back too");
+
+        client
+            .batch_execute("drop trigger reject_d_marker on pending_backfill")
+            .await
+            .expect("drop the park-failure trigger");
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "live");
+        assert_eq!(
+            markers(&client).await,
+            ["public.d"],
+            "going live parks the catch-up on the target its reader reads"
+        );
     }
 
     /// A chunked definition on a table another definition already reads

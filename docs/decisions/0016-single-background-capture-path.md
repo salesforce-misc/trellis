@@ -85,14 +85,19 @@ Either way a `waiting_to_backfill` definition always has a marker in its future,
 and registration never runs `ALTER PUBLICATION`.
 
 This differs from the split first recorded here, where registration parked the
-marker itself when the source needed no publication change. Registration can't
-tell that case apart: which publication the staging worker serves is that
-worker's own option (`ClientOptions::publication`), not something the catalog
-or a registering process knows, and guessing wrong in either direction is a
-bug (a marker on a table not yet streamed, or no marker ever for an
-already-published table). The staging worker knows exactly which tables it
-has just published. The cost is at most one maintenance pass of latency, and
-the fence is taken later, which only makes it safer.
+marker itself when the source needed no publication change. Registration can
+tell from the catalog that a source is another definition's target, but not
+that it is already published: which publication the staging worker serves is
+that worker's own option (`ClientOptions::publication`), not something the
+catalog or a registering process knows, and guessing wrong in either
+direction is a bug (a marker on a table not yet streamed, or no marker ever
+for an already-published table). The staging worker knows exactly which
+tables it has just published, so it parks both cases and there is one owner.
+The cost is at most one reconcile pass of latency
+(`ClientOptions::reconcile_interval`), and the fence is taken later, which
+only makes it safer: the definition isn't `live` in the meantime, so nothing
+it could miss is folded anywhere, and the capture read comes after the later
+fence.
 
 ### What each build reads
 
