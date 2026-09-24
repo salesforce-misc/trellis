@@ -182,8 +182,10 @@ pub(crate) async fn park_target_catchup_if_read(
 /// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
 /// `pending_backfill` mechanism [`reconcile_publication`] already relies on
 /// for a table newly joining the publication (docs/decisions/0007's
-/// amendment). `defs::chunk_queue::complete_direct_backfill` calls this the
-/// moment a direct-build definition flips `backfilling` -> `live`: while it
+/// amendment). `defs::catalog::complete_direct_backfill` (and, for a
+/// synchronous build, `install_definition`, once per table the build read)
+/// calls this the moment a direct-build definition flips `backfilling` ->
+/// `live`: while it
 /// sat non-`live`, [`super::super::defs::dependents_of`]'s status filter kept
 /// any live CDC delta for `qualified_table` from being folded into its
 /// target, so the definition's target may be missing whatever changed on

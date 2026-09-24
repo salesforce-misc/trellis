@@ -123,6 +123,24 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
 
 const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
 
+/// Installs [`SKU_TOTALS`] and discharges the catch-up marker its build
+/// parks on `sales` when it goes live (issue #430), so each test starts with
+/// no marker but the one it is about.
+async fn install_sku_totals(pool: &trellis::Pool, client: &mut Client) {
+    install_definition(pool, SKU_TOTALS, &sales_columns(), "public")
+        .await
+        .expect("install the aggregate");
+    publication::run_pending_backfills(
+        client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the aggregate's go-live catch-up");
+    drain_to_quiescence(pool, client).await;
+}
+
 /// `sales`, including a NULL-`sku` row so `sku_totals` has a NULL-keyed group
 /// — the case a raw `sku::text` key would silently lose.
 async fn create_schema(client: &Client) {
@@ -179,10 +197,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
     let mut client = connect_raw(db.dsn()).await;
     create_schema(&client).await;
 
-    install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
-        .await
-        .expect("install the aggregate");
-    drain_to_quiescence(&db.pool, &mut client).await;
+    install_sku_totals(&db.pool, &mut client).await;
     install_definition(
         &db.pool,
         "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total",
@@ -249,10 +264,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
     let mut client = connect_raw(db.dsn()).await;
     create_schema(&client).await;
 
-    install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
-        .await
-        .expect("install the aggregate");
-    drain_to_quiescence(&db.pool, &mut client).await;
+    install_sku_totals(&db.pool, &mut client).await;
     client
         .batch_execute("alter table sku_totals replica identity full")
         .await

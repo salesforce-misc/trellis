@@ -344,9 +344,12 @@ async fn recovery_leaves_prior_freezes_alone_and_discards_only_orphaned_markers(
         definer.apply(statement).await.expect(statement);
     }
 
+    // Replace the go-live catch-up markers the aggregate builds parked
+    // (issue #430) with the two this test stages.
     raw.batch_execute(&format!(
         "create publication only_orders for table orders; \
          insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
+         delete from pending_backfill; \
          insert into pending_backfill (table_name, fence_snapshot) values \
              ('{DEFAULT_SCHEMA}.orders', pg_current_snapshot()), \
              ('{DEFAULT_SCHEMA}.refunds', pg_current_snapshot());"

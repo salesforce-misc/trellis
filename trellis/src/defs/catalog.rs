@@ -720,9 +720,11 @@ pub async fn create_definition_without_backfill(
 /// incremental accumulator (e.g. `AVG`) folds against an existing baseline,
 /// not just racing harmlessly. [`dependents_of`]/[`transforms_for_source`]
 /// now filter to `status = 'live'`, so no build path (backgrounded or still
-/// synchronous) can have a delta folded into it while non-`live` — see
-/// [`complete_direct_backfill`] for how a delta skipped during that window is
-/// recovered rather than lost once the definition does go live.
+/// synchronous) can have a delta folded into it while non-`live`. A delta
+/// skipped during that window is recovered rather than lost by the catch-up
+/// marker parked when the definition goes live: [`complete_direct_backfill`]
+/// parks one on the source for the chunked path, and the synchronous path
+/// below parks one on every table its build read (issue #430).
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -928,17 +930,19 @@ pub async fn install_definition(
             definition.status = go_live_if_backfilling(&**client, definition.id)
                 .await?
                 .status();
-            // Issue #315: a source that is another definition's target never
-            // joins the publication, so there is no publication-join marker
-            // to catch this definition up on the upstream writes its build
-            // raced (the seam skips a reader until it is live). Park one
-            // explicitly once it is live, the same catch-up
-            // `complete_direct_backfill` parks for the chunked path.
-            if definition.status == TransformStatus::Live
-                && is_definition_target(&**client, &qualified_source).await?
-            {
-                crate::intake::publication::park_backfill_catchup(&**client, &qualified_source)
-                    .await?;
+            // Issues #315/#430: the apply path skipped this definition while
+            // it sat `backfilling`, so a change to any table the build read
+            // that drained during the build is missing from the target. Park
+            // a catch-up on each of them, as `complete_direct_backfill` does
+            // for the chunked path: its discharge re-derives from current
+            // state, and the coverage just committed lets it skip a table
+            // that hasn't changed since its pre-build fence. A frozen
+            // definition's resume parks its own and rebuilds.
+            if !definition.status.is_frozen() {
+                for plan in &coverage_plan {
+                    crate::intake::publication::park_backfill_catchup(&**client, plan.qualified())
+                        .await?;
+                }
             }
             Ok(definition)
         }
@@ -1096,6 +1100,8 @@ async fn go_live_if_backfilling(
 /// `Backfilling` -> `Live` synchronously inside [`install_definition`] itself
 /// via [`go_live_if_backfilling`], since neither is chunked into
 /// `backfill_chunks` (see this crate's `defs::backfill` module docs on why).
+/// That path parks the same catch-up itself, on its source and on every
+/// relationship to-side table its build read (issue #430).
 ///
 /// **Only a still-`backfilling` definition completes (issue #331).** The
 /// pause gates new chunk claims, not a chunk a worker already holds, so the
@@ -1221,6 +1227,15 @@ enum CoveragePlan {
     /// fence), so only a full enumeration can be trusted to catch every reader
     /// up — clear any coverage to force that.
     Clear { qualified: String },
+}
+
+impl CoveragePlan {
+    /// The table this plan is for.
+    fn qualified(&self) -> &str {
+        match self {
+            CoveragePlan::Record { qualified, .. } | CoveragePlan::Clear { qualified } => qualified,
+        }
+    }
 }
 
 /// Plans direct-backfill coverage (issue #79, bug B) for a definition about to
@@ -5299,9 +5314,11 @@ struct PendingDefinition {
 /// delta is not lost, though — [`crate::intake::publication::run_pending_backfills`]'s
 /// discharge (parked via the same `pending_backfill` marker the ring-fallback
 /// path already relies on, inserted when a definition flips to
-/// [`TransformStatus::Live`] — see `chunk_queue::complete_direct_backfill`)
-/// re-derives the definition's target from current source state once it goes
-/// live, folding in anything skipped while it wasn't.
+/// [`TransformStatus::Live`]: by [`complete_direct_backfill`] for a chunked
+/// build, and by [`install_definition`] for a synchronous one, on every table
+/// that build read, issue #430) re-derives the definition's target from
+/// current source state once it goes live, folding in anything skipped while
+/// it wasn't.
 ///
 /// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0007)
 /// — matched exactly against `schema_nodes.table_name`, which is now always
