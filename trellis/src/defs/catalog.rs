@@ -926,10 +926,6 @@ pub async fn install_definition(
             // live, so the redundant publication-join catch-up enumeration of
             // those tables can be skipped.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
-            let client = pool.get().await?;
-            definition.status = go_live_if_backfilling(&**client, definition.id)
-                .await?
-                .status();
             // Issues #315/#430: the apply path skipped this definition while
             // it sat `backfilling`, so a change to any table the build read
             // that drained during the build is missing from the target. Park
@@ -938,12 +934,25 @@ pub async fn install_definition(
             // state, and the coverage just committed lets it skip a table
             // that hasn't changed since its pre-build fence. A frozen
             // definition's resume parks its own and rebuilds.
+            //
+            // The flip and the parks commit together, as in
+            // `complete_direct_backfill`: a crash or a failed park between
+            // them would otherwise leave the definition live with the loss
+            // unrecovered. Parked in name order so two installs sharing
+            // tables can't deadlock on each other's marker rows.
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            definition.status = go_live_if_backfilling(&*txn, definition.id).await?.status();
             if !definition.status.is_frozen() {
-                for plan in &coverage_plan {
-                    crate::intake::publication::park_backfill_catchup(&**client, plan.qualified())
-                        .await?;
+                let mut tables: Vec<&str> =
+                    coverage_plan.iter().map(CoveragePlan::qualified).collect();
+                tables.sort_unstable();
+                tables.dedup();
+                for table in tables {
+                    crate::intake::publication::park_backfill_catchup(&*txn, table).await?;
                 }
             }
+            txn.commit().await?;
             Ok(definition)
         }
         Err(BackfillError::Unsupported(_)) => {

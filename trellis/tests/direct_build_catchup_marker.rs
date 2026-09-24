@@ -342,3 +342,67 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
         "going live parks a catch-up marker on every table the build read"
     );
 }
+
+/// Going live and parking the catch-ups commit together: when a park fails,
+/// the definition is not left `live` with some of its tables uncovered, which
+/// would lose a build-window change exactly as before the fix. The failure is
+/// injected with a trigger rejecting the marker on the second table parked.
+#[tokio::test]
+async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, name text); \
+             create table public.comments (id integer primary key, author_id integer); \
+             alter table public.comments replica identity full; \
+             insert into public.authors values (1, 'a'); \
+             insert into public.comments values (200, 1)",
+        )
+        .await
+        .expect("create + seed authors and comments");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create the comments relationship");
+    client
+        .batch_execute(
+            "create function reject_comments_marker() returns trigger \
+             language plpgsql as $$ \
+             begin raise exception 'injected: cannot park a marker on %', new.table_name; end $$; \
+             create trigger reject_comments_marker before insert on pending_backfill \
+               for each row when (new.table_name = 'public.comments') \
+               execute function reject_comments_marker()",
+        )
+        .await
+        .expect("install the park-failure trigger");
+
+    let outcome = install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT COUNT(comments.id) AS comment_count",
+        &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
+        "public",
+    )
+    .await;
+    assert!(outcome.is_err(), "the injected park failure surfaces");
+
+    let status: String = client
+        .query_one(
+            "select status from transform_definitions where target_table = 'public.author_totals'",
+            &[],
+        )
+        .await
+        .expect("read the definition's status")
+        .get(0);
+    assert_ne!(
+        status, "live",
+        "a definition whose catch-ups didn't all park must not be live"
+    );
+    assert!(
+        pending_markers(&client).await.is_empty(),
+        "no catch-up is left half-parked"
+    );
+}
