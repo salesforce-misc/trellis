@@ -280,6 +280,10 @@ pub(crate) async fn park_backfill_catchup(
 /// can be the older one when it had to wait on the row lock of a concurrent
 /// park.
 ///
+/// A park also clears the marker's retry state (issue #407, ADR-0016): the
+/// new generation is due at once, whatever the last discharge's failures had
+/// backed it off to.
+///
 /// Returns the bare Postgres error so [`crate::Trellis::request_backfill`]
 /// can report it as the plain database failure it is.
 pub(crate) async fn park_marker(
@@ -295,7 +299,10 @@ pub(crate) async fn park_marker(
                  when pg_snapshot_xmax(excluded.fence_snapshot) > pg_snapshot_xmax(pb.fence_snapshot) \
                  then excluded.fence_snapshot else pb.fence_snapshot end, \
                generation = default, \
-               added_at = now()",
+               added_at = now(), \
+               attempts = 0, \
+               last_error = null, \
+               next_attempt_at = null",
             &[&qualified_table],
         )
         .await?;
@@ -393,6 +400,11 @@ struct PendingBackfill {
     /// Which park of `table` this is ([`park_marker`]). Discharge deletes
     /// only this generation.
     generation: i64,
+    /// How many discharges of this generation have failed so far.
+    attempts: i32,
+    /// Whether the backoff after the last failure has run out
+    /// (`next_attempt_at`, read against the database's clock).
+    due: bool,
 }
 
 async fn fetch_pending_backfills(
@@ -400,7 +412,9 @@ async fn fetch_pending_backfills(
 ) -> Result<Vec<PendingBackfill>, IntakeError> {
     let rows = client
         .query(
-            "select table_name, fence_snapshot::text, generation from pending_backfill",
+            "select table_name, fence_snapshot::text, generation, attempts, \
+                    coalesce(next_attempt_at <= now(), true) \
+             from pending_backfill",
             &[],
         )
         .await?;
@@ -408,14 +422,64 @@ async fn fetch_pending_backfills(
         .map(|r| {
             let table: String = r.get(0);
             let fence_text: String = r.get(1);
-            let generation: i64 = r.get(2);
             Snapshot::parse(&fence_text).map(|fence| PendingBackfill {
                 table,
                 fence,
-                generation,
+                generation: r.get(2),
+                attempts: r.get(3),
+                due: r.get(4),
             })
         })
         .collect()
+}
+
+/// The backoff before the first retry of a failed discharge (issue #407).
+/// Twice the maintenance loop's default reconcile interval, so a marker that
+/// just failed sits out at least one pass.
+const DISCHARGE_RETRY_BASE: Duration = Duration::from_secs(10);
+
+/// The longest a failing marker waits between attempts. There is no
+/// quarantine (ADR-0016): a marker that fails forever is retried at this
+/// interval forever, so a fixed cause is picked up within this long.
+const DISCHARGE_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// How long a marker waits after its `attempts`th failed discharge before the
+/// next one: [`DISCHARGE_RETRY_BASE`], doubled per further failure, capped at
+/// [`DISCHARGE_RETRY_CAP`].
+fn discharge_retry_delay(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(31);
+    DISCHARGE_RETRY_BASE
+        .saturating_mul(1 << doublings)
+        .min(DISCHARGE_RETRY_CAP)
+}
+
+/// Records a failed discharge of `marker` on its row (issue #407): one more
+/// attempt, the error's text, and `delay` from now as when the next pass may
+/// try it again. Scoped to the generation the pass read, so a park that raced
+/// the failed discharge keeps the fresh, immediately due state
+/// [`park_marker`] gave it.
+async fn record_discharge_failure(
+    client: &impl GenericClient,
+    marker: &PendingBackfill,
+    error: &IntakeError,
+    delay: Duration,
+) -> Result<(), IntakeError> {
+    client
+        .execute(
+            "update pending_backfill set \
+               attempts = attempts + 1, \
+               last_error = $3, \
+               next_attempt_at = now() + make_interval(secs => $4) \
+             where table_name = $1 and generation = $2",
+            &[
+                &marker.table,
+                &marker.generation,
+                &error.to_string(),
+                &delay.as_secs_f64(),
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Page size for [`enumerate_and_append`]'s server-side cursor. Bounds one
@@ -804,8 +868,27 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// marker stays, so the next pass retries cleanly. The pass then stops rather
 /// than waiting again on the remaining markers: each later horizon is at
 /// least as far ahead, so every one would most likely time out too, and the
-/// maintenance loop seals nothing while this waits. A discharge that fails
-/// outright rolls back the same way before returning its error (issue #387).
+/// maintenance loop seals nothing while this waits.
+///
+/// # A failing marker (issues #387, #407)
+///
+/// A discharge that fails outright rolls back the same way, so the marker
+/// and its definitions stay as they were. The failure then ends only that
+/// marker's turn, not the pass: it is logged, recorded on the marker (one
+/// more `attempts`, the `last_error` text, and a `next_attempt_at` backed off
+/// by [`discharge_retry_delay`]), and the pass goes on to the next marker. A
+/// marker that isn't due yet is skipped, so a broken one is neither retried
+/// every pass nor able to starve the healthy ones behind it, whatever order
+/// the markers are read in. There is no quarantine: it is retried at the
+/// capped interval until the cause is fixed or its definitions are dropped,
+/// and a new park of the table resets the state ([`park_marker`]). The
+/// recorded error is what `Trellis::status` reports for every definition
+/// reading the table.
+///
+/// This form returns the first such failure once the pass has run, for tests
+/// that expect one; [`run_pending_backfills_until`] returns them all without
+/// failing the pass.
+///
 /// A caller with no intake running yet must not call this at all (see
 /// `client::setup_staging`); tests with no CDC stream pass
 /// [`crate::staging::StagedWatermark::saturated`].
@@ -836,17 +919,43 @@ pub async fn run_pending_backfills(
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
 ) -> Result<(), IntakeError> {
-    run_pending_backfills_until(client, wake_channel, watermark, catch_up_timeout, &|| false).await
+    let failures =
+        run_pending_backfills_until(client, wake_channel, watermark, catch_up_timeout, &|| false)
+            .await?;
+    match failures.into_iter().next() {
+        Some(failure) => Err(failure.error),
+        None => Ok(()),
+    }
+}
+
+/// One marker whose discharge failed in a pass of
+/// [`run_pending_backfills_until`]. The failure is already logged and
+/// recorded on the marker, which stays for a later pass.
+#[derive(Debug)]
+pub(crate) struct FailedDischarge {
+    /// The marker's table.
+    #[allow(dead_code)]
+    pub(crate) table: String,
+    pub(crate) error: IntakeError,
 }
 
 /// [`run_pending_backfills`], with `stop` checked while an enumeration waits
 /// for intake. When `stop` returns `true` the wait gives up early, through
 /// the same rollback as a timeout, so the maintenance loop shuts down
 /// promptly with nothing half-dispatched.
+///
+/// Returns every marker whose discharge failed this pass (see "A failing
+/// marker" above). An `Err` means the pass itself couldn't run: reading the
+/// markers or recording a failure on one failed, which points at the
+/// connection rather than any one marker.
 #[tracing::instrument(
     name = "intake.run_pending_backfills",
     skip(client, wake_channel, watermark, stop),
-    fields(pending = tracing::field::Empty, settled = tracing::field::Empty)
+    fields(
+        pending = tracing::field::Empty,
+        settled = tracing::field::Empty,
+        failed = tracing::field::Empty
+    )
 )]
 pub(crate) async fn run_pending_backfills_until(
     client: &mut tokio_postgres::Client,
@@ -854,16 +963,25 @@ pub(crate) async fn run_pending_backfills_until(
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
-) -> Result<(), IntakeError> {
+) -> Result<Vec<FailedDischarge>, IntakeError> {
     let pending = fetch_pending_backfills(client).await?;
     tracing::Span::current().record("pending", pending.len());
     if pending.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let now = current_snapshot(client).await?;
 
     let mut settled = 0usize;
+    let mut failures = Vec::new();
     for marker in pending {
+        if !marker.due {
+            tracing::debug!(
+                table = %marker.table,
+                attempts = marker.attempts,
+                "backfill marker backing off after a failed discharge; not due yet"
+            );
+            continue;
+        }
         if !now.settled_since(&marker.fence) {
             // Issue #56/`docs/observability.md`'s "Backfill status and the
             // `xmin` caveat": deliberately *not* a warning — sitting here is
@@ -898,19 +1016,30 @@ pub(crate) async fn run_pending_backfills_until(
                 break;
             }
             Err(error) => {
-                // The maintenance loop logs this pass's error too (issue
-                // #408), but only this report names the table.
+                // The maintenance loop doesn't report the failures this pass
+                // returns, so this is the one place the log shows it; the
+                // marker row carries it to `Trellis::status`.
+                let attempts = u32::try_from(marker.attempts).unwrap_or(0) + 1;
+                let retry_in = discharge_retry_delay(attempts);
                 tracing::warn!(
                     table = %marker.table,
                     error = %error,
-                    "backfill discharge failed; its marker stays for the next pass"
+                    attempts,
+                    retry_in_secs = retry_in.as_secs(),
+                    "backfill discharge failed; its marker stays and is retried after a backoff"
                 );
-                return Err(error);
+                record_discharge_failure(&*client, &marker, &error, retry_in).await?;
+                failures.push(FailedDischarge {
+                    table: marker.table,
+                    error,
+                });
             }
         }
     }
-    tracing::Span::current().record("settled", settled);
-    Ok(())
+    let span = tracing::Span::current();
+    span.record("settled", settled);
+    span.record("failed", failures.len());
+    Ok(failures)
 }
 
 /// How [`discharge_marker`] ended short of an error.
@@ -1895,6 +2024,27 @@ mod tests {
         assert_eq!(joined, "public.widgets");
         assert_eq!(split_qualified(&joined).unwrap(), ("public", "widgets"));
     }
+
+    /// Issue #407: the backoff after a failed discharge starts at the base,
+    /// doubles per further failure, and stops growing at the cap, however
+    /// many failures pile up.
+    #[test]
+    fn discharge_retry_delay_doubles_up_to_the_cap() {
+        let secs = |attempts| discharge_retry_delay(attempts).as_secs();
+        assert_eq!(DISCHARGE_RETRY_BASE.as_secs(), 10);
+        assert_eq!(DISCHARGE_RETRY_CAP.as_secs(), 300);
+        assert_eq!(secs(0), 10, "no failure yet reads as the first");
+        assert_eq!(
+            (1..=6).map(secs).collect::<Vec<_>>(),
+            vec![10, 20, 40, 80, 160, 300]
+        );
+        assert_eq!(secs(40), 300);
+        assert_eq!(
+            secs(u32::MAX),
+            300,
+            "no overflow on a marker failing forever"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2209,9 +2359,13 @@ mod catch_up_tests {
             .get(0);
         assert_eq!(markers, 1, "the marker must survive for the next pass");
 
-        // Once the cause is fixed, the next pass picks the definition back up.
+        // Once the cause is fixed, the next pass after the marker's backoff
+        // (issue #407; run out by hand here) picks the definition back up.
         client
-            .batch_execute("alter table public.nokey add primary key (id)")
+            .batch_execute(
+                "alter table public.nokey add primary key (id); \
+                 update pending_backfill set next_attempt_at = now()",
+            )
             .await
             .expect("give the source a primary key");
         run_pending_backfills(
@@ -2226,6 +2380,199 @@ mod catch_up_tests {
             status(&client, id).await,
             "backfilling",
             "the retry dispatches the definition's chunks"
+        );
+    }
+
+    /// A marker's retry state, as `(attempts, last_error, seconds until
+    /// next_attempt_at)`, or `None` if `table` has no marker.
+    async fn retry_state(
+        client: &tokio_postgres::Client,
+        table: &str,
+    ) -> Option<(i32, Option<String>, Option<f64>)> {
+        client
+            .query_opt(
+                "select attempts, last_error, \
+                        extract(epoch from next_attempt_at - now())::float8 \
+                 from pending_backfill where table_name = $1",
+                &[&table],
+            )
+            .await
+            .expect("read retry state")
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+    }
+
+    /// Issue #407 (ADR-0016): a marker whose discharge always fails doesn't
+    /// stop the healthy marker behind it in the same pass. The failure is
+    /// recorded on the marker with a backoff, the marker isn't retried
+    /// before its next-attempt time, each retry that fails again backs off
+    /// further, and a new park of the table resets the state.
+    ///
+    /// `public.nokey` has no identity key, so planning its plain 1-1
+    /// definition's chunks fails on every attempt. Its marker is parked first
+    /// so an unordered read meets it first too.
+    #[tokio::test]
+    async fn a_failing_marker_backs_off_without_starving_the_marker_behind_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.nokey (id bigint not null); \
+                 insert into public.nokey values (1); \
+                 create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 create publication test_pub; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.nokey', 1);",
+            )
+            .await
+            .expect("seed a broken and a healthy source table");
+        reconcile_publication(&mut client, "test_pub", &["public.nokey".to_string()])
+            .await
+            .expect("reconcile parks the broken table's marker");
+        client
+            .execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.nokey', 1, $1, 'waiting_to_backfill')",
+                &[&"TRANSFORM d FROM nokey SELECT id AS x"],
+            )
+            .await
+            .expect("seed the broken table's deferred definition");
+        register_reader(&db, "public.t", "t_reader").await;
+        reconcile_publication(
+            &mut client,
+            "test_pub",
+            &["public.nokey".to_string(), "public.t".to_string()],
+        )
+        .await
+        .expect("reconcile parks the healthy table's marker");
+
+        async fn pass(client: &mut tokio_postgres::Client) -> Vec<FailedDischarge> {
+            run_pending_backfills_until(
+                client,
+                "wake",
+                &StagedWatermark::saturated(),
+                Duration::from_secs(600),
+                &|| false,
+            )
+            .await
+            .expect("a failing marker must not fail the pass")
+        }
+
+        let failures = pass(&mut client).await;
+        assert_eq!(
+            retry_state(&client, "public.t").await,
+            None,
+            "the healthy marker behind the failing one must discharge in the same pass"
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public.nokey"]
+        );
+        let (attempts, last_error, retry_in) = retry_state(&client, "public.nokey")
+            .await
+            .expect("the failing marker stays");
+        assert_eq!(attempts, 1);
+        let last_error = last_error.expect("the failure's error is recorded");
+        assert!(
+            last_error.contains("no primary key"),
+            "the recorded error names the cause, got {last_error:?}"
+        );
+        let retry_in = retry_in.expect("a failed marker has a next-attempt time");
+        assert!(
+            (5.0..=10.0).contains(&retry_in),
+            "the first retry waits out the base backoff, got {retry_in}s"
+        );
+
+        // Not due yet: the next pass leaves it alone.
+        assert!(pass(&mut client).await.is_empty());
+        assert_eq!(
+            retry_state(&client, "public.nokey").await.map(|s| s.0),
+            Some(1),
+            "a marker is not retried before its next-attempt time"
+        );
+
+        // Due again (run out by hand), it fails again and backs off further.
+        client
+            .execute(
+                "update pending_backfill set next_attempt_at = now() - interval '1 second'",
+                &[],
+            )
+            .await
+            .expect("run the backoff out");
+        assert_eq!(pass(&mut client).await.len(), 1);
+        let (attempts, _, retry_in) = retry_state(&client, "public.nokey")
+            .await
+            .expect("the failing marker stays");
+        assert_eq!(attempts, 2);
+        let retry_in = retry_in.expect("a failed marker has a next-attempt time");
+        assert!(
+            (15.0..=20.0).contains(&retry_in),
+            "the second retry waits twice as long, got {retry_in}s"
+        );
+
+        // A new park of the table starts it over, due at once.
+        park_backfill_catchup(&client, "public.nokey")
+            .await
+            .expect("re-park the broken table");
+        assert_eq!(
+            retry_state(&client, "public.nokey").await,
+            Some((0, None, None)),
+            "a new park resets the retry state"
+        );
+    }
+
+    /// Issue #407: a park that lands while a discharge of the same table is
+    /// failing keeps its fresh state. The failure is recorded against the
+    /// generation the pass read, which the park replaced.
+    #[tokio::test]
+    async fn a_park_racing_a_failed_discharge_stays_due() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut discharger, parker) = one_settled_marker(&db).await;
+        // `one_settled_marker`'s `live` reader makes the discharge enumerate
+        // (and so wait, which the race runs in). A waiting definition whose
+        // dispatch then fails to move its status fails the discharge.
+        discharger
+            .batch_execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.t', 1, 'TRANSFORM d FROM t SELECT id AS x', \
+                         'waiting_to_backfill'); \
+                 create function fail_status_move() returns trigger \
+                 language plpgsql as $$ begin raise exception 'status move fails'; end $$; \
+                 create trigger fail_status_move before update on transform_definitions \
+                 for each row execute function fail_status_move();",
+            )
+            .await
+            .expect("make the discharge fail");
+
+        let parker_ref = &parker;
+        discharge_racing(&mut discharger, |go, _done| async move {
+            park_backfill_catchup(parker_ref, "public.t")
+                .await
+                .expect("park during discharge");
+            go.send(()).expect("release discharge");
+        })
+        .await;
+
+        let status: String = parker
+            .query_one(
+                "select status from transform_definitions where target_table = 'public.d'",
+                &[],
+            )
+            .await
+            .expect("read status")
+            .get(0);
+        assert_eq!(status, "waiting_to_backfill", "the discharge failed");
+        assert_eq!(
+            retry_state(&parker, "public.t").await,
+            Some((0, None, None)),
+            "the racing park's generation carries no failure"
         );
     }
 
@@ -2306,8 +2653,15 @@ mod catch_up_tests {
         })
         .await
         .expect("the discharge finishes");
-        match result {
-            Err(IntakeError::Db(error)) => assert_eq!(
+        match result.as_deref() {
+            Ok(
+                [
+                    FailedDischarge {
+                        error: IntakeError::Db(error),
+                        ..
+                    },
+                ],
+            ) => assert_eq!(
                 error.code(),
                 Some(&tokio_postgres::error::SqlState::RAISE_EXCEPTION)
             ),
@@ -2981,8 +3335,12 @@ mod dispatch_tests {
         );
         assert!(!staged(&client).await, "the enumeration rolled back too");
 
+        // Run the failed marker's backoff (issue #407) out by hand.
         client
-            .batch_execute("drop trigger reject_d_marker on pending_backfill")
+            .batch_execute(
+                "drop trigger reject_d_marker on pending_backfill; \
+                 update pending_backfill set next_attempt_at = now()",
+            )
             .await
             .expect("drop the park-failure trigger");
         discharge(&mut client).await;

@@ -132,7 +132,7 @@ fn define_returns_before_backfill_completes() {
         .expect("status (sync)")
         .expect("definition must be registered");
     assert_eq!(
-        status,
+        status.status,
         TransformStatus::WaitingToBackfill,
         "apply() must return before any staging worker (of which there are none here) could \
          possibly have dispatched the build (ADR-0016)"

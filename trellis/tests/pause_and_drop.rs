@@ -307,7 +307,11 @@ async fn pausing_twice_is_a_no_op_success() {
         "the second pause left the row exactly as the first one did"
     );
     assert_eq!(
-        trellis.status("order_rollup").await.expect("status"),
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .map(|s| s.status),
         Some(TransformStatus::Paused),
         "the facade reports the paused state back through its own read path too"
     );

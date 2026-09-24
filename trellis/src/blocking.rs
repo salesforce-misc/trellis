@@ -26,11 +26,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::types::PgLsn;
 
 use crate::app::{
-    Applied, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry, RelationshipSummary,
-    Trellis, TrellisError, TrellisOptions,
+    Applied, DefinitionStatus, DefinitionSummary, PoisonEntry, PoisonSample, QuarantineEntry,
+    RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 use crate::config::Config;
-use crate::defs::TransformStatus;
 
 /// One [`BlockingTrellis`] method call, carried over a channel to the
 /// dedicated background thread that owns the real, async [`Trellis`] (see
@@ -49,7 +48,7 @@ enum Job {
     ),
     Status(
         String,
-        oneshot::Sender<Result<Option<TransformStatus>, TrellisError>>,
+        oneshot::Sender<Result<Option<DefinitionStatus>, TrellisError>>,
     ),
     Quarantined(oneshot::Sender<Result<Vec<QuarantineEntry>, TrellisError>>),
     QuarantineStatus(
@@ -161,7 +160,7 @@ impl BlockingTrellis {
     ///
     /// In particular, registering a plain (non-relationship) 1-1 transform
     /// returns before its backfill finishes; poll
-    /// [`BlockingTrellis::status`] for [`TransformStatus::Live`].
+    /// [`BlockingTrellis::status`] for [`TransformStatus::Live`](crate::TransformStatus::Live).
     pub fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
         let statement_text = statement_text.to_string();
         self.submit(|reply| Job::Apply(statement_text, reply))
@@ -192,9 +191,10 @@ impl BlockingTrellis {
         self.submit(|reply| Job::PoisonedSince(watermark, reply))
     }
 
-    /// One registered transform definition's current [`TransformStatus`], by
-    /// target table name. See [`Trellis::status`].
-    pub fn status(&self, target_table: &str) -> Result<Option<TransformStatus>, TrellisError> {
+    /// One registered transform definition's current [`TransformStatus`](crate::TransformStatus), and
+    /// its source's backfill failure if any, by target table name. See
+    /// [`Trellis::status`].
+    pub fn status(&self, target_table: &str) -> Result<Option<DefinitionStatus>, TrellisError> {
         let target_table = target_table.to_string();
         self.submit(|reply| Job::Status(target_table, reply))
     }

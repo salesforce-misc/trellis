@@ -82,7 +82,7 @@
 //! )
 //! .await?;
 //! // Poll until every registered transform is done backfilling.
-//! while running.status("authors_calc").await? != Some(TransformStatus::Live) {
+//! while running.status("authors_calc").await?.map(|s| s.status) != Some(TransformStatus::Live) {
 //!     // ... sleep, then re-check ...
 //! }
 //! // ... run until shutdown ...
@@ -523,12 +523,17 @@ impl Trellis {
     /// (issue #55), by target table name — the read a host-language embedder
     /// polls after [`apply`](Trellis::apply) registers a definition, per
     /// `docs/decisions/0008-public-api-design.md`'s decision 1 ("define, then poll status
-    /// until live"). A thin convenience over [`definitions`](Trellis::definitions)
-    /// for callers that only want one row rather than the full list.
+    /// until live").
+    ///
+    /// Also reports why a definition isn't getting there, when the cause is a
+    /// failing backfill of its source table
+    /// ([`DefinitionStatus::backfill_failure`], issue #407): the staging
+    /// worker retries it with backoff forever, so without this the only
+    /// sign would be a warning in that worker's log.
     pub async fn status(
         &self,
         target_table: &str,
-    ) -> Result<Option<TransformStatus>, TrellisError> {
+    ) -> Result<Option<DefinitionStatus>, TrellisError> {
         let client = self.pool.get().await?;
         // Issue #73: `transform_definitions.target_table` is persisted
         // fully-qualified, but every caller here only ever has the bare name
@@ -541,16 +546,31 @@ impl Trellis {
         // the qualified column directly.
         let row = client
             .query_opt(
-                "select status from transform_definitions \
-                 where split_part(target_table, '.', 2) = $1",
+                "select d.status, pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at \
+                 from transform_definitions d \
+                 left join pending_backfill pb \
+                   on pb.table_name = d.source_table and pb.last_error is not null \
+                 where split_part(d.target_table, '.', 2) = $1",
                 &[&target_table],
             )
             .await?;
         Ok(row.map(|row| {
             let status_text: String = row.get(0);
-            TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                 panic!("transform_definitions.status held unrecognized value '{status_text}'")
-            })
+            });
+            let backfill_failure =
+                row.get::<_, Option<String>>(1)
+                    .map(|source_table| BackfillFailure {
+                        source_table,
+                        attempts: u32::try_from(row.get::<_, i32>(2)).unwrap_or(0),
+                        last_error: row.get(3),
+                        next_attempt_at: row.get(4),
+                    });
+            DefinitionStatus {
+                status,
+                backfill_failure,
+            }
         }))
     }
 
@@ -1330,6 +1350,39 @@ impl Trellis {
 /// directly in `trellis/tests/app.rs` against `defs::all_source_tables`.
 pub(crate) async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
     Ok(defs::publication_tables(pool).await?)
+}
+
+/// One registered transform definition's status, as [`Trellis::status`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionStatus {
+    /// Where the transform is in its lifecycle (issue #55).
+    pub status: TransformStatus,
+    /// Set while the backfill marker parked on the definition's source table
+    /// keeps failing to discharge (issue #407, ADR-0016). That discharge runs
+    /// every build of a `waiting_to_backfill` definition on the table and the
+    /// catch-up of every `live` one, so its failure is reported on each
+    /// definition that reads the table, whatever its status. A definition
+    /// stuck in `waiting_to_backfill` with this set is waiting on the cause
+    /// named in [`BackfillFailure::last_error`], not on the discharge's turn.
+    /// It clears once the discharge succeeds or the table is parked again.
+    pub backfill_failure: Option<BackfillFailure>,
+}
+
+/// The retry state of a source table's backfill marker whose discharge has
+/// failed (issue #407). The discharge retries it with capped exponential
+/// backoff, and never gives up on its own: fix the cause (or drop the
+/// definitions reading the table) and the next attempt goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillFailure {
+    /// The qualified source table the marker is parked on.
+    pub source_table: String,
+    /// How many discharges of the marker have failed since it was parked.
+    pub attempts: u32,
+    /// The latest failure's error, as the staging worker's log reported it.
+    pub last_error: String,
+    /// The earliest time the staging worker's discharge tries it again.
+    pub next_attempt_at: SystemTime,
 }
 
 /// One registered transform definition, as [`Trellis::definitions`] reports

@@ -219,6 +219,28 @@ The remedy is documentation, not a signal: an operator clears the wait by ending
 the pinning transaction — idle-in-transaction connections, long analytics
 queries, `pg_dump`, or workload on another database sharing the cluster.
 
+### A backfill that keeps failing
+
+A backfill can also fail outright, for example when a plain 1-1 transform's
+source has lost its primary key. That is a fault, so unlike the fence wait it
+is surfaced (issue #407,
+[ADR-0016](decisions/0016-single-background-capture-path.md#consequences)):
+
+* **It doesn't hold up other tables.** The staging worker logs the failure as a
+  warning and moves on to the next table's backfill in the same pass.
+* **It is retried with backoff.** The next attempt waits 10 seconds, doubling
+  after each further failure up to 5 minutes. It keeps retrying at that pace
+  forever; nothing is quarantined automatically. Once you fix the cause (or drop
+  the transform), the next attempt goes through. A new backfill request for the
+  same table (`Trellis::request_backfill`, a resume, or any other catch-up)
+  resets the backoff and runs at once.
+* **`Trellis::status` reports it.** The transform stays `waiting_to_backfill`,
+  and `DefinitionStatus::backfill_failure` carries the source table, the
+  attempt count, the last error and the next attempt time. The source table's
+  backfill also runs the catch-up of its `live` readers, so every transform
+  reading that table reports the failure, whatever its status. It clears once
+  an attempt goes through.
+
 ## Dependencies
 
 Approved and pinned in `trellis/Cargo.toml` (issues #51/#56); rationale in

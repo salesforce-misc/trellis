@@ -131,7 +131,11 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
         "a PAUSE statement must report a pause"
     );
     assert_eq!(
-        trellis.status("order_rollup").await.expect("status"),
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .map(|s| s.status),
         Some(TransformStatus::Paused)
     );
 
@@ -145,7 +149,11 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
         "a whole-transform resume reports no columns, got {applied:?}"
     );
     assert_eq!(
-        trellis.status("order_rollup").await.expect("status"),
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .map(|s| s.status),
         Some(TransformStatus::WaitingToBackfill),
         "RESUME rebuilds rather than catching up (ADR-0014)"
     );
@@ -394,7 +402,11 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
         1
     );
     assert_eq!(
-        trellis.status("order_rollup").await.expect("status"),
+        trellis
+            .status("order_rollup")
+            .await
+            .expect("status")
+            .map(|s| s.status),
         Some(TransformStatus::Live),
         "an invalid statement must leave the catalog exactly as it was"
     );

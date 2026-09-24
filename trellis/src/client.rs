@@ -1379,6 +1379,9 @@ async fn reconcile_source_tables(
     let desired: Vec<String> = desired.into_iter().collect();
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;
+    // The markers whose discharge failed are already logged and backed off on
+    // their own rows (issue #407). Only a failure of the pass itself errors,
+    // and costs this connection a reconnect.
     intake::publication::run_pending_backfills_until(
         client,
         wake_channel,
