@@ -514,6 +514,21 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
             );
             ok = false;
         }
+        // Same cross-check as `report_probes` (#423): the counter counts
+        // staged source rows, one per committed row, so any excess is a
+        // mid-window re-stage the probe measured on top of its offer.
+        if result.changes_applied > result.rows_issued {
+            eprintln!(
+                "HARNESS FAILURE: {} groups at {} rows/sec applied {} changes for {} committed \
+                 rows — source rows were staged again during the window (a catch-up \
+                 backfill?), so this rate was measured under extra load",
+                result.groups,
+                result.target_rows_per_sec,
+                result.changes_applied,
+                result.rows_issued
+            );
+            ok = false;
+        }
         if result.generator_bound {
             eprintln!(
                 "GENERATOR-BOUND: {} groups — generator offered only {:.0} of {} rows/sec and \
@@ -743,6 +758,89 @@ mod tests {
     #[should_panic(expected = "--connections must be at least 1")]
     fn zero_connections_is_rejected() {
         connections(&argv(&["intake-ceiling", "--connections", "0"]));
+    }
+
+    fn probe(rows_issued: u64, changes_applied: u64) -> throughput::ThroughputProbe {
+        throughput::ThroughputProbe {
+            target_rows_per_sec: 20_000.0,
+            rows_per_commit: 400,
+            commits_per_sec: 50.0,
+            connections: 8,
+            offered_duration_secs: 10.0,
+            rows_issued,
+            achieved_rows_per_sec: 20_000.0,
+            generator_bound: false,
+            changes_applied,
+            backlog_after_grace: 0,
+            sustained: true,
+            e2e_count: rows_issued,
+            e2e_p50_bucket_frac: 1.0,
+            e2e_p99_bucket_frac: 1.0,
+            e2e_max_frac: 1.0,
+            oracle: crate::streaming::chain::ChainOracle {
+                source_rows: rows_issued as i64 + 1,
+                terminal_rows: rows_issued as i64 + 1,
+                mismatched_rows: 0,
+                fully_converged: true,
+            },
+        }
+    }
+
+    fn fold_in(rows_issued: u64, changes_applied: u64) -> fold_in::FoldInResult {
+        fold_in::FoldInResult {
+            fold_in_ratio: 1000.0,
+            groups: 50,
+            target_rows_per_sec: 50_000.0,
+            application_threads: 8,
+            connections: 8,
+            offered_duration_secs: 10.0,
+            rows_issued,
+            achieved_rows_per_sec: 50_000.0,
+            generator_bound: false,
+            changes_applied,
+            sustained: true,
+            folded_rows_per_sec: Some(50_000.0),
+            in_window_folded_rows_per_sec: Some(50_000.0),
+            kept_target_rate: true,
+            e2e_count: rows_issued,
+            e2e_p50_bucket_frac: 1.0,
+            e2e_p99_bucket_frac: 1.0,
+            e2e_max_frac: 1.0,
+            oracle_ok: Some(true),
+            oracle_groups: 50,
+            oracle_mismatched_groups: 0,
+            contention: Default::default(),
+            deadlocks: 0,
+            xact_rollbacks: 0,
+        }
+    }
+
+    /// Issue #423: a counter ahead of the rows committed means something
+    /// re-staged source rows inside the window (the go-live catch-up measured
+    /// 297,601 for 200,000), so the probe fails even though it drained and
+    /// its oracle agrees.
+    #[test]
+    fn a_counter_ahead_of_rows_committed_fails_the_probe() {
+        assert!(report_probes(&[probe(200_000, 200_000)], "throughput-ramp"));
+        assert!(!report_probes(
+            &[probe(200_000, 297_601)],
+            "throughput-ramp"
+        ));
+        let unsustained = throughput::ThroughputProbe {
+            sustained: false,
+            backlog_after_grace: 10,
+            ..probe(200_000, 200_001)
+        };
+        assert!(!report_probes(&[unsustained], "throughput-ramp"));
+
+        assert!(report_fold_in(
+            &[fold_in(500_000, 500_000)],
+            "fold-in-ratio"
+        ));
+        assert!(!report_fold_in(
+            &[fold_in(500_000, 596_001)],
+            "fold-in-ratio"
+        ));
     }
 
     #[test]

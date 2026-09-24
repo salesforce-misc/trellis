@@ -39,8 +39,14 @@ pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// [`ClientOptions::reconcile_interval`]'s own stock default (5 s), and what
 /// the single-hop scenarios run at: they have no intermediate hops for the
-/// reconcile pass to publish, so it makes no difference to them and the stock
-/// value is the honest one.
+/// reconcile pass to publish, so the stock value is the honest one.
+///
+/// It still matters to them in one way: the reconcile pass is what discharges
+/// the catch-up backfill a definition parks when it goes live, and that
+/// discharge re-stages every row the source holds by then (#423). The
+/// throughput and fold-in probes wait it out before writing their first row
+/// (`chain::wait_for_catch_up_discharged`), which costs setup up to one
+/// interval.
 pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What the multi-hop latency ladder runs at — longer than any single run, so
