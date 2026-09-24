@@ -25,7 +25,7 @@
 //! blocked on aggregate transform-defs) would call before it.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -558,18 +558,15 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 /// single-column case (still the overwhelmingly common one) pays no extra
 /// cost.
 ///
-/// # NULL-keyed groups (issue #110)
+/// # NULL-keyed groups (issues #110, #446)
 ///
-/// A `NULL` component decodes off `keys` (via [`ddl::transpose_pk_keys`]) as
-/// a real `Option::None`, bound as SQL `NULL` in its column's array — so a
-/// plain `t.<col> = u.<c>` join condition would never match it (`NULL` is
-/// never `=` anything, including another `NULL`), which is exactly how a
+/// A `NULL` component decodes off `keys` (via [`ddl::split_pk_key`]) as a
+/// real `Option::None`. A plain `t.<col> = u.<c>` never matches it (`NULL`
+/// is never `=` anything, including another `NULL`), which is how a
 /// `NULL`-keyed aggregate group's live row used to be mistaken for "already
-/// deleted" by every downstream consumer of this function. [`live_rows_join_cond`]
-/// therefore uses `is not distinct from` — the same per-column, only-when-
-/// needed choice `apply_aggregate::keyset_match` already makes — for any `pk`
-/// column that carries at least one `NULL` in this batch, so that group
-/// resolves to its real live row instead.
+/// deleted" by every downstream consumer of this function. See
+/// [`live_rows_query`] for how such keys are matched without giving up the
+/// index.
 async fn read_live_rows_batch(
     pool: &Pool,
     source_table: &str,
@@ -580,36 +577,9 @@ async fn read_live_rows_batch(
         return Ok(HashMap::new());
     }
     let client = pool.get().await?;
-    let columns = ddl::transpose_pk_keys(pk, source_table, keys)?;
-    let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let arrays: Vec<String> = pk
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("${}::text[]::{}[]", i + 1, c.data_type))
-        .collect();
-    let u_cols: Vec<String> = (0..pk.len()).map(|i| format!("c{i}")).collect();
-    let null_safe: Vec<bool> = columns
-        .iter()
-        .map(|c| c.iter().any(Option::is_none))
-        .collect();
-    let join_cond = live_rows_join_cond(&pk_idents, &u_cols, &null_safe);
-    let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
-    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
     let row_columns = live_row_columns(&**client, source_table).await?;
-    let doc_expr = row_as_text_jsonb_sql("t", &row_columns);
-    let sql = format!(
-        "select m.k, e.key, e.value \
-         from (select {k_expr} as k, {doc_expr} as doc from {} t \
-               join unnest({}) as u({}) on {join_cond}) m \
-         cross join lateral jsonb_each_text(m.doc) e",
-        ddl::qualified_source_table(source_table),
-        arrays.join(", "),
-        u_cols.join(", "),
-    );
-    let params: Vec<&(dyn ToSql + Sync)> =
-        columns.iter().map(|c| c as &(dyn ToSql + Sync)).collect();
-    let db_rows = client.query(&sql, &params).await?;
+    let query = live_rows_query(source_table, pk, &row_columns, keys)?;
+    let db_rows = client.query(&query.sql, &query.params()).await?;
     let mut rows: HashMap<String, Row> = HashMap::new();
     for db_row in db_rows {
         let key: String = db_row.get(0);
@@ -620,32 +590,130 @@ async fn read_live_rows_batch(
     Ok(rows)
 }
 
-/// A `t.<col> <op> u.<c>` conjunction matching a refetched row's primary-key
-/// columns against the keyset relation — [`read_live_rows_batch`]'s join
-/// condition, factored out as its own pure, directly testable function (the
-/// same convention [`key_array_filter`] and
-/// `apply_aggregate::keyset_match`/`keyset_match_source` use for their own
-/// per-column operator choice). `null_safe[i]` selects `is not distinct
-/// from` over plain `=` for column `i`: `=` is preferred whenever no key in
-/// this batch binds a `NULL` for that column (hashable/indexable, so
-/// Postgres can pick a plan that uses a btree index on `t.<col>` — the same
-/// tradeoff `apply_aggregate::keyset_match`'s own doc comment explains), but
-/// a batch that does needs `is not distinct from` for it (issue #110):
-/// plain `=` never matches a `NULL` operand, so a `NULL`-keyed group's live
-/// row would otherwise be indistinguishable from "row doesn't exist" and
-/// mistaken for a delete.
-fn live_rows_join_cond(pk_idents: &[String], u_cols: &[String], null_safe: &[bool]) -> String {
-    pk_idents
-        .iter()
-        .zip(u_cols)
-        .enumerate()
-        .map(|(i, (ident, u_col))| {
-            let op = if null_safe[i] {
-                "is not distinct from"
+/// [`read_live_rows_batch`]'s statement and the arrays it binds: one
+/// [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's keys.
+struct LiveRowsQuery<'a> {
+    sql: String,
+    arms: Vec<LiveRowsArm<'a>>,
+}
+
+/// The keys of one [`read_live_rows_batch`] call whose `pk` is `NULL` in
+/// exactly the same columns, bound as one `union all` arm.
+struct LiveRowsArm<'a> {
+    /// One array per `pk` column that is not `NULL` in this pattern, in
+    /// column order. A `NULL` column binds nothing: the arm matches it with
+    /// `is null`.
+    parts: Vec<Vec<Cow<'a, str>>>,
+}
+
+impl LiveRowsQuery<'_> {
+    /// The bind parameters, in the order `sql` numbers them.
+    fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
+        self.arms
+            .iter()
+            .flat_map(|arm| arm.parts.iter().map(|part| part as &(dyn ToSql + Sync)))
+            .collect()
+    }
+}
+
+/// Builds [`read_live_rows_batch`]'s statement: one `union all` arm per
+/// pattern of `NULL` key columns present among `keys` (issue #446), usually
+/// just one. Each arm joins its keys' non-`NULL` parts as a keyset relation
+/// (one array per such column, so the bind count doesn't grow with the
+/// batch) and matches with [`live_rows_join_cond`], so every arm probes an
+/// index on `pk`. Each matched row is returned as its own recomputed key
+/// text plus one `(column, value)` pair per column, via a `cross join
+/// lateral jsonb_each_text` (so decoding costs no extra round trip).
+///
+/// Matching a whole batch with `is not distinct from` on any column one of
+/// its keys binds a `NULL` for (the pre-#446 shape) is correct but not
+/// indexable: one `NULL`-keyed group in a batch turned the refetch into a
+/// nested loop over a sequential scan of the source. This is the same split
+/// `target_mutations::read_new_images` makes (issue #433).
+fn live_rows_query<'a>(
+    source_table: &str,
+    pk: &[PrimaryKeyColumn],
+    row_columns: &[String],
+    keys: &[&'a str],
+) -> Result<LiveRowsQuery<'a>, ApplyError> {
+    // `pattern[i]`: key column `i` is NULL.
+    let mut arms: BTreeMap<Vec<bool>, LiveRowsArm<'a>> = BTreeMap::new();
+    for &key in keys {
+        let decoded = ddl::split_pk_key(pk, source_table, key)?;
+        let pattern: Vec<bool> = decoded.iter().map(Option::is_none).collect();
+        let arm = arms
+            .entry(pattern)
+            .or_insert_with_key(|pattern| LiveRowsArm {
+                parts: vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
+            });
+        for (column, part) in arm.parts.iter_mut().zip(decoded.into_iter().flatten()) {
+            column.push(part);
+        }
+    }
+
+    let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
+    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
+    let doc_expr = row_as_text_jsonb_sql("t", row_columns);
+    let source_ident = ddl::qualified_source_table(source_table);
+    let mut next_param = 0;
+    let selects: Vec<String> = arms
+        .keys()
+        .map(|pattern| {
+            let mut arrays = Vec::new();
+            let mut u_cols = Vec::new();
+            for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
+                if !null {
+                    next_param += 1;
+                    arrays.push(format!("${next_param}::text[]::{}[]", column.data_type));
+                    u_cols.push(pk_keyset_col(i));
+                }
+            }
+            // An all-`NULL` pattern binds no array at all: its one possible
+            // row is found by `is null` alone.
+            let keyset = if arrays.is_empty() {
+                String::new()
             } else {
-                "="
+                format!(
+                    " join unnest({}) as u({}) on true",
+                    arrays.join(", "),
+                    u_cols.join(", ")
+                )
             };
-            format!("t.{ident} {op} u.{u_col}")
+            format!(
+                "select {k_expr} as k, {doc_expr} as doc from {source_ident} t{keyset} \
+                 where {}",
+                live_rows_join_cond(pk, pattern),
+            )
+        })
+        .collect();
+    Ok(LiveRowsQuery {
+        sql: format!(
+            "select m.k, e.key, e.value from ({}) m \
+             cross join lateral jsonb_each_text(m.doc) e",
+            selects.join(" union all ")
+        ),
+        arms: arms.into_values().collect(),
+    })
+}
+
+/// [`read_live_rows_batch`]'s match for one [`live_rows_query`] arm: a
+/// conjunction over `pk` where column `i` is `t.<col> is null` if
+/// `pattern[i]` (every key in this arm is `NULL` there), else `t.<col> =
+/// u.c<i>`. Never `is not distinct from`: that is not indexable (issue
+/// #446), and within one arm it is never needed, since a column is either
+/// `NULL` for every key or for none.
+fn live_rows_join_cond(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> String {
+    pk.iter()
+        .zip(pattern)
+        .enumerate()
+        .map(|(i, (column, &null))| {
+            let col = quote_ident(&column.name);
+            if null {
+                format!("t.{col} is null")
+            } else {
+                format!("t.{col} = u.{}", pk_keyset_col(i))
+            }
         })
         .collect::<Vec<_>>()
         .join(" and ")
@@ -3636,29 +3704,152 @@ mod tests {
         );
     }
 
-    /// Issue #110 regression pin: [`live_rows_join_cond`] uses plain `=` for
-    /// a column no key in the batch binds `NULL` for (preserving the
-    /// pre-#110, index-friendly shape), but `is not distinct from` for a
-    /// column that does — so a `NULL`-keyed group's live row is found
-    /// instead of being mistaken for "already deleted."
+    /// Issues #110/#446 regression pin: [`live_rows_join_cond`] matches a
+    /// column that is `NULL` in the arm's pattern with `is null` (so a
+    /// `NULL`-keyed group's live row is found instead of being mistaken for
+    /// "already deleted") and every other column with the indexable `=` —
+    /// never `is not distinct from`.
     #[test]
-    fn live_rows_join_cond_uses_is_not_distinct_from_only_for_a_null_carrying_column() {
-        let idents = vec![r#""warehouse""#.to_string(), r#""sku""#.to_string()];
-        let u_cols = vec!["c0".to_string(), "c1".to_string()];
+    fn live_rows_join_cond_matches_a_null_column_with_is_null_and_the_rest_with_eq() {
+        let pk: Vec<PrimaryKeyColumn> = ["warehouse", "sku"]
+            .into_iter()
+            .map(|name| PrimaryKeyColumn {
+                name: name.to_string(),
+                data_type: "integer".to_string(),
+                nullable: true,
+            })
+            .collect();
 
         assert_eq!(
-            live_rows_join_cond(&idents, &u_cols, &[false, false]),
+            live_rows_join_cond(&pk, &[false, false]),
             r#"t."warehouse" = u.c0 and t."sku" = u.c1"#,
-            "no NULL anywhere in the batch: both columns keep the indexable `=`"
+            "no NULL in the pattern: both columns keep the indexable `=`"
         );
         assert_eq!(
-            live_rows_join_cond(&idents, &u_cols, &[true, false]),
-            r#"t."warehouse" is not distinct from u.c0 and t."sku" = u.c1"#,
-            "only the column that actually carries a NULL switches operator"
+            live_rows_join_cond(&pk, &[true, false]),
+            r#"t."warehouse" is null and t."sku" = u.c1"#,
+            "only the NULL column switches to `is null`, and binds no array"
         );
         assert_eq!(
-            live_rows_join_cond(&idents, &u_cols, &[true, true]),
-            r#"t."warehouse" is not distinct from u.c0 and t."sku" is not distinct from u.c1"#
+            live_rows_join_cond(&pk, &[true, true]),
+            r#"t."warehouse" is null and t."sku" is null"#
+        );
+    }
+
+    /// Issue #446: a [`read_live_rows_batch`] batch that includes
+    /// `NULL`-keyed groups (an aggregate target read as a source) still
+    /// probes the table's `UNIQUE NULLS NOT DISTINCT` index, at a
+    /// single-column and a composite key, and still finds every key's row.
+    /// Before the fix, one `NULL` key switched the whole batch's match on
+    /// that column to `is not distinct from`, which can't use the index, so
+    /// the plan was a nested loop over a sequential scan.
+    #[tokio::test]
+    async fn read_live_rows_batch_probes_the_index_when_a_batch_binds_a_null() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table single (g int, total int, unique nulls not distinct (g)); \
+                 insert into single select g, g from generate_series(1, 200000) g; \
+                 insert into single values (null, 0); \
+                 analyze single; \
+                 create table composite (g int, h text, total int, \
+                                         unique nulls not distinct (g, h)); \
+                 insert into composite select g, 'k' || g, g from generate_series(1, 200000) g; \
+                 insert into composite values (null, 'k1', 0), (5, null, 0), (null, null, 0); \
+                 analyze composite;",
+            )
+            .await
+            .expect("seed large aggregate-style sources");
+        // Each table's 500-key batch: its NULL-bearing keys plus plain keys
+        // spread across the table.
+        let cases = [
+            ("public.single", "t.g is null or t.g % 397 = 0", 2),
+            (
+                "public.composite",
+                "t.g is null or t.h is null or t.g % 397 = 0",
+                4,
+            ),
+        ];
+        for (table, batch, patterns) in cases {
+            let pk = ddl::identity_key_columns(&client, table)
+                .await
+                .expect("identity");
+            let columns = live_row_columns(&client, table).await.expect("columns");
+            let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
+            let owned: Vec<String> = client
+                .query(
+                    &format!(
+                        "select {key_sql} from {table} t where {batch} \
+                         order by t.g nulls first limit 500"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let keys: Vec<&str> = owned.iter().map(String::as_str).collect();
+            assert_eq!(keys.len(), 500);
+            let query = live_rows_query(table, &pk, &columns, &keys).expect("query");
+            assert_eq!(
+                query.arms.len(),
+                patterns,
+                "{table}: one arm per NULL pattern in the batch"
+            );
+            let plan: String = client
+                .query(&format!("explain {}", query.sql), &query.params())
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan.contains("Index") && !plan.contains("Seq Scan"),
+                "{table}: every arm should probe the key index, got:\n{plan}"
+            );
+            let found: std::collections::HashSet<String> = client
+                .query(&query.sql, &query.params())
+                .await
+                .expect("read")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(
+                found,
+                owned.iter().cloned().collect(),
+                "{table}: every key, NULL-bearing or not, finds its own row"
+            );
+        }
+
+        // The pre-#446 shape over a single-column batch with one NULL key can
+        // only plan a sequential scan, so the difference above is real.
+        let groups: Vec<Option<String>> = std::iter::once(None)
+            .chain((1..500).map(|i| Some((i * 397).to_string())))
+            .collect();
+        let plan: String = client
+            .query(
+                "explain select t.total from single t \
+                 join unnest($1::text[]::int[]) as u(c0) on t.g is not distinct from u.c0",
+                &[&groups],
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Seq Scan"),
+            "the pre-#446 shape should not be able to probe the index, got:\n{plan}"
         );
     }
 

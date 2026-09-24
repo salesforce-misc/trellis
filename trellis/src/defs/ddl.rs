@@ -901,7 +901,7 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 ///
 /// Every producer and consumer must agree on this one order:
 /// [`pk_key_sql_expr`] and [`join_pk_key`] (producers),
-/// [`split_pk_key`]/[`transpose_pk_keys`] (consumers), and
+/// [`split_pk_key`] (consumer), and
 /// [`crate::intake::extract_key`] (a producer that reaches the key through
 /// `pgoutput`'s physical column order and so has to normalize back onto this
 /// one — see its own doc comment).
@@ -1154,31 +1154,6 @@ pub(crate) fn split_pk_key<'a>(
             }
         })
         .collect())
-}
-
-/// [`split_pk_key`], applied to a whole batch of keys and transposed so
-/// column `j`'s array holds every key's `j`th part — the shape a batched,
-/// parameterized `unnest(...)` match needs (one bind array per `pk` column,
-/// regardless of how many keys the batch carries), mirroring
-/// `staging::apply_aggregate`'s `keyset_unnest`/`transpose_group_values`
-/// pair for the identical reason. A `None` part (issue #110: a `NULL` key
-/// component, decoded by [`split_pk_key`]) binds as a genuine SQL `NULL` in
-/// its column's array, not [`NULL_KEY_SENTINEL`]'s literal text.
-pub(crate) fn transpose_pk_keys<'a>(
-    pk: &[PrimaryKeyColumn],
-    source_table: &str,
-    keys: &[&'a str],
-) -> Result<Vec<Vec<Option<Cow<'a, str>>>>, DdlError> {
-    let mut columns: Vec<Vec<Option<Cow<'a, str>>>> = (0..pk.len())
-        .map(|_| Vec::with_capacity(keys.len()))
-        .collect();
-    for &key in keys {
-        let parts = split_pk_key(pk, source_table, key)?;
-        for (column, part) in columns.iter_mut().zip(parts) {
-            column.push(part);
-        }
-    }
-    Ok(columns)
 }
 
 /// Every column of `source_table`, mapped to its *concrete* Postgres type as
