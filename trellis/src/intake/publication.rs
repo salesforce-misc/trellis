@@ -1880,11 +1880,12 @@ mod catch_up_tests {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (mut discharger, operator) = one_settled_marker(&db).await;
+        // `one_settled_marker` registers a reader on `public.t`, which
+        // upserts its `source_table_versions` row to version 1 already
+        // (issue #417) — no separate seed needed here.
         discharger
             .batch_execute(
-                "insert into source_table_versions (source_table, version) \
-                 values ('public.t', 1); \
-                 create function fail_marker_delete() returns trigger \
+                "create function fail_marker_delete() returns trigger \
                  language plpgsql as $$ begin raise exception 'marker delete fails'; end $$; \
                  create trigger fail_marker_delete before delete on pending_backfill \
                  for each row execute function fail_marker_delete();",
