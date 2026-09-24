@@ -1408,11 +1408,11 @@ async fn slot_health(
     let row = client
         .query_opt(
             "select s.wal_status, s.confirmed_flush_lsn, \
-                    to_jsonb(s) ->> 'invalidation_reason', \
-                    (to_jsonb(s) ->> 'conflicting')::boolean \
+                    to_jsonb(s) ->> $2::text, \
+                    (to_jsonb(s) ->> $3::text)::boolean \
              from pg_replication_slots s \
              where s.slot_name = $1 and s.database = current_database()",
-            &[&slot],
+            &[&slot, &INVALIDATION_REASON_COLUMN, &CONFLICTING_COLUMN],
         )
         .await?;
     Ok(classify_slot(
@@ -1425,6 +1425,12 @@ async fn slot_health(
         last_confirmed_lsn,
     ))
 }
+
+/// The `pg_replication_slots` columns [`slot_health`] reads by name through
+/// `to_jsonb`, where a misspelt name reads as NULL just like a server
+/// without the column; `slot_health_reads_a_real_slot` pins both names.
+const INVALIDATION_REASON_COLUMN: &str = "invalidation_reason";
+const CONFLICTING_COLUMN: &str = "conflicting";
 
 /// The `pg_replication_slots` columns [`slot_health`] reads for one slot.
 struct SlotRow {
@@ -1617,10 +1623,33 @@ mod slot_health_tests {
             .expect("create a slot")
             .get(0);
         let health = slot_health(&**client, "slot_413", lsn).await;
+        // A misspelt column name would read as NULL, the same as a server
+        // without the column, and every other check here would still pass;
+        // so pin the names `slot_health` reads to the versions that have them.
+        let columns = client
+            .query_one(
+                "select current_setting('server_version_num')::int, \
+                        to_jsonb(s) ? $1, to_jsonb(s) ? $2 \
+                 from pg_replication_slots s where s.slot_name = 'slot_413'",
+                &[&INVALIDATION_REASON_COLUMN, &CONFLICTING_COLUMN],
+            )
+            .await;
         client
             .execute("select pg_drop_replication_slot('slot_413')", &[])
             .await
             .expect("drop the slot");
+        let columns = columns.expect("read the slot's columns");
+        let version: i32 = columns.get(0);
+        assert_eq!(
+            columns.get::<_, bool>(1),
+            version >= 170000,
+            "invalidation_reason on {version}"
+        );
+        assert_eq!(
+            columns.get::<_, bool>(2),
+            version >= 160000,
+            "conflicting on {version}"
+        );
         assert_eq!(health.expect("slot_health"), SlotHealth::Healthy);
         assert_eq!(
             slot_health(&**client, "slot_413", lsn)
