@@ -566,7 +566,7 @@ async fn a_to_many_relationship_gets_no_projection() {
 #[tokio::test]
 async fn two_instances_sharing_a_target_schema_keep_independent_projections() {
     use trellis::config::DEFAULT_SCHEMA;
-    use trellis::{Config, Pool, migrate};
+    use trellis::{Config, Pool, Trellis, TrellisOptions, migrate};
 
     const INSTANCE_B: &str = "instance_b";
 
@@ -666,4 +666,45 @@ async fn two_instances_sharing_a_target_schema_keep_independent_projections() {
         in_target_schema, 0,
         "no projection lives in the target schema"
     );
+
+    // Dropping A's relationship drops A's projection and leaves B's, whose
+    // generated name is the same, untouched.
+    let trellis_a = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis for instance A");
+    trellis_a
+        .apply("DROP RELATIONSHIP articles.category")
+        .await
+        .expect("nothing reads A's relationship, so it drops");
+    let projection_exists = |schema: &'static str, table: String| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "select exists(select 1 from information_schema.tables \
+                     where table_schema = $1 and table_name = $2)",
+                    &[&schema, &table],
+                )
+                .await
+                .expect("look up a projection table")
+                .get::<_, bool>(0)
+        }
+    };
+    assert!(
+        !projection_exists(DEFAULT_SCHEMA, projection_a.projection_table.clone()).await,
+        "A's projection is dropped"
+    );
+    assert!(
+        projection_exists(INSTANCE_B, projection_b.projection_table.clone()).await,
+        "B's same-named projection survives A's DROP RELATIONSHIP"
+    );
+    assert_eq!(
+        keys(projection_b.qualified_table()).await,
+        vec![10, 20],
+        "B's projection still holds B's to-side keys"
+    );
+    trellis_a.shutdown().await.expect("shut down");
 }

@@ -38,9 +38,15 @@ the rest in the background: it publishes the source, reads its existing rows,
 builds the target, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 So a web process needs no publication ownership or replication privileges; only
-the worker does. Code that needs the target populated polls `status()` until
-the transform is `live`, then calls `await_converged` with a fresh
-`watermark_token()` to let the backfill's staged rows drain. That pair is the
+the worker does. It does need to create tables: each target table in the target
+schema, and, for a to-one relationship, the relationship's projection in the
+instance schema, where Trellis keeps its own state. A transform that reads a
+parent column the projection doesn't carry yet adds it there, so the process
+that applies it must own the projection too
+([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
+Code that needs the target populated polls `status()` until the transform is
+`live`, then calls `await_converged` with a fresh `watermark_token()` to let
+the backfill's staged rows drain. That pair is the
 contract: `live` means the transform is in its steady state, so a token awaited
 after it covers every commit at or before the token
 ([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).

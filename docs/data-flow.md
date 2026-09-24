@@ -242,8 +242,10 @@ a row committed during that wait would be neither read nor streamed (#393).
   process that only registers transforms needs catalog access and the right to
   create target tables. One that declares a to-one relationship also needs to
   create a table in the instance schema, where the relationship's projection
-  lives (the same right `migrate` already uses there). *Planned (#427):* `DROP` still reconciles the publication
-  from whichever process applies it
+  lives (the same right `migrate` already uses there), and one that applies a
+  transform reading a parent column the projection doesn't carry yet must own
+  the projection, since it adds that column. *Planned (#427):* `DROP` still
+  reconciles the publication from whichever process applies it
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#the-publication-shrinks-by-reconciliation));
   the decided design moves that shrink to the staging worker's reconcile pass,
   driven from the catalog.
