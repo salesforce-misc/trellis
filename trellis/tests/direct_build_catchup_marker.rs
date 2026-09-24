@@ -21,7 +21,8 @@
 //! which may let the go-live catch-up skip the source, so those tests check
 //! the target before the catch-up runs: the horizon alone must keep it
 //! right, however the late delta arrives (still in the ring, staged late by
-//! a lagging intake, or released from quarantine).
+//! a lagging intake, or released from quarantine), and whether it is on the
+//! source or on a relationship's to-side table.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -444,6 +445,114 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
         .expect("release the parked key");
     assert_eq!(replayed, 1);
     assert_the_read_change_is_counted_once(&db.pool, &mut client).await;
+}
+
+/// Issue #442, the to-side half: an aggregate grouped by a relationship key
+/// reads the relationship's to-side table too, and a to-side change the
+/// build read can drain after go-live just the same. Moving customer 3 from
+/// `apac` to `us` before the build, with its CDC still undrained, must leave
+/// `us` at `7`, not add order 4's `4` a second time. The build records
+/// coverage for `customers` as well, so the catch-up can't be what fixes it.
+#[tokio::test]
+async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_after_go_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.customers (id bigint primary key, region text); \
+             alter table public.customers replica identity full; \
+             create table public.orders (id bigint primary key, customer_id bigint, a numeric); \
+             alter table public.orders replica identity full; \
+             insert into public.customers values (1, 'eu'), (2, 'us'), (3, 'apac'); \
+             insert into public.orders values (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4)",
+        )
+        .await
+        .expect("create + seed customers and orders");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
+    )
+    .await
+    .expect("create the customer relationship");
+
+    let txn = client.transaction().await.expect("begin to-side write");
+    txn.batch_execute("update public.customers set region = 'us' where id = 3")
+        .await
+        .expect("to-side write");
+    let lsn: PgLsn = txn
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the write's lsn")
+        .get(0);
+    trellis::staging::append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: "public.customers".to_string(),
+            key: "3".to_string(),
+            op: CdcOp::Update,
+            lsn: Some(lsn),
+            old_image: Some(r#"{"id":"3","region":"apac"}"#.to_string()),
+            new_image: Some(r#"{"id":"3","region":"us"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the to-side change's CDC row");
+    txn.commit().await.expect("commit to-side write");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM region_totals FROM orders GROUP BY customer.region SELECT sum(a) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("customer_id", ValueType::Numeric),
+            ("a", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    publication::settle_registrations(&db.pool).await;
+    assert_eq!(status_of(&client, "public.region_totals").await, "live");
+    let covered: bool = client
+        .query_one(
+            "select exists (select 1 from backfill_coverage where table_name = 'public.customers')",
+            &[],
+        )
+        .await
+        .expect("read backfill_coverage")
+        .get(0);
+    assert!(
+        covered,
+        "the build records its coverage of the to-side table"
+    );
+
+    let expected = vec!["eu=3".to_string(), "us=7".to_string()];
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        region_totals(&client).await,
+        expected,
+        "the to-side change the build read is counted once, not again by its drained delta"
+    );
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(region_totals(&client).await, expected);
+}
+
+async fn region_totals(client: &Client) -> Vec<String> {
+    client
+        .query(
+            "select region || '=' || total::text from region_totals order by region",
+            &[],
+        )
+        .await
+        .expect("read region_totals")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
 }
 
 /// The relationship-enriched 1-1 shape, with the change on a relationship's
