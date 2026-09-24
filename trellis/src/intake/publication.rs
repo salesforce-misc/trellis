@@ -1351,13 +1351,16 @@ async fn slot_is_orphaned(client: &impl GenericClient, slot: &str) -> Result<boo
     Ok(!has_progress_row)
 }
 
-/// The slot's observed health, per `pg_replication_slots.wal_status` and
-/// its `confirmed_flush_lsn` against this instance's last confirmed position.
+/// The slot's observed health, per `pg_replication_slots`' invalidation
+/// columns and its `confirmed_flush_lsn` against this instance's last
+/// confirmed position.
+#[derive(Debug, PartialEq, Eq)]
 enum SlotHealth {
     Healthy,
     Missing,
+    /// Postgres invalidated the slot; see [`SlotRow::is_invalidated`].
     Invalidated,
-    /// Present and not `lost`, but its `confirmed_flush_lsn` is past the
+    /// Present and not invalidated, but its `confirmed_flush_lsn` is past the
     /// position this instance last confirmed, or not set yet because another
     /// session is still creating it (issue #406). See [`slot_health`] for why
     /// either means the slot isn't the one this instance was acknowledging.
@@ -1398,19 +1401,65 @@ async fn slot_health(
     slot: &str,
     last_confirmed_lsn: PgLsn,
 ) -> Result<SlotHealth, IntakeError> {
+    // `invalidation_reason` (PG17+) and `conflicting` (PG16+) are read
+    // through `to_jsonb` so one query runs on every supported server: a
+    // column the server's view doesn't have reads as NULL instead of failing
+    // the query.
     let row = client
         .query_opt(
-            "select wal_status, confirmed_flush_lsn from pg_replication_slots \
-             where slot_name = $1 and database = current_database()",
+            "select s.wal_status, s.confirmed_flush_lsn, \
+                    to_jsonb(s) ->> 'invalidation_reason', \
+                    (to_jsonb(s) ->> 'conflicting')::boolean \
+             from pg_replication_slots s \
+             where s.slot_name = $1 and s.database = current_database()",
             &[&slot],
         )
         .await?;
+    Ok(classify_slot(
+        row.map(|row| SlotRow {
+            wal_status: row.get(0),
+            confirmed_flush: row.get(1),
+            invalidation_reason: row.get(2),
+            conflicting: row.get(3),
+        }),
+        last_confirmed_lsn,
+    ))
+}
+
+/// The `pg_replication_slots` columns [`slot_health`] reads for one slot.
+struct SlotRow {
+    wal_status: Option<String>,
+    confirmed_flush: Option<PgLsn>,
+    /// PG17+; NULL on older servers and for a slot that is still valid.
+    invalidation_reason: Option<String>,
+    /// PG16+; NULL on older servers.
+    conflicting: Option<bool>,
+}
+
+impl SlotRow {
+    /// Issue #413: `wal_status = 'lost'` covers only invalidation by the
+    /// retention cap (`max_slot_wal_keep_size`). A logical slot can also be
+    /// invalidated on a standby by a recovery conflict (`rows_removed`,
+    /// `wal_level_insufficient`, PG16+) or, on PG18, by
+    /// `idle_replication_slot_timeout` (`idle_timeout`), and none of those
+    /// set `wal_status` to `lost`. PG17+ names every reason in
+    /// `invalidation_reason`; PG16 has only `conflicting`, which is true for
+    /// exactly the two recovery-conflict reasons. Streaming from any
+    /// invalidated slot fails, so each of these is as unrecoverable as `lost`.
+    fn is_invalidated(&self) -> bool {
+        self.wal_status.as_deref() == Some("lost")
+            || self.invalidation_reason.is_some()
+            || self.conflicting == Some(true)
+    }
+}
+
+/// [`slot_health`]'s decision over the row it read, if any.
+fn classify_slot(row: Option<SlotRow>, last_confirmed_lsn: PgLsn) -> SlotHealth {
     let Some(row) = row else {
-        return Ok(SlotHealth::Missing);
+        return SlotHealth::Missing;
     };
-    let wal_status: Option<String> = row.get(0);
-    if wal_status.as_deref() == Some("lost") {
-        return Ok(SlotHealth::Invalidated);
+    if row.is_invalidated() {
+        return SlotHealth::Invalidated;
     }
     // NULL only for a physical slot (filtered out by the `database` scope) or
     // a logical slot another session is still creating, which Postgres gives
@@ -1418,18 +1467,18 @@ async fn slot_health(
     // acknowledged had one from the moment its creation returned, so a NULL
     // one is a recreate in progress; called healthy, intake could start
     // streaming from it, past the gap, as soon as the creation finished.
-    let confirmed_flush: Option<PgLsn> = row.get(1);
-    Ok(match confirmed_flush {
+    match row.confirmed_flush {
         Some(position) if position <= last_confirmed_lsn => SlotHealth::Healthy,
         _ => SlotHealth::Recreated,
-    })
+    }
 }
 
 /// Checked at [`super::Intake::connect`] whenever `last_confirmed_lsn` shows
 /// this instance has confirmed work against `slot` before: the slot must
-/// still exist, not be marked `lost`, and not have been recreated under the
+/// still exist, not be invalidated, and not have been recreated under the
 /// same name, which shows up as a position past `last_confirmed_lsn` (issue
-/// #406, see [`slot_health`]). Invalidation (retention cap exceeded), loss on
+/// #406, see [`slot_health`]). Invalidation (retention cap exceeded, a
+/// standby's recovery conflict, PG18's idle timeout), loss on
 /// failover (pre-PG17 doesn't preserve slots across a promotion) and a
 /// drop-and-recreate all mean everything between `last_confirmed_lsn` and the
 /// new slot's start position is unrecoverable by streaming — so this errors
@@ -1450,6 +1499,135 @@ pub async fn require_slot_healthy(
                 last_confirmed_lsn: u64::from(last_confirmed_lsn),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_health_tests {
+    use super::*;
+
+    fn last_confirmed() -> PgLsn {
+        PgLsn::from(0x1000)
+    }
+
+    fn valid_slot() -> SlotRow {
+        SlotRow {
+            wal_status: Some("reserved".to_string()),
+            confirmed_flush: Some(PgLsn::from(0x0800)),
+            invalidation_reason: None,
+            conflicting: Some(false),
+        }
+    }
+
+    #[test]
+    fn a_valid_slot_behind_the_last_confirmed_position_is_healthy() {
+        assert_eq!(
+            classify_slot(Some(valid_slot()), last_confirmed()),
+            SlotHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn a_missing_slot_is_missing() {
+        assert_eq!(classify_slot(None, last_confirmed()), SlotHealth::Missing);
+    }
+
+    #[test]
+    fn a_lost_slot_is_invalidated() {
+        let row = SlotRow {
+            wal_status: Some("lost".to_string()),
+            invalidation_reason: Some("wal_removed".to_string()),
+            ..valid_slot()
+        };
+        assert_eq!(
+            classify_slot(Some(row), last_confirmed()),
+            SlotHealth::Invalidated
+        );
+    }
+
+    /// Issue #413: PG17+ names the reason even when `wal_status` isn't
+    /// `lost` — a standby's recovery conflicts, and PG18's idle timeout.
+    #[test]
+    fn every_invalidation_reason_is_invalidated_whatever_wal_status_says() {
+        for reason in ["rows_removed", "wal_level_insufficient", "idle_timeout"] {
+            let row = SlotRow {
+                invalidation_reason: Some(reason.to_string()),
+                ..valid_slot()
+            };
+            assert_eq!(
+                classify_slot(Some(row), last_confirmed()),
+                SlotHealth::Invalidated,
+                "invalidation_reason = {reason}"
+            );
+        }
+    }
+
+    /// Issue #413: PG16 has no `invalidation_reason`, only `conflicting`.
+    #[test]
+    fn a_conflicting_slot_without_a_reason_column_is_invalidated() {
+        let row = SlotRow {
+            conflicting: Some(true),
+            ..valid_slot()
+        };
+        assert_eq!(
+            classify_slot(Some(row), last_confirmed()),
+            SlotHealth::Invalidated
+        );
+    }
+
+    /// Pre-PG16 servers report neither column: `wal_status` alone decides.
+    #[test]
+    fn a_server_without_either_column_still_reads_healthy() {
+        let row = SlotRow {
+            invalidation_reason: None,
+            conflicting: None,
+            ..valid_slot()
+        };
+        assert_eq!(
+            classify_slot(Some(row), last_confirmed()),
+            SlotHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn a_slot_past_the_last_confirmed_position_is_recreated() {
+        let row = SlotRow {
+            confirmed_flush: Some(PgLsn::from(0x2000)),
+            ..valid_slot()
+        };
+        assert_eq!(
+            classify_slot(Some(row), last_confirmed()),
+            SlotHealth::Recreated
+        );
+    }
+
+    /// The query itself, against this box's real server: the `to_jsonb`
+    /// reads must parse and return a valid slot as healthy.
+    #[tokio::test]
+    async fn slot_health_reads_a_real_slot() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        let lsn: PgLsn = client
+            .query_one(
+                "select lsn from pg_create_logical_replication_slot('slot_413', 'pgoutput')",
+                &[],
+            )
+            .await
+            .expect("create a slot")
+            .get(0);
+        let health = slot_health(&**client, "slot_413", lsn).await;
+        client
+            .execute("select pg_drop_replication_slot('slot_413')", &[])
+            .await
+            .expect("drop the slot");
+        assert_eq!(health.expect("slot_health"), SlotHealth::Healthy);
+        assert_eq!(
+            slot_health(&**client, "slot_413", lsn)
+                .await
+                .expect("slot_health"),
+            SlotHealth::Missing
+        );
     }
 }
 

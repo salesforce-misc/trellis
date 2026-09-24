@@ -1,7 +1,8 @@
 //! Issue #310: what the staging worker does when the replication slot it has
 //! confirmed work against is gone — missing (a pre-PG-17 failover, a restore
 //! of the source database from a backup or PITR, a manual drop), invalidated
-//! (`wal_status = 'lost'`, the retention cap), or dropped and recreated under
+//! (`wal_status = 'lost'` for the retention cap, or any other
+//! `invalidation_reason`, issue #413), or dropped and recreated under
 //! the same name before Trellis looked (issue #406; detected by the slot's
 //! position being past the last confirmed one, see
 //! [`super::publication::require_slot_healthy`]).
