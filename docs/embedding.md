@@ -42,9 +42,9 @@ the transform is `live`, then calls `await_converged` with a fresh
 chunked or direct build's go-live catch-up can still be pending
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 
-*Planned (#418, #419):* today `apply` still reads the source while
-registering. An aggregate or relationship-enriched 1-1 transform is built
-completely before `apply` returns, which is slow against a large table.
+*Planned (#419):* an aggregate or relationship-enriched 1-1 transform is still
+built completely before `apply` returns, which is slow against a large table.
+Every other shape registers without reading the source (#418).
 *Planned (#427):* `DROP` still changes the publication from the process that
 applies it, so a process that drops transforms still needs publication
 privileges; the decided design moves that shrink to the staging worker's

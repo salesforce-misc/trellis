@@ -32,9 +32,10 @@ the background, on the staging worker's maintenance loop, through the existing
 marker-discharge machinery (`intake::publication::run_pending_backfills_until`):
 
 1. **Join.** The source gets a `pending_backfill` marker, fenced at the
-   snapshot of the transaction that parks it. If the table isn't in the
-   publication yet, the staging worker's reconcile pass adds it and parks the
-   marker in the same transaction (`reconcile_publication`). The fence has to
+   snapshot of the transaction that parks it. The staging worker's reconcile
+   pass parks it (`reconcile_publication`), adding the table to the
+   publication in the same transaction if it isn't there yet (see
+   [Who parks the marker](#who-parks-the-marker)). The fence has to
    cover every transaction that could have written the table before the join
    committed, since the stream doesn't carry those writes. A fence taken inside
    the `ALTER`'s own transaction falls slightly short of that, so the discharge
@@ -45,13 +46,14 @@ marker-discharge machinery (`intake::publication::run_pending_backfills_until`):
 2. **Wait.** The discharge leaves the marker alone until its fence settles:
    every transaction that was open when it was parked has ended. It then waits
    for intake to stage through the WAL position its read snapshot was taken at.
-3. **Capture and build.** The discharge promotes the table's
-   `waiting_to_backfill` definitions to `backfilling`, picks the capture
-   snapshot, and dispatches each definition's build **by shape**: the direct
-   set-based build ([ADR-0007](0007-direct-set-based-backfill.md)) or chunked
-   work that drain threads execute, whichever the shape has a builder for
-   (resume rebuilds included). Ring enumeration is the `Unsupported` fallback,
-   not a size threshold.
+3. **Capture and build.** The discharge picks the capture snapshot and
+   dispatches each of the table's `waiting_to_backfill` definitions' build
+   **by shape**: the direct set-based build
+   ([ADR-0007](0007-direct-set-based-backfill.md)) or chunked work that drain
+   threads execute, whichever the shape has a builder for (resume rebuilds
+   included). Ring enumeration is the `Unsupported` fallback, not a size
+   threshold. A definition moves to `backfilling` only in the transaction
+   that commits the work driving it.
 4. **Go live.** The definition flips to `live` when its build finishes.
 
 The marker discharge is the only capture path. It handles a table joining the
@@ -64,21 +66,33 @@ through the path and why it's gap-free.
 
 ### Who parks the marker
 
-The join has two cases, split by whether the source needs a publication change:
+Registration parks nothing. The staging worker's reconcile pass
+(`reconcile_publication`) parks every registration's marker, in one of two
+ways, split by whether the source needs a publication change:
 
-- **The source isn't published yet.** Registration parks nothing. The staging
-  worker's next reconcile pass adds the table and parks the marker in one
-  transaction. A marker parked any earlier could discharge before the table
-  joined the stream, and a commit between that read and the join would be
-  neither read nor streamed.
+- **The source isn't published yet.** The pass adds the table and parks the
+  marker in one transaction (the join marker). A marker parked any earlier
+  could discharge before the table joined the stream, and a commit between
+  that read and the join would be neither read nor streamed.
 - **The source needs no publication change.** It is already published (another
   definition reads it), or it is another definition's target, which is never
-  published. Registration parks the marker itself, in the same transaction as
-  the catalog row. That's a catalog write, not a source read, and its fence is
-  registration's own snapshot.
+  published. The pass parks a marker on the source of every
+  `waiting_to_backfill` definition that has none (`park_registration_markers`),
+  in the same transaction as its publication changes. A source the pass hasn't
+  published is left for the pass that publishes it.
 
 Either way a `waiting_to_backfill` definition always has a marker in its future,
 and registration never runs `ALTER PUBLICATION`.
+
+This differs from the split first recorded here, where registration parked the
+marker itself when the source needed no publication change. Registration can't
+tell that case apart: which publication the staging worker serves is that
+worker's own option (`ClientOptions::publication`), not something the catalog
+or a registering process knows, and guessing wrong in either direction is a
+bug (a marker on a table not yet streamed, or no marker ever for an
+already-published table). The staging worker knows exactly which tables it
+has just published. The cost is at most one maintenance pass of latency, and
+the fence is taken later, which only makes it safer.
 
 ### What each build reads
 
@@ -92,7 +106,7 @@ how many snapshots the build reads through:
 
 | Build | Dispatched as | Reads the source | Covers changes during the build by |
 |---|---|---|---|
-| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target also gets a go-live catch-up marker (`mark_definitions_live`): its writes arrive through the seam from drain workers, which don't wait for a seal |
+| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target also gets a go-live catch-up marker (`intake::publication::go_live`): its writes arrive through the seam from drain workers, which don't wait for a seal |
 | **Plain 1-1 chunks** | chunk boundaries enumerated and enqueued as `backfill_chunks`, executed by drain threads | once per chunk, each under its own snapshot | the catch-up marker parked when the last chunk goes live (`complete_direct_backfill`), discharged by this same path |
 | **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job | once per statement | the same go-live catch-up marker, parked by every direct build |
 
@@ -205,6 +219,17 @@ unconfirmed. This is what keeps the join step gap-free.
   This removes `reconcile_publication_after_drop`, stops treating the startup
   `source_tables` copy as a permanent floor, and supersedes
   [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time".
+- **A ring read is one transaction (known limitation).** The ring
+  enumeration stages one `Recompute` row per source key inside the discharge
+  transaction. That's the `Unsupported` fallback's whole build, and it's also
+  every catch-up's read on a table something reads: the go-live catch-up of
+  every chunked or direct build, a resume's rebuild of a shape still built by
+  ring, a `request_backfill`. On a very large table that's one long
+  transaction holding back `xmin`, and a ring write the size of the table.
+  Dispatch by shape keeps it off the initial build of every shape with a
+  builder, but not off the catch-ups. Bounding it (paging the enumeration
+  across transactions, or a catch-up that reads only what changed) is a
+  follow-up under #415.
 - **`backfill_coverage` becomes an optimization at most.** It lets a catch-up
   skip re-reading a table that provably hasn't changed since a build read it. No
   path depends on it for correctness.
@@ -217,14 +242,14 @@ happens, and its role in this design.
 | Path | Where in code | Role in the design |
 |---|---|---|
 | Fresh-install handshake read | was `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | **Retired (#417).** `create_slot_and_park_markers` creates the slot, seeds `replication_progress`, and parks a marker on every configured source table in the same transaction, after slot creation returns. It reads nothing, the same shape slot-loss recovery (`intake::slot_loss`) already has. The discharge skips a table no definition reads (`defs::catalog::table_has_reader`) |
-| Ring enumeration inside registration | `defs::catalog::create_definition_inner`'s `enumerate_and_append`, reached through `create_definition` and `install_definition`'s `Unsupported` fallback | Moves to the discharge |
-| Plain 1-1 chunk enqueue at registration | `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | The discharge enumerates and enqueues the chunks; drain threads still execute them |
+| Ring enumeration inside registration | was `defs::catalog::create_definition_inner`'s `enumerate_and_append`, reached through `create_definition` and `install_definition`'s `Unsupported` fallback | **Done (#418).** The discharge's ring fallback does it (`intake::publication::run_pending_backfills`, dispatch by shape). `create_definition` survives only as a test fixture that stands in for that discharge |
+| Plain 1-1 chunk enqueue at registration | was `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | **Done (#418).** The discharge plans the chunks and enqueues them in its own transaction (`chunk_queue::dispatch_one_to_one`); drain threads still execute them |
 | Synchronous direct build inside registration | `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | The discharge dispatches it as a background job |
-| Registration's defer branch | `install_definition`'s `defer_if_fence_unsettled`, `create_definition_inner`'s `backfill_marker_unsettled` check | Becomes unconditional: registration always defers to the discharge, and the branch goes away |
+| Registration's defer branch | `install_definition`'s `defer_if_fence_unsettled`; was also `create_definition_inner`'s `backfill_marker_unsettled` check | Becomes unconditional: registration always defers to the discharge, and the branch goes away. **Done for every shape but #419's (#418):** only the in-call aggregate and relationship-enriched 1-1 build still asks it |
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` discharges | The one path |
-| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported` |
+| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done for plain 1-1 (#418):** its rebuild is chunked, and a chunk planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). Aggregates and relationship-enriched 1-1 definitions are rebuilt by ring until #419 |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
-| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `mark_definitions_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs |
+| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs |
 | Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call |
 | `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | Separate: a redefinition-side capture that reads the added columns' values in-call |
 | Publication change on `DROP` | `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | Moves to the staging worker: a `DROP` only removes catalog rows, and the worker's reconcile pass shrinks the publication from the catalog. `reconcile_publication_after_drop` is removed, and the startup `source_tables` copy stops being a permanent floor. Supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time" |

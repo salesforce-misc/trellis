@@ -1458,11 +1458,11 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-
-    // `s` starts empty, so def A builds directly and is `live` by now: a
-    // target still `backfilling` can't be made a relationship endpoint
-    // (issue #403). No replica identity is needed on it either, since an
-    // endpoint that is this instance's own target is never published.
+    // `s` starts empty, so def A's discharge takes it `live` at once: a
+    // target not yet `live` can't be made a relationship endpoint (issue
+    // #403). No replica identity is needed on it either, since an endpoint
+    // that is this instance's own target is never published.
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     // The relationship's bare `TO t2.id` must still resolve to def A's
     // `custom.t2` — a plain `search_path` walk alone (what `to_regclass`
@@ -1534,11 +1534,11 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
     )
     .await
     .expect("def A installs with an explicit non-default target schema");
-
-    // `s` starts empty, so def A builds directly and is `live` by now: a
-    // target still `backfilling` can't be made a relationship endpoint
-    // (issue #403). No replica identity is needed on it either, since an
-    // endpoint that is this instance's own target is never published.
+    // `s` starts empty, so def A's discharge takes it `live` at once: a
+    // target not yet `live` can't be made a relationship endpoint (issue
+    // #403). No replica identity is needed on it either, since an endpoint
+    // that is this instance's own target is never published.
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     // The relationship's bare `TO t2.id` must resolve to def A's `custom.t2`
     // (already covered by the test above; needed here as this test's own

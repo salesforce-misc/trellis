@@ -57,13 +57,15 @@ pub struct Definition {
 
 /// A transform's lifecycle status (issue #55), persisted as
 /// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
-/// documents the full state machine this mirrors. [`super::catalog::install_definition`]
-/// is the only writer that transitions a row through more than one variant
-/// today — from [`TransformStatus::Backfilling`] to [`TransformStatus::Live`]
-/// once its (still fully synchronous) backfill completes; every other
-/// creation path persists [`TransformStatus::Live`] directly, since by the
-/// time those rows exist their backfill (ring-enumeration or direct build)
-/// has already been staged/completed.
+/// documents the full state machine this mirrors. Registration
+/// ([`super::catalog::install_definition`]) persists
+/// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
+/// (ADR-0016) moves it on: to [`TransformStatus::Backfilling`] together with
+/// the chunks that build it, then [`TransformStatus::Live`] when the last one
+/// finishes, or straight to `live` for a ring-built definition. Until issue
+/// #419, an aggregate or relationship-enriched 1-1 definition is persisted
+/// `backfilling` by registration itself and flipped `live` once its in-call
+/// build completes.
 ///
 /// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
 /// two triggers of ADR-0014's single "frozen" state: the poison fuse trips

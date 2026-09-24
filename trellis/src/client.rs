@@ -1176,10 +1176,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // A backfill enumeration can sit waiting for intake to catch
                 // up (issue #312), and intake is the first task shutdown
                 // stops. The wait therefore watches the shutdown signal
-                // itself and gives up through its own revert path. Dropping
-                // this future on shutdown instead would strand a definition
-                // it had already promoted to `backfilling` (see
-                // `run_pending_backfills_until`).
+                // itself and gives up by rolling the discharge back, leaving
+                // its definitions `waiting_to_backfill` for the next start
+                // (see `run_pending_backfills_until`).
                 let shutting_down = || *shutdown_rx.borrow();
                 failed = reconcile_source_tables(
                     c,
@@ -2538,6 +2537,10 @@ mod backfill_chunk_claim_tests {
         )
         .await
         .expect("install_definition");
+        // Registration only records it; the discharge plans the chunks.
+        crate::intake::publication::discharge_registrations(&pool)
+            .await
+            .expect("dispatch the build");
         let chunk_count: i64 = raw
             .query_one(
                 "select count(*) from backfill_chunks where definition_id = $1",
@@ -2663,12 +2666,12 @@ mod backfill_shutdown_tests {
     }
 
     /// Issue #312 review: shutting down while a backfill enumeration waits
-    /// for intake must hand its definition back to `waiting_to_backfill`.
-    /// The wait follows the definition's committed promotion to
-    /// `backfilling`, and only `waiting_to_backfill` definitions are ever
-    /// promoted again, so a definition left in `backfilling` would never
-    /// reach `live`. The catch-up timeout here is far longer than the test
-    /// waits for shutdown, so only the shutdown signal can end the wait.
+    /// for intake must leave its definition `waiting_to_backfill` with its
+    /// marker intact, since only `waiting_to_backfill` definitions are ever
+    /// dispatched again. The catch-up timeout here is far longer than the
+    /// test waits for shutdown, so only the shutdown signal can end the wait.
+    /// An aggregate, since it's rebuilt by the ring (and so waits for intake)
+    /// until issue #419.
     #[tokio::test]
     async fn shutdown_during_a_backfill_wait_returns_the_definition_to_waiting() {
         let cluster = testkit::TestCluster::start();
@@ -2678,6 +2681,7 @@ mod backfill_shutdown_tests {
             .expect("connect");
         raw.batch_execute(
             "create table public.s (id bigint primary key, a numeric); \
+             alter table public.s replica identity full; \
              insert into public.s (id, a) select g, g from generate_series(1, 5) g; \
              create publication test_pub;",
         )
@@ -2697,10 +2701,13 @@ mod backfill_shutdown_tests {
             &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
         )
         .expect("build a same-crate pool");
-        let columns = std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
+        let columns = std::collections::HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM t FROM s SELECT a + a AS x",
+            "TRANSFORM t FROM s GROUP BY a SELECT sum(id) AS total",
             &columns,
             "public",
         )
@@ -2726,15 +2733,30 @@ mod backfill_shutdown_tests {
         };
         let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
 
-        // The first pass promotes the definition, then waits on intake.
+        // The first pass declares the enumeration cursor over `public.s`,
+        // then waits on intake: an event (its lock on the table), not a
+        // convergence budget. The bound only turns a hang into a failure.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while status_of(&raw).await != TransformStatus::Backfilling {
+        loop {
+            let enumerating: bool = raw
+                .query_one(
+                    "select exists(select 1 from pg_locks \
+                     where relation = 'public.s'::regclass and pid <> pg_backend_pid())",
+                    &[],
+                )
+                .await
+                .expect("read pg_locks")
+                .get(0);
+            if enumerating {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
                 "the first maintenance pass never started the enumeration"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(status_of(&raw).await, TransformStatus::WaitingToBackfill);
 
         shutdown_tx.send(true).expect("signal shutdown");
         tokio::time::timeout(Duration::from_secs(30), task)
@@ -2745,7 +2767,7 @@ mod backfill_shutdown_tests {
         assert_eq!(
             status_of(&raw).await,
             TransformStatus::WaitingToBackfill,
-            "a shutdown mid-wait must not strand the definition in backfilling"
+            "a shutdown mid-wait leaves the definition for the next pass"
         );
         let markers: i64 = raw
             .query_one("select count(*) from pending_backfill", &[])

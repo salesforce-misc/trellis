@@ -68,7 +68,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error_code::{self, ErrorCode};
-use crate::pool::{Client, Pool, quote_ident};
+use crate::pool::{Pool, quote_ident};
 use crate::staging::target_mutations::TargetMutations;
 use tokio_postgres::GenericClient;
 
@@ -536,7 +536,7 @@ async fn backfill_one_to_one(
 
     let source = ddl::qualified_source_table(source_table);
     let client = pool.get().await?;
-    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
         write_one_to_one_range(
             &**client,
             def,
@@ -600,7 +600,7 @@ pub(crate) async fn backfill_altered_columns(
     // through the target-mutation seam in the chunk's own transaction.
     let qualified_target = crate::intake::publication::qualify(target_schema, &def.target)
         .map_err(|err| BackfillError::Unsupported(err.to_string()))?;
-    for (lo, hi) in discover_pk_ranges(&client, &source, &pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, &pk).await? {
         let txn = client.transaction().await?;
         let mut mutations = TargetMutations::new();
         let prior_image_expr = mutations.image_sql(&txn, &qualified_target, "t").await?;
@@ -830,20 +830,25 @@ async fn write_one_to_one_range(
 /// amendment): fails fast with [`BackfillError::Unsupported`] exactly as
 /// `backfill_one_to_one` would (same [`substitute_all_fields`] call), then
 /// returns the same `(lo, hi]` PK-range boundaries its loop would have
-/// walked — without writing a single row of the target. `defs::catalog::install_definition`
-/// calls this instead of `backfill_definition` for a plain (non-relationship)
-/// 1-1 definition, persisting the boundaries as durable `backfill_chunks`
-/// work items rather than executing them in-call.
+/// walked — without writing a single row of the target. The backfill
+/// discharge (`intake::publication::run_pending_backfills`, ADR-0016) calls
+/// this for a plain (non-relationship) 1-1 definition once its capture point
+/// has passed, and persists the boundaries as durable `backfill_chunks` work
+/// items that drain threads execute.
+///
+/// Reads only the source's primary-key index, on `client` (the discharge's
+/// own connection, outside its transaction). A key committed above the last
+/// boundary after this reads is left to the go-live catch-up the last chunk
+/// parks (`catalog::complete_direct_backfill`).
 pub(crate) async fn plan_one_to_one_chunks(
-    pool: &Pool,
+    client: &impl GenericClient,
     def: &TransformDef,
     source_table: &str,
 ) -> Result<Vec<(Option<String>, String)>, BackfillError> {
     let _ = substitute_all_fields(def)?;
-    let pk = source_primary_key(pool, source_table).await?;
+    let pk = ddl::source_primary_key_in_txn(client, source_table).await?;
     let source = ddl::qualified_source_table(source_table);
-    let client = pool.get().await?;
-    let ranges = discover_pk_ranges(&client, &source, &pk).await?;
+    let ranges = discover_pk_ranges(client, &source, &pk).await?;
     // `backfill_chunks.lo`/`.hi` (V20__backfill_chunks.sql) are each a single
     // `text` column — issue #121 reuses this crate's existing composite-key
     // identity text ([`ddl::join_pk_key`], the same encoding
@@ -926,7 +931,7 @@ pub(crate) async fn execute_one_to_one_chunk(
 /// see [`backfill_one_to_one`]'s doc comment for the off-by-one this guards
 /// against. `source` is the already-quoted source table identifier.
 async fn discover_pk_ranges(
-    client: &Client,
+    client: &impl GenericClient,
     source: &str,
     pk: &[PrimaryKeyColumn],
 ) -> Result<Vec<(Option<Vec<String>>, Vec<String>)>, BackfillError> {
@@ -2022,7 +2027,7 @@ async fn backfill_relationship_one_to_one(
         .collect::<Vec<_>>()
         .join(" ");
 
-    for (lo, hi) in discover_pk_ranges(&client, &source, pk).await? {
+    for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
         let where_clause = pk_range_where(&pk_qualified, pk, &lo);
         let insert_sql = format!(
             "insert into {target} ({insert_cols}) \

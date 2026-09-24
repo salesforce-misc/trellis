@@ -62,6 +62,11 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "composite_nullable_group_key_backfill_test_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");

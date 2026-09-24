@@ -737,8 +737,12 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
         .unwrap_or_else(|e| panic!("install {target}: {e}"));
     }
     // A bare to-one path isn't a shape the direct build renders, so the
-    // definition falls back to the ring's enumeration of its existing rows
-    // (`install_definition`'s `Unsupported` arm); drain it.
+    // definition falls back to the ring's enumeration of its existing rows,
+    // which the backfill discharge stages (`install_definition`'s
+    // `Unsupported` arm, ADR-0016); run it, then drain.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the registration");
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
         author_names(&client, "shop_feed").await,

@@ -152,6 +152,11 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 /// running `application_threads` drain worker (copied from
 /// `defs_install_definition.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "typed_literal_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");

@@ -85,10 +85,23 @@
 //!
 //! # Only the definitions this marker rebuilds
 //!
-//! The caller passes exactly the definitions the discharge just promoted out
-//! of `waiting_to_backfill` (a resumed definition, or a deferred new one whose
-//! target is still empty). A `live` sibling on the same source is not
-//! rebuilt, and its target is none of this pass's business.
+//! The caller passes exactly the `waiting_to_backfill` definitions the
+//! discharge is dispatching (a resumed definition, or a new one whose target
+//! is still empty). A `live` sibling on the same source is not rebuilt, and
+//! its target is none of this pass's business.
+//!
+//! ## A chunked rebuild (issue #418)
+//!
+//! Everything above assumes the ring rebuild, which goes `live` in the
+//! discharge's own transaction. A plain 1-1 definition is rebuilt by
+//! `backfill_chunks` instead (ADR-0016's dispatch by shape), which drain
+//! threads run after this pass commits, and it stays `backfilling`, so its
+//! CDC is skipped, until the last chunk finishes. A source row deleted after
+//! this anti-join ran is then not removed by anything: its chunk either
+//! copied it before the delete or never saw it, its CDC delete is skipped,
+//! and the go-live catch-up only enumerates keys that still exist. A fresh
+//! chunked build has the same window for a row deleted after its chunk
+//! copied it. Issue #436 closes the race on the new path.
 //!
 //! # Keeping the anti-join hashable
 //!
@@ -139,10 +152,10 @@ struct Match {
     joins: String,
 }
 
-/// Deletes, from each target of `ids` that is still `backfilling`, every row
-/// no row of `source_table` backs any more, and reports each deleted key
-/// through the target-mutation seam in `txn`. See the module doc for why this
-/// must run before the discharge's enumeration is declared.
+/// Deletes, from each target of `ids` that is still `waiting_to_backfill`,
+/// every row no row of `source_table` backs any more, and reports each
+/// deleted key through the target-mutation seam in `txn`. See the module doc
+/// for why this must run before the discharge's enumeration is declared.
 pub(super) async fn delete_orphaned_target_rows(
     txn: &Transaction<'_>,
     source_table: &str,
@@ -151,14 +164,14 @@ pub(super) async fn delete_orphaned_target_rows(
     if ids.is_empty() {
         return Ok(());
     }
-    // Still `backfilling`: a pause that landed since the promotion (#331)
-    // leaves the target as the pause found it, and its own resume comes
-    // back here.
+    // Still `waiting_to_backfill`: a pause that landed since the discharge
+    // read these (#331) leaves the target as the pause found it, and its own
+    // resume comes back here.
     let defs = txn
         .query(
             "select definition_text, target_table from transform_definitions \
              where id = any($1) and status = $2 order by id",
-            &[&ids, &TransformStatus::Backfilling.as_str()],
+            &[&ids, &TransformStatus::WaitingToBackfill.as_str()],
         )
         .await?;
     let source_ident = ddl::qualified_source_table(source_table);

@@ -54,6 +54,11 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// `defs_deleted_oneone_target_reduces_chained_aggregate.rs`'s helper of the
 /// same name.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "oneone_chained_off_null_group_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");

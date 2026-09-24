@@ -1,17 +1,18 @@
 //! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
 //! the front door that creates a definition's target table once, then either
-//! builds it directly via the fast set-based backfill
-//! (`backfill::backfill_definition`) or falls back to the ring-based
-//! `create_definition` when the definition's shape is `Unsupported` by the
-//! direct build.
+//! records it for the backfill discharge (ADR-0016, #418: a plain 1-1
+//! definition's chunks, or the ring enumeration for a shape the direct build
+//! can't render) or, for an aggregate or relationship-enriched 1-1 definition,
+//! still builds it in-call via the fast set-based backfill
+//! (`backfill::backfill_definition`) until issue #419.
 //!
-//! Each branch leaves a distinct, checkable signature in the ring: the fast
-//! path persists via `create_definition_without_backfill`, which stages no
-//! enumeration `Recompute` rows, while the ring fallback's `create_definition`
-//! enumerates every existing source row into the active segment. Both tests
-//! assert on that signature directly, rather than only on the end-to-end
-//! target contents, to confirm each branch actually ran the code path it
-//! claims to.
+//! Each branch leaves a distinct, checkable signature in the ring: a direct or
+//! chunked build stages no enumeration `Recompute` rows, while the ring
+//! fallback enumerates every existing source row into the active segment.
+//! Tests assert on that signature directly, rather than only on the
+//! end-to-end target contents, to confirm each branch actually ran the code
+//! path it claims to. `discharge_registrations` stands in for the staging
+//! worker's discharge.
 //!
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
 //! mirrors `apply_relationships.rs`/`defs_relationship_frontdoor.rs`; see
@@ -43,6 +44,11 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
 /// means the test itself is broken, not something to retry past.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "install_def_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -310,8 +316,12 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
-    assert_eq!(def.status, TransformStatus::Backfilling);
+    .expect("install_definition records the definition and returns");
+    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    // ADR-0016 (#418): the discharge plans and enqueues the chunks.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
 
     let chunk_count: i64 = client
         .query_one(
@@ -378,8 +388,8 @@ async fn install_definition_chunks_a_composite_key_boundary_inside_a_group_into_
 /// is unmistakable in the target's contents, not just in a persisted string.
 ///
 /// Drives the definition all the way through the fast (non-relationship 1-1)
-/// path's durable chunk queue (`install_plain_one_to_one` ->
-/// `chunk_queue::enqueue_one_to_one` -> `backfill::plan_one_to_one_chunks`,
+/// path's durable chunk queue (the backfill discharge ->
+/// `backfill::plan_one_to_one_chunks` -> `chunk_queue::dispatch_one_to_one`,
 /// claimed and executed by [`drain_backfill_chunks`] via
 /// `backfill::execute_one_to_one_chunk`) — the read-back leg that
 /// reconstructs a [`trellis::defs::model::Definition`] fresh via
@@ -569,15 +579,14 @@ async fn install_definition_fast_path_ends_up_live() {
     .await
     .expect("install_definition via the fast path");
 
-    // docs/decisions/0007's amendment: `install_definition` now returns once
-    // the plain 1-1 direct build's chunk work is enumerated/persisted, not
-    // once it's fully built — so the definition it hands back (and the
-    // persisted row) must still be `Backfilling` right here, before any
-    // drain worker has claimed a single chunk.
+    // ADR-0016 (#418): `install_definition` returns once the definition is
+    // recorded, before its build is even dispatched — so the definition it
+    // hands back (and the persisted row) must still be `WaitingToBackfill`
+    // right here.
     assert_eq!(
         def.status,
-        TransformStatus::Backfilling,
-        "install_definition must return before the backgrounded chunk work completes"
+        TransformStatus::WaitingToBackfill,
+        "install_definition must return before the build is dispatched"
     );
     let rows = client
         .query(
@@ -595,8 +604,8 @@ async fn install_definition_fast_path_ends_up_live() {
     );
     let persisted_status: String = rows[0].get(0);
     assert_eq!(
-        persisted_status, "backfilling",
-        "the persisted row sits at backfilling until a drain worker finishes its chunks"
+        persisted_status, "waiting_to_backfill",
+        "the persisted row waits for the discharge to dispatch its chunks"
     );
 
     // Driving the chunk queue to completion (the `application_threads` drain
@@ -664,9 +673,12 @@ async fn install_definition_ring_fallback_ends_up_live() {
 
     assert_eq!(
         def.status,
-        TransformStatus::Live,
-        "the ring-fallback path also persists Live, not Backfilling"
+        TransformStatus::WaitingToBackfill,
+        "the ring-fallback path waits for the discharge too (ADR-0016, #418)"
     );
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge enumerates the source and takes it live");
 
     let rows = client
         .query(
@@ -1095,11 +1107,14 @@ async fn install_definition_falls_back_to_ring_for_relationship_enriched_definit
     )
     .await
     .expect("install_definition falls back to the ring path for a relationship-enriched shape");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge enumerates the source");
 
     // The ring fallback enumerates every existing source row into the active
     // segment — the opposite signal from the fast-path sibling test above —
-    // and the target starts empty, since `create_definition` never builds
-    // rows synchronously.
+    // and the target starts empty, since the ring build only stages
+    // `Recompute` rows.
     assert_eq!(
         staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.articles")).await,
         3,
@@ -1436,7 +1451,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 /// Plain (non-relationship) 1-1 repro: exercises `resolve_source_for_install`
 /// specifically, since a plain 1-1 definition's DDL step
 /// (`ddl::source_primary_key(pool, &qualified_source)`, run directly inside
-/// `install_definition` before it ever dispatches to `install_plain_one_to_one`)
+/// `install_definition` before it registers the definition for the discharge)
 /// is the very first place this gap could fail — before `plan_direct_backfill_coverage`
 /// even runs (that function only runs for the relationship-enriched/aggregate
 /// branch, see the sibling test below).
@@ -1516,8 +1531,8 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
 
 /// Relationship-enriched-1-1 repro: exercises `plan_direct_backfill_coverage`'s
 /// own per-table resolution specifically. A relationship-enriched 1-1
-/// definition never takes the plain-1-1 short-circuit
-/// (`install_plain_one_to_one`) — `backfill::uses_relationships` routes it
+/// definition never takes the plain-1-1 short-circuit (registering for the
+/// discharge) — `backfill::uses_relationships` routes it
 /// through `plan_direct_backfill_coverage` instead, same as an Aggregate
 /// would, but without also exercising `create_definition_inner`'s separate
 /// `assert_replica_identity_supports_aggregate` check (irrelevant to a
@@ -1599,8 +1614,12 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
 
     // This shape is `Unsupported` by the direct build (see this test's own
     // doc comment), so `install_definition` falls back to the ring — the
-    // target starts empty and only converges once the ring is drained,
-    // exactly like `install_definition_falls_back_to_ring_for_relationship_enriched_definition`.
+    // target starts empty and only converges once the discharge has
+    // enumerated the source and the ring is drained, exactly like
+    // `install_definition_falls_back_to_ring_for_relationship_enriched_definition`.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge enumerates the source");
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let row_count: i64 = client
@@ -1611,5 +1630,100 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     assert_eq!(
         row_count, 50,
         "u must be built from custom.t's 50 rows, each enriched via tagrel"
+    );
+}
+
+/// ADR-0016 (#418): registration reads no source rows. It succeeds while
+/// another session holds the source `ACCESS EXCLUSIVE` (which blocks every
+/// read of it) — for a plain 1-1 definition, and for a shape the direct build
+/// can't render, whose ring fallback used to enumerate the source inside
+/// registration — and both go live once the lock is released and the
+/// discharge runs. The timeout only turns a registration stuck on the lock
+/// into a failure instead of a hang.
+#[tokio::test]
+async fn registration_reads_no_source_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 50) g",
+        )
+        .await
+        .expect("seed source");
+
+    let locker = connect_raw(db.dsn()).await;
+    locker
+        .batch_execute("begin; lock table s in access exclusive mode")
+        .await
+        .expect("lock the source against reads");
+
+    let register = |text: String| {
+        let pool = db.pool.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                install_definition(&pool, &text, &numeric(&["a"]), "public"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
+            .unwrap_or_else(|e| panic!("register {text:?}: {e}"))
+        }
+    };
+    let plain = register("TRANSFORM t FROM s SELECT a + a AS x".to_string()).await;
+    assert_eq!(plain.status, TransformStatus::WaitingToBackfill);
+    // A doubling alias chain (`f<k> = f<k-1> + f<k-1>`) whose inlined form
+    // outgrows the direct build's substitution budget is `Unsupported`, so
+    // it falls back to the ring.
+    let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
+        .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
+        .collect();
+    let ring = register(format!("TRANSFORM u FROM s SELECT {}", chain.join(", "))).await;
+    assert_eq!(ring.status, TransformStatus::WaitingToBackfill);
+
+    locker
+        .batch_execute("commit")
+        .await
+        .expect("release the lock");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the registrations");
+    let ring_rows: i64 = client
+        .query_one(
+            &format!("select count(*) from {}", active_seg_table(&client).await),
+            &[],
+        )
+        .await
+        .expect("count staged ring rows")
+        .get(0);
+    assert_eq!(
+        ring_rows, 50,
+        "only the ring fallback enumerates the source"
+    );
+    drain_backfill_chunks(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let statuses: Vec<String> = client
+        .query("select status from transform_definitions order by id", &[])
+        .await
+        .expect("read statuses")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(statuses, ["live", "live"]);
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s \
+             left join t on t.id = s.id left join u on u.id = s.id \
+             where t.x is distinct from s.a + s.a or u.f17 is distinct from s.a * 262144",
+            &[],
+        )
+        .await
+        .expect("compare the targets to the source")
+        .get(0);
+    assert_eq!(
+        mismatches, 0,
+        "both targets are built from every source row"
     );
 }

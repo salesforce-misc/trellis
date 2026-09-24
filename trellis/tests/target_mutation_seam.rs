@@ -198,7 +198,8 @@ async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
 
 /// A target's initial build writes it outside the seam, so a definition may
 /// only chain off it once it is live. A plain 1-1 target builds through the
-/// chunk queue, and with no drain worker running it stays `backfilling`.
+/// chunk queue its discharge dispatches, and with no drain worker running it
+/// stays `backfilling`.
 #[tokio::test]
 async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused() {
     let (_cluster, db, raw) = setup().await;
@@ -216,7 +217,10 @@ async fn defining_a_transform_off_a_target_that_is_still_backfilling_is_refused(
     )
     .await
     .expect("install h1");
-    assert_eq!(h1.status.as_str(), "backfilling");
+    assert_eq!(h1.status.as_str(), "waiting_to_backfill");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch h1's chunks");
 
     let err = install_definition(
         &db.pool,

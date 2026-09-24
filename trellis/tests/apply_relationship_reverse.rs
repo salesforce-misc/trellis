@@ -3255,6 +3255,9 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
     )
     .await
     .expect("a reader through the relationship");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge enumerates the source (ADR-0016)");
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
     async fn codes(client: &Client, projection_table: &str) -> Vec<i32> {

@@ -145,6 +145,11 @@ async fn converged_fixture(
     .await
     .expect("connect");
     trellis.apply(transform).await.expect("define");
+    // No staging worker runs here: stand in for its discharge, which takes
+    // a definition over an empty source straight to `live`.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
     let status: String = raw
         .query_one(
             "select status from transform_definitions \

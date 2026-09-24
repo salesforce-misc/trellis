@@ -248,6 +248,9 @@ async fn to_one_enrichment_nulls_out_when_the_related_row_appears_then_disappear
     install_definition(&db.pool, ARTICLE_CAT, &source_columns, "public")
         .await
         .expect("install the to-one enrichment definition through the front door");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge enumerates the source (ADR-0016)");
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Initial derivation: no matching category -> NULL enrichment, but the

@@ -53,6 +53,7 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h1");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     // No `REPLICA IDENTITY FULL` on `h1`: an aggregate over a target
     // never reads its CDC, so it has no old-image requirement (#315).
     install_definition(

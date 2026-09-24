@@ -567,9 +567,10 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
 }
 
 /// Issue #56's backfill status transition events (#55's lifecycle):
-/// `waiting_to_backfill` -> `backfilling` -> `live`, both emitted from
-/// `intake::publication::run_pending_backfills`'s single discharge pass —
-/// mirrors `transform_status_lifecycle.rs`'s
+/// `waiting_to_backfill` -> `backfilling` from
+/// `intake::publication::run_pending_backfills`'s discharge dispatching a
+/// plain 1-1 definition's chunks (ADR-0016), then `backfilling` -> `live`
+/// from its last chunk finishing — mirrors `transform_status_lifecycle.rs`'s
 /// `a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`'s straggler
 /// setup, trimmed to just the settle-and-discharge half this test cares
 /// about (that file already covers the full status/data correctness story;
@@ -620,6 +621,7 @@ async fn backfill_status_transitions_emit_info_events() {
     )
     .await
     .expect("run_pending_backfills (settled)");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     let events = captured.events();
     let to_backfilling = events.iter().find(|e| {
@@ -648,5 +650,9 @@ async fn backfill_status_transitions_emit_info_events() {
     assert!(
         to_live.is_some(),
         "expected an info event for backfilling -> live: {events:#?}"
+    );
+    assert_eq!(
+        to_live.unwrap().fields.get("from").map(String::as_str),
+        Some("backfilling")
     );
 }

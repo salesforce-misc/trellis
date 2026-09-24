@@ -21,6 +21,35 @@ use trellis::intake::publication;
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
+/// `install_definition`, then the discharge that dispatches a plain 1-1
+/// definition's chunked build (ADR-0016, #418): this file tests the chunk
+/// queue, which only fills once the discharge has run. Returns the definition
+/// with its status as of then.
+async fn install_and_dispatch(
+    pool: &trellis::Pool,
+    text: &str,
+    cols: &std::collections::HashMap<String, ValueType>,
+    target_schema: &str,
+) -> Result<trellis::defs::Definition, trellis::defs::CatalogError> {
+    let mut def = install_definition(pool, text, cols, target_schema).await?;
+    publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch the build");
+    let status: String = pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select status from transform_definitions where id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("read status")
+        .get(0);
+    def.status = TransformStatus::from_persisted(&status).expect("a known status");
+    Ok(def)
+}
+
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     tokio::spawn(async move {
@@ -132,14 +161,14 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         .expect("seed source");
 
     let cols = numeric(&["a"]);
-    let def = install_definition(
+    let def = install_and_dispatch(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
         &cols,
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install and dispatch the chunk work");
     assert_eq!(
         def.status,
         TransformStatus::Backfilling,
@@ -247,14 +276,14 @@ async fn a_chunk_of_an_explicitly_schema_qualified_target_is_written_into_that_s
         .await
         .expect("seed source and create the custom schema");
 
-    let def = install_definition(
+    let def = install_and_dispatch(
         &db.pool,
         "TRANSFORM custom.t FROM s SELECT a + a AS x",
         &numeric(&["a"]),
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install and dispatch the chunk work");
     assert_eq!(def.status, TransformStatus::Backfilling);
 
     let claimed = chunk_queue::claim_chunks(&client, "worker", 10)
@@ -328,14 +357,14 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
         .expect("seed widgets with a composite primary key");
 
     let cols = numeric(&["a", "b"]);
-    let def = install_definition(
+    let def = install_and_dispatch(
         &db.pool,
         "TRANSFORM widgets_calc FROM widgets SELECT a + b AS total",
         &cols,
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install and dispatch the chunk work");
     assert_eq!(
         def.status,
         TransformStatus::Backfilling,
@@ -443,14 +472,14 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
         .expect("seed source");
 
     let cols = numeric(&["a"]);
-    install_definition(
+    install_and_dispatch(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
         &cols,
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install and dispatch the chunk work");
 
     // A statement-level trigger that sleeps once per `insert` statement,
     // simulating a chunk write slow enough (~600ms) to outlast several
@@ -559,7 +588,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
         .expect("seed source");
 
     let cols = numeric(&["a"]);
-    install_definition(
+    install_and_dispatch(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS x",
         &cols,
@@ -642,7 +671,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
 
     // Definition A: install and fully drain its chunk work now, so it's
     // `live` before the CDC delta below arrives.
-    install_definition(
+    install_and_dispatch(
         &db.pool,
         "TRANSFORM a_calc FROM s SELECT a AS x",
         &cols,
@@ -681,7 +710,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     // *definition* is still non-`live`, and the exclusion is definition-
     // scoped (docs/decisions/0007's amendment: parked per-definition, not
     // per-chunk/per-row).
-    install_definition(
+    install_and_dispatch(
         &db.pool,
         "TRANSFORM b_calc FROM s SELECT a AS y",
         &cols,
@@ -871,7 +900,7 @@ async fn alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_bac
         .await
         .expect("seed source");
 
-    install_definition(
+    install_and_dispatch(
         &db.pool,
         "TRANSFORM a_calc FROM s SELECT a AS x",
         &numeric(&["a"]),

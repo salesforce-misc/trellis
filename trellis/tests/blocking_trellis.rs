@@ -79,22 +79,19 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 /// (b): `BlockingTrellis::apply`ing a `TRANSFORM` statement must return before
 /// a plain (non-relationship) 1-1 transform's backfill actually runs — per
 /// `docs/decisions/0008-public-api-design.md`'s
-/// decision 1 and the `app` module's doc comment, registering a definition only enumerates
-/// and persists the backfill's chunk work; some running drain
-/// (`application_threads`) worker elsewhere in the fleet is what actually
-/// executes it (`trellis/tests/defs_backfill_chunk_queue.rs` exercises the
-/// same "no worker running" shape directly against `install_definition`).
+/// decision 1 and ADR-0016, registering a definition only records it; a
+/// running staging worker dispatches its build and some running drain
+/// (`application_threads`) worker elsewhere in the fleet executes it.
 ///
 /// This `BlockingTrellis` connects with the default options — no staging, no
 /// drain threads — and no other client of any kind runs against this
 /// isolated test database. That makes the check below deterministic rather
-/// than a timing-dependent race: with nothing anywhere ever claiming the
-/// enqueued chunk, `status()` immediately after `apply()` returns can only
-/// read back `Backfilling`. Were registration still fully synchronous (as it
-/// was before this branch's backgrounding work), the target would already
-/// be fully built in-call and `status()` would read back `Live` instead,
-/// with no worker involved at all — so this test does discriminate the
-/// behavior it's meant to prove.
+/// than a timing-dependent race: with nothing anywhere dispatching the
+/// build, `status()` immediately after `apply()` returns can only read back
+/// `WaitingToBackfill`. Were registration still synchronous, the target
+/// would already be built in-call and `status()` would read back `Live`
+/// instead, with no worker involved at all — so this test does discriminate
+/// the behavior it's meant to prove.
 #[test]
 fn define_returns_before_backfill_completes() {
     let cluster = TestCluster::start();
@@ -136,9 +133,9 @@ fn define_returns_before_backfill_completes() {
         .expect("definition must be registered");
     assert_eq!(
         status,
-        TransformStatus::Backfilling,
-        "apply() must return before any drain worker (of which there are none here) could \
-         possibly have built the target"
+        TransformStatus::WaitingToBackfill,
+        "apply() must return before any staging worker (of which there are none here) could \
+         possibly have dispatched the build (ADR-0016)"
     );
 
     trellis.shutdown().expect("shutdown (sync)");

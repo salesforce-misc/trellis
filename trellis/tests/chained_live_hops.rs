@@ -51,10 +51,9 @@ fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-/// Installs each `TRANSFORM` in order against `columns`. Every table here is
-/// still empty, so a 1-1 target has no chunks to build and is live as soon
-/// as it is installed; that is what lets the next hop chain off it at all
-/// (`reject_non_live_upstream`, issue #315).
+/// Installs each `TRANSFORM` in order against `columns`, taking each live
+/// (the discharge, then its chunks) before the next: that is what lets the
+/// next hop chain off it at all (`reject_non_live_upstream`, issue #315).
 async fn install_chain(
     db: &testkit::TestDatabase,
     texts: &[&str],
@@ -64,6 +63,7 @@ async fn install_chain(
         install_definition(&db.pool, text, columns, "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
+        trellis::intake::publication::settle_registrations(&db.pool).await;
     }
 }
 

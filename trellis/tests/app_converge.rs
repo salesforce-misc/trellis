@@ -160,7 +160,12 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
     trellis
         .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
         .await
-        .expect("define over an empty source, so it goes live without a backfill");
+        .expect("define over an empty source");
+    // Stand in for the staging worker's discharge (ADR-0016), which takes a
+    // definition over an empty source straight to `live`.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the build");
 
     raw.execute("insert into widgets (id, price) values (1, 9)", &[])
         .await

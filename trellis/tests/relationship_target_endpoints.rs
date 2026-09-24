@@ -76,6 +76,7 @@ async fn a_target_endpoint_keeps_its_replica_identity_and_stays_unpublished() {
     )
     .await
     .expect("install h1");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     assert_eq!(replica_identity(&raw, "public.h1").await, "d");
 
     let err = create_relationship(&db.pool, "RELATIONSHIP noted FROM notes.oid TO h1.id")
@@ -132,6 +133,7 @@ async fn a_target_that_becomes_a_to_many_from_side_reaches_its_aggregate_through
         install_definition(&db.pool, text, &numeric_columns(&["id", "val"]), "public")
             .await
             .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
+        trellis::intake::publication::settle_registrations(&db.pool).await;
     }
     create_relationship(&db.pool, "RELATIONSHIP cats FROM h1.id TO categories.hid")
         .await
@@ -216,10 +218,10 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
 }
 
 /// A target still `backfilling` can't become an endpoint yet: its initial
-/// build (here the chunk queue, with no drain worker to run it) writes it
-/// outside the seam, which is now the endpoint's only feed, so the
-/// relationship would never hear about the rows the rest of the build
-/// writes. The same rule a transform chaining off the target follows.
+/// build (here the chunk queue the discharge dispatched, with no drain worker
+/// to run it) writes it outside the seam, which is now the endpoint's only
+/// feed, so the relationship would never hear about the rows the rest of the
+/// build writes. The same rule a transform chaining off the target follows.
 #[tokio::test]
 async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
     let (_cluster, db, raw) = pgoutput_intake::database().await;
@@ -239,7 +241,10 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
     )
     .await
     .expect("install h1");
-    assert_eq!(h1.status.as_str(), "backfilling");
+    assert_eq!(h1.status.as_str(), "waiting_to_backfill");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch h1's chunks");
 
     match create_relationship(&db.pool, "RELATIONSHIP rollup FROM reports.oid TO h1.id").await {
         Err(CatalogError::TransformNotLive { transform, status }) => {

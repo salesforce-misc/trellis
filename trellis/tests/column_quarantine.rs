@@ -242,6 +242,19 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]
     );
 }
 
+/// The persisted status of the transform whose bare target name is `target`.
+async fn status_named(client: &Client, target: &str) -> String {
+    client
+        .query_one(
+            "select status from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read status")
+        .get(0)
+}
+
 async fn column_status_row(
     client: &Client,
     transform: &str,
@@ -1035,10 +1048,18 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install_definition records the definition and returns");
     assert_eq!(
         def.status,
-        TransformStatus::Backfilling,
+        TransformStatus::WaitingToBackfill,
+        "registration only records the definition (ADR-0016)"
+    );
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
+    assert_eq!(
+        status_named(&client, def.def.target.as_str()).await,
+        "backfilling",
         "a plain 1-1 definition sits at backfilling until its chunk is claimed and finished"
     );
 
@@ -1690,10 +1711,9 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
         .expect("seed source table");
 
     let cols = numeric_columns(&["a"]);
-    // `install_definition`'s plain-1-1 path (`defs::catalog::install_plain_one_to_one`)
-    // persists the definition as `Backfilling` and enqueues its build as a
-    // `backfill_chunks` row *before* returning — nothing in this test ever
-    // claims/runs/finishes that chunk, so the definition is genuinely,
+    // A plain 1-1 definition's discharge persists it as `Backfilling` and
+    // enqueues its build as a `backfill_chunks` row — nothing in this test
+    // ever claims/runs/finishes that chunk, so the definition is genuinely,
     // deterministically stuck in `Backfilling` for the rest of the test.
     // Same "nothing is watching the queue" determinism
     // `trellis/tests/defs_backfill_chunk_queue.rs`'s
@@ -1707,10 +1727,14 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install_definition records the definition and returns");
+    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     assert_eq!(
-        def.status,
-        TransformStatus::Backfilling,
+        status_named(&client, def.def.target.as_str()).await,
+        "backfilling",
         "nothing drains the chunk queue in this test, so the definition must still be \
          backfilling"
     );
@@ -1843,10 +1867,14 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install_definition records the definition and returns");
+    assert_eq!(summary_def.status, TransformStatus::WaitingToBackfill);
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     assert_eq!(
-        summary_def.status,
-        TransformStatus::Backfilling,
+        status_named(&client, summary_def.def.target.as_str()).await,
+        "backfilling",
         "nothing drains the chunk queue in this test, so order_summaries must still be \
          backfilling"
     );

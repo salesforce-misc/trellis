@@ -176,12 +176,15 @@ quarantine are two arcs of one lifecycle:
   marker's transaction fence has settled (see caveat below), and intake has
   caught up to the read's snapshot
   ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
-  *Planned (#418, #419):* today only a transform whose source already has an
-  unsettled marker starts here. The rest are read or built during
-  registration.
-* **`backfilling`** — the backfill discharge has captured the source and the
-  transform's build is running: a ring enumeration, chunks on drain threads,
-  or a direct set-based build. The target is partial.
+  *Planned (#419):* an aggregate or relationship-enriched 1-1 transform is
+  still built during registration unless its source already has an unsettled
+  marker.
+* **`backfilling`** — the backfill discharge has captured the source and
+  enqueued the transform's build, which is running: chunks on drain threads,
+  or a direct set-based build. The target is partial. A ring enumeration
+  (the fallback for a shape neither build can render) never shows this: it
+  goes from `waiting_to_backfill` straight to `live` in the discharge's own
+  transaction.
 * **`live`** — build complete; tracking live changes only. The steady state.
   Not yet a promise that the target is complete: a ring enumeration's rows may
   still be draining, and a chunked or direct build's go-live catch-up may still

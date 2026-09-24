@@ -672,12 +672,9 @@ where
 /// sequence repeats if either finds work again rather than returning on
 /// stale evidence. A marker can appear after its definition is already
 /// `live`: a stale chunk given up after a rebuild went live parks one
-/// (`defs::chunk_queue`), and `intake::publication::mark_definitions_live`
-/// parks its catch-ups in statements that commit after the flip itself.
-/// The re-check narrows that last window but can't close it: a `quiesce`
-/// that runs start to finish, re-check included, between the flip's commit
-/// and the park's still returns early. Only committing the flip and its
-/// parks together (#444) closes it.
+/// (`defs::chunk_queue`). A ring-built definition's go-live catch-ups
+/// don't: `intake::publication::go_live` parks them in the discharge's own
+/// transaction, so they commit with the flip (#444, #418).
 pub(super) async fn quiesce(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
@@ -910,8 +907,7 @@ mod tests {
     }
 
     /// A marker parked while `quiesce` is already waiting on the ring, with
-    /// the definition long since `live` (`mark_definitions_live` parks its
-    /// catch-ups after the flip commits; a stale chunk parks one after a
+    /// the definition long since `live` (a stale chunk parks one after a
     /// rebuild went live). The ring draining must not end the wait: the
     /// re-check has to find the marker and wait out its discharge and that
     /// enumeration's drain too.

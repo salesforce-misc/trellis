@@ -125,6 +125,11 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 /// of the same name). A chunked 1-1 target reaches `live` this way with no
 /// running pipeline and nothing to wait for.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "pause_and_drop_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -556,6 +561,62 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         count(&raw, "select count(*) from orders").await,
         6,
         "...nor are its rows"
+    );
+}
+
+/// Issue #418: re-registering a transform after dropping it builds it again
+/// from scratch through the backfill discharge, like any registration: the
+/// drop leaves no marker, chunk or status behind that the new definition
+/// could trip over, and the new target holds every source row.
+#[tokio::test]
+async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 40).await;
+    let text = "TRANSFORM order_doubles FROM orders SELECT a + a AS x";
+
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(text).await.expect("define");
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("live")
+    );
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause");
+    trellis
+        .apply("DROP TRANSFORM order_doubles")
+        .await
+        .expect("drop");
+    raw.batch_execute("delete from orders where id > 30")
+        .await
+        .expect("change the source while nothing reads it");
+
+    trellis.apply(text).await.expect("define again");
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("waiting_to_backfill")
+    );
+    drain_backfill_chunks(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_doubles").await.as_deref(),
+        Some("live")
+    );
+    assert_eq!(
+        count(
+            &raw,
+            &format!(
+                "select count(*) from orders o \
+                 full join {DEFAULT_TARGET_SCHEMA}.order_doubles t on t.id = o.id \
+                 where t.x is distinct from o.a + o.a"
+            ),
+        )
+        .await,
+        0,
+        "the new target is built from the source as it is now"
     );
 }
 
@@ -1030,13 +1091,16 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
         .expect("create publication");
 
     let trellis = define_only(db.dsn()).await;
-    // A plain 1-1 transform enumerates a durable chunk queue and returns
+    // A plain 1-1 transform's discharge enumerates a durable chunk queue
     // before it is built, which is exactly the in-flight backfill state under
     // test here.
     trellis
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     assert!(
         count(&raw, "select count(*) from backfill_chunks").await > 0,
         "precondition: the chunk queue was enumerated"
@@ -1120,6 +1184,9 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     assert_eq!(
         persisted_status(&raw, "order_doubles").await.as_deref(),
         Some("backfilling"),
@@ -1206,10 +1273,17 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS x")
         .await
         .expect("define a chunked 1-1 transform");
+    // Dispatched one at a time, so `order_doubles`' chunks get the lower ids.
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     trellis
         .apply("TRANSFORM item_doubles FROM items SELECT a + a AS x")
         .await
         .expect("define a sibling chunked 1-1 transform");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     assert_eq!(
         count(&raw, "select count(*) from backfill_chunks").await,
         3,
@@ -1822,6 +1896,9 @@ async fn a_target_paused_mid_build_is_refused_as_a_relationship_endpoint() {
         .apply("TRANSFORM order_doubles FROM orders SELECT a + a AS total")
         .await
         .expect("define the upstream target");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("the discharge dispatches the chunked build");
     let client = db.pool.get().await.expect("acquire connection");
     let held = chunk_queue::claim_chunks(&**client, "held_across_pause", 1000)
         .await

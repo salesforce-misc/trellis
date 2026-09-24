@@ -15,6 +15,11 @@ use trellis::defs::{
 /// chunked 1-1 target goes `live` without a running drain worker — a
 /// definition can only chain off a live target (issue #315).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     loop {
         let client = pool.get().await.expect("acquire connection");
         let claimed = chunk_queue::claim_chunks(&**client, "defs_catalog_test", 1000)

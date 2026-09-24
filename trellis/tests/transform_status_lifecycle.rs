@@ -141,9 +141,13 @@ async fn insert_cdc_row(
         .unwrap_or_else(|e| panic!("insert cdc row {key:?} into {table} failed: {e}"));
 }
 
-/// Seals and drains repeatedly until nothing is pending anywhere in the
-/// ring — the same harness `defs_install_definition.rs` uses.
+/// Runs any dispatched backfill chunks, then seals and drains repeatedly
+/// until nothing is pending anywhere in the ring — the same harness
+/// `defs_install_definition.rs` uses. A plain 1-1 definition's discharge
+/// dispatches chunks rather than a ring enumeration (ADR-0016, #418), so the
+/// chunks run first.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    drain_backfill_chunks(pool).await;
     // Issue #132: a throwaway, always-caught-up watermark — this helper
     // has no live `Intake` running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
@@ -185,6 +189,11 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
+    // A chunked rebuild goes live from its last chunk (ADR-0016, #418).
+    drain_backfill_chunks(pool).await;
+    if status_of(client, target).await == TransformStatus::Live {
+        return;
+    }
     // Issue #132: see `drain_to_quiescence`'s own comment — no live `Intake`
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
@@ -218,6 +227,11 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 /// remain — the harness stand-in for a running drain worker, matching
 /// `defs_install_definition.rs`'s `drain_backfill_chunks`.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "status_lifecycle_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
@@ -479,10 +493,9 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     .await
     .expect("run_pending_backfills (settled)");
 
-    // `run_pending_backfills` only *stages* the enumeration into the ring;
-    // draining it is what actually populates the target and is where the
-    // deferred definition's own promotion to `backfilling` (transient,
-    // inside that same discharge) resolves to `live`.
+    // `run_pending_backfills` only *dispatches* the build (for this plain
+    // 1-1 definition, its chunks); running the chunks is what actually
+    // populates the target and takes the definition `live`.
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -507,9 +520,10 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 }
 
 /// Issue #312: when the settled marker's enumeration has to wait for intake
-/// and gives up, the definition it promoted to `backfilling` goes back to
-/// `waiting_to_backfill`. Left in `backfilling`, the next pass (which only
-/// promotes `waiting_to_backfill` definitions) would never flip it to `live`.
+/// and gives up, the definition stays `waiting_to_backfill`. Left in
+/// `backfilling`, the next pass (which only dispatches `waiting_to_backfill`
+/// definitions) would never flip it to `live`. An aggregate, since the ring
+/// rebuilds it (and so waits for intake) until issue #419.
 #[tokio::test]
 async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() {
     let cluster = TestCluster::start();
@@ -518,6 +532,7 @@ async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() 
 
     raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
+         alter table s replica identity full; \
          insert into s (id, a) select g, g from generate_series(1, 5) g; \
          create publication test_pub;",
     )
@@ -531,8 +546,8 @@ async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() 
         .expect("reconcile leaves an unsettled marker");
     install_definition(
         &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
+        "TRANSFORM t FROM s GROUP BY a SELECT sum(id) AS total",
+        &numeric(&["id", "a"]),
         "public",
     )
     .await
@@ -1056,7 +1071,7 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     )
     .await
     .expect("install_definition (chunked path)");
-    assert_eq!(plain.status, TransformStatus::Backfilling);
+    assert_eq!(plain.status, TransformStatus::WaitingToBackfill);
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 

@@ -714,8 +714,8 @@ async fn staging_and_application_threads_are_independent_knobs() {
 /// end-to-end through the real `Client` runtime rather than by manually
 /// calling `defs::chunk_queue`'s primitives (see `defs_backfill_chunk_queue.rs`
 /// for that lower-level coverage): `install_definition` on a plain
-/// (non-relationship) 1-1 transform returns immediately with the definition
-/// still `Backfilling`, and it's the running client's own `application_threads`
+/// (non-relationship) 1-1 transform returns immediately, its discharge
+/// enqueues the chunks, and it's the running client's own `application_threads`
 /// drain workers — with no ring/CDC involved at all here (`staging_worker:
 /// false`) — that claim and finish its backfill chunk, flipping it to `Live`
 /// and building the target correctly.
@@ -747,12 +747,17 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
+    .expect("install_definition records the definition and returns");
     assert_eq!(
         def.status,
-        TransformStatus::Backfilling,
-        "install_definition must return before any running drain worker finishes the chunk queue"
+        TransformStatus::WaitingToBackfill,
+        "install_definition must return before its build is even dispatched"
     );
+    // No staging worker here (`staging_worker: false`): stand in for its
+    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the chunked build");
 
     poll_until(
         Duration::from_secs(20),
@@ -831,8 +836,13 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
-    assert_eq!(def.status, TransformStatus::Backfilling);
+    .expect("install_definition records the definition and returns");
+    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    // No staging worker here (`staging_worker: false`): stand in for its
+    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the chunked build");
 
     // Simulate a drain worker that claimed this definition's one chunk and
     // then crashed before ever executing or finishing it. No `Client` is
@@ -965,8 +975,13 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
         "public",
     )
     .await
-    .expect("install_definition enumerates chunk work and returns");
-    assert_eq!(def.status, TransformStatus::Backfilling);
+    .expect("install_definition records the definition and returns");
+    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    // No staging worker here (`staging_worker: false`): stand in for its
+    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the chunked build");
 
     let chunk_count: i64 = raw
         .query_one(

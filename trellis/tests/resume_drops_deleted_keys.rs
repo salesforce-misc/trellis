@@ -58,6 +58,11 @@ async fn define_only(dsn: &str) -> Trellis {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     loop {
         let client = pool.get().await.expect("acquire connection");
         let claimed = chunk_queue::claim_chunks(&**client, TEST_NAME, 1000)

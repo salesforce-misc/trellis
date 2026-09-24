@@ -82,12 +82,10 @@ validates the definition, creates the target table, writes the catalog row as
 `waiting_to_backfill`, and returns. It reads no source rows and makes no
 replication change, so its latency doesn't depend on the table's size.
 
-*Planned (#418, #419):* today registration still reads the source.
-`create_definition` enumerates it into the ring inside the registration
-transaction. A plain 1-1 definition cuts and enqueues its chunks at
-registration, returning `backfilling`. An aggregate or relationship-enriched
-1-1 definition runs its whole direct build before `apply` returns. Only a
-source with an unsettled marker already defers to the path below.
+*Planned (#419):* an aggregate or relationship-enriched 1-1 definition still
+runs its whole direct build before `apply` returns, unless its source has an
+unsettled marker, in which case it defers to the path below. Every other shape
+already registers without reading the source (#418).
 
 ### The four steps
 
@@ -106,11 +104,13 @@ call), execute on drain threads.
      sees it, at a snapshot that postdates the commit
      ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence);
      *Planned (#431)*).
-   - If the source needs no publication change, registration parks the marker
-     itself, in the catalog row's transaction. That covers a table that is
+   - If the source needs no publication change, the staging worker's next
+     reconcile pass parks the marker on it (`park_registration_markers`, in the
+     same transaction as any publication change). That covers a table that is
      already published and a source that is another definition's target, which
-     is never published (#315). *Planned (#418):* registration doesn't park
-     one yet.
+     is never published (#315). Registration itself parks nothing: which
+     publication the staging worker serves is that worker's own option, so
+     registration can't tell whether the source is published yet.
 
    Only the staging worker changes the publication, including the shrink after
    a `DROP` (*Planned (#427)*). A table has at most one
@@ -125,9 +125,9 @@ call), execute on drain threads.
    Once the fence settles, the discharge also waits for intake to stage through
    the WAL position its read snapshot was taken at (#312), so the stream's copy
    of any commit the read also sees is staged no later than the read's output.
-3. **Capture and build.** The discharge promotes the table's
-   `waiting_to_backfill` definitions to `backfilling`, takes the capture
-   snapshot, and dispatches each definition's build:
+3. **Capture and build.** The discharge takes the capture snapshot and
+   dispatches each of the table's `waiting_to_backfill` definitions' build by
+   shape, in one transaction with the marker's delete:
 
    | Build | Used for | How it runs |
    |---|---|---|
@@ -135,12 +135,16 @@ call), execute on drain threads.
    | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0007](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability)) |
    | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | one background job running ADR-0007's `INSERT … SELECT` build |
 
-   *Planned (#418):* the discharge only runs ring enumeration today. Chunks are
-   cut at registration. *Planned (#419):* direct builds run inside
-   registration. Whether the job runs on the staging worker or a drain thread
-   is #419's call.
+   A definition only reaches `backfilling` together with the work that drives
+   it (#404): a chunked build commits `backfilling` with its `backfill_chunks`
+   rows. A ring-built definition skips it, flipping from `waiting_to_backfill`
+   to `live` as the discharge transaction's last statement. *Planned (#419):*
+   direct builds run inside registration; an aggregate or relationship-enriched
+   1-1 definition that reaches the discharge (one that deferred, or a resumed
+   one) is rebuilt by ring enumeration until then. Whether the job runs on the
+   staging worker or a drain thread is #419's call.
 4. **Go live.** The definition flips to `live` when its build finishes. For
-   ring enumeration that's right after the discharge transaction commits. For
+   ring enumeration that's inside the discharge transaction itself. For
    chunks it's when the last chunk commits. For a direct build it's when the
    job commits. Apply doesn't fold a live change into a definition until it's
    `live`, so a reader sees a partial target while the status says
@@ -173,21 +177,20 @@ call), execute on drain threads.
   another definition's target is different. Its writes reach readers through
   the target-mutation seam, from drain workers that don't wait for a seal, and
   only to `live` ones, so going live parks a catch-up marker on it
-  (`mark_definitions_live`, #315). Chunked and direct builds read the source
+  (`go_live` in `intake::publication`, #315). Chunked and direct builds read the source
   through many snapshots over a longer time, so going live parks a fresh
   catch-up marker (`complete_direct_backfill`). Its discharge, through this
   same path, re-derives the definition from the source's current state, which
   for an aggregate also corrects a change the build read whose streamed delta
-  was folded again after the flip. *Planned (#419):* today's in-registration
-  direct build parks that catch-up only when its source is another
-  definition's target, so on an already-published source a change that drains
-  during the build is lost. A `backfill_coverage` record can let a catch-up
+  was folded again after the flip. A `backfill_coverage` record can let a catch-up
   skip re-reading a table that provably hasn't changed since the build. That
   saves work but never decides correctness.
 - **A resumed target drops rows its source no longer backs.** Before the read,
-  the discharge deletes every row of a promoted definition's target that no
+  the discharge deletes every row of a dispatched definition's target that no
   current source row backs (#330, `intake::resume_orphans`), since the read
-  only reaches keys the source still has.
+  only reaches keys the source still has. A chunked rebuild stays non-`live`
+  long after that delete, so a source row deleted meanwhile can outlive it;
+  #436 closes that on the new path.
 
 ### A fresh install
 
@@ -217,6 +220,8 @@ a row committed during that wait would be neither read nor streamed (#393).
   drain. Neither signal waits for a chunked or direct build's go-live catch-up,
   which a later maintenance pass discharges
   ([ADR-0016](decisions/0016-single-background-capture-path.md#consequences)).
+  *Planned (#419):* an aggregate or relationship-enriched 1-1 definition still
+  builds in-call, so it's usually `live` already when `apply` returns.
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
   live without its maintenance loop. Chunked builds also need drain threads
   ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).

@@ -192,6 +192,7 @@ impl Harness {
                     install_definition(&db.pool, text, &columns, "public")
                         .await
                         .unwrap_or_else(|e| panic!("install {text}: {e}"));
+                    trellis::intake::publication::settle_registrations(&db.pool).await;
                 }
                 Setup::Relationship(text) => {
                     create_relationship(&db.pool, text)

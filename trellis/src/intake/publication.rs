@@ -88,6 +88,17 @@ async fn current_publication_tables(
 /// safe to call on every setup pass, and (issue #14) on every periodic
 /// re-reconciliation pass a running client's maintenance loop makes.
 ///
+/// **Parks every registration's marker (ADR-0016, issue #418).** Registration
+/// reads no source rows and parks nothing: a `waiting_to_backfill` definition
+/// is captured by its source's marker's discharge, and this is where that
+/// marker comes from. In the same transaction as the `ALTER`s,
+/// [`park_registration_markers`] parks one on every source of a
+/// `waiting_to_backfill` definition that has none, provided the source needs
+/// no further publication change: it is in `desired_tables` (so published
+/// once this commits) or is another definition's target (never published,
+/// fed by the target-mutation seam). A source this pass just added already
+/// has its join marker.
+///
 /// Takes a plain `&mut tokio_postgres::Client` rather than a
 /// [`crate::staging::session::ProducerSession`]: nothing here needs that
 /// session's guards (`synchronous_commit`, the producer singleton advisory
@@ -111,10 +122,6 @@ pub async fn reconcile_publication(
         .filter(|t| !current.contains(*t))
         .collect();
     let to_drop: Vec<&String> = current.iter().filter(|t| !desired.contains(t)).collect();
-
-    if to_add.is_empty() && to_drop.is_empty() {
-        return Ok(());
-    }
 
     let txn = client.transaction().await?;
     for table in &to_drop {
@@ -147,7 +154,49 @@ pub async fn reconcile_publication(
         // the stream — see the module doc.
         park_marker(&txn, table).await?;
     }
+    park_registration_markers(&txn, desired_tables).await?;
     txn.commit().await?;
+    Ok(())
+}
+
+/// Parks a `pending_backfill` marker on every source of a
+/// `waiting_to_backfill` definition that has no marker yet and needs no
+/// publication change: it is in `published`, or it is another definition's
+/// target (ADR-0016's "Who parks the marker"). See [`reconcile_publication`].
+///
+/// A source that is in neither is left for the pass that publishes it, whose
+/// join marker is fenced inside the `ALTER`'s transaction: a marker parked on
+/// it any earlier could discharge before the table joined the stream, and a
+/// commit between that read and the join would be neither read nor streamed.
+///
+/// Only the staging worker runs this, and it runs the discharge itself right
+/// after, so no discharge of an existing marker is in flight: an existing
+/// marker is one the next discharge will run, promoting every
+/// `waiting_to_backfill` definition on its table.
+pub(crate) async fn park_registration_markers(
+    client: &impl GenericClient,
+    published: &[String],
+) -> Result<(), IntakeError> {
+    let tables: Vec<String> = client
+        .query(
+            "select distinct d.source_table from transform_definitions d \
+             where d.status = $1 \
+               and (d.source_table = any($2) or exists ( \
+                   select 1 from transform_definitions u where u.target_table = d.source_table \
+               )) \
+               and not exists ( \
+                   select 1 from pending_backfill pb where pb.table_name = d.source_table \
+               ) \
+             order by 1",
+            &[&TransformStatus::WaitingToBackfill.as_str(), &published],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for table in tables {
+        park_marker(client, &table).await?;
+    }
     Ok(())
 }
 
@@ -307,12 +356,12 @@ async fn current_snapshot(client: &impl GenericClient) -> Result<Snapshot, Intak
 /// a strict superset of it), so there is nothing to defer.
 ///
 /// Used at definition-creation time
-/// ([`crate::defs::catalog::create_definition_inner`],
-/// [`crate::defs::catalog::install_definition`]) to decide whether a fresh
-/// transform's initial backfill should run synchronously (the existing,
-/// unconditional behavior) or defer to `waiting_to_backfill` and ride this
-/// same marker's own discharge instead — see docs/observability.md's
-/// "Backfill status and the `xmin` caveat."
+/// ([`crate::defs::catalog::install_definition`]) to decide whether an
+/// aggregate's or relationship-enriched 1-1 definition's in-call build should
+/// run, or defer to `waiting_to_backfill` and ride this same marker's own
+/// discharge instead — see docs/observability.md's "Backfill status and the
+/// `xmin` caveat." Every other shape always defers (ADR-0016); issue #419
+/// moves these two there too, and retires this check.
 pub(crate) async fn backfill_marker_unsettled(
     client: &impl GenericClient,
     qualified_table: &str,
@@ -678,33 +727,50 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
     Ok(covered)
 }
 
-/// Runs every pending backfill whose fence has settled, staging its
-/// pre-existing rows and deleting the marker in the *same* transaction as
-/// that staging commit. A crash between the `ALTER` and this point leaves
-/// the marker durable; a fence that hasn't settled yet is left alone for the
-/// next setup pass — this function is meant to be retried on every one.
+/// Runs every pending backfill whose fence has settled: dispatches the build
+/// of every `waiting_to_backfill` definition on the marker's table, stages the
+/// table's pre-existing rows by ring enumeration where something needs them,
+/// and deletes the marker, all in one transaction. A crash anywhere short of
+/// that commit leaves the marker durable and the definitions
+/// `waiting_to_backfill`; a fence that hasn't settled yet is left alone for
+/// the next pass — this function is meant to be retried on every one.
 ///
-/// Issue #79 (bug B): before enumerating a marker's table, consult
-/// [`coverage_covers`]. When a direct backfill has already folded the table's
-/// current contents into a target and the table provably hasn't changed since,
-/// the enumeration would stage millions of `Recompute` markers that only
-/// re-derive already-correct values — so the marker is discharged with nothing
-/// staged. Any uncertainty falls back to the full enumeration this has always
-/// done, so the skip can never drop work.
+/// # Dispatch by shape (ADR-0016, issue #418)
 ///
-/// Issue #55: a marker whose fence hasn't settled is where a transform sits
-/// in [`TransformStatus::WaitingToBackfill`] — but that status is written
-/// once, at creation time ([`backfill_marker_unsettled`]'s callers), not
-/// here on every unsettled pass; there is nothing left for this function to
-/// *set* for an unsettled marker; `continue` is unchanged. Once a marker
-/// *does* settle, [`advance_deferred_definitions`] promotes exactly the
-/// definitions that were deferred because of *this* marker —
-/// `waiting_to_backfill` -> `backfilling` before the enumeration below, then
-/// -> `live` after it commits — never a sibling definition on the same
-/// table that's `backfilling`/`live` for an unrelated reason (a live
-/// definition's own catch-up marker, or a concurrently-running
-/// `backfill_chunks` build), since those were never `waiting_to_backfill` in
-/// the first place.
+/// The discharge is the one capture path every definition's build goes
+/// through: a fresh registration, a resumed definition's rebuild, and a
+/// definition that deferred to an unsettled marker alike. Each
+/// `waiting_to_backfill` definition on the marker's table gets the build its
+/// shape has:
+///
+/// - **A plain (non-relationship) 1-1 definition**: its primary-key chunk
+///   boundaries are planned before the transaction opens
+///   ([`crate::defs::backfill::plan_one_to_one_chunks`]), and the transaction
+///   persists them as `backfill_chunks` rows and moves the definition to
+///   `backfilling` together (`defs::chunk_queue::dispatch_one_to_one`). Drain
+///   threads execute the chunks, and the last one flips it `live` and parks
+///   its go-live catch-up.
+/// - **Everything else** — the `Unsupported` fallback, and for now aggregates
+///   and relationship-enriched 1-1 definitions (issue #419 gives them a
+///   background direct-build job) — goes through the ring enumeration below,
+///   and flips `waiting_to_backfill` -> `live` as the last statement of the
+///   transaction, together with its go-live catch-up parks. There is no
+///   intermediate `backfilling` for it to be stranded in (issue #404).
+///
+/// A definition an operator paused after this pass read it keeps its status:
+/// both status updates are scoped to `waiting_to_backfill`.
+///
+/// # When the table is enumerated
+///
+/// The enumeration stages one image-less `Recompute` row per source key, for
+/// every `live` reader of the table to re-derive. It runs when a ring-built
+/// definition needs it, or when anything other than this pass's chunk-built
+/// definitions reads the table (a catch-up for `live` readers) — unless
+/// [`coverage_covers`] shows the table unchanged since a direct build folded
+/// it in (issue #79, bug B). A marker on a table only chunk-built definitions
+/// read, or nothing reads at all (issue #417: a fresh install parks a marker
+/// on every configured source table, [`create_slot_and_park_markers`]), is
+/// discharged without enumerating.
 ///
 /// # Waiting for intake before staging (issue #312)
 ///
@@ -727,46 +793,33 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// the `Recompute` rows appended afterward resolve the ring pointer later
 /// and commit later: they land in the same batch as that CDC or a later one.
 ///
-/// If intake doesn't get there within `catch_up_timeout`, the enumeration
-/// rolls back, the marker stays, and any definition this pass promoted to
-/// `backfilling` returns to `waiting_to_backfill`, so the next pass retries
-/// cleanly. The pass then stops rather than waiting again on the remaining
-/// markers: each later horizon is at least as far ahead, so every one would
-/// most likely time out too, and the maintenance loop seals nothing while
-/// this waits. A discharge that fails outright (a failed `DECLARE`, append,
-/// marker delete or commit) takes the same rollback-and-revert path before
-/// returning its error (issue #387). A caller with no intake running yet must
-/// not call this at all (see `client::setup_staging`); tests with no CDC
-/// stream pass [`crate::staging::StagedWatermark::saturated`].
+/// If intake doesn't get there within `catch_up_timeout`, the whole
+/// discharge rolls back — no chunk is enqueued and no status moves — and the
+/// marker stays, so the next pass retries cleanly. The pass then stops rather
+/// than waiting again on the remaining markers: each later horizon is at
+/// least as far ahead, so every one would most likely time out too, and the
+/// maintenance loop seals nothing while this waits. A discharge that fails
+/// outright rolls back the same way before returning its error (issue #387).
+/// A caller with no intake running yet must not call this at all (see
+/// `client::setup_staging`); tests with no CDC stream pass
+/// [`crate::staging::StagedWatermark::saturated`].
 ///
 /// # Dropping what the source no longer backs (issue #330)
 ///
-/// The enumeration only reaches keys the source still has. A definition this
-/// pass rebuilds (a resumed one, above all) can hold target rows whose source
-/// rows went away while it was frozen, and nothing would ever enumerate them.
-/// So, first thing in the transaction, `resume_orphans::delete_orphaned_target_rows`
-/// deletes every row of each promoted definition's target that no source row
-/// backs, reporting each through the target-mutation seam. It runs before
-/// `DECLARE`, and never after the intake wait, which would leave an aggregate
-/// group repopulated during the wait at its stale pre-pause value. The
-/// maintenance loop that runs this pass is also the only sealer, so any
-/// source change committed after the pass starts is drained only once the
-/// definition is `live`. The anti-join and the cursor still read different
-/// snapshots, which leaves a short race for aggregates in either order. That
+/// The enumeration and the chunks only reach keys the source still has. A
+/// definition this pass rebuilds (a resumed one, above all) can hold target
+/// rows whose source rows went away while it was frozen, and nothing would
+/// ever enumerate them. So, first thing in the transaction,
+/// `resume_orphans::delete_orphaned_target_rows` deletes every row of each
+/// dispatched definition's target that no source row backs, reporting each
+/// through the target-mutation seam. It runs before `DECLARE`, and never
+/// after the intake wait, which would leave an aggregate group repopulated
+/// during the wait at its stale pre-pause value. The maintenance loop that
+/// runs this pass is also the only sealer, so any source change committed
+/// after the pass starts is drained only once a ring-built definition is
+/// `live`. The anti-join and the cursor still read different snapshots, which
+/// leaves a short race for aggregates in either order (issue #436). That
 /// module's doc comment has the full argument and its limits.
-///
-/// # A table nothing reads (issue #417)
-///
-/// A marker on a table no registered definition reads, directly or through a
-/// relationship ([`crate::defs::catalog::table_has_reader`]), is discharged
-/// without enumerating: no apply would consume its `Recompute` rows. A fresh
-/// install parks a marker on every configured source table
-/// ([`create_slot_and_park_markers`]), including ones no transform uses yet.
-/// A definition registered on such a table later captures it itself: today
-/// through registration's own read, or, if an unsettled marker made it defer,
-/// through that marker's discharge, which finds it as a reader. The check
-/// runs after [`advance_deferred_definitions`], so a deferred definition it
-/// can't see yet is one that pass wouldn't have promoted anyway.
 // The maintenance loop calls [`run_pending_backfills_until`] so it can stop
 // the wait on shutdown. This no-stop form is the tests' entry point, so
 // nothing in the crate calls it unless `internals` exposes it.
@@ -782,14 +835,8 @@ pub async fn run_pending_backfills(
 
 /// [`run_pending_backfills`], with `stop` checked while an enumeration waits
 /// for intake. When `stop` returns `true` the wait gives up early, through
-/// the same rollback-and-revert path as a timeout.
-///
-/// This is how the maintenance loop shuts down promptly. It must not drop
-/// the future mid-wait instead: the `waiting_to_backfill -> backfilling`
-/// promotion is already committed by then, so dropping would skip the revert
-/// and leave the definition in `backfilling` for good, since a later pass
-/// only promotes `waiting_to_backfill` definitions and so never flips it to
-/// `live`.
+/// the same rollback as a timeout, so the maintenance loop shuts down
+/// promptly with nothing half-dispatched.
 #[tracing::instrument(
     name = "intake.run_pending_backfills",
     skip(client, wake_channel, watermark, stop),
@@ -824,22 +871,9 @@ pub(crate) async fn run_pending_backfills_until(
             continue;
         }
         settled += 1;
-        let advancing = advance_deferred_definitions(
-            client,
-            &marker.table,
-            TransformStatus::WaitingToBackfill,
-            TransformStatus::Backfilling,
-        )
-        .await?;
-
-        // Issue #387: `advancing` is already committed as `backfilling`, and a
-        // later pass only promotes `waiting_to_backfill` definitions. So every
-        // way out of the discharge short of its commit (a deferral *or* an
-        // error) must hand them back, or they never go live.
         match discharge_marker(
             client,
             &marker,
-            &advancing,
             wake_channel,
             watermark,
             catch_up_timeout,
@@ -847,38 +881,8 @@ pub(crate) async fn run_pending_backfills_until(
         )
         .await
         {
-            Ok(Discharge::Committed) => {
-                // Issue #444: the flip and the catch-ups it parks commit
-                // together. A crash or a failed park between them would
-                // otherwise leave a definition `live` with its catch-up never
-                // parked, silently losing whatever that catch-up re-derives.
-                if let Err(error) = go_live(client, &advancing).await {
-                    tracing::warn!(
-                        table = %marker.table,
-                        ids = ?advancing,
-                        error = %error,
-                        "could not take backfilled definitions live; re-parking their marker"
-                    );
-                    // The discharge already deleted the marker, so handing
-                    // the definitions back to `waiting_to_backfill` alone
-                    // would strand them: only a marker's discharge promotes
-                    // them. Re-park it with the revert so the next pass
-                    // retries the whole discharge.
-                    if let Err(hand_back_error) =
-                        hand_back_for_retry(client, &marker.table, &advancing).await
-                    {
-                        tracing::warn!(
-                            table = %marker.table,
-                            ids = ?advancing,
-                            error = %hand_back_error,
-                            "could not hand backfilled definitions back for a retry"
-                        );
-                    }
-                    return Err(error);
-                }
-            }
+            Ok(Discharge::Committed) => {}
             Ok(Discharge::Deferred { horizon }) => {
-                revert_to_waiting(client, &advancing).await?;
                 tracing::debug!(
                     table = %marker.table,
                     horizon = %horizon,
@@ -895,14 +899,6 @@ pub(crate) async fn run_pending_backfills_until(
                     error = %error,
                     "backfill discharge failed; its marker stays for the next pass"
                 );
-                if let Err(revert_error) = revert_to_waiting(client, &advancing).await {
-                    tracing::warn!(
-                        table = %marker.table,
-                        ids = ?advancing,
-                        error = %revert_error,
-                        "could not return definitions to waiting_to_backfill after a failed discharge"
-                    );
-                }
                 return Err(error);
             }
         }
@@ -913,38 +909,116 @@ pub(crate) async fn run_pending_backfills_until(
 
 /// How [`discharge_marker`] ended short of an error.
 enum Discharge {
-    /// The enumeration (if the table needed one) and the marker's delete
-    /// committed together.
+    /// The dispatches, the enumeration (if the table needed one) and the
+    /// marker's delete committed together.
     Committed,
     /// Intake had not staged through `horizon` in time, so the transaction
     /// rolled back and the marker stays.
     Deferred { horizon: PgLsn },
 }
 
-/// Runs `marker`'s discharge in one transaction: the enumeration, unless
-/// coverage already stands in for it, then the marker's delete. An error
-/// drops the transaction, which rolls it back, so the marker survives either
-/// way the discharge falls short.
+/// The build [`discharge_marker`] dispatches for one `waiting_to_backfill`
+/// definition (ADR-0016's dispatch by shape; see [`run_pending_backfills`]).
+enum Build {
+    /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
+    /// boundaries, enqueued as `backfill_chunks` rows.
+    Chunks(Vec<(Option<String>, String)>),
+    /// The ring enumeration of the marker's table, flipped `live` in the
+    /// discharge's own transaction.
+    Ring,
+}
+
+/// Reads every `waiting_to_backfill` definition sourced from `table` and plans
+/// the build its shape gets. Runs on `client` before the discharge's
+/// transaction opens, so planning chunk boundaries (a walk of the source's
+/// primary-key index) doesn't hold that transaction open.
+async fn plan_waiting_builds(
+    client: &tokio_postgres::Client,
+    table: &str,
+) -> Result<Vec<(i64, Build)>, IntakeError> {
+    use crate::defs::ast::KeySpace;
+    use crate::defs::backfill::{self, BackfillError};
+    use crate::defs::catalog::CatalogError;
+
+    let rows = client
+        .query(
+            "select id, definition_text from transform_definitions \
+             where source_table = $1 and status = $2 order by id",
+            &[&table, &TransformStatus::WaitingToBackfill.as_str()],
+        )
+        .await?;
+    let mut builds = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.get(0);
+        let text: String = row.get(1);
+        let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
+        // Aggregates and relationship-enriched 1-1 definitions build in-call
+        // at registration unless they deferred to a marker; a deferred one
+        // (or a resumed one) is rebuilt by the ring here until issue #419
+        // gives them a background direct-build job.
+        let chunked =
+            matches!(def.key_space, KeySpace::OneToOne) && !backfill::uses_relationships(&def);
+        let build = if !chunked {
+            Build::Ring
+        } else {
+            match backfill::plan_one_to_one_chunks(client, &def, table).await {
+                Ok(ranges) => Build::Chunks(ranges),
+                Err(BackfillError::Unsupported(what)) => {
+                    tracing::debug!(
+                        definition_id = id,
+                        table = %table,
+                        unsupported = %what,
+                        "direct build unsupported; falling back to the ring enumeration"
+                    );
+                    Build::Ring
+                }
+                Err(err) => return Err(CatalogError::DirectBackfill(err).into()),
+            }
+        };
+        builds.push((id, build));
+    }
+    Ok(builds)
+}
+
+/// Runs `marker`'s discharge in one transaction: the orphan delete, the
+/// enumeration (see [`run_pending_backfills`]'s "When the table is
+/// enumerated"), each waiting definition's dispatch, the marker's delete and
+/// the ring-built definitions' flip to `live`. An error drops the
+/// transaction, which rolls it back, so the marker survives either way the
+/// discharge falls short.
 async fn discharge_marker(
     client: &mut tokio_postgres::Client,
     marker: &PendingBackfill,
-    advancing: &[i64],
     wake_channel: &str,
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Discharge, IntakeError> {
+    let builds = plan_waiting_builds(client, &marker.table).await?;
+    let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
+    let chunked: Vec<i64> = builds
+        .iter()
+        .filter(|(_, build)| matches!(build, Build::Chunks(_)))
+        .map(|(id, _)| *id)
+        .collect();
+    let ring: Vec<i64> = builds
+        .iter()
+        .filter(|(_, build)| matches!(build, Build::Ring))
+        .map(|(id, _)| *id)
+        .collect();
+
     let txn = client.transaction().await?;
     // Issue #330: before the enumeration's `DECLARE` and its intake wait; see
     // "Dropping what the source no longer backs" above. On the rollback
     // below (including the `Deferred` and error paths, since both drop
     // `txn` without committing), the deletes roll back with everything else.
-    super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, advancing).await?;
-    // Issue #417: see "A table nothing reads" above.
-    let read = crate::defs::catalog::table_has_reader(&txn, &marker.table).await?;
-    let staged = if !read || coverage_covers(&txn, &marker.table).await? {
-        false
-    } else {
+    super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, &waiting).await?;
+    // A ring-built definition has never read the table, so coverage can't
+    // stand in for its enumeration.
+    let enumerate = !ring.is_empty()
+        || (crate::defs::catalog::table_has_reader(&txn, &marker.table, &chunked).await?
+            && !coverage_covers(&txn, &marker.table).await?);
+    if enumerate {
         declare_enumeration(&txn, &marker.table).await?;
         let horizon: PgLsn = txn
             .query_one("select pg_current_wal_insert_lsn()", &[])
@@ -955,8 +1029,12 @@ async fn discharge_marker(
             return Ok(Discharge::Deferred { horizon });
         }
         append_enumeration(&txn, &marker.table).await?;
-        true
-    };
+    }
+    for (id, build) in &builds {
+        if let Build::Chunks(ranges) = build {
+            crate::defs::chunk_queue::dispatch_one_to_one(&txn, *id, ranges).await?;
+        }
+    }
     // Delete only the marker this pass read (issues #311/#367). A park
     // since then gave the row a new generation, so it stays for the next
     // pass: this enumeration's snapshot may predate that park's change.
@@ -973,11 +1051,21 @@ async fn discharge_marker(
         &[&marker.table, &marker.generation],
     )
     .await?;
-    if staged {
+    let chained_sources = go_live(&txn, &ring).await?;
+    if enumerate {
         txn.execute("select pg_notify($1, '')", &[&wake_channel])
             .await?;
     }
     txn.commit().await?;
+    // Issue #315: `go_live` parked each chained source's catch-up inside the
+    // transaction, so it survives a crash here. Its fence, though, predates
+    // the flip's commit, and a seam writer that started after that fence
+    // and checked for `live` readers before the commit reached nobody. A
+    // re-park now keeps the later fence ([`park_marker`]), which waits that
+    // writer out.
+    for source in chained_sources {
+        park_backfill_catchup(&*client, &source).await?;
+    }
     Ok(Discharge::Committed)
 }
 
@@ -1006,139 +1094,37 @@ async fn intake_caught_up(
     }
 }
 
-/// Undoes [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
-/// `backfilling` promotion for exactly `ids`, when the discharge that
-/// promotion announced was deferred or failed instead of committing, or
-/// committed but couldn't go live ([`hand_back_for_retry`]). Scoped to `ids`
-/// and to the `backfilling` status for the same reason that function is, so a
-/// definition an operator paused or quarantined meanwhile stays frozen.
+/// Flips exactly `ids` (the discharge's ring-built definitions)
+/// `waiting_to_backfill` -> [`TransformStatus::Live`] inside the discharge's
+/// transaction, and parks the go-live catch-ups the flip calls for in that
+/// same transaction, so the enumeration, the flip and the catch-ups commit
+/// together or not at all (issues #404/#444).
 ///
-/// After a failed discharge (or a failed [`go_live`]) this runs on the same
-/// connection as the transaction that just failed. That transaction may be aborted, and it was
-/// dropped rather than rolled back explicitly. It is still safe: dropping a
-/// `tokio_postgres::Transaction` queues its `ROLLBACK` on the connection's
-/// request channel synchronously, so the server runs it before this update.
-async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    client
-        .execute(
-            "update transform_definitions set status = $1 where id = any($2) and status = $3",
-            &[
-                &TransformStatus::WaitingToBackfill.as_str(),
-                &ids,
-                &TransformStatus::Backfilling.as_str(),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Runs [`mark_definitions_live`] in its own transaction, so the flip and
-/// every catch-up it parks commit together or not at all (issue #444).
-async fn go_live(client: &mut tokio_postgres::Client, ids: &[i64]) -> Result<(), IntakeError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let txn = client.transaction().await?;
-    mark_definitions_live(&txn, ids).await?;
-    txn.commit().await?;
-    Ok(())
-}
-
-/// After a discharge committed but [`go_live`] failed: returns `ids` to
-/// `waiting_to_backfill` and re-parks `table`'s marker in one transaction, so
-/// the next pass promotes and discharges them again. Either half alone would
-/// strand them: a `backfilling` definition is never promoted again, and a
-/// `waiting_to_backfill` one only is by a marker's discharge.
-async fn hand_back_for_retry(
-    client: &mut tokio_postgres::Client,
-    table: &str,
-    ids: &[i64],
-) -> Result<(), IntakeError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let txn = client.transaction().await?;
-    revert_to_waiting(&txn, ids).await?;
-    park_backfill_catchup(&txn, table).await?;
-    txn.commit().await?;
-    Ok(())
-}
-
-/// Promotes every `transform_definitions` row sourced from `table` (matched
-/// against `source_table`'s own persisted, fully-qualified shape — issue
-/// #72; `table` itself is always already qualified here, since every caller
-/// derives it from `pending_backfill.table_name`) currently in `from` to
-/// `to`, returning the ids actually moved (issue #55).
+/// Scoped `status = 'waiting_to_backfill'` (issue #331): an operator pause
+/// (or a quarantine) that landed on one of `ids` since the discharge read it
+/// leaves it frozen — its resume re-parks a marker of its own — rather than
+/// forcing it `live` behind the operator's back.
 ///
-/// Scoped by both `source_table` and current `status`, so a second,
-/// unrelated definition on the same table sitting in some other status for
-/// an unrelated reason (e.g. still `backfilling` behind its own independent
-/// `backfill_chunks` queue, or already `live`) is never touched. Returning
-/// the moved ids — rather than the caller re-deriving "which ones did I just
-/// touch" from a second, separately-timed query — is what lets
-/// [`run_pending_backfills`] flip *exactly* these rows to `live` afterward
-/// without also catching a sibling definition that happened to already be
-/// `backfilling` when this marker's discharge ran.
-async fn advance_deferred_definitions(
-    client: &impl GenericClient,
-    table: &str,
-    from: TransformStatus,
-    to: TransformStatus,
-) -> Result<Vec<i64>, IntakeError> {
-    let rows = client
-        .query(
-            "update transform_definitions set status = $1 \
-             where source_table = $2 and status = $3 \
-             returning id",
-            &[&to.as_str(), &table, &from.as_str()],
-        )
-        .await?;
-    let ids: Vec<i64> = rows.into_iter().map(|r| r.get(0)).collect();
-    if !ids.is_empty() {
-        // Issue #56: a backfill status transition (#55's lifecycle,
-        // `docs/observability.md`'s "Transform status lifecycle" diagram) —
-        // operationally meaningful, since a transform sitting in
-        // `waiting_to_backfill` can mean either "about to advance" or "the
-        // xmin fence is pinned by an unrelated long-running transaction
-        // cluster-wide" (see that diagram's caveat), and this event is the
-        // moment that ambiguity resolves.
-        tracing::info!(
-            table = %table,
-            ids = ?ids,
-            from = %from.as_str(),
-            to = %to.as_str(),
-            "transform status transition"
-        );
-    }
-    Ok(ids)
-}
-
-/// Flips exactly `ids` to [`TransformStatus::Live`] (issue #55) — the second
-/// half of [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
-/// `backfilling` promotion, run once the marker's enumeration has committed.
-/// A no-op for an empty `ids` (the common case: no definition was deferred
-/// against this particular marker).
+/// Two kinds of catch-up, both issue #315, parked in name order so two
+/// transactions parking overlapping tables can't deadlock on each other's
+/// marker rows:
 ///
-/// Scoped `status = 'backfilling'` (issue #331): the promotion and this flip
-/// are separate transactions, and an operator pause (or a quarantine) can land
-/// on one of `ids` in between. That definition stays frozen — its resume
-/// re-parks a marker of its own and rebuilds by a fresh backfill — rather than
-/// being forced `live` behind the operator's back. Returns the ids actually
-/// flipped.
+/// - A flipped definition's target that some `live` definition reads (see
+///   [`park_target_catchup_if_read`]): its readers re-derive from the
+///   rebuilt target.
+/// - A flipped definition's source that is another definition's target: it
+///   was enumerated while the definition wasn't `live`, which the
+///   target-mutation seam skips, and that target is never in the
+///   publication. A write to it between the enumeration and the flip reached
+///   nobody. The next discharge flips nothing, so this doesn't loop.
 ///
-/// Parks the catch-ups the flip calls for on `client` too, so `client` must
-/// be a transaction ([`go_live`]'s) for the two to be atomic (issue #444).
-async fn mark_definitions_live(
-    client: &impl GenericClient,
-    ids: &[i64],
-) -> Result<Vec<i64>, IntakeError> {
+/// Returns the second kind, for the caller to re-park after commit (see
+/// [`discharge_marker`]).
+async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<Vec<String>, IntakeError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let flipped: Vec<i64> = client
+    let flipped: Vec<i64> = txn
         .query(
             "update transform_definitions set status = $1 \
              where id = any($2) and status = $3 \
@@ -1146,7 +1132,7 @@ async fn mark_definitions_live(
             &[
                 &TransformStatus::Live.as_str(),
                 &ids,
-                &TransformStatus::Backfilling.as_str(),
+                &TransformStatus::WaitingToBackfill.as_str(),
             ],
         )
         .await?
@@ -1156,47 +1142,10 @@ async fn mark_definitions_live(
     if !flipped.is_empty() {
         tracing::info!(
             ids = ?flipped,
+            from = %TransformStatus::WaitingToBackfill.as_str(),
             to = %TransformStatus::Live.as_str(),
             "transform status transition: backfill enumeration committed"
         );
-    }
-    // Two kinds of catch-up, both issue #315:
-    //
-    // - A flipped definition's target that some `live` definition reads (see
-    //   [`park_target_catchup_if_read`]): the enumeration wrote it outside
-    //   the target-mutation seam, so its readers re-derive from the result.
-    // - A flipped definition's source that is another definition's target:
-    //   it was enumerated while still `backfilling`, which the seam skips,
-    //   and that target is never in the publication. A write to it between
-    //   the enumeration and this flip reached nobody (see
-    //   `defs::catalog::create_definition_inner`'s matching step). The next
-    //   discharge flips nothing, so this doesn't loop.
-    //
-    // Parked in name order, as `defs::catalog::install_definition` does, so
-    // two transactions parking overlapping tables can't deadlock on each
-    // other's marker rows.
-    let mut tables: Vec<String> = client
-        .query(
-            "select d.target_table from transform_definitions d \
-             where d.id = any($1) and exists ( \
-                 select 1 from transform_definitions r \
-                 where r.source_table = d.target_table and r.status = 'live' \
-             ) \
-             union \
-             select d.source_table from transform_definitions d \
-             where d.id = any($1) and exists ( \
-                 select 1 from transform_definitions u where u.target_table = d.source_table \
-             )",
-            &[&flipped],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    tables.sort_unstable();
-    tables.dedup();
-    for table in tables {
-        park_backfill_catchup(client, &table).await?;
     }
     if flipped.len() < ids.len() {
         let skipped: Vec<i64> = ids
@@ -1206,11 +1155,118 @@ async fn mark_definitions_live(
             .collect();
         tracing::info!(
             ids = ?skipped,
-            "backfill enumeration committed, but these definitions left `backfilling` \
+            "backfill enumeration staged, but these definitions left `waiting_to_backfill` \
              meanwhile; leaving their status as it is"
         );
     }
-    Ok(flipped)
+    let read_targets: Vec<String> = txn
+        .query(
+            "select d.target_table from transform_definitions d \
+             where d.id = any($1) and exists ( \
+                 select 1 from transform_definitions r \
+                 where r.source_table = d.target_table and r.status = 'live' \
+             )",
+            &[&flipped],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let chained_sources: Vec<String> = txn
+        .query(
+            "select distinct d.source_table from transform_definitions d \
+             where d.id = any($1) and exists ( \
+                 select 1 from transform_definitions u where u.target_table = d.source_table \
+             )",
+            &[&flipped],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut tables: Vec<&String> = read_targets.iter().chain(&chained_sources).collect();
+    tables.sort_unstable();
+    tables.dedup();
+    for table in tables {
+        park_backfill_catchup(txn, table).await?;
+    }
+    Ok(chained_sources)
+}
+
+/// Test stand-in for the staging worker's maintenance pass over newly
+/// registered definitions (ADR-0016), for a test with no staging worker and
+/// no publication: parks the marker [`reconcile_publication`] would on every
+/// `waiting_to_backfill` definition's source (treating every source as
+/// published), then discharges every settled marker with intake taken as
+/// caught up. Retries for a few seconds while a fence is still pinned by some
+/// other transaction in the cluster (other tests share it), and returns once
+/// no definition is left `waiting_to_backfill` or the retries run out. Chunks
+/// it enqueues still need a drain worker (or a test's own chunk loop).
+/// [`discharge_registrations`], then claims and runs every backfill chunk it
+/// (or anything before it) enqueued until none is left: a synchronous
+/// stand-in for the staging worker and a drain thread together, for a test
+/// that needs its plain 1-1 definitions `live` before it goes on (to chain a
+/// definition off one, say). Ring enumerations it stages are left in the
+/// ring for the test to drain. Panics on any failure: it is test harness.
+#[cfg(any(test, feature = "internals"))]
+pub async fn settle_registrations(pool: &crate::pool::Pool) {
+    use crate::defs::chunk_queue;
+    const CLAIMED_BY: &str = "settle_registrations";
+    discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
+    loop {
+        let client = pool.get().await.expect("acquire a connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim backfill chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
+                .await
+                .expect("run a backfill chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish a backfill chunk");
+        }
+    }
+}
+
+#[cfg(any(test, feature = "internals"))]
+pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), IntakeError> {
+    let mut client = pool
+        .get()
+        .await
+        .map_err(crate::defs::catalog::CatalogError::from)?;
+    for _ in 0..100 {
+        let sources: Vec<String> = client
+            .query(
+                "select distinct source_table from transform_definitions where status = $1",
+                &[&TransformStatus::WaitingToBackfill.as_str()],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if sources.is_empty() {
+            return Ok(());
+        }
+        park_registration_markers(&**client, &sources).await?;
+        // Consume an xid so a fence parked just now has settled.
+        client.batch_execute("select txid_current()").await?;
+        run_pending_backfills(
+            &mut client,
+            "trellis_wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
 }
 
 /// Fresh-install slot setup: creates `slot`, seeds its `replication_progress`
@@ -1465,7 +1521,7 @@ mod tests {
     }
 
     /// Issue #315: a definition reading another definition's target was
-    /// enumerated while `backfilling`, when the target-mutation seam skips
+    /// enumerated while it wasn't `live`, when the target-mutation seam skips
     /// it, and the target is never published. Going live must park a fresh
     /// catch-up on that target, or a write landing between the enumeration
     /// and the flip reaches nobody.
@@ -1473,7 +1529,7 @@ mod tests {
     async fn going_live_over_a_target_parks_a_catchup_on_that_target() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let client = db.pool.get().await.expect("acquire connection");
+        let mut client = db.pool.get().await.expect("acquire connection");
 
         client
             .batch_execute(
@@ -1489,17 +1545,21 @@ mod tests {
             .query_one(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.t', 1, '', 'backfilling') returning id",
+                 values ('public.d', 'public.t', 1, '', 'waiting_to_backfill') returning id",
                 &[],
             )
             .await
             .expect("seed the chained definition")
             .get(0);
 
-        let flipped = mark_definitions_live(&**client, &[reader])
-            .await
-            .expect("mark_definitions_live");
-        assert_eq!(flipped, [reader]);
+        let txn = client.transaction().await.expect("begin");
+        let chained = go_live(&txn, &[reader]).await.expect("go_live");
+        txn.commit().await.expect("commit");
+        assert_eq!(
+            chained,
+            ["public.t"],
+            "reported for the post-commit re-park"
+        );
 
         let markers: Vec<String> = client
             .query("select table_name from pending_backfill", &[])
@@ -1534,16 +1594,15 @@ mod tests {
         assert!(Snapshot::parse("21:31:").unwrap().settled_since(&fence));
     }
 
-    /// Issue #331: `run_pending_backfills` promotes deferred definitions to
-    /// `backfilling` and flips them `live` in separate transactions, so an
-    /// operator pause (or a quarantine) can land on one in between. The flip
-    /// must only move definitions still `backfilling`, and report exactly
-    /// those — never force a frozen definition `live` behind the operator.
+    /// Issue #331: an operator pause (or a quarantine) can land on a
+    /// definition after the discharge read it and before its flip. The flip
+    /// must only move definitions still `waiting_to_backfill` — never force a
+    /// frozen definition `live` behind the operator.
     #[tokio::test]
-    async fn mark_definitions_live_leaves_a_definition_that_left_backfilling_alone() {
+    async fn going_live_leaves_a_definition_that_left_waiting_alone() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let client = db.pool.get().await.expect("acquire connection");
+        let mut client = db.pool.get().await.expect("acquire connection");
 
         client
             .execute(
@@ -1555,7 +1614,7 @@ mod tests {
             .expect("seed source_table_versions");
         let mut ids = Vec::new();
         for (target, status) in [
-            ("public.still_backfilling", "backfilling"),
+            ("public.still_waiting", "waiting_to_backfill"),
             ("public.paused_meanwhile", "paused"),
             ("public.quarantined_meanwhile", "quarantined"),
         ] {
@@ -1572,9 +1631,9 @@ mod tests {
             ids.push(id);
         }
 
-        let flipped = mark_definitions_live(&**client, &ids)
-            .await
-            .expect("mark_definitions_live");
+        let txn = client.transaction().await.expect("begin");
+        go_live(&txn, &ids).await.expect("go_live");
+        txn.commit().await.expect("commit");
 
         let statuses: Vec<String> = client
             .query(
@@ -1589,9 +1648,8 @@ mod tests {
         assert_eq!(
             statuses,
             ["live", "paused", "quarantined"],
-            "only the definition still backfilling goes live; a frozen one stays frozen"
+            "only the definition still waiting goes live; a frozen one stays frozen"
         );
-        assert_eq!(flipped, [ids[0]], "reports exactly the ids it flipped");
     }
 
     #[test]
@@ -1863,11 +1921,12 @@ mod catch_up_tests {
         assert_ne!(after, before, "the surviving marker is the racing park's");
     }
 
-    /// Issue #387: a discharge that fails partway (here its `DECLARE`, since
-    /// `public.nokey` has no identity key) must hand back the definitions it
-    /// promoted to `backfilling`. A later pass only promotes definitions still
-    /// in `waiting_to_backfill`, so one left in `backfilling` would never go
-    /// live. The marker must survive too, so the retry has something to run.
+    /// Issue #387: a discharge that fails partway (here planning the plain
+    /// 1-1 definition's chunks, since `public.nokey` has no identity key)
+    /// must leave its definitions `waiting_to_backfill`. A later pass only
+    /// dispatches definitions still waiting, so one left in `backfilling`
+    /// would never go live. The marker must survive too, so the retry has
+    /// something to run.
     #[tokio::test]
     async fn a_failed_discharge_returns_its_definitions_to_waiting() {
         let cluster = testkit::TestCluster::start();
@@ -1916,8 +1975,18 @@ mod catch_up_tests {
         )
         .await
         {
-            Err(IntakeError::MissingKeyValue { table }) => assert_eq!(table, "public.nokey"),
-            other => panic!("expected the enumeration to fail, got {other:?}"),
+            Err(IntakeError::Catalog(error)) => assert!(
+                matches!(
+                    *error,
+                    crate::defs::catalog::CatalogError::DirectBackfill(
+                        crate::defs::backfill::BackfillError::Ddl(
+                            crate::defs::ddl::DdlError::NoPrimaryKey { .. }
+                        )
+                    )
+                ),
+                "expected the chunk planning to fail on the missing key, got {error:?}"
+            ),
+            other => panic!("expected the chunk planning to fail, got {other:?}"),
         }
         assert_eq!(status(&client, id).await, "waiting_to_backfill");
         let markers: i64 = client
@@ -1940,130 +2009,21 @@ mod catch_up_tests {
         )
         .await
         .expect("the retry discharges");
-        assert_eq!(status(&client, id).await, "live");
-    }
-
-    /// Issue #444: going live after a committed discharge flips the
-    /// definition and parks the catch-ups the flip calls for, and the two
-    /// commit together. When a park fails (injected here with a trigger
-    /// rejecting the catch-up on `public.d`, which a live definition reads),
-    /// the definition must not be left `live` with that catch-up lost. It is
-    /// handed back to `waiting_to_backfill` with its marker re-parked, and the
-    /// next pass takes it live.
-    #[tokio::test]
-    async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(&db).await;
-        client
-            .batch_execute(
-                "create table public.orders (id bigint primary key); \
-                 insert into public.orders values (1); \
-                 create publication test_pub; \
-                 insert into source_table_versions (source_table, version) \
-                 values ('public.orders', 1), ('public.d', 1);",
-            )
-            .await
-            .expect("seed the source table");
-        reconcile_publication(&mut client, "test_pub", &["public.orders".to_string()])
-            .await
-            .expect("reconcile parks a marker");
-        let id: i64 = client
-            .query_one(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.orders', 1, $1, 'waiting_to_backfill') \
-                 returning id",
-                &[&"TRANSFORM d FROM orders SELECT id AS x"],
-            )
-            .await
-            .expect("seed a deferred definition")
-            .get(0);
-        client
-            .batch_execute(
-                "insert into transform_definitions \
-                 (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.r', 'public.d', 1, '', 'live'); \
-                 create function reject_d_marker() returns trigger \
-                 language plpgsql as $$ \
-                 begin raise exception 'injected: cannot park a marker on %', new.table_name; end $$; \
-                 create trigger reject_d_marker before insert on pending_backfill \
-                   for each row when (new.table_name = 'public.d') \
-                   execute function reject_d_marker()",
-            )
-            .await
-            .expect("seed a live reader of public.d and the park-failure trigger");
-        async fn status(client: &tokio_postgres::Client, id: i64) -> String {
-            client
-                .query_one(
-                    "select status from transform_definitions where id = $1",
-                    &[&id],
-                )
-                .await
-                .expect("read status")
-                .get(0)
-        }
-        async fn markers(client: &tokio_postgres::Client) -> Vec<String> {
-            client
-                .query(
-                    "select table_name from pending_backfill order by table_name",
-                    &[],
-                )
-                .await
-                .expect("read markers")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect()
-        }
-
-        let outcome = run_pending_backfills(
-            &mut client,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::from_secs(600),
-        )
-        .await;
-        assert!(outcome.is_err(), "the injected park failure surfaces");
         assert_eq!(
             status(&client, id).await,
-            "waiting_to_backfill",
-            "a definition whose catch-up didn't park must not be live"
-        );
-        assert_eq!(
-            markers(&client).await,
-            ["public.orders"],
-            "the discharged marker is re-parked for the retry, and no catch-up is half-parked"
-        );
-
-        client
-            .batch_execute("drop trigger reject_d_marker on pending_backfill")
-            .await
-            .expect("drop the park-failure trigger");
-        run_pending_backfills(
-            &mut client,
-            "wake",
-            &StagedWatermark::saturated(),
-            Duration::from_secs(600),
-        )
-        .await
-        .expect("the retry discharges");
-        assert_eq!(status(&client, id).await, "live");
-        assert_eq!(
-            markers(&client).await,
-            ["public.d"],
-            "going live parks the catch-up on the target its reader reads"
+            "backfilling",
+            "the retry dispatches the definition's chunks"
         );
     }
 
     /// Issue #387, the server-side case: the marker delete fails inside the
     /// discharge transaction (forced here by a trigger), which leaves that
-    /// transaction aborted. Dropping it must roll it back *before* the revert
-    /// runs on the same connection, or the revert fails with "current
-    /// transaction is aborted". Meanwhile an operator pauses one promoted
-    /// definition and quarantines another while the discharge waits for
-    /// intake. The revert must hand back only the one still `backfilling`.
+    /// transaction aborted, and rolling it back must leave every definition
+    /// where it was. Meanwhile an operator pauses one waiting definition and
+    /// quarantines another while the discharge waits for intake: their
+    /// freezes stand, and the other stays `waiting_to_backfill`.
     #[tokio::test]
-    async fn a_failed_discharge_after_an_operator_freeze_reverts_only_backfilling() {
+    async fn a_failed_discharge_after_an_operator_freeze_leaves_every_definition_where_it_was() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (mut discharger, operator) = one_settled_marker(&db).await;
@@ -2098,8 +2058,7 @@ mod catch_up_tests {
 
         let watermark = StagedWatermark::new();
         let waiting = tokio::sync::Notify::new();
-        // `stop` is polled only while the enumeration waits for intake, which
-        // is after the promotion to `backfilling` has committed.
+        // `stop` is polled only while the enumeration waits for intake.
         let stop = || {
             waiting.notify_one();
             false
@@ -2420,6 +2379,321 @@ mod catch_up_tests {
             rollup_rows(&discharger).await,
             vec![(0, "12".to_string())],
             "group 1 went extinct after the orphan delete ran; its CDC delete drops it"
+        );
+    }
+}
+
+/// Issue #418 (ADR-0016): registration's marker comes from the reconcile
+/// pass, and the discharge dispatches each waiting definition's build by
+/// shape. These drive the pieces directly rather than waiting on a running
+/// staging worker (#297).
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    async fn connect(db: &testkit::TestDatabase) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+        client
+    }
+
+    /// `public.orders` with three rows (in two groups of `g`), a publication
+    /// that doesn't hold it yet, and its version row.
+    async fn seed(client: &tokio_postgres::Client) {
+        client
+            .batch_execute(
+                "create table public.orders (id bigint primary key, g int, a numeric); \
+                 alter table public.orders replica identity full; \
+                 insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 30); \
+                 create publication test_pub; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1)",
+            )
+            .await
+            .expect("seed the source table");
+    }
+
+    /// A definition row sourced from `source`, as registration leaves one.
+    async fn define(
+        client: &tokio_postgres::Client,
+        source: &str,
+        target: &str,
+        text: &str,
+        status: &str,
+    ) -> i64 {
+        client
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ($1, $2, 1, $3, $4) returning id",
+                &[&target, &source, &text, &status],
+            )
+            .await
+            .expect("seed a definition")
+            .get(0)
+    }
+
+    async fn status(client: &tokio_postgres::Client, id: i64) -> String {
+        client
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read status")
+            .get(0)
+    }
+
+    async fn markers(client: &tokio_postgres::Client) -> Vec<String> {
+        client
+            .query(
+                "select table_name from pending_backfill order by table_name",
+                &[],
+            )
+            .await
+            .expect("read markers")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    async fn chunks(client: &tokio_postgres::Client, id: i64) -> i64 {
+        client
+            .query_one(
+                "select count(*) from backfill_chunks where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("count chunks")
+            .get(0)
+    }
+
+    async fn staged(client: &tokio_postgres::Client) -> bool {
+        crate::staging::has_pending(client)
+            .await
+            .expect("read the ring")
+    }
+
+    async fn reconcile(client: &mut tokio_postgres::Client, desired: &[&str]) {
+        let desired: Vec<String> = desired.iter().map(|t| t.to_string()).collect();
+        reconcile_publication(client, "test_pub", &desired)
+            .await
+            .expect("reconcile");
+    }
+
+    /// Consumes an xid, so a fence parked just before has settled, then runs
+    /// one discharge pass with intake taken as caught up.
+    async fn discharge(client: &mut tokio_postgres::Client) {
+        client
+            .batch_execute("select txid_current()")
+            .await
+            .expect("consume an xid");
+        run_pending_backfills(
+            client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge");
+    }
+
+    /// ADR-0016's "Who parks the marker": a waiting definition's source gets
+    /// its marker from the reconcile pass that publishes it (the join
+    /// marker), from a later pass once it is already published, or at once
+    /// when it is another definition's target. A source this pass doesn't
+    /// publish gets none, since a marker could then discharge before the
+    /// table joined the stream.
+    #[tokio::test]
+    async fn the_reconcile_pass_parks_every_registrations_marker() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let text = "TRANSFORM d FROM orders SELECT a + a AS x";
+        define(
+            &client,
+            "public.orders",
+            "public.d",
+            text,
+            "waiting_to_backfill",
+        )
+        .await;
+
+        reconcile(&mut client, &[]).await;
+        assert!(
+            markers(&client).await.is_empty(),
+            "an unpublished source waits for the pass that publishes it"
+        );
+
+        reconcile(&mut client, &["public.orders"]).await;
+        assert_eq!(markers(&client).await, ["public.orders"], "the join marker");
+        discharge(&mut client).await;
+        assert!(
+            markers(&client).await.is_empty(),
+            "precondition: discharged"
+        );
+
+        // A second registration on the now-published source, and one chained
+        // off `public.d` (another definition's target, never published).
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.d', 1)",
+            )
+            .await
+            .expect("seed public.d's version row");
+        define(
+            &client,
+            "public.orders",
+            "public.e",
+            text,
+            "waiting_to_backfill",
+        )
+        .await;
+        define(
+            &client,
+            "public.d",
+            "public.f",
+            "TRANSFORM f FROM d SELECT x AS y",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+        assert_eq!(
+            markers(&client).await,
+            ["public.d", "public.orders"],
+            "an already-published source and a definition's target both get a marker"
+        );
+    }
+
+    /// A plain 1-1 definition is built by `backfill_chunks`: the discharge
+    /// enqueues them and moves it to `backfilling` in the same transaction,
+    /// and stages no ring enumeration when nothing else reads the table.
+    #[tokio::test]
+    async fn a_plain_one_to_one_definition_is_dispatched_as_chunks() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "backfilling");
+        assert_eq!(chunks(&client, id).await, 1);
+        assert!(!staged(&client).await, "no ring enumeration of the source");
+        assert!(
+            markers(&client).await.is_empty(),
+            "the marker is discharged"
+        );
+    }
+
+    /// A shape the direct build can't render (here a cyclic field-alias
+    /// chain) falls back to the ring: the discharge enumerates the source and
+    /// flips the definition straight from `waiting_to_backfill` to `live` in
+    /// the same transaction, with no `backfilling` in between (#404).
+    #[tokio::test]
+    async fn an_unsupported_shape_goes_live_by_ring_in_the_discharge() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT b + 1 AS a, a + 1 AS b",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "live");
+        assert_eq!(chunks(&client, id).await, 0);
+        assert!(
+            staged(&client).await,
+            "the source is enumerated into the ring"
+        );
+        assert!(markers(&client).await.is_empty());
+    }
+
+    /// An aggregate waiting on the discharge (one that deferred to an
+    /// unsettled marker, or a resumed one) is rebuilt by the ring until issue
+    /// #419 gives it a background direct build.
+    #[tokio::test]
+    async fn an_aggregate_waiting_on_the_discharge_is_rebuilt_by_ring() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.rollup",
+            "TRANSFORM rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "live");
+        assert!(staged(&client).await);
+    }
+
+    /// A chunked definition on a table another definition already reads
+    /// still gets the ring enumeration: the marker may carry a catch-up the
+    /// `live` reader needs, and the discharge can't tell.
+    #[tokio::test]
+    async fn a_live_reader_still_gets_the_enumeration_beside_a_chunked_build() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        seed(&client).await;
+        define(
+            &client,
+            "public.orders",
+            "public.old",
+            "TRANSFORM old FROM orders SELECT a AS x",
+            "live",
+        )
+        .await;
+        let id = define(
+            &client,
+            "public.orders",
+            "public.d",
+            "TRANSFORM d FROM orders SELECT a + a AS x",
+            "waiting_to_backfill",
+        )
+        .await;
+        reconcile(&mut client, &["public.orders"]).await;
+
+        discharge(&mut client).await;
+        assert_eq!(status(&client, id).await, "backfilling");
+        assert_eq!(chunks(&client, id).await, 1);
+        assert!(
+            staged(&client).await,
+            "the live reader's enumeration is staged"
         );
     }
 }

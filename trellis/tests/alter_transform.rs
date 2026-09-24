@@ -582,6 +582,11 @@ async fn combined_add_drop_alter_in_one_statement() {
 /// no running `Client`. This is the hand-driven stand-in for a drain worker
 /// that `defs_install_definition.rs` uses.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
+    // ADR-0016 (#418): registration only records a definition; the backfill
+    // discharge dispatches its chunks.
+    trellis::intake::publication::discharge_registrations(pool)
+        .await
+        .expect("dispatch registered definitions' builds");
     const CLAIMED_BY: &str = "alter_transform_test_backfill_worker";
     loop {
         let client = pool.get().await.expect("acquire connection");
