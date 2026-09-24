@@ -5948,8 +5948,8 @@ pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String 
 /// `=` (never `is not distinct from`): a 1-1 target's own primary-key columns
 /// are never nullable (`ddl::create_target_table` always declares them a
 /// real `primary key`, which Postgres makes `NOT NULL` unconditionally),
-/// unlike `apply_aggregate`'s `GROUP BY` keyset match, which does need the
-/// null-safe form for a nullable grouping column.
+/// unlike `apply_aggregate`'s `GROUP BY` keyset match, which also needs an
+/// `is null` arm for a nullable grouping column.
 pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
     pk.iter()
         .enumerate()

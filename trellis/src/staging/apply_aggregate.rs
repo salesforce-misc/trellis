@@ -190,6 +190,7 @@
 //! "Aggregate groups: the recompute horizon".
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -671,8 +672,8 @@ impl AggregateTargetPlan {
 /// `NULL`-keyed group could never round-trip through a *downstream* refetch:
 /// its encoded key looked exactly like "no row," which
 /// `staging::apply::read_live_rows_batch`'s `=`-based keyset join (also
-/// fixed by #110, to `is not distinct from` wherever a batch's key carries a
-/// `NULL` component) mistook for a delete. Both the encoding
+/// fixed by #110; since #446 it matches a `NULL` component with `is null`)
+/// mistook for a delete. Both the encoding
 /// (`ddl::pk_key_sql_expr`'s SQL-side `ddl::null_key_escape_sql`) and
 /// this Rust-side producer route every component through the same
 /// `NULL_KEY_SENTINEL` substitution, so a `NULL` group's key text agrees
@@ -2215,32 +2216,47 @@ fn keyset_unnest(group_by_types: &[ValueType], start: usize, with_ordinality: bo
     )
 }
 
-/// A `<alias>.<group col> <op> k.c<i>` conjunction, matching a row of `alias`
-/// against the keyset relation. `null_safe[i]` selects the operator per column:
+/// The distinct patterns of `NULL` `GROUP BY` columns among a keyset's groups
+/// (`arrays` shaped by [`transpose_group_values`]): `pattern[i]` is whether
+/// column `i` is `NULL`. Sorted, so the SQL [`keyset_match`] renders from
+/// them is deterministic. A batch with no `NULL` key has exactly one pattern,
+/// all `false`.
+fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
+    let group_count = arrays.first().map_or(0, Vec::len);
+    (0..group_count)
+        .map(|g| arrays.iter().map(|a| a[g].is_none()).collect())
+        .collect::<BTreeSet<Vec<bool>>>()
+        .into_iter()
+        .collect()
+}
+
+/// Matches a row of `alias` against the keyset relation: one arm per
+/// [`null_patterns`] entry, `or`ed together (and parenthesized) when there
+/// is more than one. Within an arm, column `i` is `<alias>.<col> = k.c<i>`,
+/// or `<alias>.<col> is null and k.c<i> is null` where the pattern has it
+/// `NULL`. A group matches only its own pattern's arm (the `k.c<i> is null`
+/// terms rule out every other), so this is exactly `is not distinct from` on
+/// every column.
 ///
-/// - `false` → plain `=`. Safe *and preferred* when no group in this batch
-///   binds a NULL for column `i`: with a non-NULL right-hand side, `col = k`
-///   and `col IS NOT DISTINCT FROM k` are identical (both reject NULL `col`),
-///   but `=` is hashable/indexable so Postgres can pick a Hash Join instead of
-///   the `IS NOT DISTINCT FROM` Nested Loop that rescans the whole keyset per
-///   source row (the O(table_size²/…) blowup behind issues #59/#62).
-/// - `true` → `is not distinct from`, required only for a column that actually
-///   carries a NULL group key in this batch (a NULL key never matches under
-///   `=`), for the same NULL-grouping reason [`group_where_clause`] uses it.
-fn keyset_match(group_by: &[String], alias: &str, null_safe: &[bool]) -> String {
-    group_by
+/// Never `is not distinct from` itself: that is neither hashable nor
+/// indexable, so a batch with one `NULL` key used to nested-loop over a
+/// sequential scan of the target (issue #445), and of the source before
+/// that (the O(table_size²/…) blowup behind issues #59/#62, which `=`'s Hash
+/// Join avoids). A batch with no `NULL` key renders the plain `=`
+/// conjunction; one with several patterns lets Postgres probe the target's
+/// `UNIQUE NULLS NOT DISTINCT` index once per arm through a `BitmapOr`.
+///
+/// One `or`ed condition rather than #433's `union all` of per-pattern arms
+/// because every statement this feeds must stay a single statement: the
+/// pre-lock takes every lock `FOR UPDATE` in one ascending order (which
+/// Postgres doesn't allow over a `UNION`), and the `update ... from`/
+/// `delete ... using` writes have no `union` form.
+fn keyset_match(group_by: &[String], alias: &str, patterns: &[Vec<bool>]) -> String {
+    let cols: Vec<String> = group_by
         .iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let op = if null_safe[i] {
-                "is not distinct from"
-            } else {
-                "="
-            };
-            format!("{alias}.{} {op} k.{}", quote_ident(col), keyset_col(i))
-        })
-        .collect::<Vec<_>>()
-        .join(" and ")
+        .map(|col| format!("{alias}.{}", quote_ident(col)))
+        .collect();
+    keyset_match_cols(&cols, patterns)
 }
 
 /// [`keyset_match`]'s source-side counterpart (issue #137): matches
@@ -2249,20 +2265,41 @@ fn keyset_match(group_by: &[String], alias: &str, null_safe: &[bool]) -> String 
 /// (optionally `LEFT JOIN`ed to `plan.rel_joins`) rather than to the target
 /// table, since a relationship-path `GROUP BY` key's value there comes from
 /// its own join alias, not `source`'s alias.
-fn keyset_match_source(plan: &AggregateTargetPlan, alias: &str, null_safe: &[bool]) -> String {
-    group_by_source_cols(plan, alias)
-        .into_iter()
-        .enumerate()
-        .map(|(i, col_sql)| {
-            let op = if null_safe[i] {
-                "is not distinct from"
-            } else {
-                "="
-            };
-            format!("{col_sql} {op} k.{}", keyset_col(i))
+fn keyset_match_source(plan: &AggregateTargetPlan, alias: &str, patterns: &[Vec<bool>]) -> String {
+    keyset_match_cols(&group_by_source_cols(plan, alias), patterns)
+}
+
+/// [`keyset_match`]'s rendering over already-rendered column references.
+fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
+    let arms: Vec<String> = patterns
+        .iter()
+        .map(|pattern| {
+            cols.iter()
+                .zip(pattern)
+                .enumerate()
+                .map(|(i, (col, &null))| {
+                    let k = keyset_col(i);
+                    if null {
+                        format!("{col} is null and k.{k} is null")
+                    } else {
+                        format!("{col} = k.{k}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" and ")
         })
-        .collect::<Vec<_>>()
-        .join(" and ")
+        .collect();
+    debug_assert!(!arms.is_empty(), "a keyset match needs at least one group");
+    match arms.as_slice() {
+        [arm] => arm.clone(),
+        _ => format!(
+            "({})",
+            arms.iter()
+                .map(|arm| format!("({arm})"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    }
 }
 
 /// The per-`GROUP BY`-column value arrays for `groups`, transposed so column
@@ -2313,14 +2350,9 @@ async fn apply_forced_groups_bulk(
     let arity = plan.group_by.len();
     let forced_groups: Vec<&GroupPlan> = forced.iter().map(|(_, g)| *g).collect();
     let arrays = transpose_group_values(arity, &forced_groups);
-    // Per-column: does any touched group bind a NULL key here? Only then does
-    // this column need the null-safe (non-hashable) match operator; otherwise
-    // plain `=` is equivalent and lets Postgres hash-join the keyset to the
-    // source instead of nested-looping it (see [`keyset_match`], #59/#62).
-    let null_safe: Vec<bool> = arrays
-        .iter()
-        .map(|a| a.iter().any(|v| v.is_none()))
-        .collect();
+    // Which columns each touched group binds a NULL for: see [`keyset_match`]
+    // (#59/#62, #445).
+    let patterns = null_patterns(&arrays);
     let source_ident = ddl::qualified_source_table(&plan.source);
     // `target` is always [`AggregateTargetPlan::target`]'s qualified
     // identity by the time this is called (reviewer follow-up to issue #74).
@@ -2345,7 +2377,7 @@ async fn apply_forced_groups_bulk(
     let survivor_sql = format!(
         "select distinct k.ord::bigint from {source_ident} s{rel_joins_sql} join {} on {}",
         keyset_unnest(&plan.group_by_types, 1, true),
-        keyset_match_source(plan, "s", &null_safe),
+        keyset_match_source(plan, "s", &patterns),
     );
     let survivor_params: Vec<&(dyn ToSql + Sync)> =
         arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -2467,7 +2499,7 @@ async fn apply_forced_groups_bulk(
             insert_cols.join(", "),
             select_exprs.join(", "),
             keyset_unnest(&plan.group_by_types, 1, false),
-            keyset_match_source(plan, "s", &null_safe),
+            keyset_match_source(plan, "s", &patterns),
             select_exprs[..arity].join(", "),
             group_idents.join(", "),
             update_sets.join(", "),
@@ -2487,7 +2519,7 @@ async fn apply_forced_groups_bulk(
              where {} and k.ord = any(${ord_param}::bigint[]) \
              returning k.ord::bigint",
             keyset_unnest(&plan.group_by_types, 1, true),
-            keyset_match(&plan.group_by, "t", &null_safe),
+            keyset_match(&plan.group_by, "t", &patterns),
         );
         let mut delete_params: Vec<&(dyn ToSql + Sync)> =
             arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
@@ -2669,7 +2701,7 @@ async fn probe_recompute_fields_bulk(
     txn: &Transaction<'_>,
     plan: &AggregateTargetPlan,
     key_arrays: &[Vec<Option<String>>],
-    null_safe: &[bool],
+    patterns: &[Vec<bool>],
     group_count: usize,
 ) -> Result<Vec<Vec<Option<String>>>, ApplyError> {
     let recompute_fields: Vec<&AggFieldPlan> = plan
@@ -2705,7 +2737,7 @@ async fn probe_recompute_fields_bulk(
         select_exprs.join(", "),
         rel_joins_sql(plan),
         keyset_unnest(&plan.group_by_types, 1, true),
-        keyset_match_source(plan, "s", null_safe),
+        keyset_match_source(plan, "s", patterns),
     );
     let params: Vec<&(dyn ToSql + Sync)> = key_arrays
         .iter()
@@ -3055,13 +3087,10 @@ async fn apply_delta_groups_bulk(
 
     let group_plans: Vec<&GroupPlan> = groups.iter().map(|(_, g)| *g).collect();
     let key_arrays = transpose_group_values(arity, &group_plans);
-    let null_safe: Vec<bool> = key_arrays
-        .iter()
-        .map(|a| a.iter().any(|v| v.is_none()))
-        .collect();
+    let patterns = null_patterns(&key_arrays);
 
     let recompute_values =
-        probe_recompute_fields_bulk(txn, plan, &key_arrays, &null_safe, groups.len()).await?;
+        probe_recompute_fields_bulk(txn, plan, &key_arrays, &patterns, groups.len()).await?;
 
     let (carriers, insert_cols_fields, insert_exprs_fields, update_sets) =
         build_delta_carriers(plan, groups, &recompute_values, &target_ident);
@@ -3082,7 +3111,7 @@ async fn apply_delta_groups_bulk(
     let update_sql = format!(
         "update {target_ident} set {} from {unnest_sql} where {}",
         update_sets.join(", "),
-        keyset_match(&plan.group_by, &target_ident, &null_safe),
+        keyset_match(&plan.group_by, &target_ident, &patterns),
     );
     let update_returning_sql = format!("{update_sql} returning k.ord::bigint");
     let updated_rows = txn.query(&update_returning_sql, &base_params).await?;
@@ -3121,7 +3150,7 @@ async fn apply_delta_groups_bulk(
         select_exprs.join(", "),
         pk_idents.join(", "),
         pk_idents.join(", "),
-        keyset_match(&plan.group_by, "ins", &null_safe),
+        keyset_match(&plan.group_by, "ins", &patterns),
     );
     let mut insert_params = base_params.clone();
     insert_params.push(&pending_ords);
@@ -3211,6 +3240,31 @@ async fn raise_extinct_horizon(txn: &Transaction<'_>, target: &str) -> Result<()
     Ok(())
 }
 
+/// [`apply_aggregate_target`]'s pre-lock: every touched group's existing
+/// target row (`target_ident`, aliased `t`), locked `FOR UPDATE` in one
+/// statement in ascending `GROUP BY`-column order, selecting `select` (which
+/// can read `t` and the keyset's `k.ord`). `patterns` are the keyset's
+/// [`null_patterns`], so a batch with a `NULL` group still probes the
+/// target's index (issue #445) under the same single lock order.
+fn prelock_sql(
+    plan: &AggregateTargetPlan,
+    target_ident: &str,
+    select: &str,
+    patterns: &[Vec<bool>],
+) -> String {
+    let order_by: Vec<String> = plan
+        .group_by
+        .iter()
+        .map(|c| format!("t.{}", quote_ident(c)))
+        .collect();
+    format!(
+        "select {select} from {target_ident} t join {} on {} order by {} for update of t",
+        keyset_unnest(&plan.group_by_types, 1, true),
+        keyset_match(&plan.group_by, "t", patterns),
+        order_by.join(", "),
+    )
+}
+
 /// Phase 3 for one aggregate target table. Every group this batch touched is
 /// written or deleted under a single ascending-ordered pre-lock taken up
 /// front (see below), then split by strategy:
@@ -3293,18 +3347,9 @@ pub(super) async fn apply_aggregate_target(
     // pre-lock, which is why a from-scratch backfill (all groups new) takes no
     // locks here and cannot contend.
     let prelock_arrays = transpose_group_values(arity, &all_groups);
-    let prelock_null_safe: Vec<bool> = prelock_arrays
-        .iter()
-        .map(|a| a.iter().any(|v| v.is_none()))
-        .collect();
     let prelock_params: Vec<&(dyn ToSql + Sync)> = prelock_arrays
         .iter()
         .map(|a| a as &(dyn ToSql + Sync))
-        .collect();
-    let order_by: Vec<String> = plan
-        .group_by
-        .iter()
-        .map(|c| format!("t.{}", quote_ident(c)))
         .collect();
     // The pre-lock returns each locked row's position in the keyset (so it
     // maps back to `group_keys[ord - 1]` exactly, with no re-encoding of the
@@ -3318,11 +3363,11 @@ pub(super) async fn apply_aggregate_target(
         Some(expr) => format!("k.ord, t.{horizon_col}, ({expr})::text"),
         None => format!("k.ord, t.{horizon_col}"),
     };
-    let prelock_sql = format!(
-        "select {prior_select} from {target_ident} t join {} on {} order by {} for update of t",
-        keyset_unnest(&plan.group_by_types, 1, true),
-        keyset_match(&plan.group_by, "t", &prelock_null_safe),
-        order_by.join(", "),
+    let prelock_sql = prelock_sql(
+        plan,
+        &target_ident,
+        &prior_select,
+        &null_patterns(&prelock_arrays),
     );
     let locked = txn.query(&prelock_sql, &prelock_params).await?;
     let mut prior_images: HashMap<&str, String> = HashMap::new();
@@ -3959,9 +4004,9 @@ mod tests {
     }
 
     /// A forced group whose key column is *NULL* must still be matched by the
-    /// bulk recompute. This is the case that keeps [`keyset_match`]'s null-safe
-    /// operator: with a NULL key, `col = k` never matches (even a NULL `col`),
-    /// so `null_safe` must flip that column back to `is not distinct from`.
+    /// bulk recompute. This is the case that keeps [`keyset_match`]'s `is
+    /// null` arm: with a NULL key, `col = k` never matches (even a NULL
+    /// `col`), so that column's pattern must match with `is null` instead.
     /// Guards against the `=` fast path (chosen when no key is NULL) ever
     /// swallowing a genuinely NULL-keyed group.
     #[tokio::test]
@@ -4045,6 +4090,204 @@ mod tests {
         assert_eq!(
             total, "12.00",
             "the NULL group's SUM must include both NULL-keyed source rows"
+        );
+    }
+
+    /// Issue #445: [`keyset_match`] renders one arm per [`null_patterns`]
+    /// entry. A batch with no NULL key keeps the plain `=` conjunction; a
+    /// NULL column matches with `is null` on both sides (so no other
+    /// pattern's group can match that arm); several patterns are `or`ed and
+    /// parenthesized, so a caller can still append `and ...`. Never `is not
+    /// distinct from`, which no index can serve.
+    #[test]
+    fn keyset_match_renders_one_arm_per_null_pattern() {
+        let group_by = vec!["g".to_string(), "h".to_string()];
+        let arrays = vec![
+            vec![Some("1".to_string()), None, Some("2".to_string())],
+            vec![Some("a".to_string()), Some("b".to_string()), None],
+        ];
+        assert_eq!(
+            null_patterns(&arrays),
+            vec![vec![false, false], vec![false, true], vec![true, false]]
+        );
+        assert_eq!(
+            null_patterns(&[vec![Some("1".to_string()), Some("2".to_string())]]),
+            vec![vec![false]],
+            "a batch with no NULL key has the one all-false pattern"
+        );
+
+        assert_eq!(
+            keyset_match(&group_by, "t", &[vec![false, false]]),
+            r#"t."g" = k.c0 and t."h" = k.c1"#
+        );
+        assert_eq!(
+            keyset_match(&group_by, "t", &[vec![false, true]]),
+            r#"t."g" = k.c0 and t."h" is null and k.c1 is null"#
+        );
+        assert_eq!(
+            keyset_match(&group_by, "t", &null_patterns(&arrays)),
+            r#"((t."g" = k.c0 and t."h" = k.c1) or "#.to_string()
+                + r#"(t."g" = k.c0 and t."h" is null and k.c1 is null) or "#
+                + r#"(t."g" is null and k.c0 is null and t."h" = k.c1))"#
+        );
+    }
+
+    /// Issue #445: [`apply_aggregate_target`]'s pre-lock over a batch that
+    /// includes NULL groups still probes the target's `UNIQUE NULLS NOT
+    /// DISTINCT` index, at a single-column and a composite `GROUP BY`, and
+    /// still locks exactly the batch's rows, reporting each one's own
+    /// ordinal. So does the delta path's `update ... from` over the same
+    /// keyset. Before the fix, one NULL group switched the whole batch's
+    /// match on that column to `is not distinct from`, which can't use the
+    /// index, so each was a nested loop over a sequential scan of the target.
+    #[tokio::test]
+    async fn prelock_probes_the_index_when_a_batch_binds_a_null() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table single (g int, total numeric, unique nulls not distinct (g)); \
+                 insert into single select g, g from generate_series(1, 200000) g; \
+                 insert into single values (null, 0); \
+                 analyze single; \
+                 create table composite (g int, h text, total numeric, \
+                                         unique nulls not distinct (g, h)); \
+                 insert into composite select g, 'k' || g, g from generate_series(1, 200000) g; \
+                 insert into composite values (null, 'k1', 0), (5, null, 0), (null, null, 0); \
+                 analyze composite;",
+            )
+            .await
+            .expect("seed large aggregate targets");
+        let int4 = ValueType::Integer(crate::integer::IntWidth::Int4);
+        let cases = [
+            (
+                "single",
+                vec!["g"],
+                vec![int4],
+                "t.g is null or t.g % 397 = 0",
+                2,
+            ),
+            (
+                "composite",
+                vec!["g", "h"],
+                vec![int4, ValueType::Text],
+                "t.g is null or t.h is null or t.g % 397 = 0",
+                4,
+            ),
+        ];
+        let txn = client.transaction().await.expect("begin");
+        for (table, group_by, types, batch, pattern_count) in cases {
+            let plan = AggregateTargetPlan::new(
+                &group_by
+                    .iter()
+                    .map(|c| crate::defs::ast::GroupByKey::Column(c.to_string()))
+                    .collect::<Vec<_>>(),
+                types,
+                vec![AggFieldPlan {
+                    name: "total".to_string(),
+                    value_type: ValueType::Numeric,
+                    kind: AggFieldKind::Sum,
+                }],
+                "src".to_string(),
+                table.to_string(),
+                HashMap::from([(
+                    "total".to_string(),
+                    Expr::FunctionCall {
+                        name: "SUM".to_string(),
+                        args: vec![Expr::Column("total".to_string())],
+                    },
+                )]),
+                Vec::new(),
+            );
+            // The batch, column-major like `transpose_group_values`, and
+            // each group's `total` (its row's own identity) by ordinal.
+            let cols: Vec<String> = group_by.iter().map(|c| format!("t.{c}::text")).collect();
+            let rows = txn
+                .query(
+                    &format!(
+                        "select {}, t.total::text from {table} t where {batch} \
+                         order by t.g nulls first limit 500",
+                        cols.join(", ")
+                    ),
+                    &[],
+                )
+                .await
+                .expect("batch");
+            assert_eq!(rows.len(), 500);
+            let arrays: Vec<Vec<Option<String>>> = (0..group_by.len())
+                .map(|j| rows.iter().map(|r| r.get(j)).collect())
+                .collect();
+            let totals: Vec<String> = rows.iter().map(|r| r.get(group_by.len())).collect();
+            let patterns = null_patterns(&arrays);
+            assert_eq!(patterns.len(), pattern_count, "{table}: NULL patterns");
+            let params: Vec<&(dyn ToSql + Sync)> =
+                arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+
+            let sql = prelock_sql(&plan, table, "k.ord, t.total::text", &patterns);
+            let update_sql = format!(
+                "update {table} set total = total from {} where {}",
+                keyset_unnest(&plan.group_by_types, 1, true),
+                keyset_match(&plan.group_by, table, &patterns),
+            );
+            for statement in [&sql, &update_sql] {
+                let plan: String = txn
+                    .query(&format!("explain {statement}"), &params)
+                    .await
+                    .expect("explain")
+                    .into_iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    plan.contains("Index") && !plan.contains("Seq Scan"),
+                    "{table}: should probe the group index, got:\n{plan}"
+                );
+            }
+
+            let locked: Vec<(i64, String)> = txn
+                .query(&sql, &params)
+                .await
+                .expect("pre-lock")
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            assert_eq!(locked.len(), 500, "{table}: every group's row is locked");
+            for (ord, total) in locked {
+                assert_eq!(
+                    total,
+                    totals[usize::try_from(ord - 1).expect("1-based")],
+                    "{table}: group {ord} locked its own row"
+                );
+            }
+        }
+
+        // The pre-#445 shape over a single-column batch with one NULL group
+        // can only plan a sequential scan, so the difference above is real.
+        let groups: Vec<Option<String>> = std::iter::once(None)
+            .chain((1..500).map(|i| Some((i * 397).to_string())))
+            .collect();
+        let plan: String = txn
+            .query(
+                "explain select k.ord from single t \
+                 join unnest($1::text[]::int[]) with ordinality as k(c0, ord) \
+                 on t.g is not distinct from k.c0 order by t.g for update of t",
+                &[&groups],
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Seq Scan"),
+            "the pre-#445 shape should not be able to probe the index, got:\n{plan}"
         );
     }
 
