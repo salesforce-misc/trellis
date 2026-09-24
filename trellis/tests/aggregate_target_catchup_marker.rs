@@ -296,18 +296,17 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         "sanity check: the chained aggregate built every group, NULL included"
     );
 
-    // Park the marker exactly as `park_backfill_catchup` does.
+    // Park the marker as `park_backfill_catchup` does: unfenced, for the
+    // discharge to fence when it reads it.
     client
         .execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ('public.sku_totals', pg_current_snapshot()) \
+            "insert into pending_backfill (table_name) values ('public.sku_totals') \
              on conflict (table_name) do nothing",
             &[],
         )
         .await
         .expect("park a catch-up marker on the aggregate target");
-    // Change both a real-keyed and the NULL-keyed group after the fence; this
-    // also consumes an xid, settling the fence.
+    // Change both a real-keyed and the NULL-keyed group after the park.
     client
         .batch_execute(
             "update sku_totals set total = 100 where sku = 'a'; \

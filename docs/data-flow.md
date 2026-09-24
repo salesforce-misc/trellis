@@ -88,17 +88,19 @@ Everything after registration runs in the background, driven by the staging
 worker's maintenance loop. Chunked builds and direct-build jobs execute on
 drain threads.
 
-1. **Join.** The source gets a `pending_backfill` marker. Its **fence** is the
-   snapshot (`pg_current_snapshot()`) of the transaction that parks it.
+1. **Join.** The source gets a `pending_backfill` marker, parked with no
+   **fence** yet. The first discharge pass to see the marker takes the fence,
+   the snapshot (`pg_current_snapshot()`) of a statement run after reading the
+   committed marker, and records it on the marker for later passes.
    - If the table isn't in the publication yet, the staging worker's reconcile
      pass (`reconcile_publication`) adds it and parks the marker in the same
      transaction. The fence has to cover every transaction that could have
-     written the table before the join committed. A fence taken inside the
-     `ALTER`'s own transaction falls short of a writer that starts between the
-     fence and the commit, so the discharge re-fences a marker the first time it
-     sees it, at a snapshot that postdates the commit
-     ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence);
-     *Planned (#431)*).
+     written the table before the join committed. A snapshot taken inside the
+     `ALTER`'s own transaction falls short of a writer that starts between that
+     snapshot and the commit. The discharge's fence postdates the commit, so it
+     waits out that writer too
+     ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence),
+     #431).
    - If the source needs no publication change, the staging worker's next
      reconcile pass parks the marker on it (`park_registration_markers`, in the
      same transaction as any publication change). That covers a table that is
@@ -109,11 +111,12 @@ drain threads.
 
    Only the staging worker changes the publication, including the shrink after
    a `DROP` (*Planned (#427)*). A table has at most one
-   marker, and a second park merges into it, keeping the later fence
+   marker, and a second park merges into it and clears its fence, so the
+   next pass fences it afresh
    ([intake](staging-and-claiming/01-intake-and-lsn-confirmation.md#adjacent-invariants-that-are-easy-to-miss)).
 2. **Wait.** The discharge (`run_pending_backfills_until`, once per maintenance
    pass) skips a marker until its fence settles: every transaction that was
-   open when it was parked has ended (`now.xmin > fence.xmax`). Because `xmin`
+   open when it was fenced has ended (`now.xmin > fence.xmax`). Because `xmin`
    is cluster-wide, an unrelated long transaction can hold this step up. That
    is safe, and the definition's `waiting_to_backfill` status is the signal
    ([observability](observability.md#backfill-status-and-the-xmin-caveat)).
@@ -156,11 +159,11 @@ drain threads.
 ### Why the path is gap-free
 
 - **Nothing falls between the read and the stream.** The capture snapshot is
-  taken after the fence settles. A transaction that was open at the join ended
-  before that, so the snapshot sees its commit (except for step 1's known gap).
-  Any commit the snapshot
-  doesn't see belongs to a transaction that began after the join, and the
-  stream carries it.
+  taken after the fence settles, and the fence postdates the join's commit. A
+  transaction that was open when the join committed had either ended by the
+  fence or was open at it and waited out, so the snapshot sees its commit. Any
+  commit the snapshot doesn't see belongs to a transaction that began after
+  the join, and the stream carries it.
 - **A commit both see is counted once.** Commits between the join and the
   capture snapshot are read *and* streamed. For a 1-1 target that's harmless,
   because apply re-evaluates the row from live state. For an aggregate, the

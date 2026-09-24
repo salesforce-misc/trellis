@@ -31,20 +31,20 @@ catalog row as `waiting_to_backfill`, and returns. Everything else happens in
 the background, on the staging worker's maintenance loop, through the existing
 marker-discharge machinery (`intake::publication::run_pending_backfills_until`):
 
-1. **Join.** The source gets a `pending_backfill` marker, fenced at the
-   snapshot of the transaction that parks it. The staging worker's reconcile
-   pass parks it (`reconcile_publication`), adding the table to the
-   publication in the same transaction if it isn't there yet (see
-   [Who parks the marker](#who-parks-the-marker)). The fence has to
-   cover every transaction that could have written the table before the join
-   committed, since the stream doesn't carry those writes. A fence taken inside
-   the `ALTER`'s own transaction falls slightly short of that, so the discharge
-   **re-fences a marker the first time it sees it**, at a snapshot necessarily
-   later than the `ALTER`'s commit (see [The join fence](#the-join-fence)).
+1. **Join.** The source gets a `pending_backfill` marker. The staging
+   worker's reconcile pass parks it (`reconcile_publication`), adding the
+   table to the publication in the same transaction if it isn't there yet (see
+   [Who parks the marker](#who-parks-the-marker)). The marker's **fence** has
+   to cover every transaction that could have written the table before the
+   join committed, since the stream doesn't carry those writes. A snapshot
+   taken inside the `ALTER`'s own transaction falls slightly short of that, so
+   a marker is parked with no fence and the discharge **fences it the first
+   time it sees it**, at a snapshot necessarily later than the `ALTER`'s
+   commit (see [The join fence](#the-join-fence)).
    Only the staging worker changes the publication, including the shrink after a
    `DROP` (see [Consequences](#consequences)).
 2. **Wait.** The discharge leaves the marker alone until its fence settles:
-   every transaction that was open when it was parked has ended. It then waits
+   every transaction that was open when it was fenced has ended. It then waits
    for intake to stage through the WAL position its read snapshot was taken at.
 3. **Capture and build.** The discharge picks the capture snapshot and
    dispatches each of the table's `waiting_to_backfill` definitions' build
@@ -94,10 +94,10 @@ direction is a bug (a marker on a table not yet streamed, or no marker ever
 for an already-published table). The staging worker knows exactly which
 tables it has just published, so it parks both cases and there is one owner.
 The cost is at most one reconcile pass of latency
-(`ClientOptions::reconcile_interval`), and the fence is taken later, which
+(`ClientOptions::reconcile_interval`), and the marker is parked later, which
 only makes it safer: the definition isn't `live` in the meantime, so nothing
-it could miss is folded anywhere, and the capture read comes after the later
-fence.
+it could miss is folded anywhere, and the fence and the capture read come
+later too.
 
 ### What each build reads
 
@@ -216,22 +216,36 @@ with a catch-up that reads only what changed.
 ### The join fence
 
 `reconcile_publication` parks the join marker inside the `ALTER PUBLICATION`'s
-own transaction, so its fence is a snapshot taken before the join commits. A
+own transaction, so any snapshot taken there predates the join's commit. A
 writer whose transaction id is assigned after that snapshot, and which writes
-the table before the `ALTER` commits, is neither waited for by the fence nor
-streamed (its write precedes the join); if it commits after the capture snapshot
-its row is lost on both sides. The window is short — the park is the `ALTER`
-transaction's last statement — but it has been reproduced on Postgres 17.
+the table before the `ALTER` commits, is neither waited for by a fence taken
+there nor streamed (its write precedes the join). If it commits after the
+capture snapshot its row is lost on both sides. The window is short, since the
+park is the `ALTER` transaction's last statement, but it was reproduced on
+Postgres 17 while the fence was still the parking transaction's own snapshot
+(#431).
 
-**The discharge re-fences a marker the first time it sees it.** The marker
-exists exactly when the `ALTER` committed, so any snapshot the discharge takes
-after reading the committed marker necessarily postdates the commit; it records
-that it re-fenced (so later passes reuse the confirmed fence) and waits on the
-new fence. This is crash-safe by construction: there is no window between the
-`ALTER` and the marker to recover from. Every marker is re-fenced uniformly,
-including ones parked where no `ALTER` happened (a table already in the
-publication, a resume catch-up); a new park of the same table resets it to
-unconfirmed. This is what keeps the join step gap-free.
+**The discharge fences a marker the first time it sees it** (#431). A park
+leaves the marker's `fence_snapshot` null. The marker exists exactly when the
+`ALTER` committed, so any snapshot the discharge takes after reading the
+committed marker necessarily postdates the commit. The first pass that reads
+an unfenced marker records the current snapshot as its fence
+(`confirm_fence`, scoped to the generation it read) and waits on it. Later
+passes wait on the recorded fence. This is crash-safe by construction: there
+is no window between the `ALTER` and the marker to recover from.
+
+Every marker is fenced this way, including ones parked where no `ALTER`
+happened (a table already in the publication, a resume catch-up, a go-live
+catch-up). A new park of the same table clears the fence, so the new
+generation is fenced afresh after its own commit. A go-live catch-up parked
+inside the flip's transaction therefore needs no second park after the
+commit. The pass that takes a fence waits for it to settle, bounded by the
+same timeout as its wait for intake (`fresh_fences_settled`). The writers a
+fresh fence names are normally ones in flight at that instant, so the cost is
+the accepted one: one extra fence wait per marker, normally milliseconds. A
+long transaction elsewhere in the cluster outlasts the bound and the marker
+waits for a later pass, which `waiting_to_backfill` already signals. This is
+what keeps the join step gap-free.
 
 ## Why
 
@@ -344,7 +358,7 @@ happens, and its role in this design.
 | Plain 1-1 chunk enqueue at registration | was `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | **Done (#418).** The discharge plans the chunks and enqueues them in its own transaction (`chunk_queue::dispatch_one_to_one`); drain threads still execute them |
 | Synchronous direct build inside registration | was `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | **Done (#419).** The discharge dispatches it as one background job (`chunk_queue::dispatch_direct_build`) that a drain thread runs ([The direct-build job](#the-direct-build-job)) |
 | Registration's defer branch | was `install_definition`'s `defer_if_fence_unsettled`, and `create_definition_inner`'s `backfill_marker_unsettled` check | **Done (#418, #419).** Registration always defers to the discharge, and the branch is gone |
-| Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` discharges | The one path |
+| Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` fences and discharges | The one path. **Done (#431):** the discharge fences every marker the first time it sees it ([The join fence](#the-join-fence)) |
 | Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. #436 makes it race-free |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
 | Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs |

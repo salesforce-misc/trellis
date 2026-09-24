@@ -637,8 +637,9 @@ pub async fn create_definition(
     definition.status = TransformStatus::Live;
     // Issue #315: a source that is another definition's target is never
     // published, and its writer's target-mutation seam only reached this
-    // definition once it was live. Parked after commit, as the discharge
-    // does, so the fence waits out every such writer.
+    // definition once it was live. The discharge fences the marker when it
+    // reads it (issue #431), after this commit, so the fence waits out every
+    // such writer.
     if is_definition_target(&**client, &definition.source_table).await? {
         crate::intake::publication::park_backfill_catchup(&**client, &definition.source_table)
             .await?;

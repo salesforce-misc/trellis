@@ -180,12 +180,13 @@ knife-edged guards:
   `pending_backfill` marker in one transaction, deletes the marker in the same
   transaction as the staging commit, and retries it on every setup pass. The marker
   carries a **transaction fence** so enumeration waits until every transaction in
-  flight at `ADD` time has settled. A fence taken inside the `ALTER`'s
-  transaction falls slightly short — a writer that starts between the fence and
-  the commit is neither covered nor streamed — so the discharge re-fences a
-  marker the first time it sees it, at a snapshot that postdates the commit
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#the-join-fence);
-  *Planned, #431*). This discharge is the **only** capture path:
+  flight at `ADD` time has settled. A snapshot taken inside the `ALTER`'s
+  transaction falls slightly short — a writer that starts between it and the
+  commit is neither covered nor streamed — so the marker is parked with no
+  fence, and the first discharge pass to see it takes one, at a snapshot that
+  postdates the commit, and records it for later passes
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#the-join-fence),
+  #431). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
   ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
@@ -199,8 +200,9 @@ knife-edged guards:
   marker, and the catch-ups that park one (a direct build going live, a column
   resume, `ALTER TRANSFORM`) can land while that table's marker is mid-discharge,
   after its enumeration snapshot is already fixed. Each park gives the marker a new
-  `generation` (keeping the later of the two fences), and discharge deletes only the
-  generation it read, skipping a row a park still has locked. The re-parked marker
+  `generation` (clearing its fence, so the next pass fences it afresh), and
+  discharge deletes only the generation it read, skipping a row a park still has
+  locked. The re-parked marker
   survives for the next pass, whose snapshot includes the park's commit (issues
   #311, #367).
 - **That enumeration overlaps the stream, so it must not get ahead of intake.** A
