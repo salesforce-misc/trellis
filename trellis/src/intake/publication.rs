@@ -1008,16 +1008,33 @@ async fn intake_caught_up(
 
 /// Undoes [`advance_deferred_definitions`]'s `waiting_to_backfill` ->
 /// `backfilling` promotion for exactly `ids`, when the discharge that
-/// promotion announced was deferred or failed instead of committing. Scoped to
-/// `ids` and to the `backfilling` status for the same reason that function
-/// is, so a definition an operator paused or quarantined meanwhile stays
-/// frozen.
+/// promotion announced was deferred or failed instead of committing, or
+/// committed but couldn't go live ([`hand_back_for_retry`]). Scoped to `ids`
+/// and to the `backfilling` status for the same reason that function is, so a
+/// definition an operator paused or quarantined meanwhile stays frozen.
 ///
-/// After a failed discharge this runs on the same connection as the
-/// transaction that just failed. That transaction may be aborted, and it was
+/// After a failed discharge (or a failed [`go_live`]) this runs on the same
+/// connection as the transaction that just failed. That transaction may be aborted, and it was
 /// dropped rather than rolled back explicitly. It is still safe: dropping a
 /// `tokio_postgres::Transaction` queues its `ROLLBACK` on the connection's
 /// request channel synchronously, so the server runs it before this update.
+async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    client
+        .execute(
+            "update transform_definitions set status = $1 where id = any($2) and status = $3",
+            &[
+                &TransformStatus::WaitingToBackfill.as_str(),
+                &ids,
+                &TransformStatus::Backfilling.as_str(),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Runs [`mark_definitions_live`] in its own transaction, so the flip and
 /// every catch-up it parks commit together or not at all (issue #444).
 async fn go_live(client: &mut tokio_postgres::Client, ids: &[i64]) -> Result<(), IntakeError> {
@@ -1047,23 +1064,6 @@ async fn hand_back_for_retry(
     revert_to_waiting(&txn, ids).await?;
     park_backfill_catchup(&txn, table).await?;
     txn.commit().await?;
-    Ok(())
-}
-
-async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    client
-        .execute(
-            "update transform_definitions set status = $1 where id = any($2) and status = $3",
-            &[
-                &TransformStatus::WaitingToBackfill.as_str(),
-                &ids,
-                &TransformStatus::Backfilling.as_str(),
-            ],
-        )
-        .await?;
     Ok(())
 }
 
