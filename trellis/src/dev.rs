@@ -74,6 +74,10 @@ pub mod staging {
     /// `retire_drained_segments` rides along because a forced seal must
     /// answer `RingFull` the same way the engine's own seal-on-demand does:
     /// retire what's retirable, then retry.
+    /// `converged_through` is the single, non-waiting check behind
+    /// `await_converged`, for a harness that must re-check the ring once
+    /// without starting another wait.
+    pub use crate::staging::converge::converged_through;
     pub use crate::staging::{
         StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,
         seal_phase2, watermark_token,

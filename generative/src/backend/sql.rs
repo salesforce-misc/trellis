@@ -24,7 +24,7 @@ use trellis::dev::defs::TransformStatus;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
-use trellis::dev::staging::{StagingError, await_converged, watermark_token};
+use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
 
 use crate::model::{Column, Op, Relationship, Table};
 
@@ -675,9 +675,10 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 /// returns the moment the definition flips `live` with its rows still
 /// undrained, or with its catch-up marker still parked.
 ///
-/// After the ring drains, both cheaper checks run once more, and the whole
-/// sequence repeats if either finds work again rather than returning on
-/// stale evidence. A marker can appear after its definition is already
+/// After the ring drains, both cheaper checks run once more, and then the
+/// ring once more against the same token (a marker can park and discharge in
+/// between, leaving only its enumeration behind). The whole sequence repeats
+/// if any of them finds work again rather than returning on stale evidence. A marker can appear after its definition is already
 /// `live`: a stale chunk given up after a rebuild went live parks one
 /// (`defs::chunk_queue`). A ring-built definition's go-live catch-ups
 /// don't: `intake::publication::go_live` parks them in the discharge's own
@@ -705,7 +706,15 @@ pub(super) async fn quiesce(
         let unsettled = unsettled_definitions(raw, defs).await?;
         let tables = pending_backfills(raw).await?;
         if unsettled.is_empty() && tables.is_empty() {
-            return Ok(());
+            // A marker parked and discharged between the ring wait and the
+            // reads above leaves no marker behind, only its enumeration in
+            // the ring. Those rows have no origin, so they gate every token,
+            // `token` included; intake's progress past it only ever grows,
+            // so this one check fails only if such rows appeared.
+            if converged_through(raw, token).await? {
+                return Ok(());
+            }
+            continue;
         }
         // Every wait above checks at least once even with the budget spent,
         // so without this a state that keeps reappearing would loop forever.
