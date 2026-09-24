@@ -285,6 +285,15 @@ mod lock_probe_tests {
                 advisory_lock_held(&**observer, key).await.expect("probe"),
                 "{key:#x} is held by another session"
             );
+            // Only that key: another instance's producer singleton (another
+            // schema's key) mustn't count. One neighbour differs in each
+            // half, so each half of the reassembly is actually compared.
+            for other in [key ^ 1, key ^ (1 << 32)] {
+                assert!(
+                    !advisory_lock_held(&**observer, other).await.expect("probe"),
+                    "{other:#x} is not held while {key:#x} is"
+                );
+            }
             holder
                 .execute("select pg_advisory_unlock($1)", &[&key])
                 .await
@@ -294,6 +303,31 @@ mod lock_probe_tests {
                 "{key:#x} was released"
             );
         }
+    }
+
+    /// Advisory locks are per database, and every instance on the default
+    /// schema shares one producer-singleton key. So a staging worker for the
+    /// same schema in another database on the server mustn't count.
+    #[tokio::test]
+    async fn advisory_lock_held_ignores_another_databases_lock() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let other_db = cluster.create_isolated_database().await;
+        let holder = other_db.pool.get().await.expect("holder connection");
+        let observer = db.pool.get().await.expect("observer connection");
+        let key = producer_singleton_lock_key(crate::config::DEFAULT_SCHEMA);
+        holder
+            .execute("select pg_advisory_lock($1)", &[&key])
+            .await
+            .expect("take the lock");
+        assert!(
+            !advisory_lock_held(&**observer, key).await.expect("probe"),
+            "another database's lock is not this database's"
+        );
+        assert!(
+            advisory_lock_held(&**holder, key).await.expect("probe"),
+            "the holder's own database sees it"
+        );
     }
 }
 

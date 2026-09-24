@@ -112,8 +112,10 @@ whether some connection holds this instance's producer singleton, the
 session-scoped advisory lock the staging worker's intake holds for as long as
 it streams. It needs no heartbeat, since Postgres frees the lock the moment a
 crashed worker's connection closes. It also reads `false` while a failed
-intake waits to restart (up to a minute between attempts), when nothing is
-captured either.
+intake waits to restart, when nothing is captured either. That wait starts at
+a second and doubles to a minute while intake keeps failing, so a single
+dropped connection reads `false` for about a second: page on it staying
+`false` across a few checks, not on one reading.
 
 **These are liveness checks, not backlog checks.** `true` means the worker is
 alive; it says nothing about whether it is keeping up. Use
