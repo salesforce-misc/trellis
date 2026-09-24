@@ -388,25 +388,9 @@ pub struct ManualBackend {
     /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
     /// `generative/tests/concurrent_convergence.rs`).
     maintenance_interval: Duration,
-    /// The Trellis **instance schema** this backend drives (issue #234,
-    /// `docs/instance-identity.md`): the schema its `Pool`/`raw` connection
-    /// pin `search_path` to, where its source tables are created, and — as
-    /// the qualifier on `ClientOptions::source_tables` — the schema its
-    /// engine client's publication is told to watch.
-    ///
-    /// Always `trellis::config::DEFAULT_SCHEMA` for every caller that
-    /// predates #234 (the constructors that don't name one), so nothing
-    /// about the single-instance properties changes. What #234 needed was
-    /// for this to stop being a *hardcoded constant* at the three places it
-    /// reaches SQL — `Backend::install`'s `source_tables` qualifier,
-    /// `install_definition`'s target-schema argument, and `snapshot`'s
-    /// `qualified_target_table` argument all used to spell `DEFAULT_SCHEMA`
-    /// / `"public"` literally, which silently pinned the whole backend to
-    /// exactly one instance per database no matter what its `Config` said.
-    schema: String,
     /// The schema this backend's transform *target* tables are created
-    /// under (`trellis::Config::target_schema`). Kept alongside
-    /// [`Self::schema`] for the same reason: two instances sharing one
+    /// under (`trellis::Config::target_schema`; issue #234,
+    /// `docs/instance-identity.md`): two instances sharing one
     /// database must not both write their targets into `public`, where two
     /// independently-generated programs' identically-named target tables
     /// would collide for reasons that have nothing to do with instance
@@ -414,7 +398,7 @@ pub struct ManualBackend {
     target_schema: String,
     /// The resolved [`Config`] this backend's [`Pool`] and every
     /// [`EngineClient`] it starts are built from — carrying
-    /// [`Self::schema`]/[`Self::target_schema`] (issue #234). Kept whole
+    /// the instance schema and [`Self::target_schema`] (issue #234). Kept whole
     /// rather than rebuilt at each use so the engine client, the oracle's
     /// pool, and this backend's own raw connection provably share one
     /// instance identity.
@@ -546,7 +530,6 @@ impl ManualBackend {
             application_threads,
             maintenance_interval: maintenance_interval
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
-            schema,
             target_schema,
             config,
         })
@@ -737,10 +720,11 @@ impl ManualBackend {
     /// gives a real source table (task E1: untracked-object noise) —
     /// including the same unconditional `replica identity full` (harmless,
     /// and keeps this table indistinguishable from a real one at the DDL
-    /// level) — but never registers it in `self.tables` and never hands its
-    /// name to the engine's `ClientOptions.source_tables`. Those are the
-    /// only two places a table needs to appear to be "tracked" by this
-    /// backend or watched by the engine (see [`ManualBackend::install`]/
+    /// level) — but never registers it in `self.tables`, and no definition
+    /// reads it, so the engine never publishes it (the staging worker
+    /// publishes exactly the tables registered definitions read, issue
+    /// #427). Those are the only ways a table is "tracked" by this backend
+    /// or watched by the engine (see [`ManualBackend::install`]/
     /// [`ManualBackend::snapshot`]), and `run::check_program`'s oracle never
     /// looks at "every table in the schema" either — it only ever resolves a
     /// definition's source/target through `Program.tables`/`Program.defs`
@@ -1044,21 +1028,12 @@ impl super::Backend for ManualBackend {
             self.defs.push(def.clone());
         }
 
-        let source_tables: Vec<String> = program
-            .tables
-            .iter()
-            // Issue #234: `self.schema`, not a hardcoded `DEFAULT_SCHEMA` —
-            // see that field's doc comment. This is the qualifier the
-            // engine's publication is told to watch, so a hardcoded
-            // constant here meant a second instance in another schema would
-            // have silently published *the first instance's* tables.
-            .map(|t| format!("{}.{}", self.schema, t.name))
-            .collect();
-        if !source_tables.is_empty() && self.engine_client.is_none() {
+        // The staging worker publishes whatever the definitions just
+        // registered read, straight from the catalog (issue #427).
+        if !program.tables.is_empty() && self.engine_client.is_none() {
             let mut options = ClientOptions {
                 staging_worker: true,
                 application_threads: self.application_threads,
-                source_tables,
                 maintenance_interval: self.maintenance_interval,
                 ..Default::default()
             };
@@ -1254,10 +1229,8 @@ impl super::Backend for ManualBackend {
     /// alongside whatever primary client `install` already started —
     /// confirming multiple clients can coexist draining the same ring (the
     /// module doc comment on `trellis::Client` claims this is supported; this
-    /// is where the generative suite exercises that claim). Never touches
-    /// `source_tables`: an application-only client doesn't consult it (see
-    /// `ClientOptions::source_tables`'s own doc comment), so this needs no
-    /// state beyond the dsn.
+    /// is where the generative suite exercises that claim). Needs no state
+    /// beyond the dsn.
     async fn scale_out(&mut self) -> Result<(), ManualBackendError> {
         let options = ClientOptions {
             staging_worker: false,

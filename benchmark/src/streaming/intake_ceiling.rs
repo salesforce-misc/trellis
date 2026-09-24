@@ -1,15 +1,19 @@
 //! Intake ceiling — issue #266's E3 (tests H2): a staging-worker client with
-//! **zero transforms and zero application threads**, so nothing ever drains
+//! **one transform and zero application threads**, so nothing ever drains
 //! the ring and every row reported came only from CDC intake's
-//! single-threaded `pgoutput` decode plus the ring append.
+//! single-threaded `pgoutput` decode plus the ring append. The one transform
+//! is there only so the staging worker publishes the table: it publishes
+//! exactly what registered definitions read (issue #427). Its capture marker
+//! is discharged while the table is still empty, before the baseline is
+//! sampled, so it adds nothing to the count.
 //!
 //! Reported as the hard ceiling every other throughput number in this suite
 //! sits under, per H2: "whether that path alone clears 100k rows/s — let alone
 //! 400k — is unknown and bounds every other number in this issue."
 //!
-//! There is no oracle check here, deliberately: with no transforms installed
-//! there is no target table to check, and the measured quantity *is* the ring
-//! row count. The equivalent integrity check is the offered-vs-appended
+//! There is no oracle check here, deliberately: nothing drains the ring, so
+//! the transform's target never moves, and the measured quantity *is* the
+//! ring row count. The equivalent integrity check is the offered-vs-appended
 //! comparison this already reports (`append_backlog`).
 //!
 //! **Mind the volume.** At [`Pace::Max`] the multi-connection generator
@@ -34,12 +38,16 @@ use trellis::ClientOptions;
 use trellis::config::DEFAULT_SCHEMA;
 
 use crate::scenario::connect_raw;
+use crate::streaming::chain::{install_chain_hops, wait_for_catch_up_discharged};
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
 use crate::streaming::load::{
     GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
 };
 
 const SOURCE_TABLE: &str = "intake_src";
+
+/// How long the startup capture of the (still empty) source may take.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Total rows across every physical ring table (`seg_0..seg_<RING_SIZE-1>`),
 /// discovered via `pg_tables` rather than hardcoding `RING_SIZE` — a private
@@ -181,10 +189,13 @@ pub async fn run(
     ))
     .await
     .expect("create intake-ceiling source table");
+    // Registered before the client starts, so the staging worker publishes
+    // the table at startup (see the module doc comment).
+    install_chain_hops(&db.pool, SOURCE_TABLE, 1).await;
 
     // Not built from `EngineTuning`: this scenario's defining property is
-    // `application_threads: 0` with no transforms at all, which is not a
-    // tuning of the streaming pipeline but the deliberate absence of it.
+    // `application_threads: 0`, which is not a tuning of the streaming
+    // pipeline but the deliberate absence of it.
     // `group_commit` (issue #274) is threaded through directly for the same
     // reason — the caller picks `Some(..)`/`None` explicitly rather than
     // inheriting whatever `ClientOptions::default()` happens to ship, so a
@@ -194,12 +205,12 @@ pub async fn run(
         ClientOptions {
             staging_worker: true,
             application_threads: 0,
-            source_tables: vec![format!("public.{SOURCE_TABLE}")],
             group_commit,
             ..Default::default()
         },
     )
     .expect("client start");
+    wait_for_catch_up_discharged(&raw, Instant::now() + SETUP_TIMEOUT).await;
 
     let baseline_ring_rows = total_ring_rows(&raw).await;
     let wal_lsn_before = wal_lsn(&raw).await;

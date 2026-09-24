@@ -57,11 +57,10 @@ impl Chain {
 /// Creates `public.<prefix>_src (id bigint primary key, val numeric)`, bare —
 /// no transforms yet.
 ///
-/// Split out from [`install_chain_hops`] because
-/// [`trellis::ClientOptions::source_tables`] (and the `ALTER PUBLICATION ADD
-/// TABLE` a staging-worker `Client::start` issues against it) needs this
-/// table to physically exist *before* the client starts, while the chain's
-/// transforms can only be installed *after* — see [`install_chain_hops`].
+/// Split out from [`install_chain_hops`] so a caller can create the table,
+/// start the client, and only then install the chain — see
+/// [`install_chain_hops`]. The staging worker publishes the table once the
+/// first hop reads it (issue #427).
 pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String {
     let source = format!("{prefix}_src");
     raw.batch_execute(&format!(

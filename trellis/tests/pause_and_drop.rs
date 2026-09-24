@@ -1407,109 +1407,20 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
 // Publication
 // ---------------------------------------------------------------------
 
-/// ADR-0014, "The publication shrinks by reconciliation": a drop does not
-/// hand-edit the publication. It reconciles against the definitions that
-/// remain — which removes a source table from replication only once nothing
-/// derives from it any longer, and leaves it in place while a sibling still
-/// does.
+/// ADR-0014, "The publication shrinks by reconciliation", as ADR-0016 amends
+/// it (issue #427): a drop only removes catalog rows and never touches the
+/// publication, so the process applying it needs no publication privileges.
+/// The staging worker's next reconcile pass shrinks the publication from the
+/// catalog; `client::reconcile_tests` covers that pass directly.
 #[tokio::test]
-async fn dropping_shrinks_the_publication_to_what_still_derives() {
+async fn dropping_leaves_the_publication_to_the_staging_worker() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 4).await;
-    seed_source(&raw, "shipments", 4).await;
-    raw.batch_execute("create publication trellis_pub for table trellis.orders, trellis.shipments")
-        .await
-        .expect("create a publication already covering both sources");
-
-    let trellis = define_only(db.dsn()).await;
-    trellis
-        .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
-        .await
-        .expect("define");
-    trellis
-        .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
-        .await
-        .expect("define a sibling over the same source");
-    trellis
-        .apply("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
-        .await
-        .expect("define over the other source");
-
-    trellis
-        .apply("PAUSE TRANSFORM order_rollup")
-        .await
-        .expect("pause");
-    trellis
-        .apply("DROP TRANSFORM order_rollup")
-        .await
-        .expect("drop one of two readers of `orders`");
-
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from pg_publication_tables \
-             where pubname = 'trellis_pub' and tablename = 'orders'"
-        )
-        .await,
-        1,
-        "`orders` stays published: a sibling definition still derives from it"
-    );
-
-    trellis
-        .apply("PAUSE TRANSFORM order_echo")
-        .await
-        .expect("pause");
-    trellis
-        .apply("DROP TRANSFORM order_echo")
-        .await
-        .expect("drop its last reader");
-
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from pg_publication_tables \
-             where pubname = 'trellis_pub' and tablename = 'orders'"
-        )
-        .await,
-        0,
-        "`orders` leaves replication once nothing derives from it any longer"
-    );
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from pg_publication_tables \
-             where pubname = 'trellis_pub' and tablename = 'shipments'"
-        )
-        .await,
-        1,
-        "...and the untouched source stays exactly where it was"
-    );
-}
-
-/// Reviewer regression (ADR-0014, "The publication shrinks by
-/// reconciliation"): the inline reconcile runs on a standalone
-/// `tokio_postgres` connection, which — unlike every pooled one — does not
-/// get `pool::session_bootstrap`'s `search_path`. A reconcile that has to
-/// *add* a table parks a `pending_backfill` marker, and against a non-`public`
-/// Trellis schema that failed `42P01` with the definition already gone.
-///
-/// A drop whose desired set is *larger* than the published one is ordinary:
-/// a define-only connection registered a second source after the pipeline
-/// last reconciled.
-#[tokio::test]
-async fn dropping_reconciles_a_publication_that_still_has_to_grow() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    seed_source(&raw, "orders", 4).await;
-    seed_source(&raw, "shipments", 4).await;
-    // Deliberately published for `orders` only: `shipments` joins on the
-    // next reconcile, which is the drop's.
     raw.batch_execute("create publication trellis_pub for table trellis.orders")
         .await
-        .expect("create a publication covering only one of the two sources");
+        .expect("create a publication covering the source");
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1517,29 +1428,14 @@ async fn dropping_reconciles_a_publication_that_still_has_to_grow() {
         .await
         .expect("define");
     trellis
-        .apply("TRANSFORM shipment_rollup FROM shipments GROUP BY g SELECT sum(a) AS total")
-        .await
-        .expect("define over the as-yet-unpublished source");
-
-    trellis
         .apply("PAUSE TRANSFORM order_rollup")
         .await
         .expect("pause");
     trellis
         .apply("DROP TRANSFORM order_rollup")
         .await
-        .expect("the drop's own reconcile must not fail over an unpinned search_path");
+        .expect("drop the source's only reader");
 
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from pg_publication_tables \
-             where pubname = 'trellis_pub' and tablename = 'shipments'"
-        )
-        .await,
-        1,
-        "reconciliation grows the publication as well as shrinking it"
-    );
     assert_eq!(
         count(
             &raw,
@@ -1547,8 +1443,8 @@ async fn dropping_reconciles_a_publication_that_still_has_to_grow() {
              where pubname = 'trellis_pub' and tablename = 'orders'"
         )
         .await,
-        0,
-        "...and `orders` left it with its last reader"
+        1,
+        "the drop leaves the publication alone; the staging worker's reconcile removes `orders`"
     );
 }
 

@@ -153,11 +153,7 @@ pub async fn run_depth(
     let raw = connect_raw(db.dsn()).await;
 
     let source = create_chain_source_table(&raw, &format!("d{depth}")).await;
-    let client = trellis::Client::start(
-        db.dsn(),
-        tuning.client_options(vec![format!("public.{source}")]),
-    )
-    .expect("client start");
+    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
 
     let chain = install_chain_hops(&db.pool, &source, depth).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;

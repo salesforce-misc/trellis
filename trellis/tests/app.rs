@@ -29,9 +29,9 @@ async fn create_table_with_fk_column(pool: &trellis::pool::Pool, name: &str, fk_
         .expect("create table with fk column");
 }
 
-/// Issue #83 WI3: `defs::all_source_tables` (which `app`'s crate-private
-/// `qualified_source_tables` passes straight through as the seed for
-/// [`trellis::ClientOptions::source_tables`] at staging startup) must seed the
+/// Issue #83 WI3: `defs::all_source_tables` (which the staging worker's
+/// publication set is built from, at startup and on every reconcile pass)
+/// must seed the
 /// full transitive closure of source tables, not just each definition's
 /// direct anchor. A definition anchored on
 /// `authors` with a to-many relationship to `posts` (the shape a
@@ -513,4 +513,52 @@ async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
         matches!(err, trellis::TrellisError::Db(_)),
         "a failed park is a plain database error, got {err:?}: {err}"
     );
+}
+
+/// Issue #427: the staging worker reads what to publish from the catalog
+/// itself, so it no longer needs a definition registered before it can start
+/// (this used to fail with `TrellisError::NoDefinitions`). It starts with an
+/// empty publication and a slot, ready to pick up whatever is applied later.
+#[tokio::test]
+async fn a_staging_connection_starts_with_no_definitions_registered() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+
+    let running = Trellis::connect(
+        config,
+        TrellisOptions {
+            staging: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a staging worker starts against an empty catalog");
+
+    let client = db.pool.get().await.expect("connection");
+    let published: i64 = client
+        .query_one(
+            "select count(*) from pg_publication_tables where pubname = 'trellis_pub'",
+            &[],
+        )
+        .await
+        .expect("read publication membership")
+        .get(0);
+    assert_eq!(
+        published, 0,
+        "nothing is registered, so nothing is published"
+    );
+    let slots: i64 = client
+        .query_one(
+            "select count(*) from pg_replication_slots \
+             where slot_name = 'trellis_slot' and database = current_database()",
+            &[],
+        )
+        .await
+        .expect("read replication slots")
+        .get(0);
+    assert_eq!(slots, 1, "the slot is created up front");
+    drop(client);
+
+    running.shutdown().await.expect("shutdown");
 }

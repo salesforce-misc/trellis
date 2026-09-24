@@ -54,10 +54,11 @@ Until #476 lands, a chunked or direct build's go-live catch-up can still be
 pending after `live`
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 
-*Planned (#427):* `DROP` still changes the publication from the process that
-applies it, so a process that drops transforms still needs publication
-privileges; the decided design moves that shrink to the staging worker's
-reconcile pass, driven from the catalog.
+Dropping a transform is the same: `DROP` removes catalog rows and nothing else,
+and the worker takes the source out of the publication on its next reconcile
+pass once nothing reads it (#427). The worker also doesn't need any transforms
+registered before it starts; it picks up each one on the pass after `apply`
+registers it.
 
 ```rust
 // The one dedicated worker process for this fleet.

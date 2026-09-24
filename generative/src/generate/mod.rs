@@ -2421,7 +2421,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
 /// `crate::backend::ManualBackend::snapshot`/`crate::run::check_program`
 /// only ever key off table *name*, and
 /// `crate::backend::ManualBackend::install_noise_table` never touches
-/// `self.tables`/`ClientOptions.source_tables` at all — a same-named column
+/// `self.tables`, and no definition reads it — a same-named column
 /// on an entirely different, untracked table cannot collide with anything.
 pub fn adversarial_noise_table() -> Table {
     noise_table("noise_untracked", "c0", "total", ValueType::Text)

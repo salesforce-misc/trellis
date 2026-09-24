@@ -148,11 +148,7 @@ pub async fn run_probe(
     let raw = connect_raw(db.dsn()).await;
 
     let source = create_chain_source_table(&raw, "shp").await;
-    let client = trellis::Client::start(
-        db.dsn(),
-        tuning.client_options(vec![format!("public.{source}")]),
-    )
-    .expect("client start");
+    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
 
     let chain = install_chain_hops(&db.pool, &source, 1).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;

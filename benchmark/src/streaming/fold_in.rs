@@ -338,11 +338,7 @@ pub async fn run_probe(
     .await
     .expect("create aggregate source table");
 
-    let client = trellis::Client::start(
-        db.dsn(),
-        tuning.client_options(vec![format!("public.{SOURCE_TABLE}")]),
-    )
-    .expect("client start");
+    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
 
     let columns: HashMap<_, _> = numeric_columns(&["id", GROUP_COLUMN, "val"]);
     let source_text = format!(

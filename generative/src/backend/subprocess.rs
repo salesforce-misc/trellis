@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 
 use testkit::crash::CrashGuard;
 use tokio_postgres::NoTls;
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::defs::{CatalogError, DdlError, create_relationship, install_definition};
 use trellis::dev::staging::StagingError;
@@ -195,12 +194,6 @@ pub struct SubprocessBackend {
     publication: String,
     application_threads: usize,
     maintenance_interval: Duration,
-    /// Remembered from the first successful [`SubprocessBackend::install`]
-    /// (which is the only call that ever computes it from a [`Program`]) so
-    /// [`SubprocessBackend::restart`] can respawn against the exact same
-    /// source-table set without the caller handing it back in — the
-    /// subprocess analog of `ManualBackend::client_options`.
-    source_tables: Vec<String>,
     /// The primary engine subprocess, once spawned. `None` before the first
     /// [`SubprocessBackend::install`] call that has at least one table.
     child: Option<CrashGuard>,
@@ -306,7 +299,6 @@ impl SubprocessBackend {
             application_threads,
             maintenance_interval: maintenance_interval
                 .unwrap_or_else(|| trellis::ClientOptions::default().maintenance_interval),
-            source_tables: Vec::new(),
             child: None,
             scale_out_children: Vec::new(),
             last_kill_status: None,
@@ -446,7 +438,6 @@ impl SubprocessBackend {
                     "1".to_string()
                 },
             )
-            .env("TRELLIS_SOURCE_TABLES", self.source_tables.join(","))
             .env("TRELLIS_SLOT", &self.slot)
             .env("TRELLIS_PUBLICATION", &self.publication)
             .env(
@@ -515,13 +506,9 @@ impl super::Backend for SubprocessBackend {
             self.defs.push(def.clone());
         }
 
-        let source_tables: Vec<String> = program
-            .tables
-            .iter()
-            .map(|t| format!("{DEFAULT_SCHEMA}.{}", t.name))
-            .collect();
-        if !source_tables.is_empty() && self.child.is_none() {
-            self.source_tables = source_tables;
+        // The staging worker publishes whatever the definitions just
+        // registered read, straight from the catalog (issue #427).
+        if !program.tables.is_empty() && self.child.is_none() {
             self.spawn_engine(true).await?;
         }
         Ok(())

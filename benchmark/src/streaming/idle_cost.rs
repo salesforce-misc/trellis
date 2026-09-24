@@ -1,6 +1,7 @@
 //! Idle cost — epic #269's **V-IDLE** (issue #268's X6): what a fully idle
 //! install costs the database. A staging worker plus N drain workers, a
-//! published source table that is never written to, and nothing else —
+//! published source table that is never written to, the one 1-1 transform
+//! that makes the staging worker publish it (issue #427), and nothing else —
 //! sampled for transactions/sec, WAL bytes/sec and seals/sec.
 //!
 //! All three come **from Postgres directly**, not from new engine metrics:
@@ -31,8 +32,15 @@ use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
-use crate::streaming::chain::create_chain_source_table;
+use crate::streaming::chain::{
+    create_chain_source_table, install_chain_hops, wait_for_catch_up_discharged,
+    wait_for_chain_live,
+};
 use crate::streaming::tuning::EngineTuning;
+
+/// How long installing the one transform and capturing its (empty) source may
+/// take before the warm-up starts.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn xact_commit(raw: &RawClient) -> i64 {
     raw.query_one(
@@ -126,11 +134,14 @@ pub async fn run(warmup: Duration, duration: Duration, tuning: &EngineTuning) ->
     let raw = connect_raw(db.dsn()).await;
 
     let source = create_chain_source_table(&raw, "idle").await;
-    let client = trellis::Client::start(
-        db.dsn(),
-        tuning.client_options(vec![format!("public.{source}")]),
+    let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
+    let chain = install_chain_hops(&db.pool, &source, 1).await;
+    wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
+    wait_for_catch_up_discharged(
+        &raw,
+        Instant::now() + SETUP_TIMEOUT + tuning.reconcile_interval,
     )
-    .expect("client start");
+    .await;
 
     tokio::time::sleep(warmup).await;
 

@@ -116,18 +116,18 @@ untouched.
 
 ### The publication shrinks by reconciliation
 
-A drop does not hand-edit the replication publication. After removing the definition it
-reconciles the publication against the definitions that remain, which removes a source
-table from replication only when nothing derives from it any longer. Correct by
-construction, and applied at drop time rather than deferred to a maintenance pass.
+A drop does not touch the replication publication. It removes the definition's catalog
+rows, and the staging worker's reconcile pass, which derives the publication from the
+catalog every `reconcile_interval`, removes a source table from replication once nothing
+derives from it any longer. A table a sibling definition still reads stays published.
+Correct by construction, with the catalog as the only input.
 
-> **Superseded by [ADR-0016](0016-single-background-capture-path.md) (#427).**
-> ADR-0016 makes the staging worker the only process that changes the
-> publication. The drop-time reconcile described here moves to the staging
-> worker's maintenance pass, which reconciles from the catalog on its own
-> cadence; `reconcile_publication_after_drop` goes away, and dropping a
-> transform no longer needs publication privileges. Code is *Planned (#427)*;
-> this section describes the pre-ADR-0016 behavior.
+The shrink is deferred to that pass rather than applied at drop time
+([ADR-0016](0016-single-background-capture-path.md), #427): the staging worker is the only
+process that changes the publication, so dropping a transform needs no publication
+privileges. The cost is that the table's changes keep being staged for up to one
+`reconcile_interval` with no reader, which is harmless, because apply skips a table
+nothing reads.
 
 ### Pause and drop are idempotent
 

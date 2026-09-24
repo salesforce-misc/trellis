@@ -320,8 +320,8 @@ pub struct Program {
 /// other) but never registers as tracked — never in a [`Program`]'s own
 /// `tables`, so `run::check_program`'s oracle can never resolve a
 /// definition's source/target against it (that function only ever walks
-/// `Program.tables`/`Program.defs`), and never handed to the engine's
-/// `ClientOptions.source_tables`, so CDC intake never watches it either.
+/// `Program.tables`/`Program.defs`), and no definition reads it, so the
+/// engine never publishes it and CDC intake never watches it either.
 /// Values follow the same rendered-text convention [`Op`] uses (`None` is
 /// SQL `NULL`).
 #[derive(Debug, Clone, PartialEq)]

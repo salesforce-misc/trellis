@@ -2,28 +2,19 @@
 //! CDC/apply pipeline until interrupted.
 //!
 //! Unlike `define`, this command can't just call `.migrate()` right after
-//! connecting: [`trellis::Trellis::connect`] with `staging: true` derives the
-//! source-table set from the catalog *during* connect, before this module
-//! ever gets a chance to run anything, and it errors immediately
-//! (`TrellisError::NoDefinitions`) if no definitions are registered yet.
-//! Migrating after that connect would be too late even if it created
-//! definitions — which it doesn't; migrations only create/update schema, not
-//! data. So there is no ordering of "connect once, then migrate" that helps
-//! here: an operator must have already run `trellis apply` (against a
-//! migrated database) before `run` will do anything useful, and that's a
-//! real prerequisite, not an oversight.
+//! connecting: [`trellis::Trellis::connect`] with `staging: true` starts the
+//! staging worker *during* connect, and the worker reads the catalog for the
+//! tables to publish before this module gets a chance to run anything. On a
+//! genuinely fresh database (no Trellis tables at all) that read would fail
+//! with a raw "relation does not exist" error. So this module opens a
+//! short-lived, no-options connection first, migrates on it, and shuts it
+//! down — that guarantees the catalog tables exist by the time the real
+//! `staging`/`drain_threads` connect runs, so a fresh database doesn't need a
+//! separate `migrate` step any more than `define` does.
 //!
-//! What `.migrate()` *is* still useful for here is the schema itself: on a
-//! genuinely fresh database (no Trellis tables at all), the catalog query
-//! `connect` runs to derive source tables would fail with a raw "relation
-//! does not exist" error rather than the engine's own clear
-//! `NoDefinitions` message. So this module opens a short-lived, no-options
-//! connection first, migrates on it, and shuts it down — that guarantees the
-//! catalog tables exist by the time the real `staging`/`drain_threads`
-//! connect runs, so a no-definitions-yet database surfaces the engine's own
-//! `NoDefinitions` message instead of a confusing SQL error, while a
-//! genuinely fresh database doesn't require a separate `migrate` step any
-//! more than `define` does.
+//! No definitions need to be registered yet (issue #427): the staging worker
+//! publishes nothing until `trellis apply` registers something, then picks
+//! it up on its next reconcile pass without a restart.
 //!
 //! ## `--prometheus-bind`
 //!
@@ -57,9 +48,8 @@ Usage: trellis run [--staging|--no-staging] [--drain-threads N]
                     [--prometheus-bind <ADDR>] [--database-url <URL>]
 
 Runs the live CDC/apply pipeline (staging worker and/or drain workers) until
-interrupted with Ctrl-C. Requires at least one TRANSFORM or RELATIONSHIP
-definition to already be registered (via `trellis apply`) against a
-migrated database.
+interrupted with Ctrl-C. Migrates the database first if needed. Definitions
+registered later (via `trellis apply`) are picked up without a restart.
 
 Options:
   --staging                  Run the CDC/staging worker. Default.
@@ -194,12 +184,9 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 pub async fn run(args: Args, database_url: Option<String>) -> Result<String, String> {
     let config = Config::resolve(database_url).map_err(|err| err.to_string())?;
 
-    // Migrate on a plain, no-background-work connection first. This isn't
-    // "run migrations before doing anything" for its own sake — it exists so
-    // that, on a genuinely fresh database, the staging connect below fails
-    // with the engine's clear `NoDefinitions` message rather than a raw
-    // "relation does not exist" from the catalog query `connect` runs
-    // internally when `staging` is set. See the module doc comment.
+    // Migrate on a plain, no-background-work connection first, so the
+    // catalog query the staging worker runs during `connect` finds its
+    // tables on a genuinely fresh database. See the module doc comment.
     let migrator = Trellis::connect(config.clone(), TrellisOptions::default())
         .await
         .map_err(|err| err.to_string())?;

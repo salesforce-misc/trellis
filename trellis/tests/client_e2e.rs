@@ -205,7 +205,6 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 2,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
@@ -299,7 +298,6 @@ async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 2,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
@@ -396,7 +394,7 @@ fn comments_calc_def() -> TransformDef {
 /// Issue #14's regression case: a transform registered — via
 /// `defs::create_definition`, mirroring what `defctl add` does under the
 /// hood — against a source table that was **not** in
-/// `ClientOptions::source_tables` at `Client::start` time must still get
+/// the catalog when `Client::start` ran must still get
 /// published and backfilled while that same client keeps running, with no
 /// restart. Before the fix, `reconcile_publication`/`run_pending_backfills`
 /// only ever ran once, from `setup_staging`, so `comments` would never join
@@ -415,7 +413,6 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 2,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         // A short reconcile cadence so the test doesn't have to wait out a
         // production-sized interval to observe the periodic re-reconcile.
         reconcile_interval: Duration::from_millis(200),
@@ -517,8 +514,7 @@ fn comments_calc_custom_schema_def() -> TransformDef {
 /// `public` — the schema the old bug guessed — while the real, registered
 /// source lives in `custom`, named explicitly via issue #76's `FROM
 /// custom.comments` grammar, registered *after* the client is already
-/// running (so its own initial `ClientOptions::source_tables` never named
-/// it — discovering it is exactly the periodic-reconcile job under test). A
+/// running (so the startup publication never named it — discovering it is exactly the periodic-reconcile job under test). A
 /// row inserted into `custom.comments` after registration must still reach
 /// `comments_calc`: that requires the periodic reconcile to have added
 /// `custom.comments` (not `public.comments`) to the publication, so CDC
@@ -537,7 +533,6 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 2,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         reconcile_interval: Duration::from_millis(200),
         ..Default::default()
     };
@@ -673,7 +668,6 @@ async fn staging_and_application_threads_are_independent_knobs() {
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 0,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");

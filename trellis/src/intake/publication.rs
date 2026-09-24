@@ -176,10 +176,8 @@ pub async fn reconcile_publication(
 /// before this one registered, it deletes the marker without dispatching
 /// this one. The definition is then left without a marker only until the
 /// staging worker's next pass, which parks one here. The staging worker
-/// runs this every reconcile pass, right before its discharge. The process
-/// that applies a `DROP` also runs it, through
-/// `Trellis::reconcile_publication_after_drop`, until #427 moves that
-/// reconcile to the staging worker.
+/// runs this every reconcile pass, right before its discharge, and is the
+/// only process that does (issue #427).
 pub(crate) async fn park_registration_markers(
     client: &impl GenericClient,
     published: &[String],

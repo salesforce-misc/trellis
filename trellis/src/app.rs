@@ -169,13 +169,14 @@ impl Trellis {
     ///
     /// With the default options nothing background runs — the returned handle
     /// is purely for defining transforms/relationships and inspecting the
-    /// catalog. With `staging` set, the source-table set is derived from the
-    /// registered definitions and CDC intake + ring maintenance start; with a
-    /// non-zero `drain_threads`, that many application workers start.
+    /// catalog. With `staging` set, CDC intake + ring maintenance start, and
+    /// the staging worker publishes whatever tables the registered
+    /// definitions read (none yet is fine); with a non-zero `drain_threads`,
+    /// that many application workers start.
     pub async fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let pool = Pool::new(&config)?;
         let client = if options.staging || options.drain_threads > 0 {
-            Some(Self::start_client(&config, &pool, &options).await?)
+            Some(Self::start_client(&config, &options)?)
         } else {
             None
         };
@@ -417,15 +418,16 @@ impl Trellis {
     }
 
     /// [`Statement::Drop`](defs::Statement::Drop)'s half of
-    /// [`apply`](Trellis::apply). Reconciles the publication only on a drop
-    /// that actually removed something — an idempotent no-op changed no
-    /// source-table set, so there is nothing to shrink.
+    /// [`apply`](Trellis::apply). Only removes catalog rows: it never touches
+    /// the publication (issue #427, ADR-0016). The staging worker's next
+    /// reconcile pass drops a table nothing reads any more, so the process
+    /// applying a `DROP` needs no publication privileges.
     async fn apply_drop(&self, reference: defs::DefinitionRef) -> Result<Applied, TrellisError> {
-        let outcome = match reference {
+        match reference {
             defs::DefinitionRef::Transform(target) => {
                 defs::lifecycle::drop_transform(&self.pool, &target)
                     .await
-                    .map_err(TrellisError::Catalog)?
+                    .map_err(TrellisError::Catalog)?;
             }
             defs::DefinitionRef::Relationship {
                 schema,
@@ -444,12 +446,8 @@ impl Trellis {
                     &name,
                 )
                 .await
-                .map_err(TrellisError::Catalog)?
+                .map_err(TrellisError::Catalog)?;
             }
-        };
-
-        if outcome == defs::lifecycle::DropOutcome::Dropped {
-            self.reconcile_publication_after_drop().await?;
         }
         Ok(Applied::Dropped)
     }
@@ -926,76 +924,6 @@ impl Trellis {
             .collect())
     }
 
-    /// Reconciles the replication publication against whatever definitions
-    /// are left, immediately after a drop (ADR-0014, "The publication shrinks
-    /// by reconciliation").
-    ///
-    /// Lives here rather than in `defs::lifecycle` for two reasons the engine
-    /// layer can't supply on its own:
-    /// [`crate::intake::publication::reconcile_publication`] needs a concrete
-    /// `tokio_postgres::Client` (not a pooled one — see its own doc comment
-    /// for why intake's session isn't available), and it needs the configured
-    /// publication name, which only the facade knows. It mirrors
-    /// [`crate::client`]'s own periodic `reconcile_source_tables` exactly:
-    /// derive the desired set from the catalog, then diff. Because
-    /// `defs::all_source_tables` walks the definitions that still exist, a
-    /// source table leaves the publication precisely when its last reader
-    /// does — never while a sibling definition still reads it.
-    ///
-    /// A publication that doesn't exist yet is skipped rather than an error:
-    /// a define-only connection that never ran with `staging: true` has no
-    /// publication to shrink, and refusing its drop over that would be
-    /// gratuitous.
-    async fn reconcile_publication_after_drop(&self) -> Result<(), TrellisError> {
-        let publication = ClientOptions::default().publication;
-        let exists: bool = self
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "select exists(select 1 from pg_publication where pubname = $1)",
-                &[&publication],
-            )
-            .await?
-            .get(0);
-        if !exists {
-            return Ok(());
-        }
-
-        let desired = defs::publication_tables(&self.pool)
-            .await
-            .map_err(TrellisError::Catalog)?;
-
-        let (mut client, connection) =
-            tokio_postgres::connect(self.config.dsn(), tokio_postgres::NoTls).await?;
-        let handle = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        // A bare `tokio_postgres::connect` lands on the *default*
-        // `search_path`, not the Trellis schema — unlike every pooled
-        // connection, which `pool::session_bootstrap` pins. Without this,
-        // `reconcile_publication`'s add path (which parks a
-        // `pending_backfill` marker for a table joining the publication)
-        // fails with a `42P01` "relation \"pending_backfill\" does not
-        // exist" against any non-`public` Trellis schema, so a drop that
-        // leaves the desired set *larger* than the published one reports
-        // `TrellisError::Publication` after the definition is already gone.
-        // Mirrors `client::connect_plain`'s own bootstrap.
-        client
-            .batch_execute(&format!(
-                "set search_path to {}, public; {}",
-                crate::pool::quote_ident(self.config.schema()),
-                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
-            ))
-            .await?;
-        let result =
-            crate::intake::publication::reconcile_publication(&mut client, &publication, &desired)
-                .await;
-        drop(client);
-        handle.abort();
-        result.map_err(TrellisError::Publication)
-    }
-
     /// Stops any background work this connection started (staging worker and
     /// drain workers) and waits for it to exit cleanly. A no-op for a
     /// connection that started none.
@@ -1193,27 +1121,12 @@ impl Trellis {
     }
 
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
-    /// connection. When staging, derives the source-table set from the
-    /// catalog (a staging worker needs it non-empty).
-    async fn start_client(
-        config: &Config,
-        pool: &Pool,
-        options: &TrellisOptions,
-    ) -> Result<Client, TrellisError> {
-        let source_tables = if options.staging {
-            let tables = qualified_source_tables(pool).await?;
-            if tables.is_empty() {
-                return Err(TrellisError::NoDefinitions);
-            }
-            tables
-        } else {
-            Vec::new()
-        };
-
+    /// connection. The staging worker reads the tables to publish from the
+    /// catalog itself (issue #427), so an empty catalog is fine.
+    fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
         let client_options = ClientOptions {
             staging_worker: options.staging,
             application_threads: options.drain_threads,
-            source_tables,
             ..Default::default()
         };
         // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
@@ -1326,27 +1239,6 @@ impl Trellis {
         }
         Ok(columns)
     }
-}
-
-/// The full transitive closure of source tables reachable from every
-/// registered definition — each definition's direct anchor table plus every
-/// relationship `to_table` reachable from one — each already schema-qualified
-/// for [`ClientOptions::source_tables`].
-///
-/// Issue #75, ADR-0007: [`defs::all_source_tables`] itself now returns each
-/// table's actual, already-persisted qualified identity, so this is a thin
-/// pass-through — it used to re-resolve every bare result against
-/// `information_schema`/`current_schemas(false)` (a `search_path` walk of
-/// exactly the kind ADR-0007 forbids downstream of definition-acceptance
-/// time), which broke for a source living outside this connection's
-/// `search_path` (e.g. an issue #76 explicit-schema source).
-///
-/// `pub(crate)`: [`Trellis::connect`]'s `start_client` is its only caller, and
-/// ADR-0012 keeps the facade's public surface to tier 1 and tier 2. What it
-/// passes through to — the transitive source-table closure — is covered
-/// directly in `trellis/tests/app.rs` against `defs::all_source_tables`.
-pub(crate) async fn qualified_source_tables(pool: &Pool) -> Result<Vec<String>, TrellisError> {
-    Ok(defs::publication_tables(pool).await?)
 }
 
 /// One registered transform definition's status, as [`Trellis::status`]
@@ -1645,9 +1537,6 @@ pub enum TrellisError {
     /// A direct Postgres query this facade runs itself (introspection,
     /// listing, backfill request) failed.
     Db(tokio_postgres::Error),
-    /// `staging` was requested but no transform definitions are registered,
-    /// so there is nothing to publish or stream.
-    NoDefinitions,
     /// A named source table doesn't resolve on the connection's search path.
     SourceTableNotFound(String),
     /// [`Trellis::request_backfill`] was asked to backfill a table that isn't
@@ -1728,13 +1617,10 @@ impl TrellisError {
             TrellisError::Client(err) => err.code(),
             TrellisError::Engine(err) => err.code(),
             TrellisError::Db(err) => error_code::classify_pg_error(err),
-            // `staging` requested with nothing registered, or a backfill
-            // request against an unpublished table, are both rejected calls
-            // given the connection's current state — same category as any
-            // other invalid-configuration error.
-            TrellisError::NoDefinitions | TrellisError::TableNotPublished { .. } => {
-                ErrorCode::Validation
-            }
+            // A backfill request against an unpublished table is a rejected
+            // call given the connection's current state — same category as
+            // any other invalid-configuration error.
+            TrellisError::TableNotPublished { .. } => ErrorCode::Validation,
             TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
             // Same category as `ClientError`'s equivalent thread-lifecycle
             // variants — an embedder can't do anything about these beyond
@@ -1766,11 +1652,6 @@ impl std::fmt::Display for TrellisError {
                 write!(f, "database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            TrellisError::NoDefinitions => write!(
-                f,
-                "no transform definitions registered; define one before running with staging \
-                 enabled"
-            ),
             TrellisError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
@@ -1831,8 +1712,7 @@ impl std::error::Error for TrellisError {
             TrellisError::Client(err) => Some(err),
             TrellisError::Engine(err) => Some(err),
             TrellisError::Db(err) => Some(err),
-            TrellisError::NoDefinitions
-            | TrellisError::SourceTableNotFound(_)
+            TrellisError::SourceTableNotFound(_)
             | TrellisError::TableNotPublished { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone
@@ -1898,11 +1778,6 @@ impl From<SelfCheckError> for TrellisError {
 #[cfg(test)]
 mod error_code_tests {
     use super::*;
-
-    #[test]
-    fn no_definitions_is_validation() {
-        assert_eq!(TrellisError::NoDefinitions.code(), ErrorCode::Validation);
-    }
 
     #[test]
     fn source_table_not_found_is_not_found() {
