@@ -2320,14 +2320,11 @@ fn transpose_group_values(arity: usize, groups: &[&GroupPlan]) -> Vec<Vec<Option
 /// — the aggregate analog of [`super::apply::apply_target`]'s bulk chunked
 /// write. Instead of `O(forced groups)` round trips (an existence probe plus
 /// one probe per field, per group — each a separate source scan), this is a
-/// fixed handful of statements regardless of group count:
+/// fixed two statements regardless of group count:
 ///
-/// 1. One `SELECT` over the source, joined to the bound keyset, returning the
-///    ordinals of forced groups that still have at least one source row (the
-///    survivors) — the bulk replacement for the per-group [`probe_group_exists`].
-/// 2. One `INSERT … SELECT <group cols>, <per-field aggregate exprs> FROM
+/// 1. One `INSERT … SELECT <group cols>, <per-field aggregate exprs> FROM
 ///    source JOIN keyset GROUP BY <group cols> ON CONFLICT DO UPDATE` that
-///    recomputes every survivor group's visible columns and hidden
+///    recomputes every surviving group's visible columns and hidden
 ///    `SUM`/`AVG` partials in a single grouped pass (the join restricts the
 ///    scan to touched groups, so extinct groups simply produce no row and are
 ///    never inserted). Each field's SELECT expression is built exactly as its
@@ -2336,9 +2333,12 @@ fn transpose_group_values(arity: usize, groups: &[&GroupPlan]) -> Vec<Vec<Option
 ///    `RecomputeOnly` field) — Postgres's `sum()` being NULL over zero
 ///    non-null values preserves the same "NULL, not 0" rule the per-group
 ///    path guards, with no extra `case` needed for the visible sum column.
-/// 3. One `DELETE … USING keyset` for the extinct groups (touched but with no
-///    surviving source row), the bulk replacement for the per-group
-///    [`delete_group_row`].
+///    Its `RETURNING` names the survivors (the groups it wrote), the bulk
+///    replacement for the per-group [`probe_group_exists`], read from the
+///    write's own snapshot (issue #388).
+/// 2. One `DELETE … USING keyset` for the extinct groups (touched, but the
+///    recompute found no source row), the bulk replacement for the
+///    per-group [`delete_group_row`].
 ///
 /// Callers must have already taken this batch's ascending-ordered pre-lock
 /// (see [`apply_aggregate_target`]) — this function's own statements lock
@@ -2363,8 +2363,8 @@ async fn apply_forced_groups_bulk(
     let group_idents: Vec<String> = plan.group_by.iter().map(|c| quote_ident(c)).collect();
     // Issue #94: to-one relationship joins onto the recompute's source scan,
     // so a `SUM(post.word_count)` field reads the joined to-side column.
-    // Issue #137: a relationship-path `GROUP BY` key needs this same join for
-    // its *survivor probe* too (unlike a plain-column key, whose existence
+    // Issue #137: a relationship-path `GROUP BY` key needs this same join to
+    // match its group at all (unlike a plain-column key, whose existence
     // never depended on one) — `keyset_match_source` below resolves such a
     // key's value through its own join alias, which only exists once the
     // join is present. The extinct-group DELETE still needs none (it matches
@@ -2372,36 +2372,21 @@ async fn apply_forced_groups_bulk(
     // relationship-free aggregate, leaving its SQL byte-identical.
     let rel_joins_sql = rel_joins_sql(plan);
 
-    // 1. Survivor ordinals: which forced groups still have a source row
-    // whose (possibly relationship-resolved) group key matches.
-    // The keyset joins onto `source` *after* its relationship joins, since
-    // the match can read a relationship alias (issue #330's review found
-    // the other order, where the `ON` names an alias not yet in scope).
-    let survivor_sql = format!(
-        "select distinct k.ord::bigint from {source_ident} s{rel_joins_sql} join {} on {}",
-        keyset_unnest(&plan.group_by_types, 1, true),
-        keyset_match_source(plan, "s", &patterns),
-    );
-    let survivor_params: Vec<&(dyn ToSql + Sync)> =
+    let keyset_params: Vec<&(dyn ToSql + Sync)> =
         arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-    let survivor_rows = txn.query(&survivor_sql, &survivor_params).await?;
-    let survivor_ords: std::collections::HashSet<i64> =
-        survivor_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
 
-    let mut written = Vec::new();
-    let mut extinct_ords: Vec<i64> = Vec::new();
-    for (i, (key, group)) in forced.iter().enumerate() {
-        let ord = (i + 1) as i64;
-        if survivor_ords.contains(&ord) {
-            written.push(((*key).clone(), group.hop_gen, group.src_changed));
-        } else {
-            extinct_ords.push(ord);
-        }
-    }
-
-    // 2. Bulk recompute of every survivor group (the join to the keyset means
-    // extinct groups produce no SELECT row, so this touches only survivors).
-    if !survivor_ords.is_empty() {
+    // 1. Bulk recompute of every forced group that still has a source row
+    // (the join to the keyset means an extinct group produces no SELECT row,
+    // so it is never inserted), reporting back which groups it wrote.
+    //
+    // Issue #388: the survivors are read off this statement's own output,
+    // not a separate probe. Phase 3 runs at READ COMMITTED, one snapshot per
+    // statement, so a probe and the write would read two snapshots: a group
+    // whose last source rows were deleted between them would count as a
+    // survivor yet get no row from the write, leaving its old value and old
+    // horizon standing while this batch's delta for it was discarded, with
+    // no extinct-horizon raise to send that delta back through a re-derive.
+    let survivor_ords: HashSet<i64> = {
         let mut insert_cols: Vec<String> = group_idents.clone();
         // Issue #137: a relationship-path `GROUP BY` key projects its
         // joined value, not a plain `s.<column>` — `group_by_source_cols`
@@ -2493,12 +2478,23 @@ async fn apply_forced_groups_bulk(
 
         // The `GROUP BY` mirrors the leading `arity` SELECT expressions
         // (`select_exprs`'s `s.<group col>` prefix), so reuse them rather
-        // than rebuilding the identical list.
+        // than rebuilding the identical list. The keyset joins onto `source`
+        // *after* its relationship joins, since the match can read a
+        // relationship alias (issue #330's review found the other order,
+        // where the `ON` names an alias not yet in scope). The outer query
+        // maps each row the `INSERT` returns back to its keyset ordinal by
+        // matching the target's own `GROUP BY` columns, the same way the
+        // extinct-group `DELETE` below does; it runs in the same statement,
+        // so it sees exactly what the `INSERT` wrote.
         let insert_sql = format!(
-            "insert into {target_ident} ({}) \
-             select {} from {source_ident} s{rel_joins_sql} join {} on {} \
-             group by {} \
-             on conflict ({}) do update set {}",
+            "with written as ( \
+               insert into {target_ident} ({}) \
+               select {} from {source_ident} s{rel_joins_sql} join {} on {} \
+               group by {} \
+               on conflict ({}) do update set {} \
+               returning {} \
+             ) \
+             select k.ord::bigint from written join {} on {}",
             insert_cols.join(", "),
             select_exprs.join(", "),
             keyset_unnest(&plan.group_by_types, 1, false),
@@ -2506,14 +2502,34 @@ async fn apply_forced_groups_bulk(
             select_exprs[..arity].join(", "),
             group_idents.join(", "),
             update_sets.join(", "),
+            group_idents.join(", "),
+            keyset_unnest(&plan.group_by_types, 1, true),
+            keyset_match(&plan.group_by, "written", &patterns),
         );
-        txn.query(&insert_sql, &survivor_params).await?;
+        let rows = txn.query(&insert_sql, &keyset_params).await?;
+        rows.iter().map(|r| r.get::<_, i64>(0)).collect()
+    };
+
+    let mut written = Vec::new();
+    let mut extinct_ords: Vec<i64> = Vec::new();
+    for (i, (key, group)) in forced.iter().enumerate() {
+        let ord = (i + 1) as i64;
+        if survivor_ords.contains(&ord) {
+            written.push(((*key).clone(), group.hop_gen, group.src_changed));
+        } else {
+            extinct_ords.push(ord);
+        }
     }
 
-    // 3. Extinct groups: touched, but no surviving source row — delete their
-    // target rows in one statement, `ord` telling us which we removed. (Their
-    // prior images, which a downstream aggregate needs to find the group they
-    // left, came from `apply_aggregate_target`'s pre-lock — issue #315.)
+    // 2. Extinct groups: touched, but the recompute above found no source
+    // row — delete their target rows in one statement, `ord` telling us
+    // which we removed. (Their prior images, which a downstream aggregate
+    // needs to find the group they left, came from `apply_aggregate_target`'s
+    // pre-lock — issue #315.) A commit that refills one of these groups after
+    // the recompute's snapshot is not lost: `apply_aggregate_target` raises
+    // the extinct horizon after this, so such a commit's delta either lands
+    // at or below it and re-derives the group, or committed after the raise
+    // and applies on top of the empty group this leaves.
     let mut deleted = Vec::new();
     if !extinct_ords.is_empty() {
         let ord_param = arity + 1;
@@ -3434,7 +3450,7 @@ pub(super) async fn apply_aggregate_target(
     if !forced.is_empty() {
         let (w, d) = apply_forced_groups_bulk(txn, target, plan, &forced).await?;
         // `w` holds exactly the survivors, so anything short of every forced
-        // group is one the survivor probe found empty.
+        // group is one the bulk recompute found empty.
         found_extinct |= w.len() < forced.len();
         written.extend(w);
         deleted.extend(d);
@@ -3487,7 +3503,7 @@ pub(super) async fn apply_aggregate_target(
         }
     }
 
-    // Issue #321: a live read (the forced path's survivor probe, or
+    // Issue #321: a live read (the forced path's bulk recompute, or
     // `probe_group_exists`) that found a group empty discarded this batch's
     // delta for it, so it may have absorbed commits whose deltas are still in
     // flight. That holds whether or not the group had a row to delete: an
@@ -4004,6 +4020,132 @@ mod tests {
             .expect("count order_summary")
             .get(0);
         assert_eq!(remaining, 0, "the stale target row must be gone");
+    }
+
+    /// Issue #388: a forced group whose last source rows are deleted while
+    /// the bulk recompute is on its way must come out extinct, not a
+    /// survivor. A second session deletes group 10's only row (uncommitted)
+    /// and holds a lock on the target that the recompute's write blocks on,
+    /// then commits once the apply is waiting — so everything the apply read
+    /// before its write saw the row, and the write itself does not. The old
+    /// separate survivor probe counted group 10 as surviving, so the write
+    /// produced nothing for it and its stale row (99) stayed standing with
+    /// no extinct report behind it.
+    #[tokio::test]
+    async fn apply_forced_groups_bulk_reports_a_group_emptied_before_its_write_as_extinct() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
+        let mut client = connect().await;
+        let mut locker = connect().await;
+        let observer = connect().await;
+
+        client
+            .batch_execute(
+                "create table order_items \
+                 (id integer primary key, order_id integer, amount numeric); \
+                 create table order_summary \
+                 (order_id numeric primary key, total numeric, __total_count bigint, \
+                  __trellis_recompute_lsn pg_lsn); \
+                 insert into order_items (id, order_id, amount) values (1, 10, 5.00), (2, 20, 7.00); \
+                 insert into order_summary (order_id, total, __total_count) \
+                 values (10, 99.00, 1), (20, 99.00, 1)",
+            )
+            .await
+            .expect("create source/target and seed stale target rows");
+
+        let plan = AggregateTargetPlan::new(
+            &[crate::defs::ast::GroupByKey::Column("order_id".to_string())],
+            vec![ValueType::Numeric],
+            vec![AggFieldPlan {
+                name: "total".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Sum,
+            }],
+            "order_items".to_string(),
+            "order_summary".to_string(),
+            HashMap::from([(
+                "total".to_string(),
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            )]),
+            Vec::new(),
+        );
+        let mut group_10 = GroupPlan::new(vec![Some("10".to_string())]);
+        group_10.force_full_recompute = true;
+        let mut group_20 = GroupPlan::new(vec![Some("20".to_string())]);
+        group_20.force_full_recompute = true;
+        let (key_10, key_20) = ("2:10".to_string(), "2:20".to_string());
+        let forced = vec![(&key_10, &group_10), (&key_20, &group_20)];
+
+        let ltxn = locker.transaction().await.expect("begin locker");
+        ltxn.batch_execute(
+            "delete from order_items where order_id = 10; \
+             lock table order_summary in share mode",
+        )
+        .await
+        .expect("delete group 10's last row and hold the target");
+
+        let pid: i32 = client
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("apply pid")
+            .get(0);
+        let txn = client.transaction().await.expect("begin");
+        let apply = apply_forced_groups_bulk(&txn, "order_summary", &plan, &forced);
+        let release = async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "select exists (select 1 from pg_stat_activity \
+                         where pid = $1 and wait_event_type = 'Lock')",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("poll apply's lock wait")
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            ltxn.commit().await.expect("commit locker");
+        };
+        let (result, ()) = tokio::join!(apply, release);
+        let (written, deleted) = result.expect("bulk apply");
+        txn.commit().await.expect("commit");
+
+        assert_eq!(
+            written,
+            vec![(key_20.clone(), 0, None)],
+            "only group 20 survives"
+        );
+        assert_eq!(
+            deleted,
+            vec![(key_10.clone(), 0, None)],
+            "group 10 was emptied before the recompute's write, so it is extinct"
+        );
+        let rows: Vec<(String, String)> = client
+            .query(
+                "select order_id::text, total::text from order_summary order by order_id",
+                &[],
+            )
+            .await
+            .expect("read order_summary")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(rows, vec![("20".to_string(), "7.00".to_string())]);
     }
 
     /// A forced group whose key column is *NULL* must still be matched by the
