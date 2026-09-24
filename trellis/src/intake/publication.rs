@@ -848,7 +848,34 @@ pub(crate) async fn run_pending_backfills_until(
         .await
         {
             Ok(Discharge::Committed) => {
-                mark_definitions_live(client, &advancing).await?;
+                // Issue #444: the flip and the catch-ups it parks commit
+                // together. A crash or a failed park between them would
+                // otherwise leave a definition `live` with its catch-up never
+                // parked, silently losing whatever that catch-up re-derives.
+                if let Err(error) = go_live(client, &advancing).await {
+                    tracing::warn!(
+                        table = %marker.table,
+                        ids = ?advancing,
+                        error = %error,
+                        "could not take backfilled definitions live; re-parking their marker"
+                    );
+                    // The discharge already deleted the marker, so handing
+                    // the definitions back to `waiting_to_backfill` alone
+                    // would strand them: only a marker's discharge promotes
+                    // them. Re-park it with the revert so the next pass
+                    // retries the whole discharge.
+                    if let Err(hand_back_error) =
+                        hand_back_for_retry(client, &marker.table, &advancing).await
+                    {
+                        tracing::warn!(
+                            table = %marker.table,
+                            ids = ?advancing,
+                            error = %hand_back_error,
+                            "could not hand backfilled definitions back for a retry"
+                        );
+                    }
+                    return Err(error);
+                }
             }
             Ok(Discharge::Deferred { horizon }) => {
                 revert_to_waiting(client, &advancing).await?;
@@ -991,6 +1018,38 @@ async fn intake_caught_up(
 /// dropped rather than rolled back explicitly. It is still safe: dropping a
 /// `tokio_postgres::Transaction` queues its `ROLLBACK` on the connection's
 /// request channel synchronously, so the server runs it before this update.
+/// Runs [`mark_definitions_live`] in its own transaction, so the flip and
+/// every catch-up it parks commit together or not at all (issue #444).
+async fn go_live(client: &mut tokio_postgres::Client, ids: &[i64]) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let txn = client.transaction().await?;
+    mark_definitions_live(&txn, ids).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// After a discharge committed but [`go_live`] failed: returns `ids` to
+/// `waiting_to_backfill` and re-parks `table`'s marker in one transaction, so
+/// the next pass promotes and discharges them again. Either half alone would
+/// strand them: a `backfilling` definition is never promoted again, and a
+/// `waiting_to_backfill` one only is by a marker's discharge.
+async fn hand_back_for_retry(
+    client: &mut tokio_postgres::Client,
+    table: &str,
+    ids: &[i64],
+) -> Result<(), IntakeError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let txn = client.transaction().await?;
+    revert_to_waiting(&txn, ids).await?;
+    park_backfill_catchup(&txn, table).await?;
+    txn.commit().await?;
+    Ok(())
+}
+
 async fn revert_to_waiting(client: &impl GenericClient, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());
@@ -1069,6 +1128,9 @@ async fn advance_deferred_definitions(
 /// re-parks a marker of its own and rebuilds by a fresh backfill — rather than
 /// being forced `live` behind the operator's back. Returns the ids actually
 /// flipped.
+///
+/// Parks the catch-ups the flip calls for on `client` too, so `client` must
+/// be a transaction ([`go_live`]'s) for the two to be atomic (issue #444).
 async fn mark_definitions_live(
     client: &impl GenericClient,
     ids: &[i64],
@@ -1098,19 +1160,30 @@ async fn mark_definitions_live(
             "transform status transition: backfill enumeration committed"
         );
     }
-    for id in &flipped {
-        park_target_catchup_if_read(client, *id).await?;
-    }
-    // Issue #315: a flipped definition whose source is another definition's
-    // target was enumerated while it was still `backfilling`, which the
-    // target-mutation seam skips, and that target is never in the
-    // publication. A write to it between the enumeration and this flip
-    // reached nobody, so park a fresh catch-up for the source now that the
-    // flip has committed (see `defs::catalog::create_definition_inner`'s
-    // matching step). The next discharge flips nothing, so this doesn't loop.
-    let sources: Vec<String> = client
+    // Two kinds of catch-up, both issue #315:
+    //
+    // - A flipped definition's target that some `live` definition reads (see
+    //   [`park_target_catchup_if_read`]): the enumeration wrote it outside
+    //   the target-mutation seam, so its readers re-derive from the result.
+    // - A flipped definition's source that is another definition's target:
+    //   it was enumerated while still `backfilling`, which the seam skips,
+    //   and that target is never in the publication. A write to it between
+    //   the enumeration and this flip reached nobody (see
+    //   `defs::catalog::create_definition_inner`'s matching step). The next
+    //   discharge flips nothing, so this doesn't loop.
+    //
+    // Parked in name order, as `defs::catalog::install_definition` does, so
+    // two transactions parking overlapping tables can't deadlock on each
+    // other's marker rows.
+    let mut tables: Vec<String> = client
         .query(
-            "select distinct d.source_table from transform_definitions d \
+            "select d.target_table from transform_definitions d \
+             where d.id = any($1) and exists ( \
+                 select 1 from transform_definitions r \
+                 where r.source_table = d.target_table and r.status = 'live' \
+             ) \
+             union \
+             select d.source_table from transform_definitions d \
              where d.id = any($1) and exists ( \
                  select 1 from transform_definitions u where u.target_table = d.source_table \
              )",
@@ -1120,8 +1193,10 @@ async fn mark_definitions_live(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    for source in sources {
-        park_backfill_catchup(client, &source).await?;
+    tables.sort_unstable();
+    tables.dedup();
+    for table in tables {
+        park_backfill_catchup(client, &table).await?;
     }
     if flipped.len() < ids.len() {
         let skipped: Vec<i64> = ids
@@ -1866,6 +1941,118 @@ mod catch_up_tests {
         .await
         .expect("the retry discharges");
         assert_eq!(status(&client, id).await, "live");
+    }
+
+    /// Issue #444: going live after a committed discharge flips the
+    /// definition and parks the catch-ups the flip calls for, and the two
+    /// commit together. When a park fails (injected here with a trigger
+    /// rejecting the catch-up on `public.d`, which a live definition reads),
+    /// the definition must not be left `live` with that catch-up lost. It is
+    /// handed back to `waiting_to_backfill` with its marker re-parked, and the
+    /// next pass takes it live.
+    #[tokio::test]
+    async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.orders (id bigint primary key); \
+                 insert into public.orders values (1); \
+                 create publication test_pub; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1), ('public.d', 1);",
+            )
+            .await
+            .expect("seed the source table");
+        reconcile_publication(&mut client, "test_pub", &["public.orders".to_string()])
+            .await
+            .expect("reconcile parks a marker");
+        let id: i64 = client
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.orders', 1, $1, 'waiting_to_backfill') \
+                 returning id",
+                &[&"TRANSFORM d FROM orders SELECT id AS x"],
+            )
+            .await
+            .expect("seed a deferred definition")
+            .get(0);
+        client
+            .batch_execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.r', 'public.d', 1, '', 'live'); \
+                 create function reject_d_marker() returns trigger \
+                 language plpgsql as $$ \
+                 begin raise exception 'injected: cannot park a marker on %', new.table_name; end $$; \
+                 create trigger reject_d_marker before insert on pending_backfill \
+                   for each row when (new.table_name = 'public.d') \
+                   execute function reject_d_marker()",
+            )
+            .await
+            .expect("seed a live reader of public.d and the park-failure trigger");
+        async fn status(client: &tokio_postgres::Client, id: i64) -> String {
+            client
+                .query_one(
+                    "select status from transform_definitions where id = $1",
+                    &[&id],
+                )
+                .await
+                .expect("read status")
+                .get(0)
+        }
+        async fn markers(client: &tokio_postgres::Client) -> Vec<String> {
+            client
+                .query(
+                    "select table_name from pending_backfill order by table_name",
+                    &[],
+                )
+                .await
+                .expect("read markers")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        let outcome = run_pending_backfills(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(outcome.is_err(), "the injected park failure surfaces");
+        assert_eq!(
+            status(&client, id).await,
+            "waiting_to_backfill",
+            "a definition whose catch-up didn't park must not be live"
+        );
+        assert_eq!(
+            markers(&client).await,
+            ["public.orders"],
+            "the discharged marker is re-parked for the retry, and no catch-up is half-parked"
+        );
+
+        client
+            .batch_execute("drop trigger reject_d_marker on pending_backfill")
+            .await
+            .expect("drop the park-failure trigger");
+        run_pending_backfills(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+        )
+        .await
+        .expect("the retry discharges");
+        assert_eq!(status(&client, id).await, "live");
+        assert_eq!(
+            markers(&client).await,
+            ["public.d"],
+            "going live parks the catch-up on the target its reader reads"
+        );
     }
 
     /// Issue #387, the server-side case: the marker delete fails inside the
