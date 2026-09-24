@@ -1156,7 +1156,12 @@ async fn mark_definitions_live(
 /// every commit that read misses is after the consistent point, and the slot
 /// streams it. A table `reconcile_publication` just added already has a join
 /// marker with an earlier fence. [`park_marker`] keeps the later fence, and
-/// the discharge reads it once either way.
+/// the discharge reads it once either way. That later fence postdates the
+/// join's commit, so it also covers a writer the join's own fence misses (one
+/// that starts between that fence and the `ALTER`'s commit; see ADR-0016's
+/// open item on the join fence). No discharge runs before this re-park: the
+/// maintenance loop starts only after setup, and a crash in between re-runs
+/// setup, which parks again.
 ///
 /// Every table in `tables` gets a marker, not only the newly published ones:
 /// a table already in the publication has no marker of its own, and without

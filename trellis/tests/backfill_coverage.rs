@@ -435,3 +435,65 @@ async fn install_definition_records_coverage_and_a_to_side_join_skips() {
     );
     assert_eq!(pending_marker_count(&client).await, 0);
 }
+
+/// Issue #417: the discharge skips a table no definition reads, but a table a
+/// definition reads only through a relationship still has a reader. Its marker
+/// must be enumerated, or a to-side row the definition never saw (#393's gap
+/// on a fresh install, say) would never re-derive the rows that depend on it.
+#[tokio::test]
+async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, name text); \
+             create table public.posts (id integer primary key, author_id integer, words integer); \
+             alter table public.posts replica identity full; \
+             insert into public.authors (id, name) values (1, 'a'), (2, 'b'); \
+             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5); \
+             create publication test_pub;",
+        )
+        .await
+        .expect("seed authors + posts");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP posts FROM authors.id TO posts.author_id",
+    )
+    .await
+    .expect("create posts relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_words FROM authors SELECT SUM(posts.words) AS word_sum",
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+        "public",
+    )
+    .await
+    .expect("install_definition via the direct relationship path");
+    // A write after the build's coverage fence, so coverage can't skip the
+    // enumeration either: only the reader check decides.
+    client
+        .batch_execute("insert into public.posts (id, author_id, words) values (102, 1, 7)")
+        .await
+        .expect("write posts after the build");
+
+    publication::reconcile_publication(&mut client, "test_pub", &["public.posts".to_string()])
+        .await
+        .expect("reconcile adds public.posts");
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+
+    assert_eq!(
+        recompute_count(&client, "public.posts").await,
+        3,
+        "a table read through a relationship has a reader, so it is enumerated"
+    );
+    assert_eq!(pending_marker_count(&client).await, 0);
+}
