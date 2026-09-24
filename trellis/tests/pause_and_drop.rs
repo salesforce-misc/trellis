@@ -1869,6 +1869,13 @@ async fn dropping_a_relationship_is_refused_while_a_live_transform_reads_it() {
         .apply("TRANSFORM author_stats FROM authors SELECT count(posts.id) AS post_count")
         .await
         .expect("define a transform that reads it");
+    // Registration only records it (#419); its direct-build job takes it live.
+    publication::settle_registrations(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "author_stats").await.as_deref(),
+        Some("live"),
+        "precondition: the reader is live"
+    );
 
     let err = trellis
         .apply("DROP RELATIONSHIP authors.posts")

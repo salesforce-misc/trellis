@@ -192,7 +192,35 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     )
     .await
     .expect("install the aggregate");
+    // Registration only records the aggregate (#419): run its direct-build
+    // job, then discharge the catch-up marker going live parks, so the only
+    // marker the rebuild below sees is the resume's.
+    drain_backfill_chunks(&db.pool).await;
+    publication::run_pending_backfills(
+        &mut client,
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the build's catch-up marker");
     drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(status(&client, "order_rollup").await, "live");
+    let built: Vec<(i64, String)> = client
+        .query(
+            "select g::bigint, total::text from order_rollup order by g",
+            &[],
+        )
+        .await
+        .expect("read order_rollup")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        built,
+        vec![(0, "12".to_string()), (1, "9".to_string())],
+        "precondition: group 0 is built before the pause"
+    );
 
     let operator = define_only(db.dsn()).await;
     operator

@@ -237,10 +237,9 @@ pub(crate) async fn park_target_catchup_if_read(
 /// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
 /// `pending_backfill` mechanism [`reconcile_publication`] already relies on
 /// for a table newly joining the publication (docs/decisions/0007's
-/// amendment). `defs::catalog::complete_direct_backfill` (and, for a
-/// synchronous build, `install_definition`, once per table the build read)
-/// calls this the moment a direct-build definition flips `backfilling` ->
-/// `live`: while it
+/// amendment). `defs::catalog::complete_direct_backfill` calls this, once
+/// per table the build read, the moment a chunk- or job-built definition
+/// flips `backfilling` -> `live`: while it
 /// sat non-`live`, [`super::super::defs::dependents_of`]'s status filter kept
 /// any live CDC delta for `qualified_table` from being folded into its
 /// target, so the definition's target may be missing whatever changed on
@@ -2980,6 +2979,61 @@ mod catch_up_tests {
             rollup_rows(&discharger).await,
             vec![(0, "12".to_string())],
             "group 1 went extinct after the orphan delete ran; its CDC delete drops it"
+        );
+    }
+
+    /// The extinct-horizon half of the build's horizon. Group 0 is emptied
+    /// while the definition is paused, with those deletes' CDC still staged
+    /// when it goes live again, and the discharge's orphan delete drops the
+    /// group's row, so the job writes none. A new row lands in the group after
+    /// the job read, and its CDC drains in one batch with the deletes, against
+    /// a group with no row. The deletes are at or below the extinct horizon
+    /// the build raised, so the group is re-derived: 100. Folded as deltas
+    /// instead, the deletes would subtract rows the build never counted: 88.
+    #[tokio::test]
+    async fn a_group_emptied_before_the_rebuild_reads_holds_only_its_new_rows() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) =
+            resumed_rollup(&db, "delete from public.orders where g = 0").await;
+        for id in [2, 4, 6] {
+            stage_order_cdc(
+                &mut discharger,
+                &id.to_string(),
+                crate::staging::CdcOp::Delete,
+                Some(&format!(r#"{{"id":"{id}","g":"0","a":"{id}"}}"#)),
+                None,
+            )
+            .await;
+        }
+
+        run_pending_backfills(
+            &mut discharger,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge the resume's marker");
+        settle_registrations(&pool).await;
+        discharger
+            .batch_execute("insert into public.orders values (10, 0, 100)")
+            .await
+            .expect("repopulate group 0 after the build read");
+        stage_order_cdc(
+            &mut discharger,
+            "10",
+            crate::staging::CdcOp::Insert,
+            None,
+            Some(r#"{"id":"10","g":"0","a":"100"}"#),
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "100".to_string()), (1, "9".to_string())],
+            "group 0 holds only its new row: the deletes the build already read don't reach it"
         );
     }
 }

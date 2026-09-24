@@ -165,7 +165,10 @@ stranded in `backfilling`:
   (`backfill_chunks.prior_attempts`), so the backoff grows across repeated
   failed builds instead of restarting at each dispatch. The retry is a fresh
   dispatch that re-checks the shape, so a build that failed `Unsupported`
-  because the catalog changed under it goes to the ring fallback. Releasing
+  because a relationship changed under it goes to the ring fallback. (The
+  check skips the aggregate build's to-side column typing, so a to-side
+  column dropped under a definition fails every retry instead, reported on
+  status.) Releasing
   the job for an immediate retry, as a failed chunk is, would re-run a
   whole-table build as fast as it can fail.
 
@@ -195,6 +198,10 @@ starting only after its marker's fence has settled:
   empty
   ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)),
   so such a delta re-derives its group instead of counting the commit twice.
+  A record also vouches only for its own build's write. A job a worker still
+  held across a resume can write its older read after the rebuild went live
+  and recorded coverage, so discarding that job clears the source's record as
+  it parks the source's catch-up, and the catch-up re-reads the source.
 - **Registration's defer check is gone.** Registration always defers now, so
   `defer_if_fence_unsettled` and the `backfill_marker_unsettled` check it asked
   are removed.

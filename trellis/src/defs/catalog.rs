@@ -5034,8 +5034,8 @@ struct PendingDefinition {
 /// discharge (parked via the same `pending_backfill` marker the ring-fallback
 /// path already relies on, inserted when a definition flips to
 /// [`TransformStatus::Live`]: by [`complete_direct_backfill`] for a chunked
-/// build, and by [`install_definition`] for a synchronous one, on every table
-/// that build read, issue #430) re-derives the definition's target from
+/// build or a direct-build job, on every table that build read, issue #430)
+/// re-derives the definition's target from
 /// current source state once it goes live, folding in anything skipped while
 /// it wasn't.
 ///
@@ -5718,8 +5718,8 @@ fn expr_references_column(
     }
 }
 
-/// Issue #331: every build-finished flip (`install_definition`'s synchronous
-/// build, and the chunk queue's last-chunk completion) goes through
+/// Issue #331: every build-finished flip (the chunk queue's completion of a
+/// definition's last chunk or its direct-build job) goes through
 /// [`go_live_if_backfilling`], which must only ever move a definition that is
 /// still `backfilling` — never one paused, quarantined or resumed meanwhile.
 #[cfg(test)]

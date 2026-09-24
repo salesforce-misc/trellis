@@ -1229,11 +1229,16 @@ fn to_one_joins(
 /// (ADR-0016, issue #419), so a shape the build can't render goes to the ring
 /// enumeration inside the discharge instead. It runs the same shape checks as
 /// the builds, through the same helpers, on the discharge's own connection.
-/// One check a build makes is left out: the aggregate build's field-type
-/// inference, which can't fail for a definition registration validated. A
+/// One step a build takes is left out: the aggregate build's resolution of
+/// each to-side column's type and its field-type inference, which can't fail
+/// for a definition registration validated against an unchanged schema. A
 /// catalog change between this check and the job (a relationship redefined,
 /// say) can still make the job hit `Unsupported`; that is a failed build like
-/// any other, handed back to the discharge, which asks this again.
+/// any other, handed back to the discharge, which asks this again and so
+/// routes a shape change to the ring. A change only that left-out step sees
+/// (a to-side column the definition reads, dropped from its table) passes
+/// this check every time, so the job keeps failing at the discharge's capped
+/// backoff, with the error on `Trellis::status`, rather than falling back.
 pub(crate) async fn check_direct_build(
     client: &impl GenericClient,
     def: &TransformDef,
