@@ -45,6 +45,20 @@ async fn recompute_count(client: &Client, src_table: &str) -> i64 {
         .get(0)
 }
 
+/// Registers a definition reading `widgets`, so the discharge has a reader to
+/// stage for (issue #417). Called while `widgets` is still empty, so the
+/// registration's own read stages nothing and every counted `Recompute` is
+/// the discharge's.
+async fn register_reader(db: &testkit::TestDatabase) {
+    trellis::defs::create_definition(
+        &db.pool,
+        "TRANSFORM widgets_reader FROM widgets SELECT id AS total",
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("register a definition reading widgets");
+}
+
 async fn pending_marker_count(client: &Client) -> i64 {
     client
         .query_one("select count(*) from pending_backfill", &[])
@@ -65,9 +79,13 @@ async fn covered_and_unchanged_table_skips_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source with pre-existing rows");
 
@@ -115,9 +133,13 @@ async fn a_write_after_the_coverage_fence_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source");
 
@@ -165,9 +187,13 @@ async fn a_table_with_no_coverage_is_enumerated_as_before() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key); \
-             insert into widgets (id) values (1), (2), (3); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
         .await
         .expect("seed source");
 
@@ -206,9 +232,13 @@ async fn an_update_after_the_coverage_fence_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key, label text); \
-             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c')")
         .await
         .expect("seed source");
 
@@ -262,9 +292,13 @@ async fn a_write_during_the_build_window_forces_full_enumeration() {
     client
         .batch_execute(
             "create table widgets (id bigint primary key, label text); \
-             insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c'); \
              create publication test_pub;",
         )
+        .await
+        .expect("create source");
+    register_reader(&db).await;
+    client
+        .batch_execute("insert into widgets (id, label) values (1, 'a'), (2, 'b'), (3, 'c')")
         .await
         .expect("seed source");
 

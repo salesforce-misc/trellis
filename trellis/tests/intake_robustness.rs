@@ -4,6 +4,7 @@
 //! startup error on slot loss. See
 //! docs/staging-and-claiming/01-intake-and-lsn-confirmation.md.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use pgwire_replication::{Lsn, ReplicationEvent};
@@ -11,6 +12,7 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::{ValueType, create_definition};
 use trellis::intake::{self, IntakeError, publication, spill};
 use trellis::staging::session::ProducerSession;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark};
@@ -25,6 +27,21 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("set search_path");
     client
+}
+
+/// Registers a definition reading `table`'s `id`, so the backfill discharge
+/// has a reader to stage for: it skips a table no definition reads (issue
+/// #417). Call it while `table` is still empty, so the registration's own
+/// read stages nothing and every staged row the test counts is the
+/// discharge's.
+async fn register_reader(db: &testkit::TestDatabase, table: &str) {
+    create_definition(
+        &db.pool,
+        &format!("TRANSFORM {table}_reader FROM {table} SELECT id AS total"),
+        &HashMap::from([("id".to_string(), ValueType::Numeric)]),
+    )
+    .await
+    .expect("register a definition reading the table");
 }
 
 async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
@@ -335,11 +352,15 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
     setup
         .batch_execute(
             "create table widgets (id bigint primary key);
-             insert into widgets (id) values (1), (2), (3);
              create publication test_pub;",
         )
         .await
-        .expect("create source table with pre-existing rows");
+        .expect("create source table");
+    register_reader(&db, "widgets").await;
+    setup
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
+        .await
+        .expect("seed pre-existing rows");
 
     // A straggling writer: opens (and holds open) a transaction with its own
     // xid before the ALTER runs, so the fence captured by reconcile must
@@ -455,6 +476,57 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
     );
 }
 
+/// Issue #417: a marker on a table no definition reads is discharged without
+/// enumerating it, since nothing would consume the `Recompute` rows. A fresh
+/// install parks one on every configured source table, used or not.
+#[tokio::test]
+async fn a_marker_on_a_table_nothing_reads_is_discharged_without_staging() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table widgets (id bigint primary key);
+             insert into widgets (id) values (1), (2), (3);
+             create publication test_pub;",
+        )
+        .await
+        .expect("create source table with pre-existing rows");
+
+    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("connect producer session");
+    publication::reconcile_publication(
+        session.client_mut(),
+        "test_pub",
+        &[format!("{DEFAULT_SCHEMA}.widgets")],
+    )
+    .await
+    .expect("reconcile adds widgets and parks a marker");
+    publication::run_pending_backfills(
+        session.client_mut(),
+        "wake",
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+
+    let staged: i64 = setup
+        .query_one("select count(*) from seg_0", &[])
+        .await
+        .expect("count seg_0")
+        .get(0);
+    assert_eq!(staged, 0, "a table nothing reads must not be enumerated");
+    let markers: i64 = setup
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count pending_backfill")
+        .get(0);
+    assert_eq!(markers, 0, "its marker is still discharged");
+}
+
 /// Issue #312: a backfill enumeration must not stage its `Recompute` rows
 /// until intake has staged everything the enumeration's snapshot can see.
 /// Otherwise the recompute can seal and drain ahead of the CDC for a change
@@ -470,11 +542,15 @@ async fn a_backfill_enumeration_waits_for_intake_to_stage_what_its_snapshot_saw(
     setup
         .batch_execute(
             "create table widgets (id bigint primary key);
-             insert into widgets (id) values (1), (2), (3);
              create publication test_pub;",
         )
         .await
-        .expect("create source table with pre-existing rows");
+        .expect("create source table");
+    register_reader(&db, "widgets").await;
+    setup
+        .batch_execute("insert into widgets (id) values (1), (2), (3)")
+        .await
+        .expect("seed pre-existing rows");
 
     let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
         .await
@@ -623,7 +699,7 @@ async fn connecting_with_no_progress_row_is_a_loud_startup_error() {
         .await
         .expect("create replication slot");
     // Deliberately skip seeding replication_progress — standing in for
-    // `initial_snapshot_handshake` never having run against this slot.
+    // `create_slot_and_park_markers` never having run against this slot.
 
     let config = intake::IntakeConfig {
         dsn: db.dsn().to_string(),
@@ -650,14 +726,14 @@ async fn connecting_with_no_progress_row_is_a_loud_startup_error() {
     }
 }
 
-/// The other half of finding 2: `initial_snapshot_handshake` is the code
+/// The other half of finding 2: `create_slot_and_park_markers` is the code
 /// that is supposed to create the `replication_progress` row (per
 /// `V4__replication_progress.sql`'s "whatever first uses a slot's name"),
 /// seeded at the slot's own consistent point — so a slot set up through it,
 /// and nothing else, must pass `Intake::connect`'s precondition check
 /// without the test seeding anything itself.
 #[tokio::test]
-async fn initial_snapshot_handshake_seeds_the_progress_row_connect_requires() {
+async fn fresh_slot_setup_seeds_the_progress_row_connect_requires() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -673,19 +749,35 @@ async fn initial_snapshot_handshake_seeds_the_progress_row_connect_requires() {
     let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
         .await
         .expect("connect producer session");
-    publication::initial_snapshot_handshake(
+    publication::create_slot_and_park_markers(
         &mut session,
         "handshake_slot",
         &[format!("{DEFAULT_SCHEMA}.widgets")],
     )
     .await
-    .expect("run initial snapshot handshake");
+    .expect("create the slot");
     drop(session);
 
     assert!(
         confirmed_lsn(&setup, "handshake_slot").await.is_some(),
-        "initial_snapshot_handshake must seed a replication_progress row"
+        "create_slot_and_park_markers must seed a replication_progress row"
     );
+    // Issue #417: `widgets` was already published, so no join parked a
+    // marker for it. Setup must, or its rows would never be captured.
+    let marked: Vec<String> = setup
+        .query("select table_name from pending_backfill", &[])
+        .await
+        .expect("read pending_backfill")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(marked, vec![format!("{DEFAULT_SCHEMA}.widgets")]);
+    let staged: i64 = setup
+        .query_one("select count(*) from seg_0", &[])
+        .await
+        .expect("count seg_0")
+        .get(0);
+    assert_eq!(staged, 0, "slot setup must read no source rows itself");
 
     let config = intake::IntakeConfig {
         dsn: db.dsn().to_string(),
@@ -704,20 +796,20 @@ async fn initial_snapshot_handshake_seeds_the_progress_row_connect_requires() {
     };
     intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
         .await
-        .expect("connect must succeed once the handshake has seeded the row");
+        .expect("connect must succeed once slot setup has seeded the row");
 }
 
 /// Finding 1: `pg_create_logical_replication_slot` persists the slot to disk
 /// the instant it returns, independent of the transaction
-/// `initial_snapshot_handshake` runs it in — so a crash between slot creation
-/// and that handshake's own commit leaves the slot on disk with no
+/// `create_slot_and_park_markers` runs it in — so a crash between slot creation
+/// and that function's own commit leaves the slot on disk with no
 /// `replication_progress` row. Reproduced directly (create the slot with raw
-/// SQL, seed no row) rather than by actually crashing mid-handshake; the
-/// resulting on-disk state is identical either way. Re-running the handshake
+/// SQL, seed no row) rather than by actually crashing mid-setup; the
+/// resulting on-disk state is identical either way. Re-running slot setup
 /// against this state must not die at slot-create with "already exists" — it
 /// must name the orphan so an operator can drop and retry.
 #[tokio::test]
-async fn initial_snapshot_handshake_reports_an_orphaned_slot_instead_of_retrying_blind() {
+async fn fresh_slot_setup_reports_an_orphaned_slot_instead_of_retrying_blind() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -742,7 +834,7 @@ async fn initial_snapshot_handshake_reports_an_orphaned_slot_instead_of_retrying
         .await
         .expect("connect producer session");
 
-    match publication::initial_snapshot_handshake(
+    match publication::create_slot_and_park_markers(
         &mut session,
         "orphan_slot",
         &[format!("{DEFAULT_SCHEMA}.widgets")],
@@ -774,15 +866,15 @@ async fn initial_snapshot_handshake_reports_an_orphaned_slot_instead_of_retrying
 /// name.
 ///
 /// Reproduced directly with two isolated databases sharing one
-/// `TestCluster`: `db_a` creates a real slot; `db_b`'s handshake for a slot
+/// `TestCluster`: `db_a` creates a real slot; `db_b`'s slot setup for a slot
 /// of the *same name* must not call it *its own* orphan. Post-fix, the
 /// scoped existence check correctly reports "no such slot in this
-/// database", so the handshake proceeds to actually create one — and
+/// database", so slot setup proceeds to actually create one — and
 /// Postgres's own cluster-wide slot-name uniqueness constraint rejects that,
 /// surfacing as a plain [`IntakeError::Db`] rather than a misleading
 /// [`IntakeError::OrphanedSlot`].
 #[tokio::test]
-async fn initial_snapshot_handshake_does_not_mistake_another_databases_slot_for_its_own_orphan() {
+async fn fresh_slot_setup_does_not_mistake_another_databases_slot_for_its_own_orphan() {
     let cluster = TestCluster::start();
     let db_a = cluster.create_isolated_database().await;
     let db_b = cluster.create_isolated_database().await;
@@ -807,13 +899,13 @@ async fn initial_snapshot_handshake_does_not_mistake_another_databases_slot_for_
         .await
         .expect("create a real replication slot on db_a");
 
-    // db_b never created a slot by this name at all — its own handshake for
+    // db_b never created a slot by this name at all — its own slot setup for
     // the same name must not be told it's *its own* crash-orphaned slot.
     let mut session_b = ProducerSession::connect(db_b.dsn(), DEFAULT_SCHEMA)
         .await
         .expect("connect producer session for db_b");
 
-    match publication::initial_snapshot_handshake(&mut session_b, "shared_name_slot", &[]).await {
+    match publication::create_slot_and_park_markers(&mut session_b, "shared_name_slot", &[]).await {
         Err(IntakeError::OrphanedSlot { slot }) => panic!(
             "db_b misdiagnosed db_a's slot {slot:?} as its own orphan — \
              slot_is_orphaned must scope its pg_replication_slots check by \
@@ -821,13 +913,13 @@ async fn initial_snapshot_handshake_does_not_mistake_another_databases_slot_for_
         ),
         Err(IntakeError::Db(_)) => {
             // Expected: the scoped check correctly says "not this
-            // database's slot", so the handshake goes on to actually try
+            // database's slot", so slot setup goes on to actually try
             // `pg_create_logical_replication_slot`, which Postgres itself
             // rejects — the name is taken cluster-wide, just not by db_b.
         }
         Err(other) => panic!("expected IntakeError::Db (slot name collision), got {other:?}"),
         Ok(()) => {
-            panic!("db_b's handshake must not succeed while db_a still holds the same slot name")
+            panic!("db_b's slot setup must not succeed while db_a still holds the same slot name")
         }
     }
 

@@ -191,20 +191,21 @@ call), execute on drain threads.
 
 ### A fresh install
 
-A fresh install creates the replication slot and makes sure every published
-table has a marker. It reads no source table itself. The first discharge pass
-reads each table after the slot exists, so every commit the read misses comes
-after the slot's consistent point and is streamed. A lost slot is recovered the
-same way (`intake::slot_loss`): the slot is recreated without a read, and each
-paused transform's resume parks its own marker.
+A fresh install creates the replication slot and parks a marker on every
+configured source table, in one transaction, after slot creation returns
+(`intake::publication::create_slot_and_park_markers`). It reads no source table
+itself. The first discharge pass reads each table after the slot exists, so
+every commit the read misses comes after the slot's consistent point and is
+streamed. The discharge skips a table no definition reads yet, since nothing
+would consume its rows. A definition registered on it later gets its own
+capture. A lost slot is recovered the same way (`intake::slot_loss`): the slot
+is recreated without a read, and each paused transform's resume parks its own
+marker.
 
-*Planned (#417):* today `initial_snapshot_handshake` reads every source table
-in the slot-creation transaction. Its snapshot predates the slot's consistent
-point, so a row committed during slot creation is neither read nor streamed
-(#393). A table the same setup's `reconcile_publication` just added gets a join
-marker, and its discharge on the first maintenance pass re-reads the table and
-repairs the gap. A table that was already in the publication gets no marker,
-so its gap stays open until #417.
+Reading inside the slot-creation transaction instead would not be gap-free.
+`pg_create_logical_replication_slot` exports no snapshot, and the transaction's
+own snapshot is taken before slot creation waits for in-flight transactions, so
+a row committed during that wait would be neither read nor streamed (#393).
 
 ### What it asks of a deployment
 

@@ -364,8 +364,8 @@ pub struct Client {
 
 impl Client {
     /// Starts a client against `dsn`. Blocks (synchronously) until the
-    /// background thread has finished setup (publication/slot/snapshot
-    /// handshake, if `staging_worker`) and every worker task is spawned, or
+    /// background thread has finished setup (publication and slot, if
+    /// `staging_worker`) and every worker task is spawned, or
     /// until setup fails.
     ///
     /// The instance schema is resolved from the process environment
@@ -889,16 +889,17 @@ fn uniqueish_id() -> String {
 }
 
 // ---------------------------------------------------------------------
-// Staging setup: publication + slot + snapshot handshake
+// Staging setup: publication + slot
 // ---------------------------------------------------------------------
 
 /// Reconciles the publication's membership against
-/// `options.source_tables`, then runs the initial snapshot handshake if the
-/// slot is fresh (no `replication_progress` row yet). For an existing slot,
-/// first recovers from that slot's loss if it has been lost
-/// ([`intake::slot_loss::pause_if_slot_lost`], issue #310); the slot's
-/// backfill markers themselves are left for the maintenance loop (issue
-/// #312; see the comment in the body). Not safe to call concurrently with
+/// `options.source_tables`, then creates the slot if it is fresh (no
+/// `replication_progress` row yet), parking a backfill marker on every source
+/// table ([`intake::publication::create_slot_and_park_markers`]). For an
+/// existing slot, first recovers from that slot's loss if it has been lost
+/// ([`intake::slot_loss::pause_if_slot_lost`], issue #310). Either way, every
+/// backfill marker is left for the maintenance loop (issue #312; see the
+/// comment in the body). Not safe to call concurrently with
 /// another client's own staging setup against the same slot — callers are
 /// expected to run exactly one staging worker per fleet, per this module's
 /// doc comment.
@@ -956,7 +957,10 @@ async fn setup_staging(
         // loop's first pass, which runs as soon as intake is up, discharges
         // them behind `run_pending_backfills`'s wait for intake instead.
     } else {
-        intake::publication::initial_snapshot_handshake(
+        // Issue #417: reads nothing. For the same reason as above, the
+        // markers this parks are discharged by the maintenance loop once
+        // intake is running.
+        intake::publication::create_slot_and_park_markers(
             &mut session,
             &options.slot,
             &options.source_tables,

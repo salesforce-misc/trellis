@@ -139,11 +139,13 @@ unconfirmed. This is what keeps the join step gap-free.
 - **The wait already belongs in `waiting_to_backfill`.** That status is the
   documented, observable signal for exactly this wait
   ([observability](../observability.md#backfill-status-and-the-xmin-caveat)).
-- **Consistency bugs keep appearing where capture paths meet.** The
-  fresh-install handshake reads at a snapshot taken *before* the slot's
-  consistent point, so a row committed during slot creation is lost on both
-  sides; only the leftover join markers repair it, and that repair is
-  incidental. One path has no seams to get wrong.
+- **Consistency bugs keep appearing where capture paths meet.** #393: the
+  fresh-install handshake read at a snapshot taken *before* the slot's
+  consistent point, so a row committed during slot creation was lost on both
+  sides. Only the leftover join markers repaired it, and that repair was
+  incidental (#417 removed the handshake's read). #79, #312, #330 and #387
+  were all bugs where two capture paths meet. One path has no seams to get
+  wrong.
 - **Registration latency.** Aggregate and relationship-enriched 1-1
   registrations build synchronously in-call, so registering one against a large
   table is slow. Under this decision registration's latency doesn't depend on
@@ -214,7 +216,7 @@ happens, and its role in this design.
 
 | Path | Where in code | Role in the design |
 |---|---|---|
-| Fresh-install handshake read | `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | Retired. Setup creates the slot and seeds `replication_progress`, reads nothing, and makes sure every published table has a marker — the same shape slot-loss recovery (`intake::slot_loss`) already has |
+| Fresh-install handshake read | was `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | **Retired (#417).** `create_slot_and_park_markers` creates the slot, seeds `replication_progress`, and parks a marker on every configured source table in the same transaction, after slot creation returns. It reads nothing, the same shape slot-loss recovery (`intake::slot_loss`) already has. The discharge skips a table no definition reads (`defs::catalog::table_has_reader`) |
 | Ring enumeration inside registration | `defs::catalog::create_definition_inner`'s `enumerate_and_append`, reached through `create_definition` and `install_definition`'s `Unsupported` fallback | Moves to the discharge |
 | Plain 1-1 chunk enqueue at registration | `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | The discharge enumerates and enqueues the chunks; drain threads still execute them |
 | Synchronous direct build inside registration | `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | The discharge dispatches it as a background job |

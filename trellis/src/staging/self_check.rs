@@ -629,9 +629,7 @@ async fn compare_once(
     // Must be the transaction's first statement (Postgres requires `SET
     // TRANSACTION` before any other command) — only a REPEATABLE READ
     // transaction holds its snapshot steady across the recompute and
-    // persisted-read queries below, matching
-    // `intake::publication::initial_snapshot_handshake`'s identical
-    // first-statement requirement.
+    // persisted-read queries below.
     txn.execute("set transaction isolation level repeatable read", &[])
         .await?;
 

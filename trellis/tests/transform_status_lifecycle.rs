@@ -41,6 +41,11 @@
 //! — one new eviction must not immediately re-quarantine it just because the
 //! pre-resume `poison` rows are (deliberately) still there, while a full
 //! fresh threshold's worth of new evictions must.
+//!
+//! Two more (issue #417) cover a fresh install's slot creation: a row
+//! committed while the slot is being created still reaches the target (#393),
+//! and a definition that defers while the slot is being created still goes
+//! live (#323).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -56,6 +61,7 @@ use trellis::defs::{
 use trellis::intake::publication;
 use trellis::staging::apply;
 use trellis::staging::quarantine;
+use trellis::staging::session::ProducerSession;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -1070,4 +1076,220 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
         "the direct/set-based path still builds synchronously and ends up live in-call"
     );
     assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);
+}
+
+/// Polls until some other backend is blocked on a transaction lock inside
+/// `pg_create_logical_replication_slot`: slot creation waiting out a
+/// transaction that was open when it started. A state to reach, not a
+/// convergence: the tests below hold that transaction open until this
+/// returns.
+async fn wait_until_slot_creation_blocks(client: &Client) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: bool = client
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where pid <> pg_backend_pid() and wait_event_type = 'Lock' \
+                 and query like '%pg_create_logical_replication_slot%')",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if blocked {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slot creation never blocked on the open transaction"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Runs fresh-install slot setup for `table` on its own producer session.
+async fn create_slot(dsn: &str, slot: &str, table: &str) {
+    let mut session = ProducerSession::connect(dsn, DEFAULT_SCHEMA)
+        .await
+        .expect("connect producer session");
+    publication::create_slot_and_park_markers(&mut session, slot, &[table.to_string()])
+        .await
+        .expect("create the slot");
+}
+
+/// Issue #393, fixed by #417: a transaction open when a fresh install starts
+/// creating its slot, and committed while slot creation waits for it, lands
+/// before the slot's consistent point, so the slot never streams it. Setup
+/// used to read every table at a snapshot taken before that wait, so it
+/// missed the row too, and only a leftover join marker could repair it. `s`
+/// here is already published, so it had no such marker and the row was lost.
+/// Setup now reads nothing and parks a marker on every table, and the
+/// discharge's read, taken after the slot exists, sees the row.
+#[tokio::test]
+async fn a_row_committed_during_fresh_slot_creation_reaches_the_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    let source = format!("{DEFAULT_SCHEMA}.s");
+
+    raw.batch_execute(
+        "create table s (id bigint primary key, a numeric); \
+         insert into s (id, a) values (1, 1); \
+         create publication test_pub for table s;",
+    )
+    .await
+    .expect("seed an already-published source table");
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition");
+    // Build it and discharge its go-live catch-up, so no marker is left over
+    // to re-read `s` by accident.
+    drain_backfill_chunks(&db.pool).await;
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the go-live catch-up");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
+
+    let writer = OpenTransaction::begin(db.dsn()).await;
+    writer
+        .execute(&format!("insert into {source} (id, a) values (2, 2)"))
+        .await;
+    tokio::join!(create_slot(db.dsn(), "gap_slot", &source), async {
+        wait_until_slot_creation_blocks(&raw).await;
+        writer.commit().await;
+    });
+
+    // The commit is before the consistent point: the slot carries no insert.
+    let streamed_inserts: i64 = raw
+        .query_one(
+            "select count(*) from pg_logical_slot_peek_binary_changes( \
+                 'gap_slot', null, null, 'proto_version', '1', 'publication_names', 'test_pub') \
+             where get_byte(data, 0) = ascii('I')",
+            &[],
+        )
+        .await
+        .expect("peek the slot")
+        .get(0);
+    assert_eq!(
+        streamed_inserts, 0,
+        "the writer must commit before the consistent point for this to test #393's gap"
+    );
+
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge setup's marker");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let x: Option<String> = raw
+        .query_opt("select x::text from t where id = 2", &[])
+        .await
+        .expect("read t")
+        .map(|row| row.get(0));
+    assert_eq!(
+        x,
+        Some("4".to_string()),
+        "a row committed during slot creation must reach the target"
+    );
+
+    raw.execute("select pg_drop_replication_slot('gap_slot')", &[])
+        .await
+        .expect("drop the slot");
+}
+
+/// Issue #323's second concern, checked for #417: a definition registered
+/// while a fresh install's slot creation waits defers to
+/// `waiting_to_backfill` (its source's join marker is unsettled), and must
+/// still go live. Setup parks its own marker on the table after slot
+/// creation, merging into the join marker, and nothing discharges markers
+/// during setup, so the deferred definition's marker is always there for the
+/// discharge to promote it.
+#[tokio::test]
+async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    let source = format!("{DEFAULT_SCHEMA}.s");
+
+    raw.batch_execute(
+        "create table s (id bigint primary key, a numeric); \
+         insert into s (id, a) select g, g from generate_series(1, 3) g; \
+         create publication test_pub;",
+    )
+    .await
+    .expect("seed source table and publication");
+
+    // Open before the join, so the join marker's fence is unsettled and slot
+    // creation has to wait for it.
+    let writer = OpenTransaction::begin(db.dsn()).await;
+    writer
+        .execute(&format!("insert into {source} (id, a) values (4, 4)"))
+        .await;
+    publication::reconcile_publication(&mut raw, "test_pub", std::slice::from_ref(&source))
+        .await
+        .expect("reconcile adds s with an unsettled marker");
+
+    let (_, def) = tokio::join!(create_slot(db.dsn(), "defer_slot", &source), async {
+        wait_until_slot_creation_blocks(&raw).await;
+        let def = install_definition(
+            &db.pool,
+            "TRANSFORM t FROM s SELECT a + a AS x",
+            &numeric(&["a"]),
+            "public",
+        )
+        .await
+        .expect("install_definition while the slot is being created");
+        writer.commit().await;
+        def
+    });
+    assert_eq!(
+        def.status,
+        TransformStatus::WaitingToBackfill,
+        "registered behind an unsettled marker, the definition must defer"
+    );
+
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the marker");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert_eq!(
+        status_of(&raw, "t").await,
+        TransformStatus::Live,
+        "a definition deferred during slot creation must not be stranded"
+    );
+    let mismatches: i64 = raw
+        .query_one(
+            "select count(*) from s left join t on t.id = s.id \
+             where t.id is null or t.x is distinct from s.a + s.a",
+            &[],
+        )
+        .await
+        .expect("compare s and t")
+        .get(0);
+    assert_eq!(mismatches, 0, "every source row, the writer's included");
+
+    raw.execute("select pg_drop_replication_slot('defer_slot')", &[])
+        .await
+        .expect("drop the slot");
 }

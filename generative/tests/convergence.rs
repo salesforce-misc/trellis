@@ -31,7 +31,7 @@
 //! then tried to install against the same slot name, found it already
 //! existed (owned by the still-live prior database) with no
 //! `replication_progress` row in *its own* fresh schema, and
-//! `initial_snapshot_handshake` correctly-by-its-own-lights but
+//! `create_slot_and_park_markers` correctly-by-its-own-lights but
 //! incorrectly-overall called that an orphaned slot
 //! (`Client(Intake(OrphanedSlot { .. }))`) — the failure this issue's nightly
 //! `deep` run hit after 43 clean cases. See

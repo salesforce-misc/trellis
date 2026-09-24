@@ -83,9 +83,9 @@ pub enum IntakeError {
     /// `"xmin:xmax:xip..."` text form this decodes.
     InvalidSnapshot(String),
     /// `slot` has no `replication_progress` row at connect time.
-    /// [`super::publication::initial_snapshot_handshake`] seeds this row (at
-    /// the slot's own consistent point) as part of creating the slot, so a
-    /// missing row here means that handshake never ran, or ran against a
+    /// [`super::publication::create_slot_and_park_markers`] seeds this row
+    /// (at the slot's own consistent point) as part of creating the slot, so a
+    /// missing row here means that setup never ran, or ran against a
     /// different database than intake is connecting to — a precondition
     /// violation, not a fresh-slot state. Left unrepaired: the linchpin's
     /// watermark `UPDATE` (issue #31) matches zero rows forever while the
@@ -96,9 +96,9 @@ pub enum IntakeError {
     /// `replication_progress` row — `pg_create_logical_replication_slot`
     /// persists the slot to disk the instant it returns, independent of the
     /// transaction it was called in, so a crash between that call and
-    /// [`super::publication::initial_snapshot_handshake`]'s own commit
-    /// leaves the slot behind with no seed row and no backfill. Re-running
-    /// the handshake would die at slot-create with "already exists," and
+    /// [`super::publication::create_slot_and_park_markers`]'s own commit
+    /// leaves the slot behind with no seed row and no backfill markers.
+    /// Re-running that setup would die at slot-create with "already exists," and
     /// dropping the slot automatically is a destructive, WAL-retention-losing
     /// action this crate never takes on its own — so this names the exact
     /// operator recovery instead.
@@ -208,16 +208,16 @@ impl fmt::Display for IntakeError {
             }
             IntakeError::MissingProgressRow { slot } => write!(
                 f,
-                "no replication_progress row for slot {slot}; initial_snapshot_handshake is \
+                "no replication_progress row for slot {slot}; fresh-install slot setup is \
                  expected to seed one when the slot is created — refusing to start rather than \
                  stage work with no durable watermark to advance"
             ),
             IntakeError::OrphanedSlot { slot } => write!(
                 f,
                 "replication slot {slot} exists but has no replication_progress row — it was \
-                 created but never fully initialized (a crash during initial_snapshot_handshake, \
-                 before its seed row and backfill committed); run \
-                 `SELECT pg_drop_replication_slot('{slot}')` and retry the handshake"
+                 created but never fully initialized (a crash during fresh-install slot setup, \
+                 before its seed row and backfill markers committed); run \
+                 `SELECT pg_drop_replication_slot('{slot}')` and retry setup"
             ),
         }
     }

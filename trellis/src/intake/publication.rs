@@ -10,9 +10,9 @@
 //!   pre-existing rows, staged by enumeration once the marker's transaction
 //!   fence has settled and intake has staged everything the enumeration's
 //!   snapshot sees (issue #312).
-//! - [`initial_snapshot_handshake`] creates a slot and backfills every
-//!   watched table from the exact snapshot the slot's creation exports —
-//!   gap-free by construction.
+//! - [`create_slot_and_park_markers`] creates a fresh install's slot and
+//!   parks a marker on every watched table, so the discharge captures each
+//!   one after the slot's consistent point. It reads no rows itself.
 //! - [`require_slot_healthy`] is the loud startup check for slot
 //!   invalidation/loss, including a slot recreated under the same name.
 
@@ -754,6 +754,19 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// definition is `live`. The anti-join and the cursor still read different
 /// snapshots, which leaves a short race for aggregates in either order. That
 /// module's doc comment has the full argument and its limits.
+///
+/// # A table nothing reads (issue #417)
+///
+/// A marker on a table no registered definition reads, directly or through a
+/// relationship ([`crate::defs::catalog::table_has_reader`]), is discharged
+/// without enumerating: no apply would consume its `Recompute` rows. A fresh
+/// install parks a marker on every configured source table
+/// ([`create_slot_and_park_markers`]), including ones no transform uses yet.
+/// A definition registered on such a table later captures it itself: today
+/// through registration's own read, or, if an unsettled marker made it defer,
+/// through that marker's discharge, which finds it as a reader. The check
+/// runs after [`advance_deferred_definitions`], so a deferred definition it
+/// can't see yet is one that pass wouldn't have promoted anyway.
 // The maintenance loop calls [`run_pending_backfills_until`] so it can stop
 // the wait on shutdown. This no-stop form is the tests' entry point, so
 // nothing in the crate calls it unless `internals` exposes it.
@@ -900,7 +913,9 @@ async fn discharge_marker(
     // below (including the `Deferred` and error paths, since both drop
     // `txn` without committing), the deletes roll back with everything else.
     super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, advancing).await?;
-    let staged = if coverage_covers(&txn, &marker.table).await? {
+    // Issue #417: see "A table nothing reads" above.
+    let read = crate::defs::catalog::table_has_reader(&txn, &marker.table).await?;
+    let staged = if !read || coverage_covers(&txn, &marker.table).await? {
         false
     } else {
         declare_enumeration(&txn, &marker.table).await?;
@@ -1123,38 +1138,56 @@ async fn mark_definitions_live(
     Ok(flipped)
 }
 
-/// The initial snapshot handshake: creates `slot` and backfills every one of
-/// `tables` from the exact snapshot `pg_create_logical_replication_slot`
-/// exports — valid for the rest of this transaction — then commits. Intake
-/// then streams from the slot's own consistent point. Gap-free by
-/// construction, not by overlap-and-dedup: nothing written after the slot's
-/// consistent point is enumerated here, and nothing before it is skipped by
-/// the stream.
+/// Fresh-install slot setup: creates `slot`, seeds its `replication_progress`
+/// row at the slot's consistent point, and parks a `pending_backfill` marker
+/// on every one of `tables`, all in one transaction. It reads no source rows.
+/// Each table's existing rows are captured by the first discharge of its
+/// marker ([`run_pending_backfills`]), the one capture path every definition
+/// backfill goes through (ADR-0016).
+///
+/// # Why it doesn't read the tables itself (issue #393)
+///
+/// `pg_create_logical_replication_slot` exports no snapshot. A read in this
+/// transaction would use a snapshot taken before slot creation waits out the
+/// transactions in flight and reaches its consistent point, so a transaction
+/// committing in that wait would be neither read nor streamed. The markers
+/// are parked after slot creation returns, so each fence is a snapshot taken
+/// after the consistent point, and the discharge's read comes later still:
+/// every commit that read misses is after the consistent point, and the slot
+/// streams it. A table `reconcile_publication` just added already has a join
+/// marker with an earlier fence. [`park_marker`] keeps the later fence, and
+/// the discharge reads it once either way.
+///
+/// Every table in `tables` gets a marker, not only the newly published ones:
+/// a table already in the publication has no marker of its own, and without
+/// one its rows would never be captured. The discharge skips a table no
+/// definition reads yet ([`run_pending_backfills`]'s "A table nothing
+/// reads").
 ///
 /// **Not one atomic unit.** `pg_create_logical_replication_slot` persists the
 /// slot to disk the moment it returns, independent of the surrounding
-/// transaction — only the backfill and the `replication_progress` INSERT
-/// that follow are undone by a rollback or a crash before `commit()`. A
-/// crash in that window leaves the slot on disk with no progress row: the
-/// orphaned state [`slot_is_orphaned`] below detects and
-/// [`IntakeError::OrphanedSlot`] names, rather than dying on "slot already
-/// exists" if this function were just retried.
+/// transaction. Only the markers and the `replication_progress` INSERT that
+/// follow are undone by a rollback or a crash before `commit()`. A crash in
+/// that window leaves the slot on disk with no progress row: the orphaned
+/// state [`slot_is_orphaned`] below detects and [`IntakeError::OrphanedSlot`]
+/// names, rather than dying on "slot already exists" if this function were
+/// just retried.
 ///
 /// Callers on a fresh install run this once, before ever calling
 /// [`super::Intake::connect`]; an existing install with a `replication_progress`
 /// row for `slot` never calls this again. Recovery from losing that slot is
-/// not a re-run of this handshake (which would re-enumerate every table at
-/// once): [`super::slot_loss::pause_if_slot_lost`] pauses every transform the
-/// slot fed and recreates the slot, and each transform is rebuilt by its own
+/// not a re-run of this function:
+/// [`super::slot_loss::pause_if_slot_lost`] pauses every transform the slot
+/// fed and recreates the slot, and each transform is rebuilt by its own
 /// fresh backfill when an operator resumes it (issue #310).
 ///
-/// Also seeds `replication_progress` for `slot` at its own consistent point —
-/// this is "whatever first uses the slot's name" that `V4__replication_progress.sql`
-/// says is responsible for the row's one INSERT. The linchpin
-/// (`trellis::intake::stage_and_advance`) only ever UPDATEs it; without this
-/// seed the row never exists, so [`super::Intake::connect`]'s precondition
-/// check (issue #31, finding 2) would reject every fresh slot.
-pub async fn initial_snapshot_handshake(
+/// The progress row is "whatever first uses the slot's name" that
+/// `V4__replication_progress.sql` says is responsible for the row's one
+/// INSERT. The linchpin (`trellis::intake::stage_and_advance`) only ever
+/// UPDATEs it; without this seed the row never exists, so
+/// [`super::Intake::connect`]'s precondition check (issue #31, finding 2)
+/// would reject every fresh slot.
+pub async fn create_slot_and_park_markers(
     session: &mut ProducerSession,
     slot: &str,
     tables: &[String],
@@ -1165,12 +1198,10 @@ pub async fn initial_snapshot_handshake(
         });
     }
     let txn = session.transaction().await?;
-    // Must be the transaction's first statement (Postgres requires `SET
-    // TRANSACTION` before any other command), and matters here: only a
-    // REPEATABLE READ transaction holds its snapshot steady across the
-    // multiple enumeration queries below.
-    txn.execute("set transaction isolation level repeatable read", &[])
-        .await?;
+    // Slot creation must come before any write in this transaction (Postgres
+    // refuses to create a logical slot in a transaction that has written).
+    // Read committed, so each marker's fence below is a fresh snapshot taken
+    // after slot creation returned, not one taken before it waited.
     let slot_row = txn
         .query_one(
             "select lsn from pg_create_logical_replication_slot($1, 'pgoutput')",
@@ -1178,29 +1209,8 @@ pub async fn initial_snapshot_handshake(
         )
         .await?;
     let consistent_point: PgLsn = slot_row.get(0);
-    // One append call per table-page rather than collecting every table's
-    // changes into one giant `Vec` first: still all one transaction, so this
-    // is equivalent to the old "collect all then append once" for atomicity
-    // — `append::append` has no state that requires being called exactly
-    // once (see its own doc comment: it just reads the ring pointer and
-    // inserts).
-    //
-    // Issue #79 (bug B): a table a direct backfill already folded into a
-    // target — and that provably hasn't changed since ([`coverage_covers`]) —
-    // is skipped here exactly as `run_pending_backfills` skips it, so the
-    // fresh-install path floods the ring no worse than a restart does. This
-    // preserves gap-free-by-construction: `coverage_covers` is evaluated in
-    // this same repeatable-read snapshot (≈ the slot's consistent point), so
-    // any write between the build's coverage fence and that point leaves a
-    // fence-invisible `xmin` or changes the row count → `coverage_covers`
-    // returns false → the table is enumerated, the safe default. Only a table
-    // byte-for-byte identical to its covered state is skipped, and everything
-    // after the consistent point streams via CDC as usual.
     for table in tables {
-        if coverage_covers(&txn, table).await? {
-            continue;
-        }
-        enumerate_and_append(&txn, table).await?;
+        park_marker(&txn, table).await?;
     }
     txn.execute(
         "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
@@ -1214,8 +1224,8 @@ pub async fn initial_snapshot_handshake(
 /// Whether `slot` exists in `pg_replication_slots` **and belongs to the
 /// current database** but has no `replication_progress` row — the orphaned
 /// state a crash between `pg_create_logical_replication_slot` (which
-/// persists immediately, see [`initial_snapshot_handshake`]'s doc comment)
-/// and that same handshake's commit leaves behind. A slot that exists *with*
+/// persists immediately, see [`create_slot_and_park_markers`]'s doc comment)
+/// and that same function's commit leaves behind. A slot that exists *with*
 /// a progress row is a different situation (re-running setup against an
 /// already-initialized slot) and is left to the existing "slot already
 /// exists" error path.
@@ -1572,6 +1582,8 @@ mod catch_up_tests {
             ))
             .await
             .expect("seed two source tables");
+        register_reader(&db, "public.a", "a_reader").await;
+        register_reader(&db, "public.b", "b_reader").await;
         reconcile_publication(
             &mut client,
             "test_pub",
@@ -1608,6 +1620,20 @@ mod catch_up_tests {
         assert_eq!(markers, 2, "both markers must survive for the next pass");
     }
 
+    /// Registers a definition reading `source`, so the discharge has a
+    /// reader to enumerate for: it skips a table nothing reads (issue #417).
+    async fn register_reader(db: &testkit::TestDatabase, source: &str, target: &str) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
+        crate::defs::catalog::create_definition(
+            &pool,
+            &format!("TRANSFORM {target} FROM {source} SELECT id AS total"),
+            &std::collections::HashMap::from([("id".to_string(), crate::defs::ValueType::Numeric)]),
+        )
+        .await
+        .expect("register a definition reading the table");
+    }
+
     async fn connect(db: &testkit::TestDatabase) -> tokio_postgres::Client {
         let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
             .await
@@ -1640,6 +1666,7 @@ mod catch_up_tests {
             )
             .await
             .expect("seed source table");
+        register_reader(db, "public.t", "t_reader").await;
         reconcile_publication(&mut discharger, "test_pub", &["public.t".to_string()])
             .await
             .expect("reconcile parks a marker");

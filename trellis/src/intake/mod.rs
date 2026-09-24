@@ -9,7 +9,7 @@
 //!   [`spill::TxnBuffer`] spills past a threshold and enforces the hard cap.
 //! - [`publication`] is the slot/publication lifecycle (issue #8):
 //!   reconciling the publication in place, the backfill marker and its
-//!   transaction fence, the initial snapshot handshake, and the loud
+//!   transaction fence, fresh-install slot creation, and the loud
 //!   startup error on slot loss.
 //! - [`stage_and_advance`] is the linchpin: stage + watermark + notify, in
 //!   one transaction.
@@ -119,7 +119,7 @@ pub(crate) async fn advance_watermark_and_notify(
 }
 
 /// Reads `slot`'s durable watermark, if any — a missing row means either
-/// [`publication::initial_snapshot_handshake`] never ran for `slot`, which
+/// [`publication::create_slot_and_park_markers`] never ran for `slot`, which
 /// [`Intake::connect`] rejects as [`IntakeError::MissingProgressRow`] (issue
 /// #31, finding 2), or (once a row exists) that the row is present but the
 /// slot itself has since gone missing or invalid, which
@@ -770,9 +770,9 @@ impl Intake {
     ///
     /// Before opening the replication stream, checks that `config.slot` has
     /// a `replication_progress` row (issue #31, finding 2's precondition:
-    /// [`publication::initial_snapshot_handshake`] seeds this row at slot
+    /// [`publication::create_slot_and_park_markers`] seeds this row at slot
     /// creation, so a missing row here is never a legitimate fresh-slot
-    /// state — it means that handshake never ran, and staging into a slot
+    /// state — it means that setup never ran, and staging into a slot
     /// with no durable watermark lets WAL reclaim ahead of work that never
     /// persists, silently) and that the slot itself is still healthy — see
     /// [`publication::require_slot_healthy`].

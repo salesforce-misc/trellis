@@ -547,7 +547,7 @@ impl ManualBackend {
     /// hasn't actually been torn down yet (`trellis::Client::drop` is a
     /// best-effort shutdown signal, not a synchronous join — see its own
     /// doc comment) and get misdiagnosed by
-    /// the engine's own `intake::publication::initial_snapshot_handshake` as an
+    /// the engine's own `intake::publication::create_slot_and_park_markers` as an
     /// orphaned slot.
     pub fn set_slot_and_publication(
         &mut self,

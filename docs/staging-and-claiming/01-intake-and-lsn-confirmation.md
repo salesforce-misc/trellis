@@ -216,8 +216,7 @@ knife-edged guards:
   horizon ([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon),
   issue #321). The wait only makes the resulting re-derivations rarer. The
   discharge runs only once intake is running, so setup leaves every marker to
-  the maintenance loop. *Planned (#417):* that holds for an existing slot today,
-  but a fresh install still reads its tables during setup (below).
+  the maintenance loop, for a fresh slot and an existing one alike.
 - **Trellis's own writes to a target never stream at all.** A chain's
   intermediate hop is a target Trellis writes and a source a downstream
   transform reads. It stays out of the publication (issue #315): every write to
@@ -231,8 +230,9 @@ knife-edged guards:
   seam stages that target's rows CDC-shaped instead, with the row's new image
   and, as the `lsn`, a write token read after the writer's last row lock.
 - **A fresh install reads nothing while it creates the slot.** It creates the
-  slot, seeds `replication_progress` at the slot's consistent point, and makes
-  sure every published table has a `pending_backfill` marker. The first
+  slot, seeds `replication_progress` at the slot's consistent point, and parks a
+  `pending_backfill` marker on every configured source table, all in one
+  transaction (`intake::publication::create_slot_and_park_markers`). The first
   discharge then reads each table at a snapshot taken after the slot exists, so
   anything that read misses commits after the consistent point and is streamed.
   Slot-loss recovery already works this way (`intake::slot_loss`). Reading
@@ -245,11 +245,8 @@ knife-edged guards:
   only by keeping a second capture path for fresh installs, and neither
   replication client Trellis uses supports it
   ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
-  *Planned (#417):* `initial_snapshot_handshake` still reads every table in the
-  slot-creation transaction. For a table the same setup's `reconcile_publication`
-  just added, the join marker it leaves behind repairs #393's gap on the first
-  maintenance pass, by accident. A table that was already published gets no
-  marker and no repair.
+  The discharge skips a table no definition reads yet, since no apply would
+  consume its `Recompute` rows.
 
 ## The load-bearing invariants
 

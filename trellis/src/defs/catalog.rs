@@ -5487,21 +5487,48 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
     let client = pool.get().await?;
     let rows = client
         .query(
-            "with recursive reachable(table_name) as (
-                select distinct source_table from transform_definitions
-                union
-                select from_node.table_name
-                from schema_edges se
-                join schema_nodes to_node on to_node.id = se.to_node_id
-                join schema_nodes from_node on from_node.id = se.from_node_id
-                join reachable r on r.table_name = to_node.table_name
-                where se.kind = 'relationship'
-             )
-             select table_name from reachable",
+            &format!("{REACHABLE_TABLES_CTE} select table_name from reachable"),
             &[],
         )
         .await?;
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
+/// The recursive walk [`all_source_tables`] documents: every anchor
+/// `source_table`, plus every table reachable from one through relationship
+/// edges. Shared with [`table_has_reader`] so the two can't disagree about
+/// which tables a definition reads.
+const REACHABLE_TABLES_CTE: &str = "with recursive reachable(table_name) as (
+        select distinct source_table from transform_definitions
+        union
+        select from_node.table_name
+        from schema_edges se
+        join schema_nodes to_node on to_node.id = se.to_node_id
+        join schema_nodes from_node on from_node.id = se.from_node_id
+        join reachable r on r.table_name = to_node.table_name
+        where se.kind = 'relationship'
+     )";
+
+/// Whether any registered definition reads `qualified_table`, in any status:
+/// as its anchor source, or through a relationship path
+/// ([`all_source_tables`]'s set). The backfill discharge
+/// ([`crate::intake::publication::run_pending_backfills`]) skips reading a
+/// table this says `false` for (issue #417), since nothing would consume the
+/// `Recompute` rows.
+pub(crate) async fn table_has_reader(
+    client: &impl GenericClient,
+    qualified_table: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            &format!(
+                "{REACHABLE_TABLES_CTE} \
+                 select exists (select 1 from reachable where table_name = $1)"
+            ),
+            &[&qualified_table],
+        )
+        .await?
+        .get(0))
 }
 
 /// The tables this instance's CDC publication should hold: every table
