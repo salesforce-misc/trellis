@@ -657,11 +657,11 @@ async fn to_many_relationship_context_has_no_projection_and_stays_live() {
 /// from-side keying #288 fixes; the to-side is still keyed bare (#372).
 ///
 /// Each relationship is declared through a pool whose `target_schema` is its
-/// own schema, so its settled projection lives there, while everything else
-/// runs through `db.pool` and its default target schema. Issue #379: every
+/// own schema, while everything else runs through `db.pool` and its default
+/// target schema. Issue #435: the settled projection lives in the instance's
+/// catalog schema whatever the declaring pool's target schema, so every
 /// projection reader (the definition's widening, the forward read, the reverse
-/// advance and the `TRUNCATE` clear) must find the projection in the schema it
-/// was created in, not the reading pool's. Issue #380: both `blog.posts` and
+/// advance and the `TRUNCATE` clear) finds it there. Issue #380: both `blog.posts` and
 /// `shop.posts` carry a transform, which the drain's version fence used to
 /// reject by matching `source_table_versions` on the bare table name.
 #[tokio::test]
@@ -712,14 +712,14 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
     .await
     .expect("shop.posts declares its own `author`");
 
-    for (schema, relationship_id) in [("blog", blog_rel.id), ("shop", shop_rel.id)] {
+    for relationship_id in [blog_rel.id, shop_rel.id] {
         let projection = relationship_projection(&db.pool, relationship_id)
             .await
             .expect("read projection catalog row")
             .expect("to-one relationship has a projection");
         assert_eq!(
-            projection.projection_schema, schema,
-            "the projection records the declaring pool's target schema"
+            projection.projection_schema, DEFAULT_SCHEMA,
+            "the projection lives in the catalog schema, not the declaring pool's target schema"
         );
     }
 
@@ -857,7 +857,7 @@ async fn same_named_relationships_in_different_schemas_each_resolve_their_own_to
     let shop_projection_rows: i64 = client
         .query_one(
             &format!(
-                "select count(*) from shop._trellis_rel_projection_{}",
+                "select count(*) from {DEFAULT_SCHEMA}._trellis_rel_projection_{}",
                 shop_rel.id
             ),
             &[],

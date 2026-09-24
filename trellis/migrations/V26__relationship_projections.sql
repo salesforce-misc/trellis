@@ -34,12 +34,14 @@
 --
 -- `projection_table` is the physical table's bare name
 -- (`defs::ddl::relationship_projection_table_name`,
--- `_trellis_rel_projection_<id>`), created under the same `target_schema` a
--- transform's own target tables live under. Named after the relationship's
+-- `_trellis_rel_projection_<id>`), created in this instance's own schema
+-- alongside this table, never the target schema (issue #435: another
+-- instance sharing the target schema numbers its relationships from 1 too).
+-- Named after the relationship's
 -- catalog id rather than its declared name because a relationship name is
 -- only unique *per from-table* (`V16__relationship_definitions.sql`), so two
 -- differently-from-tabled relationships could otherwise collide; the id is
--- already globally unique by the time the projection is created
+-- already unique within this catalog by the time the projection is created
 -- (`create_relationship` inserts the `relationship_definitions` row first,
 -- in the same transaction). `unique` here too, even though it's already
 -- functionally unique by construction (one id, one deterministic name) — a

@@ -1235,13 +1235,19 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// only *per from-table* (`V38__relationship_definitions_schema_qualified_key.sql`'s
 /// `unique (from_schema, from_table, name)`), so two different from-tables can declare a
 /// same-named relationship; the id is the one thing already guaranteed
-/// globally unique by the time this is called
+/// unique within this catalog by the time this is called
 /// (`catalog::create_relationship` names the projection right after
 /// inserting the relationship's own row, in the same transaction — see
 /// `catalog::ensure_relationship_projection_in_txn`), so it's the natural
 /// disambiguator. Matches this crate's existing `_trellis_backfill_*` naming
 /// for its own other generated tables ([`super::backfill::STAGE_TABLE`],
 /// [`super::backfill::REL_STAGE_TABLE_PREFIX`]).
+///
+/// Unique only within one catalog: every instance numbers its relationships
+/// from 1, so another instance in the same database has its own
+/// `_trellis_rel_projection_1`. That's why the table lives in the instance's
+/// catalog schema, never the target schema two instances may share (issue
+/// #435; see [`qualified_relationship_projection_table`]).
 pub(crate) fn relationship_projection_table_name(relationship_id: i64) -> String {
     format!("_trellis_rel_projection_{relationship_id}")
 }
@@ -1249,14 +1255,15 @@ pub(crate) fn relationship_projection_table_name(relationship_id: i64) -> String
 /// The schema-qualified, DDL-ready form of
 /// [`relationship_projection_table_name`]'s output — same component-independent
 /// quoting as [`qualified_target_table`], for direct interpolation into DDL/DML
-/// text.
+/// text. `catalog_schema` is the instance's own schema
+/// ([`crate::Config::schema`]), where every projection lives (issue #435).
 pub(crate) fn qualified_relationship_projection_table(
-    target_schema: &str,
+    catalog_schema: &str,
     projection_table: &str,
 ) -> String {
     format!(
         "{}.{}",
-        quote_ident(target_schema),
+        quote_ident(catalog_schema),
         quote_ident(projection_table)
     )
 }

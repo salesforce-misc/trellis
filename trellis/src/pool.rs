@@ -47,6 +47,9 @@ pub type Client = deadpool_postgres::Client;
 #[derive(Debug, Clone)]
 pub struct Pool {
     inner: DeadpoolPool,
+    /// A copy of the [`Config::schema`] this pool was built from — see
+    /// [`Pool::schema`].
+    schema: String,
     /// A copy of the [`Config::target_schema`] this pool was built from —
     /// see [`Pool::target_schema`].
     target_schema: String,
@@ -104,6 +107,7 @@ impl Pool {
 
         Ok(Self {
             inner,
+            schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
         })
     }
@@ -116,6 +120,15 @@ impl Pool {
     /// via [`Error::code`]) instead of hanging indefinitely (issue #182).
     pub async fn get(&self) -> Result<Client, Error> {
         Ok(self.inner.get().await?)
+    }
+
+    /// The [`Config::schema`] this pool was built with: the instance's own
+    /// catalog schema, first on every connection's `search_path`. Trellis's
+    /// internal tables that DDL creates at runtime rather than a migration
+    /// (a to-one relationship's settled parent projection, issue #435) are
+    /// qualified with it explicitly.
+    pub(crate) fn schema(&self) -> &str {
+        &self.schema
     }
 
     /// The [`Config::target_schema`] this pool was built with (issue #73,

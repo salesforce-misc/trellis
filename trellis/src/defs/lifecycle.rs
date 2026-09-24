@@ -433,16 +433,15 @@ pub(crate) async fn drop_relationship(
         });
     }
 
-    // Issue #379: the projection lives in the schema it was created in (the
-    // declaring connection's `target_schema`), not necessarily this pool's.
-    let projection: Option<(String, String)> = txn
+    // The projection lives in this instance's catalog schema (issue #435).
+    let projection: Option<String> = txn
         .query_opt(
-            "select projection_schema, projection_table from relationship_projections \
+            "select projection_table from relationship_projections \
              where relationship_id = $1",
             &[&reldef.id],
         )
         .await?
-        .map(|row| (row.get(0), row.get(1)));
+        .map(|row| row.get(0));
 
     // The `relationship` edge is persisted parent -> child (`to_table ->
     // from_table`; see `create_relationship`'s own comment for why that
@@ -474,11 +473,10 @@ pub(crate) async fn drop_relationship(
     )
     .await?;
 
-    if let Some((projection_schema, projection_table)) = projection {
+    if let Some(projection_table) = projection {
         txn.batch_execute(&format!(
-            "drop table if exists {}.{}",
-            quote_ident(&projection_schema),
-            quote_ident(&projection_table)
+            "drop table if exists {}",
+            super::ddl::qualified_relationship_projection_table(pool.schema(), &projection_table)
         ))
         .await?;
     }

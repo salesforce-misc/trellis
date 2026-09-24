@@ -23,7 +23,7 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 }
 
 /// The projection's own bookkeeping + data columns, as introspected off
-/// `information_schema.columns` — `(name, data_type, is_nullable)` sorted by
+/// `information_schema.columns` in the catalog schema (issue #435) — `(name, data_type, is_nullable)` sorted by
 /// name so assertions don't depend on physical column order.
 async fn projection_columns(
     pool: &trellis::pool::Pool,
@@ -33,9 +33,9 @@ async fn projection_columns(
     let rows = client
         .query(
             "select column_name, data_type, is_nullable from information_schema.columns \
-             where table_schema = 'public' and table_name = $1 \
+             where table_schema = $1 and table_name = $2 \
              order by column_name",
-            &[&projection_table],
+            &[&trellis::config::DEFAULT_SCHEMA, &projection_table],
         )
         .await
         .expect("introspect projection columns");
@@ -552,5 +552,118 @@ async fn a_to_many_relationship_gets_no_projection() {
     assert!(
         projection.is_none(),
         "a to-many relationship must not get a settled parent projection"
+    );
+}
+
+/// Issue #435: a projection's name (`_trellis_rel_projection_<id>`) is only
+/// unique within one catalog, since every instance numbers its relationships
+/// from 1. Two instances sharing a target schema (both on the default
+/// `public`) that each declare a to-one relationship get the same generated
+/// name, so a projection placed in the target schema was shared: the second
+/// instance adopted the first's table and caught its own to-side keys up into
+/// it. Projections live in each instance's own catalog schema instead, where
+/// the name can't collide.
+#[tokio::test]
+async fn two_instances_sharing_a_target_schema_keep_independent_projections() {
+    use trellis::config::DEFAULT_SCHEMA;
+    use trellis::{Config, Pool, migrate};
+
+    const INSTANCE_B: &str = "instance_b";
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table public.categories (id integer primary key, name text); \
+             alter table public.categories replica identity full; \
+             create table public.articles (id integer primary key, category_id integer); \
+             alter table public.articles replica identity full; \
+             insert into public.categories (id, name) values (1, 'news'), (2, 'sport'); \
+             create table public.brands (id integer primary key, name text); \
+             alter table public.brands replica identity full; \
+             create table public.products (id integer primary key, brand_id integer); \
+             alter table public.products replica identity full; \
+             insert into public.brands (id, name) values (10, 'acme'), (20, 'globex')",
+        )
+        .await
+        .expect("create both instances' tables in the shared target schema");
+    drop(client);
+
+    let config_b = Config::with_schema(db.dsn(), INSTANCE_B).expect("valid schema");
+    assert_eq!(config_b.target_schema(), "public");
+    let pool_b = Pool::new(&config_b).expect("build instance B's pool");
+    migrate(&pool_b, &config_b)
+        .await
+        .expect("migrate instance B");
+
+    let rel_a = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM articles.category_id TO categories.id",
+    )
+    .await
+    .expect("instance A declares a to-one relationship");
+    let rel_b = create_relationship(
+        &pool_b,
+        "RELATIONSHIP brand FROM products.brand_id TO brands.id",
+    )
+    .await
+    .expect("instance B declares a to-one relationship");
+    assert_eq!(
+        rel_a.id, rel_b.id,
+        "each catalog numbers its relationships from 1, so the generated names collide"
+    );
+
+    let projection_a = relationship_projection(&db.pool, rel_a.id)
+        .await
+        .expect("read A's projection")
+        .expect("A's to-one relationship has a projection");
+    let projection_b = relationship_projection(&pool_b, rel_b.id)
+        .await
+        .expect("read B's projection")
+        .expect("B's to-one relationship has a projection");
+    let client = db.pool.get().await.expect("get connection");
+    let keys = |qualified: String| {
+        let client = &client;
+        async move {
+            client
+                .query(&format!("select id from {qualified} order by id"), &[])
+                .await
+                .unwrap_or_else(|e| panic!("read {qualified}: {e}"))
+                .into_iter()
+                .map(|row| row.get::<_, i32>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        keys(projection_a.qualified_table()).await,
+        vec![1, 2],
+        "A's projection holds only A's to-side keys"
+    );
+    assert_eq!(
+        keys(projection_b.qualified_table()).await,
+        vec![10, 20],
+        "B's projection holds only B's to-side keys"
+    );
+
+    assert_eq!(projection_a.projection_schema, DEFAULT_SCHEMA);
+    assert_eq!(projection_b.projection_schema, INSTANCE_B);
+    assert_ne!(
+        projection_a.qualified_table(),
+        projection_b.qualified_table()
+    );
+
+    let in_target_schema: i64 = client
+        .query_one(
+            "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = 'public' and c.relname like '\\_trellis\\_rel\\_projection\\_%'",
+            &[],
+        )
+        .await
+        .expect("look for projections in the target schema")
+        .get(0);
+    assert_eq!(
+        in_target_schema, 0,
+        "no projection lives in the target schema"
     );
 }

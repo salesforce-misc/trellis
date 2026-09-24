@@ -2059,7 +2059,7 @@ async fn create_definition_inner(
         &txn,
         &def,
         &qualified_source,
-        resolved_target_schema,
+        pool.schema(),
     )
     .await?;
 
@@ -2655,7 +2655,7 @@ pub async fn create_relationship(
             &def.to_table,
             &def.to_col,
             &to_type,
-            pool.target_schema(),
+            pool.schema(),
             &[],
         )
         .await?;
@@ -4375,9 +4375,10 @@ async fn assert_replica_identity_supports_projection(
 pub struct RelationshipProjection {
     pub id: i64,
     pub relationship_id: i64,
-    /// The schema the projection table was created in: the `target_schema` of
-    /// the connection that declared the relationship, which need not be the
-    /// reading connection's (issue #379).
+    /// The schema the projection table lives in: always the instance's own
+    /// catalog schema ([`crate::Config::schema`]), alongside the rest of
+    /// Trellis's internal state, never the target schema (issue #435). Not
+    /// stored in `relationship_projections`, which lives in that same schema.
     pub projection_schema: String,
     /// The physical table's bare name. [`Self::qualified_table`] gives the
     /// form to interpolate into SQL.
@@ -4406,7 +4407,7 @@ pub async fn relationship_projection(
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select id, relationship_id, projection_schema, projection_table \
+            "select id, relationship_id, projection_table \
              from relationship_projections where relationship_id = $1",
             &[&relationship_id],
         )
@@ -4414,8 +4415,8 @@ pub async fn relationship_projection(
     Ok(row.map(|row| RelationshipProjection {
         id: row.get(0),
         relationship_id: row.get(1),
-        projection_schema: row.get(2),
-        projection_table: row.get(3),
+        projection_schema: pool.schema().to_string(),
+        projection_table: row.get(2),
     }))
 }
 
@@ -4475,6 +4476,14 @@ pub async fn relationship_projection(
 /// `to_col_pg_type` is only consulted on first creation (an existing
 /// projection's key column type can't change short of dropping the
 /// projection outright, which nothing does in v1).
+///
+/// `catalog_schema` is the instance's own schema ([`Pool::schema`]), where the
+/// projection lives (issue #435): its generated name is unique only within
+/// this catalog, since every instance numbers its relationships from 1, so a
+/// projection in a target schema two instances share would collide with the
+/// other instance's. In the catalog schema the collision can't happen, which
+/// is why creation is a plain `create table`: a table already there is a bug,
+/// not something to adopt.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_relationship_projection_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
@@ -4483,7 +4492,7 @@ async fn ensure_relationship_projection_in_txn(
     to_table_bare: &str,
     to_col: &str,
     to_col_pg_type: &str,
-    target_schema: &str,
+    catalog_schema: &str,
     needed_columns: &[String],
 ) -> Result<(), CatalogError> {
     // `qualified_to_table` is the plain, unquoted `"schema.table"` identity
@@ -4498,23 +4507,20 @@ async fn ensure_relationship_projection_in_txn(
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
     let to_col_ident = quote_ident(to_col);
 
-    // Issue #379: an existing projection is widened where it was created,
-    // whatever `target_schema` this caller runs under; `target_schema` only
-    // places a new one.
     let existing = txn
         .query_opt(
-            "select projection_schema, projection_table from relationship_projections \
+            "select projection_table from relationship_projections \
              where relationship_id = $1",
             &[&relationship_id],
         )
         .await?;
 
-    let (projection_schema, projection_table) = match existing {
-        Some(row) => (row.get::<_, String>(0), row.get::<_, String>(1)),
+    let projection_table = match existing {
+        Some(row) => row.get::<_, String>(0),
         None => {
             let projection_table = ddl::relationship_projection_table_name(relationship_id);
             let qualified_projection =
-                ddl::qualified_relationship_projection_table(target_schema, &projection_table);
+                ddl::qualified_relationship_projection_table(catalog_schema, &projection_table);
 
             // The projection's own shape: its key (the to-side column
             // itself, same name and type as the to-side's), plus the two
@@ -4528,7 +4534,7 @@ async fn ensure_relationship_projection_in_txn(
             // is what actually populates it, using this branch's freshly
             // created, still-empty table as its starting point.
             txn.batch_execute(&format!(
-                "create table if not exists {qualified_projection} (\
+                "create table {qualified_projection} (\
                      {to_col_ident} {to_col_pg_type} primary key, \
                      {gen_col} bigint not null default 0, \
                      {lsn_col} pg_lsn not null)",
@@ -4539,17 +4545,17 @@ async fn ensure_relationship_projection_in_txn(
 
             txn.execute(
                 "insert into relationship_projections \
-                 (relationship_id, projection_schema, projection_table) values ($1, $2, $3)",
-                &[&relationship_id, &target_schema, &projection_table],
+                 (relationship_id, projection_table) values ($1, $2)",
+                &[&relationship_id, &projection_table],
             )
             .await?;
 
-            (target_schema.to_string(), projection_table)
+            projection_table
         }
     };
 
     let qualified_projection =
-        ddl::qualified_relationship_projection_table(&projection_schema, &projection_table);
+        ddl::qualified_relationship_projection_table(catalog_schema, &projection_table);
 
     // Every data column (i.e. excluding the key and the two bookkeeping
     // columns) the projection currently carries, in ordinal order — the
@@ -4567,7 +4573,7 @@ async fn ensure_relationship_projection_in_txn(
         .query(
             "select column_name from information_schema.columns \
              where table_schema = $1 and table_name = $2 order by ordinal_position",
-            &[&projection_schema, &projection_table],
+            &[&catalog_schema, &projection_table],
         )
         .await?
         .into_iter()
@@ -4673,7 +4679,7 @@ async fn widen_relationship_projections_for_definition_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     def: &TransformDef,
     qualified_source: &str,
-    target_schema: &str,
+    catalog_schema: &str,
 ) -> Result<(), CatalogError> {
     // Issue #288: `def`'s relationships are the ones declared on its own
     // qualified source, not on any same-named table in another schema.
@@ -4714,7 +4720,7 @@ async fn widen_relationship_projections_for_definition_in_txn(
             &to_table,
             &to_col,
             &to_col_pg_type,
-            target_schema,
+            catalog_schema,
             &columns,
         )
         .await?;

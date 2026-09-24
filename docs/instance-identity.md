@@ -105,7 +105,11 @@ Two things remain the operator's responsibility, not the engine's:
   instances materialize similarly-named targets. Target tables are
   application data, deliberately outside the instance schema (see
   `DEFAULT_TARGET_SCHEMA`), so nothing keeps two instances' targets apart
-  automatically.
+  automatically. Only the targets you name need this. The tables Trellis
+  generates for itself, such as a to-one relationship's projection
+  (`_trellis_rel_projection_<id>`, numbered per instance), live in the instance
+  schema, so two instances sharing a target schema can't collide on them
+  (issue #435).
 
 An instance can read another instance's 1-1 target as a source, exactly as it
 would any other table with a primary key. It cannot read another instance's

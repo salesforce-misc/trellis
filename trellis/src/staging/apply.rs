@@ -1357,9 +1357,9 @@ pub(crate) struct ReverseRelationshipShape {
     /// `information_schema.columns` (issue #131's own write path: which
     /// data columns to copy off the parent's new image).
     projection_table_bare: String,
-    /// The schema `projection_table_bare` lives in (the declaring
-    /// connection's `target_schema`, issue #379) — bare, for the same
-    /// `information_schema.columns` introspection.
+    /// The schema `projection_table_bare` lives in (the instance's catalog
+    /// schema, issue #435) — bare, for the same `information_schema.columns`
+    /// introspection.
     projection_schema: String,
     to_col: String,
     from_table: String,
