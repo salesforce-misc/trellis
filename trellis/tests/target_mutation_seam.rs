@@ -140,6 +140,7 @@ async fn a_chained_target_is_never_published_even_as_a_relationship_endpoint() {
     )
     .await
     .expect("install the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     // No `REPLICA IDENTITY FULL` on `agg`: an aggregate over a seam-only
     // target never reads its CDC, so it has no old-image requirement.
     install_definition(
@@ -266,6 +267,7 @@ async fn resuming_an_aggregate_column_succeeds() {
     )
     .await
     .expect("install agg");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     raw.batch_execute(
         "insert into column_status (transform_table, column_name, last_error, local_fuse) \
          values ('agg', 'total', 'synthetic pause', true)",
@@ -376,6 +378,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install agg");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.d FROM public.agg GROUP BY total SELECT COUNT(*) AS n",
@@ -387,6 +390,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     )
     .await
     .expect("install d");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select total::text, n::text from public.d").await,
@@ -452,6 +456,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select p::text, t::text from public.agg").await,
@@ -573,6 +578,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     )
     .await
     .expect("install tag_totals");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     install_definition(
         &db.pool,
         "TRANSFORM public.tag_view FROM public.tag_totals GROUP BY tag \
@@ -585,6 +591,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
     )
     .await
     .expect("install tag_view");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     raw.execute("update public.posts set word_count = 400 where id = 1", &[])

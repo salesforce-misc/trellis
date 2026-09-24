@@ -355,45 +355,6 @@ async fn current_snapshot(client: &impl GenericClient) -> Result<Snapshot, Intak
     Snapshot::parse(&text)
 }
 
-/// Whether `qualified_table` currently has a durable `pending_backfill`
-/// marker whose `xmin` fence has **not** yet settled (issue #55) — i.e.
-/// whether enumerating this table's rows right now would race a transaction
-/// the marker's fence was captured against.
-///
-/// `false` covers two different "safe to enumerate now" cases the caller
-/// doesn't need to distinguish: no marker at all (nothing pending for this
-/// table), and a marker whose fence has already settled but
-/// [`run_pending_backfills`] simply hasn't discharged it yet. Both mean a
-/// synchronous enumeration started right now would see a state
-/// [`run_pending_backfills`]'s later discharge is guaranteed to see too (or
-/// a strict superset of it), so there is nothing to defer.
-///
-/// Used at definition-creation time
-/// ([`crate::defs::catalog::install_definition`]) to decide whether an
-/// aggregate's or relationship-enriched 1-1 definition's in-call build should
-/// run, or defer to `waiting_to_backfill` and ride this same marker's own
-/// discharge instead — see docs/observability.md's "Backfill status and the
-/// `xmin` caveat." Every other shape always defers (ADR-0016); issue #419
-/// moves these two there too, and retires this check.
-pub(crate) async fn backfill_marker_unsettled(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<bool, IntakeError> {
-    let Some(row) = client
-        .query_opt(
-            "select fence_snapshot::text from pending_backfill where table_name = $1",
-            &[&qualified_table],
-        )
-        .await?
-    else {
-        return Ok(false);
-    };
-    let fence_text: String = row.get(0);
-    let fence = Snapshot::parse(&fence_text)?;
-    let now = current_snapshot(client).await?;
-    Ok(!now.settled_since(&fence))
-}
-
 struct PendingBackfill {
     table: String,
     fence: Snapshot,
@@ -477,6 +438,40 @@ async fn record_discharge_failure(
                 &error.to_string(),
                 &delay.as_secs_f64(),
             ],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Parks a marker on `qualified_table` for a direct-build job that failed
+/// (issue #419, `defs::chunk_queue::fail_chunk`), carrying the failure as the
+/// marker's retry state: `attempts` failures so far, `error`'s text, and the
+/// same backoff a failed discharge gets ([`discharge_retry_delay`]). The
+/// discharge retries the build when the backoff runs out, and
+/// `Trellis::status` reports the error meanwhile, exactly as for a marker
+/// whose discharge failed (issue #407). Parked in the caller's transaction,
+/// which hands the build back.
+///
+/// Merges into a marker already parked on the table like any park
+/// ([`park_marker`]), which then takes this retry state too: the table's
+/// catch-ups wait out the same backoff, just as they would behind a failing
+/// discharge of the table.
+pub(crate) async fn park_failed_build(
+    client: &impl GenericClient,
+    qualified_table: &str,
+    attempts: i32,
+    error: &str,
+) -> Result<(), tokio_postgres::Error> {
+    park_marker(client, qualified_table).await?;
+    let delay = discharge_retry_delay(u32::try_from(attempts).unwrap_or(1));
+    client
+        .execute(
+            "update pending_backfill set \
+               attempts = $2, \
+               last_error = $3, \
+               next_attempt_at = now() + make_interval(secs => $4) \
+             where table_name = $1",
+            &[&qualified_table, &attempts, &error, &delay.as_secs_f64()],
         )
         .await?;
     Ok(())
@@ -617,12 +612,6 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
 pub struct CoverageFence {
     pub fence: String,
     pub count: i64,
-    /// The WAL insert position read in the same statement, after its snapshot
-    /// was taken: every commit `fence` sees ends at or before it. Not
-    /// persisted; the build uses it to check that no streamed change it read
-    /// is still waiting to drain when it goes live (issue #442,
-    /// [`crate::staging::converge::table_drained_through`]).
-    pub horizon: PgLsn,
 }
 
 /// Captures the fence snapshot and row count for `qualified_table` in one
@@ -647,8 +636,8 @@ pub async fn capture_backfill_coverage_fence(
     let row = client
         .query_one(
             &format!(
-                "select count(*)::bigint, pg_current_snapshot()::text, \
-                 pg_current_wal_insert_lsn() from {}.{}",
+                "select count(*)::bigint, pg_current_snapshot()::text \
+                 from {}.{}",
                 quote_ident(schema),
                 quote_ident(table)
             ),
@@ -658,7 +647,6 @@ pub async fn capture_backfill_coverage_fence(
     Ok(CoverageFence {
         count: row.get(0),
         fence: row.get(1),
-        horizon: row.get(2),
     })
 }
 
@@ -813,11 +801,11 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// `waiting_to_backfill`; a fence that hasn't settled yet is left alone for
 /// the next pass — this function is meant to be retried on every one.
 ///
-/// # Dispatch by shape (ADR-0016, issue #418)
+/// # Dispatch by shape (ADR-0016, issues #418, #419)
 ///
 /// The discharge is the one capture path every definition's build goes
 /// through: a fresh registration, a resumed definition's rebuild, and a
-/// definition that deferred to an unsettled marker alike. Each
+/// direct build handed back after a failure alike. Each
 /// `waiting_to_backfill` definition on the marker's table gets the build its
 /// shape has:
 ///
@@ -828,9 +816,15 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 ///   `backfilling` together (`defs::chunk_queue::dispatch_one_to_one`). Drain
 ///   threads execute the chunks, and the last one flips it `live` and parks
 ///   its go-live catch-up.
-/// - **Everything else** — the `Unsupported` fallback, and for now aggregates
-///   and relationship-enriched 1-1 definitions (issue #419 gives them a
-///   background direct-build job) — goes through the ring enumeration below,
+/// - **An aggregate or relationship-enriched 1-1 definition**: the
+///   transaction enqueues one direct-build job as a `backfill_chunks` row and
+///   moves the definition to `backfilling` together
+///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
+///   that the direct build can render it
+///   ([`crate::defs::backfill::check_direct_build`]). A drain thread runs the
+///   whole ADR-0007 build, and finishing it flips the definition `live` and
+///   parks its go-live catch-ups, as for the last chunk.
+/// - **The `Unsupported` fallback** goes through the ring enumeration below,
 ///   and flips `waiting_to_backfill` -> `live` as the last statement of the
 ///   transaction, together with its go-live catch-up parks. There is no
 ///   intermediate `backfilling` for it to be stranded in (issue #404).
@@ -842,11 +836,12 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 ///
 /// The enumeration stages one image-less `Recompute` row per source key, for
 /// every `live` reader of the table to re-derive. It runs when a ring-built
-/// definition needs it, or when anything other than this pass's chunk-built
-/// definitions reads the table (a catch-up for `live` readers) — unless
+/// definition needs it, or when anything other than this pass's
+/// background-built definitions (chunks or a direct-build job, which read the
+/// table themselves) reads the table (a catch-up for `live` readers) — unless
 /// [`coverage_covers`] shows the table unchanged since a direct build folded
-/// it in (issue #79, bug B). A marker on a table only chunk-built definitions
-/// read, or nothing reads at all (issue #417: a fresh install parks a marker
+/// it in (issue #79, bug B). A marker on a table only background-built
+/// definitions read, or nothing reads at all (issue #417: a fresh install parks a marker
 /// on every configured source table, [`create_slot_and_park_markers`]), is
 /// discharged without enumerating.
 ///
@@ -1066,6 +1061,9 @@ enum Build {
     /// A plain 1-1 definition: these `(lo, hi]` primary-key chunk
     /// boundaries, enqueued as `backfill_chunks` rows.
     Chunks(Vec<(Option<String>, String)>),
+    /// An aggregate or relationship-enriched 1-1 definition: one direct-build
+    /// job, enqueued as a `backfill_chunks` row (issue #419).
+    Direct,
     /// The ring enumeration of the marker's table, flipped `live` in the
     /// discharge's own transaction.
     Ring,
@@ -1095,28 +1093,29 @@ async fn plan_waiting_builds(
         let id: i64 = row.get(0);
         let text: String = row.get(1);
         let def = crate::defs::parse(&text).map_err(CatalogError::from)?;
-        // Aggregates and relationship-enriched 1-1 definitions build in-call
-        // at registration unless they deferred to a marker; a deferred one
-        // (or a resumed one) is rebuilt by the ring here until issue #419
-        // gives them a background direct-build job.
         let chunked =
             matches!(def.key_space, KeySpace::OneToOne) && !backfill::uses_relationships(&def);
-        let build = if !chunked {
-            Build::Ring
+        let planned = if chunked {
+            backfill::plan_one_to_one_chunks(client, &def, table)
+                .await
+                .map(Build::Chunks)
         } else {
-            match backfill::plan_one_to_one_chunks(client, &def, table).await {
-                Ok(ranges) => Build::Chunks(ranges),
-                Err(BackfillError::Unsupported(what)) => {
-                    tracing::debug!(
-                        definition_id = id,
-                        table = %table,
-                        unsupported = %what,
-                        "direct build unsupported; falling back to the ring enumeration"
-                    );
-                    Build::Ring
-                }
-                Err(err) => return Err(CatalogError::DirectBackfill(err).into()),
+            backfill::check_direct_build(client, &def, table)
+                .await
+                .map(|()| Build::Direct)
+        };
+        let build = match planned {
+            Ok(build) => build,
+            Err(BackfillError::Unsupported(what)) => {
+                tracing::debug!(
+                    definition_id = id,
+                    table = %table,
+                    unsupported = %what,
+                    "direct build unsupported; falling back to the ring enumeration"
+                );
+                Build::Ring
             }
+            Err(err) => return Err(CatalogError::DirectBackfill(err).into()),
         };
         builds.push((id, build));
     }
@@ -1139,9 +1138,10 @@ async fn discharge_marker(
 ) -> Result<Discharge, IntakeError> {
     let builds = plan_waiting_builds(client, &marker.table).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
-    let chunked: Vec<i64> = builds
+    // Definitions whose build reads the table itself, in the background.
+    let background: Vec<i64> = builds
         .iter()
-        .filter(|(_, build)| matches!(build, Build::Chunks(_)))
+        .filter(|(_, build)| !matches!(build, Build::Ring))
         .map(|(id, _)| *id)
         .collect();
     let ring: Vec<i64> = builds
@@ -1159,7 +1159,7 @@ async fn discharge_marker(
     // A ring-built definition has never read the table, so coverage can't
     // stand in for its enumeration.
     let enumerate = !ring.is_empty()
-        || (crate::defs::catalog::table_has_reader(&txn, &marker.table, &chunked).await?
+        || (crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?
             && !coverage_covers(&txn, &marker.table).await?);
     if enumerate {
         declare_enumeration(&txn, &marker.table).await?;
@@ -1174,8 +1174,14 @@ async fn discharge_marker(
         append_enumeration(&txn, &marker.table).await?;
     }
     for (id, build) in &builds {
-        if let Build::Chunks(ranges) = build {
-            crate::defs::chunk_queue::dispatch_one_to_one(&txn, *id, ranges).await?;
+        match build {
+            Build::Chunks(ranges) => {
+                crate::defs::chunk_queue::dispatch_one_to_one(&txn, *id, ranges).await?;
+            }
+            Build::Direct => {
+                crate::defs::chunk_queue::dispatch_direct_build(&txn, *id, marker.attempts).await?;
+            }
+            Build::Ring => {}
         }
     }
     // Delete only the marker this pass read (issues #311/#367). A park
@@ -2818,6 +2824,7 @@ mod catch_up_tests {
         )
         .await
         .expect("install order_rollup");
+        settle_registrations(&pool).await;
         drain_all(&pool, &mut client).await;
         crate::defs::lifecycle::pause_transform(&pool, "order_rollup")
             .await
@@ -2876,79 +2883,98 @@ mod catch_up_tests {
             .collect()
     }
 
-    /// Issue #330's ordering, the half that fixes where the orphan delete
-    /// runs. Group 0 is empty when the discharge starts and is repopulated
-    /// after the enumeration's snapshot is taken, so the cursor never sees
-    /// the new row and only its CDC carries it. The group must come out as
-    /// that row alone. Had the anti-join run after the intake wait (as
-    /// #330's spike did), it would have seen the new row, kept the group's
-    /// pre-pause total of 12, and the CDC insert would have folded into that
-    /// as a delta: 112. The repopulation lands during the wait, so this test
-    /// can't tell "before `DECLARE`" from "right after `DECLARE`": both pass.
+    /// Issue #330's orphan delete, on a resumed aggregate's direct-build
+    /// rebuild (issue #419). The discharge deletes the target rows no source
+    /// row backs and dispatches the job; `race` then writes the source before
+    /// the job reads it, staging that write's CDC the way intake would. The
+    /// job runs and finishes, and the CDC drains once the definition is
+    /// `live`.
+    async fn rebuild_racing(
+        pool: &crate::pool::Pool,
+        discharger: &mut tokio_postgres::Client,
+        race: &str,
+        key: &str,
+        op: crate::staging::CdcOp,
+        old_image: Option<&str>,
+        new_image: Option<&str>,
+    ) {
+        run_pending_backfills(
+            discharger,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge the resume's marker");
+        let status: String = discharger
+            .query_one(
+                "select status from transform_definitions \
+                 where target_table = 'public.order_rollup'",
+                &[],
+            )
+            .await
+            .expect("read status")
+            .get(0);
+        assert_eq!(status, "backfilling", "the rebuild is a direct-build job");
+        discharger.batch_execute(race).await.expect("race the job");
+        stage_order_cdc(discharger, key, op, old_image, new_image).await;
+        settle_registrations(pool).await;
+        drain_all(pool, discharger).await;
+    }
+
+    /// Group 0 is empty when the discharge's orphan delete runs, so its
+    /// pre-pause row goes, and it is repopulated before the job reads the
+    /// source. The job builds it from the new row, and that row's CDC,
+    /// draining after the flip, must not count it again: its LSN is at or
+    /// below the recompute horizon the build stamped on the group, so it
+    /// re-derives the group instead of adding 100 to it (200).
     #[tokio::test]
-    async fn a_group_repopulated_after_the_enumeration_snapshot_holds_only_its_new_rows() {
+    async fn a_group_repopulated_before_the_rebuild_reads_holds_only_its_new_rows() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) =
             resumed_rollup(&db, "delete from public.orders where g = 0").await;
-        let mut writer = connect(&db).await;
 
-        let writer_ref = &mut writer;
-        discharge_racing(&mut discharger, |go, _done| async move {
-            writer_ref
-                .batch_execute("insert into public.orders values (10, 0, 100)")
-                .await
-                .expect("repopulate group 0");
-            stage_order_cdc(
-                writer_ref,
-                "10",
-                crate::staging::CdcOp::Insert,
-                None,
-                Some(r#"{"id":"10","g":"0","a":"100"}"#),
-            )
-            .await;
-            go.send(()).expect("release discharge");
-        })
+        rebuild_racing(
+            &pool,
+            &mut discharger,
+            "insert into public.orders values (10, 0, 100)",
+            "10",
+            crate::staging::CdcOp::Insert,
+            None,
+            Some(r#"{"id":"10","g":"0","a":"100"}"#),
+        )
         .await;
-        drain_all(&pool, &mut discharger).await;
 
         assert_eq!(
             rollup_rows(&discharger).await,
             vec![(0, "100".to_string()), (1, "9".to_string())],
-            "group 0 is rebuilt from its new row alone, not on top of its pre-pause total"
+            "group 0 is rebuilt from its new row alone, counted once"
         );
     }
 
-    /// The other half: group 1's last row is deleted after the enumeration's
-    /// snapshot, so the orphan delete (which ran before it) kept the group
-    /// and the enumeration still names that row. The row's CDC delete is
-    /// what removes the group, applied once the definition is `live`.
+    /// Group 1's last row is deleted after the orphan delete kept the group
+    /// and before the job reads the source, so the job writes nothing for it
+    /// and its pre-pause row survives the rebuild (#436's race). The row's
+    /// CDC delete is what removes the group, applied once the definition is
+    /// `live`.
     #[tokio::test]
     async fn a_group_emptied_after_the_orphan_delete_is_dropped_by_its_cdc() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) =
             resumed_rollup(&db, "delete from public.orders where id in (3, 5)").await;
-        let mut writer = connect(&db).await;
 
-        let writer_ref = &mut writer;
-        discharge_racing(&mut discharger, |go, _done| async move {
-            writer_ref
-                .batch_execute("delete from public.orders where id = 1")
-                .await
-                .expect("empty group 1");
-            stage_order_cdc(
-                writer_ref,
-                "1",
-                crate::staging::CdcOp::Delete,
-                Some(r#"{"id":"1","g":"1","a":"1"}"#),
-                None,
-            )
-            .await;
-            go.send(()).expect("release discharge");
-        })
+        rebuild_racing(
+            &pool,
+            &mut discharger,
+            "delete from public.orders where id = 1",
+            "1",
+            crate::staging::CdcOp::Delete,
+            Some(r#"{"id":"1","g":"1","a":"1"}"#),
+            None,
+        )
         .await;
-        drain_all(&pool, &mut discharger).await;
 
         assert_eq!(
             rollup_rows(&discharger).await,
@@ -3212,11 +3238,11 @@ mod dispatch_tests {
         assert!(markers(&client).await.is_empty());
     }
 
-    /// An aggregate waiting on the discharge (one that deferred to an
-    /// unsettled marker, or a resumed one) is rebuilt by the ring until issue
-    /// #419 gives it a background direct build.
+    /// An aggregate waiting on the discharge gets one direct-build job
+    /// (issue #419), committed with its move to `backfilling`, and nothing is
+    /// enumerated into the ring: the job reads the source itself.
     #[tokio::test]
-    async fn an_aggregate_waiting_on_the_discharge_is_rebuilt_by_ring() {
+    async fn an_aggregate_waiting_on_the_discharge_gets_a_direct_build_job() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let mut client = connect(&db).await;
@@ -3232,8 +3258,22 @@ mod dispatch_tests {
         reconcile(&mut client, &["public.orders"]).await;
 
         discharge(&mut client).await;
-        assert_eq!(status(&client, id).await, "live");
-        assert!(staged(&client).await);
+        assert_eq!(status(&client, id).await, "backfilling");
+        assert_eq!(chunks(&client, id).await, 1);
+        let unbounded: bool = client
+            .query_one(
+                "select hi is null and lo is null from backfill_chunks where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read the job")
+            .get(0);
+        assert!(unbounded, "the job builds the whole definition");
+        assert!(
+            !staged(&client).await,
+            "the source is not enumerated into the ring"
+        );
+        assert!(markers(&client).await.is_empty());
     }
 
     /// A ring-built definition has never read its table, so a coverage

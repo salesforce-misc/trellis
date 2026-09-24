@@ -1601,8 +1601,10 @@ pub async fn resume_column(
 /// the freeze left it until that marker's discharge
 /// ([`crate::intake::publication::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
-/// #330, `intake::resume_orphans`) and enumerates every current source row
-/// for the drain to re-derive. The discharge respects the marker's `xmin`
+/// #330, `intake::resume_orphans`) and dispatches the rebuild by shape
+/// (ADR-0016): chunks or a direct-build job that drain threads run, or, for
+/// a shape the direct build can't render, an enumeration of every current
+/// source row for the drain to re-derive. The discharge respects the marker's `xmin`
 /// fence, never re-deriving the target without waiting out a concurrent
 /// transaction that might still be pinning it (issue #55;
 /// docs/observability.md's "Backfill status and the `xmin` caveat" applies

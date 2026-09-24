@@ -241,9 +241,10 @@ async fn discharge_pending_backfills(client: &mut Client) {
 /// Seeds a source table carrying `REPLICA IDENTITY FULL`, which both the
 /// aggregate shape (`assert_replica_identity_supports_aggregate`) and the
 /// reverse-recompute machinery require. Aggregates are this file's default
-/// transform shape for a reason: they build synchronously, so a test that
-/// needs a definition to actually reach `live` doesn't have to stand up drain
-/// workers just to get there.
+/// transform shape. Registration only records one as `waiting_to_backfill`
+/// (issue #419); a test that needs it `live` settles it with
+/// [`publication::settle_registrations`], which dispatches and runs its one
+/// direct-build job in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
     raw.batch_execute(&format!(
         "create table {table} (id bigint primary key, g bigint, a numeric); \
@@ -278,13 +279,19 @@ async fn pausing_twice_is_a_no_op_success() {
     let def = trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
-        .expect("an aggregate definition builds synchronously")
+        .expect("an aggregate definition registers")
         .into_transform()
         .expect("a TRANSFORM statement registers a transform");
     assert_eq!(
         def.status,
-        TransformStatus::Live,
-        "an aggregate transform is live the moment it is defined"
+        TransformStatus::WaitingToBackfill,
+        "registration only records an aggregate; its build is dispatched by the backfill discharge (#419)"
+    );
+    publication::settle_registrations(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_rollup").await.as_deref(),
+        Some("live"),
+        "precondition: the direct-build job took the aggregate live"
     );
 
     trellis
@@ -372,7 +379,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
 
     // No live pipeline (issue #301): every change below is staged by hand and
     // drained through the engine's own apply path, and the resume's backfill
-    // marker is discharged by hand, so each claim is checked the moment its
+    // marker is discharged and its build job run by hand, so each claim is checked the moment its
     // precondition holds instead of polled for under a wall-clock budget.
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -383,6 +390,9 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
+    // Registration only records the two aggregates (#419); their direct-build
+    // jobs take both live before one is paused.
+    publication::settle_registrations(&db.pool).await;
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -476,10 +486,32 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         "resume drops the definition back into the backfill lifecycle it was defined through"
     );
 
+    // Claim 2, mechanism continued: the resume's marker discharges into the
+    // same direct-build job a freshly registered aggregate gets (#419): one
+    // unbounded `backfill_chunks` row, the definition `backfilling`.
+    discharge_pending_backfills(&mut raw).await;
+    assert_eq!(
+        persisted_status(&raw, "order_rollup").await.as_deref(),
+        Some("backfilling"),
+        "the discharge hands the resumed aggregate to its direct-build job"
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from backfill_chunks c \
+             join transform_definitions d on d.id = c.definition_id \
+             where split_part(d.target_table, '.', 2) = 'order_rollup' \
+               and c.lo is null and c.hi is null and not c.done"
+        )
+        .await,
+        1,
+        "the rebuild is one whole-definition job, not a replay of buffered changes"
+    );
+
     // Claim 2, outcome: the target comes back reconciled against the *current*
     // source — including the eight rows written while it was paused, whose
     // change records were drained for the sibling and never held for it.
-    discharge_pending_backfills(&mut raw).await;
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         count(
@@ -525,6 +557,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
+    publication::settle_registrations(&db.pool).await;
     assert!(
         table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,
         "precondition: the target table exists"
@@ -700,6 +733,9 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
+    // A transform chains only off a live target; the upstream's direct-build
+    // job takes it there (#419).
+    publication::settle_registrations(&db.pool).await;
     raw.batch_execute(&format!(
         "alter table {DEFAULT_TARGET_SCHEMA}.order_rollup replica identity full"
     ))
@@ -709,6 +745,12 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g SELECT sum(total) AS t")
         .await
         .expect("define a transform chained off the first one's target");
+    publication::settle_registrations(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "grand_total").await.as_deref(),
+        Some("live"),
+        "precondition: the dependent is live, the status this test's refusal is named for"
+    );
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -789,6 +831,9 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define the upstream");
+    // A transform chains only off a live target; the upstream's direct-build
+    // job takes it there (#419).
+    publication::settle_registrations(&db.pool).await;
     raw.batch_execute(&format!(
         "alter table {DEFAULT_TARGET_SCHEMA}.order_rollup replica identity full"
     ))
@@ -916,6 +961,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
+    publication::settle_registrations(&db.pool).await;
 
     let err = trellis
         .apply("DROP TRANSFORM order_rollup")

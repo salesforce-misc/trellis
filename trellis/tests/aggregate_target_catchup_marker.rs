@@ -128,13 +128,15 @@ fn sku_totals_columns() -> HashMap<String, ValueType> {
 
 const SKU_TOTALS: &str = "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total";
 
-/// Installs [`SKU_TOTALS`] and discharges the catch-up marker its build
-/// parks on `sales` when it goes live (issue #430), so each test starts with
-/// no marker but the one it is about.
+/// Installs [`SKU_TOTALS`], settles its background build (#419), and
+/// discharges the catch-up marker its build parks on `sales` when it goes
+/// live (issue #430), so each test starts with no marker but the one it is
+/// about.
 async fn install_sku_totals(pool: &trellis::Pool, client: &mut Client) {
     install_definition(pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
+    publication::settle_registrations(pool).await;
     publication::run_pending_backfills(
         client,
         "wake",

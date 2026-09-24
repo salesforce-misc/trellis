@@ -198,6 +198,7 @@ async fn an_aggregate_target_is_accepted_as_a_relationship_endpoint() {
     )
     .await
     .expect("install the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     for text in [
         "RELATIONSHIP totals FROM stores.region TO region_totals.region",

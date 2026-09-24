@@ -115,8 +115,8 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
     assert_eq!(definition.def.target, "order_rollup");
     assert_eq!(
         definition.status,
-        TransformStatus::Live,
-        "an aggregate builds synchronously"
+        TransformStatus::WaitingToBackfill,
+        "registration returns before the build (ADR-0016)"
     );
 
     // PAUSE TRANSFORM — freezes it.
@@ -407,7 +407,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
             .await
             .expect("status")
             .map(|s| s.status),
-        Some(TransformStatus::Live),
+        Some(TransformStatus::WaitingToBackfill),
         "an invalid statement must leave the catalog exactly as it was"
     );
 }

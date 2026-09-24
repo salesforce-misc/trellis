@@ -525,8 +525,9 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 /// Issue #312: when the settled marker's enumeration has to wait for intake
 /// and gives up, the definition stays `waiting_to_backfill`. Left in
 /// `backfilling`, the next pass (which only dispatches `waiting_to_backfill`
-/// definitions) would never flip it to `live`. An aggregate, since the ring
-/// rebuilds it (and so waits for intake) until issue #419.
+/// definitions) would never flip it to `live`. A doubling alias chain too
+/// large for the direct build to inline, so it's `Unsupported` there and
+/// built by the ring (which waits for intake).
 #[tokio::test]
 async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() {
     let cluster = TestCluster::start();
@@ -547,9 +548,12 @@ async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() 
     publication::reconcile_publication(&mut raw, "test_pub", &[format!("{DEFAULT_SCHEMA}.s")])
         .await
         .expect("reconcile leaves an unsettled marker");
+    let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
+        .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
+        .collect();
     install_definition(
         &db.pool,
-        "TRANSFORM t FROM s GROUP BY a SELECT sum(id) AS total",
+        &format!("TRANSFORM t FROM s SELECT {}", chain.join(", ")),
         &numeric(&["id", "a"]),
         "public",
     )
@@ -1045,9 +1049,8 @@ async fn resume_transform_reports_not_found_for_an_unregistered_target() {
 }
 
 /// Regression coverage (this issue's items 2/3): with no unsettled marker at
-/// creation time, both backfill mechanisms still reach `live` directly, the
-/// same as before this issue's deferral logic was added — the deferral
-/// check must be a no-op on the ordinary path.
+/// creation time, both background builds (a plain 1-1 definition's chunks and
+/// an aggregate's direct-build job) reach `live` through the discharge.
 #[tokio::test]
 async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     let cluster = TestCluster::start();
@@ -1090,9 +1093,10 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     .expect("install_definition (direct/aggregate path)");
     assert_eq!(
         agg.status,
-        TransformStatus::Live,
-        "the direct/set-based path still builds synchronously and ends up live in-call"
+        TransformStatus::WaitingToBackfill,
+        "the direct/set-based path registers without building (ADR-0016, #419)"
     );
+    drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);
 }
 

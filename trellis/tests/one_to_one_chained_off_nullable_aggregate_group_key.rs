@@ -36,49 +36,14 @@
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
-
-/// Claims and executes every pending direct-build backfill chunk until none
-/// remain — `sku_totals_echo` (a plain, non-aggregate [`KeySpace::OneToOne`])
-/// backfills via the durable chunk queue rather than in-call
-/// (docs/decisions/0007's amendment), unlike `sku_totals` (an aggregate),
-/// which still backfills synchronously inside `install_definition`. Mirrors
-/// `defs_deleted_oneone_target_reduces_chained_aggregate.rs`'s helper of the
-/// same name.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "oneone_chained_off_null_group_test_backfill_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
-                .await
-                .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
-}
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -256,12 +221,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
-    drain_backfill_chunks(&db.pool).await;
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     assert_eq!(

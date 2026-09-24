@@ -41,12 +41,11 @@
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::staging::{has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -59,33 +58,6 @@ async fn connect_raw(dsn: &str) -> Client {
         .await
         .expect("set search_path");
     client
-}
-
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0016 (#418): registration only records a definition; the backfill
-    // discharge dispatches its chunks.
-    trellis::intake::publication::discharge_registrations(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    const CLAIMED_BY: &str = "composite_nullable_group_key_backfill_test_worker";
-    loop {
-        let client = pool.get().await.expect("acquire connection");
-        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
-            .await
-            .expect("claim_chunks");
-        drop(client);
-        if claimed.is_empty() {
-            return;
-        }
-        for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
-                .await
-                .expect("run_claimed_chunk");
-            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
-                .await
-                .expect("finish_chunk");
-        }
-    }
 }
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
@@ -138,6 +110,7 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     )
     .await
     .expect("install the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     let null_group_count: i64 = client
         .query_one("select count(*) from stock_totals where sku is null", &[])
@@ -165,7 +138,7 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     .await
     .expect("install the chained OneToOne");
 
-    drain_backfill_chunks(&db.pool).await;
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     retire_drained_segments(&mut client)
         .await

@@ -229,6 +229,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the upstream aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -239,6 +240,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     install_definition(&db.pool, SKU_TOTALS_V2, &sku_totals_columns(), "public")
         .await
         .expect("install the aggregate chained onto the upstream aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // The one source-committed change this whole test traces: a brand-new

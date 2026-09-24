@@ -83,6 +83,9 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
     )
     .await
     .expect("instance A installs its aggregate");
+    // The aggregate builds in the background (#419); settle it so A's target
+    // is live and populated, as a chain off it requires.
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     let config_b = Config::with_schema(db.dsn(), INSTANCE_B).expect("valid schema");
     let pool_b = Pool::new(&config_b).expect("build instance B's pool");

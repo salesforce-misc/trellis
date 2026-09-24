@@ -38,20 +38,20 @@
 //! **[`apply`](Trellis::apply)ing a definition doesn't block on backfill.** Per
 //! `docs/decisions/0008-public-api-design.md`'s decision 1 and
 //! [ADR-0007's amendment](../../docs/decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability-amendment),
-//! a plain (non-relationship) 1-1 transform's initial backfill runs as a
-//! durable, claimable queue of chunks that running drain
-//! (`application_threads`) workers execute — anywhere in the fleet, not
-//! necessarily on the connection that called `apply()`. `apply()` itself
-//! returns once the definition is registered and that chunk work is
-//! enumerated/persisted, with [`TransformStatus::Backfilling`]; callers that
-//! need the target actually populated poll [`Trellis::status`] until it
-//! reports [`TransformStatus::Live`] — which requires *some* client in the
-//! fleet to be running with `drain_threads > 0` (a define-only connection,
-//! with no such client anywhere, leaves the transform queued indefinitely).
-//! A relationship-enriched 1-1 transform (like the `count(posts.id)` example
-//! below) or an aggregate (`GROUP BY`) transform still builds fully
-//! synchronously in-call today — see `trellis::defs::backfill`'s module docs
-//! for why those two shapes aren't chunked into the durable queue yet.
+//! and ADR-0016, a transform's initial backfill runs in the background:
+//! `apply()` returns once the definition is registered, with
+//! [`TransformStatus::WaitingToBackfill`], having read no source rows. The
+//! staging worker's backfill discharge then dispatches the build by shape: a
+//! plain (non-relationship) 1-1 transform as a durable, claimable queue of
+//! chunks, and an aggregate (`GROUP BY`) or relationship-enriched 1-1
+//! transform (like the `count(posts.id)` example below) as one direct-build
+//! job. Running drain (`application_threads`) workers execute either —
+//! anywhere in the fleet, not necessarily on the connection that called
+//! `apply()`. Callers that need the target actually populated poll
+//! [`Trellis::status`] until it reports [`TransformStatus::Live`] — which
+//! requires a staging worker and *some* client in the fleet running with
+//! `drain_threads > 0` (a define-only connection, with no such client
+//! anywhere, leaves the transform queued indefinitely).
 //!
 //! # Lifecycle
 //!
@@ -274,14 +274,12 @@ impl Trellis {
     /// # What each statement does
     ///
     /// `TRANSFORM`/`RELATIONSHIP` register a definition, as the retired
-    /// `define`/`define_relationship` did — including that **a plain 1-1
-    /// transform returns before its backfill finishes** (see this module's doc
-    /// comment): the returned [`Definition`] reports
-    /// [`TransformStatus::Backfilling`] and the target is populated by drain
-    /// workers elsewhere in the fleet. Poll [`Trellis::status`] for
-    /// [`TransformStatus::Live`]. A relationship-enriched 1-1 or an aggregate
-    /// (`GROUP BY`) transform still builds synchronously and comes back
-    /// [`TransformStatus::Live`].
+    /// `define`/`define_relationship` did — including that **a transform
+    /// returns before its backfill starts** (see this module's doc comment):
+    /// the returned [`Definition`] reports
+    /// [`TransformStatus::WaitingToBackfill`] and the target is populated in
+    /// the background, whatever the transform's shape. Poll
+    /// [`Trellis::status`] for [`TransformStatus::Live`].
     ///
     /// `PAUSE` freezes a definition at its current value (ADR-0014's
     /// operator-driven half of the pause state whose other half is the poison
@@ -1359,7 +1357,9 @@ pub struct DefinitionStatus {
     /// Where the transform is in its lifecycle (issue #55).
     pub status: TransformStatus,
     /// Set while the backfill marker parked on the definition's source table
-    /// keeps failing to discharge (issue #407, ADR-0016). That discharge runs
+    /// keeps failing to discharge (issue #407, ADR-0016), or carries the error
+    /// of a direct build that failed and was handed back to it (issue #419).
+    /// That discharge runs
     /// every build of a `waiting_to_backfill` definition on the table and the
     /// catch-up of every `live` one, so its failure is reported on each
     /// definition that reads the table, whatever its status. A definition
@@ -1436,8 +1436,8 @@ pub struct RelationshipSummary {
 #[non_exhaustive]
 pub enum Applied {
     /// A `TRANSFORM ...` statement registered a transform definition. Reports
-    /// [`TransformStatus::Backfilling`] for a plain 1-1 transform, whose
-    /// backfill runs in the background — see [`Trellis::apply`].
+    /// [`TransformStatus::WaitingToBackfill`]: its backfill runs in the
+    /// background — see [`Trellis::apply`].
     TransformDefined(Definition),
     /// A `RELATIONSHIP ...` statement registered a relationship declaration.
     RelationshipDefined(RelationshipDefinition),

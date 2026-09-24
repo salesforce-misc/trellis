@@ -393,6 +393,9 @@ async fn install_definition_records_coverage_and_a_to_side_join_skips() {
     )
     .await
     .expect("install_definition via the direct relationship path");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches.
+    publication::settle_registrations(&db.pool).await;
 
     // Coverage recorded for the source and both to-side tables it reads.
     let covered: Vec<String> = client
@@ -471,6 +474,7 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
     )
     .await
     .expect("install_definition via the direct relationship path");
+    publication::settle_registrations(&db.pool).await;
     // A write after the build's coverage fence, so coverage can't skip the
     // enumeration either: only the reader check decides.
     client

@@ -225,9 +225,7 @@ Every defined transform carries an observable **status**:
 
 * **`waiting_to_backfill`** — defined, but pre-existing source rows not yet read.
   Every new transform starts here: defining one returns before any source row
-  is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows);
-  *Planned, #419*, for aggregates and relationship-enriched 1-1 transforms,
-  which are still built while defining them).
+  is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 * **`backfilling`** — those rows have been read and the target is being built.
 * **`live`** — backfill complete; tracking live changes only. The steady state.
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);

@@ -1753,10 +1753,16 @@ async fn drain_backfill_chunks(
         Ok(()) => {
             let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
         }
-        Err(_) => {
-            if let Ok(mut client) = pool.get().await {
-                let _ = chunk_queue::release_chunk(&mut **client, chunk.id, claimed_by).await;
+        Err(err) => {
+            if matches!(chunk.work, chunk_queue::ChunkWork::DirectBuild) {
+                tracing::warn!(
+                    definition_id = chunk.definition_id,
+                    error = %err,
+                    "direct build failed; handing it back to the backfill discharge, \
+                     which retries it after a backoff"
+                );
             }
+            let _ = chunk_queue::fail_chunk(pool, &chunk, claimed_by, &err.to_string()).await;
         }
     }
     true
@@ -2924,8 +2930,9 @@ mod backfill_shutdown_tests {
     /// marker intact, since only `waiting_to_backfill` definitions are ever
     /// dispatched again. The catch-up timeout here is far longer than the
     /// test waits for shutdown, so only the shutdown signal can end the wait.
-    /// An aggregate, since it's rebuilt by the ring (and so waits for intake)
-    /// until issue #419.
+    /// A doubling alias chain too large for the direct build to inline, so
+    /// it's `Unsupported` there and built by the ring (which waits for
+    /// intake).
     #[tokio::test]
     async fn shutdown_during_a_backfill_wait_returns_the_definition_to_waiting() {
         let cluster = testkit::TestCluster::start();
@@ -2959,9 +2966,12 @@ mod backfill_shutdown_tests {
             ("id".to_string(), ValueType::Numeric),
             ("a".to_string(), ValueType::Numeric),
         ]);
+        let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
+            .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
+            .collect();
         crate::defs::install_definition(
             &pool,
-            "TRANSFORM t FROM s GROUP BY a SELECT sum(id) AS total",
+            &format!("TRANSFORM t FROM s SELECT {}", chain.join(", ")),
             &columns,
             "public",
         )

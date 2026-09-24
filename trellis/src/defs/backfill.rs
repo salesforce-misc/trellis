@@ -14,9 +14,12 @@
 //! directly with server-side `INSERT … SELECT` statements, chunked by key
 //! range so each statement is one bounded transaction. The ring is then left
 //! to carry only live CDC deltas that land *after* the build (see the fence
-//! discussion below). Callers pair this with
-//! [`super::catalog::create_definition_without_backfill`] so the ring
-//! enumeration doesn't *also* run.
+//! discussion below). The backfill discharge (ADR-0016) dispatches it by
+//! shape instead of a ring enumeration: a plain 1-1 definition's primary-key
+//! ranges as durable chunks ([`plan_one_to_one_chunks`]), and an aggregate's
+//! or relationship-enriched 1-1 definition's whole build
+//! ([`backfill_definition`]) as one direct-build job (`defs::chunk_queue`,
+//! issue #419), once [`check_direct_build`] confirms it can render the shape.
 //!
 //! # Correctness — the five concerns issue #63 M3 calls out
 //!
@@ -34,10 +37,14 @@
 //!    (or whole group) from the current source, identical in effect to the
 //!    ring's own image-less `Recompute` path. Overwrite is idempotent and
 //!    order-independent, so the handoff to the ring is the same one the ring
-//!    already relies on: the caller runs this build before live CDC
-//!    application begins for the definition (target table created, build run,
-//!    *then* the client starts), and any genuine post-build delta the ring
-//!    later applies lands on a fully-built row. This is deliberately *not* the
+//!    already relies on: live CDC isn't applied to the definition until the
+//!    build has finished and flipped it `live`, and any genuine post-build
+//!    delta the ring later applies lands on a fully-built row. The build runs
+//!    as a background job after its source joined the publication (ADR-0016,
+//!    issue #419), so a commit it read can also be streamed and drain after
+//!    the flip; for an aggregate, the recompute horizon each built group row
+//!    records makes such a delta re-derive the group instead of counting the
+//!    commit twice (see [`backfill_aggregate`]). This is deliberately *not* the
 //!    additive (`col = target.col + excluded.col`) merge the issue sketches as
 //!    the aggregate default: additive merge is not idempotent (a re-run or an
 //!    overlapping CDC delta double-counts) and cannot express a
@@ -65,7 +72,7 @@
 //!    ring's row-at-a-time apply path (`staging::apply::apply_target`) must
 //!    chunk around.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -80,7 +87,7 @@ use super::ddl::{
     self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
 };
 use super::invertibility::{AggregateArg, CountArg, classify};
-use super::model::RelationshipCardinality;
+use super::model::{RelationshipCardinality, RelationshipDefinition};
 use super::oracle::render_expr_sql;
 use super::registry::lookup_aggregate_function;
 
@@ -1172,19 +1179,32 @@ async fn resolve_to_one_joins(
     def: &TransformDef,
     source_table: &str,
 ) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
-    let mut names: Vec<String> = super::eval::relationship_references(def)
+    let mut found = BTreeMap::new();
+    for rel in referenced_relationship_names(def) {
+        let reldef = super::catalog::relationship_on_source(pool, source_table, &rel)
+            .await
+            .map_err(map_rel_lookup_err)?;
+        found.insert(rel, reldef);
+    }
+    to_one_joins(found)
+}
+
+/// The distinct relationship names `def`'s fields reference, sorted.
+fn referenced_relationship_names(def: &TransformDef) -> BTreeSet<String> {
+    super::eval::relationship_references(def)
         .into_iter()
         .map(|(rel, _column)| rel)
-        .collect();
-    names.sort();
-    names.dedup();
+        .collect()
+}
 
-    let mut resolved = Vec::with_capacity(names.len());
-    for rel in names {
-        let Some(reldef) = super::catalog::relationship_on_source(pool, source_table, &rel)
-            .await
-            .map_err(map_rel_lookup_err)?
-        else {
+/// [`resolve_to_one_joins`]'s check, over each referenced relationship's
+/// catalog entry (`None` for a name the source declares no relationship by).
+fn to_one_joins(
+    found: BTreeMap<String, Option<RelationshipDefinition>>,
+) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
+    let mut resolved = Vec::with_capacity(found.len());
+    for (rel, reldef) in found {
+        let Some(reldef) = reldef else {
             return Err(BackfillError::Unsupported(
                 "a definition referencing an unknown relationship".to_string(),
             ));
@@ -1197,6 +1217,49 @@ async fn resolve_to_one_joins(
         resolved.push((rel, reldef.def));
     }
     Ok(resolved)
+}
+
+/// Whether the direct build ([`backfill_definition`]) can render `def`, an
+/// aggregate or a relationship-enriched 1-1 definition, sourced from the
+/// qualified `source_table`: `Err(`[`BackfillError::Unsupported`]`)` exactly
+/// when the build itself would decline it before writing anything, and `Ok`
+/// otherwise. Reads only the catalog, never a source row.
+///
+/// The backfill discharge asks this before it dispatches a direct-build job
+/// (ADR-0016, issue #419), so a shape the build can't render goes to the ring
+/// enumeration inside the discharge instead. It runs the same shape checks as
+/// the builds, through the same helpers, on the discharge's own connection.
+/// One check a build makes is left out: the aggregate build's field-type
+/// inference, which can't fail for a definition registration validated. A
+/// catalog change between this check and the job (a relationship redefined,
+/// say) can still make the job hit `Unsupported`; that is a failed build like
+/// any other, handed back to the discharge, which asks this again.
+pub(crate) async fn check_direct_build(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    source_table: &str,
+) -> Result<(), BackfillError> {
+    let (schema, table) = source_table.split_once('.').ok_or_else(|| {
+        BackfillError::Unsupported(format!("an unqualified source table '{source_table}'"))
+    })?;
+    let mut found = BTreeMap::new();
+    for rel in referenced_relationship_names(def) {
+        let reldef = super::catalog::relationship_by_name_in(client, schema, table, &rel)
+            .await
+            .map_err(map_rel_lookup_err)?;
+        found.insert(rel, reldef);
+    }
+    match &def.key_space {
+        KeySpace::Aggregate { .. } => {
+            substituted_field_exprs(def)?;
+            to_one_joins(found)?;
+        }
+        KeySpace::OneToOne => {
+            let cardinality = to_many_cardinalities(found)?;
+            to_many_leaves(def, &cardinality)?;
+        }
+    }
+    Ok(())
 }
 
 /// The aggregate build: aggregate the whole source in a **single** full-table
@@ -1443,6 +1506,17 @@ async fn backfill_aggregate(
             }
         }
     }
+    // Issue #419: the build is a live `GROUP BY` read of the source, so each
+    // group row records its recompute horizon exactly as the forced path's
+    // re-derivation does (issue #321, [`ddl::RECOMPUTE_LSN_COLUMN`]). The
+    // build runs after its source joined the publication, so a commit it read
+    // is streamed too, and that commit's delta can drain after the definition
+    // goes live. The function is evaluated while the staging statement runs,
+    // after its snapshot is taken, so every commit that statement saw ends at
+    // or below it, and such a delta re-derives its group instead of counting
+    // the commit a second time.
+    insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
+    stage_exprs.push("pg_current_wal_insert_lsn()".to_string());
 
     let arity = group_idents.len();
     let update_sets: Vec<String> = insert_cols
@@ -1773,6 +1847,59 @@ fn map_rel_lookup_err(err: super::catalog::CatalogError) -> BackfillError {
     }
 }
 
+/// Each referenced relationship's cardinality, for [`to_many_leaves`]. An
+/// unknown relationship name is a shape the direct build can't render: the
+/// ring path surfaces the same `UnknownRelationship` the evaluator/validator
+/// would.
+fn to_many_cardinalities(
+    found: BTreeMap<String, Option<RelationshipDefinition>>,
+) -> Result<HashMap<String, RelationshipCardinality>, BackfillError> {
+    found
+        .into_iter()
+        .map(|(rel, reldef)| match reldef {
+            Some(reldef) => Ok((rel, reldef.cardinality)),
+            None => Err(BackfillError::Unsupported(
+                "a definition referencing an unknown relationship".to_string(),
+            )),
+        })
+        .collect()
+}
+
+/// The relationship-enriched 1-1 build's shape check: makes every field
+/// self-contained (substituting cross-field-alias references), then collects
+/// the distinct to-many-aggregate leaves across all fields — bailing to the
+/// ring on any unsupported shape (a bare to-one path, a nested relationship
+/// reference, or a cyclic alias chain). Every leaf must read a known to-many
+/// relationship; an aggregate over a to-one (or an unknown relationship) is a
+/// shape the validator rejects, so it falls back rather than emit wrong SQL
+/// for it. Returns the substituted fields and the leaves.
+fn to_many_leaves(
+    def: &TransformDef,
+    cardinality: &HashMap<String, RelationshipCardinality>,
+) -> Result<(Vec<Expr>, BTreeSet<AggLeaf>), BackfillError> {
+    let substituted = substitute_all_fields(def)?;
+    let mut leaves: BTreeSet<AggLeaf> = BTreeSet::new();
+    for expr in &substituted {
+        collect_agg_leaves(expr, &mut leaves)?;
+    }
+    for (rel, _agg, _column) in &leaves {
+        match cardinality.get(rel) {
+            Some(RelationshipCardinality::ToMany) => {}
+            Some(_) => {
+                return Err(BackfillError::Unsupported(
+                    "an aggregate over a to-one relationship".to_string(),
+                ));
+            }
+            None => {
+                return Err(BackfillError::Unsupported(
+                    "a definition referencing an unknown relationship".to_string(),
+                ));
+            }
+        }
+    }
+    Ok((substituted, leaves))
+}
+
 /// The relationship-enriched 1-1 build: computes a target whose fields
 /// aggregate over to-many relationship paths (`SUM(posts.x)`, `COUNT(comments)`,
 /// `coalesce(sum(posts.x), 0)`, `post_count + comment_count`) directly with
@@ -1831,55 +1958,19 @@ async fn backfill_relationship_one_to_one(
     // Resolve every referenced relationship to its endpoints + cardinality the
     // same way the rest of the catalog does (`relationship_on_source`), so this
     // build reads the identical join metadata the ring/oracle do.
-    let mut rel_defs: HashMap<String, RelationshipDef> = HashMap::new();
-    let mut rel_cardinality: HashMap<String, RelationshipCardinality> = HashMap::new();
-    for (rel, _column) in super::eval::relationship_references(def) {
-        if rel_defs.contains_key(&rel) {
-            continue;
-        }
-        let Some(reldef) = super::catalog::relationship_on_source(pool, source_table, &rel)
+    let mut found = BTreeMap::new();
+    for rel in referenced_relationship_names(def) {
+        let reldef = super::catalog::relationship_on_source(pool, source_table, &rel)
             .await
-            .map_err(map_rel_lookup_err)?
-        else {
-            // Unknown relationship name: the direct build can't render it — let
-            // the ring path surface the same `UnknownRelationship` the
-            // evaluator/validator would.
-            return Err(BackfillError::Unsupported(
-                "a definition referencing an unknown relationship".to_string(),
-            ));
-        };
-        rel_cardinality.insert(rel.clone(), reldef.cardinality);
-        rel_defs.insert(rel, reldef.def);
+            .map_err(map_rel_lookup_err)?;
+        found.insert(rel, reldef);
     }
-
-    // Make every field self-contained (substituting cross-field-alias
-    // references), then collect the distinct to-many-aggregate leaves across
-    // all fields — bailing to the ring on any unsupported shape (a bare to-one
-    // path, a nested relationship reference, or a cyclic alias chain).
-    let substituted = substitute_all_fields(def)?;
-    let mut leaves: BTreeSet<AggLeaf> = BTreeSet::new();
-    for expr in &substituted {
-        collect_agg_leaves(expr, &mut leaves)?;
-    }
-
-    // Every aggregate leaf must resolve to a known to-many relationship; an
-    // aggregate over a to-one (or an unknown relationship) is a shape the
-    // validator rejects — fall back rather than emit wrong SQL for it.
-    for (rel, _agg, _column) in &leaves {
-        match rel_cardinality.get(rel) {
-            Some(RelationshipCardinality::ToMany) => {}
-            Some(_) => {
-                return Err(BackfillError::Unsupported(
-                    "an aggregate over a to-one relationship".to_string(),
-                ));
-            }
-            None => {
-                return Err(BackfillError::Unsupported(
-                    "a definition referencing an unknown relationship".to_string(),
-                ));
-            }
-        }
-    }
+    let rel_defs: HashMap<String, RelationshipDef> = found
+        .iter()
+        .filter_map(|(rel, reldef)| Some((rel.clone(), reldef.as_ref()?.def.clone())))
+        .collect();
+    let rel_cardinality = to_many_cardinalities(found)?;
+    let (substituted, leaves) = to_many_leaves(def, &rel_cardinality)?;
 
     // Assign each distinct leaf a synthetic, collision-free staging-column
     // name keyed by its index in the sorted leaf set — never by a field name,

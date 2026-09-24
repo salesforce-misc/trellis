@@ -324,6 +324,7 @@ async fn aggregate_over_a_relationship_group_by_key_backfills_to_the_oracle() {
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -366,6 +367,7 @@ async fn inserting_a_from_side_row_lands_in_the_relationship_group_by_keys_group
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -425,6 +427,7 @@ async fn updating_a_to_side_rows_group_by_column_moves_affected_rows_to_the_new_
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -534,6 +537,7 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     install_definition(&db.pool, AUTHOR_TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the relationship-group-by-key definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Drive both of this issue's interesting mechanics directly against
@@ -610,6 +614,7 @@ async fn chaining_a_further_aggregate_onto_the_relationship_group_by_target_conv
     install_definition(&db.pool, TAG_TOTALS_2, &author_tag_totals_columns, "public")
         .await
         .expect("install the chained plain-column aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let tag_totals_2: HashMap<String, (String, Option<String>)> = client
@@ -766,6 +771,7 @@ async fn updating_a_to_sides_row_with_a_passthrough_field_for_the_group_by_key_s
     )
     .await
     .expect("install the passthrough-field definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client

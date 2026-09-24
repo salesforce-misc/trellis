@@ -451,6 +451,7 @@ async fn to_many_aggregate_returns_the_empty_set_when_the_last_related_row_goes(
     install_definition(&db.pool, ARTICLE_STATS, &source_columns, "public")
         .await
         .expect("install the to-many enrichment definition through the front door");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(

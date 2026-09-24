@@ -177,12 +177,11 @@ quarantine are two arcs of one lifecycle:
   marker's transaction fence has settled (see caveat below), and intake has
   caught up to the read's snapshot
   ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
-  *Planned (#419):* an aggregate or relationship-enriched 1-1 transform is
-  still built during registration unless its source already has an unsettled
-  marker.
+  A direct build that failed comes back here too, retried after a backoff;
+  `Trellis::status` reports its error meanwhile (`backfill_failure`).
 * **`backfilling`** — the backfill discharge has captured the source and
-  enqueued the transform's build, which is running: chunks on drain threads,
-  or a direct set-based build. The target is partial. A ring enumeration
+  enqueued the transform's build, which is running: chunks, or one direct
+  set-based build job, on drain threads. The target is partial. A ring enumeration
   (the fallback for a shape neither build can render) never shows this: it
   goes from `waiting_to_backfill` straight to `live` in the discharge's own
   transaction.

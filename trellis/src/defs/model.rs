@@ -61,11 +61,10 @@ pub struct Definition {
 /// ([`super::catalog::install_definition`]) persists
 /// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
 /// (ADR-0016) moves it on: to [`TransformStatus::Backfilling`] together with
-/// the chunks that build it, then [`TransformStatus::Live`] when the last one
-/// finishes, or straight to `live` for a ring-built definition. Until issue
-/// #419, an aggregate or relationship-enriched 1-1 definition is persisted
-/// `backfilling` by registration itself and flipped `live` once its in-call
-/// build completes.
+/// the chunks or job that build it, then [`TransformStatus::Live`] when the last one
+/// finishes (or its direct-build job does, for an aggregate or
+/// relationship-enriched 1-1 definition), or straight to `live` for a
+/// ring-built definition.
 ///
 /// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
 /// two triggers of ADR-0014's single "frozen" state: the poison fuse trips

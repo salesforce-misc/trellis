@@ -46,9 +46,9 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// definition's backfill in-call (docs/decisions/0007's amendment): it
 /// returns as soon as the chunk work is enumerated and persisted,
 /// `Backfilling` until a drain worker actually claims and finishes each
-/// chunk. `order_view` (this file's 1-1 mirror) needs this; `customer_totals`
-/// (an aggregate) still backfills synchronously in-call and needs no chunk
-/// draining. Mirrors `defs_install_definition.rs`'s helper of the same name.
+/// chunk. Both `order_view` (this file's 1-1 mirror) and `customer_totals`
+/// (an aggregate, whose direct build is a background job since #419) need
+/// this. Mirrors `defs_install_definition.rs`'s helper of the same name.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
     // ADR-0016 (#418): registration only records a definition; the backfill
     // discharge dispatches its chunks.
@@ -252,6 +252,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, CUSTOMER_TOTALS, &order_view_columns(), "public")
         .await
         .expect("install the aggregate chained onto order_view");
+    drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     assert_eq!(

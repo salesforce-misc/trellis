@@ -113,15 +113,98 @@ how many snapshots the build reads through:
 |---|---|---|---|
 | **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target also gets a go-live catch-up marker (`intake::publication::go_live`): its writes arrive through the seam from drain workers, which don't wait for a seal |
 | **Plain 1-1 chunks** | chunk boundaries enumerated and enqueued as `backfill_chunks`, executed by drain threads | once per chunk, each under its own snapshot | the catch-up marker parked when the last chunk goes live (`complete_direct_backfill`), discharged by this same path |
-| **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job | once per statement | the same go-live catch-up marker, parked by every direct build |
+| **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job, a `backfill_chunks` row with no bounds that a drain thread runs start to finish ([The direct-build job](#the-direct-build-job)) | once per statement | the same go-live catch-up marker, parked on every table the build read (its source and each relationship to-side) |
 
 The go-live catch-up re-reads the source, so a change that drained while the
-definition wasn't `live` reaches the target. For an aggregate its re-derivation
-of each group also corrects a change the build read whose streamed delta was
-folded again after the flip.
+definition wasn't `live` reaches the target. For an aggregate, a change the
+build read whose streamed delta drains after the flip re-derives its group
+through the recompute horizon the build records
+([Which consistency bookkeeping stays](#which-consistency-bookkeeping-stays)).
 
 A shape the direct build can't render (`BackfillError::Unsupported`) falls back
-to ring enumeration, inside the discharge.
+to ring enumeration, inside the discharge. The discharge finds out before it
+dispatches anything: `backfill::check_direct_build` runs the build's own shape
+checks against the catalog, reading no source rows.
+
+### The direct-build job
+
+An aggregate or relationship-enriched 1-1 definition's build is one job, not
+chunks: it materializes connection-scoped `TEMP TABLE` staging, which a set of
+independent workers on separate connections can't share. Splitting it stays a
+separate optimization ([ADR-0007](0007-direct-set-based-backfill.md),
+"Backgrounding and resumability").
+
+**The job runs on a drain thread, not on the staging worker.** The discharge
+enqueues it as a `backfill_chunks` row with no bounds
+(`chunk_queue::dispatch_direct_build`), in the transaction that moves the
+definition to `backfilling`. That gives it the chunk queue's whole driver
+contract unchanged: a drain thread claims it, heartbeats the claim for as long
+as the build runs, and finishing it flips the definition `live` with its
+go-live catch-ups (`chunk_queue::finish_chunk`, `complete_direct_backfill`). A
+pause withholds it and a resume supersedes it, exactly as for a chunk. The
+staging worker was the other option, and a poor one: its maintenance loop is
+the only sealer, so a build that runs for minutes there would stall every
+drain in the instance, and it has no claim to reclaim if the process dies. The
+cost is the one chunked builds already pay: nothing builds without drain
+threads somewhere in the fleet.
+
+**Failure contract.** Neither way a job can end short leaves the definition
+stranded in `backfilling`:
+
+- **The worker dies.** Its claim stops being heartbeated, the reclaim sweep
+  frees it (`reclaim_stale_chunks`), and another drain thread reruns the whole
+  build. Every write the build makes is an idempotent overwrite, so a partial
+  earlier run costs nothing.
+- **The build fails.** The job hands its build back to the discharge, in one
+  transaction (`chunk_queue::fail_chunk`): the job row is deleted, the
+  definition moves back to `waiting_to_backfill`, and a marker is parked on
+  its source carrying the failure as retry state (attempt count, error text,
+  next attempt time). That's the same state a failed discharge records, so the
+  same capped backoff paces the retry and `Trellis::status` reports the error.
+  The attempt count carries over from the marker that dispatched the job
+  (`backfill_chunks.prior_attempts`), so the backoff grows across repeated
+  failed builds instead of restarting at each dispatch. The retry is a fresh
+  dispatch that re-checks the shape, so a build that failed `Unsupported`
+  because the catalog changed under it goes to the ring fallback. Releasing
+  the job for an immediate retry, as a failed chunk is, would re-run a
+  whole-table build as fast as it can fail.
+
+### Which consistency bookkeeping stays
+
+The in-registration build carried three pieces of bookkeeping. With the build
+starting only after its marker's fence has settled:
+
+- **The go-live catch-up stays, and correctness needs it.** Apply skips a
+  definition that isn't `live`, so a change that drains while the job runs
+  reaches nothing. The catch-up marker parked with the flip, on every table the
+  build read (issue #430), re-derives from current state.
+- **The coverage fence and `backfill_coverage` stay, as an optimization.**
+  Without a record, every direct build's go-live catch-up enumerates the whole
+  source, and each to-side table, into the ring in one transaction: exactly the
+  cost the direct build exists to avoid. The job captures the fence before its
+  first read and commits the record after its last, while it still holds a
+  current claim. The rule that makes the record sound doesn't depend on when
+  the build runs: it only vouches for a table none of whose rows changed after
+  the fence and whose row count is unchanged. What it can't see is a commit
+  the build read *and* the stream carries, which is new now that every build
+  runs after its source joined the publication. That commit's delta can drain
+  after the flip, and no catch-up re-derives it. For a 1-1 target that's
+  harmless, since apply re-evaluates the row from live state. For an
+  aggregate, the build now records its read as a recompute horizon, on each
+  group row it writes and on the target's extinct horizon for groups it found
+  empty
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)),
+  so such a delta re-derives its group instead of counting the commit twice.
+- **Registration's defer check is gone.** Registration always defers now, so
+  `defer_if_fence_unsettled` and the `backfill_marker_unsettled` check it asked
+  are removed.
+
+The direct build doesn't wait for intake to reach its snapshot, as a ring
+enumeration does (#312): the horizon makes that wait unnecessary for
+correctness, and it only ever made re-derivations rarer.
+
+Whether coverage is worth keeping at all is step 6's question (#420), together
+with a catch-up that reads only what changed.
 
 ### The join fence
 
@@ -166,9 +249,9 @@ unconfirmed. This is what keeps the join step gap-free.
   were all bugs where two capture paths meet. One path has no seams to get
   wrong.
 - **Registration latency.** Aggregate and relationship-enriched 1-1
-  registrations build synchronously in-call, so registering one against a large
-  table is slow. Under this decision registration's latency doesn't depend on
-  table size.
+  registrations used to build synchronously in-call, so registering one against
+  a large table was slow. Under this decision registration's latency doesn't
+  depend on table size.
 
 ## Rejected alternatives
 
@@ -213,9 +296,11 @@ unconfirmed. This is what keeps the join step gap-free.
     live` as the last statement of the discharge transaction, together with the
     read, the marker delete and the go-live catch-up parks. Chunked builds commit
     `backfilling` with their `backfill_chunks` rows; direct builds, with a
-    durable, reclaimable job row. A crash anywhere leaves the definitions
-    `waiting_to_backfill` with the marker intact, so the next pass retries — no
-    definition is ever visibly `backfilling` without something driving it forward.
+    durable, reclaimable job row, which a failed build trades back for a marker
+    ([failure contract](#the-direct-build-job)). A crash anywhere leaves the
+    definitions `waiting_to_backfill` with the marker intact, or `backfilling`
+    with their rows, so the next pass or the next claim retries — no definition
+    is ever visibly `backfilling` without something driving it forward.
 - **Only the staging worker needs publication and replication privileges.**
   Registering processes need catalog access and the right to create target
   tables, and nothing on the publication. A `DROP` is no exception: it only
@@ -237,11 +322,8 @@ unconfirmed. This is what keeps the join step gap-free.
   follow-up under #415.
 - **`backfill_coverage` becomes an optimization at most.** It lets a catch-up
   skip re-reading a table that provably hasn't changed since a build read it. No
-  path depends on it for correctness. A build records it only once every
-  streamed change from before its fence has drained
-  (`staging::converge::table_drained_through`, #442). One still in flight would
-  fold into the `live` definition on top of the build's own read of it, and
-  only the catch-up's re-derivation corrects that.
+  path depends on it for correctness (see
+  [Which consistency bookkeeping stays](#which-consistency-bookkeeping-stays)).
 
 ## Inventory of capture paths
 
@@ -253,10 +335,10 @@ happens, and its role in this design.
 | Fresh-install handshake read | was `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | **Retired (#417).** `create_slot_and_park_markers` creates the slot, seeds `replication_progress`, and parks a marker on every configured source table in the same transaction, after slot creation returns. It reads nothing, the same shape slot-loss recovery (`intake::slot_loss`) already has. The discharge skips a table no definition reads (`defs::catalog::table_has_reader`) |
 | Ring enumeration inside registration | was `defs::catalog::create_definition_inner`'s `enumerate_and_append`, reached through `create_definition` and `install_definition`'s `Unsupported` fallback | **Done (#418).** The discharge's ring fallback does it (`intake::publication::run_pending_backfills`, dispatch by shape). `create_definition` survives only as a test fixture that stands in for that discharge |
 | Plain 1-1 chunk enqueue at registration | was `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | **Done (#418).** The discharge plans the chunks and enqueues them in its own transaction (`chunk_queue::dispatch_one_to_one`); drain threads still execute them |
-| Synchronous direct build inside registration | `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | The discharge dispatches it as a background job |
-| Registration's defer branch | `install_definition`'s `defer_if_fence_unsettled`; was also `create_definition_inner`'s `backfill_marker_unsettled` check | Becomes unconditional: registration always defers to the discharge, and the branch goes away. **Done for every shape but #419's (#418):** only the in-call aggregate and relationship-enriched 1-1 build still asks it |
+| Synchronous direct build inside registration | was `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | **Done (#419).** The discharge dispatches it as one background job (`chunk_queue::dispatch_direct_build`) that a drain thread runs ([The direct-build job](#the-direct-build-job)) |
+| Registration's defer branch | was `install_definition`'s `defer_if_fence_unsettled`, and `create_definition_inner`'s `backfill_marker_unsettled` check | **Done (#418, #419).** Registration always defers to the discharge, and the branch is gone |
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` discharges | The one path |
-| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done for plain 1-1 (#418):** its rebuild is chunked, and a chunk planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). Aggregates and relationship-enriched 1-1 definitions are rebuilt by ring until #419 |
+| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. #436 makes it race-free |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
 | Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs |
 | Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call |
@@ -265,15 +347,6 @@ happens, and its role in this design.
 
 ## Open questions
 
-- **Where a direct build runs.** It can run on the staging worker or on a drain
-  thread. One background job per definition is enough; splitting these shapes
-  into chunks stays a separate optimization (ADR-0007, "Backgrounding and
-  resumability").
-- **Which consistency bookkeeping stays.** Once every build starts after the
-  fence has settled and intake has passed the snapshot, some of the coverage
-  fence and `backfill_coverage` may be redundant. The go-live catch-up of a
-  chunked or direct build is not: it's what recovers the changes that drained
-  while the definition wasn't `live`.
 - **What `live` promises.** Today `live` means the build has finished, not that
   the target is complete. Should the flip wait for the go-live catch-up to
   discharge, or should a caller get some other "target complete" signal?

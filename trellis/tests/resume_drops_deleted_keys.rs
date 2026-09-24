@@ -718,6 +718,10 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
 /// (issue #312) and rolls back. The orphan delete is in that transaction,
 /// so the target must come out exactly as the pause left it: no rows gone,
 /// and nothing staged for a chained reader. The retry then drops them.
+///
+/// The resumed aggregate's rebuild is a direct-build job, which doesn't wait
+/// for intake (#419), so a live 1-1 sibling on the same source is what makes
+/// this discharge enumerate (its catch-up) and wait.
 #[tokio::test]
 async fn a_discharge_that_times_out_waiting_for_intake_leaves_the_target_as_it_was() {
     let cluster = TestCluster::start();
@@ -727,7 +731,10 @@ async fn a_discharge_that_times_out_waiting_for_intake_leaves_the_target_as_it_w
     let operator = define_only(db.dsn()).await;
     apply_all(
         &operator,
-        &["TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total"],
+        &[
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+            "TRANSFORM order_doubles FROM orders SELECT a + a AS x",
+        ],
     )
     .await;
     settle(&db.pool, &mut client).await;

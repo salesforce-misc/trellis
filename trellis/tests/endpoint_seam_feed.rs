@@ -314,6 +314,7 @@ async fn a_seam_row_on_a_target_to_side_drives_an_aggregates_reverse_delta() {
     )
     .await
     .expect("install tag_totals");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select tag, total_words::text from public.tag_totals").await,
@@ -583,6 +584,7 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     )
     .await
     .expect("install region_totals");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     let relationship = create_relationship(
         &db.pool,
@@ -634,34 +636,40 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     drain_round(&db.pool, &mut raw).await;
 
     let staged = staged_rows(&raw, "public.region_totals").await;
-    let mut shape: Vec<(&str, Option<&str>, Option<&str>)> = staged
-        .iter()
-        .map(|r| {
-            (
-                r.op.as_str(),
-                r.old_image.as_deref(),
-                r.new_image.as_deref(),
-            )
+    // The hidden recompute horizon is a WAL position the build and the
+    // forced re-derivations stamp (#321, #419), not part of what this pins.
+    let horizon =
+        regex::Regex::new(r#""__trellis_recompute_lsn": ("[^"]*"|null)"#).expect("valid regex");
+    let image = |image: &Option<String>| {
+        image.as_deref().map(|image| {
+            horizon
+                .replace(image, r#""__trellis_recompute_lsn": <lsn>"#)
+                .into_owned()
         })
+    };
+    let mut shape: Vec<(&str, Option<String>, Option<String>)> = staged
+        .iter()
+        .map(|r| (r.op.as_str(), image(&r.old_image), image(&r.new_image)))
         .collect();
     shape.sort();
+    let expected = |text: &str| Some(text.to_string());
     assert_eq!(
         shape,
         vec![
             (
                 "insert",
                 None,
-                Some(
-                    r#"{"total": "7", "region": "2", "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                expected(
+                    r#"{"total": "7", "region": "2", "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
                 )
             ),
             (
                 "update",
-                Some(
-                    r#"{"total": "5", "region": null, "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                expected(
+                    r#"{"total": "5", "region": null, "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
                 ),
-                Some(
-                    r#"{"total": "8", "region": null, "__total_count": "1", "__trellis_recompute_lsn": null}"#
+                expected(
+                    r#"{"total": "8", "region": null, "__total_count": "1", "__trellis_recompute_lsn": <lsn>}"#
                 )
             ),
         ],

@@ -197,66 +197,6 @@ pub async fn converged_through(
     Ok(row.get(0))
 }
 
-/// Whether every streamed change to `src_table` from a commit at or below
-/// `token` has drained, so none of them can still be folded into a definition
-/// that goes `live` after this returns `true` (issue #442).
-///
-/// A direct build uses this to decide whether its coverage record may stand:
-/// the build read every commit its fence saw, and a streamed delta for one of
-/// those commits that drains after the flip is folded in a second time. Only
-/// the go-live catch-up's re-derivation corrects that, so coverage must not
-/// let the catch-up skip it while such a delta is still in flight.
-///
-/// [`converged_through`]'s four conditions, scoped to one table and keyed on
-/// the ring row's commit `lsn` (intake leaves `origin_lsn` NULL on every row
-/// it stages, so `converged_through`'s key would gate on the whole ring):
-///
-/// - **Intake has staged through `token`**, or no logical slot exists in this
-///   database, in which case nothing streams at all: a slot created later
-///   starts after every commit `token` bounds.
-/// - **No row of `src_table` at or below `token` is still pending** in any
-///   ring slot, by `converged_through`'s definition of pending (the active
-///   slot, a segment that isn't `drained`, or a straggler its drained owner's
-///   fence can't see). A row with no `lsn` is unknown, so it gates.
-/// - **No such row is parked in `poison_held`**: its release replays it.
-///
-/// One statement, so every condition reads the same snapshot.
-pub(crate) async fn table_drained_through(
-    client: &impl GenericClient,
-    src_table: &str,
-    token: PgLsn,
-) -> Result<bool, tokio_postgres::Error> {
-    let pending = per_ring_table(" union all ", |slot, table| {
-        format!(
-            "select 1 from {table} r \
-             where r.src_table = $2 \
-               and (r.lsn is null or r.lsn <= $1) \
-               and ((select ring_slot from segment_pointer) = {slot} \
-                    or exists ( \
-                        select 1 from segments s \
-                        where s.ring_slot = {slot} \
-                          and (s.state <> 'drained' \
-                               or (s.fence_snapshot is not null \
-                                   and not pg_visible_in_snapshot( \
-                                       r.row_txid, s.fence_snapshot))) \
-                    ))"
-        )
-    });
-    let sql = format!(
-        "select \
-             (coalesce((select min(confirmed_lsn) from replication_progress) >= $1, false) \
-              or not exists ( \
-                  select 1 from pg_replication_slots \
-                  where slot_type = 'logical' and database = current_database())) \
-             and not exists ({pending}) \
-             and not exists ( \
-                 select 1 from poison_held \
-                 where src_table = $2 and (lsn is null or lsn <= $1))"
-    );
-    let row = client.query_one(&sql, &[&token, &src_table]).await?;
-    Ok(row.get(0))
-}
-
 /// "Is anything pending at all?" — the cheap gate the doc's "Ask for the
 /// sign, not the number" table describes: `exists(...)` over every slot
 /// (active tail included) whose owning segment isn't `drained`, so it

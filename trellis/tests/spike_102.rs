@@ -144,6 +144,7 @@ async fn install_with_transform(
     install_definition(pool, transform, columns, "public")
         .await
         .expect("install tag_totals");
+    trellis::intake::publication::settle_registrations(pool).await;
 }
 
 /// Every row currently sitting in any ring segment, as

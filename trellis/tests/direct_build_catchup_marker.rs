@@ -1,13 +1,13 @@
 //! Issue #430: a direct build (aggregate, or relationship-enriched 1-1) must
 //! not lose a source change that drains while the build is still running.
 //!
-//! `install_definition` builds these shapes synchronously while the definition
-//! sits `backfilling`, and the apply path skips any definition that isn't
-//! `live` (`catalog::dependents_of`). A change to an already-published source
-//! that commits after the build's read and drains before go-live is therefore
+//! The backfill discharge dispatches these shapes' build as one background job
+//! (ADR-0016, #419), which a drain worker runs while the definition sits
+//! `backfilling`, and the apply path skips any definition that isn't `live`
+//! (`catalog::dependents_of`). A change to an already-published source that
+//! commits after the build's read and drains before go-live is therefore
 //! skipped by the drain and missing from what the build wrote. Only a catch-up
-//! marker parked at go-live brings it back, the way the chunked 1-1 path's
-//! `complete_direct_backfill` always has.
+//! marker parked at go-live (`complete_direct_backfill`) brings it back.
 //!
 //! The tests hold the build between its read and its target write with an
 //! event trigger (see [`install_build_hold`]) that blocks on an advisory lock
@@ -27,7 +27,7 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{TransformStatus, ValueType, create_relationship, install_definition};
+use trellis::defs::{ValueType, chunk_queue, create_relationship, install_definition};
 use trellis::intake::publication;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -79,6 +79,17 @@ async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
         .await
         .expect("run_pending_backfills");
     drain_to_quiescence(pool, client).await;
+}
+
+async fn status_of(client: &Client, target: &str) -> String {
+    client
+        .query_one(
+            "select status from transform_definitions where target_table = $1",
+            &[&target],
+        )
+        .await
+        .expect("read the definition's status")
+        .get(0)
 }
 
 async fn pending_markers(client: &Client) -> Vec<String> {
@@ -201,20 +212,20 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         .await
         .expect("take the hold lock");
 
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("sku", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
     let pool = db.pool.clone();
-    let build = tokio::spawn(async move {
-        install_definition(
-            &pool,
-            "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
-            &columns(&[
-                ("id", ValueType::Numeric),
-                ("sku", ValueType::Text),
-                ("amount", ValueType::Numeric),
-            ]),
-            "public",
-        )
-        .await
-    });
+    let build = tokio::spawn(async move { publication::settle_registrations(&pool).await });
     wait_for_build_held(&client).await;
 
     commit_and_stage_insert(
@@ -231,11 +242,8 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         .query_one("select pg_advisory_unlock($1)", &[&HOLD_LOCK])
         .await
         .expect("release the build");
-    let definition = build
-        .await
-        .expect("build task")
-        .expect("install the aggregate");
-    assert_eq!(definition.status, TransformStatus::Live);
+    build.await.expect("build task");
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     client
         .batch_execute("drop event trigger hold_direct_build")
         .await
@@ -553,16 +561,16 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
         .await
         .expect("take the hold lock");
 
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT COUNT(comments.id) AS comment_count",
+        &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
+        "public",
+    )
+    .await
+    .expect("install the relationship-enriched 1-1");
     let pool = db.pool.clone();
-    let build = tokio::spawn(async move {
-        install_definition(
-            &pool,
-            "TRANSFORM author_totals FROM authors SELECT COUNT(comments.id) AS comment_count",
-            &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
-            "public",
-        )
-        .await
-    });
+    let build = tokio::spawn(async move { publication::settle_registrations(&pool).await });
     wait_for_build_held(&client).await;
 
     commit_and_stage_insert(
@@ -579,11 +587,8 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
         .query_one("select pg_advisory_unlock($1)", &[&HOLD_LOCK])
         .await
         .expect("release the build");
-    let definition = build
-        .await
-        .expect("build task")
-        .expect("install the relationship-enriched 1-1");
-    assert_eq!(definition.status, TransformStatus::Live);
+    build.await.expect("build task");
+    assert_eq!(status_of(&client, "public.author_totals").await, "live");
     client
         .batch_execute("drop event trigger hold_direct_build")
         .await
@@ -614,7 +619,8 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
 /// Going live and parking the catch-ups commit together: when a park fails,
 /// the definition is not left `live` with some of its tables uncovered, which
 /// would lose a build-window change exactly as before the fix. The failure is
-/// injected with a trigger rejecting the marker on the second table parked.
+/// injected with a trigger rejecting the marker on the second table parked,
+/// so finishing the direct-build job fails as a whole.
 #[tokio::test]
 async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
     let cluster = TestCluster::start();
@@ -648,23 +654,32 @@ async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
         .await
         .expect("install the park-failure trigger");
 
-    let outcome = install_definition(
+    install_definition(
         &db.pool,
         "TRANSFORM author_totals FROM authors SELECT COUNT(comments.id) AS comment_count",
         &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
         "public",
     )
-    .await;
+    .await
+    .expect("install the relationship-enriched 1-1");
+    publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the direct-build job");
+    const WORKER: &str = "direct_build_catchup_marker_worker";
+    let job = {
+        let conn = db.pool.get().await.expect("acquire connection");
+        chunk_queue::claim_chunks(&**conn, WORKER, 10)
+            .await
+            .expect("claim the job")
+    };
+    assert_eq!(job.len(), 1);
+    chunk_queue::run_claimed_chunk(&db.pool, &job[0], WORKER, Duration::from_secs(5))
+        .await
+        .expect("run the build");
+    let outcome = chunk_queue::finish_chunk(&db.pool, &job[0], WORKER).await;
     assert!(outcome.is_err(), "the injected park failure surfaces");
 
-    let status: String = client
-        .query_one(
-            "select status from transform_definitions where target_table = 'public.author_totals'",
-            &[],
-        )
-        .await
-        .expect("read the definition's status")
-        .get(0);
+    let status = status_of(&client, "public.author_totals").await;
     assert_ne!(
         status, "live",
         "a definition whose catch-ups didn't all park must not be live"

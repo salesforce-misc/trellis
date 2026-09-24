@@ -1,10 +1,10 @@
 //! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
-//! the front door that creates a definition's target table once, then either
-//! records it for the backfill discharge (ADR-0016, #418: a plain 1-1
-//! definition's chunks, or the ring enumeration for a shape the direct build
-//! can't render) or, for an aggregate or relationship-enriched 1-1 definition,
-//! still builds it in-call via the fast set-based backfill
-//! (`backfill::backfill_definition`) until issue #419.
+//! the front door that creates a definition's target table once, then
+//! records it for the backfill discharge (ADR-0016, #418, #419), which builds
+//! it by shape: a plain 1-1 definition's chunks, an aggregate's or
+//! relationship-enriched 1-1 definition's direct-build job
+//! (`backfill::backfill_definition`), or the ring enumeration for a shape the
+//! direct build can't render.
 //!
 //! Each branch leaves a distinct, checkable signature in the ring: a direct or
 //! chunked build stages no enumeration `Recompute` rows, while the ring
@@ -815,6 +815,9 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     )
     .await
     .expect("install_definition builds the aggregate alias chain directly");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     // The direct build populates the target synchronously and stages nothing
     // in the ring — the fast-path signature (see the sibling fast-path tests).
@@ -889,6 +892,9 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     )
     .await
     .expect("install_definition builds a bare alias of a SUM field declared before it");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     let mut rows: Vec<(String, String, String)> = client
         .query(
@@ -955,6 +961,9 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     )
     .await
     .expect("install_definition shares one count column across several SUM aliases");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     // (order_id, total, grand_total, super_total)
     type Row = (String, Option<String>, Option<String>, Option<String>);
@@ -1222,6 +1231,9 @@ async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_ch
     )
     .await
     .expect("install_definition builds the relationship alias chain directly");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     // Direct build: target populated synchronously, nothing staged in the ring.
     let mut rows: Vec<(String, String, String, String)> = client
@@ -1306,6 +1318,9 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     )
     .await
     .expect("install_definition builds a coalesce-wrapped aggregate directly");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     let mut rows: Vec<(String, String)> = client
         .query(
@@ -1391,6 +1406,9 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     )
     .await
     .expect("install_definition builds the nested coalesce alias chain directly");
+    // ADR-0016 (#419): the direct build runs as a background job the
+    // discharge dispatches; run it before reading the target.
+    drain_backfill_chunks(&db.pool).await;
 
     let mut rows: Vec<(String, String, String, String)> = client
         .query(
@@ -1726,4 +1744,113 @@ async fn registration_reads_no_source_rows() {
         mismatches, 0,
         "both targets are built from every source row"
     );
+}
+
+/// ADR-0016 (#419): the direct set-based build of an aggregate and of a
+/// relationship-enriched 1-1 definition runs as a background job the
+/// discharge dispatches, not inside registration. Registering each succeeds
+/// while another session holds the source and the relationship's to-side
+/// `ACCESS EXCLUSIVE`, so registration latency doesn't depend on either
+/// table's size. Both go live, built directly (nothing enumerated into the
+/// ring), once the lock is released and the discharge and a drain worker run.
+#[tokio::test]
+async fn registering_a_direct_build_shape_reads_no_source_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, g bigint, a numeric); \
+             create table p (id bigint primary key, s_id bigint); \
+             alter table s replica identity full; \
+             alter table p replica identity full; \
+             insert into s (id, g, a) select i, i % 5, i from generate_series(1, 50) i; \
+             insert into p (id, s_id) select i, i % 10 + 1 from generate_series(1, 30) i",
+        )
+        .await
+        .expect("seed source and to-side");
+    create_relationship(&db.pool, "RELATIONSHIP kids FROM s.id TO p.s_id")
+        .await
+        .expect("create the relationship");
+
+    let locker = connect_raw(db.dsn()).await;
+    locker
+        .batch_execute("begin; lock table s, p in access exclusive mode")
+        .await
+        .expect("lock the source and the to-side against reads");
+
+    let columns: HashMap<String, ValueType> = numeric(&["id", "g", "a"]);
+    let register = |text: &'static str| {
+        let pool = db.pool.clone();
+        let columns = columns.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                install_definition(&pool, text, &columns, "public"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
+            .unwrap_or_else(|e| panic!("register {text:?}: {e}"))
+        }
+    };
+    let aggregate = register("TRANSFORM v FROM s GROUP BY g SELECT g AS g, SUM(a) AS total").await;
+    assert_eq!(aggregate.status, TransformStatus::WaitingToBackfill);
+    let enriched = register("TRANSFORM w FROM s SELECT COUNT(kids.id) AS n").await;
+    assert_eq!(enriched.status, TransformStatus::WaitingToBackfill);
+
+    locker
+        .batch_execute("commit")
+        .await
+        .expect("release the lock");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the registrations");
+    let statuses: Vec<String> = client
+        .query("select status from transform_definitions order by id", &[])
+        .await
+        .expect("read statuses")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        statuses,
+        ["backfilling", "backfilling"],
+        "the discharge hands each build to a background job"
+    );
+    assert_eq!(
+        staged_count_for_source(&client, &format!("{DEFAULT_SCHEMA}.s")).await,
+        0,
+        "a direct build doesn't enumerate the source into the ring"
+    );
+    drain_backfill_chunks(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let statuses: Vec<String> = client
+        .query("select status from transform_definitions order by id", &[])
+        .await
+        .expect("read statuses")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(statuses, ["live", "live"]);
+    let aggregate_mismatches: i64 = client
+        .query_one(
+            "select count(*) from (select g, sum(a) as total from s group by g) e \
+             full join v on v.g = e.g where v.total is distinct from e.total",
+            &[],
+        )
+        .await
+        .expect("compare the aggregate to the source")
+        .get(0);
+    assert_eq!(aggregate_mismatches, 0, "every group is built");
+    let enriched_mismatches: i64 = client
+        .query_one(
+            "select count(*) from s left join w on w.id = s.id \
+             where w.n is distinct from (select count(*) from p where p.s_id = s.id)",
+            &[],
+        )
+        .await
+        .expect("compare the enriched target to the source")
+        .get(0);
+    assert_eq!(enriched_mismatches, 0, "every source row is enriched");
 }

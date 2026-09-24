@@ -26,15 +26,15 @@
 //! chunks is done — race-free under concurrent finishers via a `for update`
 //! lock on the definition's own row (see that function's doc comment).
 //!
-//! A relationship-enriched 1-1 definition is *not* enqueued here at all: its
-//! per-relationship staging tables are connection-scoped `TEMP TABLE`s, which
-//! don't survive being read by independent drain workers on separate
-//! connections — the same open problem the ADR amendment calls out for the
-//! aggregate path's own staging table, applying verbatim. It (and the
-//! aggregate key-space) instead still build synchronously inside
-//! `install_definition` (issue #419 moves them onto the discharge) — see
-//! [`super::catalog::install_definition`]'s doc comment and
-//! [`super::backfill`]'s module docs for the full shape-by-shape breakdown.
+//! An aggregate or relationship-enriched 1-1 definition isn't split into
+//! ranges: its build materializes connection-scoped `TEMP TABLE` staging,
+//! which doesn't survive being read by independent drain workers on separate
+//! connections (the open problem the ADR amendment calls out). The discharge
+//! enqueues its whole direct build as one job instead ([`dispatch_direct_build`],
+//! issue #419), a row with no bounds ([`ChunkWork::DirectBuild`]) that one
+//! drain worker runs start to finish. Everything above applies to it
+//! unchanged, except that a failed job hands its build back to the discharge
+//! rather than being released for an immediate retry ([`fail_chunk`]).
 
 use std::time::Duration;
 
@@ -138,15 +138,25 @@ impl From<CatalogError> for ChunkQueueError {
     }
 }
 
-/// One durable `backfill_chunks` row, as claimed by [`claim_chunks`]: a
-/// plain 1-1 PK-range chunk. `lo` is `None` for the first chunk (`pk <= hi`,
-/// no lower bound) and `Some` for every later one.
+/// One durable `backfill_chunks` row, as claimed by [`claim_chunks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedChunk {
     pub id: i64,
     pub definition_id: i64,
-    pub lo: Option<String>,
-    pub hi: String,
+    pub work: ChunkWork,
+}
+
+/// What one `backfill_chunks` row builds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkWork {
+    /// A plain 1-1 definition's primary-key range. `lo` is `None` for the
+    /// first chunk (`pk <= hi`, no lower bound) and `Some` for every later
+    /// one.
+    Range { lo: Option<String>, hi: String },
+    /// An aggregate or relationship-enriched 1-1 definition's whole direct
+    /// set-based build (ADR-0007), run as one job (issue #419; the row's
+    /// `hi` is null). See [`dispatch_direct_build`].
+    DirectBuild,
 }
 
 /// Dispatches a plain (non-relationship) 1-1 definition's build onto the
@@ -173,17 +183,7 @@ pub(crate) async fn dispatch_one_to_one(
     definition_id: i64,
     ranges: &[(Option<String>, String)],
 ) -> Result<Option<TransformStatus>, CatalogError> {
-    let promoted = txn
-        .execute(
-            "update transform_definitions set status = $1 where id = $2 and status = $3",
-            &[
-                &TransformStatus::Backfilling.as_str(),
-                &definition_id,
-                &TransformStatus::WaitingToBackfill.as_str(),
-            ],
-        )
-        .await?;
-    if promoted == 0 {
+    if !start_backfilling(txn, definition_id).await? {
         return Ok(None);
     }
 
@@ -220,6 +220,71 @@ pub(crate) async fn dispatch_one_to_one(
         from = %TransformStatus::WaitingToBackfill.as_str(),
         to = %TransformStatus::Backfilling.as_str(),
         "transform status transition: backfill chunks enqueued"
+    );
+    Ok(Some(TransformStatus::Backfilling))
+}
+
+/// Moves `definition_id` `waiting_to_backfill` -> `backfilling`, taking its
+/// row lock. Returns `false`, touching nothing, when it had already left
+/// `waiting_to_backfill` (an operator paused it since the discharge read it).
+async fn start_backfilling(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition_id: i64,
+) -> Result<bool, CatalogError> {
+    let promoted = txn
+        .execute(
+            "update transform_definitions set status = $1 where id = $2 and status = $3",
+            &[
+                &TransformStatus::Backfilling.as_str(),
+                &definition_id,
+                &TransformStatus::WaitingToBackfill.as_str(),
+            ],
+        )
+        .await?;
+    Ok(promoted == 1)
+}
+
+/// Dispatches an aggregate or relationship-enriched 1-1 definition's direct
+/// set-based build (ADR-0007) as one background job, inside the backfill
+/// discharge's own transaction (ADR-0016, issue #419): moves `definition_id`
+/// `waiting_to_backfill` -> `backfilling` and persists the job as a
+/// [`ChunkWork::DirectBuild`] row, so the status and the work that drives it
+/// commit together (issue #404's rule) or not at all.
+///
+/// The job is a `backfill_chunks` row so it gets the queue's whole driver
+/// contract for free: a drain thread claims it ([`claim_chunks`]), heartbeats
+/// the claim for as long as the build runs ([`run_claimed_chunk`]), and flips
+/// the definition `live` with its go-live catch-ups when it's done
+/// ([`finish_chunk`]); a worker that dies holding it loses the claim to
+/// [`reclaim_stale_chunks`], and another worker reruns it (the build's
+/// writes are idempotent overwrites); a pause withholds it and a resume
+/// supersedes it ([`STALE`]) exactly as for a chunk. A build that fails hands
+/// itself back to the discharge ([`fail_chunk`]).
+///
+/// `prior_attempts` is the failure count of the marker this dispatch is
+/// discharging, carried so a failed build backs off from there.
+///
+/// Returns the status the dispatch left the definition in, or `None` when it
+/// was no longer `waiting_to_backfill`, as for [`dispatch_one_to_one`].
+pub(crate) async fn dispatch_direct_build(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition_id: i64,
+    prior_attempts: i32,
+) -> Result<Option<TransformStatus>, CatalogError> {
+    if !start_backfilling(txn, definition_id).await? {
+        return Ok(None);
+    }
+    txn.execute(
+        "insert into backfill_chunks (definition_id, lo, hi, fuse_rearmed_at, prior_attempts) \
+         select id, null, null, fuse_rearmed_at, $2 from transform_definitions where id = $1",
+        &[&definition_id, &prior_attempts],
+    )
+    .await?;
+    tracing::info!(
+        definition_id,
+        from = %TransformStatus::WaitingToBackfill.as_str(),
+        to = %TransformStatus::Backfilling.as_str(),
+        "transform status transition: direct build job enqueued"
     );
     Ok(Some(TransformStatus::Backfilling))
 }
@@ -307,8 +372,10 @@ pub async fn claim_chunks(
         .map(|row| ClaimedChunk {
             id: row.get(0),
             definition_id: row.get(1),
-            lo: row.get(2),
-            hi: row.get(3),
+            work: match row.get::<_, Option<String>>(3) {
+                Some(hi) => ChunkWork::Range { lo: row.get(2), hi },
+                None => ChunkWork::DirectBuild,
+            },
         })
         .collect())
 }
@@ -385,6 +452,96 @@ pub async fn release_chunk(
     free_or_discard_claims(&txn, &rows).await?;
     txn.commit().await?;
     Ok(n)
+}
+
+/// Gives up `chunk` after running it failed with `error` — what a drain
+/// worker calls instead of [`finish_chunk`] on a failure.
+///
+/// A [`ChunkWork::Range`] chunk is released ([`release_chunk`]): the next
+/// claim retries it.
+///
+/// A [`ChunkWork::DirectBuild`] job **hands its build back to the backfill
+/// discharge** (ADR-0016, issue #419), in one transaction: the job row is
+/// deleted, the definition moves `backfilling` -> `waiting_to_backfill`, and
+/// its source's marker is re-parked carrying the failure as its retry state
+/// (`intake::publication::park_failed_build`). The marker's backoff (issue
+/// #407) then paces the retry, rather than a drain worker re-running a
+/// whole-table build as fast as it can fail, and [`crate::Trellis::status`]
+/// reports the error through the marker like any failed discharge. The
+/// retry is a fresh dispatch, so it re-plans the build by shape: a build that
+/// failed [`BackfillError::Unsupported`] because the catalog changed under it
+/// goes to the ring fallback. A definition that was paused or quarantined
+/// meanwhile only loses the job: its resume parks a marker and rebuilds. A
+/// job held across a resume ([`STALE`]) is discarded as usual.
+///
+/// Scoped to `claimed_by`'s current claim, like [`release_chunk`]: a claim
+/// already reclaimed out from under this caller is left to its new holder.
+/// Returns how many claims (zero or one) it gave up.
+pub async fn fail_chunk(
+    pool: &Pool,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+    error: &str,
+) -> Result<u64, ChunkQueueError> {
+    let mut client = pool.get().await?;
+    if matches!(chunk.work, ChunkWork::Range { .. }) {
+        return release_chunk(&mut **client, chunk.id, claimed_by).await;
+    }
+    let txn = client.transaction().await?;
+    // The definition row first, as `finish_chunk` locks it, then the job.
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for update",
+        &[&chunk.definition_id],
+    )
+    .await?;
+    let Some(row) = txn
+        .query_opt(
+            &format!(
+                "select {STALE}, bc.prior_attempts, d.source_table, d.status \
+                 from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done \
+                 for update of bc"
+            ),
+            &[&chunk.id, &claimed_by],
+        )
+        .await?
+    else {
+        return Ok(0);
+    };
+    if row.get::<_, bool>(0) {
+        discard_resumed_chunks(&txn, &[chunk.id]).await?;
+        txn.commit().await?;
+        return Ok(1);
+    }
+    txn.execute("delete from backfill_chunks where id = $1", &[&chunk.id])
+        .await?;
+    let status_text: String = row.get(3);
+    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+        panic!("transform_definitions.status held unrecognized value '{status_text}'")
+    });
+    if status == TransformStatus::Backfilling {
+        txn.execute(
+            "update transform_definitions set status = $1 where id = $2",
+            &[
+                &TransformStatus::WaitingToBackfill.as_str(),
+                &chunk.definition_id,
+            ],
+        )
+        .await?;
+        let source_table: String = row.get(2);
+        let attempts = row.get::<_, i32>(1).saturating_add(1);
+        crate::intake::publication::park_failed_build(&*txn, &source_table, attempts, error)
+            .await?;
+        tracing::info!(
+            definition_id = chunk.definition_id,
+            from = %TransformStatus::Backfilling.as_str(),
+            to = %TransformStatus::WaitingToBackfill.as_str(),
+            "transform status transition: direct build failed; handed back to the discharge"
+        );
+    }
+    txn.commit().await?;
+    Ok(1)
 }
 
 /// Gives up the claims `rows` (each `(chunk id, stale)`, locked by the
@@ -508,13 +665,102 @@ pub async fn run_claimed_chunk(
         heartbeat_interval,
     );
 
-    backfill::execute_one_to_one_chunk(
+    match &chunk.work {
+        ChunkWork::Range { lo, hi } => {
+            backfill::execute_one_to_one_chunk(
+                pool,
+                &definition.def,
+                target_schema,
+                &definition.source_table,
+                lo.as_deref(),
+                hi,
+            )
+            .await?;
+        }
+        ChunkWork::DirectBuild => {
+            run_direct_build(pool, &definition, target_schema, chunk, claimed_by).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
+/// of `definition` (ADR-0007, [`backfill::backfill_definition`]), bracketed
+/// by the coverage bookkeeping (issue #79, bug B) that lets its go-live
+/// catch-up skip re-reading a table that hasn't changed since the build read
+/// it (ADR-0016, "Which consistency bookkeeping stays").
+///
+/// The coverage plan is captured before the build reads anything, and
+/// committed after it only while this worker still holds a current claim on
+/// the job (a claim reclaimed out from under it, or held across a resume,
+/// commits nothing: whoever builds the definition next records its own). An
+/// aggregate's target also gets its extinct horizon raised in that
+/// transaction (see [`raise_extinct_horizon_after_build`]).
+///
+/// Flipping `live` is [`finish_chunk`]'s job, as for every chunk.
+async fn run_direct_build(
+    pool: &Pool,
+    definition: &super::model::Definition,
+    target_schema: &str,
+    chunk: &ClaimedChunk,
+    claimed_by: &str,
+) -> Result<(), ChunkQueueError> {
+    let coverage = catalog::plan_direct_backfill_coverage(pool, definition).await?;
+    backfill::backfill_definition(
         pool,
         &definition.def,
         target_schema,
         &definition.source_table,
-        chunk.lo.as_deref(),
-        &chunk.hi,
+        &definition.source_columns,
+    )
+    .await?;
+
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let current = txn
+        .query_opt(
+            &format!(
+                "select 1 from backfill_chunks bc \
+                 join transform_definitions d on d.id = bc.definition_id \
+                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done and not ({STALE}) \
+                 for share of bc, d"
+            ),
+            &[&chunk.id, &claimed_by],
+        )
+        .await?
+        .is_some();
+    if current {
+        catalog::commit_direct_backfill_coverage(&txn, &coverage).await?;
+    }
+    if matches!(
+        definition.def.key_space,
+        super::ast::KeySpace::Aggregate { .. }
+    ) {
+        raise_extinct_horizon_after_build(&txn, &definition.target_table).await?;
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Raises an aggregate target's extinct horizon (issue #321,
+/// `aggregate_extinct_horizon`) to the WAL insert position after its direct
+/// build read the source. The build is a live `GROUP BY` read, and it writes
+/// no row for a group it found empty, so a delta for such a group that drains
+/// after the definition goes live (the build runs after its source joined the
+/// publication, so a commit it read is streamed too) is judged against this
+/// value, the same way a delta on a group a forced recompute found empty is.
+/// Raising a horizon is always safe: the worst it does is send a delta to
+/// the re-deriving path.
+async fn raise_extinct_horizon_after_build(
+    txn: &tokio_postgres::Transaction<'_>,
+    target_table: &str,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "insert into aggregate_extinct_horizon (target_table, lsn) \
+         values ($1, pg_current_wal_insert_lsn()) \
+         on conflict (target_table) do update \
+         set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
+        &[&target_table],
     )
     .await?;
     Ok(())
@@ -1052,5 +1298,196 @@ mod tests {
             0,
             "the held chunk is discarded"
         );
+    }
+
+    /// Seeds `public.orders` (three rows over two groups) and a
+    /// `waiting_to_backfill` aggregate definition `rollup` over it, creating
+    /// its target table unless `with_target` is `false`.
+    async fn seed_waiting_aggregate(
+        pool: &Pool,
+        raw: &tokio_postgres::Client,
+        with_target: bool,
+    ) -> i64 {
+        let text = "TRANSFORM rollup FROM orders GROUP BY g SELECT g AS g, sum(a) AS total";
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g numeric, a numeric); \
+             insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
+             insert into source_table_versions (source_table, version) \
+             values ('public.orders', 1)",
+        )
+        .await
+        .expect("seed source");
+        if with_target {
+            let columns: std::collections::HashMap<String, super::super::ast::ValueType> =
+                ["id", "g", "a"]
+                    .into_iter()
+                    .map(|c| (c.to_string(), super::super::ast::ValueType::Numeric))
+                    .collect();
+            super::super::ddl::create_aggregate_target_table(
+                pool,
+                &parse(text).expect("parse"),
+                "public",
+                &columns,
+            )
+            .await
+            .expect("create the target");
+        }
+        raw.query_one(
+            "insert into transform_definitions \
+             (target_table, source_table, source_version, definition_text, status, \
+              source_columns) \
+             values ('public.rollup', 'public.orders', 1, $1, 'waiting_to_backfill', \
+                     '{\"id\": \"numeric\", \"g\": \"numeric\", \"a\": \"numeric\"}') \
+             returning id",
+            &[&text],
+        )
+        .await
+        .expect("seed definition")
+        .get(0)
+    }
+
+    /// Dispatches `id`'s direct-build job as the backfill discharge does.
+    async fn dispatch_job(pool: &Pool, id: i64, prior_attempts: i32) {
+        let mut client = pool.get().await.expect("connection");
+        let txn = client.transaction().await.expect("begin");
+        let status = dispatch_direct_build(&txn, id, prior_attempts)
+            .await
+            .expect("dispatch");
+        txn.commit().await.expect("commit");
+        assert_eq!(status, Some(TransformStatus::Backfilling));
+    }
+
+    /// Issue #419: a direct-build job whose worker dies is reclaimed and
+    /// rerun by another worker, and finishing it flips the definition `live`
+    /// with its go-live catch-up. The build records its read as the recompute
+    /// horizon of every group row it writes and of the target itself, so a
+    /// streamed delta for a commit it read re-derives its group rather than
+    /// counting the commit twice.
+    #[tokio::test]
+    async fn a_direct_build_job_held_by_a_dead_worker_is_rerun_by_another() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let id = seed_waiting_aggregate(&pool, &raw, true).await;
+        dispatch_job(&pool, id, 0).await;
+
+        let dead = claim_chunks(&raw, "dead-worker", 10).await.expect("claim");
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].work, ChunkWork::DirectBuild);
+        let reclaimed = reclaim_stale_chunks(&mut raw, Duration::ZERO)
+            .await
+            .expect("reclaim");
+        assert_eq!(reclaimed, 1);
+
+        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim again");
+        assert_eq!(job.len(), 1);
+        run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
+            .await
+            .expect("run the job");
+        finish_chunk(&pool, &job[0], WORKER)
+            .await
+            .expect("finish the job");
+        // A finish from the dead worker's claim is a no-op.
+        finish_chunk(&pool, &dead[0], "dead-worker")
+            .await
+            .expect("finish a lost claim");
+
+        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(chunk_count(&raw, id).await, 0);
+        assert!(marker_generation(&raw, "public.orders").await.is_some());
+        let rows: Vec<(String, String, bool)> = raw
+            .query(
+                "select g::text, total::text, __trellis_recompute_lsn is not null \
+                 from public.rollup order by g",
+                &[],
+            )
+            .await
+            .expect("read the target")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("1".to_string(), "30".to_string(), true),
+                ("2".to_string(), "5".to_string(), true)
+            ]
+        );
+        let extinct: i64 = raw
+            .query_one(
+                "select count(*) from aggregate_extinct_horizon where target_table = 'public.rollup'",
+                &[],
+            )
+            .await
+            .expect("read the extinct horizon")
+            .get(0);
+        assert_eq!(extinct, 1);
+    }
+
+    /// Issue #419: a direct build that fails hands its build back to the
+    /// discharge in one transaction: the job is gone, the definition is
+    /// `waiting_to_backfill` again, and its source's marker carries the error
+    /// and a backoff, one attempt past the marker that dispatched the job.
+    #[tokio::test]
+    async fn a_failed_direct_build_is_handed_back_to_the_discharge() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        // No target table, so the build's write fails.
+        let id = seed_waiting_aggregate(&pool, &raw, false).await;
+        dispatch_job(&pool, id, 2).await;
+
+        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
+        let error = run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
+            .await
+            .expect_err("the build has no target to write");
+        let given_up = fail_chunk(&pool, &job[0], WORKER, &error.to_string())
+            .await
+            .expect("fail the job");
+        assert_eq!(given_up, 1);
+
+        assert_eq!(status_of(&raw, id).await, "waiting_to_backfill");
+        let jobs: i64 = raw
+            .query_one(
+                "select count(*) from backfill_chunks where definition_id = $1",
+                &[&id],
+            )
+            .await
+            .expect("count jobs")
+            .get(0);
+        assert_eq!(jobs, 0);
+        let marker = raw
+            .query_one(
+                "select attempts, last_error, next_attempt_at > now() \
+                 from pending_backfill where table_name = 'public.orders'",
+                &[],
+            )
+            .await
+            .expect("the marker is parked");
+        assert_eq!(marker.get::<_, i32>(0), 3);
+        assert_eq!(marker.get::<_, Option<String>>(1), Some(error.to_string()));
+        assert!(marker.get::<_, bool>(2), "the retry is backed off");
+    }
+
+    /// A job that fails after an operator paused its definition only loses
+    /// the job: the definition stays paused, with no marker, and its resume
+    /// parks one and rebuilds.
+    #[tokio::test]
+    async fn a_failed_direct_build_of_a_paused_definition_leaves_it_paused() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let id = seed_waiting_aggregate(&pool, &raw, false).await;
+        dispatch_job(&pool, id, 0).await;
+        let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
+        pause_transform(&pool, "rollup").await.expect("pause");
+
+        fail_chunk(&pool, &job[0], WORKER, "boom")
+            .await
+            .expect("fail the job");
+
+        assert_eq!(status_of(&raw, id).await, "paused");
+        assert_eq!(chunk_count(&raw, id).await, 0);
+        assert_eq!(marker_generation(&raw, "public.orders").await, None);
     }
 }

@@ -138,6 +138,9 @@ async fn a_lost_slot_pauses_fed_transforms_and_resume_rebuilds_them() {
         .apply("TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
+    // Registration only records the two aggregates (#419); run their
+    // direct-build jobs so both targets hold their pre-loss value.
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     definer.shutdown().await.expect("shut the definer down");
 
     // First run: creates the slot and confirms work against it, so a
@@ -287,6 +290,9 @@ async fn fed_transforms_include_chained_targets_and_exclude_unpublished_sources(
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define a transform over the published table");
+    // A transform chains only off a live target; the aggregate's direct-build
+    // job takes it there (#419).
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     definer
         .apply(&format!(
             "TRANSFORM rollup_copy FROM {DEFAULT_TARGET_SCHEMA}.order_rollup \
@@ -339,10 +345,17 @@ async fn recovery_leaves_prior_freezes_alone_and_discards_only_orphaned_markers(
         "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
         "TRANSFORM order_echo FROM orders GROUP BY g SELECT sum(a) AS total",
         "TRANSFORM refund_rollup FROM refunds GROUP BY g SELECT sum(a) AS total",
-        "PAUSE TRANSFORM order_echo",
     ] {
         definer.apply(statement).await.expect(statement);
     }
+    // Registration only records the aggregates (#419); their direct-build
+    // jobs take all three live, so the one paused below is a prior freeze of
+    // a live transform and the other two are what the recovery sees running.
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    definer
+        .apply("PAUSE TRANSFORM order_echo")
+        .await
+        .expect("pause order_echo before the loss");
 
     // Replace the go-live catch-up markers the aggregate builds parked
     // (issue #430) with the two this test stages.

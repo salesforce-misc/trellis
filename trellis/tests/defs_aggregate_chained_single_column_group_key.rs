@@ -208,6 +208,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, SKU_TOTALS, &sales_columns(), "public")
         .await
         .expect("install the single-column GROUP BY aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     client
@@ -218,6 +219,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     install_definition(&db.pool, SKU_TOTALS_V2, &sku_totals_columns(), "public")
         .await
         .expect("install the chained aggregate reading sku_totals");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, client).await;
 
     // Both backfills: a=12 (5+7), b=2, c=11; identity re-aggregation carries

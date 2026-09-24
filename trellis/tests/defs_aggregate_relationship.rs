@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{
@@ -92,14 +91,19 @@ async fn stage_cdc(
 ) {
     let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
-    let lsn = PgLsn::from(1u64);
+    // The WAL position now, which is at or past the commit of the write this
+    // stands in for, as intake's own `lsn` would be. A fixed low value would
+    // sit below the recompute horizon the direct build stamps (#419), which
+    // sends the change down the live re-derive path instead of the delta
+    // path these tests exercise.
     client
         .execute(
             &format!(
                 "insert into {table} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+                 values ($1, $2, $3, pg_current_wal_insert_lsn(), $4::text::jsonb, \
+                         $5::text::jsonb, 0)"
             ),
-            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+            &[&src_table, &key, &op, &old_image, &new_image],
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
@@ -302,6 +306,7 @@ async fn aggregate_over_a_to_one_relationship_backfills_to_the_oracle() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -338,6 +343,7 @@ async fn inserting_a_from_side_row_updates_its_groups_total() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -403,6 +409,7 @@ async fn inserting_a_from_side_row_resolves_from_the_projection_not_live_parent_
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = relationship_projection(&db.pool, relationship.id)
@@ -482,6 +489,7 @@ async fn updating_a_to_side_row_updates_every_dependent_group() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -549,6 +557,7 @@ async fn a_from_side_re_point_within_one_update_diffs_old_and_new_parent_contrib
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -628,6 +637,7 @@ async fn a_from_side_re_point_to_a_nonexistent_parent_subtracts_the_old_contribu
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let totals_before = target_totals(&client).await;
@@ -763,6 +773,7 @@ async fn avg_over_a_relationship_read_column_maintains_through_backfill_and_forw
     )
     .await
     .expect("install the AVG-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
@@ -872,6 +883,7 @@ async fn two_relationships_sharing_a_to_side_column_name_resolve_independently()
     )
     .await
     .expect("install the two-relationship aggregate definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     async fn review_totals(
@@ -1068,6 +1080,7 @@ async fn sum_and_relationship_min_mixed_single_group_forward_insert() {
     install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the mixed sum/relationship-min definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
@@ -1139,6 +1152,7 @@ async fn sum_and_relationship_min_mixed_two_groups_in_one_batch() {
     install_definition(&db.pool, MIXED_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the mixed sum/relationship-min definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -1427,6 +1441,7 @@ async fn count_of_a_relationship_path_folds_through_backfill_forward_and_reverse
     install_definition(&db.pool, TAG_WORD_COUNTS, &post_tags_columns(), "public")
         .await
         .expect("install COUNT(<rel>.<column>) in a GROUP BY definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Backfill: `rust` = rows 10 (post 1, wc 100), 11 (post 2, wc 250), 13

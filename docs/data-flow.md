@@ -82,16 +82,11 @@ validates the definition, creates the target table, writes the catalog row as
 `waiting_to_backfill`, and returns. It reads no source rows and makes no
 replication change, so its latency doesn't depend on the table's size.
 
-*Planned (#419):* an aggregate or relationship-enriched 1-1 definition still
-runs its whole direct build before `apply` returns, unless its source has an
-unsettled marker, in which case it defers to the path below. Every other shape
-already registers without reading the source (#418).
-
 ### The four steps
 
 Everything after registration runs in the background, driven by the staging
-worker's maintenance loop. Chunked builds, and possibly direct builds (#419's
-call), execute on drain threads.
+worker's maintenance loop. Chunked builds and direct-build jobs execute on
+drain threads.
 
 1. **Join.** The source gets a `pending_backfill` marker. Its **fence** is the
    snapshot (`pg_current_snapshot()`) of the transaction that parks it.
@@ -133,16 +128,21 @@ call), execute on drain threads.
    |---|---|---|
    | Ring enumeration | any shape; the fallback for a shape the direct build can't render | one cursor inside the discharge transaction appends an image-less `Recompute` per source row, which drain workers fold like any batch |
    | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0007](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability)) |
-   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | one background job running ADR-0007's `INSERT … SELECT` build |
+   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0016](decisions/0016-single-background-capture-path.md#the-direct-build-job)) |
+
+   The discharge checks against the catalog that the direct build can render
+   a definition before it dispatches one; a shape it can't
+   (`BackfillError::Unsupported`) gets the ring enumeration.
 
    A definition only reaches `backfilling` together with the work that drives
    it (#404): a chunked build commits `backfilling` with its `backfill_chunks`
-   rows. A ring-built definition skips it, flipping from `waiting_to_backfill`
-   to `live` as the discharge transaction's last statement. *Planned (#419):*
-   direct builds run inside registration; an aggregate or relationship-enriched
-   1-1 definition that reaches the discharge (one that deferred, or a resumed
-   one) is rebuilt by ring enumeration until then. Whether the job runs on the
-   staging worker or a drain thread is #419's call.
+   rows, a direct build with its job row. A ring-built definition skips it,
+   flipping from `waiting_to_backfill` to `live` as the discharge
+   transaction's last statement. A drain thread that dies holding a chunk or a
+   job loses its claim to the reclaim sweep, and another reruns it. A direct
+   build that fails goes back to `waiting_to_backfill` behind a marker that
+   carries the error and a backoff, the same retry state a failed discharge
+   gets (#407), so `Trellis::status` reports it.
 4. **Go live.** The definition flips to `live` when its build finishes. For
    ring enumeration that's inside the discharge transaction itself. For
    chunks it's when the last chunk commits. For a direct build it's when the
@@ -167,7 +167,9 @@ call), execute on drain threads.
   read's image-less `Recompute` re-derives the whole group, and the recompute
   horizon keeps the streamed delta from counting the commit a second time
   ([stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)).
-  #312's wait for intake only makes those re-derivations rarer.
+  A direct build records the same horizon on every group row it writes, and
+  on the target for the groups it found empty (#419). #312's wait for intake
+  only makes those re-derivations rarer.
 - **Changes during the build aren't lost.** Apply skips a definition that
   isn't `live`, so a change that drains while the build runs doesn't reach it.
   For ring enumeration on a published source that can't happen: the maintenance
@@ -179,13 +181,14 @@ call), execute on drain threads.
   only to `live` ones, so going live parks a catch-up marker on it
   (`go_live` in `intake::publication`, #315). Chunked and direct builds read the source
   through many snapshots over a longer time, so going live parks a fresh
-  catch-up marker (`complete_direct_backfill`). Its discharge, through this
-  same path, re-derives the definition from the source's current state, which
-  for an aggregate also corrects a change the build read whose streamed delta
-  was folded again after the flip. A `backfill_coverage` record can let a catch-up
-  skip re-reading a table that provably hasn't changed since the build, so a
-  build records one only when no streamed change from before its fence is
-  still waiting to drain (#442). That saves work but never decides correctness.
+  catch-up marker on every table the build read (`complete_direct_backfill`;
+  a direct build also reads each relationship to-side). Its discharge,
+  through this same path, re-derives the definition from the tables' current
+  state. A `backfill_coverage` record can let a catch-up skip re-reading a
+  table that provably hasn't changed since the build. That saves work but
+  never decides correctness: the one change it can't see, a commit the build
+  read whose streamed delta drains after the flip, is harmless for a 1-1
+  target and re-derived by the recompute horizon for an aggregate (above).
 - **A resumed target drops rows its source no longer backs.** Before the read,
   the discharge deletes every row of a dispatched definition's target that no
   current source row backs (#330, `intake::resume_orphans`), since the read
@@ -221,10 +224,8 @@ a row committed during that wait would be neither read nor streamed (#393).
   drain. Neither signal waits for a chunked or direct build's go-live catch-up,
   which a later maintenance pass discharges
   ([ADR-0016](decisions/0016-single-background-capture-path.md#consequences)).
-  *Planned (#419):* an aggregate or relationship-enriched 1-1 definition still
-  builds in-call, so it's usually `live` already when `apply` returns.
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
-  live without its maintenance loop. Chunked builds also need drain threads
+  live without its maintenance loop. Chunked and direct builds also need drain threads
   ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).
 - **Only the staging worker needs publication and replication privileges.** A
   process that only registers transforms needs catalog access and the right to

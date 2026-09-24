@@ -64,6 +64,7 @@ async fn start() -> Pipeline {
     )
     .await
     .expect("install h3");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     Pipeline::attach(cluster, db, raw, &["public.src"]).await
 }
 

@@ -250,6 +250,7 @@ async fn aggregate_over_a_to_one_relationship_with_composite_pk_backfills_to_the
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition against a composite-pk source");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     drain_to_quiescence(&db.pool, &mut client).await;
 
@@ -291,6 +292,7 @@ async fn forward_insert_of_a_composite_pk_from_side_row_updates_its_group_total(
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -353,6 +355,7 @@ async fn reverse_update_of_the_to_side_row_updates_every_dependent_group() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -427,6 +430,7 @@ async fn plain_aggregate_over_a_composite_pk_source_drains_with_no_relationship_
     )
     .await
     .expect("install a plain aggregate over a composite-pk source");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let read_totals = async |client: &Client| -> Totals {

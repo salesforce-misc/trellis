@@ -907,6 +907,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
     )
     .await
     .expect("a numeric-grouped aggregate over an integer-keyed table is accepted");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     client
         .batch_execute("alter table price_totals replica identity full")
         .await

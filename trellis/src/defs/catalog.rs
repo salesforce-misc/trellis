@@ -594,8 +594,8 @@ impl From<crate::intake::IntakeError> for CatalogError {
 }
 
 /// Test fixture: registers a definition exactly as [`install_definition`]
-/// registers one it can't build in-call (`waiting_to_backfill`, no source
-/// read), then stands in for the backfill discharge's ring fallback
+/// registers every one (`waiting_to_backfill`, no source read), then stands
+/// in for the backfill discharge's ring fallback
 /// (`intake::publication::run_pending_backfills`, ADR-0016) in-call: it
 /// enumerates the source into the ring as image-less `Recompute` rows and
 /// flips the definition `live` in one transaction. `source_columns` maps the
@@ -679,46 +679,21 @@ pub async fn create_definition_without_backfill(
 /// Target-table creation always runs first, unconditionally, because no build
 /// path creates it itself.
 ///
-/// **Registration reads no source rows (ADR-0016, issue #418).** A plain
-/// (non-relationship) `KeySpace::OneToOne` definition, and any shape the
-/// direct build can't render ([`BackfillError::Unsupported`]), is persisted
-/// [`TransformStatus::WaitingToBackfill`] and this returns. Its build runs in
-/// the background: the staging worker's reconcile pass parks a
-/// `pending_backfill` marker on its source (joining the source to the
-/// publication first if it has to; see
+/// **Registration reads no source rows (ADR-0016, issues #418, #419).** Every
+/// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
+/// returns, so its latency doesn't depend on the size of any table the
+/// definition reads. Its build runs in the background: the staging worker's
+/// reconcile pass parks a `pending_backfill` marker on its source (joining
+/// the source to the publication first if it has to; see
 /// [`crate::intake::publication::reconcile_publication`]), and that marker's
 /// discharge dispatches the build by shape once the marker's fence has
-/// settled: `backfill_chunks` for a plain 1-1 definition, which drain threads
-/// execute, flipping it `live` when the last chunk finishes
-/// ([`complete_direct_backfill`]), or a ring enumeration flipped `live` in
-/// the discharge's own transaction for the `Unsupported` fallback. A caller
-/// polls [`crate::Trellis::status`] until it reads `live`.
-///
-/// **Aggregates and relationship-enriched 1-1 definitions still build in-call
-/// (until issue #419).** Once the target exists and the coverage plan is
-/// captured, the definition row is persisted *speculatively* with
-/// [`TransformStatus::Backfilling`], then [`backfill::backfill_definition`]
-/// runs. Three things can happen next:
-///
-/// * The build succeeds: the coverage plan is committed and the row is
-///   flipped to [`TransformStatus::Live`] in place (same id, same
-///   `target_table`), together with a catch-up marker on every table the
-///   build read (issue #430).
-/// * The build reports [`BackfillError::Unsupported`]: the speculative row is
-///   deleted and the definition is re-registered `waiting_to_backfill`, for
-///   the discharge's ring fallback. Deleting first frees `target_table`'s
-///   uniqueness constraint back up; re-running
-///   [`resolve_node_in_txn`]/[`persist_edge_in_txn`]/the `source_table_versions`
-///   bump for the same source/target pair is harmless — nodes upsert, edges
-///   dedupe on conflict, and an extra version bump only costs a downstream
-///   drain worker a routine, self-healing version-fence retry (see
-///   `staging::apply::ApplyError::VersionFenceMiss`).
-/// * The build fails for a real reason: the speculative row is deleted and
-///   the error propagates, without rolling back the target-table DDL.
-///
-/// Such a definition defers to the discharge instead of building in-call when
-/// its source already has an unsettled marker (issue #55,
-/// [`defer_if_fence_unsettled`]).
+/// settled. A plain 1-1 definition gets `backfill_chunks`, an aggregate or
+/// relationship-enriched 1-1 definition one direct-build job
+/// (`chunk_queue::dispatch_direct_build`); drain threads execute either, and
+/// the last one to finish flips it `live` ([`complete_direct_backfill`]). A
+/// shape the direct build can't render ([`BackfillError::Unsupported`]) gets
+/// a ring enumeration flipped `live` in the discharge's own transaction. A
+/// caller polls [`crate::Trellis::status`] until it reads `live`.
 ///
 /// **Why nothing is folded into a non-`live` target.**
 /// [`dependents_of`]/[`transforms_for_source`] filter to `status = 'live'`,
@@ -842,132 +817,14 @@ pub async fn install_definition(
         }
     }
 
-    // ADR-0016 (issue #418): registration reads no source rows. Every shape
-    // the direct build can't run in-call yet waits for the backfill
-    // discharge, which dispatches its build by shape.
-    let builds_in_call =
-        !matches!(def.key_space, KeySpace::OneToOne) || backfill::uses_relationships(&def);
-    if !builds_in_call {
-        return register_for_discharge(pool, source_text, source_columns, target_schema).await;
-    }
-
-    // Issue #55: if this definition's own source table already has a
-    // durable, unsettled `pending_backfill` marker (some unrelated
-    // transaction elsewhere in the cluster is pinning the `xmin` fence a
-    // publication-join or catch-up marker was captured against — see
-    // docs/observability.md's "Backfill status and the `xmin` caveat"),
-    // defer the in-call build to that marker's own discharge rather than
-    // racing it: persist the row `waiting_to_backfill` and return
-    // immediately. Issue #419 moves these shapes onto the discharge
-    // unconditionally and removes this check.
+    // ADR-0016 (issues #418, #419): registration reads no source rows. The
+    // definition waits for the backfill discharge, which dispatches its build
+    // by shape.
     //
-    // Only `def.source` is checked, not every relationship to-side table
-    // [`plan_direct_backfill_coverage`] would also read below — a
-    // deliberate scope cut: the doc's `xmin` caveat is framed around a
-    // *source* table joining the publication, and a relationship's to-side
-    // table has its own, already-correct coverage-fence handling
-    // independent of this check.
-    if defer_if_fence_unsettled(pool, &qualified_source).await? {
-        return register_for_discharge(pool, source_text, source_columns, target_schema).await;
-    }
-
-    // Issue #79 (bug B): capture each table's coverage fence *before* the
-    // build reads it. The fence must precede every build read — a fence taken
-    // after the build could vouch for a row the build never folded (see
-    // `plan_direct_backfill_coverage` / `capture_backfill_coverage_fence`).
-    let coverage_plan = plan_direct_backfill_coverage(pool, &def, &relationships).await?;
-
-    // Issue #55: persist *before* running the backfill, not after — see this
-    // function's doc comment for the status lifecycle and the cleanup story
-    // for each of the three outcomes below. `target_schema` — the exact value
-    // the DDL step above just created the physical target table under — is
-    // threaded straight through rather than re-derived from `pool` (issue
-    // #73's persisted qualification must never drift from what the DDL
-    // built).
-    let mut definition = create_definition_inner(
-        pool,
-        source_text,
-        source_columns,
-        TransformStatus::Backfilling,
-        target_schema,
-    )
-    .await?;
-
-    match backfill::backfill_definition(
-        pool,
-        &def,
-        target_schema,
-        &qualified_source,
-        source_columns,
-    )
-    .await
-    {
-        Ok(()) => {
-            // The build folded each planned table's pre-build contents into the
-            // target. Persist that coverage *before* the definition is marked
-            // live, so the redundant publication-join catch-up enumeration of
-            // those tables can be skipped. A table with a streamed change from
-            // before its fence still in flight gets no coverage (issue #442):
-            // the build read that change, its delta folds in again after the
-            // flip, and only the catch-up's re-derivation corrects it.
-            commit_direct_backfill_coverage(pool, &coverage_plan).await?;
-            // Issues #315/#430: the apply path skipped this definition while
-            // it sat `backfilling`, so a change to any table the build read
-            // that drained during the build is missing from the target. Park
-            // a catch-up on each of them, as `complete_direct_backfill` does
-            // for the chunked path: its discharge re-derives from current
-            // state, and the coverage just committed lets it skip a table
-            // that hasn't changed since its pre-build fence. A frozen
-            // definition's resume parks its own and rebuilds.
-            //
-            // The flip and the parks commit together, as in
-            // `complete_direct_backfill`: a crash or a failed park between
-            // them would otherwise leave the definition live with the loss
-            // unrecovered. Parked in name order so two installs sharing
-            // tables can't deadlock on each other's marker rows.
-            let mut client = pool.get().await?;
-            let txn = client.transaction().await?;
-            definition.status = go_live_if_backfilling(&*txn, definition.id).await?.status();
-            if !definition.status.is_frozen() {
-                let mut tables: Vec<&str> =
-                    coverage_plan.iter().map(CoveragePlan::qualified).collect();
-                tables.sort_unstable();
-                tables.dedup();
-                for table in tables {
-                    crate::intake::publication::park_backfill_catchup(&*txn, table).await?;
-                }
-            }
-            txn.commit().await?;
-            Ok(definition)
-        }
-        Err(BackfillError::Unsupported(_)) => {
-            // This shape can't be built directly after all — discard the
-            // speculative row (see doc comment: safe, since re-registering
-            // recreates every one of its side effects idempotently) and hand
-            // the build to the discharge's ring fallback.
-            delete_definition_row(pool, definition.id).await?;
-            register_for_discharge(pool, source_text, source_columns, target_schema).await
-        }
-        Err(err) => {
-            delete_definition_row(pool, definition.id).await?;
-            Err(CatalogError::DirectBackfill(err))
-        }
-    }
-}
-
-/// Persists a definition [`TransformStatus::WaitingToBackfill`], reading no
-/// source rows (ADR-0016, issue #418): the backfill discharge dispatches its
-/// build once the staging worker has parked a marker on its source and that
-/// marker's fence has settled
-/// ([`crate::intake::publication::reconcile_publication`] parks it,
-/// [`crate::intake::publication::run_pending_backfills`] dispatches). The
-/// target table must already exist; `target_schema` is the one its DDL used.
-async fn register_for_discharge(
-    pool: &Pool,
-    source_text: &str,
-    source_columns: &HashMap<String, ValueType>,
-    target_schema: &str,
-) -> Result<Definition, CatalogError> {
+    // `target_schema` — the exact value the DDL step above just created the
+    // physical target table under — is threaded straight through rather than
+    // re-derived from `pool` (issue #73's persisted qualification must never
+    // drift from what the DDL built).
     create_definition_inner(
         pool,
         source_text,
@@ -1068,13 +925,12 @@ async fn go_live_if_backfilling(
 /// (the exclusion), but this marker's later discharge re-derives the target
 /// from current source state, folding that delta in after all.
 ///
-/// Only ever called for the plain (non-relationship) 1-1 chunk-queue path
-/// today — a relationship-enriched 1-1 or aggregate definition still flips
-/// `Backfilling` -> `Live` synchronously inside [`install_definition`] itself
-/// via [`go_live_if_backfilling`], since neither is chunked into
-/// `backfill_chunks` (see this crate's `defs::backfill` module docs on why).
-/// That path parks the same catch-up itself, on its source and on every
-/// relationship to-side table its build read (issue #430).
+/// Completes every build that runs through `backfill_chunks`: a plain 1-1
+/// definition's chunks, and an aggregate or relationship-enriched 1-1
+/// definition's direct-build job (issue #419). The catch-up is parked on
+/// every table the build read: the source, and each relationship to-side
+/// table (issue #430), in name order so two completions sharing tables can't
+/// deadlock on each other's marker rows.
 ///
 /// **Only a still-`backfilling` definition completes (issue #331).** The
 /// pause gates new chunk claims, not a chunk a worker already holds, so the
@@ -1112,16 +968,50 @@ pub(crate) async fn complete_direct_backfill(
         crate::intake::publication::park_target_catchup_if_read(txn, definition_id).await?;
     }
     if !status.is_frozen() {
-        let qualified: String = txn
+        let row = txn
             .query_one(
-                "select source_table from transform_definitions where id = $1",
+                "select source_table, definition_text from transform_definitions where id = $1",
                 &[&definition_id],
             )
-            .await?
-            .get(0);
-        crate::intake::publication::park_backfill_catchup(txn, &qualified).await?;
+            .await?;
+        let qualified: String = row.get(0);
+        let def = parse(row.get::<_, &str>(1))?;
+        for table in tables_read_by(txn, &def, &qualified).await? {
+            crate::intake::publication::park_backfill_catchup(txn, &table).await?;
+        }
     }
     Ok(status)
+}
+
+/// Every table `def`'s direct build reads, fully qualified, sorted and
+/// deduplicated: its source (`qualified_source`, the persisted
+/// `transform_definitions.source_table`) and the to-side table of every
+/// relationship its fields reference. A to-side is persisted bare, so it is
+/// resolved the way registration resolved it ([`resolve_graph_identity_in_txn`]).
+/// A referenced relationship the source no longer declares contributes
+/// nothing.
+async fn tables_read_by(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+    qualified_source: &str,
+) -> Result<Vec<String>, CatalogError> {
+    let mut tables = vec![qualified_source.to_string()];
+    if let Some((schema, table)) = qualified_source.split_once('.') {
+        let mut rels: Vec<String> = super::eval::relationship_references(def)
+            .into_iter()
+            .map(|(rel, _column)| rel)
+            .collect();
+        rels.sort_unstable();
+        rels.dedup();
+        for rel in rels {
+            if let Some(reldef) = relationship_by_name_in(txn, schema, table, &rel).await? {
+                tables.push(resolve_graph_identity_in_txn(txn, &reldef.def.to_table).await?);
+            }
+        }
+    }
+    tables.sort_unstable();
+    tables.dedup();
+    Ok(tables)
 }
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
@@ -1175,22 +1065,9 @@ async fn is_definition_target(
         .get(0))
 }
 
-/// Deletes a definition row by id (issue #55) — used by [`install_definition`]
-/// to discard the speculative `Backfilling` row it persists ahead of its
-/// direct build when that build doesn't pan out (falls back to the ring, or
-/// fails outright). Only ever targets a row this same call just inserted, so
-/// there's nothing else in the catalog yet that could reference it.
-async fn delete_definition_row(pool: &Pool, id: i64) -> Result<(), CatalogError> {
-    let client = pool.get().await?;
-    client
-        .execute("delete from transform_definitions where id = $1", &[&id])
-        .await?;
-    Ok(())
-}
-
 /// What to do with one table's coverage once a direct build succeeds: either
 /// persist a fence captured before the build, or clear any stale record.
-enum CoveragePlan {
+pub(crate) enum CoveragePlan {
     /// This build is the table's sole reader — record the pre-build fence.
     Record {
         qualified: String,
@@ -1202,18 +1079,9 @@ enum CoveragePlan {
     Clear { qualified: String },
 }
 
-impl CoveragePlan {
-    /// The table this plan is for.
-    fn qualified(&self) -> &str {
-        match self {
-            CoveragePlan::Record { qualified, .. } | CoveragePlan::Clear { qualified } => qualified,
-        }
-    }
-}
-
-/// Plans direct-backfill coverage (issue #79, bug B) for a definition about to
-/// be built through the fast path: its own source table plus every to-side
-/// relationship table its fields read. For each, either captures a coverage
+/// Plans direct-backfill coverage (issue #79, bug B) for `definition`, whose
+/// direct-build job is about to run (`chunk_queue`, issue #419): every table
+/// the build reads ([`tables_read_by`]). For each, either captures a coverage
 /// fence (row count + snapshot) or, when another definition already reads the
 /// table, marks it for clearing.
 ///
@@ -1225,63 +1093,19 @@ impl CoveragePlan {
 /// leaves any build-window write invisible in the fence, so
 /// [`crate::intake::publication::coverage_covers`] falls back to enumeration.
 ///
-/// Also runs before the new definition is persisted, so [`table_has_other_reader`]
-/// sees only the *pre-existing* readers of each table.
-/// `resolved` is the caller's already-resolved relationship map (the same one
-/// it validated against), passed in rather than re-resolved here: `install_definition`
-/// needs it up front anyway to validate ahead of DDL.
-async fn plan_direct_backfill_coverage(
+/// Coverage is only ever an optimization: a record lets the build's
+/// go-live catch-up skip re-reading a table that hasn't changed since
+/// the fence (ADR-0016, "Which consistency bookkeeping stays").
+pub(crate) async fn plan_direct_backfill_coverage(
     pool: &Pool,
-    def: &TransformDef,
-    resolved: &HashMap<String, ResolvedRelationship>,
+    definition: &Definition,
 ) -> Result<Vec<CoveragePlan>, CatalogError> {
-    // Distinct to-side tables this definition reads through a relationship.
-    let mut tables: HashSet<String> = resolved.values().map(|r| r.to_table.clone()).collect();
-    tables.insert(def.source.clone());
-
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    let tables = tables_read_by(&txn, &definition.def, &definition.source_table).await?;
     let mut plans = Vec::with_capacity(tables.len());
-    for bare_table in tables {
-        // Issue #76: `def.source` specifically must resolve to the same
-        // schema `create_definition_inner`'s own `qualified_source` will
-        // independently compute a few steps later in this same call
-        // (`install_definition`) — an explicit `FROM <schema>.<source>`
-        // ([`super::ast::TransformDef::explicit_source_schema`]) is trusted
-        // here exactly as it is there, never re-walked through `search_path`,
-        // so the coverage fence below is captured (and later looked up) under
-        // the *actual* persisted qualified name rather than a different one
-        // a bare walk might independently pick. Every other table in this set
-        // is a relationship to-side ([`ResolvedRelationship::to_table`]),
-        // which ADR-0007's "Scope" section explicitly leaves bare-resolved
-        // for now (relationship endpoints aren't qualified syntax yet — a
-        // later issue's job), so only this one entry needs the branch.
-        //
-        // Reviewer follow-up to issue #74 (epic #78's own whole-branch
-        // review): both branches used to call [`resolve_source_schema_in_txn`]
-        // directly — a plain `search_path` walk with no fallback — even
-        // though `create_definition_inner`'s own resolution of a bare
-        // `def.source`/relationship to-side has carried issue #74's
-        // bare-target-suffix fallback ([`resolve_graph_identity_in_txn`])
-        // since that issue landed. Since this function only ever runs from
-        // `install_definition`'s fast path (never from the ring path that
-        // already had the fallback), a bare name chained off another
-        // definition's target explicitly qualified into a non-default schema
-        // (issue #76) failed here first, before the build ever ran, as a
-        // plain "not found on the search path". Switched to
-        // [`resolve_graph_identity_in_txn`] itself (which already returns the
-        // fully-qualified identity directly, so the separate `qualify` call
-        // below moves into this same match), rather than re-implementing the
-        // fallback a third time.
-        let qualified = if bare_table == def.source {
-            match &def.explicit_source_schema {
-                Some(schema) => crate::intake::publication::qualify(schema, &bare_table)?,
-                None => resolve_graph_identity_in_txn(&txn, &bare_table).await?,
-            }
-        } else {
-            resolve_graph_identity_in_txn(&txn, &bare_table).await?
-        };
-        if table_has_other_reader(&txn, &bare_table, &qualified).await? {
+    for qualified in tables {
+        if table_has_other_reader(&txn, &qualified, definition.id).await? {
             plans.push(CoveragePlan::Clear { qualified });
         } else {
             let fence =
@@ -1295,90 +1119,59 @@ async fn plan_direct_backfill_coverage(
 }
 
 /// Persists a [`plan_direct_backfill_coverage`] result once the direct build
-/// has succeeded (issue #79, bug B), in one transaction so the whole plan lands
-/// atomically.
-///
-/// A fence is recorded only if every streamed change to its table from a
-/// commit the fence saw has already drained (issue #442,
-/// [`crate::staging::converge::table_drained_through`]). Those drains ran
-/// while the definition wasn't `live`, so they skipped it, and the build read
-/// the commits instead. A change still in flight is different: the build read
-/// it, and its delta will be folded in again once the definition goes live.
-/// For an aggregate that counts it twice, and only the go-live catch-up's
-/// re-derivation of the group corrects it, so the table's coverage is cleared
-/// instead and the catch-up enumerates it. Nothing can join the in-flight set
-/// after this check: intake has already staged through the fence's horizon.
-async fn commit_direct_backfill_coverage(
-    pool: &Pool,
+/// has succeeded (issue #79, bug B), inside the caller's transaction so the
+/// whole plan lands atomically.
+pub(crate) async fn commit_direct_backfill_coverage(
+    txn: &tokio_postgres::Transaction<'_>,
     plans: &[CoveragePlan],
 ) -> Result<(), CatalogError> {
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
     for plan in plans {
         match plan {
             CoveragePlan::Record { qualified, fence } => {
-                let drained = crate::staging::converge::table_drained_through(
-                    &*txn,
-                    qualified,
-                    fence.horizon,
-                )
-                .await?;
-                if drained {
-                    crate::intake::publication::write_backfill_coverage(&*txn, qualified, fence)
-                        .await?;
-                } else {
-                    crate::intake::publication::clear_backfill_coverage(&*txn, qualified).await?;
-                }
+                crate::intake::publication::write_backfill_coverage(txn, qualified, fence).await?;
             }
             CoveragePlan::Clear { qualified } => {
-                crate::intake::publication::clear_backfill_coverage(&*txn, qualified).await?;
+                crate::intake::publication::clear_backfill_coverage(txn, qualified).await?;
             }
         }
     }
-    txn.commit().await?;
     Ok(())
 }
 
-/// Whether any *already-persisted* transform definition reads `table` — either
-/// as its own `FROM` source, or as the to-side of a relationship anchored on a
-/// table some definition transforms. Conservative on the relationship side: it
-/// does not confirm the anchoring definition's text actually references that
-/// relationship, so it may report a reader where none truly exists. That only
-/// ever suppresses a coverage record (falling back to full enumeration), which
-/// is always safe — the direction the issue's safety valve demands.
+/// Whether any transform definition other than `excluding` reads the
+/// qualified `qualified` — either as its own `FROM` source, or as the to-side
+/// of a relationship anchored on a table some definition transforms.
+/// Conservative on the relationship side: it does not confirm the anchoring
+/// definition's text actually references that relationship, so it may report
+/// a reader where none truly exists. That only ever suppresses a coverage
+/// record (falling back to full enumeration), which is always safe — the
+/// direction the issue's safety valve demands.
 ///
-/// Takes both `table`'s bare and fully-qualified (`qualified`) spellings
-/// (issue #72), because the two clauses below need different ones and
-/// neither can be derived from the other inside this query:
-///
-/// * The first clause compares against `transform_definitions.source_table`,
-///   which — since issue #72 — holds the *qualified* identity, so it needs
-///   `qualified` to ever match.
-/// * The second clause joins a relationship to the definitions over its
-///   from-table by the relationship's qualified from-side
-///   (`from_schema || '.' || from_table`, issue #288) against
-///   `d.source_table`, but its to-side is still persisted bare, so
-///   `r.to_table = $2` needs the bare `table`. Matching the to-side bare can
-///   only ever *widen* a match (two same-named tables in different schemas
-///   both count as "has a reader"), never narrow one — the conservative
-///   direction the doc comment above already accepts for this whole
-///   function, pushing toward the always-safe `Clear` side.
+/// The first clause compares against `transform_definitions.source_table`,
+/// which holds the qualified identity (issue #72). The second joins a
+/// relationship to the definitions over its qualified from-side
+/// (`from_schema || '.' || from_table`, issue #288), but its to-side is still
+/// persisted bare, so it matches `qualified`'s bare table name. Matching the
+/// to-side bare can only ever *widen* a match (two same-named tables in
+/// different schemas both count as "has a reader"), never narrow one — the
+/// conservative direction, pushing toward the always-safe `Clear` side.
 async fn table_has_other_reader(
     txn: &tokio_postgres::Transaction<'_>,
-    table: &str,
     qualified: &str,
+    excluding: i64,
 ) -> Result<bool, CatalogError> {
     let exists: bool = txn
         .query_one(
             "select \
-               exists(select 1 from transform_definitions where source_table = $1) \
+               exists(select 1 from transform_definitions \
+                      where source_table = $1 and id <> $2) \
                or exists( \
                  select 1 from relationship_definitions r \
                  join transform_definitions d \
                    on d.source_table = r.from_schema || '.' || r.from_table \
-                 where r.to_table = $2 \
+                 where r.to_table = split_part($1, '.', 2) and d.id <> $2 \
                )",
-            &[&qualified, &table],
+            &[&qualified, &excluding],
         )
         .await?
         .get(0);
@@ -3471,28 +3264,6 @@ async fn confirm_qualified_table_exists(
         .await?
         .get(0);
     Ok(exists)
-}
-
-/// Checks whether `qualified_source`'s own `pending_backfill` marker (if
-/// any) is unsettled (issue #55: [`crate::intake::publication::backfill_marker_unsettled`]),
-/// and if so, clears any stale [`crate::intake::publication::clear_backfill_coverage`]
-/// record for it before reporting `true` — a definition about to be
-/// persisted `waiting_to_backfill` because of this check has never itself
-/// backfilled the table, so it cannot trust a coverage record some earlier,
-/// unrelated direct build left behind (see [`coverage_covers`]'s "safe
-/// default" contract, mirrored by [`clear_backfill_coverage`]'s own
-/// multi-reader handling).
-async fn defer_if_fence_unsettled(
-    pool: &Pool,
-    qualified_source: &str,
-) -> Result<bool, CatalogError> {
-    let client = pool.get().await?;
-    let unsettled =
-        crate::intake::publication::backfill_marker_unsettled(&**client, qualified_source).await?;
-    if unsettled {
-        crate::intake::publication::clear_backfill_coverage(&**client, qualified_source).await?;
-    }
-    Ok(unsettled)
 }
 
 /// Pooled (non-transaction) counterpart to [`column_type_in_txn`], for
@@ -6031,8 +5802,12 @@ mod go_live_tests {
                 .query_one(
                     "insert into transform_definitions \
                      (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, 'public.orders', 1, '', $2) returning id",
-                    &[&format!("public.t_{}", status.as_str()), &status.as_str()],
+                     values ($1, 'public.orders', 1, $3, $2) returning id",
+                    &[
+                        &format!("public.t_{}", status.as_str()),
+                        &status.as_str(),
+                        &format!("TRANSFORM t_{} FROM orders SELECT a AS x", status.as_str()),
+                    ],
                 )
                 .await
                 .expect("seed a definition")

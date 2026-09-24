@@ -1811,12 +1811,14 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     .await
     .expect("seed");
 
-    // Aggregates build synchronously, so no running pipeline is needed here.
+    // The aggregate's build runs in the background (#419); settling it here
+    // brings the definition live without a running pipeline.
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
-        .expect("an aggregate definition builds synchronously");
+        .expect("define the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
 
     let err = trellis
         .apply("ALTER TRANSFORM order_rollup ADD g AS g2")

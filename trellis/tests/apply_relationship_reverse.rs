@@ -410,6 +410,7 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -475,6 +476,7 @@ async fn two_parent_changes_in_one_batch_fold_to_one_record() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -544,6 +546,7 @@ async fn parent_insert_is_picked_up_by_the_reverse_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -602,6 +605,7 @@ async fn parent_delete_is_picked_up_by_the_reverse_path() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -672,6 +676,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -811,6 +816,7 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // First parent change: 100 -> 400, its own segment.
@@ -938,6 +944,7 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1048,6 +1055,7 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1441,6 +1449,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1579,6 +1588,7 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -1670,6 +1680,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
 
@@ -1962,6 +1973,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -2128,6 +2140,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
@@ -2336,6 +2349,7 @@ async fn fairness_escalation_increments_its_own_metric() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     client
         .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2428,6 +2442,7 @@ async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one()
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     client
@@ -2581,6 +2596,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
+        trellis::intake::publication::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         client
             .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2637,6 +2653,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
+        trellis::intake::publication::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         let projection_table = projection_table_for(&db.pool, relationship.id).await;
         client
@@ -2703,6 +2720,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
+        trellis::intake::publication::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
         client
             .execute("update posts set word_count = 400 where id = 1", &[])
@@ -2776,6 +2794,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
         install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
             .await
             .expect("install the aggregate-over-to-one definition");
+        trellis::intake::publication::settle_registrations(&db.pool).await;
         drain_to_quiescence(&db.pool, &mut client).await;
 
         client
@@ -2910,6 +2929,7 @@ async fn a_sibling_that_already_drained_before_the_parents_own_cdc_is_staged_doe
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // This test's own lsns must be real, monotonically-increasing WAL
@@ -3183,6 +3203,7 @@ async fn an_image_less_recompute_on_the_to_side_table_is_not_a_parent_insert() {
     install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
         .await
         .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     let settled = target_totals(&client).await;
@@ -3255,9 +3276,8 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
     )
     .await
     .expect("a reader through the relationship");
-    trellis::intake::publication::discharge_registrations(&db.pool)
-        .await
-        .expect("the discharge enumerates the source (ADR-0016)");
+    // The discharge dispatches the build as a background job (ADR-0016, #419).
+    trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     let projection_table = projection_table_for(&db.pool, relationship.id).await;
     async fn codes(client: &Client, projection_table: &str) -> Vec<i32> {
