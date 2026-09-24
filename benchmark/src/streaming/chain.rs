@@ -143,6 +143,46 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
     }
 }
 
+/// Polls until no `pending_backfill` marker is left, or panics at `deadline`.
+/// Call it after the transforms are live and **before** the first source row
+/// is written, warm-up row included.
+///
+/// A definition going live parks a catch-up marker on its source, and the
+/// staging worker discharges it on its next reconcile pass, up to
+/// `reconcile_interval` later. The discharge enumerates every row the source
+/// holds at that moment as an image-less `Recompute` and stages it. Each one
+/// is applied and counted into `trellis_changes_applied_total` like any other
+/// staged row, although nothing about the row changed. If the pass lands
+/// inside the measurement window, the probe measures a re-derive of however
+/// much of the table exists by then on top of the offered load, and the
+/// counter runs ahead of the rows committed by that many. Issue #423 measured
+/// exactly that: at 20k rows/sec the discharge ran about 5 s into the offer
+/// and added 95,878-100,001 to each 400,000-row probe.
+///
+/// Waiting here, while the source is still empty, lets the catch-up discharge
+/// enumerate nothing.
+pub async fn wait_for_catch_up_discharged(raw: &RawClient, deadline: Instant) {
+    loop {
+        let pending: Vec<String> = raw
+            .query("select table_name from pending_backfill", &[])
+            .await
+            .expect("read pending_backfill")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "catch-up backfill markers for {pending:?} never discharged in time (the staging \
+             worker discharges them on its reconcile pass; is `reconcile_interval` longer \
+             than the setup timeout?)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Polls until `predicate_sql` (a `select 1 ... ` returning at most one row)
 /// matches, or panics at `deadline` with `what` in the message.
 async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline: Instant) {

@@ -571,6 +571,20 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
             );
             ok = false;
         }
+        // The other direction (#423): the counter counts staged rows, so it
+        // can only pass rows committed if something staged a source row a
+        // second time inside the window, and then the probe measured more
+        // work than it offered. Setup waits out the one known source of that,
+        // the catch-up backfill a definition parks when it goes live.
+        if probe.changes_applied > probe.rows_issued {
+            eprintln!(
+                "HARNESS FAILURE: {} at {} rows/sec applied {} changes for {} committed rows — \
+                 source rows were staged again during the window (a catch-up backfill?), so \
+                 this rate was measured under extra load",
+                scenario, probe.target_rows_per_sec, probe.changes_applied, probe.rows_issued
+            );
+            ok = false;
+        }
         if probe.generator_bound {
             eprintln!(
                 "GENERATOR-BOUND: {} at {} rows/sec — generator offered only {:.0}/sec from {} \

@@ -31,7 +31,7 @@ use testkit::TestCluster;
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{
     ChainOracle, check_chain_oracle, create_chain_source_table, install_chain_hops,
-    wait_for_chain_live, warm_up,
+    wait_for_catch_up_discharged, wait_for_chain_live, warm_up,
 };
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::scrape::{
@@ -156,6 +156,11 @@ pub async fn run_probe(
 
     let chain = install_chain_hops(&db.pool, &source, 1).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
+    wait_for_catch_up_discharged(
+        &raw,
+        Instant::now() + SETUP_TIMEOUT + tuning.reconcile_interval,
+    )
+    .await;
     warm_up(&raw, &chain, SETUP_TIMEOUT).await;
 
     let terminal = chain.terminal();
@@ -183,12 +188,16 @@ pub async fn run_probe(
     //
     // Neither signal works alone here:
     //
-    // * `trellis_changes_applied_total` can *overcount* — a retried apply
-    //   re-counts changes it already counted — so `applied >= rows_issued` can
-    //   go true while rows are still in flight, ending the grace period early
-    //   and reporting a sustainable rate as backlogged. Measured at 20k
-    //   rows/sec in 10,000-row commits: the counter read 490,001 against
-    //   400,000 committed rows, leaving exactly one commit undrained.
+    // * `trellis_changes_applied_total` counts staged rows (#409), which
+    //   matches rows committed only while nothing stages a source row a second
+    //   time. A catch-up backfill does exactly that: its discharge stages every
+    //   row the source holds as a `Recompute`. Setup waits out the one that
+    //   going live parks (see `wait_for_catch_up_discharged`), and with it
+    //   gone the counter has measured exact. But if one ran mid-window, the
+    //   counter would reach `rows_issued` with rows still in flight and end
+    //   the grace period early. Issue #423 measured that before setup waited:
+    //   at 20k rows/sec in 10,000-row commits the counter read 500,001 against
+    //   400,000 committed rows.
     // * a `count(*)` every poll is exact but, at the millions-of-rows end of
     //   the ramp, a repeated seq scan competes with the drain it is watching
     //   and changes the answer. Measured at 200k rows/sec: polling the count
@@ -230,11 +239,10 @@ pub async fn run_probe(
     client.shutdown().await.expect("client shutdown");
 
     // The backlog comes from the target table's own row count, not from
-    // `changes_applied`: that counter can *overcount* under saturation (a
-    // retried apply re-counts changes it already counted — measured at 180k
-    // rows/sec, where it read 3,335,546 against 2,881,946 rows actually
-    // landed), which would understate the backlog and can report a saturated
-    // rate as sustained. A row count can't overcount. `oracle.terminal_rows`
+    // `changes_applied`: the counter is an in-process tally that a re-staged
+    // row can push past rows committed (see the drain loop above), which
+    // would understate the backlog and could report a saturated rate as
+    // sustained. A row count can't overcount. `oracle.terminal_rows`
     // includes the warm-up row, which the generator's `rows_issued` doesn't.
     let landed = oracle.terminal_rows - 1;
     let backlog = load.rows_issued as i64 - landed;
