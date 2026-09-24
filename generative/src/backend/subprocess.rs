@@ -46,15 +46,16 @@ use tokio_postgres::NoTls;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::defs::{CatalogError, DdlError, create_relationship, install_definition};
-use trellis::dev::staging::{StagingError, await_converged, watermark_token};
+use trellis::dev::staging::StagingError;
 use trellis::{Config, Pool};
 
 use super::Snapshot;
 use super::sql;
 use crate::model::{Op, Program, Table};
 
-/// How long [`SubprocessBackend::quiesce`] waits for ring convergence and
-/// definition-settle before giving up — same value and rationale as
+/// How long [`SubprocessBackend::quiesce`] waits, in total, for definitions
+/// to settle, catch-up markers to discharge and the ring to converge before
+/// giving up — same value and rationale as
 /// `ManualBackend::QUIESCE_TIMEOUT`.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -104,11 +105,31 @@ pub enum SubprocessBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// Issue #432: see `ManualBackendError::PendingBackfillTimeout`.
+    PendingBackfillTimeout {
+        tables: Vec<String>,
+        waited: Duration,
+    },
     Config(trellis::Error),
     Catalog(CatalogError),
     Ddl(DdlError),
     Staging(StagingError),
     Db(tokio_postgres::Error),
+}
+
+impl From<sql::QuiesceError> for SubprocessBackendError {
+    fn from(err: sql::QuiesceError) -> Self {
+        match err {
+            sql::QuiesceError::Db(err) => SubprocessBackendError::Db(err),
+            sql::QuiesceError::Staging(err) => SubprocessBackendError::Staging(err),
+            sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
+                SubprocessBackendError::DefinitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::BackfillsPending { tables, waited } => {
+                SubprocessBackendError::PendingBackfillTimeout { tables, waited }
+            }
+        }
+    }
 }
 
 impl From<trellis::Error> for SubprocessBackendError {
@@ -513,21 +534,8 @@ impl super::Backend for SubprocessBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), SubprocessBackendError> {
-        let token = watermark_token(&self.raw).await?;
-        await_converged(&self.raw, token, QUIESCE_TIMEOUT).await?;
-
-        // Same gap `ManualBackend::quiesce` closes (public-api-design
-        // review) and for the same reason: a direct-build 1-1 definition's
-        // backfill runs entirely outside the ring
-        // (docs/decisions/0007's amendment), invisible to `await_converged`.
-        sql::await_definitions_settled(&self.raw, &self.defs, QUIESCE_TIMEOUT)
-            .await
-            .map_err(|err| match err {
-                sql::DefinitionSettleError::Db(err) => SubprocessBackendError::Db(err),
-                sql::DefinitionSettleError::Timeout { unsettled, waited } => {
-                    SubprocessBackendError::DefinitionSettleTimeout { unsettled, waited }
-                }
-            })
+        // Issue #432: the same composed wait `ManualBackend::quiesce` runs.
+        Ok(sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {

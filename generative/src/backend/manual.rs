@@ -49,8 +49,8 @@ use trellis::dev::defs::{
     source_primary_key,
 };
 use trellis::dev::staging::{
-    StagingError, await_converged, has_pending as staging_has_pending, retire_drained_segments,
-    seal_phase1, seal_phase2, watermark_token,
+    StagingError, has_pending as staging_has_pending, retire_drained_segments, seal_phase1,
+    seal_phase2,
 };
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, IntakeError, Pool};
 
@@ -186,6 +186,14 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// Issue #432: [`ManualBackend::quiesce`] ran out of [`QUIESCE_TIMEOUT`]
+    /// with a `pending_backfill` (catch-up) marker still undischarged for
+    /// each of `tables`. A definition's go-live parks one, and its
+    /// enumeration can still re-derive a target that is already `live`.
+    PendingBackfillTimeout {
+        tables: Vec<String>,
+        waited: Duration,
+    },
     /// Issue #236: [`ManualBackend::stop_engine`] shut the engine down, but
     /// the server still reported its replication slot active after
     /// `waited`, so the slot can't be dropped or invalidated yet.
@@ -250,6 +258,21 @@ impl From<StagingError> for ManualBackendError {
 impl From<tokio_postgres::Error> for ManualBackendError {
     fn from(err: tokio_postgres::Error) -> Self {
         ManualBackendError::Db(err)
+    }
+}
+
+impl From<sql::QuiesceError> for ManualBackendError {
+    fn from(err: sql::QuiesceError) -> Self {
+        match err {
+            sql::QuiesceError::Db(err) => ManualBackendError::Db(err),
+            sql::QuiesceError::Staging(err) => ManualBackendError::Staging(err),
+            sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
+                ManualBackendError::DefinitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::BackfillsPending { tables, waited } => {
+                ManualBackendError::PendingBackfillTimeout { tables, waited }
+            }
+        }
     }
 }
 
@@ -766,31 +789,6 @@ impl ManualBackend {
             eprintln!("generative: noise statement {sql:?} failed (expected/ignored): {err:?}");
         }
     }
-
-    /// Polls every installed definition's status
-    /// (`transform_definitions.status`) until each has reached a terminal
-    /// backfill outcome (`live`/`quarantined`) or `timeout` elapses —
-    /// delegates to the shared [`sql::await_definitions_settled`]. See that
-    /// function's doc comment for why this closes a real gap in
-    /// [`ManualBackend::quiesce`] (public-api-design review): a direct-build
-    /// 1-1 definition's backfill runs through the engine's own `defs::chunk_queue`
-    /// durable claim/execute/finish queue entirely outside the ring
-    /// (docs/decisions/0007's "Backgrounding and resumability" amendment) —
-    /// `await_converged`'s CDC-ring convergence wait has no visibility into
-    /// that queue at all.
-    async fn await_definitions_settled(&self, timeout: Duration) -> Result<(), ManualBackendError> {
-        sql::await_definitions_settled(&self.raw, &self.defs, timeout)
-            .await
-            // Both arms match pre-#166 `ManualBackend` behavior exactly: a
-            // query failure was, and still is, an ordinary `Db` error on
-            // `quiesce`'s `Result` — not a panic.
-            .map_err(|err| match err {
-                sql::DefinitionSettleError::Db(err) => ManualBackendError::Db(err),
-                sql::DefinitionSettleError::Timeout { unsettled, waited } => {
-                    ManualBackendError::DefinitionSettleTimeout { unsettled, waited }
-                }
-            })
-    }
 }
 
 /// How long [`ManualBackend::stop_engine`] waits for the server to release
@@ -1100,7 +1098,8 @@ impl super::Backend for ManualBackend {
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
         // Improvement-plan workstream C, task C1: opt-in per-call timing
-        // around the watermark -> converge round trip, to test the
+        // around the whole quiesce (since #432, the settle and catch-up
+        // waits as well as the watermark -> converge round trip), to test the
         // hypothesis (see `local_docs/generative-suite-improvement-plan.md`)
         // that the convergence property's wall-clock variance is caused by
         // the same ~10s seal age-gate stall suspected in
@@ -1111,21 +1110,14 @@ impl super::Backend for ManualBackend {
         let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
         let start = timing_enabled.then(std::time::Instant::now);
 
-        let token = watermark_token(&self.raw).await?;
-        let result = await_converged(&self.raw, token, QUIESCE_TIMEOUT).await;
+        // Issue #432: definition status, catch-up markers and the ring, in
+        // that order — see `sql::quiesce` for why the order matters.
+        let result = sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await;
 
         if let Some(start) = start {
             eprintln!("QUIESCE_TIMING {}", start.elapsed().as_millis());
         }
-        result?;
-
-        // public-api-design review gap: ring convergence alone says nothing
-        // about a still-backgrounded direct-build backfill (docs/decisions/0007's
-        // amendment) — see `await_definitions_settled`'s own doc comment for
-        // why this second wait is load-bearing, not redundant.
-        self.await_definitions_settled(QUIESCE_TIMEOUT).await?;
-
-        Ok(())
+        Ok(result?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, ManualBackendError> {

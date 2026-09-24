@@ -24,6 +24,7 @@ use trellis::dev::defs::TransformStatus;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
+use trellis::dev::staging::{StagingError, await_converged, watermark_token};
 
 use crate::model::{Column, Op, Relationship, Table};
 
@@ -509,24 +510,45 @@ pub(super) async fn read_aggregate_table(
     Ok(result)
 }
 
-/// Why [`await_definitions_settled`] gave up.
+/// Why [`quiesce`] gave up.
 #[derive(Debug)]
-pub(super) enum DefinitionSettleError {
-    /// The status query itself failed — a dropped connection, a catalog
-    /// table that isn't there. Propagated, deliberately not panicked on:
-    /// pre-#166 `ManualBackend::await_definitions_settled` surfaced this as
-    /// `ManualBackendError::Db` through `Backend::quiesce`'s `Result`, and
-    /// the proptest-driven harness above it (`run::check_program`'s callers)
-    /// depends on that — a structured, shrinkable failure rather than an
-    /// unwind from inside the settle loop.
+pub(super) enum QuiesceError {
+    /// A status or marker query itself failed — a dropped connection, a
+    /// catalog table that isn't there. Propagated, deliberately not panicked
+    /// on: the proptest-driven harness above `Backend::quiesce`
+    /// (`run::check_program`'s callers) depends on a structured, shrinkable
+    /// failure rather than an unwind from inside a wait loop.
     Db(tokio_postgres::Error),
-    /// The wait timed out: `unsettled` names every target table
-    /// (`def.target`) whose `transform_definitions.status` never reached a
-    /// terminal backfill outcome within `waited`.
-    Timeout {
+    /// The ring's own wait failed: taking the watermark token, or
+    /// [`await_converged`] (a query failure or its named
+    /// `ConvergenceTimeout`).
+    Staging(StagingError),
+    /// `unsettled` names every target table (`def.target`) whose
+    /// `transform_definitions.status` hadn't reached a terminal backfill
+    /// outcome when the budget ran out after `waited`.
+    DefinitionsUnsettled {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// `tables` names every table that still had an undischarged
+    /// `pending_backfill` (catch-up) marker when the budget ran out after
+    /// `waited`.
+    BackfillsPending {
+        tables: Vec<String>,
+        waited: Duration,
+    },
+}
+
+impl From<tokio_postgres::Error> for QuiesceError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        QuiesceError::Db(err)
+    }
+}
+
+impl From<StagingError> for QuiesceError {
+    fn from(err: StagingError) -> Self {
+        QuiesceError::Staging(err)
+    }
 }
 
 /// The target tables of every `defs` entry whose current
@@ -569,35 +591,124 @@ async fn unsettled_definitions(
     Ok(unsettled)
 }
 
-/// Polls every entry in `defs` until each has reached a terminal backfill
-/// outcome (`live`/`quarantined`) or `timeout` elapses — see
-/// `ManualBackend::await_definitions_settled`'s former doc comment (git
-/// history) for why this closes a real gap in ring-only convergence
-/// waiting (a direct-build 1-1 definition's backfill runs entirely outside
-/// the ring).
-pub(super) async fn await_definitions_settled(
+/// Every table with an undischarged `pending_backfill` (catch-up) marker in
+/// this instance's schema (the raw session's `search_path`). All of them,
+/// not only the ones `defs` names: any marker is engine work that can still
+/// re-derive a target, and the engine discharges every marker on its own
+/// while it runs.
+async fn pending_backfills(
     raw: &tokio_postgres::Client,
-    defs: &[TransformDef],
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(raw
+        .query(
+            "select table_name from pending_backfill order by table_name",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// Polls `probe` until it returns an empty list or `started + timeout`
+/// passes, returning the last non-empty list and the time waited on timeout.
+async fn poll_until_empty<F, Fut>(
+    started: Instant,
     timeout: Duration,
-) -> Result<(), DefinitionSettleError> {
+    mut probe: F,
+) -> Result<Result<(), (Vec<String>, Duration)>, tokio_postgres::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, tokio_postgres::Error>>,
+{
     const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
 
-    let started = Instant::now();
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        let unsettled = unsettled_definitions(raw, defs)
-            .await
-            .map_err(DefinitionSettleError::Db)?;
-        if unsettled.is_empty() {
-            return Ok(());
+        let found = probe().await?;
+        if found.is_empty() {
+            return Ok(Ok(()));
         }
         let waited = started.elapsed();
         if waited >= timeout {
-            return Err(DefinitionSettleError::Timeout { unsettled, waited });
+            return Ok(Err((found, waited)));
         }
         tokio::time::sleep(backoff.min(timeout - waited)).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Waits, within one `timeout` budget, until the engine has no work left
+/// that could still change a target (issue #432). Shared by both backends'
+/// `Backend::quiesce`.
+///
+/// Three kinds of pending work, each invisible to the others' waits:
+///
+/// - **A definition still building.** A direct-build definition's backfill
+///   runs through `defs::chunk_queue`, entirely outside the ring
+///   (docs/decisions/0007's amendment), and a marker-driven one sits in
+///   `waiting_to_backfill`/`backfilling` until its enumeration commits. Only
+///   `transform_definitions.status` shows either.
+/// - **An undischarged catch-up marker.** A definition going live parks a
+///   `pending_backfill` marker for its source (and, when something reads it,
+///   its target) in the same transaction as the flip, so a `live` status says
+///   nothing about whether that catch-up has run. The marker's discharge
+///   commits its enumeration and deletes the marker together.
+/// - **Staged rows not yet drained.** [`await_converged`] against a token
+///   taken after the mutations of interest.
+///
+/// The order is what makes this sound. Status first, then markers, then the
+/// ring: by the time no definition is building and no marker is left, every
+/// enumeration those produced has committed its `Recompute` rows to the
+/// ring, and those rows carry a NULL `origin_lsn`, which gates *any* token.
+/// So the convergence wait, started only then, covers them. Run the other
+/// way around (as it was before #432), the ring wait can pass on an empty
+/// ring before an enumeration appends to it, and the status wait then
+/// returns the moment the definition flips `live` with its rows still
+/// undrained, or with its catch-up marker still parked.
+///
+/// After the ring drains, both cheaper checks run once more, and the whole
+/// sequence repeats if either finds work again rather than returning on
+/// stale evidence. A marker can appear after its definition is already
+/// `live`: a stale chunk given up after a rebuild went live parks one
+/// (`defs::chunk_queue`), and `intake::publication::mark_definitions_live`
+/// parks its catch-ups in statements that commit after the flip itself.
+pub(super) async fn quiesce(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+    timeout: Duration,
+) -> Result<(), QuiesceError> {
+    let started = Instant::now();
+    loop {
+        poll_until_empty(started, timeout, || unsettled_definitions(raw, defs))
+            .await?
+            .map_err(|(unsettled, waited)| QuiesceError::DefinitionsUnsettled {
+                unsettled,
+                waited,
+            })?;
+        poll_until_empty(started, timeout, || pending_backfills(raw))
+            .await?
+            .map_err(|(tables, waited)| QuiesceError::BackfillsPending { tables, waited })?;
+
+        let token = watermark_token(raw).await?;
+        await_converged(raw, token, timeout.saturating_sub(started.elapsed())).await?;
+
+        let unsettled = unsettled_definitions(raw, defs).await?;
+        let tables = pending_backfills(raw).await?;
+        if unsettled.is_empty() && tables.is_empty() {
+            return Ok(());
+        }
+        // Every wait above checks at least once even with the budget spent,
+        // so without this a state that keeps reappearing would loop forever.
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return Err(if unsettled.is_empty() {
+                QuiesceError::BackfillsPending { tables, waited }
+            } else {
+                QuiesceError::DefinitionsUnsettled { unsettled, waited }
+            });
+        }
     }
 }
 
@@ -656,5 +767,165 @@ mod tests {
         });
 
         assert_eq!(def.fields[0].expr, expr);
+    }
+
+    // --- `quiesce` (issue #432) ---
+    //
+    // No engine runs in these tests. Each stands the engine's side up by hand
+    // on a second session, in the order the engine itself commits it, so the
+    // interleaving that used to let `quiesce` return early is exact rather
+    // than left to timing. Replication progress is faked far ahead, so the
+    // ring's convergence predicate turns only on what the ring holds.
+
+    const SOURCE: &str = "public.s";
+
+    async fn session(dsn: &str) -> tokio_postgres::Client {
+        let config = trellis::Config::from_dsn(dsn.to_string()).expect("config");
+        let (client, connection) = tokio_postgres::connect(config.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("set search_path to {}, public", config.schema()))
+            .await
+            .expect("set search_path");
+        client
+    }
+
+    /// One definition `t` on `SOURCE`, catalogued with `status`, and the
+    /// harness's view of it.
+    async fn catalog_definition(client: &tokio_postgres::Client, status: &str) -> TransformDef {
+        client
+            .batch_execute(&format!(
+                "insert into replication_progress (slot_name, confirmed_lsn) \
+                     values ('fake', 'FFFFFFFF/FFFFFFFF'); \
+                 insert into source_table_versions (source_table, version) values ('{SOURCE}', 1); \
+                 insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ('public.t', '{SOURCE}', 1, 'TRANSFORM t FROM s SELECT a AS a', '{status}')"
+            ))
+            .await
+            .expect("catalog the definition");
+        parse("TRANSFORM t FROM s SELECT a AS a").expect("parse")
+    }
+
+    /// Stages what an enumeration stages: an image-less `recompute` row,
+    /// NULL `origin_lsn`, in the active slot (`seg_0` on a fresh ring).
+    const STAGE_ENUMERATION: &str =
+        "insert into seg_0 (src_table, key, op) values ('public.s', '1', 'recompute')";
+
+    /// Stands in for the drain: empties the active slot. Returns the instant
+    /// just before it started, so a `quiesce` that waited for it can't have
+    /// returned earlier.
+    async fn drain_ring(client: &tokio_postgres::Client) -> Instant {
+        let drained_at = Instant::now();
+        client
+            .execute("delete from seg_0", &[])
+            .await
+            .expect("drain");
+        drained_at
+    }
+
+    /// A marker-driven build commits its enumeration and only then flips the
+    /// definition `live`, in a later transaction. The ring wait must start
+    /// after the flip, or it passes on an empty ring and the status wait
+    /// returns at the flip with the enumeration still undrained.
+    #[tokio::test]
+    async fn quiesce_drains_an_enumeration_committed_before_its_definition_went_live() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "backfilling").await;
+
+        let engine = session(db.dsn()).await;
+        let engine_side = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            engine.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+            engine
+                .execute("update transform_definitions set status = 'live'", &[])
+                .await
+                .expect("go live");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drain_ring(&engine).await
+        });
+
+        quiesce(&raw, &[def], Duration::from_secs(30))
+            .await
+            .expect("quiesce");
+        let returned_at = Instant::now();
+        let drained_at = engine_side.await.expect("engine side");
+        assert!(
+            returned_at >= drained_at,
+            "quiesce returned before the enumeration staged ahead of the go-live drained"
+        );
+    }
+
+    /// A definition that is already `live` can still have its go-live
+    /// catch-up marker parked. Neither a `live` status nor an empty ring
+    /// says the catch-up has run; only the marker's absence does, and its
+    /// enumeration must then drain too.
+    #[tokio::test]
+    async fn quiesce_waits_for_a_live_definitions_catch_up_marker_and_its_enumeration() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(
+            "insert into pending_backfill (table_name, fence_snapshot) \
+             values ($1, pg_current_snapshot())",
+            &[&SOURCE],
+        )
+        .await
+        .expect("park the catch-up marker");
+
+        let mut engine = session(db.dsn()).await;
+        let engine_side = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // A discharge: the enumeration and the marker's delete commit together.
+            let txn = engine.transaction().await.expect("begin");
+            txn.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+            txn.execute("delete from pending_backfill", &[])
+                .await
+                .expect("discharge");
+            txn.commit().await.expect("commit");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drain_ring(&engine).await
+        });
+
+        quiesce(&raw, &[def], Duration::from_secs(30))
+            .await
+            .expect("quiesce");
+        let returned_at = Instant::now();
+        let drained_at = engine_side.await.expect("engine side");
+        assert!(
+            returned_at >= drained_at,
+            "quiesce returned before the catch-up marker discharged and its enumeration drained"
+        );
+    }
+
+    /// A marker that never discharges is a named timeout, not a hang and not
+    /// a silent success.
+    #[tokio::test]
+    async fn quiesce_names_an_undischarged_catch_up_marker_on_timeout() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(
+            "insert into pending_backfill (table_name, fence_snapshot) \
+             values ($1, pg_current_snapshot())",
+            &[&SOURCE],
+        )
+        .await
+        .expect("park the catch-up marker");
+
+        match quiesce(&raw, &[def], Duration::from_millis(300)).await {
+            Err(QuiesceError::BackfillsPending { tables, .. }) => {
+                assert_eq!(tables, vec![SOURCE.to_string()]);
+            }
+            other => panic!("expected BackfillsPending, got {other:?}"),
+        }
     }
 }
