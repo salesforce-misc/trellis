@@ -1314,8 +1314,9 @@ async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
 
 /// Issue #407 (ADR-0016): a definition whose source's backfill keeps failing
 /// stays `waiting_to_backfill`, and `Trellis::status` says why: the marker's
-/// attempt count, last error and next attempt. Once the cause is fixed, the
-/// next attempt goes through and the failure clears.
+/// attempt count, last error and next attempt. Once the cause is fixed, a
+/// fresh `request_backfill` resets the backoff, the next attempt goes through
+/// and the failure clears.
 #[tokio::test]
 async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     let cluster = TestCluster::start();
@@ -1368,13 +1369,38 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
         "the retry is backed off"
     );
 
-    // Fix the cause, and run the backoff out by hand.
+    // Fix the cause, then ask for a fresh backfill rather than waiting the
+    // backoff out: a new park resets the marker's retry state, so the table
+    // is due at once and `status` stops reporting the old failure while the
+    // marker is still there.
     raw.batch_execute(
         "alter table public.widgets add primary key (id); \
-         update pending_backfill set next_attempt_at = now()",
+         create publication trellis_pub for table public.widgets",
     )
     .await
-    .expect("restore the primary key");
+    .expect("restore the primary key and publish the source");
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("request a fresh backfill");
+    let markers: i64 = raw
+        .query_one(
+            "select count(*) from pending_backfill where table_name = 'public.widgets'",
+            &[],
+        )
+        .await
+        .expect("count markers")
+        .get(0);
+    assert_eq!(markers, 1, "the re-parked marker is still pending");
+    let status = trellis
+        .status("widget_totals")
+        .await
+        .expect("status")
+        .expect("the transform is registered");
+    assert_eq!(
+        status.backfill_failure, None,
+        "a marker with no recorded failure reports none"
+    );
     publication::discharge_registrations(&db.pool)
         .await
         .expect("the retry goes through");
