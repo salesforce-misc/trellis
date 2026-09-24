@@ -577,8 +577,8 @@ impl Trellis {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "select id, name, from_schema, from_table, from_col, to_table, to_col, \
-                 cardinality, created_at \
+                "select id, name, from_schema, from_table, from_col, to_schema, to_table, \
+                 to_col, cardinality, created_at \
                  from relationship_definitions order by id",
                 &[],
             )
@@ -591,10 +591,11 @@ impl Trellis {
                 from_schema: row.get(2),
                 from_table: row.get(3),
                 from_col: row.get(4),
-                to_table: row.get(5),
-                to_col: row.get(6),
-                cardinality: row.get(7),
-                created_at: row.get(8),
+                to_schema: row.get(5),
+                to_table: row.get(6),
+                to_col: row.get(7),
+                cardinality: row.get(8),
+                created_at: row.get(9),
             })
             .collect())
     }
@@ -1410,6 +1411,9 @@ pub struct RelationshipSummary {
     pub from_schema: String,
     pub from_table: String,
     pub from_col: String,
+    /// The schema `to_table` resolved to when the relationship was declared
+    /// (issue #372): the to-side every reader uses.
+    pub to_schema: String,
     pub to_table: String,
     pub to_col: String,
     pub cardinality: String,

@@ -500,7 +500,7 @@ pub(super) struct AggregateTargetPlan {
     pub groups: HashMap<String, GroupPlan>,
     /// The source table's fully-qualified `"schema.table"` identity (issue
     /// #76, ADR-0007) — `super::apply::compute`'s own already-qualified
-    /// `change.src_table`, not the bare `catalog_source_key`. Every probe
+    /// `change.src_table`, never a bare suffix. Every probe
     /// below (`probe_sum_and_count`, `probe_count_star`, `probe_field_value`,
     /// `probe_group_exists`) and bulk-recompute builder
     /// (`apply_forced_groups_bulk`, `probe_recompute_fields_bulk`) reads this
@@ -560,6 +560,10 @@ pub(super) struct AggregateTargetPlan {
 #[derive(Debug, Clone)]
 pub(super) struct RelJoin {
     pub name: String,
+    /// The to-side's qualified `"schema.table"` identity
+    /// ([`crate::defs::RelationshipDefinition::qualified_to_table`], issue
+    /// #372), so the join reads the table the relationship was declared
+    /// against rather than whatever the session's `search_path` finds.
     pub to_table: String,
     pub to_col: String,
     pub from_col: String,
@@ -4690,7 +4694,7 @@ mod tests {
             HashMap::from([("total_words".to_string(), def.fields[1].expr.clone())]),
             vec![RelJoin {
                 name: "post".to_string(),
-                to_table: "posts".to_string(),
+                to_table: "public.posts".to_string(),
                 to_col: "id".to_string(),
                 from_col: "post".to_string(),
             }],

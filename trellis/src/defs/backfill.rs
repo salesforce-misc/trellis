@@ -80,8 +80,7 @@ use crate::staging::target_mutations::TargetMutations;
 use tokio_postgres::GenericClient;
 
 use super::ast::{
-    Expr, GroupByKey, KeySpace, Operator, RelationshipDef, TransformDef, ValueType,
-    group_by_contains,
+    Expr, GroupByKey, KeySpace, Operator, TransformDef, ValueType, group_by_contains,
 };
 use super::ddl::{
     self, PrimaryKeyColumn, avg_sum_column, qualified_target_table, source_primary_key,
@@ -1163,7 +1162,7 @@ fn agg_arg_expr(expr: &Expr) -> &Expr {
 }
 
 /// Every **to-one** relationship `def`'s fields reference, resolved against the
-/// catalog to its stored [`RelationshipDef`] and keyed by relationship name, in
+/// catalog to its stored [`RelationshipDefinition`] and keyed by relationship name, in
 /// sorted order so the emitted JOINs (and therefore the SQL text) are
 /// deterministic. Issue #94: this is what lets an aggregate build join the
 /// to-side before grouping.
@@ -1178,7 +1177,7 @@ async fn resolve_to_one_joins(
     pool: &Pool,
     def: &TransformDef,
     source_table: &str,
-) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
+) -> Result<Vec<(String, RelationshipDefinition)>, BackfillError> {
     let mut found = BTreeMap::new();
     for rel in referenced_relationship_names(def) {
         let reldef = super::catalog::relationship_on_source(pool, source_table, &rel)
@@ -1201,7 +1200,7 @@ fn referenced_relationship_names(def: &TransformDef) -> BTreeSet<String> {
 /// catalog entry (`None` for a name the source declares no relationship by).
 fn to_one_joins(
     found: BTreeMap<String, Option<RelationshipDefinition>>,
-) -> Result<Vec<(String, RelationshipDef)>, BackfillError> {
+) -> Result<Vec<(String, RelationshipDefinition)>, BackfillError> {
     let mut resolved = Vec::with_capacity(found.len());
     for (rel, reldef) in found {
         let Some(reldef) = reldef else {
@@ -1214,7 +1213,7 @@ fn to_one_joins(
                 "an aggregate over a to-many relationship".to_string(),
             ));
         }
-        resolved.push((rel, reldef.def));
+        resolved.push((rel, reldef));
     }
     Ok(resolved)
 }
@@ -1336,15 +1335,24 @@ async fn backfill_aggregate(
     // stored definition that somehow carries one falls back to the ring rather
     // than emitting SQL with different semantics.
     let rel_joins = resolve_to_one_joins(pool, def, source_table).await?;
+    // Issue #372: each to-side is joined by its recorded schema, never
+    // re-resolved through this session's `search_path`.
+    let to_tables: Vec<String> = rel_joins
+        .iter()
+        .map(|(_, reldef)| reldef.qualified_to_table())
+        .collect();
     let joins_sql = super::oracle::to_one_join_clauses(
-        rel_joins.iter().map(|(rel, d)| {
-            (
-                rel.as_str(),
-                d.to_table.as_str(),
-                d.to_col.as_str(),
-                d.from_col.as_str(),
-            )
-        }),
+        rel_joins
+            .iter()
+            .zip(&to_tables)
+            .map(|((rel, reldef), to_table)| {
+                (
+                    rel.as_str(),
+                    to_table.as_str(),
+                    reldef.def.to_col.as_str(),
+                    reldef.def.from_col.as_str(),
+                )
+            }),
         &source,
     );
     // With a join in play every source column must be qualified, or a to-side
@@ -1970,9 +1978,9 @@ async fn backfill_relationship_one_to_one(
             .map_err(map_rel_lookup_err)?;
         found.insert(rel, reldef);
     }
-    let rel_defs: HashMap<String, RelationshipDef> = found
+    let rel_defs: HashMap<String, RelationshipDefinition> = found
         .iter()
-        .filter_map(|(rel, reldef)| Some((rel.clone(), reldef.as_ref()?.def.clone())))
+        .filter_map(|(rel, reldef)| Some((rel.clone(), reldef.clone()?)))
         .collect();
     let rel_cardinality = to_many_cardinalities(found)?;
     let (substituted, leaves) = to_many_leaves(def, &rel_cardinality)?;
@@ -2028,8 +2036,10 @@ async fn backfill_relationship_one_to_one(
                 )
             })
             .collect();
-        let to_table = quote_ident(&reldef.to_table);
-        let to_col = quote_ident(&reldef.to_col);
+        // Issue #372: the to-side the relationship was declared against, not
+        // whichever same-named table this session's `search_path` finds.
+        let to_table = ddl::qualified_source_table(&reldef.qualified_to_table());
+        let to_col = quote_ident(&reldef.def.to_col);
         client
             .batch_execute(&format!("drop table if exists {stage}"))
             .await?;
@@ -2117,7 +2127,7 @@ async fn backfill_relationship_one_to_one(
         .iter()
         .map(|rel| {
             let stage = &rel_stage[rel];
-            let from_col = quote_ident(&rel_defs[rel].from_col);
+            let from_col = quote_ident(&rel_defs[rel].def.from_col);
             format!("left join {stage} on {stage}._k = {source}.{from_col}")
         })
         .collect::<Vec<_>>()

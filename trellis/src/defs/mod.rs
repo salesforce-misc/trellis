@@ -91,8 +91,8 @@ pub use catalog::all_source_tables;
 #[cfg(any(test, feature = "internals"))]
 pub use catalog::{
     RelationshipProjection, create_definition, dependents_of, edges_from, node_for_table,
-    persist_edge, relationship_by_name, relationship_projection, resolve_node,
-    source_table_version, transforms_for_source,
+    persist_edge, relationship_by_name, relationship_projection, relationships_to_table,
+    resolve_node, source_table_version, transforms_for_source,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use ddl::{PrimaryKeyColumn, neighbor_table_name};

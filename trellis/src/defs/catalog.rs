@@ -53,12 +53,12 @@
 //! `def.source`/`def.from_table`/`def.to_table` gets there before either is
 //! ever called). This reaches [`create_relationship`]'s two
 //! `resolve_node_in_txn` calls as well as [`create_definition_inner`]'s,
-//! even though a relationship endpoint's own *persisted* identity
-//! (`relationship_definitions.from_table`/`to_table`) deliberately stays
-//! bare — out of this issue's scope, per ADR-0007's "Scope" section; the
-//! from-side has since gained its resolved schema alongside it
-//! (`from_schema`, issue #285), which is part of a relationship's identity
-//! as of issue #288, while the to-side is still bare — since
+//! even though a relationship endpoint's own *persisted* table name
+//! (`relationship_definitions.from_table`/`to_table`) stays bare as written;
+//! each endpoint has since gained its resolved schema alongside it
+//! (`from_schema`, issue #285, part of a relationship's identity as of issue
+//! #288; `to_schema`, issue #372), and every reader uses those rather than
+//! re-resolving the bare name — since
 //! both resolve into the one shared `schema_nodes` table a dual-role
 //! (transform-and-relationship-endpoint) table must land on consistently
 //! regardless of which grammar referenced it.
@@ -1014,10 +1014,9 @@ pub(crate) async fn complete_direct_backfill(
 /// Every table `def`'s direct build reads, fully qualified, sorted and
 /// deduplicated: its source (`qualified_source`, the persisted
 /// `transform_definitions.source_table`) and the to-side table of every
-/// relationship its fields reference. A to-side is persisted bare, so it is
-/// resolved the way registration resolved it ([`resolve_graph_identity_in_txn`]).
-/// A referenced relationship the source no longer declares contributes
-/// nothing.
+/// relationship its fields reference, as recorded at declaration time
+/// ([`RelationshipDefinition::qualified_to_table`], issue #372). A referenced
+/// relationship the source no longer declares contributes nothing.
 async fn tables_read_by(
     txn: &tokio_postgres::Transaction<'_>,
     def: &TransformDef,
@@ -1033,7 +1032,7 @@ async fn tables_read_by(
         rels.dedup();
         for rel in rels {
             if let Some(reldef) = relationship_by_name_in(txn, schema, table, &rel).await? {
-                tables.push(resolve_graph_identity_in_txn(txn, &reldef.def.to_table).await?);
+                tables.push(reldef.qualified_to_table());
             }
         }
     }
@@ -1178,11 +1177,8 @@ pub(crate) async fn commit_direct_backfill_coverage(
 /// The first clause compares against `transform_definitions.source_table`,
 /// which holds the qualified identity (issue #72). The second joins a
 /// relationship to the definitions over its qualified from-side
-/// (`from_schema || '.' || from_table`, issue #288), but its to-side is still
-/// persisted bare, so it matches `qualified`'s bare table name. Matching the
-/// to-side bare can only ever *widen* a match (two same-named tables in
-/// different schemas both count as "has a reader"), never narrow one — the
-/// conservative direction, pushing toward the always-safe `Clear` side.
+/// (`from_schema || '.' || from_table`, issue #288) and matches its qualified
+/// to-side (`to_schema || '.' || to_table`, issue #372) against `qualified`.
 async fn table_has_other_reader(
     txn: &tokio_postgres::Transaction<'_>,
     qualified: &str,
@@ -1197,7 +1193,7 @@ async fn table_has_other_reader(
                  select 1 from relationship_definitions r \
                  join transform_definitions d \
                    on d.source_table = r.from_schema || '.' || r.from_table \
-                 where r.to_table = split_part($1, '.', 2) and d.id <> $2 \
+                 where r.to_schema || '.' || r.to_table = $1 and d.id <> $2 \
                )",
             &[&qualified, &excluding],
         )
@@ -2077,10 +2073,9 @@ async fn create_definition_inner(
     // the old bare keying protected against only by never distinguishing
     // schemas at all. [`create_relationship`]'s own two `resolve_node_in_txn`
     // calls are qualified the same way (via this same
-    // [`resolve_graph_identity_in_txn`]), even though a relationship
-    // endpoint's own persisted identity (`relationship_definitions.from_table`/
-    // `to_table`) stays bare — out of this issue's scope, ADR-0007's "Scope"
-    // section defers it explicitly — because both call sites resolve into
+    // [`resolve_graph_identity_in_txn`]; a relationship records each
+    // endpoint's resolved schema too, issues #285/#372), because both call
+    // sites resolve into
     // the *same* `schema_nodes` table: a table that's both a transform
     // source/target and a relationship endpoint (the common case ADR-0006's
     // examples all chain off) must land on one node regardless of which
@@ -2454,14 +2449,8 @@ pub async fn create_relationship(
     // at all. Required now that graph keys on qualified identity, so a table
     // that's both a relationship endpoint and a transform source/target (the
     // common case ADR-0006's own examples all chain off) resolves to one
-    // node either way, not two. `relationship_definitions.from_table`/
-    // `to_table` themselves stay bare (`def.from_table`/`def.to_table`,
-    // inserted below) — a relationship endpoint gaining its *own* persisted
-    // qualified identity is explicitly out of this issue's scope (ADR-0007's
-    // "Scope" section: "relationship endpoints... as they gain persisted
-    // identity" is future work) — only the shared `schema_nodes`/
-    // `schema_edges` graph these calls feed needs to agree with the
-    // transform side today.
+    // node either way, not two. The schema half of each resolution is
+    // persisted too (`from_schema`/`to_schema`, below).
     //
     // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
     // this resolution used to run *after* this function's own pg_catalog
@@ -2520,6 +2509,14 @@ pub async fn create_relationship(
         .split_once('.')
         .map(|(schema, _)| schema.to_string())
         .ok_or_else(|| CatalogError::SourceTableNotFound(def.from_table.clone()))?;
+    // Issue #372: the to-side's resolved schema is persisted the same way, so
+    // no later reader re-resolves the bare `to_table` through its own
+    // session's `search_path` and lands on some other schema's same-named
+    // table. The `None` arm is unreachable for the reason given above.
+    let to_schema = qualified_to
+        .split_once('.')
+        .map(|(schema, _)| schema.to_string())
+        .ok_or_else(|| CatalogError::SourceTableNotFound(def.to_table.clone()))?;
 
     // Issue #288: a relationship name is unique per *qualified* from-table,
     // so `shop.posts` may declare an `author` even when `blog.posts` already
@@ -2618,15 +2615,16 @@ pub async fn create_relationship(
     let id: i64 = txn
         .query_one(
             "insert into relationship_definitions
-                (name, from_schema, from_table, from_col, to_table, to_col, definition_text,
-                 cardinality)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
+                (name, from_schema, from_table, from_col, to_schema, to_table, to_col,
+                 definition_text, cardinality)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              returning id",
             &[
                 &def.name,
                 &from_schema,
                 &def.from_table,
                 &def.from_col,
+                &to_schema,
                 &def.to_table,
                 &def.to_col,
                 &source_text,
@@ -2666,6 +2664,7 @@ pub async fn create_relationship(
     Ok(RelationshipDefinition {
         id,
         from_schema,
+        to_schema,
         def,
         cardinality,
         warnings,
@@ -2674,7 +2673,7 @@ pub async fn create_relationship(
 
 /// The columns every relationship read-back below selects, in the order
 /// [`relationship_from_row`] expects them.
-const RELATIONSHIP_READ_COLUMNS: &str = "id, from_schema, definition_text, cardinality";
+const RELATIONSHIP_READ_COLUMNS: &str = "id, from_schema, to_schema, definition_text, cardinality";
 
 /// Rebuilds a [`RelationshipDefinition`] from a row selected with
 /// [`RELATIONSHIP_READ_COLUMNS`]. Re-parses the persisted `definition_text`
@@ -2685,7 +2684,7 @@ const RELATIONSHIP_READ_COLUMNS: &str = "id, from_schema, definition_text, cardi
 fn relationship_from_row(
     row: &tokio_postgres::Row,
 ) -> Result<RelationshipDefinition, CatalogError> {
-    let cardinality_text: String = row.get(3);
+    let cardinality_text: String = row.get(4);
     let cardinality =
         RelationshipCardinality::from_persisted(&cardinality_text).unwrap_or_else(|| {
             panic!(
@@ -2695,7 +2694,8 @@ fn relationship_from_row(
     Ok(RelationshipDefinition {
         id: row.get(0),
         from_schema: row.get(1),
-        def: parse_relationship(row.get(2))?,
+        to_schema: row.get(2),
+        def: parse_relationship(row.get(3))?,
         cardinality,
         // Creation-time guidance, not a fact about the persisted row — see
         // the field's doc comment on [`RelationshipDefinition`].
@@ -2849,29 +2849,30 @@ pub async fn relationship_by_id(
     row.as_ref().map(relationship_from_row).transpose()
 }
 
-/// Every relationship whose `to_table` is `to_table` — the reverse of
-/// [`relationship_by_name`]'s from-side lookup. The staging reverse
-/// recompute (issue #30) uses this to answer "a row in this table just
-/// changed; which relationships point *at* it, so which from-side targets must
-/// re-derive?".
+/// Every relationship whose to-side is the qualified `"schema.table"`
+/// `qualified_to_table` — the reverse of [`relationship_by_name`]'s from-side
+/// lookup. The staging reverse recompute (issue #30) uses this to answer "a
+/// row in this table just changed; which relationships point *at* it, so which
+/// from-side targets must re-derive?".
 ///
-/// `to_table` is still matched bare: a relationship's to-side endpoint is
-/// persisted bare, with no schema of its own recorded (only the from-side
-/// gained one, #285). Each returned relationship does carry its from-side
-/// schema, so whatever a caller does on the from-side
-/// ([`RelationshipDefinition::qualified_from_table`]) reaches the right table.
+/// Matched against each relationship's recorded `to_schema` (issue #372), so a
+/// same-named table in another schema never picks up this one's
+/// relationships. A bare `qualified_to_table` matches nothing.
 pub async fn relationships_to_table(
     pool: &Pool,
-    to_table: &str,
+    qualified_to_table: &str,
 ) -> Result<Vec<RelationshipDefinition>, CatalogError> {
+    let Some((to_schema, to_table)) = qualified_to_table.split_once('.') else {
+        return Ok(Vec::new());
+    };
     let client = pool.get().await?;
     let rows = client
         .query(
             &format!(
                 "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions \
-                 where to_table = $1 order by id"
+                 where to_schema = $1 and to_table = $2 order by id"
             ),
-            &[&to_table],
+            &[&to_schema, &to_table],
         )
         .await?;
     rows.iter().map(relationship_from_row).collect()
@@ -2952,23 +2953,11 @@ pub(crate) async fn resolve_relationships(
             continue;
         };
         let to_table = reldef.def.to_table.clone();
-        // Reviewer follow-up to issue #74 (epic #78's own whole-branch
-        // review, 4th gap): `column_type_oid` below queries `pg_attribute`
-        // straight off this bare `to_table` — a `to_regclass` `search_path`
-        // walk with no fallback, same as `create_relationship`'s own
-        // pg_catalog checks had before [`resolve_relationship_endpoint_in_txn`]
-        // — so a relationship whose bare `TO <table>.id` chains off another
-        // definition's target explicitly qualified into a non-default schema
-        // (issue #76) resolved fine at `create_relationship` time but still
-        // failed here, at calculated-field relationship-path enrichment
-        // resolution (issue #40), as a false
-        // [`ValidationError::UnknownRelationshipColumn`]. Resolved via
-        // [`resolve_relationship_endpoint`] — the pooled counterpart to
-        // [`resolve_relationship_endpoint_in_txn`], same best-effort
-        // fallback-to-bare-on-total-miss behavior — so a genuinely
-        // nonexistent to-table still reports its own precise error out of
-        // `column_type_oid` below, not this resolution's.
-        let query_to_table = resolve_relationship_endpoint(pool, &to_table).await?;
+        // Issue #372: `column_type_oid` below reads the to-side the
+        // relationship was declared against, never the bare `to_table`
+        // re-resolved through this session's `search_path` (which may find a
+        // different same-named table, or none).
+        let query_to_table = reldef.qualified_to_table();
         // Issue #117: a to-side enum column now needs a connection to
         // classify (see `pg_type::value_type_for_oid`'s own doc comment) —
         // acquired once per relationship here rather than per column, since
@@ -3188,16 +3177,12 @@ async fn resolve_relationship_endpoint_in_txn(
 /// [`resolve_relationship_endpoint_in_txn`] — same best-effort resolution
 /// (falls back to `table` unchanged on a total miss, rather than erroring),
 /// via [`resolve_graph_identity`] instead of the txn-scoped
-/// [`resolve_graph_identity_in_txn`]. [`resolve_relationships`] (issue #40's
-/// calculated-field relationship-path enrichment) is the one caller today:
-/// it resolves a relationship's `to_table` before handing it to
-/// [`column_type`], mirroring exactly how [`create_relationship`] resolves
-/// `def.from_table`/`def.to_table` before its own pg_catalog checks
-/// (reviewer follow-up to issue #74, epic #78's own whole-branch review, 4th
-/// gap — see the call site's own comment). `resolve_relationships` runs
-/// entirely on a pooled connection (never inside a catalog-owned
-/// transaction; every caller passes a `&Pool`, not a `Transaction`), so the
-/// pooled resolution is correct here, not the txn one.
+/// [`resolve_graph_identity_in_txn`]. [`relationship_on_source`] is the one
+/// caller: it resolves a caller-supplied bare source the way the
+/// `RELATIONSHIP` statement resolved its from-table. A persisted relationship's
+/// endpoints are never re-resolved through here; each carries its recorded
+/// schema ([`RelationshipDefinition::qualified_from_table`]/
+/// [`RelationshipDefinition::qualified_to_table`], issues #288/#372).
 async fn resolve_relationship_endpoint(pool: &Pool, table: &str) -> Result<String, CatalogError> {
     match resolve_graph_identity(pool, table).await {
         Ok(qualified) => Ok(qualified),
@@ -4694,7 +4679,7 @@ async fn widen_relationship_projections_for_definition_in_txn(
     for (rel, columns) in columns_by_rel {
         let Some(row) = txn
             .query_opt(
-                "select id, to_table, to_col, cardinality from relationship_definitions \
+                "select id, to_schema, to_table, to_col, cardinality from relationship_definitions \
                  where from_schema = $1 and from_table = $2 and name = $3",
                 &[&source_schema, &source_table, &rel],
             )
@@ -4703,14 +4688,18 @@ async fn widen_relationship_projections_for_definition_in_txn(
             continue;
         };
         let relationship_id: i64 = row.get(0);
-        let to_table: String = row.get(1);
-        let to_col: String = row.get(2);
-        let cardinality_text: String = row.get(3);
+        let to_schema: String = row.get(1);
+        let to_table: String = row.get(2);
+        let to_col: String = row.get(3);
+        let cardinality_text: String = row.get(4);
         if cardinality_text != RelationshipCardinality::ToOne.as_str() {
             continue;
         }
 
-        let qualified_to = resolve_relationship_endpoint_in_txn(txn, &to_table).await?;
+        // Issue #372: the to-side the relationship was declared against, not
+        // a re-resolution of the bare name through this session's
+        // `search_path`.
+        let qualified_to = format!("{to_schema}.{to_table}");
         let to_col_pg_type = column_type_in_txn(txn, &qualified_to, &to_table, &to_col).await?;
 
         ensure_relationship_projection_in_txn(
@@ -5621,9 +5610,10 @@ pub async fn definition_by_target(
 /// **Untouched by issue #74.** This function never reads `schema_nodes`/
 /// `schema_edges` at all — it scans `transform_definitions`/
 /// `relationship_definitions` directly, matching `upstream_table` against
-/// `def.source` (freshly re-parsed, always bare) and `relationship_definitions`'
-/// bare `to_table`, both already-bare-and-self-consistent inputs the
-/// qualified graph never enters. `upstream_table` itself stays bare for the
+/// `def.source` (freshly re-parsed, always bare) and the bare `to_table` of
+/// every relationship whose recorded to-side is a definition's target (issue
+/// #372), both already-bare-and-self-consistent inputs the qualified graph
+/// never enters. `upstream_table` itself stays bare for the
 /// same `column_status`-addressing reasons the `target` column below does
 /// (see this function's own inline comment on that `select`).
 ///
@@ -5716,8 +5706,12 @@ async fn column_dependents_via(
         .await?;
     let rel_rows = client
         .query(
-            "select from_schema || '.' || from_table, name, to_table \
-             from relationship_definitions",
+            "select r.from_schema || '.' || r.from_table, r.name, r.to_table \
+             from relationship_definitions r \
+             where exists ( \
+                 select 1 from transform_definitions d \
+                 where d.target_table = r.to_schema || '.' || r.to_table \
+             )",
             &[],
         )
         .await?;
@@ -5725,6 +5719,12 @@ async fn column_dependents_via(
     // Keyed by the relationship's qualified from-table (issue #288): a
     // relationship name is unique only per qualified from-table, so the bare
     // `(from_table, name)` pair could name two different relationships.
+    //
+    // Only relationships whose recorded to-side (issue #372) *is* some
+    // definition's target are kept: `upstream_table` is always a bare target
+    // name, and bare target suffixes are unique, so the bare `to_table` match
+    // below is then exact. Without the filter, a relationship pointing at a
+    // same-named non-target table in another schema would match too.
     let mut rel_to_table: HashMap<(String, String), String> = HashMap::new();
     for row in rel_rows {
         let qualified_from: String = row.get(0);

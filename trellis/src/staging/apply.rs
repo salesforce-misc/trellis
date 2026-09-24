@@ -416,58 +416,6 @@ impl From<crate::error::Error> for ApplyError {
 // src_table qualification
 // ---------------------------------------------------------------------
 
-/// The catalog's lookup key for a folded record's `src_table`: everything
-/// after the last `.`, if any.
-///
-/// A definition's `def.source` is always a *bare* table name — even once
-/// issue #76 taught the grammar's `TRANSFORM ... FROM <table>` clause an
-/// explicit `schema.table` spelling, `def.source` itself still only ever
-/// holds the bare table part (see `defs::ast::TransformDef`'s own doc
-/// comment for why; `defs::parser`'s grammar and `defs/mod.rs`'s own tests
-/// cover both the bare and explicitly-qualified parses). CDC intake's
-/// own producer, though, always stages changes under the qualified
-/// `"schema.table"` shape `intake::publication::qualify` builds, which
-/// [`FoldedChange::src_table`] inherits directly from the ring. This is the
-/// one seam that reconciles the two conventions: strip a schema prefix
-/// before ever asking the catalog about a folded record's source.
-///
-/// Note this produces a *bare* key even though, as of issue #72,
-/// `transform_definitions.source_table`/`source_table_versions.source_table`
-/// themselves persist the fully-qualified form. Issue #380 moved `by_source`,
-/// `ApplyPlan::versions` and [`crate::defs::source_table_version`] off this
-/// bare key and onto the canonical qualified identity
-/// ([`quarantine::CanonicalSrcTables`]), because a bare key merges same-named
-/// tables in different schemas. What is left keyed on it is
-/// `relationships_to_table`, whose `to_table` is still bare (#372).
-///
-/// Since issue #267 this module no longer *emits* a bare `src_table` at all:
-/// every row it stages carries a qualified identity, so as a matter of fact
-/// this function now only ever sees a dotted name and its strip is a stable
-/// suffix extraction rather than a conditional one. It is kept as a strip
-/// regardless, for two reasons. Ring rows are durable — a segment staged
-/// before the upgrade can still be drained after it — and the *fixtures* in
-/// this crate's own integration tests stage bare names by hand
-/// (`tests/claims.rs`, `tests/converge.rs`, `tests/liveness.rs`,
-/// `tests/app_converge.rs`, and others), which readers are expected to keep
-/// tolerating. Note what #267 *did* change is narrower than "always
-/// qualified everywhere": [`crate::defs::ddl::neighbor_table_name`] still
-/// deliberately returns a bare `def.target`, and this module still keys its
-/// own in-memory bookkeeping (`ApplyPlan::targets` and friends) on that bare
-/// name. Only the string that crosses into the ring is canonicalized.
-///
-/// This function's output stays purely a *lookup key* (issue #76's own
-/// reviewer follow-up). The *physical* SQL builders that actually read a live
-/// source row (`ddl::source_primary_key`, [`read_live_rows_batch`], the source
-/// string embedded in an [`AggregateTargetPlan`]) use the qualified
-/// `change.src_table` each bucket's own changes already carry instead — see
-/// `compute`'s `by_source` loop — never this bare key.
-fn catalog_source_key(src_table: &str) -> &str {
-    match src_table.rsplit_once('.') {
-        Some((_, table)) => table,
-        None => src_table,
-    }
-}
-
 /// Resolves `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
 /// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a
@@ -492,9 +440,9 @@ fn catalog_source_key(src_table: &str) -> &str {
 /// function's output is now what those rows carry into the ring in the first
 /// place, so a bare `src_table` reaching `compute` is no longer something
 /// this module itself produces. See [`accumulate_from_side_recomputes`] for
-/// the emission site, and
-/// [`catalog_source_key`] for why the reading side still tolerates a bare
-/// name anyway.
+/// the emission site. The reading side still tolerates a bare name anyway:
+/// ring rows are durable, and this crate's integration-test fixtures stage
+/// bare names by hand.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
@@ -1156,7 +1104,10 @@ pub(crate) async fn build_relationship_context(
         };
         let from_col = reldef.def.from_col.clone();
         let to_col = reldef.def.to_col.clone();
-        let to_table = reldef.def.to_table.clone();
+        // Issue #372: the to-side the relationship was declared against, quoted
+        // for interpolation and `to_regclass`, never the bare `to_table`
+        // re-resolved through this session's `search_path`.
+        let to_table = ddl::qualified_source_table(&reldef.qualified_to_table());
 
         // The join keys we need on the to-side: the distinct non-NULL
         // `from_col` values of the from-side rows this batch evaluates.
@@ -1670,7 +1621,7 @@ async fn build_reverse_relationship_shape(
         None => {
             tracing::error!(
                 relationship = %rel.def.name,
-                to_table = %rel.def.to_table,
+                to_table = %rel.qualified_to_table(),
                 "to-one relationship has no settled parent projection; every \
                  reverse record for it will be treated as an ordering-check \
                  miss (should be unreachable — #129 creates one unconditionally)"
@@ -1790,7 +1741,7 @@ async fn build_reverse_relationship_shape(
             // join, never a second lookup.
             vec![apply_aggregate::RelJoin {
                 name: rel.def.name.clone(),
-                to_table: rel.def.to_table.clone(),
+                to_table: rel.qualified_to_table(),
                 to_col: rel.def.to_col.clone(),
                 from_col: rel.def.from_col.clone(),
             }],
@@ -2938,7 +2889,8 @@ async fn apply_projection_advance(
 /// that such a to-side row carry no key. To-one relationships get exactly one
 /// row per key (`to_col` is UNIQUE); to-many get the full related set.
 /// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
-/// [`read_live_rows_batch`] uses.
+/// [`read_live_rows_batch`] uses. `to_table` is the to-side's quoted,
+/// qualified name ([`ddl::qualified_source_table`], issue #372).
 async fn fetch_to_side_rows(
     pool: &Pool,
     to_table: &str,
@@ -2950,7 +2902,7 @@ async fn fetch_to_side_rows(
     }
     let client = pool.get().await?;
     let col_ident = quote_ident(to_col);
-    let tbl_ident = quote_ident(to_table);
+    let tbl_ident = to_table;
     let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
     // Issue #248: an explicit per-column `jsonb_build_object`, not
@@ -3007,16 +2959,9 @@ async fn fetch_to_side_rows(
 /// relationship's live to-side table) rather than the projection itself:
 /// `catalog::ensure_relationship_projection_in_txn` creates the projection's
 /// key column with exactly `to_table`'s `to_col` type, so the two always
-/// agree, and `to_table` is a plain bare/qualified table name `to_regclass`
-/// resolves directly — unlike `qualified_projection`, which arrives here
-/// already `quote_ident`-quoted for direct interpolation, not in the shape
-/// `to_regclass` expects for *this* lookup (`to_table`/`key_col` is a
-/// same-named-column shortcut, not a general rule about quoted input:
-/// [`live_row_columns`], just below, binds `qualified_projection` itself as
-/// a `to_regclass` parameter to read the projection's own live columns, and
-/// that works fine — `to_regclass` parses an already-quoted qualified name
-/// exactly like the SQL parser would parse the same text in a `FROM`
-/// clause).
+/// agree. `to_table` is the to-side's quoted, qualified name (issue #372);
+/// `to_regclass` parses an already-quoted qualified name exactly like the SQL
+/// parser would parse the same text in a `FROM` clause.
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
     qualified_projection: &str,
@@ -4760,14 +4705,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // only when some definition on it is 1-1.
         let mut source_row_columns: Option<Vec<String>> = None;
 
-        // `qualified_source` (via `qualified_schema_node_key`), not
-        // `source_key`: `schema_nodes`/`schema_edges` now key on qualified
-        // identity (issue #74, ADR-0007), so `transforms_for_source` (a
-        // thin `dependents_of` wrapper) needs an exact qualified match
-        // here, not the bare catalog-lookup key `catalog_source_key`'s own
-        // doc comment already explains stays bare for
-        // `relationships_to_table` below (still bare-keyed, unaffected by
-        // #74). `qualified_source` is
+        // `qualified_source` (via `qualified_schema_node_key`):
+        // `schema_nodes`/`schema_edges` key on qualified identity (issue #74,
+        // ADR-0007), so `transforms_for_source` (a thin `dependents_of`
+        // wrapper) needs an exact qualified match here. `qualified_source` is
         // usually already fully-qualified (real CDC/backfill), but a
         // downstream-propagation hop's `src_table` is a bare target name
         // this same apply path staged — `qualified_schema_node_key` resolves
@@ -4826,8 +4767,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
-        let inbound_rels =
-            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
+        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
         // Decode each change's pre-image once, reused across every inbound
         // relationship below (the join key lives in the pre-image for a
         // delete/re-parent). Skipped entirely when this table is nobody's
@@ -5340,7 +5280,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     }
                     rel_joins.push(apply_aggregate::RelJoin {
                         name: rel_name.clone(),
-                        to_table: reldef.def.to_table,
+                        to_table: reldef.qualified_to_table(),
                         to_col: reldef.def.to_col,
                         from_col: reldef.def.from_col,
                     });
@@ -5664,8 +5604,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // accumulator the row-driven path uses, so it's deduped the same way
         // (issue #79) and drained through the same image-less `Recompute`
         // pipeline below — no separate emission path needed.
-        let inbound_rels =
-            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
+        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
         for rel in &inbound_rels {
             // Issue #168: for a to-one relationship, the staged recompute
             // above only re-derives the from-side row's enrichment — it

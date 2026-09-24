@@ -275,8 +275,8 @@ async fn target_to_one(client: &Client) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-/// The bare (schema-resolved-via-`search_path`) table name of `relationship_id`'s
-/// settled parent projection (issue #129). Issue #130 (epic #127) moved the
+/// The quoted, schema-qualified table name of `relationship_id`'s settled
+/// parent projection (issue #129), so it never depends on `search_path` order. Issue #130 (epic #127) moved the
 /// forward to-one read off a live to-side lookup onto this projection, but
 /// nothing yet advances a projection row's *data* columns when its
 /// underlying parent changes — that's #131's job, not built yet. This test
@@ -290,7 +290,7 @@ async fn projection_table_name(pool: &trellis::Pool, relationship_id: i64) -> St
         .await
         .expect("read projection catalog row")
         .expect("to-one relationship has a projection")
-        .projection_table
+        .qualified_table()
 }
 
 #[tokio::test]
