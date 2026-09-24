@@ -307,7 +307,7 @@ impl Drop for TestCluster {
         // timeout and then SIGKILLed anyway, about 10s per test. `immediate`
         // still goes through the postmaster, which releases the SysV segment
         // before it exits.
-        let stopped_gracefully = Command::new("pg_ctl")
+        let stopped_via_pg_ctl = Command::new("pg_ctl")
             .arg("stop")
             .arg("-D")
             .arg(&self.data_dir)
@@ -323,11 +323,11 @@ impl Drop for TestCluster {
             .unwrap_or(false);
 
         let server = self.server.get_mut().unwrap_or_else(|e| e.into_inner());
-        if !stopped_gracefully {
-            // The graceful stop timed out; SIGKILL can't clean up, so free the
-            // segment ourselves from the pidfile before it's lost. Log it: a
-            // fallback here is the one leak path teardown *can* see, and a
-            // silent one turns into flaky `initdb` failures later.
+        if !stopped_via_pg_ctl {
+            // `pg_ctl stop` failed or timed out; SIGKILL can't clean up, so
+            // free the segment ourselves from the pidfile before it's lost.
+            // Log it: a fallback here is the one leak path teardown *can*
+            // see, and a silent one turns into flaky `initdb` failures later.
             eprintln!(
                 "testkit: `pg_ctl stop` did not stop postgres cleanly (pid {}); \
                  falling back to SIGKILL and reaping its shmem segment",

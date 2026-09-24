@@ -110,20 +110,7 @@ struct FuzzResult {
 /// would have used.
 const CHUNK_SIZE: i32 = 100;
 
-/// Runs up to `runs` fuzz runs of `design`, in [`CHUNK_SIZE`] chunks.
-///
-/// With `stop_at_first_corruption`, the campaign ends after the first chunk
-/// that corrupts anything. A known-unsound design's only assertion is
-/// `corrupted > 0`, and runs are independent (`reset_world` per run, seed
-/// `seed0 + r`), so the remaining chunks can't change that verdict. They only
-/// cost time. The shipped design always runs every chunk: its assertion is
-/// `corrupted == 0` across all of them.
-async fn run_campaign(
-    client: &Client,
-    design: &str,
-    runs: i32,
-    stop_at_first_corruption: bool,
-) -> FuzzResult {
+async fn run_campaign(client: &Client, design: &str, runs: i32) -> FuzzResult {
     client
         .batch_execute("set search_path to m, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; delete from stats;")
         .await
@@ -147,9 +134,6 @@ async fn run_campaign(
             worst = Some(chunk_worst);
         }
         done += chunk;
-        if stop_at_first_corruption && corrupted > 0 {
-            break;
-        }
 
         // VACUUM can't run inside a transaction block, so it must be its own
         // single-statement message rather than share a `batch_execute` with
@@ -188,7 +172,7 @@ async fn harness_violations(client: &Client) -> i64 {
 /// able to detect the very unsoundness it exists to catch. `false` means the
 /// shipped design -- corrupted must be exactly 0.
 async fn assert_design(client: &Client, design: &str, runs: i32, expect_corruption: bool) {
-    let result = run_campaign(client, design, runs, expect_corruption).await;
+    let result = run_campaign(client, design, runs).await;
 
     let violations = harness_violations(client).await;
     assert_eq!(
@@ -219,10 +203,10 @@ async fn assert_design(client: &Client, design: &str, runs: i32, expect_corrupti
 }
 
 /// Fast lane: runs on every `cargo test`. Cheap enough to pay on every PR
-/// (up to a few hundred runs per design, four designs run side by side),
-/// while still giving real signal: the negative controls (D0/D1/D3) must
-/// still show corruption -- proof the model can detect anything at all --
-/// and the shipped design (D5) must still show none across every run.
+/// (a few hundred runs per design, four designs run side by side), while
+/// still giving real signal: the negative controls (D0/D1/D3) must still
+/// show corruption -- proof the model can detect anything at all -- and the
+/// shipped design (D5) must still show none.
 ///
 /// Deliberately does NOT include the guard-ablation designs (D5-a..D5-d):
 /// see the module docs and
@@ -244,9 +228,19 @@ async fn campaign_fast_lane_confirms_the_shipped_design_and_negative_controls() 
 /// at the same time, each against its own isolated database with its own copy
 /// of the model. A campaign is one long single-connection PL/pgSQL loop, so
 /// running the designs one after another left all but one core idle. Every
-/// design's result is independent of the others (the model lives entirely in
-/// its database's `m` schema, and a run's outcome depends only on its seed),
-/// so running them side by side changes the wall clock, not the verdicts.
+/// design's result is independent of the others: the model lives entirely in
+/// its own database's `m` schema, and nothing a campaign does in one database
+/// is visible to another. A campaign's corruption count is deterministic for a
+/// given design on a fresh database, though not purely a function of the
+/// seeds: the model picks rows with `order by random()`, so the physical row
+/// order a table's history leaves behind feeds into which row is chosen.
+///
+/// Every design runs every run, controls included. The controls' own verdict
+/// (`corrupted > 0`) could stop at the first corrupting chunk, but the harness
+/// self-check (`HARNESS_VIOLATION_unstaged_below_watermark == 0`) is asserted
+/// across every run of every design, and stopping early would quietly shrink
+/// that coverage. It would not save wall-clock time either: D5 must run every
+/// run regardless, and the campaigns run side by side.
 async fn assert_designs_concurrently(cluster: &TestCluster, designs: &[(&str, bool)], runs: i32) {
     let mut campaigns = tokio::task::JoinSet::new();
     for &(design, expect_corruption) in designs {
