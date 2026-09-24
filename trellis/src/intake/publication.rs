@@ -1049,14 +1049,8 @@ pub(crate) async fn run_pending_backfills_until(
     let (now, intake_timeout) = match latest_fresh_fence {
         Some(fence) => {
             let now = fresh_fences_settled(client, fence, catch_up_timeout, stop).await?;
-            // A fence wait that ran out has spent the pass's one timeout, so
-            // an enumeration that isn't caught up at once defers instead of
-            // waiting again (see `fresh_fences_settled`).
-            let intake_timeout = if now.settled_since(fence) {
-                catch_up_timeout
-            } else {
-                Duration::ZERO
-            };
+            let intake_timeout =
+                intake_wait_after_fence_wait(now.settled_since(fence), catch_up_timeout);
             (now, intake_timeout)
         }
         None => (current_snapshot(client).await?, catch_up_timeout),
@@ -1170,6 +1164,20 @@ async fn fresh_fences_settled(
             return Ok(now);
         }
         tokio::time::sleep(CATCH_UP_POLL).await;
+    }
+}
+
+/// How long the pass's intake waits may run after its fence wait
+/// ([`fresh_fences_settled`]): the full `catch_up_timeout` if the fences
+/// settled, and nothing if the wait ran out (or `stop` ended it). A fence wait
+/// that ran out has spent the pass's one timeout, so an enumeration that
+/// intake hasn't already caught up with defers at once instead of stalling
+/// the maintenance loop for a second timeout.
+fn intake_wait_after_fence_wait(fences_settled: bool, catch_up_timeout: Duration) -> Duration {
+    if fences_settled {
+        catch_up_timeout
+    } else {
+        Duration::ZERO
     }
 }
 
@@ -2050,6 +2058,15 @@ mod tests {
             Err(IntakeError::InvalidSnapshot(text)) => assert_eq!(text, "not-a-snapshot"),
             other => panic!("expected InvalidSnapshot, got {other:?}"),
         }
+    }
+
+    /// Issue #431 review: a pass lets at most one wait run out, so a fence
+    /// wait that ran out leaves the intake waits nothing.
+    #[test]
+    fn a_fence_wait_that_ran_out_leaves_the_intake_waits_no_time() {
+        let timeout = Duration::from_secs(5);
+        assert_eq!(intake_wait_after_fence_wait(true, timeout), timeout);
+        assert_eq!(intake_wait_after_fence_wait(false, timeout), Duration::ZERO);
     }
 
     #[test]
@@ -3152,13 +3169,12 @@ mod catch_up_tests {
         );
     }
 
-    /// Issue #431 review: the maintenance loop seals nothing while a pass
-    /// waits, so a pass lets at most one wait run out. Here a long
-    /// transaction holds a fresh fence past the timeout, and an older marker
+    /// Issue #431 review, wired end to end: a long transaction holds a fresh
+    /// fence, `stop` ends that wait (its first call), and an older marker
     /// that has settled needs an enumeration intake never catches up with.
-    /// That enumeration must defer at once rather than wait a second
-    /// timeout. The bound on elapsed time leaves half a timeout of slack
-    /// either way: the bug this guards against takes twice the timeout.
+    /// That enumeration must defer at once, consulting `stop` once, rather
+    /// than wait out the 600s timeout. No wall-clock bound: the outer
+    /// timeout only turns the bug into a failure instead of a hang.
     #[tokio::test]
     async fn a_pass_whose_fence_wait_runs_out_does_not_wait_on_intake_too() {
         let cluster = testkit::TestCluster::start();
@@ -3198,23 +3214,25 @@ mod catch_up_tests {
         let mut holder = connect(&db).await;
         let (_long, _) = open_writer(&mut holder).await;
 
-        let timeout = Duration::from_secs(3);
-        let started = std::time::Instant::now();
-        run_pending_backfills_until(
-            &mut client,
-            "wake",
-            &StagedWatermark::new(),
-            timeout,
-            &|| false,
+        let stops = AtomicUsize::new(0);
+        let stop_the_fence_wait_only = || stops.fetch_add(1, Ordering::Relaxed) == 0;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_pending_backfills_until(
+                &mut client,
+                "wake",
+                &StagedWatermark::new(),
+                Duration::from_secs(600),
+                &stop_the_fence_wait_only,
+            ),
         )
         .await
+        .expect("a's enumeration defers without waiting on intake")
         .expect("discharge pass");
-        let elapsed = started.elapsed();
-
-        assert!(elapsed >= timeout, "b's fresh fence waited out the timeout");
-        assert!(
-            elapsed < timeout + timeout / 2,
-            "a's enumeration deferred without a second wait (took {elapsed:?})"
+        assert_eq!(
+            stops.load(Ordering::Relaxed),
+            2,
+            "one call ends the fence wait, one is the intake wait's single check"
         );
         let markers: i64 = client
             .query_one("select count(*) from pending_backfill", &[])
