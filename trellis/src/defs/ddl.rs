@@ -1406,11 +1406,17 @@ fn quote_qualified_ident(qualified: &str) -> String {
     }
 }
 
-/// Creates `def`'s neighbor target table (idempotent: `create table if not
-/// exists`) with `pk` as its primary key and one column per calculated
-/// field, typed per that field's inferred [`ValueType`] (`numeric`, `text`,
-/// or `boolean`). `source_columns` is the same source-column-to-[`ValueType`]
-/// map `def` was validated against — needed here to re-derive each field's
+/// Creates `def`'s neighbor target table with `pk` as its primary key and
+/// one column per calculated field — failing if a relation with that name
+/// already exists (issue #440: Trellis never adopts a table it didn't
+/// create). Renders the statement with [`target_table_ddl`] and runs it on
+/// its own connection; `catalog::install_definition` instead runs that
+/// rendered statement inside the transaction that records the definition,
+/// so a failed registration leaves no table behind.
+///
+/// Each calculated field's column is typed per that field's inferred
+/// [`ValueType`] (`numeric`, `text`, or `boolean`). `source_columns` is the
+/// same source-column-to-[`ValueType`] map `def` was validated against — needed here to re-derive each field's
 /// type, since the grammar has no separate "declare a target column's type"
 /// syntax (a field's inferred type *is* its target column's type).
 ///
@@ -1425,6 +1431,7 @@ fn quote_qualified_ident(qualified: &str) -> String {
 /// [`qualified_source_table`]) to introspect a passthrough field's concrete
 /// source column type, rather than the bare `def.source` left to
 /// `search_path`.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn create_target_table(
     pool: &Pool,
     def: &TransformDef,
@@ -1433,6 +1440,22 @@ pub async fn create_target_table(
     source_columns: &HashMap<String, ValueType>,
     source_table: &str,
 ) -> Result<(), DdlError> {
+    let sql = target_table_ddl(pool, def, target_schema, pk, source_columns, source_table).await?;
+    pool.get().await?.batch_execute(&sql).await?;
+    Ok(())
+}
+
+/// Renders [`create_target_table`]'s `create table` statement without
+/// running it. Reads the catalog and `pg_catalog` (relationship metadata, a
+/// passthrough field's concrete source column type) through `pool`.
+pub(crate) async fn target_table_ddl(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    pk: &[PrimaryKeyColumn],
+    source_columns: &HashMap<String, ValueType>,
+    source_table: &str,
+) -> Result<String, DdlError> {
     // Issue #40: a relationship-enriched field's type is the referenced
     // to-side column's type, which `infer_field_types` reads from resolved
     // relationship metadata. Resolve it the same way `create_definition` does
@@ -1474,7 +1497,7 @@ pub async fn create_target_table(
     };
 
     let mut sql = format!(
-        "create table if not exists {} (",
+        "create table {} (",
         qualified_target_table(target_schema, def),
     );
     let pk_cols: Vec<String> = pk
@@ -1506,10 +1529,7 @@ pub async fn create_target_table(
     let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     sql.push_str(&format!(", primary key ({})", pk_names.join(", ")));
     sql.push(')');
-
-    let client = pool.get().await?;
-    client.batch_execute(&sql).await?;
-    Ok(())
+    Ok(sql)
 }
 
 /// Whether `field` is a direct `AVG(...)` call — the shape whose delta
@@ -1661,7 +1681,9 @@ pub(crate) fn count_column_names_from<'a>(
 }
 
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
-/// target table (idempotent, same convention as [`create_target_table`]),
+/// target table (failing if the relation already exists, and rendered by
+/// [`aggregate_target_table_ddl`] — same convention as
+/// [`create_target_table`]),
 /// whose key is the composite tuple of grouping columns rather than a single
 /// column inherited from the source — a `GROUP BY` target has no single
 /// source row to inherit a key from; the group itself is the key.
@@ -1705,14 +1727,32 @@ pub(crate) fn count_column_names_from<'a>(
 /// # Panics
 ///
 /// If `def.key_space` is not [`KeySpace::Aggregate`].
+#[cfg(any(test, feature = "test-util"))]
 pub async fn create_aggregate_target_table(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), DdlError> {
+    let sql = aggregate_target_table_ddl(pool, def, target_schema, source_columns).await?;
+    pool.get().await?.batch_execute(&sql).await?;
+    Ok(())
+}
+
+/// Renders [`create_aggregate_target_table`]'s `create table` statement
+/// without running it (see [`target_table_ddl`]).
+///
+/// # Panics
+///
+/// If `def.key_space` is not [`KeySpace::Aggregate`].
+pub(crate) async fn aggregate_target_table_ddl(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<String, DdlError> {
     let KeySpace::Aggregate { group_by } = &def.key_space else {
-        panic!("create_aggregate_target_table called on a non-aggregate definition");
+        panic!("aggregate_target_table_ddl called on a non-aggregate definition");
     };
 
     // Substitute cross-field-alias references (e.g. `total2 = total` where
@@ -1740,7 +1780,7 @@ pub async fn create_aggregate_target_table(
     let field_types = super::validate::infer_field_types(def, source_columns, &relationships)?;
 
     let mut sql = format!(
-        "create table if not exists {} (",
+        "create table {} (",
         qualified_target_table(target_schema, def)
     );
     for (i, key) in group_by.iter().enumerate() {
@@ -1823,10 +1863,7 @@ pub async fn create_aggregate_target_table(
         pk_columns.join(", ")
     ));
     sql.push(')');
-
-    let client = pool.get().await?;
-    client.batch_execute(&sql).await?;
-    Ok(())
+    Ok(sql)
 }
 
 #[cfg(test)]

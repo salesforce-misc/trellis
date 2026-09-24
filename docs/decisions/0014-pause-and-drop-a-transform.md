@@ -80,7 +80,9 @@ definition paused. Keeping the derived rows after removing the definition that e
 them has no use we can name, and the paused state already serves it.
 
 Because the target table and its columns are Trellis-owned, dropping them is Trellis's
-to do. Source tables remain user-owned and untouched.
+to do. Source tables remain user-owned and untouched. That ownership holds because
+registration only ever creates a target table: it refuses a transform whose target name
+already names any relation (#440), so a table Trellis later drops is always one it created.
 
 ### Drops go in reverse dependency order — no cascade
 

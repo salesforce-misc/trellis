@@ -215,6 +215,17 @@ pub enum CatalogError {
         /// transaction has no way left to look it up.
         existing: Option<String>,
     },
+    /// Registering this definition would create its target table, but a
+    /// relation with that qualified name already exists (issue #440): a user
+    /// table, view, materialized view, foreign table, or another Trellis
+    /// definition's target. Trellis never adopts a table it didn't create —
+    /// the user's schema belongs to the user (ADR-0005), and `DROP` drops a
+    /// definition's target (ADR-0014), so adopting a user table would hand
+    /// that table to a later `DROP`.
+    TargetTableExists {
+        /// The qualified `schema.table` spelling that already exists.
+        table: String,
+    },
     /// An aggregate (`GROUP BY`) definition (issue #47) was rejected because
     /// its source table's replica identity doesn't guarantee the old row
     /// image the delta-maintenance path (`apply_aggregate.rs`) needs on
@@ -378,6 +389,7 @@ impl CatalogError {
             // definition's own text — the same category
             // `ValidationError::DuplicateRelationshipName` reports.
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
+            CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
             CatalogError::ReplicaIdentityRequired(err) => err.code(),
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => ErrorCode::Validation,
@@ -446,6 +458,12 @@ impl fmt::Display for CatalogError {
                  \"{requested}\", but another definition was concurrently created under the \
                  same bare table name — two definitions cannot share a bare target-table \
                  name under different schemas"
+            ),
+            CatalogError::TargetTableExists { table } => write!(
+                f,
+                "target table \"{table}\" already exists; Trellis only writes to target tables \
+                 it creates, so choose a different target name or drop or rename the existing \
+                 relation"
             ),
             CatalogError::ReplicaIdentityRequired(err) => write!(f, "{err}"),
             CatalogError::SourceNotChangeKeyed { source_table } => write!(
@@ -546,6 +564,7 @@ impl std::error::Error for CatalogError {
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
+            CatalogError::TargetTableExists { .. } => None,
             CatalogError::ReplicaIdentityRequired(err) => Some(err),
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::RelationshipEndpointNotChangeKeyed { .. } => None,
@@ -623,6 +642,7 @@ pub async fn create_definition(
         source_columns,
         TransformStatus::WaitingToBackfill,
         pool.target_schema(),
+        None,
     )
     .await?;
     let mut client = pool.get().await?;
@@ -669,6 +689,7 @@ pub async fn create_definition_without_backfill(
         source_columns,
         TransformStatus::Live,
         pool.target_schema(),
+        None,
     )
     .await
 }
@@ -676,8 +697,14 @@ pub async fn create_definition_without_backfill(
 /// The front door real callers use to stand up a new definition (issue #63
 /// C1): validates it, creates the target table, and records the definition.
 ///
-/// Target-table creation always runs first, unconditionally, because no build
-/// path creates it itself.
+/// **The target table is created in the same transaction that records the
+/// definition (issue #440),** so a registration that fails anywhere leaves
+/// neither a catalog row nor a table behind and can simply be retried. A
+/// relation that already exists under the target's qualified name, of any
+/// kind, is refused with [`CatalogError::TargetTableExists`] and left
+/// untouched: Trellis never adopts a table it didn't create (ADR-0005), since
+/// `DROP` would later drop it (ADR-0014). No build path creates the target
+/// itself.
 ///
 /// **Registration reads no source rows (ADR-0016, issues #418, #419).** Every
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
@@ -757,16 +784,9 @@ pub async fn install_definition(
     // function's DDL step is about to create and the qualified identity
     // `create_definition_inner` persists can never name different schemas.
     //
-    // No matching fail-fast existence check here, unlike the source block
-    // above: this function's own DDL step (just below) is what's about to
-    // *create* the physical target table — checking it exists first would
-    // always fail for exactly the case this is meant to support. The target
-    // still gets validated, just after DDL runs: `create_definition_inner`'s
-    // own copy of this check (its own doc comment on the identically-shaped
-    // block) confirms DDL actually landed the table under this schema, and
-    // is the *only* check the ring-path entry points
-    // ([`create_definition`]/[`create_definition_without_backfill`], whose
-    // callers must have already created the target themselves) ever get.
+    // No matching existence check on the target here: registration is about
+    // to *create* it, and `create_definition_inner` refuses one that already
+    // exists (issue #440) inside the transaction that creates it.
     let target_schema = effective_target_schema(&def, target_schema);
 
     // Issue #76, ADR-0007: resolved once, here, and threaded through every
@@ -779,9 +799,14 @@ pub async fn install_definition(
     reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
 
     // Issue #376: `reject_unkeyed_source` fails fast in both arms, before the
-    // DDL builds a target table a rejected definition would leave behind.
-    // `create_definition_inner` repeats it as the authoritative check.
-    match &def.key_space {
+    // target's DDL is rendered. `create_definition_inner` repeats it as the
+    // authoritative check.
+    //
+    // Only *rendered* here: rendering reads relationship metadata and source
+    // column types through `pool`, but the statement itself runs inside
+    // `create_definition_inner`'s transaction (issue #440), so the table
+    // commits or rolls back together with the catalog row.
+    let target_ddl = match &def.key_space {
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
             // source's in full — at whatever arity the source declares it —
@@ -792,7 +817,7 @@ pub async fn install_definition(
                 .await
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
-            ddl::create_target_table(
+            ddl::target_table_ddl(
                 pool,
                 &def,
                 target_schema,
@@ -801,7 +826,7 @@ pub async fn install_definition(
                 &qualified_source,
             )
             .await
-            .map_err(CatalogError::Ddl)?;
+            .map_err(CatalogError::Ddl)?
         }
         KeySpace::Aggregate { .. } => {
             // Issue #371: live apply reads the source's primary key through
@@ -812,26 +837,27 @@ pub async fn install_definition(
                 .await
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source).await?;
-            ddl::create_aggregate_target_table(pool, &def, target_schema, source_columns)
+            ddl::aggregate_target_table_ddl(pool, &def, target_schema, source_columns)
                 .await
-                .map_err(CatalogError::Ddl)?;
+                .map_err(CatalogError::Ddl)?
         }
-    }
+    };
 
     // ADR-0016 (issues #418, #419): registration reads no source rows. The
     // definition waits for the backfill discharge, which dispatches its build
     // by shape.
     //
-    // `target_schema` — the exact value the DDL step above just created the
-    // physical target table under — is threaded straight through rather than
-    // re-derived from `pool` (issue #73's persisted qualification must never
-    // drift from what the DDL built).
+    // `target_schema` — the exact value the DDL above was rendered under — is
+    // threaded straight through rather than re-derived from `pool` (issue
+    // #73's persisted qualification must never drift from what the DDL
+    // builds).
     create_definition_inner(
         pool,
         source_text,
         source_columns,
         TransformStatus::WaitingToBackfill,
         target_schema,
+        Some(&target_ddl),
     )
     .await
 }
@@ -1880,12 +1906,18 @@ async fn target_column_type_oid_via(
 /// its schema-graph nodes and edge and a `source_table_versions` bump, in one
 /// transaction. Reads the source's catalog shape (its key), never its rows
 /// (ADR-0016, issue #418): whoever builds the target does that later.
+///
+/// `target_ddl` is [`install_definition`]'s rendered `create table` for the
+/// target, run in this same transaction after refusing a target name that
+/// already exists (see [`create_target_in_txn`]). `None` is the test-fixture
+/// entry points' contract: their caller already created the target.
 async fn create_definition_inner(
     pool: &Pool,
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
     status: TransformStatus,
     target_schema: &str,
+    target_ddl: Option<&str>,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     // Issue #40: enrichment fields (`<rel>.<col>`) are validated against
@@ -1995,17 +2027,34 @@ async fn create_definition_inner(
     // there was never an ordering hazard here to begin with; this always ran
     // (and still runs) ahead of the node/cycle checks below.
     let resolved_target_schema = effective_target_schema(&def, target_schema);
-    if let Some(schema) = &def.explicit_target_schema
-        && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
-    {
-        return Err(ValidationError::QualifiedTargetTableNotFound {
-            schema: schema.clone(),
-            table: def.target.clone(),
-        }
-        .into());
-    }
     let qualified_target =
         crate::intake::publication::qualify(resolved_target_schema, &def.target)?;
+    match target_ddl {
+        // Issue #440: registration creates the target here, in the
+        // transaction that records the definition, so every later failure in
+        // this function rolls the table back with the catalog row.
+        Some(ddl) => {
+            create_target_in_txn(
+                &txn,
+                resolved_target_schema,
+                &def.target,
+                &qualified_target,
+                ddl,
+            )
+            .await?;
+        }
+        None => {
+            if let Some(schema) = &def.explicit_target_schema
+                && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
+            {
+                return Err(ValidationError::QualifiedTargetTableNotFound {
+                    schema: schema.clone(),
+                    table: def.target.clone(),
+                }
+                .into());
+            }
+        }
+    }
 
     // Issue #129, epic #127: before this definition is persisted, widen the
     // settled parent projection of every to-one relationship its fields read
@@ -2259,6 +2308,47 @@ async fn create_definition_inner(
         source_table: qualified_source,
         target_table: qualified_target,
     })
+}
+
+/// Creates a definition's target table inside the registration transaction
+/// `txn`, running `ddl` ([`install_definition`]'s rendered `create table`) —
+/// unless a relation named `schema.table` already exists, which is refused
+/// with [`CatalogError::TargetTableExists`] and left untouched (issue #440).
+///
+/// Any relation kind counts (table, view, materialized view, foreign table,
+/// and also an index or sequence, which would collide just the same), and so
+/// does another definition's target: that one is Trellis's own, but it
+/// belongs to that definition, not this one. The check is a clean error for
+/// the common case; a concurrent registration that creates the same name
+/// between the check and the `create table` fails the DDL with
+/// `duplicate_table`, which maps to the same error.
+async fn create_target_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    table: &str,
+    qualified_target: &str,
+    ddl: &str,
+) -> Result<(), CatalogError> {
+    let already_exists = || CatalogError::TargetTableExists {
+        table: qualified_target.to_string(),
+    };
+    let exists: bool = txn
+        .query_one(
+            "select exists (select 1 from pg_catalog.pg_class c              join pg_catalog.pg_namespace n on n.oid = c.relnamespace              where n.nspname = $1 and c.relname = $2)",
+            &[&schema, &table],
+        )
+        .await?
+        .get(0);
+    if exists {
+        return Err(already_exists());
+    }
+    match txn.batch_execute(ddl).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_TABLE) => {
+            Err(already_exists())
+        }
+        Err(err) => Err(CatalogError::Ddl(err.into())),
+    }
 }
 
 /// Whether `err` is a unique-violation against

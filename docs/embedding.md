@@ -29,7 +29,8 @@ trellis.apply("TRANSFORM widget_totals FROM widgets SELECT price + tax AS total"
 
 Defining a transform is cheap wherever it runs. `apply` validates the
 definition, creates the target table, records the transform as
-`waiting_to_backfill`, and returns. It doesn't read the source table's rows and
+`waiting_to_backfill`, and returns. The target name must be free: `apply`
+refuses a transform whose target already exists as any table or view. It doesn't read the source table's rows and
 doesn't touch the replication publication or slot, so it takes the same time
 against an empty table as against a billion-row one. The dedicated worker does
 the rest in the background: it publishes the source, reads its existing rows,

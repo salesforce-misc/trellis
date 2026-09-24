@@ -82,6 +82,13 @@ validates the definition, creates the target table, writes the catalog row as
 `waiting_to_backfill`, and returns. It reads no source rows and makes no
 replication change, so its latency doesn't depend on the table's size.
 
+The table and the catalog row commit in one transaction, so a registration that
+fails leaves neither behind and can be retried as is. If any relation (table,
+view, materialized view, foreign table) already exists under the target's
+qualified name, registration is refused with an error naming it. Trellis never
+adopts a table it didn't create, because `DROP` later drops the target table
+([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)).
+
 ### The four steps
 
 Everything after registration runs in the background, driven by the staging

@@ -191,7 +191,7 @@ async fn target_table_is_created_in_a_configured_non_default_schema() {
 }
 
 #[tokio::test]
-async fn creating_the_target_table_twice_is_a_no_op() {
+async fn creating_the_target_table_twice_fails_rather_than_adopting_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");
@@ -216,7 +216,9 @@ async fn creating_the_target_table_twice_is_a_no_op() {
     )
     .await
     .expect("first create");
-    create_target_table(
+    // Issue #440: Trellis never adopts a table it didn't create, so the DDL
+    // is a plain `create table`, not `create table if not exists`.
+    let err = create_target_table(
         &db.pool,
         &def,
         "public",
@@ -225,7 +227,11 @@ async fn creating_the_target_table_twice_is_a_no_op() {
         &def.source,
     )
     .await
-    .expect("second create is idempotent");
+    .expect_err("a second create must not silently reuse the existing table");
+    assert!(
+        err.to_string().contains("already exists"),
+        "expected Postgres's duplicate-table error, got: {err}"
+    );
 }
 
 #[tokio::test]

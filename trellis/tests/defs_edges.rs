@@ -125,7 +125,6 @@ async fn the_dependency_graph_is_walkable_across_multiple_hops() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "a").await;
-    create_bare_source_table(&db.pool, "b").await;
 
     let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
@@ -323,7 +322,6 @@ async fn a_transitive_table_cycle_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_bare_source_table(&db.pool, "a").await;
-    create_bare_source_table(&db.pool, "b").await;
 
     let b_source_columns = HashMap::from([("price".to_string(), ValueType::Numeric)]);
     create_definition(
