@@ -567,11 +567,10 @@ struct NewImage {
 /// holds the deleted row's lock, so nothing else can have re-created it).
 ///
 /// An aggregate target's key can carry a NULL grouping component (issue
-/// #110's encoding, decoded by `ddl::split_pk_key`). A column that binds a
-/// NULL in this call is matched with `is not distinct from`; every other
-/// column keeps the indexable `=` (the same per-column choice as
-/// `apply_aggregate::keyset_match`). Presence is read off `t.ctid`, since a
-/// key column can itself be NULL on a row that exists.
+/// #110's encoding, decoded by `ddl::split_pk_key`). See
+/// [`new_images_query`] for how those keys are matched without giving up
+/// the index. Presence is read off `t.ctid`, since a key column can itself be
+/// NULL on a row that exists.
 async fn read_new_images(
     txn: &Transaction<'_>,
     target: &str,
@@ -579,36 +578,95 @@ async fn read_new_images(
     feed: &EndpointFeed,
     keys: &BTreeMap<String, KeyMutation>,
 ) -> Result<HashMap<String, NewImage>, ApplyError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let query = new_images_query(target, image_columns, feed, keys)?;
+    let rows = txn.query(&query.sql, &query.params()).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let group_key: Option<Vec<String>> = row.get(2);
+            (
+                row.get(0),
+                NewImage {
+                    image: row.get(1),
+                    group_key: group_key.filter(|values| !values.is_empty()),
+                },
+            )
+        })
+        .collect())
+}
+
+/// [`read_new_images`]' statement and the arrays it binds.
+struct NewImagesQuery<'a> {
+    sql: String,
+    arms: Vec<NullPatternArm<'a>>,
+}
+
+/// The keys of one [`read_new_images`] call whose identity is `NULL` in
+/// exactly the same columns, bound as one `union all` arm.
+#[derive(Default)]
+struct NullPatternArm<'a> {
+    keys: Vec<&'a str>,
+    priors: Vec<Option<&'a str>>,
+    /// One array per identity column that is not `NULL` in this pattern, in
+    /// column order. A `NULL` column binds nothing: the arm matches it with
+    /// `is null`.
+    parts: Vec<Vec<String>>,
+}
+
+impl NewImagesQuery<'_> {
+    /// The bind parameters, in the order `sql` numbers them.
+    fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+        for arm in &self.arms {
+            params.push(&arm.keys);
+            params.push(&arm.priors);
+            for part in &arm.parts {
+                params.push(part);
+            }
+        }
+        params
+    }
+}
+
+/// Builds [`read_new_images`]' statement: one `union all` arm per pattern of
+/// `NULL` identity columns present among `keys` (issue #433), usually just
+/// one. Within an arm a `NULL` column matches with `t.<col> is null` and
+/// every other column with `=`, so each arm probes the target's index.
+///
+/// Matching a whole batch with `is not distinct from` on any column one of
+/// its keys binds a NULL for (the pre-#433 shape) is correct but not
+/// indexable: on a 500k-group aggregate target, a 500-key batch with one
+/// NULL group took 8.5s against 0.4ms without it. This is the same split
+/// `intake::resume_orphans` makes per NULL pattern.
+fn new_images_query<'a>(
+    target: &str,
+    image_columns: &[String],
+    feed: &EndpointFeed,
+    keys: &'a BTreeMap<String, KeyMutation>,
+) -> Result<NewImagesQuery<'a>, ApplyError> {
     let pk = &feed.key_columns;
-    let mut key_texts: Vec<&str> = Vec::with_capacity(keys.len());
-    let mut priors: Vec<Option<&str>> = Vec::with_capacity(keys.len());
-    let mut parts: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(keys.len()); pk.len()];
+    // `pattern[i]`: identity column `i` is NULL.
+    let mut arms: BTreeMap<Vec<bool>, NullPatternArm<'a>> = BTreeMap::new();
     for (key, m) in keys {
         let decoded = ddl::split_pk_key(pk, target, key)?;
-        key_texts.push(key);
-        priors.push(m.prior_image.as_deref());
-        for (column, part) in parts.iter_mut().zip(decoded) {
-            column.push(part.map(|p| p.into_owned()));
+        let pattern: Vec<bool> = decoded.iter().map(Option::is_none).collect();
+        let arm = arms
+            .entry(pattern)
+            .or_insert_with_key(|pattern| NullPatternArm {
+                parts: vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
+                ..NullPatternArm::default()
+            });
+        arm.keys.push(key);
+        arm.priors.push(m.prior_image.as_deref());
+        for (column, part) in arm.parts.iter_mut().zip(decoded.into_iter().flatten()) {
+            column.push(part.into_owned());
         }
     }
 
-    let mut arrays = vec!["$1::text[]".to_string(), "$2::text[]".to_string()];
-    let mut aliases = vec!["key".to_string(), "prior".to_string()];
-    let mut matched = Vec::with_capacity(pk.len());
-    for (i, (column, values)) in pk.iter().zip(&parts).enumerate() {
-        arrays.push(format!("${}::text[]::{}[]", i + 3, column.data_type));
-        aliases.push(pk_keyset_col(i));
-        let op = if values.iter().any(Option::is_none) {
-            "is not distinct from"
-        } else {
-            "="
-        };
-        matched.push(format!(
-            "t.{} {op} k.{}",
-            quote_ident(&column.name),
-            pk_keyset_col(i)
-        ));
-    }
+    let image = row_as_text_jsonb_sql("t", image_columns);
     let group_key_sql = if feed.group_key_columns.is_empty() {
         "null::text[]".to_string()
     } else {
@@ -628,37 +686,49 @@ async fn read_new_images(
             values.join(", ")
         )
     };
-    let sql = format!(
-        "select k.key, \
-                case when t.ctid is null then null \
-                     else ({image})::text end, \
-                {group_key_sql} \
-         from unnest({arrays}) as k({aliases}) \
-         left join {target_ident} t on {matched}",
-        image = row_as_text_jsonb_sql("t", image_columns),
-        arrays = arrays.join(", "),
-        aliases = aliases.join(", "),
-        target_ident = ddl::qualified_target_table_ident(target),
-        matched = matched.join(" and "),
-    );
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&key_texts, &priors];
-    for column in &parts {
-        params.push(column);
-    }
-    let rows = txn.query(&sql, &params).await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let group_key: Option<Vec<String>> = row.get(2);
-            (
-                row.get(0),
-                NewImage {
-                    image: row.get(1),
-                    group_key: group_key.filter(|values| !values.is_empty()),
-                },
+    let target_ident = ddl::qualified_target_table_ident(target);
+    let mut next_param = 1;
+    let mut param = || {
+        let placeholder = format!("${next_param}");
+        next_param += 1;
+        placeholder
+    };
+    let selects: Vec<String> = arms
+        .keys()
+        .map(|pattern| {
+            let mut arrays = vec![
+                format!("{}::text[]", param()),
+                format!("{}::text[]", param()),
+            ];
+            let mut aliases = vec!["key".to_string(), "prior".to_string()];
+            let mut matched = Vec::with_capacity(pk.len());
+            for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
+                let col = quote_ident(&column.name);
+                if null {
+                    matched.push(format!("t.{col} is null"));
+                } else {
+                    arrays.push(format!("{}::text[]::{}[]", param(), column.data_type));
+                    aliases.push(pk_keyset_col(i));
+                    matched.push(format!("t.{col} = k.{}", pk_keyset_col(i)));
+                }
+            }
+            format!(
+                "select k.key, \
+                        case when t.ctid is null then null \
+                             else ({image})::text end, \
+                        {group_key_sql} \
+                 from unnest({}) as k({}) \
+                 left join {target_ident} t on {}",
+                arrays.join(", "),
+                aliases.join(", "),
+                matched.join(" and "),
             )
         })
-        .collect())
+        .collect();
+    Ok(NewImagesQuery {
+        sql: selects.join(" union all "),
+        arms: arms.into_values().collect(),
+    })
 }
 
 /// The current WAL insert position, as this transaction's write token — see
@@ -1033,6 +1103,117 @@ mod tests {
                 Some(r#"{"g": null, "h": null, "total": "30"}"#),
                 Some(r#"{"g": "2", "h": "b", "total": "40"}"#),
             ],
+        );
+    }
+
+    /// Issue #433: a batch of keys that includes NULL grouping components
+    /// still re-reads through the target's `UNIQUE NULLS NOT DISTINCT`
+    /// index, at a single-column and a composite identity. Before the fix,
+    /// one NULL key switched the whole batch's match on that column to `is
+    /// not distinct from`, which can't use the index, so the plan was a
+    /// nested loop over a sequential scan of the target.
+    #[tokio::test]
+    async fn read_new_images_probes_the_index_when_a_batch_binds_a_null() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table single (g int, total int, unique nulls not distinct (g)); \
+                 insert into single select g, g from generate_series(1, 200000) g; \
+                 insert into single values (null, 0); \
+                 analyze single; \
+                 create table composite (g int, h text, total int, \
+                                         unique nulls not distinct (g, h)); \
+                 insert into composite select g, 'k' || g, g from generate_series(1, 200000) g; \
+                 insert into composite values (null, 'k1', 0), (5, null, 0); \
+                 analyze composite;",
+            )
+            .await
+            .expect("seed large aggregate-style targets");
+        let txn = client.transaction().await.expect("begin");
+        // Each table's 500-key batch: its NULL-bearing keys plus plain keys
+        // spread across the table.
+        let cases = [
+            ("public.single", "t.g is null or t.g % 397 = 0"),
+            (
+                "public.composite",
+                "t.g is null or t.h is null or t.g % 397 = 0",
+            ),
+        ];
+        for (table, batch) in cases {
+            let key_columns = ddl::identity_key_columns(&txn, table)
+                .await
+                .expect("identity");
+            let columns = live_row_columns(&txn, table).await.expect("columns");
+            let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
+            let keys: BTreeMap<String, KeyMutation> = txn
+                .query(
+                    &format!(
+                        "select {key_sql} from {table} t where {batch} \
+                         order by t.g nulls first limit 500"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("keys")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get(0),
+                        KeyMutation {
+                            prior_image: None,
+                            hop_gen: 0,
+                            src_changed: None,
+                        },
+                    )
+                })
+                .collect();
+            let feed = EndpointFeed {
+                key_columns,
+                group_key_columns: Vec::new(),
+            };
+            let query = new_images_query(table, &columns, &feed, &keys).expect("query");
+            assert_eq!(keys.len(), 500);
+            assert_eq!(
+                query.arms.len(),
+                if table == "public.single" { 2 } else { 3 },
+                "{table}: one arm per NULL pattern in the batch"
+            );
+            let plan: String = txn
+                .query(&format!("explain {}", query.sql), &query.params())
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan.contains("Index") && !plan.contains("Seq Scan"),
+                "{table}: every arm should probe the identity index, got:\n{plan}"
+            );
+        }
+
+        // The pre-#433 shape over the same single-column batch can only plan
+        // a sequential scan, so the difference above is real.
+        let groups: Vec<Option<String>> = std::iter::once(None)
+            .chain((1..500).map(|i| Some((i * 397).to_string())))
+            .collect();
+        let plan: String = txn
+            .query(
+                "explain select k.c0, t.total from unnest($1::text[]::int[]) as k(c0) \
+                 left join single t on t.g is not distinct from k.c0",
+                &[&groups],
+            )
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Seq Scan"),
+            "the pre-#433 shape should not be able to probe the index, got:\n{plan}"
         );
     }
 }
