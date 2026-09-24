@@ -1002,7 +1002,10 @@ impl Trellis {
     /// [`TransformStatus::WaitingToBackfill`] forever — nothing errors,
     /// nothing looks broken, the pipeline just never starts. `false` here is
     /// that misconfiguration, directly observable rather than inferred from
-    /// a transform that never seems to finish backfilling. See
+    /// a transform that never seems to finish backfilling. It counts drain
+    /// workers only: a fleet missing its staging worker stalls the same way
+    /// and passes this check, which is what
+    /// [`Trellis::has_live_staging_worker`] is for (issue #428). See
     /// `docs/embedding.md`'s health-check section for a worked Phoenix/Rails
     /// example.
     ///
@@ -1023,6 +1026,32 @@ impl Trellis {
     pub async fn has_live_drain_workers(&self) -> Result<bool, TrellisError> {
         let client = self.pool.get().await?;
         Ok(worker_registry::has_live_workers(&**client, DEFAULT_RECLAIM_TTL).await?)
+    }
+
+    /// Whether this instance's staging worker (a connection running with
+    /// `staging: true`) is running anywhere in the fleet right now (issue
+    /// #428) — [`Trellis::has_live_drain_workers`]'s counterpart, and meant
+    /// to sit behind the same timer-driven health check.
+    ///
+    /// **What this detects.** The staging worker captures source changes
+    /// and runs the maintenance loop that dispatches every new transform's
+    /// backfill. A fleet with drain workers but no staging worker passes
+    /// [`Trellis::has_live_drain_workers`] while no change is captured and
+    /// every new transform sits in [`TransformStatus::WaitingToBackfill`]
+    /// forever. `false` here is that misconfiguration. A healthy fleet
+    /// needs both checks to be `true`.
+    ///
+    /// **"Running" means holding the producer singleton**, the
+    /// session-scoped advisory lock the staging worker's intake holds on its
+    /// own connection for as long as it streams (see
+    /// `staging::ProducerSession`). One `pg_locks` read, no
+    /// heartbeat: a crashed worker's connection closes and Postgres frees
+    /// the lock with it. It also reads `false` while a failed intake waits
+    /// to restart (up to a minute between attempts), during which nothing
+    /// is captured either.
+    pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
+        let client = self.pool.get().await?;
+        Ok(crate::staging::session::producer_is_running(&**client, self.config.schema()).await?)
     }
 
     /// A read-your-writes watermark (issue #192): `pg_current_wal_lsn()`,

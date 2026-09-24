@@ -19,7 +19,7 @@
 //! session-scoped advisory lock. The singleton lock must be pinned to one
 //! connection for its whole lifetime, so this opens one directly.
 
-use tokio_postgres::{Client, NoTls, Transaction};
+use tokio_postgres::{Client, GenericClient, NoTls, Transaction};
 
 use super::error::StagingError;
 
@@ -218,6 +218,83 @@ async fn acquire_singleton(client: &Client, schema: &str) -> Result<(), StagingE
         return Err(StagingError::ProducerAlreadyRunning);
     }
     Ok(())
+}
+
+/// Issue #428: whether some session holds `schema`'s producer singleton
+/// right now — that is, whether this instance's staging worker is running.
+/// Intake holds the lock on its own connection for as long as it streams,
+/// and the staging worker's setup holds it before that, so this is true
+/// from before [`crate::client::Client::start`] returns until intake stops.
+/// It goes false while a failed intake waits to restart, which is also a
+/// window in which nothing is captured.
+///
+/// Like the lock, this needs no heartbeat: a crashed worker's connection
+/// closes, and Postgres frees the lock with it.
+pub(crate) async fn producer_is_running(
+    client: &impl GenericClient,
+    schema: &str,
+) -> Result<bool, StagingError> {
+    advisory_lock_held(client, producer_singleton_lock_key(schema)).await
+}
+
+/// Whether any session in this database holds the session-level advisory
+/// lock `key`. `pg_locks` shows a `bigint` key split across `classid` (the
+/// high 32 bits) and `objid` (the low 32), with `objsubid = 1` telling it
+/// apart from the two-`integer` form. `int8` `<<` doesn't check for
+/// overflow, so a negative key round-trips bit for bit. Advisory locks are
+/// per database, so the `database` filter keeps another database's lock
+/// under the same key from counting.
+async fn advisory_lock_held(client: &impl GenericClient, key: i64) -> Result<bool, StagingError> {
+    let held: bool = client
+        .query_one(
+            "select exists(select 1 from pg_locks \
+             where locktype = 'advisory' and granted and objsubid = 1 \
+               and database = (select oid from pg_database where datname = current_database()) \
+               and ((classid::int8 << 32) | objid::int8) = $1)",
+            &[&key],
+        )
+        .await?
+        .get(0);
+    Ok(held)
+}
+
+#[cfg(test)]
+mod lock_probe_tests {
+    use super::*;
+
+    /// Both halves of the key's range: a key with the top bit set is how
+    /// half of all schemas land (`producer_singleton_lock_key` wraps into the
+    /// negative range on purpose), and `pg_locks`' unsigned `oid` halves must
+    /// still reassemble into it.
+    #[tokio::test]
+    async fn advisory_lock_held_sees_positive_and_negative_keys() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let holder = db.pool.get().await.expect("holder connection");
+        let observer = db.pool.get().await.expect("observer connection");
+        for key in [0x0123_4567_89ab_cdef_i64, -0x0123_4567_89ab_cdef_i64, -1] {
+            assert!(
+                !advisory_lock_held(&**observer, key).await.expect("probe"),
+                "{key:#x} is not held yet"
+            );
+            holder
+                .execute("select pg_advisory_lock($1)", &[&key])
+                .await
+                .expect("take the lock");
+            assert!(
+                advisory_lock_held(&**observer, key).await.expect("probe"),
+                "{key:#x} is held by another session"
+            );
+            holder
+                .execute("select pg_advisory_unlock($1)", &[&key])
+                .await
+                .expect("release the lock");
+            assert!(
+                !advisory_lock_held(&**observer, key).await.expect("probe"),
+                "{key:#x} was released"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,7 @@ enum Job {
         oneshot::Sender<Result<Vec<PoisonSample>, TrellisError>>,
     ),
     HasLiveDrainWorkers(oneshot::Sender<Result<bool, TrellisError>>),
+    HasLiveStagingWorker(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
@@ -230,6 +231,13 @@ impl BlockingTrellis {
         self.submit(Job::HasLiveDrainWorkers)
     }
 
+    /// Whether this instance's staging worker is running anywhere in the
+    /// fleet right now — the other half of the health check. See
+    /// [`Trellis::has_live_staging_worker`].
+    pub fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
+        self.submit(Job::HasLiveStagingWorker)
+    }
+
     /// A read-your-writes watermark token. See [`Trellis::watermark_token`].
     pub fn watermark_token(&self) -> Result<PgLsn, TrellisError> {
         self.submit(Job::WatermarkToken)
@@ -381,6 +389,9 @@ async fn run(
             }
             Job::HasLiveDrainWorkers(reply) => {
                 let _ = reply.send(trellis.has_live_drain_workers().await);
+            }
+            Job::HasLiveStagingWorker(reply) => {
+                let _ = reply.send(trellis.has_live_staging_worker().await);
             }
             Job::WatermarkToken(reply) => {
                 let _ = reply.send(trellis.watermark_token().await);

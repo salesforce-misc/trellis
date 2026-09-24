@@ -76,13 +76,13 @@ easy to hit (a deploy config typo, an autoscaler with a bad minimum, a worker
 dyno nobody remembered to add), and hard to notice until someone asks why a
 derived table looks empty or frozen.
 
-### Detecting it: `has_live_drain_workers`
+### Detecting it: `has_live_drain_workers` and `has_live_staging_worker`
 
-`Trellis`/`BlockingTrellis` expose a cheap, single-query health check built
-for exactly this:
+`Trellis`/`BlockingTrellis` expose two cheap, single-query health checks
+built for exactly this, one per kind of worker:
 
 ```rust
-if !trellis.has_live_drain_workers().await? {
+if !trellis.has_live_drain_workers().await? || !trellis.has_live_staging_worker().await? {
     // Every transform in this fleet is at risk of sitting in
     // `WaitingToBackfill` forever — page someone, don't just log it.
 }
@@ -104,13 +104,21 @@ that crashed without a clean shutdown stops counting as live within that
 same window, no separate cleanup pass required. See
 `trellis::staging::worker_registry`'s doc comment for the full mechanism.
 
-**This is a liveness check, not a backlog check.** `true` means at least one
-worker is alive and heartbeating; it says nothing about whether that worker
-is keeping up. It also counts drain workers only. A fleet whose drain workers
-run but whose staging worker doesn't passes this check while every new
-transform stays in `WaitingToBackfill` (a known gap, #428), so a transform
-that never leaves that status is worth alerting on too. Use `Trellis::status`/`Trellis::watermark_token` +
-`await_converged` to reason about an individual transform's own progress.
+`has_live_drain_workers` counts drain workers only, so a fleet whose drain
+workers run but whose staging worker doesn't passes it while no change is
+captured and every new transform stays in `WaitingToBackfill`.
+`has_live_staging_worker` (issue #428) is the check for that half: it asks
+whether some connection holds this instance's producer singleton, the
+session-scoped advisory lock the staging worker's intake holds for as long as
+it streams. It needs no heartbeat, since Postgres frees the lock the moment a
+crashed worker's connection closes. It also reads `false` while a failed
+intake waits to restart (up to a minute between attempts), when nothing is
+captured either.
+
+**These are liveness checks, not backlog checks.** `true` means the worker is
+alive; it says nothing about whether it is keeping up. Use
+`Trellis::status`/`Trellis::watermark_token` + `await_converged` to reason
+about an individual transform's own progress.
 
 ### Wiring it into a host health check
 
@@ -118,8 +126,9 @@ Neither the Ruby nor the Elixir binding exists yet (epic #140 — the
 `Client::start`/`Trellis` shape above is the whole surface today; a binding
 is a thin Rustler/Magnus wrapper over it, per ADR-0010 decision 1). Until
 then, the pattern below is written against the Rust API directly, sized for
-what a binding's eventual `Trellis.has_live_drain_workers?` (Elixir) /
-`Trellis.has_live_drain_workers?` (Ruby) call is expected to wrap one-to-one
+what a binding's eventual `Trellis.has_live_drain_workers?` /
+`Trellis.has_live_staging_worker?` (Elixir and Ruby alike) calls are
+expected to wrap one-to-one
 — see ADR-0010 decision 4 for why a plain boolean needs no flattening to
 cross that boundary.
 
@@ -130,13 +139,18 @@ platform's liveness probe:
 defmodule MyAppWeb.HealthController do
   use MyAppWeb, :controller
 
-  def drain_workers(conn, _params) do
+  def workers(conn, _params) do
     # `MyApp.Trellis` is the supervised `ResourceArc` handle ADR-0010
     # decision 3 describes — one per node, held in the supervision tree.
-    if MyApp.Trellis.has_live_drain_workers?() do
-      send_resp(conn, 200, "ok")
-    else
-      send_resp(conn, 503, "no live drain workers in this fleet")
+    cond do
+      not MyApp.Trellis.has_live_drain_workers?() ->
+        send_resp(conn, 503, "no live drain workers in this fleet")
+
+      not MyApp.Trellis.has_live_staging_worker?() ->
+        send_resp(conn, 503, "no live staging worker in this fleet")
+
+      true ->
+        send_resp(conn, 200, "ok")
     end
   end
 end
@@ -148,11 +162,15 @@ is a fleet-wide question, not something that needs to be re-answered on
 every web request:
 
 ```ruby
-class DrainWorkerHealthCheck
+class TrellisWorkerHealthCheck
   def self.perform
     unless Trellis.instance.has_live_drain_workers?
       Rails.logger.error("no live Trellis drain workers — every transform is stalled")
       # ... page, raise, whatever this app's alerting expects ...
+    end
+    unless Trellis.instance.has_live_staging_worker?
+      Rails.logger.error("no live Trellis staging worker — no change is captured")
+      # ... same ...
     end
   end
 end

@@ -20,11 +20,12 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`), so an
   operator can tell a new transform is still populating rather than live — the
   right-sized answer to the silent-stall problem (#14).
-* **Fleet-level drain-worker liveness** — `Trellis::has_live_drain_workers`
-  (issue #144) answers the coarser, fleet-wide question a per-transform status
-  can't: is *any* drain worker running to build and maintain targets. It
-  doesn't cover the staging worker, which is what moves a new transform out of
-  `waiting_to_backfill` (a known gap, #428). See
+* **Fleet-level worker liveness** — `Trellis::has_live_drain_workers`
+  (issue #144) and `Trellis::has_live_staging_worker` (issue #428) answer the
+  coarser, fleet-wide questions a per-transform status can't: is *any* drain
+  worker running to build and maintain targets, and is the staging worker
+  running to capture changes and move a new transform out of
+  `waiting_to_backfill`. A healthy fleet needs both. See
   [docs/embedding.md](embedding.md#the-silent-stall-hazard-issue-144) for the
   embedded-deployment misconfiguration this exists to catch.
 

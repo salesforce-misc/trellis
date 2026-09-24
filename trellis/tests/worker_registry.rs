@@ -1,7 +1,8 @@
 //! Integration tests for the worker registry (issue #144; ADR-0010 decision
 //! 3): `staging::worker_registry`'s register/deregister/liveness primitives,
 //! `Client::start`'s wiring of them, and the `Trellis::has_live_drain_workers`
-//! health check they back — all run against a real, ephemeral Postgres
+//! health check they back (plus its staging-side counterpart,
+//! `Trellis::has_live_staging_worker`, issue #428) — all run against a real, ephemeral Postgres
 //! instance via the shared harness (`testkit::TestCluster`).
 //!
 //! `staleness_is_read_time_and_needs_no_reclaim_pass` is the one test that
@@ -103,6 +104,97 @@ async fn has_live_drain_workers_tracks_a_real_drain_connection_starting_and_stop
          not leave it to be discovered stale later"
     );
 
+    health
+        .shutdown()
+        .await
+        .expect("shutdown health-check handle");
+}
+
+/// Issue #428: a fleet with drain workers but no staging worker passes
+/// `has_live_drain_workers` while nothing captures changes or dispatches a
+/// new transform's backfill. `has_live_staging_worker` is the check that
+/// catches it: `false` with only drain workers running, `true` once a
+/// staging connection is up, read from a handle that runs neither.
+#[tokio::test]
+async fn has_live_staging_worker_needs_a_staging_connection_not_just_drain_workers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    db.pool
+        .get()
+        .await
+        .expect("connection")
+        .batch_execute("create table widgets (id integer primary key, price integer)")
+        .await
+        .expect("create source table");
+
+    let health = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect health-check handle");
+    health
+        .apply("TRANSFORM widget_prices FROM widgets SELECT price AS price")
+        .await
+        .expect("define");
+    assert!(
+        !health
+            .has_live_staging_worker()
+            .await
+            .expect("has_live_staging_worker in an empty fleet"),
+        "an empty fleet has no staging worker"
+    );
+
+    let drain_only = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: false,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect drain-only handle");
+    assert!(
+        health
+            .has_live_drain_workers()
+            .await
+            .expect("has_live_drain_workers"),
+        "the drain-only connection is a live drain worker"
+    );
+    assert!(
+        !health
+            .has_live_staging_worker()
+            .await
+            .expect("has_live_staging_worker with only drain workers"),
+        "drain workers alone must not pass as a staging worker (issue #428)"
+    );
+
+    // `Trellis::connect` returns only after intake has connected, and intake
+    // holds the producer singleton from then on, so no wait is needed.
+    let staging = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect staging handle");
+    assert!(
+        health
+            .has_live_staging_worker()
+            .await
+            .expect("has_live_staging_worker with a staging connection"),
+        "a running staging connection must be visible as soon as it connects"
+    );
+
+    staging.shutdown().await.expect("shutdown staging handle");
+    drain_only
+        .shutdown()
+        .await
+        .expect("shutdown drain-only handle");
     health
         .shutdown()
         .await
