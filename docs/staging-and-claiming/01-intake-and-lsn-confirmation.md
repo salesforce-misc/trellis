@@ -183,8 +183,8 @@ knife-edged guards:
   flight at `ADD` time has settled. A snapshot taken inside the `ALTER`'s
   transaction falls slightly short — a writer that starts between it and the
   commit is neither covered nor streamed — so the marker is parked with no
-  fence, and the first discharge pass to see it takes one, at a snapshot that
-  postdates the commit, and records it for later passes
+  fence, and the first discharge pass to see it takes one, a transaction id
+  assigned after the commit, and records it for later passes
   ([ADR-0016](../decisions/0016-single-background-capture-path.md#the-join-fence),
   #431). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through

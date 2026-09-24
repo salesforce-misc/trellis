@@ -100,8 +100,8 @@ async fn migrate_up_is_idempotent() {
         // #418 added V42 (`backfill_chunks.fuse_rearmed_at`). Issue #407
         // added V43 (`pending_backfill`'s retry state). Issue #419 added V44
         // (`backfill_chunks`' unbounded direct-build job rows). Issue #431
-        // added V45 (`pending_backfill.fence_snapshot` nullable until the discharge
-        // fences it).
+        // added V45 (`pending_backfill.fence_xid`, null until the discharge
+        // fences the marker).
         "expected exactly V1 through V7, V9 through V24, and V26 through V45 to be applied"
     );
 

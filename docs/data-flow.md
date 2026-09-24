@@ -116,7 +116,8 @@ drain threads.
    ([intake](staging-and-claiming/01-intake-and-lsn-confirmation.md#adjacent-invariants-that-are-easy-to-miss)).
 2. **Wait.** The discharge (`run_pending_backfills_until`, once per maintenance
    pass) skips a marker until its fence settles: every transaction that was
-   open when it was fenced has ended (`now.xmin > fence.xmax`). Because `xmin`
+   open when it was fenced has ended (`now.xmin > fence`, where the fence is
+   the transaction id of the statement that took it). Because `xmin`
    is cluster-wide, an unrelated long transaction can hold this step up. That
    is safe, and the definition's `waiting_to_backfill` status is the signal
    ([observability](observability.md#backfill-status-and-the-xmin-caveat)).

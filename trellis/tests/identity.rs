@@ -301,8 +301,8 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // before a resume apart from one planned for the rebuild). Issue #407
     // added V43 (`pending_backfill`'s retry state). Issue #419 added V44
     // (`backfill_chunks`' unbounded direct-build job rows). Issue #431
-    // added V45 (`pending_backfill.fence_snapshot` nullable until the discharge
-    // fences it).
+    // added V45 (`pending_backfill.fence_xid`, null until the discharge
+    // fences the marker).
     assert_eq!(
         applied,
         vec![

@@ -200,7 +200,7 @@ quarantine are two arcs of one lifecycle:
 
 Every backfill (a new transform's, a resumed one's, or a catch-up) reads its
 source only once a conservative transaction fence settles (`now.xmin >
-fence.xmax`, `trellis/src/intake/publication.rs`). Because `xmin` is
+fence`, `trellis/src/intake/publication.rs`). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
 until that transaction ends. Since every new transform goes through this wait

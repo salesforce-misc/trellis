@@ -226,13 +226,21 @@ Postgres 17 while the fence was still the parking transaction's own snapshot
 (#431).
 
 **The discharge fences a marker the first time it sees it** (#431). A park
-leaves the marker's `fence_snapshot` null. The marker exists exactly when the
-`ALTER` committed, so any snapshot the discharge takes after reading the
+leaves the marker's `fence_xid` null. The marker exists exactly when the
+`ALTER` committed, so any fence the discharge takes after reading the
 committed marker necessarily postdates the commit. The first pass that reads
-an unfenced marker records the current snapshot as its fence
-(`confirm_fence`, scoped to the generation it read) and waits on it. Later
-passes wait on the recorded fence. This is crash-safe by construction: there
-is no window between the `ALTER` and the marker to recover from.
+an unfenced marker records a fence (`confirm_fence`, scoped to the generation
+it read) and waits on it. Later passes wait on the recorded fence. This is
+crash-safe by construction: there is no window between the `ALTER` and the
+marker to recover from.
+
+The fence is a transaction id, not a snapshot: the id of the statement that
+takes it, assigned after the read. Every writer in the join's window already
+had an id by then, so each is below the fence, and the fence has settled once
+a snapshot's `xmin` is past it. A snapshot's `xmax` would not do. It is one
+past the latest *completed* transaction, so two open transactions `t < w`
+with nothing at or past `t` completed give the snapshot `t:t:`, and once `t`
+ends `xmin` is past that `xmax` while `w` is still open.
 
 Every marker is fenced this way, including ones parked where no `ALTER`
 happened (a table already in the publication, a resume catch-up, a go-live
@@ -240,7 +248,9 @@ catch-up). A new park of the same table clears the fence, so the new
 generation is fenced afresh after its own commit. A go-live catch-up parked
 inside the flip's transaction therefore needs no second park after the
 commit. The pass that takes a fence waits for it to settle, bounded by the
-same timeout as its wait for intake (`fresh_fences_settled`). The writers a
+same timeout as its wait for intake (`fresh_fences_settled`), and a pass lets
+only one of those waits run out, so it never stalls the maintenance loop for
+more than one timeout. The writers a
 fresh fence names are normally ones in flight at that instant, so the cost is
 the accepted one: one extra fence wait per marker, normally milliseconds. A
 long transaction elsewhere in the cluster outlasts the bound and the marker

@@ -272,11 +272,11 @@ pub(crate) async fn park_backfill_catchup(
 /// that snapshot and writes the table before the `ALTER` commits is neither
 /// waited out by such a fence nor streamed (its write precedes the join). If
 /// it is still open when the discharge reads, its row is lost on both sides.
-/// The marker commits exactly when the `ALTER` does, so a snapshot taken
-/// after reading the committed marker postdates the join, and every such
-/// writer still open is in it. That holds with no window to recover from
-/// after a crash. Every marker is fenced this way, including those parked
-/// where no `ALTER` happened (ADR-0016, "The join fence").
+/// The marker commits exactly when the `ALTER` does, so a fence taken after
+/// reading the committed marker postdates the join, and every such writer
+/// still open is behind it. That holds with no window to recover from after
+/// a crash. Every marker is fenced this way, including those parked where no
+/// `ALTER` happened (ADR-0016, "The join fence").
 ///
 /// # A repeat park
 ///
@@ -303,10 +303,9 @@ pub(crate) async fn park_marker(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .execute(
-            "insert into pending_backfill (table_name, fence_snapshot) \
-             values ($1, null) \
+            "insert into pending_backfill (table_name) values ($1) \
              on conflict (table_name) do update set \
-               fence_snapshot = null, \
+               fence_xid = null, \
                generation = default, \
                added_at = now(), \
                attempts = 0, \
@@ -318,46 +317,61 @@ pub(crate) async fn park_marker(
     Ok(())
 }
 
-/// Takes `marker`'s fence: the current snapshot, recorded on the marker's
-/// row so later passes wait on the same one (issue #431, see
-/// [`park_marker`]). The caller has read the marker in an earlier statement,
-/// so this statement's snapshot includes the commit that parked it.
+/// Takes `marker`'s fence and records it on the marker's row, so later
+/// passes wait on the same one (issue #431, see [`park_marker`]).
+///
+/// The fence is this statement's own transaction id, assigned here. The
+/// caller read the marker in an earlier statement, so every transaction that
+/// wrote before the marker's park committed already had an id, and ids are
+/// assigned in order: each is below the fence. The marker has settled once
+/// a snapshot's `xmin` is past the fence ([`Snapshot::settled_since`]),
+/// which is exactly when every transaction open at the fence has ended.
+/// Takes a [`tokio_postgres::Client`], not a transaction, so that nothing
+/// could have assigned this transaction its id before the read.
+///
+/// # Why not the statement's snapshot
+///
+/// A `pg_snapshot`'s `xmax` is one past the latest *completed* transaction,
+/// so it doesn't bound the ones open at it: two open transactions `t < w`,
+/// with nothing at or past `t` completed yet, give the snapshot `t:t:`. Once
+/// `t` ends, `xmin` is `w`, past that `xmax`, while `w` is still open. A
+/// writer in the join's window can be `w`.
+///
+/// # Which generation
 ///
 /// Scoped to the generation the caller read, and only while it is still
 /// unfenced. A park that committed since then is not in the caller's read,
-/// and this statement's snapshot may predate that park's commit, so it can't
+/// and a writer racing that park can hold an id past this fence, so it can't
 /// fence the new generation. `skip locked` passes over a park still in
 /// flight, as the discharge's delete does, rather than hold the maintenance
 /// loop on a caller's transaction. `None` means the row was re-parked (or is
 /// being re-parked, or was discharged) meanwhile; the next pass reads it
 /// afresh.
 async fn confirm_fence(
-    client: &impl GenericClient,
+    client: &tokio_postgres::Client,
     table: &str,
     generation: i64,
-) -> Result<Option<Snapshot>, IntakeError> {
-    let fence: Option<String> = client
+) -> Result<Option<i64>, IntakeError> {
+    Ok(client
         .query_opt(
-            "update pending_backfill set fence_snapshot = pg_current_snapshot() \
+            "update pending_backfill set fence_xid = pg_current_xact_id() \
              where table_name in ( \
                  select table_name from pending_backfill \
-                 where table_name = $1 and generation = $2 and fence_snapshot is null \
+                 where table_name = $1 and generation = $2 and fence_xid is null \
                  for update skip locked) \
-             returning fence_snapshot::text",
+             returning fence_xid::text::bigint",
             &[&table, &generation],
         )
         .await?
-        .map(|row| row.get(0));
-    fence.as_deref().map(Snapshot::parse).transpose()
+        .map(|row| row.get(0)))
 }
 
 /// A parsed `pg_snapshot` text representation (`"xmin:xmax:xip,..."`) — only
-/// `xmin`/`xmax` matter for fence settlement, so the in-progress list is
-/// parsed for validity and otherwise discarded.
+/// `xmin` matters for fence settlement, so the rest is parsed for validity
+/// and otherwise discarded.
 #[derive(Debug)]
 struct Snapshot {
     xmin: i64,
-    xmax: i64,
 }
 
 impl Snapshot {
@@ -367,24 +381,21 @@ impl Snapshot {
             .next()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| IntakeError::InvalidSnapshot(text.to_string()))?;
-        let xmax = parts
+        parts
             .next()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<i64>().ok())
             .ok_or_else(|| IntakeError::InvalidSnapshot(text.to_string()))?;
-        Ok(Self { xmin, xmax })
+        Ok(Self { xmin })
     }
 
-    /// Whether every transaction that could have been in flight when `fence`
-    /// was captured has since settled (committed or aborted). `xmin` only
-    /// advances past a transaction once it completes — so a transaction
-    /// concurrent with the fence, still open, holds `xmin` at its own xid
-    /// for as long as it stays open. The comparison must be **strict**:
-    /// `pg_current_snapshot()`'s `xmax` is "one past the latest *completed*
-    /// txid," which says nothing about a still-running transaction whose xid
-    /// happens to equal it — `self.xmin > fence.xmax`, not `>=`, is what
-    /// actually forces that transaction to complete first.
-    fn settled_since(&self, fence: &Snapshot) -> bool {
-        self.xmin > fence.xmax
+    /// Whether every transaction that was open when the fence
+    /// ([`confirm_fence`]) was taken has since ended (committed or aborted).
+    /// `xmin` is the oldest transaction still open, and every one open at
+    /// the fence has an id below `fence_xid`, so they have all ended exactly
+    /// when `xmin` passes `fence_xid`. The fence's own transaction has ended
+    /// by the time anyone reads the fence, so it never holds `xmin` back.
+    fn settled_since(&self, fence_xid: i64) -> bool {
+        self.xmin > fence_xid
     }
 }
 
@@ -398,8 +409,9 @@ async fn current_snapshot(client: &impl GenericClient) -> Result<Snapshot, Intak
 
 struct PendingBackfill {
     table: String,
-    /// `None` until the discharge takes the fence ([`confirm_fence`]).
-    fence: Option<Snapshot>,
+    /// The fence's transaction id, `None` until the discharge takes it
+    /// ([`confirm_fence`]).
+    fence: Option<i64>,
     /// Which park of `table` this is ([`park_marker`]). Discharge deletes
     /// only this generation.
     generation: i64,
@@ -418,24 +430,22 @@ async fn fetch_pending_backfills(
 ) -> Result<Vec<PendingBackfill>, IntakeError> {
     let rows = client
         .query(
-            "select table_name, fence_snapshot::text, generation, attempts, \
+            "select table_name, fence_xid::text::bigint, generation, attempts, \
                     coalesce(next_attempt_at <= now(), true) \
              from pending_backfill order by generation",
             &[],
         )
         .await?;
-    rows.into_iter()
-        .map(|r| {
-            let fence: Option<String> = r.get(1);
-            Ok(PendingBackfill {
-                table: r.get(0),
-                fence: fence.as_deref().map(Snapshot::parse).transpose()?,
-                generation: r.get(2),
-                attempts: r.get(3),
-                due: r.get(4),
-            })
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingBackfill {
+            table: r.get(0),
+            fence: r.get(1),
+            generation: r.get(2),
+            attempts: r.get(3),
+            due: r.get(4),
         })
-        .collect()
+        .collect())
 }
 
 /// The backoff before the first retry of a failed discharge (issue #407).
@@ -851,8 +861,11 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// reads it takes the fence ([`confirm_fence`]) and then waits, up to
 /// `catch_up_timeout`, for the transactions open at it to end
 /// ([`fresh_fences_settled`]), so the marker normally settles in that same
-/// pass. Later passes check the recorded fence without waiting. A park since
-/// the read leaves the marker unfenced for the next pass.
+/// pass. That is one wait for all the markers the pass fences, and if it runs
+/// out (a long transaction anywhere in the cluster), the pass's intake waits
+/// below get no timeout: a pass stalls the maintenance loop for at most one
+/// `catch_up_timeout`. Later passes check the recorded fence without waiting.
+/// A park since the read leaves the marker unfenced for the next pass.
 ///
 /// # Dispatch by shape (ADR-0016, issues #418, #419)
 ///
@@ -1028,16 +1041,25 @@ pub(crate) async fn run_pending_backfills_until(
     // Issue #431: fence every marker this pass sees for the first time, in
     // statements after the read above, so each fence postdates the commit
     // that parked its marker.
-    let mut fresh_xmax = None;
+    let mut latest_fresh_fence = None;
     for marker in pending.iter_mut().filter(|m| m.due && m.fence.is_none()) {
         marker.fence = confirm_fence(&*client, &marker.table, marker.generation).await?;
-        if let Some(fence) = &marker.fence {
-            fresh_xmax = fresh_xmax.max(Some(fence.xmax));
-        }
+        latest_fresh_fence = latest_fresh_fence.max(marker.fence);
     }
-    let now = match fresh_xmax {
-        Some(xmax) => fresh_fences_settled(client, xmax, catch_up_timeout, stop).await?,
-        None => current_snapshot(client).await?,
+    let (now, intake_timeout) = match latest_fresh_fence {
+        Some(fence) => {
+            let now = fresh_fences_settled(client, fence, catch_up_timeout, stop).await?;
+            // A fence wait that ran out has spent the pass's one timeout, so
+            // an enumeration that isn't caught up at once defers instead of
+            // waiting again (see `fresh_fences_settled`).
+            let intake_timeout = if now.settled_since(fence) {
+                catch_up_timeout
+            } else {
+                Duration::ZERO
+            };
+            (now, intake_timeout)
+        }
+        None => (current_snapshot(client).await?, catch_up_timeout),
     };
 
     let mut settled = 0usize;
@@ -1051,7 +1073,7 @@ pub(crate) async fn run_pending_backfills_until(
             );
             continue;
         }
-        let Some(fence) = &marker.fence else {
+        let Some(fence) = marker.fence else {
             tracing::debug!(
                 table = %marker.table,
                 "backfill marker re-parked before its fence was taken; fencing it next pass"
@@ -1076,7 +1098,7 @@ pub(crate) async fn run_pending_backfills_until(
             &marker,
             wake_channel,
             watermark,
-            catch_up_timeout,
+            intake_timeout,
             stop,
         )
         .await
@@ -1119,7 +1141,7 @@ pub(crate) async fn run_pending_backfills_until(
 }
 
 /// Waits until every transaction open at the fences this pass just took (the
-/// latest of which has `xmax`) has ended, `timeout` elapses, or `stop`
+/// latest of which is `fence`) has ended, `timeout` elapses, or `stop`
 /// returns `true`, and returns the last snapshot read (issue #431).
 ///
 /// Only the pass that takes a fence waits on it here; later passes check the
@@ -1127,20 +1149,24 @@ pub(crate) async fn run_pending_backfills_until(
 /// normally ones in flight at that instant, which end within milliseconds,
 /// so the wait saves the marker a whole reconcile interval. A long
 /// transaction elsewhere in the cluster holds the fence past `timeout`, and
-/// the marker then waits for a later pass, as any unsettled fence does. The
-/// bound is the pass's intake wait's ([`run_pending_backfills`]'s "Waiting
-/// for intake before staging"), so this adds at most that much to the
-/// maintenance loop's seal stall, once per park.
+/// the marker then waits for a later pass, as any unsettled fence does.
+///
+/// The bound is the intake wait's ([`run_pending_backfills`]'s "Waiting for
+/// intake before staging"), and the pass lets at most one of these waits run
+/// out: when this one does, the pass's intake waits get no timeout, so an
+/// enumeration intake hasn't already caught up with defers at once. The
+/// maintenance loop, the only sealer, stalls no more than one timeout per
+/// pass, however many markers the pass fenced.
 async fn fresh_fences_settled(
     client: &tokio_postgres::Client,
-    xmax: i64,
+    fence: i64,
     timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Snapshot, IntakeError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let now = current_snapshot(client).await?;
-        if now.xmin > xmax || tokio::time::Instant::now() >= deadline || stop() {
+        if now.settled_since(fence) || tokio::time::Instant::now() >= deadline || stop() {
             return Ok(now);
         }
         tokio::time::sleep(CATCH_UP_POLL).await;
@@ -1311,8 +1337,12 @@ async fn discharge_marker(
     Ok(Discharge::Committed)
 }
 
-/// How often [`intake_caught_up`] re-reads the in-process watermark. The read
-/// is a bare atomic load, so this only bounds how late the wait notices.
+/// How often [`intake_caught_up`] re-reads the in-process watermark, and
+/// [`fresh_fences_settled`] the current snapshot. The watermark read is a bare
+/// atomic load, so this only bounds how late the wait notices. The snapshot
+/// read is one cheap round trip on the maintenance connection, and a fence
+/// wait that runs its whole timeout repeats it about 1000 times; only a pass
+/// that took a fence while a long transaction is open does that.
 const CATCH_UP_POLL: Duration = Duration::from_millis(5);
 
 /// Waits until `watermark` reaches `horizon`, `timeout` elapses, or `stop`
@@ -1958,10 +1988,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_parses_xmin_and_xmax() {
+    fn snapshot_parses_xmin() {
         let s = Snapshot::parse("10:20:11,15").unwrap();
         assert_eq!(s.xmin, 10);
-        assert_eq!(s.xmax, 20);
+        assert!(Snapshot::parse("10:").is_err(), "an xmax is required");
     }
 
     /// Issue #315: a definition reading another definition's target was
@@ -2023,14 +2053,11 @@ mod tests {
     }
 
     #[test]
-    fn fence_settles_only_once_xmin_strictly_passes_the_old_xmax() {
-        let fence = Snapshot::parse("10:20:").unwrap();
-        assert!(!Snapshot::parse("15:25:").unwrap().settled_since(&fence));
-        // Exactly at the fence's xmax must not count as settled — that is
-        // precisely the boundary a transaction concurrent with the fence
-        // (e.g. the ADD's own transaction) can land on.
-        assert!(!Snapshot::parse("20:30:").unwrap().settled_since(&fence));
-        assert!(Snapshot::parse("21:31:").unwrap().settled_since(&fence));
+    fn fence_settles_only_once_xmin_strictly_passes_the_fence() {
+        assert!(!Snapshot::parse("15:25:").unwrap().settled_since(20));
+        // `xmin` at the fence means that transaction is still open.
+        assert!(!Snapshot::parse("20:30:").unwrap().settled_since(20));
+        assert!(Snapshot::parse("21:31:").unwrap().settled_since(20));
     }
 
     /// Issue #331: an operator pause (or a quarantine) can land on a
@@ -2789,20 +2816,15 @@ mod catch_up_tests {
         );
     }
 
-    /// Issue #431, the join fence's gap, forced by holding each transaction
-    /// open by hand. The `ALTER` and its marker are parked in one open
-    /// transaction; a writer then gets its xid (one past the park's snapshot,
-    /// with another xid burned in between, as in the issue's reproduction)
-    /// and inserts before the `ALTER` commits, so its write isn't streamed. It
-    /// is still open through the first discharge pass. That pass must wait
-    /// for it, so the row reaches the target through the read.
-    #[tokio::test]
-    async fn a_writer_inside_the_joins_window_reaches_the_target() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
+    /// `public.t`, empty and not yet published, read by a `live` 1-1
+    /// definition with its target created; `test_pub` exists. Returns a pool
+    /// and a client on the database.
+    async fn live_reader_on_t(
+        db: &testkit::TestDatabase,
+    ) -> (crate::pool::Pool, tokio_postgres::Client) {
         let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
         let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
-        let mut client = connect(&db).await;
+        let client = connect(db).await;
         client
             .batch_execute(
                 "create table public.t (id bigint primary key); \
@@ -2832,6 +2854,21 @@ mod catch_up_tests {
         )
         .await
         .expect("create the target table");
+        (pool, client)
+    }
+
+    /// Issue #431, the join fence's gap, forced by holding each transaction
+    /// open by hand. The `ALTER` and its marker are parked in one open
+    /// transaction; a writer then gets its xid (one past the park's snapshot,
+    /// with another xid burned in between, as in the issue's reproduction)
+    /// and inserts before the `ALTER` commits, so its write isn't streamed. It
+    /// is still open through the first discharge pass. That pass must wait
+    /// for it, so the row reaches the target through the read.
+    #[tokio::test]
+    async fn a_writer_inside_the_joins_window_reaches_the_target() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut client) = live_reader_on_t(&db).await;
 
         // The join, as `reconcile_publication` runs it, held open.
         let mut joiner = connect(&db).await;
@@ -2882,12 +2919,73 @@ mod catch_up_tests {
         assert_eq!(totals, ["42"], "the writer's row reaches the target");
     }
 
-    /// The marker's fence as text, or `None` while the discharge hasn't
-    /// taken it yet.
-    async fn marker_fence(client: &tokio_postgres::Client) -> Option<String> {
+    /// Issue #431 review: a fence's `xmax` is one past the latest *completed*
+    /// transaction, so it doesn't bound the transactions open at it. Here the
+    /// join window's writer `w` gets its xid after another open transaction
+    /// `t`, and nothing at or past `t` has completed when the fence is taken,
+    /// so the fence's snapshot reads `t:t:`. Once `t` ends, a snapshot's
+    /// `xmin` is `w`, past that `xmax`, while `w` is still open. The fence
+    /// must still hold the marker for `w`, or the discharge reads the table
+    /// without `w`'s row and the stream never carries it.
+    #[tokio::test]
+    async fn a_fence_holds_a_writer_whose_xid_is_past_its_xmax() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut client) = live_reader_on_t(&db).await;
+
+        let mut joiner = connect(&db).await;
+        let join = joiner.transaction().await.expect("begin the join");
+        join.batch_execute("alter publication test_pub add table public.t")
+            .await
+            .expect("add the table to the publication");
+        park_marker(&join, "public.t")
+            .await
+            .expect("park the join marker");
+        let mut other = connect(&db).await;
+        let (t, t_xid) = open_writer(&mut other).await;
+        let mut writer = connect(&db).await;
+        let (w, w_xid) = open_writer(&mut writer).await;
+        w.batch_execute("insert into public.t values (42)")
+            .await
+            .expect("write before the join commits");
+        assert!(t_xid < w_xid);
+        join.commit().await.expect("commit the join");
+
+        pass(&mut client).await;
+        assert!(
+            marker_generation(&client).await.is_some(),
+            "both transactions are open at the fence"
+        );
+        t.commit().await.expect("commit t, leaving w open");
+        let now = current_snapshot(&client).await.expect("read a snapshot");
+        assert_eq!(now.xmin, w_xid, "only w is still open");
+        pass(&mut client).await;
+        assert!(
+            marker_generation(&client).await.is_some(),
+            "w was open at the fence and still is, so the marker must wait for it"
+        );
+
+        w.commit().await.expect("commit w");
+        pass(&mut client).await;
+        assert_eq!(marker_generation(&client).await, None, "discharged");
+        drain_all(&pool, &mut client).await;
+        let totals: Vec<String> = client
+            .query("select total::text from public.t_reader", &[])
+            .await
+            .expect("read the target")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(totals, ["42"], "w's row reaches the target");
+    }
+
+    /// The marker's fence, or `None` while the discharge hasn't taken it
+    /// yet.
+    async fn marker_fence(client: &tokio_postgres::Client) -> Option<i64> {
         client
             .query_one(
-                "select fence_snapshot::text from pending_backfill where table_name = 'public.t'",
+                "select fence_xid::text::bigint from pending_backfill \
+                 where table_name = 'public.t'",
                 &[],
             )
             .await
@@ -2937,9 +3035,8 @@ mod catch_up_tests {
         let fence = marker_fence(&discharger)
             .await
             .expect("the first pass fences the marker");
-        let fence_xmax = Snapshot::parse(&fence).expect("parse the fence").xmax;
         assert!(
-            before_xid <= fence_xmax,
+            before_xid < fence,
             "the fence ({fence}) is taken while xid {before_xid} is open"
         );
         assert!(
@@ -2950,12 +3047,70 @@ mod catch_up_tests {
         open_before.commit().await.expect("commit");
         let mut after = connect(&db).await;
         let (_open_after, after_xid) = open_writer(&mut after).await;
-        assert!(after_xid > fence_xmax, "opened after the fence");
+        assert!(after_xid > fence, "opened after the fence");
         pass(&mut discharger).await;
         assert_eq!(
             marker_generation(&discharger).await,
             None,
             "the recorded fence has settled; a transaction opened after it doesn't count"
+        );
+    }
+
+    /// Issue #315, now covered by #431's fence: a definition reading another
+    /// definition's target goes live in a discharge's transaction, which
+    /// parks a catch-up on that target (never published, so only the
+    /// target-mutation seam reaches the new reader). A seam writer that
+    /// checked for `live` readers before the flip committed reached nobody.
+    /// If it is still open when the discharge first reads the catch-up, the
+    /// fence must wait for it, or the catch-up reads the target without its
+    /// write. The discharge used to re-park after commit to get a later
+    /// fence; the fence taken at first read replaces that.
+    #[tokio::test]
+    async fn a_chained_catchup_waits_for_a_seam_writer_racing_the_flip() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut discharger = connect(&db).await;
+        discharger
+            .batch_execute(
+                "create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.orders', 1), ('public.t', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.t', 'public.orders', 1, '', 'live')",
+            )
+            .await
+            .expect("seed the upstream definition and its target");
+        let reader: i64 = discharger
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.t', 1, '', 'waiting_to_backfill') returning id",
+                &[],
+            )
+            .await
+            .expect("seed the chained definition")
+            .get(0);
+
+        let mut flipper = connect(&db).await;
+        let flip = flipper.transaction().await.expect("begin the flip");
+        go_live(&flip, &[reader]).await.expect("go_live");
+        let mut seam = connect(&db).await;
+        let (seam_writer, _) = open_writer(&mut seam).await;
+        flip.commit().await.expect("commit the flip");
+
+        pass(&mut discharger).await;
+        assert!(
+            marker_generation(&discharger).await.is_some(),
+            "the seam writer that raced the flip is still open, so the catch-up waits"
+        );
+        seam_writer.commit().await.expect("commit the seam writer");
+        pass(&mut discharger).await;
+        assert_eq!(
+            marker_generation(&discharger).await,
+            None,
+            "the catch-up discharges once the seam writer has ended"
         );
     }
 
@@ -2995,6 +3150,78 @@ mod catch_up_tests {
             marker_generation(&discharger).await.is_some(),
             "left for the next pass"
         );
+    }
+
+    /// Issue #431 review: the maintenance loop seals nothing while a pass
+    /// waits, so a pass lets at most one wait run out. Here a long
+    /// transaction holds a fresh fence past the timeout, and an older marker
+    /// that has settled needs an enumeration intake never catches up with.
+    /// That enumeration must defer at once rather than wait a second
+    /// timeout. The bound on elapsed time leaves half a timeout of slack
+    /// either way: the bug this guards against takes twice the timeout.
+    #[tokio::test]
+    async fn a_pass_whose_fence_wait_runs_out_does_not_wait_on_intake_too() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.a (id bigint primary key); \
+                 create table public.b (id bigint primary key); \
+                 insert into public.a values (1); \
+                 insert into public.b values (1); \
+                 create publication test_pub;",
+            )
+            .await
+            .expect("seed two source tables");
+        register_reader(&db, "public.a", "a_reader").await;
+        register_reader(&db, "public.b", "b_reader").await;
+        reconcile_publication(
+            &mut client,
+            "test_pub",
+            &["public.a".to_string(), "public.b".to_string()],
+        )
+        .await
+        .expect("reconcile parks two markers");
+        let generation: i64 = client
+            .query_one(
+                "select generation from pending_backfill where table_name = 'public.a'",
+                &[],
+            )
+            .await
+            .expect("read a's marker")
+            .get(0);
+        confirm_fence(&client, "public.a", generation)
+            .await
+            .expect("fence a's marker")
+            .expect("unfenced until now");
+        let mut holder = connect(&db).await;
+        let (_long, _) = open_writer(&mut holder).await;
+
+        let timeout = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::new(),
+            timeout,
+            &|| false,
+        )
+        .await
+        .expect("discharge pass");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= timeout, "b's fresh fence waited out the timeout");
+        assert!(
+            elapsed < timeout + timeout / 2,
+            "a's enumeration deferred without a second wait (took {elapsed:?})"
+        );
+        let markers: i64 = client
+            .query_one("select count(*) from pending_backfill", &[])
+            .await
+            .expect("count markers")
+            .get(0);
+        assert_eq!(markers, 2, "both markers stay for a later pass");
     }
 
     /// Issue #431: a new park of a fenced marker clears its fence, so the new

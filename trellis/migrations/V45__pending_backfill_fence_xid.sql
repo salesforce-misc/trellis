@@ -1,0 +1,23 @@
+-- Issue #431 (ADR-0016, "The join fence"): a `pending_backfill` marker is
+-- parked with no fence, and the discharge takes its fence the first time it
+-- sees the marker.
+--
+-- The fence used to be the parking transaction's own snapshot. The join
+-- marker is parked inside the `ALTER PUBLICATION`'s transaction, so that
+-- snapshot predates the join's commit: a writer that got its transaction id
+-- after the snapshot and wrote the table before the `ALTER` committed was
+-- neither waited for nor streamed. The marker commits with the `ALTER`, so a
+-- fence the discharge takes after reading the committed marker postdates
+-- the join, and waits out every such writer still open.
+--
+-- The fence is now a transaction id, not a snapshot: the id of the
+-- discharge's statement that takes it, which is above every transaction
+-- open at that point. A snapshot's `xmax` is one past the latest *completed*
+-- transaction, so it doesn't bound the ones still open, and settling against
+-- it could pass a writer that was open at the fence and still is.
+--
+-- A null `fence_xid` is a marker whose fence the discharge hasn't taken yet.
+-- Every park (`park_marker`) sets it back to null, so a new generation is
+-- fenced afresh by the discharge that first reads it.
+alter table pending_backfill drop column fence_snapshot;
+alter table pending_backfill add column fence_xid xid8;

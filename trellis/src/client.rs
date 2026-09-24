@@ -1327,9 +1327,12 @@ impl From<IntakeError> for ReconcileError {
 /// to stage through the enumeration's snapshot before deferring it to the
 /// next pass (issue #312; see [`intake::publication::run_pending_backfills`]).
 /// Intake normally trails the source by milliseconds. The wait only runs this
-/// long when intake is replaying a backlog. The maintenance loop does no
-/// sealing while it waits, so this is also the longest seal stall one pass
-/// can add. A deferral ends the pass, so the stall is not repeated per marker.
+/// long when intake is replaying a backlog. The same bound applies to the
+/// pass's wait for the fences it just took to settle (issue #431), which runs
+/// this long only while a long transaction is open. The maintenance loop does
+/// no sealing while either waits, so this is also the longest seal stall one
+/// pass can add: a deferral ends the pass, and a fence wait that runs out
+/// leaves the pass's intake waits no time, so neither stall is repeated.
 /// The value is a judgement call, not a measured bound. While intake stays
 /// further behind than this, markers keep deferring and their definitions
 /// stay `waiting_to_backfill`.
