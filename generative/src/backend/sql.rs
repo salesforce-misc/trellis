@@ -674,6 +674,10 @@ where
 /// `live`: a stale chunk given up after a rebuild went live parks one
 /// (`defs::chunk_queue`), and `intake::publication::mark_definitions_live`
 /// parks its catch-ups in statements that commit after the flip itself.
+/// The re-check narrows that last window but can't close it: a `quiesce`
+/// that runs start to finish, re-check included, between the flip's commit
+/// and the park's still returns early. Only committing the flip and its
+/// parks together (#444) closes it.
 pub(super) async fn quiesce(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
@@ -902,6 +906,60 @@ mod tests {
         assert!(
             returned_at >= drained_at,
             "quiesce returned before the catch-up marker discharged and its enumeration drained"
+        );
+    }
+
+    /// A marker parked while `quiesce` is already waiting on the ring, with
+    /// the definition long since `live` (`mark_definitions_live` parks its
+    /// catch-ups after the flip commits; a stale chunk parks one after a
+    /// rebuild went live). The ring draining must not end the wait: the
+    /// re-check has to find the marker and wait out its discharge and that
+    /// enumeration's drain too.
+    #[tokio::test]
+    async fn quiesce_waits_for_a_catch_up_marker_parked_while_it_waited_on_the_ring() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        // An earlier enumeration, still undrained, so `quiesce` passes the
+        // status and marker checks at once and settles into the ring wait.
+        raw.execute(STAGE_ENUMERATION, &[])
+            .await
+            .expect("stage the earlier enumeration");
+
+        let mut engine = session(db.dsn()).await;
+        let engine_side = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            engine
+                .execute(
+                    "insert into pending_backfill (table_name, fence_snapshot) \
+                     values ($1, pg_current_snapshot())",
+                    &[&SOURCE],
+                )
+                .await
+                .expect("park the catch-up marker");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drain_ring(&engine).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let txn = engine.transaction().await.expect("begin");
+            txn.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+            txn.execute("delete from pending_backfill", &[])
+                .await
+                .expect("discharge");
+            txn.commit().await.expect("commit");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drain_ring(&engine).await
+        });
+
+        quiesce(&raw, &[def], Duration::from_secs(30))
+            .await
+            .expect("quiesce");
+        let returned_at = Instant::now();
+        let drained_at = engine_side.await.expect("engine side");
+        assert!(
+            returned_at >= drained_at,
+            "quiesce returned on the first drain, with a catch-up marker parked during its ring \
+             wait still undischarged"
         );
     }
 

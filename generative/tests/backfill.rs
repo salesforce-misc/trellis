@@ -218,7 +218,7 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 /// `quiesce` that only waits on ring convergence pass by the very
 /// coincidence this test exists to rule out. Issue #300 proposed shrinking
 /// the old `pg_sleep(13.0)` to 1-2s, but a 1.5s sleep was measured to pass
-/// even with `await_definitions_settled` deleted from `quiesce`. So the gate is
+/// even with the definition-status wait deleted from `quiesce`. So the gate is
 /// released on an *event*, not a clock: a helper task waits for the ring to
 /// converge on its own connection, lets [`RELEASE_MARGIN`] pass, and only
 /// then releases the lock. A `quiesce` that really waits on the backfill
