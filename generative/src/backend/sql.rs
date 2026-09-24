@@ -610,8 +610,9 @@ async fn pending_backfills(
         .collect())
 }
 
-/// Polls `probe` until it returns an empty list or `started + timeout`
-/// passes, returning the last non-empty list and the time waited on timeout.
+/// Polls `probe` every [`SETTLE_POLL`] until it returns an empty list or
+/// `started + timeout` passes, returning the last non-empty list and the time
+/// waited on timeout.
 async fn poll_until_empty<F, Fut>(
     started: Instant,
     timeout: Duration,
@@ -621,10 +622,6 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<String>, tokio_postgres::Error>>,
 {
-    const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
-    const MAX_BACKOFF: Duration = Duration::from_millis(250);
-
-    let mut backoff = INITIAL_BACKOFF;
     loop {
         let found = probe().await?;
         if found.is_empty() {
@@ -634,29 +631,39 @@ where
         if waited >= timeout {
             return Ok(Err((found, waited)));
         }
-        tokio::time::sleep(backoff.min(timeout - waited)).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        tokio::time::sleep(SETTLE_POLL.min(timeout - waited)).await;
     }
 }
+
+/// How often [`quiesce`] re-reads definition status and backfill markers.
+/// Each read is one cheap catalog query on the test's own isolated database,
+/// so a short fixed interval costs nothing and keeps a settle from
+/// overshooting the moment it happens.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
 
 /// Waits, within one `timeout` budget, until the engine has no work left
 /// that could still change a target (issue #432). Shared by both backends'
 /// `Backend::quiesce`.
 ///
-/// Three kinds of pending work, each invisible to the others' waits:
+/// A three-way check, the same one an operator makes (ADR-0016, "What `live`
+/// promises"): every definition reports `live` (or a terminal `paused` /
+/// `quarantined`), no backfill is pending, and the convergence wait on a fresh
+/// token returns. Each covers work the others can't see:
 ///
-/// - **A definition still building.** A direct-build definition's backfill
-///   runs through `defs::chunk_queue`, entirely outside the ring
-///   (docs/decisions/0007's amendment), and a marker-driven one sits in
+/// - **Live status.** A direct-build definition's backfill runs through
+///   `defs::chunk_queue`, entirely outside the ring (docs/decisions/0007's
+///   amendment), and a marker-driven one sits in
 ///   `waiting_to_backfill`/`backfilling` until its enumeration commits. Only
 ///   `transform_definitions.status` shows either.
-/// - **An undischarged catch-up marker.** A definition going live parks a
-///   `pending_backfill` marker for its source (and, when something reads it,
-///   its target) in the same transaction as the flip, so a `live` status says
-///   nothing about whether that catch-up has run. The marker's discharge
-///   commits its enumeration and deletes the marker together.
-/// - **Staged rows not yet drained.** [`await_converged`] against a token
-///   taken after the mutations of interest.
+/// - **No pending backfill.** Temporary, until #476. A chunked or direct
+///   build still flips `live` with its go-live catch-up marker only parked,
+///   so today a `live` status says nothing about whether that catch-up has
+///   run. The marker's discharge commits its enumeration and deletes the
+///   marker together. Once #476 makes `live` wait for that discharge, this
+///   check goes and the utility is status plus the convergence wait.
+/// - **Caught up to the token.** [`await_converged`] against a token taken
+///   after the mutations of interest: the public read-your-writes path, so
+///   every quiesce in the suite exercises it (issue #452).
 ///
 /// The order is what makes this sound. Status first, then markers, then the
 /// ring: by the time no definition is building and no marker is left, every

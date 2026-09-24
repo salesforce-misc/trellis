@@ -1166,6 +1166,9 @@ async fn discharge_marker(
             .query_one("select pg_current_wal_insert_lsn()", &[])
             .await?
             .get(0);
+        // On a quiet stream nothing else would carry intake past `horizon`
+        // until its next keepalive (issue #452).
+        crate::staging::converge::request_intake_confirm(&txn).await?;
         if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
             txn.rollback().await?;
             return Ok(Discharge::Deferred { horizon });

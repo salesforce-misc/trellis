@@ -21,6 +21,10 @@ A caller reads its own writes without waiting for global idleness:
 
 Taken *after* the write commits, the token bounds that write's position from above.
 The engine's workers do the work; the caller only waits — no client-driven drain loop.
+If intake hasn't confirmed through the token when the wait starts, the waiter writes
+one `trellis.converge` logical message so intake confirms past the token as soon as
+it gets there, rather than on its next keepalive
+([01](01-intake-and-lsn-confirmation.md#the-quiet-stream-problem)).
 
 ## The predicate
 

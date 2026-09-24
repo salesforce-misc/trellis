@@ -195,8 +195,8 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 /// direct-build definition's `defs::chunk_queue` work at all (docs/decisions/0007's
 /// "Backgrounding and resumability" amendment put that work entirely outside
 /// the ring). Every other test in this file only happened to pass because a
-/// large, unrelated ring-seal age-gate stall gave a real running drain
-/// worker enough wall-clock time to finish a small backfill before `quiesce`
+/// large, unrelated convergence stall (issue #452's keepalive throttle, since
+/// fixed) gave a real running drain worker enough wall-clock time to finish a small backfill before `quiesce`
 /// returned and the test snapshotted state — not because `quiesce` actually
 /// waited for it.
 ///
@@ -211,10 +211,11 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 /// block on an advisory lock this test holds on a separate connection.
 ///
 /// **Why an event gate, not a fixed `pg_sleep`.** The ring-convergence half
-/// of `quiesce` alone stalls for ~10s on this exact scenario (measured with
-/// `GENERATIVE_QUIESCE_TIMING=1`; presumably the seal age-gate stall that
-/// `local_docs/transit-comparison.md` §3.3 describes), independent of how
-/// slow the chunk write is. A fixed sleep shorter than that stall lets a
+/// of `quiesce` alone used to stall for ~10s on this exact scenario (measured
+/// with `GENERATIVE_QUIESCE_TIMING=1`; issue #452's keepalive throttle, not
+/// the seal age gate it was first blamed on), independent of how slow the
+/// chunk write is. Any fixed sleep races the wait it stands in for, and one
+/// shorter than that stall lets a
 /// `quiesce` that only waits on ring convergence pass by the very
 /// coincidence this test exists to rule out. Issue #300 proposed shrinking
 /// the old `pg_sleep(13.0)` to 1-2s, but a 1.5s sleep was measured to pass

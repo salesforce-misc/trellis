@@ -84,19 +84,18 @@
 //!    (`trellis/src/client.rs`) now carries the resolved `Config` through,
 //!    and `Trellis` uses it.
 //!
-//! # And one thing that is *not* a bug, but is worth knowing
+//! # A cost that used to set this file's shape
 //!
-//! Every `quiesce()` in a two-instance run costs ~10 seconds, against ~0.1s
-//! for the identical single-instance run. `quiesce()`'s token is
+//! Every `quiesce()` in a two-instance run used to cost ~10 seconds, against
+//! ~0.1s for the identical single-instance run. `quiesce()`'s token is
 //! `pg_current_wal_lsn()` — a **cluster-wide** LSN — so an instance asking
 //! "have I converged?" is really asking whether it has confirmed through
-//! WAL its co-tenant wrote and its own publication filters out. That can
-//! only advance on a keepalive, whose persist the engine deliberately
-//! throttles to once per 10s (`intake::KEEPALIVE_PERSIST_INTERVAL`, issue
-//! #8's quiet-stream guard). Correctness is unaffected — both instances
-//! converge to exactly what their own oracles say — so this is not treated
-//! as a failure, but it does set this file's cost model; see
-//! [`MAX_CHECKS_PER_RUN`].
+//! WAL its co-tenant wrote and its own publication filters out. That used
+//! to advance only on a keepalive, whose persist is throttled to once per
+//! 10s (`intake::KEEPALIVE_PERSIST_INTERVAL`). Since issue #452 the waiter
+//! writes a `trellis.converge` logical message that both instances' intakes
+//! decode and confirm through at once, so the co-tenant costs nothing
+//! extra. [`MAX_CHECKS_PER_RUN`] was sized for the old cost.
 //!
 //! # Running this property alone (design doc §9)
 //!
@@ -148,14 +147,12 @@ fn proptest_config() -> ProptestConfig {
 }
 
 /// How many convergence checkpoints a single run spends, spread across its
-/// interleaved steps. Small because every `quiesce()` in a two-instance run
-/// costs ~10 seconds no matter how little work the instance did — see
-/// `generative::run::run_two_instance_convergence`'s doc comment for the
-/// cluster-wide-watermark/keepalive-throttle reason, and for the coarser
-/// divergence localization this implies. Four keeps a case's convergence
-/// cost flat (~80s) in the length of the programs it drew, while still
-/// giving a failure several distinct windows to be localized to rather than
-/// one all-or-nothing check at the end.
+/// interleaved steps. Chosen when every `quiesce()` in a two-instance run
+/// cost ~10 seconds (see `generative::run::run_two_instance_convergence`'s
+/// doc comment, and for the coarser divergence localization this implies).
+/// Issue #452 removed that cost, so more checkpoints, up to one per step,
+/// are now affordable; four still gives a failure several distinct windows
+/// to be localized to rather than one all-or-nothing check at the end.
 const MAX_CHECKS_PER_RUN: usize = 4;
 
 /// One stood-up Trellis instance: its backend and the oracle's read handle

@@ -38,8 +38,12 @@ builds the target, and flips the transform to `live`
 So a web process needs no publication ownership or replication privileges; only
 the worker does. Code that needs the target populated polls `status()` until
 the transform is `live`, then calls `await_converged` with a fresh
-`watermark_token()` to let the backfill's staged rows drain. Even then, a
-chunked or direct build's go-live catch-up can still be pending
+`watermark_token()` to let the backfill's staged rows drain. That pair is the
+contract: `live` means the transform is in its steady state, so a token awaited
+after it covers every commit at or before the token
+([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
+Until #476 lands, a chunked or direct build's go-live catch-up can still be
+pending after `live`
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 
 *Planned (#427):* `DROP` still changes the publication from the process that

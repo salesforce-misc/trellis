@@ -1303,3 +1303,160 @@ async fn an_invalidated_slot_is_detected_and_recovered_by_recreating_it() {
         .await
         .expect("clean up the recreated slot");
 }
+
+fn converge_message(lsn: u64, prefix: &str, transactional: bool) -> ReplicationEvent {
+    ReplicationEvent::Message {
+        transactional,
+        lsn: Lsn::from(lsn),
+        prefix: prefix.to_string(),
+        content: bytes::Bytes::new(),
+    }
+}
+
+/// Issue #452: a waiter's `trellis.converge` message confirms through its own
+/// position at once, skipping the keepalive throttle (guard (d)) that would
+/// otherwise hold a quiet stream's waiter for ~10s. Guards (a) and (b) still
+/// hold, a still-open group-commit batch is flushed before the message is
+/// confirmed past it, and any other message is ignored.
+#[tokio::test]
+async fn a_converge_message_confirms_through_it_at_once_but_keeps_the_other_guards() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let setup = connect_raw(db.dsn()).await;
+    setup
+        .batch_execute(
+            "create table widgets (id bigint primary key, payload text not null);
+             create publication intake_pub for table widgets;",
+        )
+        .await
+        .expect("create source table and publication");
+    setup
+        .query_one(
+            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create replication slot");
+    seed_progress_at_slot(&setup, "intake_slot").await;
+
+    let config = intake::IntakeConfig {
+        dsn: db.dsn().to_string(),
+        schema: DEFAULT_SCHEMA.to_string(),
+        host: db.socket_dir().display().to_string(),
+        port: db.port(),
+        user: "postgres".to_string(),
+        password: String::new(),
+        database: db.name().to_string(),
+        slot: "intake_slot".to_string(),
+        publication: "intake_pub".to_string(),
+        wake_channel: "wake".to_string(),
+        spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
+        hard_cap: spill::DEFAULT_HARD_CAP,
+        // Driven through `handle_event`, a batch only flushes on `max_rows`,
+        // so a Commit below stays pending until something flushes it.
+        group_commit: Some(intake::GroupCommitConfig {
+            max_rows: 1000,
+            max_delay: Duration::from_secs(60),
+        }),
+    };
+    let watermark = StagedWatermark::new();
+    let mut consumer = intake::Intake::connect(&config, watermark.clone(), db.pool.clone())
+        .await
+        .expect("connect intake");
+    let base = confirmed_lsn(&setup, "intake_slot")
+        .await
+        .expect("seeded watermark");
+    let prefix = "trellis.converge";
+
+    // Guard (a): never mid-transaction.
+    consumer
+        .handle_event(ReplicationEvent::Begin {
+            final_lsn: Lsn::from(base + 1_000),
+            xid: 42,
+            commit_time_micros: 0,
+        })
+        .await
+        .expect("handle Begin");
+    consumer
+        .handle_event(converge_message(base + 5_000, prefix, false))
+        .await
+        .expect("handle Message");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base),
+        "a converge message received mid-transaction must not advance the watermark"
+    );
+
+    // The commit joins the open group batch, so nothing is confirmed yet.
+    consumer
+        .handle_event(ReplicationEvent::Commit {
+            lsn: Lsn::from(base + 900),
+            end_lsn: Lsn::from(base + 1_000),
+            commit_time_micros: 0,
+        })
+        .await
+        .expect("handle Commit");
+    assert_eq!(confirmed_lsn(&setup, "intake_slot").await, Some(base));
+
+    // The message flushes that batch and confirms through its own position,
+    // durably and in memory.
+    consumer
+        .handle_event(converge_message(base + 2_000, prefix, false))
+        .await
+        .expect("handle Message");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 2_000)
+    );
+    assert_eq!(u64::from(watermark.get()), base + 2_000);
+
+    // Guard (d) still throttles keepalives: that persist just reset it.
+    consumer
+        .handle_event(ReplicationEvent::KeepAlive {
+            wal_end: Lsn::from(base + 3_000),
+            reply_requested: false,
+            server_time_micros: 0,
+        })
+        .await
+        .expect("handle KeepAlive");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 2_000),
+        "a keepalive inside the throttle window must still not persist"
+    );
+
+    // ...but not a converge message: that's the point of it.
+    consumer
+        .handle_event(converge_message(base + 4_000, prefix, false))
+        .await
+        .expect("handle Message");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 4_000),
+        "a converge message must confirm at once, whatever the keepalive throttle says"
+    );
+
+    // Guard (b): never regress.
+    consumer
+        .handle_event(converge_message(base + 3_500, prefix, false))
+        .await
+        .expect("handle Message");
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 4_000)
+    );
+
+    // Anything else is ignored: another prefix, or a transactional message.
+    for event in [
+        converge_message(base + 6_000, "someone.else", false),
+        converge_message(base + 6_000, prefix, true),
+    ] {
+        consumer.handle_event(event).await.expect("handle Message");
+    }
+    assert_eq!(
+        confirmed_lsn(&setup, "intake_slot").await,
+        Some(base + 4_000),
+        "only a non-transactional trellis.converge message may confirm"
+    );
+}

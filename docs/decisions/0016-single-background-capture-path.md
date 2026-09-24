@@ -233,6 +233,33 @@ including ones parked where no `ALTER` happened (a table already in the
 publication, a resume catch-up); a new park of the same table resets it to
 unconfirmed. This is what keeps the join step gap-free.
 
+### What `live` promises
+
+*Decided 2026-09-24.* `live` tells an operator that a transform is in its
+**steady state**. Once a definition reports `live`, a watermark token taken
+after any commit and awaited with `Trellis::await_converged` guarantees that
+the transform's values reflect every commit at or before that token. Nothing
+else is needed: no marker checks, no extra waits.
+
+The two signals stay separate on purpose. `await_converged` is a pure LSN wait
+over captured changes. It never reads definition status or backfill markers,
+so it can return while a definition that isn't `live` yet is still missing
+rows. Backfill is an operator concern, reported by `Trellis::status`. A reader
+that needs a settled target checks both: `live` from status, then its token.
+
+For that to hold, a definition may flip to `live` only once nothing from its
+initial capture is still outstanding. Ring enumeration already works that
+way: it flips in the same transaction as its read, and its `Recompute` rows
+carry no `origin_lsn`, so they gate any token. **Chunked and direct builds
+don't yet.** They flip to `live` in `complete_direct_backfill` and only
+*park* their go-live catch-up, which runs on a later maintenance pass. A
+change that drained while the build ran reaches the target only then, and
+neither signal waits for it. #476 moves their flip into the catch-up's own
+discharge, and settles the same question for catch-ups parked on a definition
+that is already `live` (column resume, `ALTER TRANSFORM`, stale-chunk parks).
+Until it lands, a test that needs a settled target also checks that no
+`pending_backfill` marker is left, as the generative harness's `quiesce` does.
+
 ## Why
 
 - **Postgres has no exact "capture as of registration" without a wait.**
@@ -276,15 +303,15 @@ unconfirmed. This is what keeps the join step gap-free.
 
 - **No definition is `live` when registration returns.** Callers and tests wait
   for the status to reach `live` (`Trellis::status`), then take a watermark
-  token and `await_converged` on it. `await_converged` checks the ring and
-  intake's progress. It never reads a definition's status or a pending marker,
-  so on its own it doesn't wait for a build that hasn't started. After `live`
-  it's still needed, because `live` doesn't yet mean the target is complete. A
-  ring enumeration flips to `live` once its rows are staged, before they drain.
-  Their `Recompute` rows carry no `origin_lsn`, which the predicate treats as
-  older than any token, so the wait covers them. A chunked or direct build flips
-  to `live` with its go-live catch-up marker still waiting for a later
-  maintenance pass, and neither signal waits for that.
+  token and `await_converged` on it ([What `live` promises](#what-live-promises)).
+  `await_converged` checks the ring and intake's progress. It never reads a
+  definition's status or a pending marker, so on its own it doesn't wait for a
+  build that hasn't started. A ring enumeration flips to `live` once its rows
+  are staged, before they drain. Their `Recompute` rows carry no `origin_lsn`,
+  which the predicate treats as older than any token, so the wait covers them.
+  Until #476, a chunked or direct build flips to `live` with its go-live
+  catch-up marker still waiting for a later maintenance pass, and neither
+  signal waits for that.
 - **A running staging worker is required for anything to go live.** That's
   already true: live apply needs intake, and a deferred definition needs the
   discharge ([embedding](../embedding.md#the-silent-stall-hazard-issue-144)).
@@ -354,6 +381,5 @@ happens, and its role in this design.
 
 ## Open questions
 
-- **What `live` promises.** Today `live` means the build has finished, not that
-  the target is complete. Should the flip wait for the go-live catch-up to
-  discharge, or should a caller get some other "target complete" signal?
+- None. "What `live` promises" was settled on 2026-09-24; see
+  [What `live` promises](#what-live-promises) and #476.

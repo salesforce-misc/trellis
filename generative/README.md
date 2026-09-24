@@ -30,16 +30,24 @@ At the design doc's default case count (16), a full `cargo test -p generative
 not mysterious: per-op timing instrumentation (`GENERATIVE_QUIESCE_TIMING=1`,
 `ManualBackend::quiesce`) across 10 runs (894 samples) found a clean bimodal
 distribution — ~77% of quiesce calls resolve under 2s, and a distinct ~22%
-cluster lands at 8.2–10.2s, matching the ~10s pipeline stall independently
-suspected in `local_docs/transit-comparison.md` §3.3
-(`SealConfig::age_gate`). A second pass (`GENERATIVE_COST_TIMING=1`,
+cluster lands at 8.2–10.2s. A second pass (`GENERATIVE_COST_TIMING=1`,
 covering cluster startup, per-case database provisioning, install, apply,
 snapshot, and the oracle's recompute) found those phases collectively
-account for **under 3% of wall-clock** — so the suite's cost is, almost
-entirely, that stall, not test-harness overhead. This is a real engine bug,
-not a suite problem, and is out of scope for this crate to fix; see the git
-history for `generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for
-the full measurement writeup.
+account for **under 3% of wall-clock** — so the suite's cost was, almost
+entirely, that stall, not test-harness overhead; see the git history for
+`generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for the full
+measurement writeup.
+
+That stall was an engine bug, issue #452, not the seal age gate
+(`SealConfig::age_gate`) that `local_docs/transit-comparison.md` §3.3
+suspected: a convergence wait whose token landed past the last decoded
+change waited for intake's keepalive-driven persist, throttled to once per
+10s. The waiter now asks intake to confirm through its token with a logical
+message, and the fast-lane binaries' serial time dropped from 385s to 174s
+(fifteen binaries, measured 2026-09-24). The figures above predate that fix.
+What's left of a quiesce's floor is mostly the backfill discharge's
+`reconcile_interval` (5s), which a new registration waits out before its
+backfill starts.
 
 Because paying that cost for every property on every push/PR would be
 expensive — and because a contributor's (or agent's) first reflex is a plain

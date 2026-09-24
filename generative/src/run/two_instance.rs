@@ -197,27 +197,23 @@ impl<B: Backend> InstanceRun<'_, B> {
 ///
 /// [`super::run_convergence`] checks after every op, and does so cheaply,
 /// because a single instance's `quiesce()` almost always returns as soon as
-/// its own commit has drained. **That is not true with a co-tenant
-/// instance in the same cluster, and the reason is worth writing down.**
+/// its own commit has drained. **With a co-tenant instance in the same
+/// cluster that used not to be true, and the reason is worth writing down.**
 ///
 /// `quiesce()` waits for the engine's own convergence watermark, whose token
 /// is `pg_current_wal_lsn()` — a **cluster-wide** LSN. So when instance A
 /// asks "have I converged?", it is really asking "has my pipeline confirmed
 /// through an LSN that includes instance B's writes?" — writes A's
 /// publication filters out and A therefore never receives as data. A's
-/// `replication_progress.confirmed_lsn` can only advance past them on a
-/// keepalive, and the engine deliberately throttles that persist to once
-/// per `intake::KEEPALIVE_PERSIST_INTERVAL` (10s, issue #8's quiet-stream
-/// guard (d), because the persist is itself a WAL-generating write). The
-/// measured result is ~10s for *every* quiesce in a two-instance run versus
-/// ~0.1s in the equivalent single-instance one.
-///
-/// This is a latency property, not a correctness one — both instances do
-/// converge, to exactly what their own oracles say — so it is not treated as
-/// a failure here. But it does mean per-op checking would cost roughly
-/// `20 * 10s` per case, which no case count makes affordable. Checking at a
-/// bounded number of points keeps a case's cost flat in the program's
-/// length.
+/// `replication_progress.confirmed_lsn` used to advance past them only on a
+/// keepalive, whose persist is throttled to once per
+/// `intake::KEEPALIVE_PERSIST_INTERVAL` (10s), so *every* quiesce in a
+/// two-instance run cost ~10s, and per-op checking would have cost roughly
+/// `20 * 10s` per case. Since issue #452 the waiter writes a
+/// `trellis.converge` logical message both intakes confirm through at once,
+/// so that cost is gone. The bounded number of checks was sized for it and
+/// stays until someone decides per-op localization is worth the extra
+/// quiesces.
 ///
 /// **This makes divergence localization coarser**, exactly like
 /// [`super::run_convergence_bursty`]'s: a divergence is only known to have

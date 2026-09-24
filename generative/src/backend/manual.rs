@@ -1101,9 +1101,9 @@ impl super::Backend for ManualBackend {
         // around the whole quiesce (since #432, the settle and catch-up
         // waits as well as the watermark -> converge round trip), to test the
         // hypothesis (see `local_docs/generative-suite-improvement-plan.md`)
-        // that the convergence property's wall-clock variance is caused by
-        // the same ~10s seal age-gate stall suspected in
-        // `local_docs/transit-comparison.md` §3.3. Silent and free unless
+        // that the convergence property's wall-clock variance came from a
+        // ~10s pipeline stall. It did: issue #452's keepalive throttle, first
+        // blamed on the seal age gate. Silent and free unless
         // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
         // call so the default (unset) path pays exactly one `var_os` check
         // and no clock reads.

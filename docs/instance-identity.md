@@ -126,11 +126,11 @@ RELATIONSHIP` rejects an endpoint that is another instance's aggregate target
 with `RelationshipEndpointNotChangeKeyed` (issue #375), since the relationship
 would publish it just the same.
 
-One behaviour to expect rather than debug: convergence latency is coupled
-across co-tenant instances. `staging::watermark_token` is
-`pg_current_wal_lsn()`, a cluster-wide LSN, so "has this instance converged?"
-is asked against WAL the instance's own publication filters out. Confirming
-past that WAL waits for a keepalive, whose persist is throttled to
-`intake::KEEPALIVE_PERSIST_INTERVAL`. A busy neighbour therefore adds up to
-that interval to an instance's observed convergence time. Correctness is
-unaffected.
+Co-tenant instances don't slow each other's convergence waits.
+`staging::watermark_token` is `pg_current_wal_lsn()`, a cluster-wide LSN, so
+"has this instance converged?" is asked against WAL the instance's own
+publication filters out. Confirming past that WAL used to wait for a
+throttled keepalive, so a busy neighbour added up to 10s to every wait. A
+waiter now writes a `trellis.converge` logical message, which every slot in
+the database decodes, and each instance's intake confirms through it at once
+(issue #452).

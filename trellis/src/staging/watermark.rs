@@ -6,7 +6,8 @@
 //! **What this is not**: it is not a substitute for `replication_progress`'s
 //! `confirmed_lsn`, which stays the *durable* watermark (persisted
 //! transactionally with each staged commit, or — on a quiet stream — from a
-//! keepalive throttled to `intake::KEEPALIVE_PERSIST_INTERVAL`). Reading
+//! keepalive throttled to `intake::KEEPALIVE_PERSIST_INTERVAL`, or at once on
+//! a waiter's `trellis.converge` message, issue #452). Reading
 //! that column for guard (a) would tie the barrier to a 10-second sawtooth
 //! the plan doc measured as wrong for this purpose (§5). This value tracks
 //! intake's *staged-through* position instead — advanced right after every

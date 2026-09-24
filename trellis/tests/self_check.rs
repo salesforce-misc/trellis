@@ -118,10 +118,10 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 ///
 /// What this skips is the live `Client`: CDC intake and its
 /// `replication_progress` advance. That advance is what made these tests
-/// slow. On a quiet stream `confirmed_lsn` only reaches a fresh
-/// `pg_current_wal_lsn()` token on intake's keepalive-driven persist, paced
-/// at 10s (`Trellis::await_converged`'s doc comment), so every await cost
-/// about 10s. Here the progress row is seeded directly, as
+/// slow: before issue #452, on a quiet stream `confirmed_lsn` only reached a
+/// fresh `pg_current_wal_lsn()` token on intake's keepalive-driven persist,
+/// paced at 10s, so every await cost about 10s. Here the progress row is
+/// seeded directly, as
 /// `quarantine.rs`/`apply_aggregate.rs` seed theirs, at the highest
 /// possible LSN: intake has confirmed everything, and whether the target is
 /// caught up rests on the ring alone. `self_check`'s own convergence await

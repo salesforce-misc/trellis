@@ -263,11 +263,45 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
     Ok(row.get(0))
 }
 
+/// The prefix of the logical decoding message a waiter writes to ask intake
+/// to confirm through its position (issue #452).
+///
+/// [`converged_through`]'s first condition needs intake's confirmed position
+/// at or past the token. Intake confirms through each transaction it
+/// stages, but WAL after the caller's commit that carries no published change
+/// (the engine's own bookkeeping, a write to an unpublished table, another
+/// instance's writes) gives it nothing to confirm with except a keepalive,
+/// which arrives and persists only every ~10s. The message is decoded by
+/// every slot in the database right after everything committed before it, so
+/// intake confirms through it at once instead.
+pub(crate) const CONVERGE_MESSAGE_PREFIX: &str = "trellis.converge";
+
+/// Writes a [`CONVERGE_MESSAGE_PREFIX`] message: non-transactional, so it is
+/// in the WAL (and decoded) whatever becomes of an enclosing transaction.
+/// Every position read before this call is at or before the message.
+pub(crate) async fn request_intake_confirm(
+    client: &impl GenericClient,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "select pg_logical_emit_message(false, $1::text, ''::text)",
+            &[&CONVERGE_MESSAGE_PREFIX],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Polls [`converged_through`] until it reports `true` or `timeout` is
 /// exhausted. Backoff starts at 5ms and doubles to a 250ms ceiling
 /// (monotonic — never resets within one call), which keeps the poll cheap
 /// for a token that clears quickly without hammering the database on a
 /// token that takes a while.
+///
+/// If the first check fails while intake's confirmed position is still
+/// behind `token`, writes one [`CONVERGE_MESSAGE_PREFIX`] message so intake
+/// confirms past the token as soon as it reaches it, rather than on its next
+/// keepalive (issue #452). A wait that is already satisfied, or blocked only
+/// on draining, writes nothing.
 ///
 /// The engine's own workers do the actual draining; this only waits for
 /// them. On timeout, returns [`StagingError::ConvergenceTimeout`] — a named
@@ -284,9 +318,24 @@ pub async fn await_converged(
 
     let started = Instant::now();
     let mut backoff = INITIAL_BACKOFF;
+    let mut requested = false;
     loop {
         if converged_through(client, token).await? {
             return Ok(());
+        }
+        if !requested {
+            requested = true;
+            let behind: bool = client
+                .query_one(
+                    "select coalesce((select min(confirmed_lsn) from replication_progress) < $1, \
+                     false)",
+                    &[&token],
+                )
+                .await?
+                .get(0);
+            if behind {
+                request_intake_confirm(client).await?;
+            }
         }
         let waited = started.elapsed();
         if waited >= timeout {

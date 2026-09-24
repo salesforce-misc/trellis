@@ -1121,21 +1121,20 @@ impl Trellis {
     /// on timeout — a named, matchable condition rather than a generic
     /// failure.
     ///
-    /// **Size `timeout` in seconds, not milliseconds.** `token` is
-    /// `pg_current_wal_lsn()`, which normally sits *ahead* of the caller's
-    /// own commit (any unrelated WAL — another backend, a checkpoint, the
-    /// engine's own bookkeeping — advances it), and the convergence
-    /// predicate's first condition is `replication_progress.confirmed_lsn >=
-    /// token`. On a busy pipeline that clears almost immediately, but on a
-    /// *quiet* stream `confirmed_lsn` only catches up to a token past the
-    /// last decoded change when intake's keepalive-driven advance persists —
-    /// throttled to once per `intake::KEEPALIVE_PERSIST_INTERVAL` (10s), and
-    /// itself paced by the server's own walsender keepalive cadence. A
-    /// sub-second budget can therefore report
-    /// [`StagingError::ConvergenceTimeout`] on a pipeline that is in fact
-    /// fully caught up. The one real in-tree caller
-    /// (`generative`'s `ManualBackend::quiesce`) uses 30s; that's the right
-    /// order of magnitude.
+    /// `token` is `pg_current_wal_lsn()`, which normally sits *ahead* of the
+    /// caller's own commit: any unrelated WAL (another backend, a write to an
+    /// unpublished table, the engine's own bookkeeping) advances it, and none
+    /// of it gives intake a change to confirm. When intake is behind the
+    /// token, this writes one `trellis.converge` logical decoding message
+    /// (`pg_logical_emit_message`, executable by `PUBLIC` by default), which
+    /// intake confirms through as soon as it decodes it, so a quiet stream
+    /// converges as fast as a busy one (issue #452).
+    ///
+    /// This waits for captured changes only. It doesn't read definition
+    /// status or backfill progress: a definition that isn't
+    /// [`TransformStatus::Live`] yet may still be missing rows after this
+    /// returns. Check [`Trellis::status`] for that (ADR-0016, "What `live`
+    /// promises").
     ///
     /// Holds one pooled connection for the whole call (it polls on it), so a
     /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw

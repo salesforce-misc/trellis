@@ -950,6 +950,14 @@ impl Intake {
             ReplicationEvent::KeepAlive { wal_end, .. } => {
                 self.advance_watermark_on_keepalive(wal_end).await?;
             }
+            ReplicationEvent::Message {
+                transactional: false,
+                lsn,
+                prefix,
+                ..
+            } if prefix == crate::staging::converge::CONVERGE_MESSAGE_PREFIX => {
+                self.advance_watermark_on_converge_message(lsn).await?;
+            }
             ReplicationEvent::Message { .. } => {}
             ReplicationEvent::StoppedAt { .. } => {}
         }
@@ -1357,7 +1365,45 @@ impl Intake {
         if self.last_keepalive_persist.elapsed() < KEEPALIVE_PERSIST_INTERVAL {
             return Ok(());
         }
+        self.persist_confirmed(candidate).await
+    }
 
+    /// A waiter's request to confirm through its token (issue #452): see
+    /// [`crate::staging::converge::CONVERGE_MESSAGE_PREFIX`]. The message sits
+    /// in the WAL after the token, so every transaction committed before it
+    /// has been delivered by now, and confirming through the message's own
+    /// position is exactly what a keepalive at that position would do — minus
+    /// guard (d)'s throttle. That throttle exists to stop intake looping on its
+    /// own persists; a message is written only by a waiter, once, so it can't
+    /// loop, and it is what saves a quiet stream the wait for the next
+    /// keepalive.
+    ///
+    /// Guards (a), (b) and (c) still hold. A non-transactional message is
+    /// never decoded inside another transaction's output, but guard (a) is
+    /// kept anyway. A still-open group-commit batch holds transactions that
+    /// committed before the message, so it's flushed first rather than
+    /// skipped: skipping would leave the waiter on the keepalive cadence this
+    /// exists to avoid.
+    async fn advance_watermark_on_converge_message(
+        &mut self,
+        lsn: pgwire_replication::Lsn,
+    ) -> Result<(), IntakeError> {
+        if self.in_txn {
+            return Ok(());
+        }
+        self.flush_pending_group().await?;
+        let candidate = PgLsn::from(lsn.as_u64());
+        self.watermark.advance(candidate);
+        if candidate <= self.last_confirmed {
+            return Ok(());
+        }
+        self.persist_confirmed(candidate).await
+    }
+
+    /// Durably confirms `candidate` outside any staged transaction, then
+    /// reports it to the slot: the shared tail of the keepalive and converge-
+    /// message advances.
+    async fn persist_confirmed(&mut self, candidate: PgLsn) -> Result<(), IntakeError> {
         let txn = self.session.transaction().await?;
         txn.execute(
             "update replication_progress set confirmed_lsn = $1 \
@@ -1373,7 +1419,8 @@ impl Intake {
         // leaves the table ahead of the slot, a harmless re-stream, never a
         // gap.
         self.last_confirmed = candidate;
-        self.replication.update_applied_lsn(wal_end);
+        self.replication
+            .update_applied_lsn(pgwire_replication::Lsn::from(u64::from(candidate)));
         Ok(())
     }
 }

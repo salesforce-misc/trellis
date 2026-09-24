@@ -151,6 +151,18 @@ knife-edged guards:
 - **Rate-limit it.** The persist is itself a WAL-generating write; unthrottled, it
   loops on its own writes on servers that echo empty transactions.
 
+The rate limit (10s) would put a floor under every waiter whose token lands past
+the last decoded change, which is the common case: the engine's own staging and
+draining, a write to an unpublished table, or another instance's writes all move
+`pg_current_wal_lsn()` without giving intake anything to confirm. So a waiter that
+finds intake behind its token asks for confirmation instead (issue #452): it
+writes one non-transactional logical decoding message with the prefix
+`trellis.converge`. Every slot in the database decodes it right after everything
+committed before it, and intake confirms through its position at once. The first
+three guards still apply (an open group-commit batch is flushed first); the rate
+limit doesn't, because only a waiter writes the message, once per wait, so it
+can't loop.
+
 ## Failure modes
 
 | Failure | Result | Recovery |
