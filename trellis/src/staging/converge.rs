@@ -100,20 +100,27 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// `origin_lsn = '0/0'` means "unknown, conservatively old" and is `<=` any
 /// token, so a zero-origin pending row always gates conditions 2 and 3 —
 /// that falls out of plain `<=` with no special-casing. A SQL `NULL`
-/// `origin_lsn` (every row the three non-CDC producers stage — see
-/// `append.rs`'s `StagedChange::Recompute`, which never sets the field at
-/// all) means the same "unknown", so it's handled explicitly alongside the
+/// `origin_lsn` means the same "unknown", so it's handled explicitly alongside the
 /// `<=` comparison (`origin_lsn is null or origin_lsn <= token`) rather than
 /// folded into it: `NULL <= token` is itself `NULL`, which three-valued SQL
 /// logic would otherwise let quietly vanish from a `WHERE` filter or an
 /// aggregate instead of gating the row.
+///
+/// Which rows carry an origin (issue #469): intake stamps every CDC and
+/// truncate row with its commit's position, and every row a drain derives
+/// for a downstream transform inherits the earliest origin of the changes
+/// that produced it (unknown if any was). Rows of genuinely unknown origin
+/// stay `NULL`: a backfill enumeration's `Recompute`s (ADR-0016's "What
+/// `live` promises" relies on them gating every token) and the propagation
+/// of a write made outside a drain. A missing origin can only make a wait
+/// longer, never let it return early; before #469 every row was missing one,
+/// so a busy stream gated every token on work committed after it.
 pub async fn converged_through(
     client: &impl GenericClient,
     token: PgLsn,
 ) -> Result<bool, StagingError> {
-    // `origin_lsn` is nullable — the three non-CDC producers' `Recompute`
-    // shape (`append.rs`) never sets it, so a purely-recompute row always
-    // reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
+    // `origin_lsn` is nullable — a row of unknown origin (a backfill
+    // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
     // "unknown" to "conservatively old" — a NULL must gate exactly like the
     // explicit sentinel would. Two things go wrong if that's left implicit:
     // `min(origin_lsn)` silently ignores NULL rows rather than forcing the

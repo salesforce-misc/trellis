@@ -207,7 +207,7 @@ use crate::defs::validate::{self, ResolvedRelationship};
 use crate::pool::quote_ident;
 
 use super::apply::{ApplyError, substitute_relationship_path};
-use super::fold::FoldedChange;
+use super::fold::{FoldedChange, OriginAccum};
 use super::target_mutations::TargetMutations;
 
 // ---------------------------------------------------------------------
@@ -400,6 +400,9 @@ pub(super) struct GroupPlan {
     field_accum: HashMap<String, FieldAccum>,
     pub hop_gen: i32,
     pub src_changed: Option<std::time::SystemTime>,
+    /// The earliest origin among the changes touching this group (issue
+    /// #469); see [`GroupPlan::note_origin`].
+    origin: OriginAccum,
     pub force_full_recompute: bool,
     /// Issue #321: the earliest [`FoldedChange::min_image_lsn`] among the
     /// image-bearing changes folded into this group's delta, on either side
@@ -422,9 +425,21 @@ impl GroupPlan {
             field_accum: HashMap::new(),
             hop_gen: 0,
             src_changed: None,
+            origin: OriginAccum::Empty,
             force_full_recompute: false,
             min_image_lsn: None,
         }
+    }
+
+    /// Folds a contributing change's origin into the group's, the same way
+    /// `src_changed` is folded but with an unknown origin winning.
+    pub(super) fn note_origin(&mut self, origin_lsn: Option<PgLsn>) {
+        self.origin.add(origin_lsn);
+    }
+
+    /// The origin every row this group's write propagates carries.
+    pub(super) fn origin_lsn(&self) -> Option<PgLsn> {
+        self.origin.get()
     }
 
     /// Records that an image-bearing `change` contributed to this group's
@@ -433,6 +448,7 @@ impl GroupPlan {
     fn touch(&mut self, change: &FoldedChange) {
         self.hop_gen = self.hop_gen.max(change.hop_gen);
         self.src_changed = super::apply::earliest_src_changed(self.src_changed, change.src_changed);
+        self.note_origin(change.origin_lsn);
         self.note_image_lsn(change.min_image_lsn);
     }
 
@@ -1259,6 +1275,7 @@ pub(super) fn accumulate_changes(
                 group.hop_gen = group.hop_gen.max(change.hop_gen);
                 group.src_changed =
                     super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+                group.note_origin(change.origin_lsn);
             }
             if let Some(row) = new_row {
                 // Issue #137: even on the full-recompute path, this group's
@@ -1279,6 +1296,7 @@ pub(super) fn accumulate_changes(
                 group.hop_gen = group.hop_gen.max(change.hop_gen);
                 group.src_changed =
                     super::apply::earliest_src_changed(group.src_changed, change.src_changed);
+                group.note_origin(change.origin_lsn);
             }
             continue;
         }
@@ -1518,8 +1536,9 @@ pub(super) fn diff_contributions(
 /// One group [`apply_aggregate_target`]'s writers physically wrote or
 /// deleted: its [`derive_group_key`] text, and the [`GroupPlan::hop_gen`]/
 /// [`GroupPlan::src_changed`] its downstream `Recompute` carries forward
-/// (issue #104: the earliest origin among the changes that touched it).
-type TouchedGroup = (String, i32, Option<std::time::SystemTime>);
+/// (issue #104: the earliest origin among the changes that touched it), and
+/// its [`GroupPlan::origin_lsn`] (issue #469).
+type TouchedGroup = (String, i32, Option<std::time::SystemTime>, Option<PgLsn>);
 
 /// A `col IS NOT DISTINCT FROM $n::text::<cast>` clause per `group_by`
 /// (**target**-side, plain column name) entry, starting at `$start` — `IS
@@ -2515,7 +2534,12 @@ async fn apply_forced_groups_bulk(
     for (i, (key, group)) in forced.iter().enumerate() {
         let ord = (i + 1) as i64;
         if survivor_ords.contains(&ord) {
-            written.push(((*key).clone(), group.hop_gen, group.src_changed));
+            written.push((
+                (*key).clone(),
+                group.hop_gen,
+                group.src_changed,
+                group.origin_lsn(),
+            ));
         } else {
             extinct_ords.push(ord);
         }
@@ -2547,7 +2571,12 @@ async fn apply_forced_groups_bulk(
         let deleted_ords: HashSet<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
         for (i, (key, group)) in forced.iter().enumerate() {
             if deleted_ords.contains(&((i + 1) as i64)) {
-                deleted.push(((*key).clone(), group.hop_gen, group.src_changed));
+                deleted.push((
+                    (*key).clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    group.origin_lsn(),
+                ));
             }
         }
     }
@@ -3475,7 +3504,12 @@ pub(super) async fn apply_aggregate_target(
             )
             .await?
             {
-                deleted.push((key.clone(), group.hop_gen, group.src_changed));
+                deleted.push((
+                    key.clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    group.origin_lsn(),
+                ));
             }
             continue;
         }
@@ -3490,16 +3524,24 @@ pub(super) async fn apply_aggregate_target(
         1 => {
             let (key, group) = delta_groups[0];
             if upsert_group(txn, target, plan, group, extinct_horizon).await? {
-                written.push((key.clone(), group.hop_gen, group.src_changed));
+                written.push((
+                    key.clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    group.origin_lsn(),
+                ));
             }
         }
         _ => {
             apply_delta_groups_bulk(txn, target, plan, &delta_groups, extinct_horizon).await?;
-            written.extend(
-                delta_groups
-                    .iter()
-                    .map(|(key, group)| ((*key).clone(), group.hop_gen, group.src_changed)),
-            );
+            written.extend(delta_groups.iter().map(|(key, group)| {
+                (
+                    (*key).clone(),
+                    group.hop_gen,
+                    group.src_changed,
+                    group.origin_lsn(),
+                )
+            }));
         }
     }
 
@@ -3520,9 +3562,9 @@ pub(super) async fn apply_aggregate_target(
     span.record("deleted", deleted.len());
     span.record("rederived", rederived.len());
     let counts = (written.len(), deleted.len());
-    for (key, hop_gen, src_changed) in written.into_iter().chain(deleted) {
+    for (key, hop_gen, src_changed, origin_lsn) in written.into_iter().chain(deleted) {
         let prior = prior_images.remove(key.as_str());
-        mutations.record(target, key, prior, hop_gen, src_changed);
+        mutations.record(target, key, prior, hop_gen, src_changed, origin_lsn);
     }
     Ok(counts)
 }
@@ -4010,7 +4052,7 @@ mod tests {
             1,
             "the extinct forced group must be reported deleted"
         );
-        let (del_key, del_hop_gen, _del_src_changed) = &deleted[0];
+        let (del_key, del_hop_gen, _del_src_changed, _del_origin) = &deleted[0];
         assert_eq!(del_key, &key);
         assert_eq!(*del_hop_gen, 3);
 
@@ -4127,12 +4169,12 @@ mod tests {
 
         assert_eq!(
             written,
-            vec![(key_20.clone(), 0, None)],
+            vec![(key_20.clone(), 0, None, None)],
             "only group 20 survives"
         );
         assert_eq!(
             deleted,
-            vec![(key_10.clone(), 0, None)],
+            vec![(key_10.clone(), 0, None, None)],
             "group 10 was emptied before the recompute's write, so it is extinct"
         );
         let rows: Vec<(String, String)> = client
@@ -4219,7 +4261,7 @@ mod tests {
 
         assert_eq!(
             written,
-            vec![(key.clone(), 1, None)],
+            vec![(key.clone(), 1, None, None)],
             "the NULL-keyed group survives and is written"
         );
         assert!(deleted.is_empty(), "nothing is extinct");
@@ -4325,7 +4367,7 @@ mod tests {
         txn.commit().await.expect("commit");
 
         let labels = |touched: &[TouchedGroup]| -> Vec<String> {
-            let mut labels: Vec<String> = touched.iter().map(|(k, _, _)| k.clone()).collect();
+            let mut labels: Vec<String> = touched.iter().map(|(k, _, _, _)| k.clone()).collect();
             labels.sort();
             labels
         };

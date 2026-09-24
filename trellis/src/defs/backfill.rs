@@ -644,7 +644,7 @@ pub(crate) async fn backfill_altered_columns(
         if prior_image_expr.is_some() {
             for key in written {
                 let prior = prior_images.remove(&key);
-                mutations.record(&qualified_target, key, prior, 0, None);
+                mutations.record(&qualified_target, key, prior, 0, None, None);
             }
         }
         mutations.flush(&txn).await?;

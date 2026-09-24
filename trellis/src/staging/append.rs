@@ -96,7 +96,9 @@ pub enum StagedChange {
     /// target-mutation seam stages this shape too, for a relationship-endpoint
     /// target it feeds (issue #402, `staging::target_mutations`): `lsn` is
     /// then the writer's pre-commit write token, not a commit `end_lsn`, and
-    /// `origin_lsn` stays `None`.
+    /// `origin_lsn` is the origin of the change that produced the write
+    /// (issue #469; see [`StagedChange::Recompute::origin_lsn`]). Intake
+    /// stamps `origin_lsn` with the commit's own position.
     Cdc {
         src_table: String,
         key: String,
@@ -162,15 +164,23 @@ pub enum StagedChange {
         /// `old_image` column under `op = 'recompute'`, which the fold keeps
         /// apart from real images (`FoldedChange::prior_image`).
         prior_image: Option<String>,
+        /// The source commit this recompute traces back to (issue #469),
+        /// carried forward from the triggering change exactly as
+        /// `src_changed` is, so `converged_through` gates it only for tokens
+        /// at or past that commit. `None` means unknown, which gates every
+        /// token: a backfill-enumerated row, or a write with no source
+        /// commit behind it.
+        origin_lsn: Option<PgLsn>,
     },
     /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
     /// it asserts nothing about any one row's state, only "every row this
     /// source ever produced is gone as of this position." `lsn`/`src_changed`
     /// are stamped at commit exactly like [`StagedChange::Cdc`]'s, by
-    /// `intake::stamp_commit_metadata`; `origin_lsn` stays `None` from intake,
-    /// matching [`StagedChange::Cdc`] — a truncate always originates directly
-    /// from the source, it is never a re-propagated downstream change.
+    /// `intake::stamp_commit_metadata`, which also stamps `origin_lsn` with the
+    /// commit's position, matching [`StagedChange::Cdc`] — a truncate always
+    /// originates directly from the source, it is never a re-propagated
+    /// downstream change.
     Truncate {
         src_table: String,
         lsn: Option<PgLsn>,
@@ -230,6 +240,9 @@ pub enum StagedChange {
         /// ring row's own append position.
         lsn: Option<PgLsn>,
         src_changed: Option<SystemTime>,
+        /// The parent change's own origin (issue #469), with
+        /// [`StagedChange::Recompute::origin_lsn`]'s meaning.
+        origin_lsn: Option<PgLsn>,
         /// Which `relationship_definitions.id` this reverse belongs to —
         /// how a later drain knows which
         /// [`crate::staging::apply::ReverseRelationshipShape`] to rebuild,
@@ -319,6 +332,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 group_key,
                 src_changed,
                 prior_image,
+                origin_lsn,
             } => ChangeRow {
                 src_table,
                 key,
@@ -326,7 +340,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 lsn: None,
                 old_image: prior_image.as_deref(),
                 new_image: None,
-                origin_lsn: None,
+                origin_lsn: *origin_lsn,
                 src_changed: *src_changed,
                 hop_gen: *hop_gen,
                 group_key: group_key.as_deref(),
@@ -359,6 +373,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 new_image,
                 lsn,
                 src_changed,
+                origin_lsn,
                 relationship_id,
                 retry_count,
             } => ChangeRow {
@@ -368,7 +383,7 @@ impl<'a> From<&'a StagedChange> for ChangeRow<'a> {
                 lsn: *lsn,
                 old_image: old_image.as_deref(),
                 new_image: new_image.as_deref(),
-                origin_lsn: None,
+                origin_lsn: *origin_lsn,
                 src_changed: *src_changed,
                 hop_gen: 0,
                 group_key: None,

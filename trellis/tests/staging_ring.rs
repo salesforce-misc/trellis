@@ -20,6 +20,7 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
         group_key: None,
         src_changed: None,
         prior_image: None,
+        origin_lsn: None,
     }
 }
 

@@ -475,15 +475,22 @@ pub(crate) fn stamp_commit_metadata(
         match change {
             StagedChange::Cdc {
                 lsn: row_lsn,
+                origin_lsn,
                 src_changed,
                 ..
             }
             | StagedChange::Truncate {
                 lsn: row_lsn,
+                origin_lsn,
                 src_changed,
                 ..
             } => {
                 *row_lsn = Some(lsn);
+                // Issue #469: the commit this row traces back to is the
+                // commit itself. `converged_through` gates a token only on
+                // rows whose origin is at or below it, so a row left without
+                // one gates every token and a busy stream never converges.
+                *origin_lsn = Some(lsn);
                 *src_changed = Some(changed_at);
             }
             StagedChange::Recompute { .. } => {}

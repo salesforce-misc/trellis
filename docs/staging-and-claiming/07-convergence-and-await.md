@@ -47,7 +47,10 @@ against one committed snapshot. True iff all four hold:
 change. It LEAST-merges in the fold ([04](04-claiming-and-the-fold.md)) — a re-stage
 can only make it older — while the ordinary position GREATEST-advances. Downstream
 propagation carries the *minimum* trigger origin to the dependent it stages; `0`
-means "unknown, conservatively old".
+means "unknown, conservatively old", and so does a `NULL` origin, which wins the
+LEAST-merge rather than losing it. Intake stamps each row with its commit's own
+position; only rows with genuinely unknown origin (a backfill enumeration, a write
+made outside a drain) stay `NULL` (issue #469).
 
 > **Invariant (await soundness):** every un-reflected effect of a commit at
 > position L is represented by ≥1 pending change with `origin_lsn <= L`. Any staging

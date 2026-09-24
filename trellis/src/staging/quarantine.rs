@@ -2043,7 +2043,7 @@ async fn recompute_column(pool: &Pool, def: &Definition, column: &str) -> Result
                 continue;
             };
             if txn.execute(&update_sql, &[value, &ctid]).await? > 0 {
-                mutations.record(&def.target_table, (*pk_text).clone(), prior, 0, None);
+                mutations.record(&def.target_table, (*pk_text).clone(), prior, 0, None, None);
             }
         }
         mutations.flush(&txn).await?;
@@ -2145,6 +2145,7 @@ pub async fn release_key(pool: &Pool, src_table: &str, key: &str) -> Result<usiz
                     // `park_batch_contribution` parks a hinted recompute's
                     // prior image in `old_image` (issue #315).
                     prior_image: old_image,
+                    origin_lsn,
                 }
             } else {
                 let cdc_op = match op.as_str() {

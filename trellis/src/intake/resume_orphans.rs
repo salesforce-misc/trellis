@@ -378,7 +378,7 @@ async fn delete_unbacked_rows(
         deleted += rows.len();
         for row in rows {
             let prior = image_expr.as_ref().map(|_| row.get::<_, String>(1));
-            mutations.record(target, row.get(0), prior, 0, None);
+            mutations.record(target, row.get(0), prior, 0, None, None);
         }
     }
     Ok(deleted)

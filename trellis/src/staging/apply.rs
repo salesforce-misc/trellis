@@ -48,7 +48,7 @@ use super::apply_aggregate::{self, AggregateTargetPlan};
 use super::claim;
 use super::converge;
 use super::error::StagingError;
-use super::fold::{self, FoldedChange};
+use super::fold::{self, FoldedChange, earliest_origin};
 use super::liveness::FenceMissBackoff;
 use super::quarantine;
 use super::target_mutations::TargetMutations;
@@ -991,8 +991,8 @@ async fn accumulate_from_side_recomputes(
     pool: &Pool,
     rel: &crate::defs::RelationshipDefinition,
     key_hops: &HashMap<String, i32>,
-    key_src_changed: &HashMap<String, Option<std::time::SystemTime>>,
-    reverse_recomputes: &mut HashMap<(String, String), (i32, Option<std::time::SystemTime>)>,
+    key_src_changed: &HashMap<String, Provenance>,
+    reverse_recomputes: &mut HashMap<(String, String), (i32, Provenance)>,
 ) -> Result<(), ApplyError> {
     if key_hops.is_empty() {
         return Ok(());
@@ -1028,14 +1028,18 @@ async fn accumulate_from_side_recomputes(
         let join_text =
             join_text.expect("ReverseTrigger::Keys always reports the matched join value");
         let hop = key_hops.get(&join_text).copied().unwrap_or(0) + 1;
-        let src_changed = key_src_changed.get(&join_text).copied().flatten();
+        let (src_changed, origin_lsn) = key_src_changed
+            .get(&join_text)
+            .copied()
+            .unwrap_or((None, None));
         reverse_recomputes
             .entry((qualified_from_table.clone(), from_key))
-            .and_modify(|(h, sc)| {
+            .and_modify(|(h, (sc, origin))| {
                 *h = (*h).max(hop);
                 *sc = earliest_src_changed(*sc, src_changed);
+                *origin = earliest_origin(*origin, origin_lsn);
             })
-            .or_insert((hop, src_changed));
+            .or_insert((hop, (src_changed, origin_lsn)));
     }
     Ok(())
 }
@@ -1538,6 +1542,9 @@ pub(crate) struct RelationshipReverseRecord {
     watermark: PgLsn,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    /// The parent change's origin (issue #469), carried to every row this
+    /// record stages, as `src_changed` is.
+    origin_lsn: Option<PgLsn>,
     /// Issue #134: how many times this exact reverse (same relationship,
     /// same parent key, same underlying transition) has already been
     /// deferred by a guard rejection — `0` for a record built fresh from
@@ -2684,6 +2691,23 @@ async fn reverse_ordering_still_holds(
     }
 }
 
+/// Where a propagated change traces back to: its source commit's
+/// `src_changed` (issues #51/#52) and `origin_lsn` (issue #469), merged with
+/// [`earliest_src_changed`] and [`earliest_origin`] respectively.
+type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
+
+/// One key a drain re-derives by plain image-less recompute:
+/// `(src_table, key, hop_gen, src_changed, origin_lsn)`. The shape of
+/// [`ApplyPlan::reverse_recomputes`], a relationship reverse's fallback
+/// (`stage_reverse_recompute_fallback`), and a key Phase 3 re-stages.
+type DerivedRecompute = (
+    String,
+    String,
+    i32,
+    Option<std::time::SystemTime>,
+    Option<PgLsn>,
+);
+
 /// Stages the pre-#131 image-less `Recompute` fallback (issue #131's own
 /// stopgap, shared since by every guard rejection before #134 and by
 /// `ReverseRelationshipShape::needs_recompute_fallback`/`!fast_path_safe`
@@ -2713,9 +2737,9 @@ async fn stage_reverse_recompute_fallback(
     old_key: &Option<String>,
     new_key: &Option<String>,
     hop_gen: i32,
-    src_changed: Option<std::time::SystemTime>,
+    (src_changed, origin_lsn): Provenance,
     seen_keys: &mut std::collections::HashSet<String>,
-    fallback: &mut Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    fallback: &mut Vec<DerivedRecompute>,
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
@@ -2731,7 +2755,13 @@ async fn stage_reverse_recompute_fallback(
         .await?;
         for (from_key, _) in from_rows {
             if seen_keys.insert(from_key.clone()) {
-                fallback.push((shape.from_table.clone(), from_key, hop_gen, src_changed));
+                fallback.push((
+                    shape.from_table.clone(),
+                    from_key,
+                    hop_gen,
+                    src_changed,
+                    origin_lsn,
+                ));
             }
         }
     }
@@ -3184,6 +3214,9 @@ struct TargetWrite {
     values: Vec<Option<String>>,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    /// The triggering [`FoldedChange::origin_lsn`] (issue #469), carried
+    /// forward exactly as `src_changed` is.
+    origin_lsn: Option<PgLsn>,
     src_table: String,
     basis: String,
 }
@@ -3199,6 +3232,7 @@ struct TargetDelete {
     pk_text: String,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
     src_table: String,
 }
 
@@ -3290,6 +3324,7 @@ struct ClearPlan {
     /// rather than the bare map key it's stored under.
     qualified_target: String,
     src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
 }
 
 /// The aggregate-target counterpart to [`ClearPlan`] — see
@@ -3309,6 +3344,7 @@ struct AggregateClearPlan {
     /// (issue #315).
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
 }
 
 /// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
@@ -4383,7 +4419,7 @@ pub struct ApplyPlan {
     /// `src_changed`, fan-in tie-broken by [`earliest_src_changed`] when more
     /// than one to-side change resolves to the same `(from_table,
     /// from_key)` (issues #51/#52's multi-hop gap).
-    reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)>,
+    reverse_recomputes: Vec<DerivedRecompute>,
     /// Epic #49 cross-cutting review fix (issues #51/#52): every
     /// [`TransformObservation`] [`buffer_transform_apply_metrics`]
     /// buffered during this `compute` call, in place of recording each one
@@ -4606,8 +4642,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // multi-hop gap), fan-in tie-broken by `earliest_src_changed` (min) —
     // deliberately the opposite merge direction from `hop_gen`'s `max`, see
     // that function's doc comment.
-    let mut reverse_recomputes: HashMap<(String, String), (i32, Option<std::time::SystemTime>)> =
-        HashMap::new();
+    let mut reverse_recomputes: HashMap<(String, String), (i32, Provenance)> = HashMap::new();
     // Issue #130, epic #127: accumulated across every source/definition this
     // `compute` pass evaluates a to-one relationship for — see
     // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
@@ -4824,8 +4859,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 // `earliest_src_changed`'s doc comment for why the two use
                 // opposite merge directions.
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
-                let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
-                    HashMap::new();
+                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
                     let mut note = |value: &Option<String>, hop: i32| {
                         if let Some(text) = value {
@@ -4835,10 +4869,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 .or_insert(hop);
                             key_src_changed
                                 .entry(text.clone())
-                                .and_modify(|sc| {
-                                    *sc = earliest_src_changed(*sc, change.src_changed)
+                                .and_modify(|(sc, origin)| {
+                                    *sc = earliest_src_changed(*sc, change.src_changed);
+                                    *origin = earliest_origin(*origin, change.origin_lsn);
                                 })
-                                .or_insert(change.src_changed);
+                                .or_insert((change.src_changed, change.origin_lsn));
                         }
                     };
                     if let Some(row) = &rows[i] {
@@ -4900,8 +4935,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 .any(|change| change.old_image.is_none() && change.new_image.is_none());
             if has_image_less {
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
-                let mut key_src_changed: HashMap<String, Option<std::time::SystemTime>> =
-                    HashMap::new();
+                let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
                     if change.old_image.is_some() || change.new_image.is_some() {
                         continue;
@@ -4922,8 +4956,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         .or_insert(change.hop_gen);
                     key_src_changed
                         .entry(join_text.clone())
-                        .and_modify(|sc| *sc = earliest_src_changed(*sc, change.src_changed))
-                        .or_insert(change.src_changed);
+                        .and_modify(|(sc, origin)| {
+                            *sc = earliest_src_changed(*sc, change.src_changed);
+                            *origin = earliest_origin(*origin, change.origin_lsn);
+                        })
+                        .or_insert((change.src_changed, change.origin_lsn));
                 }
                 accumulate_from_side_recomputes(
                     pool,
@@ -4987,6 +5024,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     watermark: capture.watermark,
                     hop_gen: change.hop_gen,
                     src_changed: change.src_changed,
+                    origin_lsn: change.origin_lsn,
                     retry_count: 0,
                 });
             }
@@ -5212,6 +5250,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 values,
                                 hop_gen: change.hop_gen,
                                 src_changed: change.src_changed,
+                                origin_lsn: change.origin_lsn,
                                 src_table: change.src_table.clone(),
                                 basis: row_to_json_text(row),
                             });
@@ -5221,6 +5260,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 pk_text: change.key.clone(),
                                 hop_gen: change.hop_gen,
                                 src_changed: change.src_changed,
+                                origin_lsn: change.origin_lsn,
                                 src_table: change.src_table.clone(),
                             });
                         }
@@ -5483,6 +5523,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // toward the hop bound.
             hop_gen: 0,
             src_changed: change.src_changed,
+            origin_lsn: change.origin_lsn,
             retry_count: change.retry_count,
         });
     }
@@ -5538,6 +5579,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         existing.hop_gen = existing.hop_gen.max(change.hop_gen);
                         existing.src_changed =
                             earliest_src_changed(existing.src_changed, change.src_changed);
+                        existing.origin_lsn =
+                            earliest_origin(existing.origin_lsn, change.origin_lsn);
                     } else {
                         // Issue #385: the ungated `identity_key_columns`, not
                         // `source_primary_key`. The clear only renders this
@@ -5566,6 +5609,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 qualified_target: def.target_table.clone(),
                                 pk,
                                 src_changed: change.src_changed,
+                                origin_lsn: change.origin_lsn,
                             },
                         );
                     }
@@ -5581,12 +5625,15 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                             existing.hop_gen = existing.hop_gen.max(change.hop_gen);
                             existing.src_changed =
                                 earliest_src_changed(existing.src_changed, change.src_changed);
+                            existing.origin_lsn =
+                                earliest_origin(existing.origin_lsn, change.origin_lsn);
                         })
                         .or_insert(ClearPlan {
                             pk: target_pk,
                             hop_gen: change.hop_gen,
                             qualified_target: def.target_table.clone(),
                             src_changed: change.src_changed,
+                            origin_lsn: change.origin_lsn,
                         });
                 }
             }
@@ -5666,11 +5713,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             for (from_key, _) in from_keys {
                 reverse_recomputes
                     .entry((qualified_from_table.clone(), from_key))
-                    .and_modify(|(h, sc)| {
+                    .and_modify(|(h, (sc, origin))| {
                         *h = (*h).max(hop);
                         *sc = earliest_src_changed(*sc, change.src_changed);
+                        *origin = earliest_origin(*origin, change.origin_lsn);
                     })
-                    .or_insert((hop, change.src_changed));
+                    .or_insert((hop, (change.src_changed, change.origin_lsn)));
             }
         }
     }
@@ -5738,13 +5786,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
     }
 
-    let reverse_recomputes: Vec<(String, String, i32, Option<std::time::SystemTime>)> =
-        reverse_recomputes
-            .into_iter()
-            .map(|((from_table, from_key), (hop, src_changed))| {
-                (from_table, from_key, hop, src_changed)
-            })
-            .collect();
+    let reverse_recomputes: Vec<DerivedRecompute> = reverse_recomputes
+        .into_iter()
+        .map(
+            |((from_table, from_key), (hop, (src_changed, origin_lsn)))| {
+                (from_table, from_key, hop, src_changed, origin_lsn)
+            },
+        )
+        .collect();
 
     Ok(ApplyPlan {
         versions,
@@ -6078,9 +6127,8 @@ async fn lock_one_to_one_keys(
 }
 
 /// A key [`reconcile_with_source`] couldn't settle in Phase 3, to re-stage as
-/// an image-less recompute: `(src_table, key, hop_gen, src_changed)`, the
-/// same shape as [`ApplyPlan::reverse_recomputes`].
-type Restage = (String, String, i32, Option<std::time::SystemTime>);
+/// an image-less recompute.
+type Restage = DerivedRecompute;
 
 /// Issue #344's check: keeps only the writes and deletes whose basis is still
 /// the source's current state, and settles every other one against that
@@ -6205,14 +6253,26 @@ async fn reconcile_with_source(
             }
             continue;
         };
-        let (pk_text, hop_gen, src_changed, src_table) = match *origin {
+        let (pk_text, hop_gen, src_changed, origin_lsn, src_table) = match *origin {
             Ok(i) => {
                 let w = &plan.writes[i];
-                (&w.pk_text, w.hop_gen, w.src_changed, &w.src_table)
+                (
+                    &w.pk_text,
+                    w.hop_gen,
+                    w.src_changed,
+                    w.origin_lsn,
+                    &w.src_table,
+                )
             }
             Err(i) => {
                 let d = &plan.deletes[i];
-                (&d.pk_text, d.hop_gen, d.src_changed, &d.src_table)
+                (
+                    &d.pk_text,
+                    d.hop_gen,
+                    d.src_changed,
+                    d.origin_lsn,
+                    &d.src_table,
+                )
             }
         };
         if !settled.insert(join_pk_parts(&keys[index])) {
@@ -6242,6 +6302,7 @@ async fn reconcile_with_source(
                 values,
                 hop_gen,
                 src_changed,
+                origin_lsn,
                 src_table: src_table.clone(),
                 basis,
             }),
@@ -6249,9 +6310,16 @@ async fn reconcile_with_source(
                 pk_text: pk_text.clone(),
                 hop_gen,
                 src_changed,
+                origin_lsn,
                 src_table: src_table.clone(),
             }),
-            None => restage.push((src_table.clone(), pk_text.clone(), hop_gen, src_changed)),
+            None => restage.push((
+                src_table.clone(),
+                pk_text.clone(),
+                hop_gen,
+                src_changed,
+                origin_lsn,
+            )),
         }
     }
     tracing::debug!(
@@ -6610,30 +6678,32 @@ async fn apply_target(
     // form — so the lookups below decode it the same way. A deleted row's
     // prior image is what lets a downstream aggregate find the group it left
     // (issues #180/#196, now a recompute hint rather than a delta).
-    let mut origin_of: HashMap<String, (i32, Option<std::time::SystemTime>)> = HashMap::new();
-    for (pk_text, hop_gen, src_changed) in plan
+    let mut origin_of: HashMap<String, (i32, Provenance)> = HashMap::new();
+    for (pk_text, hop_gen, src_changed, origin_lsn) in plan
         .writes
         .iter()
-        .map(|w| (&w.pk_text, w.hop_gen, w.src_changed))
+        .map(|w| (&w.pk_text, w.hop_gen, w.src_changed, w.origin_lsn))
         .chain(
             plan.deletes
                 .iter()
-                .map(|d| (&d.pk_text, d.hop_gen, d.src_changed)),
+                .map(|d| (&d.pk_text, d.hop_gen, d.src_changed, d.origin_lsn)),
         )
     {
         if let Some(decoded) = decode_target_pk_text(&plan.pk, target, pk_text)? {
-            origin_of.insert(decoded, (hop_gen, src_changed));
+            origin_of.insert(decoded, (hop_gen, (src_changed, origin_lsn)));
         }
     }
     let mut prior_images = prior_images;
     for key in written.iter().chain(deleted.iter()) {
-        let (hop_gen, src_changed) = origin_of.get(key).copied().unwrap_or((0, None));
+        let (hop_gen, (src_changed, origin_lsn)) =
+            origin_of.get(key).copied().unwrap_or((0, (None, None)));
         mutations.record(
             &plan.qualified_target,
             key.clone(),
             prior_images.remove(key),
             hop_gen,
             src_changed,
+            origin_lsn,
         );
     }
 
@@ -6656,6 +6726,7 @@ async fn clear_target(
     pk: &[PrimaryKeyColumn],
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
     mutations: &mut TargetMutations,
 ) -> Result<usize, ApplyError> {
     let pk_key_expr = ddl::pk_key_sql_expr(pk, Some("t"));
@@ -6674,7 +6745,14 @@ async fn clear_target(
     let cleared = rows.len();
     for row in rows {
         let prior = image_expr.as_ref().map(|_| row.get::<_, String>(1));
-        mutations.record(qualified_target, row.get(0), prior, hop_gen, src_changed);
+        mutations.record(
+            qualified_target,
+            row.get(0),
+            prior,
+            hop_gen,
+            src_changed,
+            origin_lsn,
+        );
     }
     Ok(cleared)
 }
@@ -6865,6 +6943,7 @@ pub async fn apply_and_mark_drained_many(
             &clear.pk,
             clear.hop_gen,
             clear.src_changed,
+            clear.origin_lsn,
             &mut mutations,
         )
         .await?;
@@ -6881,6 +6960,7 @@ pub async fn apply_and_mark_drained_many(
             &clear.pk,
             clear.hop_gen,
             clear.src_changed,
+            clear.origin_lsn,
             &mut mutations,
         )
         .await?;
@@ -7011,12 +7091,7 @@ pub async fn apply_and_mark_drained_many(
     // comment), so this only matters when *two different* parent keys in
     // one drain happen to feed the same target (e.g. an aggregate grouped
     // by a column unrelated to the relationship).
-    let mut relationship_reverse_fallback: Vec<(
-        String,
-        String,
-        i32,
-        Option<std::time::SystemTime>,
-    )> = Vec::new();
+    let mut relationship_reverse_fallback: Vec<DerivedRecompute> = Vec::new();
     // Issue #134: guard-rejected records are re-staged as
     // `StagedChange::RelationshipReverseDeferred` (never touching `hop_gen`)
     // rather than folded into `recompute_changes` (which enforces
@@ -7082,7 +7157,7 @@ pub async fn apply_and_mark_drained_many(
                     &old_key,
                     &new_key,
                     record.hop_gen + 1,
-                    record.src_changed,
+                    (record.src_changed, record.origin_lsn),
                     &mut seen_keys,
                     &mut relationship_reverse_fallback,
                     &row_columns,
@@ -7141,6 +7216,7 @@ pub async fn apply_and_mark_drained_many(
                 new_image: record.new_image.clone(),
                 lsn: record.lsn,
                 src_changed: record.src_changed,
+                origin_lsn: record.origin_lsn,
                 relationship_id: shape.id,
                 retry_count: record.retry_count + 1,
             });
@@ -7291,6 +7367,7 @@ pub async fn apply_and_mark_drained_many(
                         group.hop_gen = group.hop_gen.max(record.hop_gen);
                         group.src_changed =
                             earliest_src_changed(group.src_changed, record.src_changed);
+                        group.note_origin(record.origin_lsn);
                         group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::diff_contributions(
                             &target_plan.fields,
@@ -7306,6 +7383,7 @@ pub async fn apply_and_mark_drained_many(
                         old_group.hop_gen = old_group.hop_gen.max(record.hop_gen);
                         old_group.src_changed =
                             earliest_src_changed(old_group.src_changed, record.src_changed);
+                        old_group.note_origin(record.origin_lsn);
                         old_group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::sub_contributions(
                             &target_plan.fields,
@@ -7320,6 +7398,7 @@ pub async fn apply_and_mark_drained_many(
                         new_group.hop_gen = new_group.hop_gen.max(record.hop_gen);
                         new_group.src_changed =
                             earliest_src_changed(new_group.src_changed, record.src_changed);
+                        new_group.note_origin(record.origin_lsn);
                         new_group.note_image_lsn(record.min_image_lsn);
                         apply_aggregate::add_contributions(
                             &target_plan.fields,
@@ -7406,7 +7485,7 @@ pub async fn apply_and_mark_drained_many(
                 &old_key,
                 &new_key,
                 record.hop_gen + 1,
-                record.src_changed,
+                (record.src_changed, record.origin_lsn),
                 &mut seen_keys,
                 &mut relationship_reverse_fallback,
                 &row_columns,
@@ -7446,7 +7525,7 @@ pub async fn apply_and_mark_drained_many(
     // re-derive, resolved in Phase 2 and staged here as ordinary image-less
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
-    for (from_table, key, hop_gen, src_changed) in &plan.reverse_recomputes {
+    for (from_table, key, hop_gen, src_changed, origin_lsn) in &plan.reverse_recomputes {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
@@ -7459,6 +7538,7 @@ pub async fn apply_and_mark_drained_many(
             group_key: None,
             src_changed: *src_changed,
             prior_image: None,
+            origin_lsn: *origin_lsn,
         });
     }
 
@@ -7469,7 +7549,7 @@ pub async fn apply_and_mark_drained_many(
     // Issue #344: keys `reconcile_with_source` couldn't re-evaluate in Phase
     // 3, staged at their own `hop_gen` — a re-read of the same hop, not a
     // step further downstream.
-    for (src_table, key, hop_gen, src_changed) in restaged {
+    for (src_table, key, hop_gen, src_changed, origin_lsn) in restaged {
         recompute_changes.push(StagedChange::Recompute {
             src_table,
             key,
@@ -7477,10 +7557,11 @@ pub async fn apply_and_mark_drained_many(
             group_key: None,
             src_changed,
             prior_image: None,
+            origin_lsn,
         });
     }
 
-    for (from_table, key, hop_gen, src_changed) in &relationship_reverse_fallback {
+    for (from_table, key, hop_gen, src_changed, origin_lsn) in &relationship_reverse_fallback {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
@@ -7493,6 +7574,7 @@ pub async fn apply_and_mark_drained_many(
             group_key: None,
             src_changed: *src_changed,
             prior_image: None,
+            origin_lsn: *origin_lsn,
         });
     }
 

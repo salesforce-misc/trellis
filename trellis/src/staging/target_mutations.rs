@@ -197,6 +197,7 @@ use super::apply::{
     ApplyError, MAX_HOP_GEN, earliest_src_changed, live_row_columns, pk_keyset_col,
     row_as_text_jsonb_sql,
 };
+use super::fold::earliest_origin;
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::pool::{quote_ident, quote_literal};
@@ -207,6 +208,9 @@ struct KeyMutation {
     prior_image: Option<String>,
     hop_gen: i32,
     src_changed: Option<SystemTime>,
+    /// The earliest source commit behind the key's writes, `None` if any is
+    /// unknown (issue #469): see [`StagedChange::Recompute::origin_lsn`].
+    origin_lsn: Option<PgLsn>,
 }
 
 /// What [`TargetMutations`] knows about one target, resolved once per
@@ -405,7 +409,8 @@ impl TargetMutations {
     ///
     /// A key touched more than once in one transaction keeps its *first*
     /// prior image (the state every downstream consumer last saw), the
-    /// highest `hop_gen`, and the earliest `src_changed`.
+    /// highest `hop_gen`, the earliest `src_changed`, and the earliest
+    /// `origin_lsn` (unknown if any is).
     pub fn record(
         &mut self,
         target: &str,
@@ -413,6 +418,7 @@ impl TargetMutations {
         prior_image: Option<String>,
         hop_gen: i32,
         src_changed: Option<SystemTime>,
+        origin_lsn: Option<PgLsn>,
     ) {
         self.touched
             .entry(target.to_string())
@@ -421,11 +427,13 @@ impl TargetMutations {
             .and_modify(|m| {
                 m.hop_gen = m.hop_gen.max(hop_gen);
                 m.src_changed = earliest_src_changed(m.src_changed, src_changed);
+                m.origin_lsn = earliest_origin(m.origin_lsn, origin_lsn);
             })
             .or_insert(KeyMutation {
                 prior_image,
                 hop_gen,
                 src_changed,
+                origin_lsn,
             });
     }
 
@@ -504,6 +512,7 @@ impl TargetMutations {
                         group_key: None,
                         src_changed: m.src_changed,
                         prior_image: m.prior_image,
+                        origin_lsn: m.origin_lsn,
                     });
                     continue;
                 };
@@ -520,7 +529,7 @@ impl TargetMutations {
                     lsn: Some(token),
                     old_image: m.prior_image,
                     new_image: new.image,
-                    origin_lsn: None,
+                    origin_lsn: m.origin_lsn,
                     src_changed: m.src_changed,
                     hop_gen: next_hop,
                     group_key: new.group_key,
@@ -754,6 +763,7 @@ mod tests {
             Some("{\"g\":\"a\"}".into()),
             0,
             None,
+            None,
         );
         m.record(
             "public.t",
@@ -761,8 +771,9 @@ mod tests {
             Some("{\"g\":\"b\"}".into()),
             3,
             None,
+            None,
         );
-        m.record("public.t", "2".into(), None, 1, None);
+        m.record("public.t", "2".into(), None, 1, None, None);
         assert_eq!(m.touched["public.t"].len(), 2);
         let key = &m.touched["public.t"]["1"];
         assert_eq!(key.prior_image.as_deref(), Some("{\"g\":\"a\"}"));
@@ -772,12 +783,13 @@ mod tests {
     #[test]
     fn a_key_created_in_the_transaction_keeps_no_prior_image() {
         let mut m = TargetMutations::new();
-        m.record("public.t", "1".into(), None, 0, None);
+        m.record("public.t", "1".into(), None, 0, None, None);
         m.record(
             "public.t",
             "1".into(),
             Some("{\"g\":\"a\"}".into()),
             0,
+            None,
             None,
         );
         assert_eq!(m.touched["public.t"]["1"].prior_image, None);
@@ -828,7 +840,7 @@ mod tests {
             .execute("update t set v = 1 where id = 1", &[])
             .await
             .expect("A's write");
-        m_a.record("public.t", "1".into(), None, 0, None);
+        m_a.record("public.t", "1".into(), None, 0, None, None);
         let token_a = m_a
             .into_staged(&txn_a)
             .await
@@ -856,7 +868,7 @@ mod tests {
             (after_a_commits, write_b.await.expect("B's write"))
         };
         assert_eq!(written_b, 1);
-        m_b.record("public.t", "1".into(), None, 0, None);
+        m_b.record("public.t", "1".into(), None, 0, None, None);
         let token_b = m_b
             .into_staged(&txn_b)
             .await
@@ -898,7 +910,7 @@ mod tests {
         txn.execute("insert into t values (1, 0)", &[])
             .await
             .expect("first write");
-        m.record("public.t", "1".into(), None, 0, None);
+        m.record("public.t", "1".into(), None, 0, None, None);
         let after_first_write = wal_insert_lsn(&txn).await;
         txn.execute(
             "insert into t select g, 0 from generate_series(2, 100) g",
@@ -907,7 +919,7 @@ mod tests {
         .await
         .expect("last write");
         for id in 2..=100 {
-            m.record("public.t", id.to_string(), None, 0, None);
+            m.record("public.t", id.to_string(), None, 0, None, None);
         }
         let after_last_write = wal_insert_lsn(&txn).await;
         let propagation = m.into_staged(&txn).await.expect("stage");
@@ -933,7 +945,7 @@ mod tests {
 
         let txn = client.transaction().await.expect("begin");
         let mut unread = TargetMutations::assuming_unread();
-        unread.record("public.t", "1".into(), None, 0, None);
+        unread.record("public.t", "1".into(), None, 0, None, None);
         let propagation = unread.into_staged(&txn).await.expect("stage unread");
         assert!(propagation.changes.is_empty());
         assert_eq!(
@@ -996,6 +1008,7 @@ mod tests {
                     prior_image: Some(prior.clone()),
                     hop_gen: 0,
                     src_changed: None,
+                    origin_lsn: None,
                 },
             );
         }
@@ -1080,6 +1093,7 @@ mod tests {
                         prior_image: Some(prior.clone()),
                         hop_gen: 0,
                         src_changed: None,
+                        origin_lsn: None,
                     },
                 )
             })
@@ -1165,6 +1179,7 @@ mod tests {
                             prior_image: None,
                             hop_gen: 0,
                             src_changed: None,
+                            origin_lsn: None,
                         },
                     )
                 })

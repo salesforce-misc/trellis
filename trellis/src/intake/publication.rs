@@ -594,6 +594,9 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
                 // `StagedChange::Recompute`'s doc comment.
                 src_changed: None,
                 prior_image: None,
+                // Unknown, so it gates every convergence token until it
+                // drains: ADR-0016's "What `live` promises" leans on that.
+                origin_lsn: None,
             });
         }
         append::append(txn, &page).await?;

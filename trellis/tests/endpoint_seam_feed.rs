@@ -527,7 +527,14 @@ async fn seam_write(raw: &mut Client, key: &str, lock_prior: bool, writes: &[&st
     for write in writes {
         txn.execute(*write, &[]).await.expect("write children");
     }
-    mutations.record("public.children", key.to_string(), prior_image, 0, None);
+    mutations.record(
+        "public.children",
+        key.to_string(),
+        prior_image,
+        0,
+        None,
+        None,
+    );
     mutations.flush(&txn).await.expect("flush the seam");
     txn.commit().await.expect("commit the writer");
 }

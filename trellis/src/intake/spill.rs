@@ -403,6 +403,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             group_key,
             src_changed,
             prior_image,
+            origin_lsn,
         } => {
             w.write_all(&[TAG_RECOMPUTE])?;
             write_str(w, src_table)?;
@@ -417,7 +418,8 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
                         .as_micros() as u64
                 }),
             )?;
-            write_opt_str(w, prior_image.as_deref())
+            write_opt_str(w, prior_image.as_deref())?;
+            write_opt_u64(w, origin_lsn.map(u64::from))
         }
         StagedChange::Truncate {
             src_table,
@@ -445,6 +447,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             new_image,
             lsn,
             src_changed,
+            origin_lsn,
             relationship_id,
             retry_count,
         } => {
@@ -454,6 +457,7 @@ fn write_change(w: &mut impl Write, change: &StagedChange) -> io::Result<()> {
             write_opt_str(w, old_image.as_deref())?;
             write_opt_str(w, new_image.as_deref())?;
             write_opt_u64(w, lsn.map(u64::from))?;
+            write_opt_u64(w, origin_lsn.map(u64::from))?;
             write_opt_u64(
                 w,
                 src_changed.map(|t| {
@@ -536,6 +540,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let src_changed = read_opt_u64(r)?
                 .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
             let prior_image = read_opt_str(r)?;
+            let origin_lsn = read_opt_u64(r)?.map(PgLsn::from);
             StagedChange::Recompute {
                 src_table,
                 key,
@@ -543,6 +548,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
                 group_key,
                 src_changed,
                 prior_image,
+                origin_lsn,
             }
         }
         TAG_TRUNCATE => {
@@ -564,6 +570,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
             let old_image = read_opt_str(r)?;
             let new_image = read_opt_str(r)?;
             let lsn = read_opt_u64(r)?.map(PgLsn::from);
+            let origin_lsn = read_opt_u64(r)?.map(PgLsn::from);
             let src_changed = read_opt_u64(r)?
                 .map(|micros| SystemTime::UNIX_EPOCH + Duration::from_micros(micros));
             let mut relationship_id_buf = [0u8; 8];
@@ -579,6 +586,7 @@ fn read_change(r: &mut impl Read) -> io::Result<Option<StagedChange>> {
                 new_image,
                 lsn,
                 src_changed,
+                origin_lsn,
                 relationship_id,
                 retry_count,
             }
@@ -647,6 +655,7 @@ mod tests {
             group_key: None,
             src_changed: Some(SystemTime::UNIX_EPOCH + Duration::from_micros(123_456)),
             prior_image: Some("{\"g\": \"a\"}".into()),
+            origin_lsn: Some(PgLsn::from(77)),
         };
         let mut buf = Vec::new();
         write_change(&mut buf, &change).unwrap();
@@ -658,8 +667,10 @@ mod tests {
                 group_key,
                 src_changed,
                 prior_image,
+                origin_lsn,
                 ..
             } => {
+                assert_eq!(origin_lsn, Some(PgLsn::from(77)));
                 assert_eq!(prior_image.as_deref(), Some("{\"g\": \"a\"}"));
                 assert_eq!(key, "k2");
                 assert_eq!(hop_gen, 1);
@@ -682,16 +693,22 @@ mod tests {
             group_key: None,
             src_changed: None,
             prior_image: None,
+            origin_lsn: None,
         };
         let mut buf = Vec::new();
         write_change(&mut buf, &change).unwrap();
         let decoded = read_change(&mut &buf[..]).unwrap().expect("one record");
         match decoded {
-            StagedChange::Recompute { src_changed, .. } => {
+            StagedChange::Recompute {
+                src_changed,
+                origin_lsn,
+                ..
+            } => {
                 assert!(
                     src_changed.is_none(),
                     "a backfill-shaped recompute with no origin must round-trip as None"
                 );
+                assert!(origin_lsn.is_none());
             }
             other => panic!("expected Recompute, got {other:?}"),
         }
@@ -712,6 +729,7 @@ mod tests {
             new_image: Some(r#"{"id":42,"name":"new"}"#.into()),
             lsn: Some(PgLsn::from(500)),
             src_changed: Some(SystemTime::UNIX_EPOCH + Duration::from_micros(9_000)),
+            origin_lsn: Some(PgLsn::from(450)),
             relationship_id: 7,
             retry_count: 3,
         };
@@ -726,9 +744,11 @@ mod tests {
                 new_image,
                 lsn,
                 src_changed,
+                origin_lsn,
                 relationship_id,
                 retry_count,
             } => {
+                assert_eq!(origin_lsn, Some(PgLsn::from(450)));
                 assert_eq!(src_table, "\u{1f}trellis-rel-reverse-deferred:7");
                 assert_eq!(key, "42");
                 assert_eq!(old_image.unwrap(), r#"{"id":42,"name":"old"}"#);

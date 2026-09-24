@@ -133,7 +133,7 @@ Four rules are load-bearing — the same four the write-time merge established:
 | `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties) | the delta's add side `+f(new)` must track the latest image |
 | `old_image` | **first** — pre-image of the lowest-`lsn` change | the state the key was last materialized from; the delta's removal side `−f(old)` |
 | `src_changed` | **OR** | any source contribution makes the record a source change, so downstream propagation fires; dropping the OR reintroduces a mutual-derivation livelock |
-| `origin_lsn` | **LEAST** | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)) |
+| `origin_lsn` | **LEAST**, unknown (`NULL`) wins | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)); an unknown origin gates every token, so it must survive the merge |
 
 Plus `lsn` GREATEST (over *every* row, image-less included, so the watermark
 still covers them) and a hop-generation counter that resets to 0 on any source

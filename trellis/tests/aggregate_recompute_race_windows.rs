@@ -305,6 +305,7 @@ impl Harness {
                 group_key: None,
                 src_changed: None,
                 prior_image: None,
+                origin_lsn: None,
             })
             .collect();
         let txn = self.raw.transaction().await.expect("begin append");
@@ -1304,7 +1305,7 @@ async fn endpoint_seam_write(txn: &tokio_postgres::Transaction<'_>, id: i32, v: 
     )
     .await
     .expect("write h1");
-    mutations.record("public.h1", id.to_string(), Some(prior), 0, None);
+    mutations.record("public.h1", id.to_string(), Some(prior), 0, None, None);
     mutations.flush(txn).await.expect("flush the seam");
     let slot: i16 = txn
         .query_one("select ring_slot from segment_pointer", &[])
@@ -1393,6 +1394,7 @@ async fn two_seam_writers_of_one_endpoint_key_straddling_a_forced_recompute() {
             group_key: None,
             src_changed: None,
             prior_image: None,
+            origin_lsn: None,
         }],
     )
     .await

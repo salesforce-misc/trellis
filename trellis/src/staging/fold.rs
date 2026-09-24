@@ -99,7 +99,8 @@ pub struct FoldedChange {
     /// `Option<SystemTime>` field, not a separate bool + timestamp, per
     /// the issue's field list.
     pub src_changed: Option<SystemTime>,
-    /// LEAST non-null `origin_lsn` over the group.
+    /// LEAST `origin_lsn` over the group, or `None` (unknown) if any row's
+    /// is unknown (issue #469): see [`earliest_origin`].
     pub origin_lsn: Option<PgLsn>,
     /// GREATEST `lsn` over *every* row in the group, image-less rows
     /// included, so the watermark still covers them.
@@ -320,7 +321,8 @@ pub async fn fold(
                  filter (where (old_image is not null or new_image is not null) \
                            and op <> 'recompute'))[1] as old_image, \
              max(src_changed) as src_changed, \
-             min(origin_lsn) as origin_lsn, \
+             case when bool_or(origin_lsn is null) then null \
+                  else min(origin_lsn) end as origin_lsn, \
              max(lsn) as lsn, \
              case when bool_or(src_changed is not null) then 0 else max(hop_gen) end as hop_gen, \
              min(appended_at) as first_seen, \
@@ -436,9 +438,11 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 /// - `src_changed`/`lsn`: `Option::max` — `None` sorts below every `Some`,
 ///   and among two `Some`s the greater watermark/timestamp wins, matching
 ///   "OR across the group" and "GREATEST over every row" respectively.
-/// - `origin_lsn`/`min_image_lsn`: the lesser of the two, ignoring a
-///   missing side — `Option::min` would wrongly let a `None` beat a real
-///   `Some` (a bare recompute trigger folded alone has no `min_image_lsn`).
+/// - `origin_lsn`: the lesser of the two, where a missing side is unknown
+///   and wins ([`earliest_origin`], issue #469).
+/// - `min_image_lsn`: the lesser of the two, ignoring a missing side —
+///   `Option::min` would wrongly let a `None` beat a real `Some` (a bare
+///   recompute trigger folded alone has no `min_image_lsn`).
 /// - `hop_gen`: 0 if the merged `src_changed` is `Some` (a source change
 ///   resets propagation depth), else the greater of the two hop generations.
 /// - `first_seen`: the earlier of the two — first append into either
@@ -475,7 +479,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     } else {
         earlier.hop_gen.max(later.hop_gen)
     };
-    let origin_lsn = least_present(earlier.origin_lsn, later.origin_lsn);
+    let origin_lsn = earliest_origin(earlier.origin_lsn, later.origin_lsn);
     let relationship_reverse_deferred = earlier
         .relationship_reverse_deferred
         .or(later.relationship_reverse_deferred);
@@ -593,6 +597,44 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
 
 /// The lesser of two optional LSNs, ignoring a missing side: SQL `min()`'s
 /// rule, which `Option::min` gets wrong (it lets `None` win).
+/// Merges two folded `origin_lsn`s the way [`fold`]'s SQL does: the earlier
+/// origin, where a missing one is *unknown*, not absent. `converged_through`
+/// reads an unknown origin as older than any token (issue #469), so a key
+/// that folded any row without an origin, such as a backfill `Recompute`,
+/// must keep gating every token, not only those past its other rows' origin.
+pub(crate) fn earliest_origin(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
+    Some(a?.min(b?))
+}
+
+/// A running [`earliest_origin`] that can start empty. An accumulator can't
+/// start at `None`, since `None` means unknown and would win every merge;
+/// this keeps "nothing contributed yet" apart from "a contribution of
+/// unknown origin".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) enum OriginAccum {
+    #[default]
+    Empty,
+    Merged(Option<PgLsn>),
+}
+
+impl OriginAccum {
+    pub(crate) fn add(&mut self, origin_lsn: Option<PgLsn>) {
+        *self = OriginAccum::Merged(match *self {
+            OriginAccum::Empty => origin_lsn,
+            OriginAccum::Merged(current) => earliest_origin(current, origin_lsn),
+        });
+    }
+
+    /// The merged origin; unknown (`None`) if nothing contributed, which
+    /// gates every token.
+    pub(crate) fn get(self) -> Option<PgLsn> {
+        match self {
+            OriginAccum::Empty => None,
+            OriginAccum::Merged(origin_lsn) => origin_lsn,
+        }
+    }
+}
+
 fn least_present(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -758,16 +800,21 @@ mod merge_tests {
         );
     }
 
-    /// `origin_lsn` takes the lesser of the two non-null sides — a plain
-    /// `Option::min` would wrongly let a missing side beat a real one.
+    /// `origin_lsn` takes the lesser of two known sides, and an unknown
+    /// (missing) side wins outright (issue #469): the key still carries a
+    /// change of unknown age, which gates every convergence token.
     #[test]
-    fn origin_lsn_takes_the_lesser_non_null_side() {
+    fn origin_lsn_takes_the_lesser_side_and_an_unknown_side_wins() {
         let mut first = base("1");
-        first.origin_lsn = None;
+        first.origin_lsn = Some(PgLsn::from(9));
         let mut second = base("1");
         second.origin_lsn = Some(PgLsn::from(7));
-        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        let merged = merge_folded_changes(vec![vec![first.clone()], vec![second.clone()]]);
         assert_eq!(merged[0].origin_lsn, Some(PgLsn::from(7)));
+
+        first.origin_lsn = None;
+        let merged = merge_folded_changes(vec![vec![first], vec![second]]);
+        assert_eq!(merged[0].origin_lsn, None);
     }
 
     /// Issue #321: `min_image_lsn` merges as the lesser present side, so a
