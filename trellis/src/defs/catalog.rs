@@ -727,8 +727,10 @@ pub async fn create_definition_without_backfill(
 /// than lost by the catch-up marker parked when the definition goes live.
 /// The reverse, a delta the build already read that drains only after the
 /// flip and folds in a second time, is corrected by the same catch-up's
-/// re-derivation; the build records no coverage that would let it skip that
-/// table (issue #442, [`commit_direct_backfill_coverage`]).
+/// re-derivation. For a change committed before the build's coverage fence,
+/// the build records no coverage that would let the catch-up skip that table
+/// (issue #442, [`commit_direct_backfill_coverage`]); one committed after the
+/// fence is left to the catch-up's own `coverage_covers` check.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -904,10 +906,10 @@ pub async fn install_definition(
             // The build folded each planned table's pre-build contents into the
             // target. Persist that coverage *before* the definition is marked
             // live, so the redundant publication-join catch-up enumeration of
-            // those tables can be skipped. A table with a streamed change the
-            // build read still in flight gets no coverage (issue #442): that
-            // delta folds in again after the flip, and only the catch-up's
-            // re-derivation corrects it.
+            // those tables can be skipped. A table with a streamed change from
+            // before its fence still in flight gets no coverage (issue #442):
+            // the build read that change, its delta folds in again after the
+            // flip, and only the catch-up's re-derivation corrects it.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
             // Issues #315/#430: the apply path skipped this definition while
             // it sat `backfilling`, so a change to any table the build read

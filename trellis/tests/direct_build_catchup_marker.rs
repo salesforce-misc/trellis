@@ -17,7 +17,8 @@
 //! Issue #442 is the reverse case: a change committed before the build's
 //! coverage fence whose delta drains only after go-live, and is folded in on
 //! top of the build's own read of it. Those tests check the build keeps its
-//! coverage record only when nothing it read can still arrive that way.
+//! coverage record only when no change from before its fence can still
+//! arrive that way.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -370,6 +371,60 @@ async fn aggregate_build_on_a_quiet_source_keeps_its_coverage() {
     assert!(
         covered,
         "nothing was in flight, so the coverage record stands"
+    );
+}
+
+/// Issue #442, the quarantine half: a pre-fence change parked in
+/// `poison_held` has drained out of the ring, but releasing its key replays
+/// it into the now-`live` definition on top of the build's own read, so it
+/// counts as still in flight and the coverage is cleared.
+#[tokio::test]
+async fn aggregate_build_with_a_parked_pre_fence_change_clears_its_coverage() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.sales (id integer primary key, sku text, amount integer); \
+             alter table public.sales replica identity full; \
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), \
+                                             (4, 'a', 1000)",
+        )
+        .await
+        .expect("create + seed sales");
+    client
+        .batch_execute(
+            "insert into poison_held (src_table, key, seg_seq, op, lsn, new_image) \
+             values ('public.sales', '4', 1, 'insert', pg_current_wal_insert_lsn(), \
+                     '{\"id\":\"4\",\"sku\":\"a\",\"amount\":\"1000\"}')",
+        )
+        .await
+        .expect("park the pre-fence change");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("sku", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+
+    let covered: bool = client
+        .query_one(
+            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
+            &[],
+        )
+        .await
+        .expect("read backfill_coverage")
+        .get(0);
+    assert!(
+        !covered,
+        "a parked pre-fence change replays on release, so the coverage must not stand"
     );
 }
 
