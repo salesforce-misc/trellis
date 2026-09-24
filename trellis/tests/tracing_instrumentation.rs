@@ -20,7 +20,7 @@
 //! ever hops to a different OS thread mid-poll.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use pgwire_replication::{Lsn, ReplicationEvent};
@@ -159,7 +159,18 @@ where
 /// default `tracing` subscriber, returning the guard (drop it to restore
 /// whatever was installed before) and the handle to read captured
 /// spans/events back out of.
+///
+/// `tracing` caches each callsite's interest globally, and while only one
+/// scoped dispatcher is live it takes that interest from the default of
+/// whichever thread registers the callsite. A test that logs before
+/// installing its capture could then cache a shared callsite as "never"
+/// while another test's capture was the only one live, silently dropping
+/// that test's events. A permanently live no-op dispatcher keeps two
+/// registered, so interest is always computed over every live dispatcher.
 fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+    static KEEP_INTEREST_GLOBAL: LazyLock<tracing::Dispatch> =
+        LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    LazyLock::force(&KEEP_INTEREST_GLOBAL);
     let captured = Captured::default();
     let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
     let guard = tracing::subscriber::set_default(subscriber);

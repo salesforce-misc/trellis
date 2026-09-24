@@ -2110,7 +2110,7 @@ mod intake_supervisor_tests {
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     use tracing::field::{Field, Visit};
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -2148,10 +2148,41 @@ mod intake_supervisor_tests {
         }
     }
 
+    /// Installs a capture as this thread's default subscriber.
+    ///
+    /// `tracing` caches each callsite's interest globally, and while only
+    /// one scoped dispatcher is live it takes that interest from the default
+    /// of whichever thread registers the callsite. A test that logs with no
+    /// capture (as `consecutive_failures_tracks_the_streak_and_clears_while_healthy`
+    /// does) could then cache a shared callsite as "never" while another
+    /// test's capture was the only one live, silently dropping that test's
+    /// events. A permanently live no-op dispatcher keeps two registered, so
+    /// interest is always computed over every live dispatcher.
     pub(super) fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+        static KEEP_INTEREST_GLOBAL: LazyLock<tracing::Dispatch> =
+            LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        LazyLock::force(&KEEP_INTEREST_GLOBAL);
         let captured = Captured::default();
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
         (tracing::subscriber::set_default(subscriber), captured)
+    }
+
+    /// The flake behind `failed_run_is_logged_at_error_and_restarted`: a
+    /// thread with no subscriber is first to hit a callsite while this
+    /// test's capture is live. The capture must still see this thread's
+    /// event through that callsite.
+    #[test]
+    fn a_callsite_first_hit_on_an_uncaptured_thread_still_reaches_the_capture() {
+        fn log() {
+            tracing::error!("callsite shared with an uncaptured thread");
+        }
+
+        let (_guard, captured) = install_capture();
+        std::thread::spawn(log).join().expect("uncaptured thread");
+        log();
+
+        let events = captured.0.lock().unwrap().len();
+        assert_eq!(events, 1, "the capture missed its own thread's event");
     }
 
     const FAST: RestartBackoff =
