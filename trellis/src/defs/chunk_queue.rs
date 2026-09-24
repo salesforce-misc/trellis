@@ -608,7 +608,14 @@ async fn discard_resumed_chunks(
             sources.insert(row.get::<_, String>(0));
         }
     }
+    // The discarded chunk's write may have landed after the rebuild recorded
+    // its coverage (a direct-build job's, issue #419), and that record vouches
+    // only for the rebuild's own write: left in place, it would let the
+    // catch-up skip exactly the re-read that repairs this one.
     for source in sources {
+        crate::intake::publication::clear_backfill_coverage(txn, &source)
+            .await
+            .map_err(CatalogError::from)?;
         crate::intake::publication::park_marker(txn, &source).await?;
     }
     Ok(())

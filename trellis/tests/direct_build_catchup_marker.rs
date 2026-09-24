@@ -689,3 +689,162 @@ async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
         "no catch-up is left half-parked"
     );
 }
+
+/// A direct-build job a worker still holds when its definition is paused and
+/// resumed again keeps running: the pause only withholds new claims. Its
+/// worker can write the target from its old read after the resume's rebuild
+/// has already gone live and recorded its coverage, and the source may not
+/// change after that at all. Discarding the stale job parks a catch-up on the
+/// source (#331) that must re-derive the target anyway, not skip the source
+/// as covered by the rebuild: the rebuild's coverage vouches for its own
+/// write, not for one that landed on top of it.
+#[tokio::test]
+async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.sales (id integer primary key, sku text, amount integer); \
+             alter table public.sales replica identity full; \
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2); \
+             create table public.hold_armed (armed boolean)",
+        )
+        .await
+        .expect("create + seed sales");
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("sku", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    publication::settle_registrations(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+
+    // Holds a build between its read and its write only while armed, so the
+    // superseded job can be parked there and the rebuild run past it.
+    client
+        .batch_execute(&format!(
+            "create function hold_direct_build() returns event_trigger \
+             language plpgsql as $$ \
+             begin \
+               if exists (select 1 from public.hold_armed) then \
+                 perform pg_advisory_lock({HOLD_LOCK}); \
+                 perform pg_advisory_unlock({HOLD_LOCK}); \
+               end if; \
+             end $$; \
+             create event trigger hold_direct_build on ddl_command_start \
+               when tag in ('ALTER TABLE') execute function hold_direct_build(); \
+             insert into public.hold_armed values (true)"
+        ))
+        .await
+        .expect("install the build hold");
+    client
+        .query_one("select pg_advisory_lock($1)", &[&HOLD_LOCK])
+        .await
+        .expect("take the hold lock");
+
+    let operator = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    let pause_and_resume = || async {
+        operator
+            .apply("PAUSE TRANSFORM sku_totals")
+            .await
+            .expect("pause");
+        operator
+            .apply("RESUME TRANSFORM sku_totals")
+            .await
+            .expect("resume");
+    };
+
+    // The first resume's rebuild job reads the source and is held.
+    pause_and_resume().await;
+    publication::discharge_registrations(&db.pool)
+        .await
+        .expect("dispatch the first rebuild");
+    const OLD_WORKER: &str = "superseded_worker";
+    let superseded = {
+        let conn = db.pool.get().await.expect("acquire connection");
+        chunk_queue::claim_chunks(&**conn, OLD_WORKER, 10)
+            .await
+            .expect("claim the first rebuild")
+    };
+    assert_eq!(superseded.len(), 1);
+    let pool = db.pool.clone();
+    let job = superseded[0].clone();
+    let old_build = tokio::spawn(async move {
+        chunk_queue::run_claimed_chunk(&pool, &job, OLD_WORKER, Duration::from_secs(5)).await
+    });
+    wait_for_build_held(&client).await;
+
+    // A change the held job didn't read. Its CDC drains while the definition
+    // isn't live, so it reaches the target only through a rebuild's read.
+    client
+        .batch_execute("update public.sales set amount = 1007 where id = 2")
+        .await
+        .expect("change the source");
+
+    // Paused and resumed again, the held job is superseded, and the second
+    // rebuild runs past the hold, goes live and records its coverage.
+    pause_and_resume().await;
+    client
+        .batch_execute("delete from public.hold_armed")
+        .await
+        .expect("disarm the hold");
+    publication::settle_registrations(&db.pool).await;
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+    let read_a = async |client: &Client| -> String {
+        client
+            .query_one("select total::text from sku_totals where sku = 'a'", &[])
+            .await
+            .expect("read sku_totals")
+            .get(0)
+    };
+    assert_eq!(read_a(&client).await, "1012", "the rebuild read the change");
+
+    // The superseded job now writes its old read on top, and gives up its
+    // claim, which discards it and parks the source's catch-up.
+    client
+        .query_one("select pg_advisory_unlock($1)", &[&HOLD_LOCK])
+        .await
+        .expect("release the superseded job");
+    old_build
+        .await
+        .expect("superseded build task")
+        .expect("the superseded job's build runs to the end");
+    chunk_queue::finish_chunk(&db.pool, &superseded[0], OLD_WORKER)
+        .await
+        .expect("give up the superseded job");
+    client
+        .batch_execute("drop event trigger hold_direct_build")
+        .await
+        .expect("drop the build hold");
+    assert_eq!(
+        pending_markers(&client).await,
+        vec!["public.sales".to_string()],
+        "discarding the superseded job parks the source's catch-up"
+    );
+    client
+        .batch_execute("select txid_current()")
+        .await
+        .expect("consume an xid");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(
+        read_a(&client).await,
+        "1012",
+        "the catch-up re-derives what the superseded job overwrote"
+    );
+}
