@@ -888,8 +888,8 @@ pub(crate) async fn run_pending_backfills_until(
                 break;
             }
             Err(error) => {
-                // The maintenance loop only asks `is_err()` of this pass, so
-                // this is the one place the failure is reported.
+                // The maintenance loop logs this pass's error too (issue
+                // #408), but only this report names the table.
                 tracing::warn!(
                     table = %marker.table,
                     error = %error,
