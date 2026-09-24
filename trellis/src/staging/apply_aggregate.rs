@@ -4093,6 +4093,121 @@ mod tests {
         );
     }
 
+    /// Issue #445 review: one forced batch mixing every NULL pattern of a
+    /// composite `GROUP BY`, so [`keyset_match`]/[`keyset_match_source`]
+    /// render several `or`ed arms in all three of
+    /// [`apply_forced_groups_bulk`]'s statements (the survivor probe, the
+    /// `insert ... select` recompute and the extinct `delete ... using`).
+    /// Each group must match only its own rows: a survivor's sum counts no
+    /// other group's source rows, and the delete (which appends `and k.ord =
+    /// any(...)` to the match) removes only the extinct groups' rows, not a
+    /// survivor's or a bystander's.
+    #[tokio::test]
+    async fn apply_forced_groups_bulk_keeps_each_null_pattern_to_its_own_rows() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table items (id integer primary key, g integer, h text, amount numeric); \
+                 create table summary (g integer, h text, total numeric, \
+                   __total_count bigint, __trellis_recompute_lsn pg_lsn, \
+                   unique nulls not distinct (g, h)); \
+                 insert into items values \
+                   (1, 1, 'a', 1), (2, 1, 'a', 2), (3, null, 'a', 5), (4, 1, null, 7), \
+                   (5, 3, 'c', 100); \
+                 insert into summary (g, h, total, __total_count) values \
+                   (1, 'a', 99, 1), (null, 'a', 99, 1), (null, null, 99, 1), \
+                   (2, 'b', 99, 1), (3, 'c', 42, 1)",
+            )
+            .await
+            .expect("seed source and stale target rows");
+        let plan = AggregateTargetPlan::new(
+            &[
+                crate::defs::ast::GroupByKey::Column("g".to_string()),
+                crate::defs::ast::GroupByKey::Column("h".to_string()),
+            ],
+            vec![
+                ValueType::Integer(crate::integer::IntWidth::Int4),
+                ValueType::Text,
+            ],
+            vec![AggFieldPlan {
+                name: "total".to_string(),
+                value_type: ValueType::Numeric,
+                kind: AggFieldKind::Sum,
+            }],
+            "items".to_string(),
+            "summary".to_string(),
+            HashMap::from([(
+                "total".to_string(),
+                Expr::FunctionCall {
+                    name: "SUM".to_string(),
+                    args: vec![Expr::Column("amount".to_string())],
+                },
+            )]),
+            Vec::new(),
+        );
+        let value = |v: Option<&str>| v.map(str::to_string);
+        // (label, g, h): three survivors and two extinct groups, spanning
+        // all four NULL patterns. `(3, 'c')` is a bystander, not in the batch.
+        let specs = [
+            ("1|a", Some("1"), Some("a")),
+            ("_|a", None, Some("a")),
+            ("1|_", Some("1"), None),
+            ("_|_", None, None),
+            ("2|b", Some("2"), Some("b")),
+        ];
+        let keys: Vec<String> = specs.iter().map(|(k, _, _)| k.to_string()).collect();
+        let groups: Vec<GroupPlan> = specs
+            .iter()
+            .map(|(_, g, h)| {
+                let mut group = GroupPlan::new(vec![value(*g), value(*h)]);
+                group.force_full_recompute = true;
+                group
+            })
+            .collect();
+        let forced: Vec<(&String, &GroupPlan)> = keys.iter().zip(&groups).collect();
+
+        let txn = client.transaction().await.expect("begin");
+        let (written, deleted) = apply_forced_groups_bulk(&txn, "summary", &plan, &forced)
+            .await
+            .expect("bulk apply");
+        txn.commit().await.expect("commit");
+
+        let labels = |touched: &[TouchedGroup]| -> Vec<String> {
+            let mut labels: Vec<String> = touched.iter().map(|(k, _, _)| k.clone()).collect();
+            labels.sort();
+            labels
+        };
+        assert_eq!(labels(&written), vec!["1|_", "1|a", "_|a"]);
+        assert_eq!(labels(&deleted), vec!["2|b", "_|_"]);
+        let rows: Vec<(Option<i32>, Option<String>, String)> = client
+            .query(
+                "select g, h, total::text from summary order by g nulls first, h nulls first",
+                &[],
+            )
+            .await
+            .expect("read summary")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (None, Some("a".to_string()), "5".to_string()),
+                (Some(1), None, "7".to_string()),
+                (Some(1), Some("a".to_string()), "3".to_string()),
+                (Some(3), Some("c".to_string()), "42".to_string()),
+            ],
+            "each survivor sums only its own rows; only the extinct groups are deleted"
+        );
+    }
+
     /// Issue #445: [`keyset_match`] renders one arm per [`null_patterns`]
     /// entry. A batch with no NULL key keeps the plain `=` conjunction; a
     /// NULL column matches with `is null` on both sides (so no other
