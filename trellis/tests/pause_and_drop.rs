@@ -1903,3 +1903,104 @@ async fn dropping_a_relationship_drops_its_projection_from_the_declaring_target_
     declaring.shutdown().await.expect("shut down");
     dropping.shutdown().await.expect("shut down");
 }
+
+/// `V41__relationship_projections_schema.sql` backfills `projection_schema`
+/// from `pg_class`, and a projection's name (`_trellis_rel_projection_<id>`) is
+/// only unique within one catalog: another Trellis instance in the same
+/// database, with its own target schema, has its own `_trellis_rel_projection_1`.
+/// Before V41 every reader looked for the projection in its own connection's
+/// target schema, so the backfill must prefer the migrating connection's
+/// `search_path` (instance schema, then target schema) over a same-named table
+/// elsewhere, and only fall back to the one table of that name outside it (a
+/// relationship declared through a connection with a different target schema).
+///
+/// Replays the migration's own SQL after dropping the column it adds.
+#[tokio::test]
+async fn the_v41_backfill_prefers_the_migrating_connections_target_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create schema another_instance; create schema elsewhere; \
+         create table authors (id bigint primary key, name text); \
+         create table posts (id bigint primary key, author bigint, editor bigint); \
+         alter table authors replica identity full; \
+         alter table posts replica identity full;",
+    )
+    .await
+    .expect("seed a from/to pair and two other schemas");
+
+    let local = define_only(db.dsn()).await;
+    local
+        .apply("RELATIONSHIP author FROM posts.author TO authors.id")
+        .await
+        .expect("declare a to-one relationship in the default target schema");
+    let declaring_elsewhere = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string())
+            .expect("valid dsn")
+            .with_target_schema("elsewhere")
+            .expect("valid target schema"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis targeting `elsewhere`");
+    declaring_elsewhere
+        .apply("RELATIONSHIP editor FROM posts.editor TO authors.id")
+        .await
+        .expect("declare a to-one relationship in `elsewhere`");
+
+    // Created after the real one, so it isn't first in `pg_class` either.
+    raw.batch_execute("create table another_instance._trellis_rel_projection_1 (id bigint)")
+        .await
+        .expect("seed another instance's same-named projection");
+
+    async fn schemas(raw: &Client) -> Vec<(String, String, String)> {
+        raw.query(
+            "select r.name, p.projection_table, p.projection_schema \
+             from relationship_projections p \
+             join relationship_definitions r on r.id = p.relationship_id \
+             order by r.name",
+            &[],
+        )
+        .await
+        .expect("read the projection catalog")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+    }
+    let before = schemas(&raw).await;
+    assert_eq!(
+        before,
+        vec![
+            (
+                "author".to_string(),
+                "_trellis_rel_projection_1".to_string(),
+                "public".to_string()
+            ),
+            (
+                "editor".to_string(),
+                "_trellis_rel_projection_2".to_string(),
+                "elsewhere".to_string()
+            ),
+        ],
+        "each projection records the schema it was created in"
+    );
+
+    raw.batch_execute("alter table relationship_projections drop column projection_schema")
+        .await
+        .expect("undo V41's column");
+    raw.batch_execute(include_str!(
+        "../migrations/V41__relationship_projections_schema.sql"
+    ))
+    .await
+    .expect("replay V41");
+    assert_eq!(
+        schemas(&raw).await,
+        before,
+        "the backfill must find each projection where it was created, not another \
+         instance's same-named table"
+    );
+
+    local.shutdown().await.expect("shut down");
+    declaring_elsewhere.shutdown().await.expect("shut down");
+}
