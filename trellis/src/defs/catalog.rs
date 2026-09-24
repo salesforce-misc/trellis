@@ -810,7 +810,7 @@ pub async fn install_definition(
         KeySpace::OneToOne => {
             // Issue #121: the 1-1 target table's own primary key mirrors the
             // source's in full — at whatever arity the source declares it —
-            // rather than narrowing to a single column. `create_target_table`
+            // rather than narrowing to a single column. `target_table_ddl`
             // renders a composite `pk` as a real, multi-column `primary key
             // (...)` constraint.
             let pk = ddl::source_primary_key(pool, &qualified_source)
@@ -2029,31 +2029,18 @@ async fn create_definition_inner(
     let resolved_target_schema = effective_target_schema(&def, target_schema);
     let qualified_target =
         crate::intake::publication::qualify(resolved_target_schema, &def.target)?;
-    match target_ddl {
-        // Issue #440: registration creates the target here, in the
-        // transaction that records the definition, so every later failure in
-        // this function rolls the table back with the catalog row.
-        Some(ddl) => {
-            create_target_in_txn(
-                &txn,
-                resolved_target_schema,
-                &def.target,
-                &qualified_target,
-                ddl,
-            )
-            .await?;
+    // The test-fixture entry points (`target_ddl` is `None`) register against
+    // a target their caller already created; `install_definition` creates it
+    // below, after every check on the definition itself (issue #440).
+    if target_ddl.is_none()
+        && let Some(schema) = &def.explicit_target_schema
+        && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
+    {
+        return Err(ValidationError::QualifiedTargetTableNotFound {
+            schema: schema.clone(),
+            table: def.target.clone(),
         }
-        None => {
-            if let Some(schema) = &def.explicit_target_schema
-                && !confirm_qualified_table_exists_in_txn(&txn, schema, &def.target).await?
-            {
-                return Err(ValidationError::QualifiedTargetTableNotFound {
-                    schema: schema.clone(),
-                    table: def.target.clone(),
-                }
-                .into());
-            }
-        }
+        .into());
     }
 
     // Issue #129, epic #127: before this definition is persisted, widen the
@@ -2191,7 +2178,7 @@ async fn create_definition_inner(
     // source with no primary key at all, or an unsafe-to-key-on primary key
     // type, before the definition is persisted — a composite (multi-column) source
     // primary key is no longer rejected here: it mirrors onto the target as
-    // a real composite primary key (`ddl::create_target_table`), and every
+    // a real composite primary key (`ddl::target_table_ddl`), and every
     // 1-1 consumer downstream (backfill, live CDC apply, quarantine,
     // self-check) now renders/compares it through the shared, arity-generic
     // key-contract text instead of assuming a single scalar column.
@@ -2232,6 +2219,24 @@ async fn create_definition_inner(
     // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
     reject_unkeyed_source(&*txn, &qualified_source).await?;
+
+    // Issue #440: registration creates the target here, in the transaction
+    // that records the definition, so a failure anywhere after this rolls the
+    // table back with the catalog row. Placed after every check on the
+    // definition itself, so a definition that's wrong in its own right (a
+    // table cycle, a target-suffix collision, an unkeyed source) reports
+    // that, not the incidental fact that its target name is taken: a
+    // cycle-closing target always already exists as a table.
+    if let Some(ddl) = target_ddl {
+        create_target_in_txn(
+            &txn,
+            resolved_target_schema,
+            &def.target,
+            &qualified_target,
+            ddl,
+        )
+        .await?;
+    }
 
     let version: i64 = txn
         .query_one(
@@ -2320,8 +2325,8 @@ async fn create_definition_inner(
 /// does another definition's target: that one is Trellis's own, but it
 /// belongs to that definition, not this one. The check is a clean error for
 /// the common case; a concurrent registration that creates the same name
-/// between the check and the `create table` fails the DDL with
-/// `duplicate_table`, which maps to the same error.
+/// between the check and the `create table` fails the DDL instead, which
+/// [`is_relation_name_taken`] maps to the same error.
 async fn create_target_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
@@ -2334,7 +2339,9 @@ async fn create_target_in_txn(
     };
     let exists: bool = txn
         .query_one(
-            "select exists (select 1 from pg_catalog.pg_class c              join pg_catalog.pg_namespace n on n.oid = c.relnamespace              where n.nspname = $1 and c.relname = $2)",
+            "select exists (select 1 from pg_catalog.pg_class c \
+             join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = $1 and c.relname = $2)",
             &[&schema, &table],
         )
         .await?
@@ -2344,11 +2351,26 @@ async fn create_target_in_txn(
     }
     match txn.batch_execute(ddl).await {
         Ok(()) => Ok(()),
-        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_TABLE) => {
-            Err(already_exists())
-        }
+        Err(err) if is_relation_name_taken(&err) => Err(already_exists()),
         Err(err) => Err(CatalogError::Ddl(err.into())),
     }
+}
+
+/// Whether a failed `create table` failed because its name was taken.
+/// `duplicate_table` covers a relation that was already visible; a
+/// concurrent creator that committed while this `create table` waited on it
+/// instead trips the unique index on `pg_type` (or `pg_class`) directly, as a
+/// plain `unique_violation` naming that system index.
+fn is_relation_name_taken(err: &tokio_postgres::Error) -> bool {
+    let Some(db_err) = err.as_db_error() else {
+        return false;
+    };
+    *db_err.code() == tokio_postgres::error::SqlState::DUPLICATE_TABLE
+        || (*db_err.code() == tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+            && matches!(
+                db_err.constraint(),
+                Some("pg_type_typname_nsp_index" | "pg_class_relname_nsp_index")
+            ))
 }
 
 /// Whether `err` is a unique-violation against
@@ -3234,7 +3256,7 @@ fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) ->
 
 /// Pooled (non-transaction) counterpart to [`resolve_source_schema_in_txn`],
 /// for [`install_definition`]'s own DDL/direct-build steps ([`ddl::source_primary_key`],
-/// [`ddl::create_target_table`], [`backfill::backfill_definition`]), which
+/// [`ddl::target_table_ddl`], [`backfill::backfill_definition`]), which
 /// run on plain pooled connections
 /// before that function's own [`create_definition_inner`] call opens a
 /// transaction and computes its own, independent, authoritative copy —
@@ -3261,7 +3283,7 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// steps read from (issue #76, ADR-0007 grammar clause 4) — computed once,
 /// early in that function, exactly like `target_schema`/[`effective_target_schema`]
 /// immediately above it, and threaded through every one of those steps
-/// (`ddl::source_primary_key`, `ddl::create_target_table`,
+/// (`ddl::source_primary_key`, `ddl::target_table_ddl`,
 /// `backfill::backfill_definition`) so none of them can independently
 /// re-derive a different answer, and so every physical SQL builder among them
 /// emits the qualified identity rather than a bare `def.source` left to the
