@@ -2238,13 +2238,16 @@ fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
 /// terms rule out every other), so this is exactly `is not distinct from` on
 /// every column.
 ///
-/// Never `is not distinct from` itself: that is neither hashable nor
-/// indexable, so a batch with one `NULL` key used to nested-loop over a
-/// sequential scan of the target (issue #445), and of the source before
-/// that (the O(table_size²/…) blowup behind issues #59/#62, which `=`'s Hash
-/// Join avoids). A batch with no `NULL` key renders the plain `=`
-/// conjunction; one with several patterns lets Postgres probe the target's
-/// `UNIQUE NULLS NOT DISTINCT` index once per arm through a `BitmapOr`.
+/// Never `is not distinct from` itself: that is not indexable, so a batch
+/// with one `NULL` key used to nested-loop over a sequential scan of the
+/// target (issue #445). A batch with no `NULL` key renders the plain `=`
+/// conjunction, which a source-side join can also hash (issues #59/#62);
+/// one with several patterns lets Postgres probe the target's `UNIQUE NULLS
+/// NOT DISTINCT` index once per arm through a `BitmapOr`. The `or`ed form
+/// is no more hashable than `is not distinct from` was, though (a column
+/// `=` in every arm is factored out and hashed, the rest is not), so
+/// against a source with no index on its `GROUP BY` columns a batch with a
+/// `NULL` key still nested-loops over the source, as before.
 ///
 /// One `or`ed condition rather than #433's `union all` of per-pattern arms
 /// because every statement this feeds must stay a single statement: the
