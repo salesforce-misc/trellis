@@ -237,7 +237,11 @@ unconfirmed. This is what keeps the join step gap-free.
   follow-up under #415.
 - **`backfill_coverage` becomes an optimization at most.** It lets a catch-up
   skip re-reading a table that provably hasn't changed since a build read it. No
-  path depends on it for correctness.
+  path depends on it for correctness. A build records it only once every
+  streamed change from before its fence has drained
+  (`staging::converge::table_drained_through`, #442). One still in flight would
+  fold into the `live` definition on top of the build's own read of it, and
+  only the catch-up's re-derivation corrects that.
 
 ## Inventory of capture paths
 

@@ -725,6 +725,10 @@ pub async fn create_definition_without_backfill(
 /// so no build path can have a live CDC delta folded into it while it is
 /// still being built. A delta skipped during that window is recovered rather
 /// than lost by the catch-up marker parked when the definition goes live.
+/// The reverse, a delta the build already read that drains only after the
+/// flip and folds in a second time, is corrected by the same catch-up's
+/// re-derivation; the build records no coverage that would let it skip that
+/// table (issue #442, [`commit_direct_backfill_coverage`]).
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -900,7 +904,10 @@ pub async fn install_definition(
             // The build folded each planned table's pre-build contents into the
             // target. Persist that coverage *before* the definition is marked
             // live, so the redundant publication-join catch-up enumeration of
-            // those tables can be skipped.
+            // those tables can be skipped. A table with a streamed change the
+            // build read still in flight gets no coverage (issue #442): that
+            // delta folds in again after the flip, and only the catch-up's
+            // re-derivation corrects it.
             commit_direct_backfill_coverage(pool, &coverage_plan).await?;
             // Issues #315/#430: the apply path skipped this definition while
             // it sat `backfilling`, so a change to any table the build read
@@ -1288,6 +1295,17 @@ async fn plan_direct_backfill_coverage(
 /// Persists a [`plan_direct_backfill_coverage`] result once the direct build
 /// has succeeded (issue #79, bug B), in one transaction so the whole plan lands
 /// atomically.
+///
+/// A fence is recorded only if every streamed change to its table from a
+/// commit the fence saw has already drained (issue #442,
+/// [`crate::staging::converge::table_drained_through`]). Those drains ran
+/// while the definition wasn't `live`, so they skipped it, and the build read
+/// the commits instead. A change still in flight is different: the build read
+/// it, and its delta will be folded in again once the definition goes live.
+/// For an aggregate that counts it twice, and only the go-live catch-up's
+/// re-derivation of the group corrects it, so the table's coverage is cleared
+/// instead and the catch-up enumerates it. Nothing can join the in-flight set
+/// after this check: intake has already staged through the fence's horizon.
 async fn commit_direct_backfill_coverage(
     pool: &Pool,
     plans: &[CoveragePlan],
@@ -1297,8 +1315,18 @@ async fn commit_direct_backfill_coverage(
     for plan in plans {
         match plan {
             CoveragePlan::Record { qualified, fence } => {
-                crate::intake::publication::write_backfill_coverage(&*txn, qualified, fence)
-                    .await?;
+                let drained = crate::staging::converge::table_drained_through(
+                    &*txn,
+                    qualified,
+                    fence.horizon,
+                )
+                .await?;
+                if drained {
+                    crate::intake::publication::write_backfill_coverage(&*txn, qualified, fence)
+                        .await?;
+                } else {
+                    crate::intake::publication::clear_backfill_coverage(&*txn, qualified).await?;
+                }
             }
             CoveragePlan::Clear { qualified } => {
                 crate::intake::publication::clear_backfill_coverage(&*txn, qualified).await?;

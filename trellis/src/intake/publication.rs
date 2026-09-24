@@ -553,6 +553,12 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
 pub struct CoverageFence {
     pub fence: String,
     pub count: i64,
+    /// The WAL insert position read in the same statement, after its snapshot
+    /// was taken: every commit `fence` sees ends at or before it. Not
+    /// persisted; the build uses it to check that no streamed change it read
+    /// is still waiting to drain when it goes live (issue #442,
+    /// [`crate::staging::converge::table_drained_through`]).
+    pub horizon: PgLsn,
 }
 
 /// Captures the fence snapshot and row count for `qualified_table` in one
@@ -577,7 +583,8 @@ pub async fn capture_backfill_coverage_fence(
     let row = client
         .query_one(
             &format!(
-                "select count(*)::bigint, pg_current_snapshot()::text from {}.{}",
+                "select count(*)::bigint, pg_current_snapshot()::text, \
+                 pg_current_wal_insert_lsn() from {}.{}",
                 quote_ident(schema),
                 quote_ident(table)
             ),
@@ -587,6 +594,7 @@ pub async fn capture_backfill_coverage_fence(
     Ok(CoverageFence {
         count: row.get(0),
         fence: row.get(1),
+        horizon: row.get(2),
     })
 }
 

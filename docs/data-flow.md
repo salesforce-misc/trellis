@@ -183,8 +183,9 @@ call), execute on drain threads.
   same path, re-derives the definition from the source's current state, which
   for an aggregate also corrects a change the build read whose streamed delta
   was folded again after the flip. A `backfill_coverage` record can let a catch-up
-  skip re-reading a table that provably hasn't changed since the build. That
-  saves work but never decides correctness.
+  skip re-reading a table that provably hasn't changed since the build, so a
+  build records one only when no streamed change it read is still waiting to
+  drain (#442). That saves work but never decides correctness.
 - **A resumed target drops rows its source no longer backs.** Before the read,
   the discharge deletes every row of a dispatched definition's target that no
   current source row backs (#330, `intake::resume_orphans`), since the read

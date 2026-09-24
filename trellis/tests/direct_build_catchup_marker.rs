@@ -13,6 +13,11 @@
 //! event trigger (see [`install_build_hold`]) that blocks on an advisory lock
 //! the test holds. While the build is parked there, the test commits a change,
 //! stages its CDC row and drains it, then lets the build finish.
+//!
+//! Issue #442 is the reverse case: a change committed before the build's
+//! coverage fence whose delta drains only after go-live, and is folded in on
+//! top of the build's own read of it. Those tests check the build keeps its
+//! coverage record only when nothing it read can still arrive that way.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -252,6 +257,214 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         vec!["public.sales".to_string()],
         "going live parks a catch-up marker on the source, as the chunked path does"
     );
+}
+
+/// Issue #442: a change committed *before* the build's coverage fence, whose
+/// CDC is still undrained when the definition goes live. The build reads the
+/// change and the drain folds its delta in again after the flip. The fence
+/// sees every row, so a coverage record would let the go-live catch-up skip
+/// the re-derivation that corrects the double fold, and the group would stay
+/// at `2012`.
+#[tokio::test]
+async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_go_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.sales (id integer primary key, sku text, amount integer); \
+             alter table public.sales replica identity full; \
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
+        )
+        .await
+        .expect("create + seed sales");
+    commit_and_stage_insert(
+        &mut client,
+        "insert into public.sales values (4, 'a', 1000)",
+        "public.sales",
+        "4",
+        r#"{"id":"4","sku":"a","amount":"1000"}"#,
+    )
+    .await;
+
+    let definition = install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("sku", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    assert_eq!(definition.status, TransformStatus::Live);
+
+    let covered: bool = client
+        .query_one(
+            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
+            &[],
+        )
+        .await
+        .expect("read backfill_coverage")
+        .get(0);
+    assert!(
+        !covered,
+        "the build's source still had undrained CDC from before its fence, \
+         so its coverage must not let the catch-up skip re-deriving"
+    );
+
+    drain_to_quiescence(&db.pool, &mut client).await;
+    discharge_markers(&db.pool, &mut client).await;
+
+    let total: String = client
+        .query_one("select total::text from sku_totals where sku = 'a'", &[])
+        .await
+        .expect("read sku_totals")
+        .get(0);
+    assert_eq!(
+        total, "1012",
+        "the pre-fence change is counted once, not by both the build and its drained delta"
+    );
+}
+
+/// The quiet-source counterpart: nothing is in flight for the source when the
+/// build goes live, so the coverage record stands and the catch-up skips
+/// re-reading the source (issue #79's optimization is kept).
+#[tokio::test]
+async fn aggregate_build_on_a_quiet_source_keeps_its_coverage() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.sales (id integer primary key, sku text, amount integer); \
+             alter table public.sales replica identity full; \
+             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
+        )
+        .await
+        .expect("create + seed sales");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("sku", ValueType::Text),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+
+    let covered: bool = client
+        .query_one(
+            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
+            &[],
+        )
+        .await
+        .expect("read backfill_coverage")
+        .get(0);
+    assert!(
+        covered,
+        "nothing was in flight, so the coverage record stands"
+    );
+}
+
+/// Issue #442, the intake half: with a slot in place, a change the build read
+/// may not have been staged yet at all, so the ring alone can't show it has
+/// drained. Coverage stands only once intake's durable progress has passed the
+/// fence.
+#[tokio::test]
+async fn aggregate_build_keeps_coverage_only_once_intake_has_passed_its_fence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.sales (id integer primary key, sku text, amount integer); \
+             create table public.refunds (id integer primary key, sku text, amount integer); \
+             alter table public.sales replica identity full; \
+             alter table public.refunds replica identity full; \
+             insert into public.sales values (1, 'a', 5); \
+             insert into public.refunds values (1, 'a', 3)",
+        )
+        .await
+        .expect("create + seed sources");
+    // Its own statement: a slot can't be created in a transaction that wrote.
+    client
+        .execute(
+            "select pg_create_logical_replication_slot('coverage_442', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create a slot");
+    client
+        .execute(
+            "insert into replication_progress (slot_name, confirmed_lsn) \
+             values ('coverage_442', '0/0')",
+            &[],
+        )
+        .await
+        .expect("record the slot's lagging progress");
+    let cols = columns(&[
+        ("id", ValueType::Numeric),
+        ("sku", ValueType::Text),
+        ("amount", ValueType::Numeric),
+    ]);
+    let covered = |table: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "select exists (select 1 from backfill_coverage where table_name = $1)",
+                    &[&table],
+                )
+                .await
+                .expect("read backfill_coverage")
+                .get::<_, bool>(0)
+        }
+    };
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_sales FROM sales GROUP BY sku SELECT sum(amount) AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install behind a lagging intake");
+    assert!(
+        !covered("public.sales").await,
+        "intake hasn't staged through the fence, so a change the build read may still stream"
+    );
+
+    client
+        .execute(
+            "update replication_progress set confirmed_lsn = 'FFFFFFFF/FFFFFFFF'",
+            &[],
+        )
+        .await
+        .expect("move intake past any fence");
+    install_definition(
+        &db.pool,
+        "TRANSFORM sku_refunds FROM refunds GROUP BY sku SELECT sum(amount) AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("install behind a caught-up intake");
+    assert!(
+        covered("public.refunds").await,
+        "intake is past the fence and nothing is pending, so the coverage stands"
+    );
+
+    client
+        .execute("select pg_drop_replication_slot('coverage_442')", &[])
+        .await
+        .expect("drop the slot");
 }
 
 /// The relationship-enriched 1-1 shape, with the change on a relationship's
