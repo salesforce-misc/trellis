@@ -14,11 +14,14 @@
 //! the test holds. While the build is parked there, the test commits a change,
 //! stages its CDC row and drains it, then lets the build finish.
 //!
-//! Issue #442 is the reverse case: a change committed before the build's
-//! coverage fence whose delta drains only after go-live, and is folded in on
-//! top of the build's own read of it. Those tests check the build keeps its
-//! coverage record only when no change from before its fence can still
-//! arrive that way.
+//! Issue #442 is the reverse case: a change the build read whose delta drains
+//! only after go-live, on top of the build's own count of it. For an
+//! aggregate the recompute horizon the build stamps on each group row sends
+//! that delta to re-derive its group. The build still records its coverage,
+//! which may let the go-live catch-up skip the source, so those tests check
+//! the target before the catch-up runs: the horizon alone must keep it
+//! right, however the late delta arrives (still in the ring, staged late by
+//! a lagging intake, or released from quarantine).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -27,7 +30,9 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{ValueType, chunk_queue, create_relationship, install_definition};
+use trellis::defs::{
+    TransformStatus, ValueType, chunk_queue, create_relationship, install_definition,
+};
 use trellis::intake::publication;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -171,7 +176,15 @@ async fn commit_and_stage_insert(
         .await
         .expect("read the write's lsn")
         .get(0);
-    let change = StagedChange::Cdc {
+    trellis::staging::append(&txn, &[cdc_insert(src_table, key, lsn, new_image)])
+        .await
+        .expect("stage the change's CDC row");
+    txn.commit().await.expect("commit source write");
+}
+
+/// The CDC insert intake would stage for a write at `lsn`.
+fn cdc_insert(src_table: &str, key: &str, lsn: PgLsn, new_image: &str) -> StagedChange {
+    StagedChange::Cdc {
         src_table: src_table.to_string(),
         key: key.to_string(),
         op: CdcOp::Insert,
@@ -182,11 +195,7 @@ async fn commit_and_stage_insert(
         src_changed: None,
         hop_gen: 0,
         group_key: None,
-    };
-    trellis::staging::append(&txn, &[change])
-        .await
-        .expect("stage the change's CDC row");
-    txn.commit().await.expect("commit source write");
+    }
 }
 
 /// The #416 reviewer's repro: an aggregate build on an already-published
@@ -268,17 +277,8 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     );
 }
 
-/// Issue #442: a change committed *before* the build's coverage fence, whose
-/// CDC is still undrained when the definition goes live. The build reads the
-/// change and the drain folds its delta in again after the flip. The fence
-/// sees every row, so a coverage record would let the go-live catch-up skip
-/// the re-derivation that corrects the double fold, and the group would stay
-/// at `2012`.
-#[tokio::test]
-async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_go_live() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+/// `public.sales`, seeded with `sku = 'a'` totalling `12`.
+async fn seed_sales(client: &Client) {
     client
         .batch_execute(
             "create table public.sales (id integer primary key, sku text, amount integer); \
@@ -287,76 +287,16 @@ async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_
         )
         .await
         .expect("create + seed sales");
-    commit_and_stage_insert(
-        &mut client,
-        "insert into public.sales values (4, 'a', 1000)",
-        "public.sales",
-        "4",
-        r#"{"id":"4","sku":"a","amount":"1000"}"#,
-    )
-    .await;
-
-    let definition = install_definition(
-        &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
-        &columns(&[
-            ("id", ValueType::Numeric),
-            ("sku", ValueType::Text),
-            ("amount", ValueType::Numeric),
-        ]),
-        "public",
-    )
-    .await
-    .expect("install the aggregate");
-    assert_eq!(definition.status, TransformStatus::Live);
-
-    let covered: bool = client
-        .query_one(
-            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
-            &[],
-        )
-        .await
-        .expect("read backfill_coverage")
-        .get(0);
-    assert!(
-        !covered,
-        "the build's source still had undrained CDC from before its fence, \
-         so its coverage must not let the catch-up skip re-deriving"
-    );
-
-    drain_to_quiescence(&db.pool, &mut client).await;
-    discharge_markers(&db.pool, &mut client).await;
-
-    let total: String = client
-        .query_one("select total::text from sku_totals where sku = 'a'", &[])
-        .await
-        .expect("read sku_totals")
-        .get(0);
-    assert_eq!(
-        total, "1012",
-        "the pre-fence change is counted once, not by both the build and its drained delta"
-    );
 }
 
-/// The quiet-source counterpart: nothing is in flight for the source when the
-/// build goes live, so the coverage record stands and the catch-up skips
-/// re-reading the source (issue #79's optimization is kept).
-#[tokio::test]
-async fn aggregate_build_on_a_quiet_source_keeps_its_coverage() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table public.sales (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2)",
-        )
-        .await
-        .expect("create + seed sales");
-
-    install_definition(
-        &db.pool,
+/// Registers `sku_totals` over `public.sales` and runs its direct build to
+/// go-live, as the discharge and a drain thread would (ADR-0016, #419).
+/// Checks the build recorded its coverage of the source: the go-live
+/// catch-up may then skip re-deriving it, so whatever keeps the target right
+/// afterwards is not that catch-up.
+async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
+    let definition = install_definition(
+        pool,
         "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
         &columns(&[
             ("id", ValueType::Numeric),
@@ -367,6 +307,13 @@ async fn aggregate_build_on_a_quiet_source_keeps_its_coverage() {
     )
     .await
     .expect("install the aggregate");
+    assert_eq!(
+        definition.status,
+        TransformStatus::WaitingToBackfill,
+        "registration only records the definition; the build is a background job"
+    );
+    publication::settle_registrations(pool).await;
+    assert_eq!(status_of(client, "public.sku_totals").await, "live");
 
     let covered: bool = client
         .query_one(
@@ -378,156 +325,125 @@ async fn aggregate_build_on_a_quiet_source_keeps_its_coverage() {
         .get(0);
     assert!(
         covered,
-        "nothing was in flight, so the coverage record stands"
+        "the build is the source's sole reader, so it records its coverage"
     );
 }
 
-/// Issue #442, the quarantine half: a pre-fence change parked in
-/// `poison_held` has drained out of the ring, but releasing its key replays
-/// it into the now-`live` definition on top of the build's own read, so it
-/// counts as still in flight and the coverage is cleared.
+async fn total_of_sku_a(client: &Client) -> String {
+    client
+        .query_one("select total::text from sku_totals where sku = 'a'", &[])
+        .await
+        .expect("read sku_totals")
+        .get(0)
+}
+
+/// Drains everything staged, then discharges the go-live catch-up, checking
+/// `sku = 'a'` counts the change the build read once at both points. The
+/// first check is the one that matters: it runs before the catch-up could
+/// re-derive anything, so only the recompute horizon the build stamped on
+/// the group can have kept the drained delta from counting the change again.
+async fn assert_the_read_change_is_counted_once(pool: &trellis::Pool, client: &mut Client) {
+    drain_to_quiescence(pool, client).await;
+    assert_eq!(
+        total_of_sku_a(client).await,
+        "1012",
+        "the change the build read is counted once, not again by its drained delta"
+    );
+    discharge_markers(pool, client).await;
+    assert_eq!(total_of_sku_a(client).await, "1012");
+}
+
+/// Issue #442: a change committed *before* the build reads the source, whose
+/// CDC is still undrained when the definition goes live. The build counts the
+/// change, and folding its delta in as well would leave the group at `2012`.
+/// The recompute horizon the build stamps on each group row it writes (#419)
+/// is above the change's LSN, so the delta re-derives the group instead.
 #[tokio::test]
-async fn aggregate_build_with_a_parked_pre_fence_change_clears_its_coverage() {
+async fn aggregate_build_does_not_double_count_a_pre_fence_change_drained_after_go_live() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table public.sales (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
-             insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), \
-                                             (4, 'a', 1000)",
-        )
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    commit_and_stage_insert(
+        &mut client,
+        "insert into public.sales values (4, 'a', 1000)",
+        "public.sales",
+        "4",
+        r#"{"id":"4","sku":"a","amount":"1000"}"#,
+    )
+    .await;
+
+    build_sku_totals_to_go_live(&db.pool, &client).await;
+    assert_the_read_change_is_counted_once(&db.pool, &mut client).await;
+}
+
+/// Issue #442, the intake half: with intake lagging, a change the build read
+/// may not have been staged at all by the time the definition goes live. Its
+/// CDC reaches the ring only after the flip, carrying its original commit
+/// position, and meets the same recompute horizon.
+#[tokio::test]
+async fn aggregate_build_does_not_double_count_a_read_change_intake_stages_after_go_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
+    let txn = client.transaction().await.expect("begin source write");
+    txn.batch_execute("insert into public.sales values (4, 'a', 1000)")
         .await
-        .expect("create + seed sales");
+        .expect("source write");
+    let lsn: PgLsn = txn
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the write's lsn")
+        .get(0);
+    txn.commit().await.expect("commit source write");
+
+    build_sku_totals_to_go_live(&db.pool, &client).await;
+
+    let txn = client.transaction().await.expect("begin late staging");
+    trellis::staging::append(
+        &txn,
+        &[cdc_insert(
+            "public.sales",
+            "4",
+            lsn,
+            r#"{"id":"4","sku":"a","amount":"1000"}"#,
+        )],
+    )
+    .await
+    .expect("stage the change's CDC row after go-live");
+    txn.commit().await.expect("commit late staging");
+    assert_the_read_change_is_counted_once(&db.pool, &mut client).await;
+}
+
+/// Issue #442, the quarantine half: a change from before the build, parked in
+/// `poison_held`, has left the ring, but releasing its key after go-live
+/// replays it into the now-`live` definition. Release keeps each replayed
+/// row's original LSN (doc 06), so the replay meets the build's recompute
+/// horizon like any other late delta.
+#[tokio::test]
+async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_released_after_go_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_sales(&client).await;
     client
         .batch_execute(
-            "insert into poison_held (src_table, key, seg_seq, op, lsn, new_image) \
+            "insert into public.sales values (4, 'a', 1000); \
+             insert into poison_held (src_table, key, seg_seq, op, lsn, new_image) \
              values ('public.sales', '4', 1, 'insert', pg_current_wal_insert_lsn(), \
                      '{\"id\":\"4\",\"sku\":\"a\",\"amount\":\"1000\"}')",
         )
         .await
-        .expect("park the pre-fence change");
+        .expect("commit the change and park its CDC");
 
-    install_definition(
-        &db.pool,
-        "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total",
-        &columns(&[
-            ("id", ValueType::Numeric),
-            ("sku", ValueType::Text),
-            ("amount", ValueType::Numeric),
-        ]),
-        "public",
-    )
-    .await
-    .expect("install the aggregate");
+    build_sku_totals_to_go_live(&db.pool, &client).await;
 
-    let covered: bool = client
-        .query_one(
-            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
-            &[],
-        )
+    let replayed = trellis::staging::release_key(&db.pool, "public.sales", "4")
         .await
-        .expect("read backfill_coverage")
-        .get(0);
-    assert!(
-        !covered,
-        "a parked pre-fence change replays on release, so the coverage must not stand"
-    );
-}
-
-/// Issue #442, the intake half: with a slot in place, a change the build read
-/// may not have been staged yet at all, so the ring alone can't show it has
-/// drained. Coverage stands only once intake's durable progress has passed the
-/// fence.
-#[tokio::test]
-async fn aggregate_build_keeps_coverage_only_once_intake_has_passed_its_fence() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-    client
-        .batch_execute(
-            "create table public.sales (id integer primary key, sku text, amount integer); \
-             create table public.refunds (id integer primary key, sku text, amount integer); \
-             alter table public.sales replica identity full; \
-             alter table public.refunds replica identity full; \
-             insert into public.sales values (1, 'a', 5); \
-             insert into public.refunds values (1, 'a', 3)",
-        )
-        .await
-        .expect("create + seed sources");
-    // Its own statement: a slot can't be created in a transaction that wrote.
-    client
-        .execute(
-            "select pg_create_logical_replication_slot('coverage_442', 'pgoutput')",
-            &[],
-        )
-        .await
-        .expect("create a slot");
-    client
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) \
-             values ('coverage_442', '0/0')",
-            &[],
-        )
-        .await
-        .expect("record the slot's lagging progress");
-    let cols = columns(&[
-        ("id", ValueType::Numeric),
-        ("sku", ValueType::Text),
-        ("amount", ValueType::Numeric),
-    ]);
-    let covered = |table: &'static str| {
-        let client = &client;
-        async move {
-            client
-                .query_one(
-                    "select exists (select 1 from backfill_coverage where table_name = $1)",
-                    &[&table],
-                )
-                .await
-                .expect("read backfill_coverage")
-                .get::<_, bool>(0)
-        }
-    };
-
-    install_definition(
-        &db.pool,
-        "TRANSFORM sku_sales FROM sales GROUP BY sku SELECT sum(amount) AS total",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install behind a lagging intake");
-    assert!(
-        !covered("public.sales").await,
-        "intake hasn't staged through the fence, so a change the build read may still stream"
-    );
-
-    client
-        .execute(
-            "update replication_progress set confirmed_lsn = 'FFFFFFFF/FFFFFFFF'",
-            &[],
-        )
-        .await
-        .expect("move intake past any fence");
-    install_definition(
-        &db.pool,
-        "TRANSFORM sku_refunds FROM refunds GROUP BY sku SELECT sum(amount) AS total",
-        &cols,
-        "public",
-    )
-    .await
-    .expect("install behind a caught-up intake");
-    assert!(
-        covered("public.refunds").await,
-        "intake is past the fence and nothing is pending, so the coverage stands"
-    );
-
-    client
-        .execute("select pg_drop_replication_slot('coverage_442')", &[])
-        .await
-        .expect("drop the slot");
+        .expect("release the parked key");
+    assert_eq!(replayed, 1);
+    assert_the_read_change_is_counted_once(&db.pool, &mut client).await;
 }
 
 /// The relationship-enriched 1-1 shape, with the change on a relationship's

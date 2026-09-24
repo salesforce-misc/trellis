@@ -700,12 +700,13 @@ pub async fn create_definition_without_backfill(
 /// so no build path can have a live CDC delta folded into it while it is
 /// still being built. A delta skipped during that window is recovered rather
 /// than lost by the catch-up marker parked when the definition goes live.
-/// The reverse, a delta the build already read that drains only after the
-/// flip and folds in a second time, is corrected by the same catch-up's
-/// re-derivation. For a change committed before the build's coverage fence,
-/// the build records no coverage that would let the catch-up skip that table
-/// (issue #442, [`commit_direct_backfill_coverage`]); one committed after the
-/// fence is left to the catch-up's own `coverage_covers` check.
+/// The reverse, a delta for a commit the build already read that drains only
+/// after the flip, is harmless for a 1-1 target. For an aggregate, the
+/// recompute horizon the build stamps on every group row it writes (and on
+/// the target, for the groups it found empty) sends that delta to
+/// re-derive its group rather than count the commit a second time (issues
+/// #419, #442), so that correction never depends on the catch-up, whose
+/// coverage record may let it skip the table.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
