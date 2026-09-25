@@ -556,15 +556,11 @@ const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 /// real size (the same class of bug issue #8 fixed for the stream path via
 /// spill). A cursor only lives for the transaction that declares it, which
 /// is exactly the scope `txn` already has here — so paging changes nothing
-/// about the one-transaction durability guarantee both callers rely on.
-///
-/// Also reused by definition creation's backfill (issue #23): a definition
-/// enumerates its source exactly once here regardless of how many
-/// calculated fields it declares, preserving the "N columns, one backfill"
-/// property as the definition model becomes first-class.
+/// about the one-transaction durability guarantee.
 ///
 /// Its only caller is the `create_definition` test fixture, so it carries the
-/// same gate; production backfill drives the two halves itself.
+/// same gate. Production backfill ([`run_pending_backfills`]) calls the two
+/// halves itself, to capture a WAL position between them (issue #312).
 #[cfg(any(test, feature = "internals"))]
 pub(crate) async fn enumerate_and_append(
     txn: &Transaction<'_>,
