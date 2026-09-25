@@ -4796,9 +4796,10 @@ async fn ensure_relationship_projection_in_txn(
 /// (issue #522, `intake::publication::park_table_catch_ups`). It diffs the
 /// whole table, about 0.7 s for a 1M-row target whose projection is already
 /// current, so no other marker asks for it. For a source to-side, CDC still
-/// pending when this runs was committed before the discharge's read, so
-/// once it has drained, in commit order, each row is back at the state this
-/// wrote. Every write to a target
+/// pending when this runs drains after it and writes its images over what
+/// this wrote. That restores this state only when every later change to the
+/// key also reached CDC. A change lost after one still pending is undone by
+/// the pending change's older image (issue #531). Every write to a target
 /// reaches its projection through the target-mutation seam's CDC-shaped rows,
 /// except a rebuild's (a resumed definition's chunks or direct build), which
 /// writes the target directly. Nothing else would ever carry what the rebuild

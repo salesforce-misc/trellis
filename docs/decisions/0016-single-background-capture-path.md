@@ -558,9 +558,18 @@ of a source to-side follows its CDC, so a change whose CDC was lost is
 missing there too; the re-read's image-less `Recompute`s would re-derive the
 consumer from the stale projection. The refresh runs even when nothing reads
 the table yet, so a consumer registered later doesn't read a stale
-projection. It is safe against CDC still pending when it runs: that CDC was
-committed before the re-read's snapshot, so once it has drained, in commit
-order, each projection row is back at the state the refresh wrote.
+projection.
+
+CDC still pending when the refresh runs drains after it and writes its
+images over what the refresh wrote. That restores the refreshed state only
+when every later change to the same key also reached CDC, which holds when
+all the lost changes predate the oldest pending one. A change lost *after*
+one still pending is undone: the pending change drains after the refresh
+and writes its older image back, and the consumer is re-derived from that
+image. For example, an operator drops a to-side from the publication while
+a rename's CDC is still in the ring, then renames the row again. This is no
+worse than before the refresh existed, but the consumer reports `live`
+while stale. Closing it is a design call (#531).
 
 A marker parked only for a `waiting_to_backfill` definition's build (a
 registration's, a resume's, a failed direct build's retry) stays a plain
