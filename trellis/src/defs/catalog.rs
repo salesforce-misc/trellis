@@ -2035,7 +2035,7 @@ async fn target_column_type_oid_via(
                and a.attname = $2 \
                and a.attnum > 0 \
                and not a.attisdropped",
-            &[&qualified_target, &column],
+            &[&regclass_arg(qualified_target), &column],
         )
         .await?;
     Ok(row.map(|row| row.get(0)))
@@ -3552,7 +3552,7 @@ async fn column_type_oid(
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&query_table, &column],
+            &[&regclass_arg(query_table), &column],
         )
         .await?;
     match row {
@@ -3599,7 +3599,7 @@ async fn column_type_in_txn(
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&query_table, &column],
+            &[&regclass_arg(query_table), &column],
         )
         .await?;
     match row {
@@ -3610,6 +3610,17 @@ async fn column_type_in_txn(
         }
         .into()),
     }
+}
+
+/// The text to bind as `pg_catalog.to_regclass($1)`'s argument for `table`:
+/// a plain `schema.table` identity, or the bare name a relationship endpoint
+/// that resolved to nothing falls back to
+/// ([`resolve_relationship_endpoint_in_txn`]). `to_regclass` parses its
+/// argument as a SQL name, folding unquoted identifiers to lower case, so
+/// each component is quoted: a mixed-case `Custom.Totals` must find
+/// `"Custom"."Totals"`, not a nonexistent `custom.totals` (issue #487).
+fn regclass_arg(table: &str) -> String {
+    ddl::qualified_source_table(table)
 }
 
 /// Postgres type names that are freely joinable despite not being textually
@@ -4109,7 +4120,7 @@ async fn to_col_cardinality_in_txn(
                   and array_length(i.indkey::int2[], 1) = 1
                   and i.indkey[0] = a.attnum
              )",
-            &[&to_table, &to_col],
+            &[&regclass_arg(to_table), &to_col],
         )
         .await?
         .get(0);
@@ -4172,7 +4183,7 @@ async fn assert_replica_identity_supports_to_many(
                 )
              from pg_class c
              where c.oid = pg_catalog.to_regclass($1)",
-            &[&to_table, &def.to_col],
+            &[&regclass_arg(to_table), &def.to_col],
         )
         .await?
         .get(0);
@@ -4305,7 +4316,7 @@ async fn check_source_guarantees(
                     .query_one(
                         "select relreplident = 'f' from pg_class where oid = \
                          pg_catalog.to_regclass($1)",
-                        &[&qualified_table],
+                        &[&regclass_arg(&qualified_table)],
                     )
                     .await?
                     .get(0);
@@ -4618,14 +4629,12 @@ async fn ensure_relationship_projection_in_txn(
     needed_columns: &[String],
 ) -> Result<(), CatalogError> {
     // `qualified_to_table` is the plain, unquoted `"schema.table"` identity
-    // (`resolve_relationship_endpoint_in_txn`'s own return shape) — safe to
-    // bind as a `to_regclass($1)` parameter (as [`column_type_in_txn`]
-    // already does with it below), but *not* safe to splice directly into
-    // raw SQL text: unlike a bind parameter, interpolated SQL needs each
-    // component quoted independently, exactly the gap
-    // [`super::ddl::qualified_source_table`] exists to close (see its own
-    // doc comment). Every DML statement built below uses this quoted form,
-    // never `qualified_to_table` itself.
+    // (`resolve_relationship_endpoint_in_txn`'s own return shape), not safe
+    // to splice into SQL text: each component needs quoting independently,
+    // the gap [`super::ddl::qualified_source_table`] exists to close. Every
+    // DML statement built below uses this quoted form, never
+    // `qualified_to_table` itself ([`column_type_in_txn`] quotes its own
+    // `to_regclass` argument the same way, via [`regclass_arg`]).
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
     let to_col_ident = quote_ident(to_col);
 
@@ -5082,7 +5091,7 @@ async fn has_usable_fk_index_in_txn(
                   and am.amname = 'btree'
                   and i.indkey[0] = a.attnum
              )",
-            &[&from_table, &from_col],
+            &[&regclass_arg(from_table), &from_col],
         )
         .await?
         .get(0);
@@ -5920,15 +5929,15 @@ pub async fn definition_by_target(
 /// actually reference it. Scanning every definition's own field expressions
 /// (rather than a persisted edge) is what makes this precise.
 ///
-/// **Untouched by issue #74.** This function never reads `schema_nodes`/
-/// `schema_edges` at all — it scans `transform_definitions`/
-/// `relationship_definitions` directly, matching `upstream_table` against
-/// `def.source` (freshly re-parsed, always bare) and the bare `to_table` of
-/// every relationship whose recorded to-side is a definition's target (issue
-/// #372), both already-bare-and-self-consistent inputs the qualified graph
-/// never enters. `upstream_table` itself stays bare for the
-/// same `column_status`-addressing reasons the `target` column below does
-/// (see this function's own inline comment on that `select`).
+/// This function never reads `schema_nodes`/`schema_edges` at all — it
+/// scans `transform_definitions`/`relationship_definitions` directly. The
+/// bare `upstream_table` is resolved to its target's qualified identity, and
+/// matched against each definition's qualified `source_table` and each
+/// relationship's recorded, qualified to-side (issues #372, #488), so a table
+/// in another schema that merely shares the target's bare name is never a
+/// match. `upstream_table` itself stays bare for the same
+/// `column_status`-addressing reasons the `target` column below does (see
+/// this function's own inline comment on that `select`).
 ///
 /// Direct (one-hop) dependents only; `staging::quarantine`'s cascade walks
 /// this transitively itself, relying on the same cycle-freedom
@@ -6012,47 +6021,52 @@ async fn column_dependents_via(
             // instead would split that bookkeeping across two spellings of
             // the same transform depending on whether a row was reached
             // directly or via cascade.
-            "select split_part(target_table, '.', 2), definition_text, source_table \
+            "select split_part(target_table, '.', 2), definition_text, source_table, \
+                    target_table \
              from transform_definitions",
             &[],
         )
         .await?;
+
+    // Issue #488: `upstream_table` is a bare target name, but a reader is
+    // matched against it by qualified identity: a definition over
+    // `other.t` doesn't read the target `public.t`. Bare target suffixes are
+    // unique ([`CatalogError::TargetTableSuffixCollision`]), so the bare name
+    // picks out at most one qualified target. A name that is no definition's
+    // target has no chained or relationship readers to find.
+    let Some(qualified_upstream) = def_rows.iter().find_map(|row| {
+        (row.get::<_, String>(0) == upstream_table).then(|| row.get::<_, String>(3))
+    }) else {
+        return Ok(Vec::new());
+    };
+
     let rel_rows = client
         .query(
-            "select r.from_schema || '.' || r.from_table, r.name, r.to_table \
-             from relationship_definitions r \
-             where exists ( \
-                 select 1 from transform_definitions d \
-                 where d.target_table = r.to_schema || '.' || r.to_table \
-             )",
+            "select r.from_schema || '.' || r.from_table, r.name, \
+                    r.to_schema || '.' || r.to_table \
+             from relationship_definitions r",
             &[],
         )
         .await?;
 
     // Keyed by the relationship's qualified from-table (issue #288): a
     // relationship name is unique only per qualified from-table, so the bare
-    // `(from_table, name)` pair could name two different relationships.
-    //
-    // Only relationships whose recorded to-side (issue #372) *is* some
-    // definition's target are kept: `upstream_table` is always a bare target
-    // name, and bare target suffixes are unique, so the bare `to_table` match
-    // below is then exact. Without the filter, a relationship pointing at a
-    // same-named non-target table in another schema would match too.
+    // `(from_table, name)` pair could name two different relationships. The
+    // value is the relationship's recorded, qualified to-side (issue #372).
     let mut rel_to_table: HashMap<(String, String), String> = HashMap::new();
     for row in rel_rows {
         let qualified_from: String = row.get(0);
         let name: String = row.get(1);
-        let to_table: String = row.get(2);
-        rel_to_table.insert((qualified_from, name), to_table);
+        let qualified_to: String = row.get(2);
+        rel_to_table.insert((qualified_from, name), qualified_to);
     }
 
     let mut deps = Vec::new();
     for row in def_rows {
         let target: String = row.get(0);
         let text: String = row.get(1);
-        // The definition's qualified source — what its relationship paths
-        // resolve against (issue #288); `def.source` below is the bare
-        // spelling this scan's table matching uses.
+        // The definition's qualified source: what it reads directly, and what
+        // its relationship paths resolve against (issue #288).
         let qualified_source: String = row.get(2);
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
@@ -6063,20 +6077,11 @@ async fn column_dependents_via(
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
-        // `def.source` (freshly re-parsed from `definition_text`), not the
-        // persisted `transform_definitions.source_table` column — issue #72
-        // made that column fully-qualified, but `upstream_table` here is
-        // always a bare *target* table name (a downstream transform's
-        // `def.source` naming an upstream one's `def.target`, or a paused
-        // column's own bare transform — see `staging::quarantine`'s
-        // callers), so comparing against it needs the same bare spelling
-        // `def.source` already gives for free, matching the `split_part`
-        // read of `target_table` above.
         for field in &def.fields {
             if expr_references_column(
                 &field.expr,
-                (&def.source, &qualified_source),
-                upstream_table,
+                &qualified_source,
+                &qualified_upstream,
                 upstream_column,
                 &rel_to_table,
             ) {
@@ -6092,8 +6097,8 @@ async fn column_dependents_via(
             for key in group_by {
                 if expr_references_column(
                     &key.as_expr(),
-                    (&def.source, &qualified_source),
-                    upstream_table,
+                    &qualified_source,
+                    &qualified_upstream,
                     upstream_column,
                     &rel_to_table,
                 ) {
@@ -6106,21 +6111,23 @@ async fn column_dependents_via(
 }
 
 /// Whether `expr` (one calculated field's expression, belonging to a
-/// definition whose `FROM` is `def_source` — its bare and qualified spellings)
-/// reads `(upstream_table, upstream_column)` — see [`column_dependents`].
+/// definition whose qualified `FROM` is `def_source`) reads
+/// `(upstream_table, upstream_column)`, `upstream_table` also qualified — see
+/// [`column_dependents`]. `rel_to_table` maps a relationship's qualified
+/// from-table and name to its qualified to-table.
 fn expr_references_column(
     expr: &Expr,
-    def_source: (&str, &str),
+    def_source: &str,
     upstream_table: &str,
     upstream_column: &str,
     rel_to_table: &HashMap<(String, String), String>,
 ) -> bool {
     match expr {
-        Expr::Column(name) => def_source.0 == upstream_table && name == upstream_column,
+        Expr::Column(name) => def_source == upstream_table && name == upstream_column,
         Expr::RelationshipPath { rel, column } => {
             column == upstream_column
                 && rel_to_table
-                    .get(&(def_source.1.to_string(), rel.clone()))
+                    .get(&(def_source.to_string(), rel.clone()))
                     .is_some_and(|to_table| to_table == upstream_table)
         }
         Expr::BinaryOp { lhs, rhs, .. } => {
@@ -6273,6 +6280,61 @@ mod go_live_tests {
                 "{status:?}: a catch-up marker is parked exactly when the definition is unfrozen"
             );
         }
+    }
+}
+
+/// Issue #488: a column's dependents are the definitions that actually read
+/// its target, matched on qualified identity, not on a bare name another
+/// schema's table can share.
+#[cfg(test)]
+mod column_dependents_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_same_named_table_in_another_schema_is_not_a_dependent() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('other.t', 1), \
+                        ('public.items', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values \
+                 ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live'), \
+                 ('public.chained', 'public.t', 1, \
+                  'TRANSFORM chained FROM t SELECT a AS a_copy', 'live'), \
+                 ('public.reader', 'other.t', 1, \
+                  'TRANSFORM reader FROM other.t SELECT a AS a_copy', 'live'), \
+                 ('public.via_rel', 'public.items', 1, \
+                  'TRANSFORM via_rel FROM items SELECT to_t.a AS a_t, to_other.a AS a_other', \
+                  'live'); \
+                 insert into relationship_definitions \
+                 (name, from_schema, from_table, from_col, to_schema, to_table, to_col, \
+                  definition_text, cardinality) \
+                 values \
+                 ('to_t', 'public', 'items', 't_id', 'public', 't', 'id', '', 'one'), \
+                 ('to_other', 'public', 'items', 't_id', 'other', 't', 'id', '', 'one')",
+            )
+            .await
+            .expect("seed definitions and relationships");
+
+        let mut deps = column_dependents_any_keyspace(&**client, "t", "a")
+            .await
+            .expect("column dependents");
+        deps.sort();
+        // `reader` reads `other.t.a`, and `via_rel.a_other` reads it through a
+        // relationship: a different table that only shares the bare name `t`
+        // with the target `public.t`.
+        assert_eq!(
+            deps,
+            vec![
+                ("chained".to_string(), "a_copy".to_string()),
+                ("via_rel".to_string(), "a_t".to_string()),
+            ]
+        );
     }
 }
 

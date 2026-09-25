@@ -1815,3 +1815,141 @@ async fn a_relationship_to_side_is_read_from_the_schema_it_was_declared_in() {
         .get(0);
     assert!(has_name, "the projection was widened with shop.users.name");
 }
+
+/// Issue #487: the `RELATIONSHIP` lexer keeps an identifier's case, so
+/// `FROM OrderItems.product_id TO Products.id` names the mixed-case tables
+/// `"OrderItems"`/`"Products"`. Declaring it must introspect those tables,
+/// not the lower-case `orderitems`/`products` an unquoted `to_regclass` folds
+/// the names to (which don't exist, so the declaration used to fail as an
+/// unknown column).
+#[tokio::test]
+async fn a_relationship_between_mixed_case_tables_is_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table \"OrderItems\" (id integer primary key, product_id integer); \
+             create index on \"OrderItems\" (product_id); \
+             alter table \"OrderItems\" replica identity full; \
+             create table \"Products\" (id integer primary key, category_id integer); \
+             alter table \"Products\" replica identity full",
+        )
+        .await
+        .expect("seed mixed-case tables");
+    drop(client);
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM OrderItems.product_id TO Products.id",
+    )
+    .await
+    .expect("a relationship between mixed-case tables must be accepted");
+    assert_eq!(created.def.from_table, "OrderItems");
+    assert_eq!(created.def.to_table, "Products");
+    // To-one: `to_col_cardinality_in_txn` found `"Products"`' primary key.
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+    // `has_usable_fk_index_in_txn` found `"OrderItems"`' index.
+    assert_eq!(created.warnings, Vec::new());
+
+    // To-many against a mixed-case to-side: cardinality and the replica
+    // identity check read `"Products"`, not a folded `products`.
+    let many = create_relationship(
+        &db.pool,
+        "RELATIONSHIP category FROM OrderItems.product_id TO Products.category_id",
+    )
+    .await
+    .expect("a to-many relationship to a mixed-case to-side must be accepted");
+    assert_eq!(many.cardinality, RelationshipCardinality::ToMany);
+
+    let read_back = relationship_by_name(&db.pool, SCHEMA, "OrderItems", "product")
+        .await
+        .expect("read query")
+        .expect("relationship should be found");
+    assert_eq!(read_back.to_schema, SCHEMA);
+}
+
+/// Issue #487: a relationship whose endpoints live in a mixed-case *schema*
+/// (here a definition's target installed into `"Custom"`) resolves through
+/// every lookup that reads its endpoints: declaration in both directions,
+/// and a later definition's `<rel>.<column>` path, which types the column
+/// from `"Custom"."Totals"` and widens that to-side's projection.
+#[tokio::test]
+async fn a_relationship_resolves_endpoints_in_a_mixed_case_schema() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create schema \"Custom\"; \
+             create table s (id bigint primary key, a numeric); \
+             create table items (id bigint primary key, totals_id bigint); \
+             alter table items replica identity full; \
+             insert into items (id, totals_id) values (1, 1), (2, 2); \
+             create table \"Products\" (id bigint primary key); \
+             alter table \"Products\" replica identity full",
+        )
+        .await
+        .expect("seed tables and the mixed-case schema");
+    drop(client);
+
+    let cols = HashMap::from([("a".to_string(), ValueType::Numeric)]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM Custom.Totals FROM s SELECT a AS total",
+        &cols,
+        "public",
+    )
+    .await
+    .expect("def A installs into the mixed-case schema");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+
+    // To-side in the mixed-case schema.
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP totals FROM items.totals_id TO Totals.id",
+    )
+    .await
+    .expect("a to-side in a mixed-case schema must resolve");
+    assert_eq!(created.to_schema, "Custom");
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+
+    // From-side in the mixed-case schema.
+    let from_custom = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM Totals.id TO Products.id",
+    )
+    .await
+    .expect("a from-side in a mixed-case schema must resolve");
+    assert_eq!(from_custom.from_schema, "Custom");
+    assert_eq!(from_custom.cardinality, RelationshipCardinality::ToOne);
+
+    // A calculated field through the relationship.
+    install_definition(
+        &db.pool,
+        "TRANSFORM enriched FROM items SELECT totals.total AS total_copy",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("a relationship path into a mixed-case schema must resolve");
+
+    let projection = relationship_projection(&db.pool, created.id)
+        .await
+        .expect("projection query")
+        .expect("a to-one relationship has a projection");
+    let client = db.pool.get().await.expect("get connection");
+    let has_total: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.columns \
+             where table_schema = $1 and table_name = $2 and column_name = 'total')",
+            &[&projection.projection_schema, &projection.projection_table],
+        )
+        .await
+        .expect("inspect projection columns")
+        .get(0);
+    assert!(
+        has_total,
+        "the projection was widened with Custom.Totals.total"
+    );
+}
