@@ -257,8 +257,53 @@ pub async fn fold(
     txn.batch_execute(FOLD_WORK_MEM).await?;
 
     let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
-    let bucket_count_idx = fence_params.len() + 1;
-    let buckets_idx = fence_params.len() + 2;
+    let sql = fold_sql(&window_sql, fence_params.len());
+
+    let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
+        .iter()
+        .map(|p| p as &(dyn ToSql + Sync))
+        .collect();
+    params.push(&bucket.bucket_count);
+    params.push(&bucket.buckets);
+
+    let rows = txn.query(&sql, &params).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| FoldedChange {
+            src_table: row.get(0),
+            key: row.get(1),
+            new_image: row.get(2),
+            old_image: row.get(3),
+            src_changed: row.get(4),
+            origin_lsn: row.get(5),
+            lsn: row.get(6),
+            hop_gen: row.get(7),
+            first_seen: row.get(8),
+            group_key: row.get(9),
+            is_truncate: row.get(10),
+            relationship_reverse_deferred: row.get(11),
+            retry_count: row.get(12),
+            prior_image: row.get(13),
+            min_image_lsn: row.get(14),
+            // `count(*)` is a non-negative bigint.
+            row_count: row.get::<_, i64>(15) as u64,
+            has_recompute: row.get(16),
+            vanished_images: {
+                // A key born and died in one group has one image, twice.
+                let mut images = row.get::<_, Option<Vec<String>>>(17).unwrap_or_default();
+                images.dedup();
+                images
+            },
+        })
+        .collect())
+}
+
+/// The fold statement over `window_sql` (the fenced window, binding
+/// `$1..=$fence_param_count`), with the bucket count and bucket list bound
+/// as the next two parameters.
+fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
+    let bucket_count_idx = fence_param_count + 1;
+    let buckets_idx = fence_param_count + 2;
 
     // The discriminator (docs/.../04-claiming-and-the-fold.md, "The two
     // kinds of missing image"): "does this row carry any image at all", not
@@ -297,12 +342,24 @@ pub async fn fold(
     // re-reads *live* current source state (already reflecting the
     // truncate) when it's later evaluated, so its position relative to the
     // truncate is irrelevant — only image-bearing rows carry a stale
-    // snapshot that must be voided. Referencing the un-bucket-filtered
-    // `fenced` CTE (not `filtered`) matters too: a truncate sentinel's own
-    // key (the sentinel) could in principle route to a different bucket
-    // than the keys it voids, though in practice every truncate-bearing
-    // batch seals with `bucket_count = 1` (see `seal::seal_phase1`), making
-    // that moot today.
+    // snapshot that must be voided. Drawing `truncates` from the
+    // un-bucket-filtered `fenced` CTE (not `filtered`) matters too: a
+    // truncate sentinel's own key (the sentinel) could in principle route to
+    // a different bucket than the keys it voids, though in practice every
+    // truncate-bearing batch seals with `bucket_count = 1` (see
+    // `seal::seal_phase1`), making that moot today.
+    //
+    // Issue #492: the anti-join reads `truncates`, a `materialized` CTE of
+    // just the batch's truncate rows (almost always none, at most a few),
+    // rather than `fenced` itself. Against `fenced` directly, a ring slot
+    // whose statistics were taken while it was small led the planner to a
+    // nested-loop anti-join that rescanned all of `fenced` for every row,
+    // making the fold quadratic in batch size (4.6s at 10k rows, 19s at
+    // 20k). `materialized` is load-bearing: `truncates` is referenced once,
+    // so without it Postgres inlines it back into that same rescan of
+    // `fenced`. Whatever join it picks now, its inner side is the handful
+    // of truncate rows.
+    //
     // Issue #133: `group_key` is a real per-key set union, computed
     // separately from every other column here so it can't perturb them.
     // `group_keys` unnests each raw row's own `group_key` array (a row with
@@ -330,14 +387,17 @@ pub async fn fold(
     // byte compare, only reached when one key has several inserts or
     // deletes), filtered to insert-shaped and delete-shaped rows so an
     // update, the common row, never feeds them.
-    let sql = format!(
+    format!(
         "with fenced as ({window_sql}), \
+         truncates as materialized ( \
+             select src_table, lsn, change_id from fenced where op = 'truncate' \
+         ), \
          filtered as ( \
              select * from fenced f \
              where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) \
                and not exists ( \
-                   select 1 from fenced t \
-                   where t.op = 'truncate' and t.src_table = f.src_table \
+                   select 1 from truncates t \
+                   where t.src_table = f.src_table \
                      and (t.lsn, t.change_id) > (f.lsn, f.change_id) \
                ) \
          ), \
@@ -392,45 +452,7 @@ pub async fn fold(
          left join group_keys \
              on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
          group by filtered.src_table, filtered.key, group_keys.group_key"
-    );
-
-    let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
-        .iter()
-        .map(|p| p as &(dyn ToSql + Sync))
-        .collect();
-    params.push(&bucket.bucket_count);
-    params.push(&bucket.buckets);
-
-    let rows = txn.query(&sql, &params).await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| FoldedChange {
-            src_table: row.get(0),
-            key: row.get(1),
-            new_image: row.get(2),
-            old_image: row.get(3),
-            src_changed: row.get(4),
-            origin_lsn: row.get(5),
-            lsn: row.get(6),
-            hop_gen: row.get(7),
-            first_seen: row.get(8),
-            group_key: row.get(9),
-            is_truncate: row.get(10),
-            relationship_reverse_deferred: row.get(11),
-            retry_count: row.get(12),
-            prior_image: row.get(13),
-            min_image_lsn: row.get(14),
-            // `count(*)` is a non-negative bigint.
-            row_count: row.get::<_, i64>(15) as u64,
-            has_recompute: row.get(16),
-            vanished_images: {
-                // A key born and died in one group has one image, twice.
-                let mut images = row.get::<_, Option<Vec<String>>>(17).unwrap_or_default();
-                images.dedup();
-                images
-            },
-        })
-        .collect())
+    )
 }
 
 /// Merges several segments' already-folded change lists — issue #63
@@ -1157,5 +1179,134 @@ mod merge_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
         assert_eq!(merged[0].new_image, Some(r#"{"v":3}"#.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use tokio_postgres::types::ToSql;
+
+    use super::*;
+    use crate::config::DEFAULT_SCHEMA;
+    use crate::staging::seal;
+
+    /// Issue #492: the fold reads the fenced window a fixed number of times,
+    /// however large the batch. The truncate-void filter used to be a `not
+    /// exists` over the whole `fenced` CTE, which Postgres planned as a
+    /// nested-loop anti-join rescanning `fenced` once per row, so the fold
+    /// was quadratic in batch size (4.6s at 10k rows, 19s at 20k).
+    ///
+    /// Counts `fenced`'s scans through `EXPLAIN ANALYZE` rather than timing
+    /// the fold: every `CTE Scan on fenced` node must run exactly once. Holds
+    /// for a batch with no truncate (the common case) and for one with a
+    /// truncate in the middle, where the filter actually voids rows.
+    #[tokio::test]
+    async fn the_fold_scans_the_fenced_window_once_per_reference_not_once_per_row() {
+        const ROWS: i64 = 2_000;
+        let cluster = testkit::TestCluster::start();
+
+        for with_truncate in [false, true] {
+            let db = cluster.create_isolated_database().await;
+            let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+                .await
+                .expect("set search_path");
+
+            // Statistics taken while the ring slot held a handful of rows,
+            // as a reused slot's usually are: the planner then expects
+            // `fenced` to be tiny, which is exactly when it picks the
+            // nested-loop anti-join. Without this the old shape could pass
+            // by luck of a hash anti-join.
+            client
+                .batch_execute(
+                    "insert into seg_0 (src_table, key, op, lsn, src_changed, hop_gen) \
+                     select 'orders', 'warmup' || g, 'update', '0/1'::pg_lsn, now(), 0 \
+                     from generate_series(1, 10) g; \
+                     analyze seg_0; \
+                     delete from seg_0;",
+                )
+                .await
+                .expect("take small-slot statistics");
+
+            // `ROWS` updates to distinct keys, lsn 1..=ROWS, one staged row
+            // each. The truncate, when present, lands halfway through.
+            client
+                .batch_execute(&format!(
+                    "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, \
+                                        origin_lsn, src_changed, hop_gen) \
+                     select 'orders', 'k' || g, 'update', \
+                            ('0/' || to_hex(g))::pg_lsn, \
+                            jsonb_build_object('v', g), jsonb_build_object('v', g + 1), \
+                            ('0/' || to_hex(g))::pg_lsn, now(), 0 \
+                     from generate_series(1, {ROWS}) g"
+                ))
+                .await
+                .expect("stage updates");
+            if with_truncate {
+                client
+                    .execute(
+                        "insert into seg_0 (src_table, key, op, lsn, src_changed, hop_gen) \
+                         values ('orders', $1, 'truncate', ('0/' || to_hex($2::bigint))::pg_lsn, \
+                                 now(), 0)",
+                        &[&super::super::TRUNCATE_SENTINEL_KEY, &(ROWS / 2)],
+                    )
+                    .await
+                    .expect("stage truncate");
+            }
+
+            let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+            seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
+                .await
+                .expect("seal phase 2");
+
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute(FOLD_WORK_MEM).await.expect("work_mem");
+            let (window_sql, fence_params) =
+                fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
+                    .await
+                    .expect("fenced window");
+            let sql = fold_sql(&window_sql, fence_params.len());
+            let bucket = BucketFilter::all();
+            let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
+                .iter()
+                .map(|p| p as &(dyn ToSql + Sync))
+                .collect();
+            params.push(&bucket.bucket_count);
+            params.push(&bucket.buckets);
+
+            let plan = txn
+                .query(
+                    &format!("explain (analyze, costs off, timing off) {sql}"),
+                    &params,
+                )
+                .await
+                .expect("explain analyze the fold")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let fenced_scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains("CTE Scan on fenced"))
+                .collect();
+            assert!(
+                !fenced_scans.is_empty(),
+                "expected the plan to scan the fenced CTE:\n{plan}"
+            );
+            for scan in fenced_scans {
+                assert!(
+                    scan.trim_end().ends_with("loops=1)"),
+                    "with_truncate={with_truncate}: every scan of the fenced window must run \
+                     once, not once per row:\n{plan}"
+                );
+            }
+        }
     }
 }

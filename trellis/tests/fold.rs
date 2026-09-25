@@ -945,6 +945,67 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
     assert_eq!(post.new_image, Some(r#"{"v": "post"}"#.to_string()));
 }
 
+/// Issue #492 moved the truncate-void filter onto a pre-filtered set of just
+/// the batch's truncate rows. That set can hold more than one truncate, and
+/// truncates of more than one table: each row is voided only by a later
+/// truncate of its own `src_table`, and the latest such truncate is what
+/// decides it.
+#[tokio::test]
+async fn several_truncates_each_void_only_earlier_rows_of_their_own_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // (src_table, key, op, lsn), inserted in this order so change_id follows.
+    let rows = [
+        ("orders", "o_before_both", "insert", 10),
+        ("customers", "c_before", "insert", 15),
+        ("orders", TRUNCATE_SENTINEL_KEY, "truncate", 20),
+        ("orders", "o_between", "insert", 30),
+        ("customers", TRUNCATE_SENTINEL_KEY, "truncate", 35),
+        ("orders", TRUNCATE_SENTINEL_KEY, "truncate", 40),
+        ("orders", "o_after_both", "insert", 50),
+        ("customers", "c_after", "insert", 55),
+    ];
+    for (src_table, key, op, lsn) in rows {
+        let image = (op == "insert").then(|| format!(r#"{{"k":"{key}"}}"#));
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, lsn, new_image, origin_lsn, \
+                                    src_changed, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $4, now(), 0)",
+                &[&src_table, &key, &op, &PgLsn::from(lsn), &image],
+            )
+            .await
+            .expect("insert row");
+    }
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    let mut survivors: Vec<(&str, &str, u64)> = folded
+        .iter()
+        .map(|f| (f.src_table.as_str(), f.key.as_str(), f.row_count))
+        .collect();
+    survivors.sort_unstable();
+    assert_eq!(
+        survivors,
+        vec![
+            ("customers", TRUNCATE_SENTINEL_KEY, 1),
+            ("customers", "c_after", 1),
+            // The first orders truncate is itself at or below the second,
+            // so only the second is left in the sentinel's group.
+            ("orders", TRUNCATE_SENTINEL_KEY, 1),
+            ("orders", "o_after_both", 1),
+        ],
+        "o_between must fall to the second orders truncate, and each table's \
+         rows only to its own truncates: {folded:?}"
+    );
+}
+
 /// Issue #392: a `recompute` folded with the key's CDC change leaves the
 /// record carrying the change's images, as before, and `has_recompute` keeps
 /// the recompute's intent. A key with no `recompute` row doesn't get it.

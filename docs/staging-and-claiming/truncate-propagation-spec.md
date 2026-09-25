@@ -48,13 +48,22 @@ image-bearing keyed changes at a position ≤ the src_table's max truncate
 position** in the fenced window:
 
 ```sql
+truncates as materialized (
+  select src_table, lsn, change_id from fenced where op = 'truncate'
+)
+-- ...
 -- keep f unless a truncate for its src_table sits strictly above it
 and not exists (
-  select 1 from fenced t
-  where t.op = 'truncate' and t.src_table = f.src_table
+  select 1 from truncates t
+  where t.src_table = f.src_table
     and (t.lsn, t.change_id) > (f.lsn, f.change_id)
 )
 ```
+
+The anti-join reads a materialized set of just the truncate rows, not `fenced`
+itself. A `not exists` straight over `fenced` can plan as a nested loop that
+rescans the whole window once per row, which makes the fold quadratic in batch
+size (#492).
 
 **Recompute rows (NULL `lsn`) are never filtered** — the comparison against a
 NULL lsn is NULL, not true, so they survive regardless of truncate position.
