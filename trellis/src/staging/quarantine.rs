@@ -1714,12 +1714,23 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // worker may still be writing its range. The `fuse_rearmed_at` stamp
     // above marks it stale (issues #360/#397): however that worker gives it
     // up (finishing, failing or dying), the chunk queue deletes it rather
-    // than completing the definition or freeing it for a rerun, and parks
-    // the catch-up marker repairing the target should its write land after
-    // the rebuild has already gone live (#331).
+    // than completing the definition or freeing it for a rerun.
     txn.execute(
         "delete from backfill_chunks \
          where definition_id = $1 and not done and claimed_by is null",
+        &[&id],
+    )
+    .await?;
+    // Waits out any write such a chunk still has in flight, which holds the
+    // chunk's row `for key share` until it commits
+    // (`defs::chunk_queue::ClaimFence`, issue #434). Every write that chunk
+    // makes then commits before this resume does, while the definition is
+    // frozen, and the rebuild overwrites it. One that starts later sees the
+    // stamp above and writes nothing, so none can land after the rebuild has
+    // gone live and readers have attached to the target.
+    txn.execute(
+        "select 1 from backfill_chunks \
+         where definition_id = $1 and not done order by id for update",
         &[&id],
     )
     .await?;

@@ -795,12 +795,13 @@ async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
 
 /// A direct-build job a worker still holds when its definition is paused and
 /// resumed again keeps running: the pause only withholds new claims. Its
-/// worker can write the target from its old read after the resume's rebuild
-/// has already gone live, and the source may not change after that at all.
-/// Discarding the stale job parks a catch-up on the source (#331) that must
-/// re-derive the target anyway.
+/// worker reaches its writes, with its old read, after the resume's rebuild
+/// has already gone live. The claim's fence (#434) stops it there: it writes
+/// nothing, so the live target keeps the rebuild's read and nothing needs a
+/// catch-up. A write landing then would have bypassed the target-mutation
+/// seam, which a reader attached after the rebuild depends on.
 #[tokio::test]
-async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
+async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes_nothing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -915,8 +916,8 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
     };
     assert_eq!(read_a(&client).await, "1012", "the rebuild read the change");
 
-    // The superseded job now writes its old read on top, and gives up its
-    // claim, which discards it and parks the source's catch-up.
+    // The superseded job now reaches its writes, is fenced out of them, and
+    // gives up its claim, which discards it.
     client
         .query_one("select pg_advisory_unlock($1)", &[&HOLD_LOCK])
         .await
@@ -924,7 +925,7 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
     old_build
         .await
         .expect("superseded build task")
-        .expect("the superseded job's build runs to the end");
+        .expect("a superseded job is not a failure");
     chunk_queue::finish_chunk(&db.pool, &superseded[0], OLD_WORKER)
         .await
         .expect("give up the superseded job");
@@ -933,25 +934,13 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
         .await
         .expect("drop the build hold");
     assert_eq!(
-        pending_markers(&client).await,
-        vec!["public.sales".to_string()],
-        "discarding the superseded job parks the source's catch-up"
-    );
-    assert_eq!(
-        status_of(&client, "public.sku_totals").await,
-        "catching_up",
-        "the target holds the superseded job's stale write until the catch-up runs (#476)"
-    );
-    client
-        .batch_execute("select txid_current()")
-        .await
-        .expect("consume an xid");
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(
         read_a(&client).await,
         "1012",
-        "the catch-up re-derives what the superseded job overwrote"
+        "the superseded job didn't overwrite the rebuild's read"
+    );
+    assert!(
+        pending_markers(&client).await.is_empty(),
+        "there is nothing to catch up on"
     );
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
 }

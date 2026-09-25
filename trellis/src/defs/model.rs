@@ -89,9 +89,8 @@ pub enum TransformStatus {
     /// when a chunked or direct build finishes, when a ring enumeration reads
     /// a source that is another definition's target, and when a `live`
     /// definition gets a catch-up of its own: a column resume, an `ALTER
-    /// TRANSFORM` that added columns, a stale backfill chunk discarded after
-    /// its rebuild, or an upstream rebuild written outside the
-    /// target-mutation seam. The discharge that runs its last pending
+    /// TRANSFORM` that added columns, or an upstream rebuild written outside
+    /// the target-mutation seam. The discharge that runs its last pending
     /// catch-up flips it to `live`.
     CatchingUp,
     Live,

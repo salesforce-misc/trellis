@@ -177,6 +177,48 @@ stranded in `backfilling`:
   the job for an immediate retry, as a failed chunk is, would re-run a
   whole-table build as fast as it can fail.
 
+### A chunk held across a resume
+
+A pause stops new claims but leaves a chunk or job that a worker already holds
+alone ([ADR-0014](0014-pause-and-drop-a-transform.md)), since the worker may be
+partway through writing it. A resume stamps the definition's
+`fuse_rearmed_at`, and a chunk that recorded an older value is **stale**
+(`chunk_queue::STALE`, #360, #397, #418). It never completes the definition,
+because the resume's rebuild owns the way back to `live`. However its worker
+gives it up (finishing, failing or dying), it's deleted, not freed for a rerun.
+
+**Its writes are fenced, so none lands after the resume (#434).** A chunk
+writes its target outside the target-mutation seam. That's safe only while
+nothing reads the target, and readers can attach once the rebuild finishes,
+because `catching_up` is applying. A stale write landing after that would reach
+no reader. That includes a relationship declared on the target in the gap:
+when the source change the write carried drains, apply finds the target
+already current and stages nothing, and so does the source's catch-up. So each
+target write a chunk or job makes runs in a transaction that first locks the
+chunk's row `for key share` and checks that the claim is still this worker's
+and not stale (`chunk_queue::ClaimFence`). Resume locks the definition's held
+chunks `for update` before it commits. A write already in flight commits first,
+while the definition is still frozen, and the rebuild overwrites it. A write
+that starts later writes nothing. A direct-build job is fenced per statement,
+so a job superseded partway through stops at its next write. Because no stale
+write can land late, discarding a stale chunk parks nothing. The same fence
+stops a worker whose claim was reclaimed while it was still running (its
+heartbeat stalled) from writing after the chunk's new holder has finished.
+
+The cost is that a resume waits for the definition's in-flight chunk writes:
+one chunk's statement, or one statement of a direct build. `for key share`
+doesn't block the heartbeat's refresh of `claimed_at`. The stale-claim sweep
+skips a chunk whose write is in flight, as it already skipped any locked row.
+
+The fence replaced repairing a late write after the fact. #360 had the discard
+park a catch-up on the chunk's source. That catch-up repaired the target
+itself, but it couldn't repair the target's readers: its re-derivation found
+the target already current, so it changed nothing and staged nothing for them.
+Fixing that would have meant a catch-up for every kind of reader, including a
+relationship consumer's settled projection. Preventing the write keeps the
+seam's one exception narrow: only a build writes a target outside the seam,
+and only before any reader can attach to it.
+
 ### Which consistency bookkeeping stays
 
 The in-registration build carried three pieces of bookkeeping: the go-live
@@ -327,8 +369,7 @@ the whole time.
 
 Some catch-ups are parked on a definition that is already `live`: a column
 resume (`staging::quarantine::resume_column`), an `ALTER TRANSFORM` that
-added columns, a stale backfill chunk discarded after its rebuild went live
-(`chunk_queue`), and an upstream rebuild that wrote a reader's source outside
+added columns, and an upstream rebuild that wrote a reader's source outside
 the seam (`park_target_catchup_if_read`). Each leaves the target missing
 something until the catch-up runs.
 

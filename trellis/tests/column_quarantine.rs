@@ -1035,15 +1035,15 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
 // ---------------------------------------------------------------------
 
 /// A durable backfill chunk (`defs::chunk_queue`, ADR-0007's amendment) is
-/// claimable and crash-recoverable: a chunk already marked `done` can still
-/// be re-executed (e.g. after a reclaim following a crash — see
+/// claimable and crash-recoverable: a chunk whose worker wrote it and died
+/// before finishing it is reclaimed and re-executed by another worker (see
 /// `trellis/tests/defs_backfill_chunk_queue.rs`'s own reclaim-and-redo
 /// tests), and `defs::backfill::write_one_to_one_range`/
 /// `execute_one_to_one_chunk` had zero awareness of `column_status`: a
 /// re-executed chunk's `ON CONFLICT DO UPDATE` blindly overwrote *every*
 /// field, including one live CDC had since paused, silently undoing the
-/// freeze. This drives the chunk-queue execution path directly (as the task
-/// suggests, in lieu of orchestrating a real crash) to prove the fix: a
+/// freeze. This drives the chunk-queue execution path directly (in lieu of
+/// orchestrating a real crash) to prove the fix: a
 /// paused column's value must survive a re-executed chunk write untouched,
 /// while a sibling, non-paused column in the very same row must still pick
 /// up the re-executed chunk's freshly computed value.
@@ -1051,7 +1051,7 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
 async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -1089,12 +1089,10 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         .expect("claim_chunks");
     assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
 
+    // The first worker writes the chunk and dies before finishing it.
     chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker-1", Duration::from_secs(5))
         .await
         .expect("run_claimed_chunk (initial build)");
-    chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker-1")
-        .await
-        .expect("finish_chunk");
 
     let initial = client
         .query_one("select x::text, y::text from t where id = 1", &[])
@@ -1125,13 +1123,18 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         .await
         .expect("mutate source row 1");
 
-    // Simulate the chunk being reclaimed (e.g. after a crash) and
-    // re-executed by a different worker — driving the chunk-queue execution
-    // path directly, exactly as it would be after
-    // `chunk_queue::reclaim_stale_chunks` frees a dead claim.
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker-2", Duration::from_secs(5))
+    // The dead worker's claim is reclaimed (a zero TTL makes it stale), and
+    // a different worker claims the chunk and re-executes it.
+    chunk_queue::reclaim_stale_chunks(&mut client, Duration::ZERO)
         .await
-        .expect("run_claimed_chunk (re-executed after simulated reclaim)");
+        .expect("reclaim the dead worker's claim");
+    let reclaimed = chunk_queue::claim_chunks(&client, "worker-2", 10)
+        .await
+        .expect("claim_chunks after the reclaim");
+    assert_eq!(reclaimed.len(), 1, "the reclaimed chunk is claimable again");
+    chunk_queue::run_claimed_chunk(&db.pool, &reclaimed[0], "worker-2", Duration::from_secs(5))
+        .await
+        .expect("run_claimed_chunk (re-executed after the reclaim)");
 
     let after = client
         .query_one("select x::text, y::text from t where id = 1", &[])

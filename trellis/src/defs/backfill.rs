@@ -74,6 +74,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use super::chunk_queue::ClaimFence;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
 use crate::staging::target_mutations::TargetMutations;
@@ -130,6 +131,11 @@ pub enum BackfillError {
     /// [`backfill_altered_columns`], the one writer here whose target can
     /// already have readers.
     Propagation(Box<crate::staging::ApplyError>),
+    /// The chunk-queue claim this build ran under no longer holds (issue
+    /// #434): its definition was resumed since the claim was taken, or the
+    /// claim was reclaimed from this worker. The write stopped before
+    /// touching the target; see `chunk_queue::ClaimFence`.
+    Superseded,
 }
 
 impl BackfillError {
@@ -149,6 +155,7 @@ impl BackfillError {
             BackfillError::Ddl(err) => err.code(),
             BackfillError::Unsupported(_) => ErrorCode::Internal,
             BackfillError::Propagation(err) => err.code(),
+            BackfillError::Superseded => ErrorCode::Internal,
         }
     }
 }
@@ -170,6 +177,9 @@ impl std::fmt::Display for BackfillError {
                     f,
                     "staging the backfill's downstream propagation failed: {err}"
                 )
+            }
+            BackfillError::Superseded => {
+                write!(f, "the backfill chunk's claim was superseded")
             }
         }
     }
@@ -213,12 +223,29 @@ impl From<ddl::DdlError> for BackfillError {
 /// or [`super::model::Definition::source_table`] for a durable chunk-queue
 /// caller) — threaded through every read of the live source below instead of
 /// a bare `def.source` left to the executing connection's own `search_path`.
+#[cfg(any(test, feature = "test-util", feature = "internals"))]
 pub async fn backfill_definition(
     pool: &Pool,
     def: &TransformDef,
     target_schema: &str,
     source_table: &str,
     source_columns: &HashMap<String, ValueType>,
+) -> Result<(), BackfillError> {
+    backfill_definition_fenced(pool, def, target_schema, source_table, source_columns, None).await
+}
+
+/// [`backfill_definition`], with every target write fenced by `fence` when
+/// the build runs as a chunk-queue job (issue #434, see [`ClaimFence`]):
+/// each write runs in its own transaction that holds the claim first, and
+/// the build stops with [`BackfillError::Superseded`] at the first write
+/// whose claim no longer holds.
+pub(crate) async fn backfill_definition_fenced(
+    pool: &Pool,
+    def: &TransformDef,
+    target_schema: &str,
+    source_table: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fence: Option<ClaimFence<'_>>,
 ) -> Result<(), BackfillError> {
     match &def.key_space {
         KeySpace::OneToOne => {
@@ -233,9 +260,10 @@ pub async fn backfill_definition(
             // constructor), so this is no longer narrowed to a single column.
             let pk = source_primary_key(pool, source_table).await?;
             if uses_relationships(def) {
-                backfill_relationship_one_to_one(pool, def, target_schema, source_table, &pk).await
+                backfill_relationship_one_to_one(pool, def, target_schema, source_table, &pk, fence)
+                    .await
             } else {
-                backfill_one_to_one(pool, def, target_schema, source_table, &pk).await
+                backfill_one_to_one(pool, def, target_schema, source_table, &pk, fence).await
             }
         }
         KeySpace::Aggregate { group_by } => {
@@ -246,10 +274,35 @@ pub async fn backfill_definition(
                 source_table,
                 group_by,
                 source_columns,
+                fence,
             )
             .await
         }
     }
+}
+
+/// Runs `write` in a transaction that first holds `fence`, and commits it
+/// (issue #434, see [`ClaimFence`]). Returns [`BackfillError::Superseded`],
+/// having written nothing, when the claim no longer holds. With no fence (a
+/// build outside the chunk queue) `write` runs on `client` directly.
+async fn write_fenced<F>(
+    client: &mut crate::pool::Client,
+    fence: Option<ClaimFence<'_>>,
+    write: F,
+) -> Result<(), BackfillError>
+where
+    F: AsyncFnOnce(&tokio_postgres::Client) -> Result<(), BackfillError>,
+{
+    let Some(fence) = fence else {
+        return write(client).await;
+    };
+    let txn = client.transaction().await?;
+    if !fence.hold(&*txn).await? {
+        return Err(BackfillError::Superseded);
+    }
+    write(txn.client()).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 /// Whether any of `def`'s field expressions reads a relationship path — the
@@ -530,6 +583,7 @@ async fn backfill_one_to_one(
     target_schema: &str,
     source_table: &str,
     pk: &[PrimaryKeyColumn],
+    fence: Option<ClaimFence<'_>>,
 ) -> Result<(), BackfillError> {
     // Substitute any cross-field-alias reference (e.g. `total = double_price +
     // tax` where `double_price` is itself a field) with a deep copy of the
@@ -541,19 +595,23 @@ async fn backfill_one_to_one(
     let substituted = substitute_all_fields(def)?;
 
     let source = ddl::qualified_source_table(source_table);
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     for (lo, hi) in discover_pk_ranges(&**client, &source, pk).await? {
-        write_one_to_one_range(
-            &**client,
-            def,
-            target_schema,
-            source_table,
-            pk,
-            &substituted,
-            None,
-            &lo,
-            &hi,
-        )
+        write_fenced(&mut client, fence, async |client| {
+            write_one_to_one_range(
+                client,
+                def,
+                target_schema,
+                source_table,
+                pk,
+                &substituted,
+                None,
+                &lo,
+                &hi,
+            )
+            .await
+            .map(drop)
+        })
         .await?;
     }
 
@@ -883,10 +941,11 @@ pub(crate) async fn execute_one_to_one_chunk(
     source_table: &str,
     lo: Option<&str>,
     hi: &str,
+    fence: ClaimFence<'_>,
 ) -> Result<(), BackfillError> {
     let pk = source_primary_key(pool, source_table).await?;
     let substituted = substitute_all_fields(def)?;
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     // The exact inverse of [`plan_one_to_one_chunks`]'s encode: a genuine
     // primary-key column (every real `PRIMARY KEY`, at any arity) is never
     // `NULL`, so every part decodes to `Some` here in practice — propagated
@@ -901,19 +960,22 @@ pub(crate) async fn execute_one_to_one_chunk(
     };
     let lo = lo.map(decode).transpose()?;
     let hi = decode(hi)?;
-    write_one_to_one_range(
-        &**client,
-        def,
-        target_schema,
-        source_table,
-        &pk,
-        &substituted,
-        None,
-        &lo,
-        &hi,
-    )
-    .await?;
-    Ok(())
+    write_fenced(&mut client, Some(fence), async |client| {
+        write_one_to_one_range(
+            client,
+            def,
+            target_schema,
+            source_table,
+            &pk,
+            &substituted,
+            None,
+            &lo,
+            &hi,
+        )
+        .await
+        .map(drop)
+    })
+    .await
 }
 
 /// Walks the source primary key in half-open `(lo, hi]` ranges, returning them
@@ -1314,6 +1376,7 @@ async fn backfill_aggregate(
     source_table: &str,
     group_by: &[GroupByKey],
     source_columns: &HashMap<String, ValueType>,
+    fence: Option<ClaimFence<'_>>,
 ) -> Result<(), BackfillError> {
     // Substitute any cross-field-alias reference (e.g. `double_total = total +
     // total` where `total` is itself a field) with a deep copy of the
@@ -1574,7 +1637,7 @@ async fn backfill_aggregate(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
 
     // Single full-table scan: aggregate the whole source — NULL-keyed groups
     // included — into a connection-scoped staging table. This is the ~60ms
@@ -1671,27 +1734,32 @@ async fn backfill_aggregate(
         params.extend(hi.iter().map(|v| v.clone().unwrap_or_default()));
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p as _).collect();
-        client.execute(&sql, &param_refs).await?;
+        write_fenced(&mut client, fence, async |client| {
+            client.execute(&sql, &param_refs).await?;
+            Ok(())
+        })
+        .await?;
         prev = Some(hi.clone());
     }
 
     // Final open-ended range above the last boundary — or, when there were no
     // boundaries at all (non-NULL-keyed group count <= BACKFILL_CHUNK_GROUPS),
     // the single range covering every non-NULL-keyed group in staging.
-    match &prev {
-        None => {
-            client
-                .execute(&insert_for(&format!(" where {group_key_not_null}")), &[])
-                .await?;
-        }
-        Some(prev) => {
-            let clause = format!(" where {group_key_not_null} and {}", tuple_cmp(">", 1));
-            let params: Vec<String> = prev.iter().map(|v| v.clone().unwrap_or_default()).collect();
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                params.iter().map(|p| p as _).collect();
-            client.execute(&insert_for(&clause), &param_refs).await?;
-        }
-    }
+    let (clause, params): (String, Vec<String>) = match &prev {
+        None => (format!(" where {group_key_not_null}"), Vec::new()),
+        Some(prev) => (
+            format!(" where {group_key_not_null} and {}", tuple_cmp(">", 1)),
+            prev.iter().map(|v| v.clone().unwrap_or_default()).collect(),
+        ),
+    };
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|p| p as _).collect();
+    let sql = insert_for(&clause);
+    write_fenced(&mut client, fence, async |client| {
+        client.execute(&sql, &param_refs).await?;
+        Ok(())
+    })
+    .await?;
 
     // NULL-keyed groups: any grouping column is NULL, so no row-value range
     // comparison is safe (see `group_key_not_null`'s doc above). Writing them
@@ -1700,12 +1768,12 @@ async fn backfill_aggregate(
     // conflict-arbiter matching needs no row-value comparison at all. NULL
     // keys are expected to be a small minority of groups, so skipping the
     // chunking optimization for them costs little.
-    client
-        .execute(
-            &insert_for(&format!(" where not ({group_key_not_null})")),
-            &[],
-        )
-        .await?;
+    let sql = insert_for(&format!(" where not ({group_key_not_null})"));
+    write_fenced(&mut client, fence, async |client| {
+        client.execute(&sql, &[]).await?;
+        Ok(())
+    })
+    .await?;
 
     // Return the staging table to a clean slate before the connection goes back
     // to the pool.
@@ -1967,6 +2035,7 @@ async fn backfill_relationship_one_to_one(
     target_schema: &str,
     source_table: &str,
     pk: &[PrimaryKeyColumn],
+    fence: Option<ClaimFence<'_>>,
 ) -> Result<(), BackfillError> {
     // Resolve every referenced relationship to its endpoints + cardinality the
     // same way the rest of the catalog does (`relationship_on_source`), so this
@@ -2004,7 +2073,7 @@ async fn backfill_relationship_one_to_one(
         .map(|ident| format!("{source}.{ident}"))
         .collect();
 
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
 
     // The relationships that actually carry an aggregate leaf, in a
     // deterministic order for stable staging-table indices. (Every relationship
@@ -2140,22 +2209,12 @@ async fn backfill_relationship_one_to_one(
              select {select_exprs} from {source} {joins} where {where_clause} \
              {on_conflict}"
         );
-        match &lo {
-            None => {
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    hi.iter().map(|v| v as _).collect();
-                client.execute(&insert_sql, &params).await?;
-            }
-            Some(lo) => {
-                let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    lo.iter().map(|v| v as _).collect();
-                params.extend(
-                    hi.iter()
-                        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)),
-                );
-                client.execute(&insert_sql, &params).await?;
-            }
-        }
+        let params = range_params(&lo, &hi);
+        write_fenced(&mut client, fence, async |client| {
+            client.execute(&insert_sql, &params).await?;
+            Ok(())
+        })
+        .await?;
     }
 
     // Drop the staging tables before the connection returns to the pool.

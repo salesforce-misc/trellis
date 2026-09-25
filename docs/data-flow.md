@@ -147,10 +147,13 @@ drain threads.
    rows, a direct build with its job row. A ring-built definition skips it,
    flipping from `waiting_to_backfill` to `live` (or `catching_up`, below) as
    the discharge transaction's last statement. A drain thread that dies holding a chunk or a
-   job loses its claim to the reclaim sweep, and another reruns it. A direct
-   build that fails goes back to `waiting_to_backfill` behind a marker that
-   carries the error and a backoff, the same retry state a failed discharge
-   gets (#407), so `Trellis::status` reports it.
+   job loses its claim to the reclaim sweep, and another reruns it. A chunk or
+   job that a worker still holds when its definition is paused and resumed is
+   superseded, and its writes are fenced so that none lands after the resume
+   (#434, [ADR-0016](decisions/0016-single-background-capture-path.md#a-chunk-held-across-a-resume)).
+   A direct build that fails goes back to `waiting_to_backfill` behind a
+   marker that carries the error and a backoff, the same retry state a failed
+   discharge gets (#407), so `Trellis::status` reports it.
 4. **Go live.** A ring enumeration flips its definition to `live` inside
    the discharge transaction itself. A chunked or direct build doesn't flip
    it `live` when it finishes (#476): the last chunk's commit, or the job's,

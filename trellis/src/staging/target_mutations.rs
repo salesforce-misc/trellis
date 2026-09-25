@@ -50,6 +50,9 @@
 //! (#403), and a target whose build finishes with readers already attached (a
 //! resumed upstream) parks a catch-up marker for itself so those readers
 //! re-derive from its rebuilt state (and report `catching_up` until then).
+//! A chunk a worker held across a resume can't write once the rebuild has
+//! made the target applying again: its claim fences every write it makes
+//! (`defs::chunk_queue::ClaimFence`, #434).
 //!
 //! The seam only stages for readers that are already applying when the
 //! writer checks, so a *new* reader parks a catch-up on its source target
