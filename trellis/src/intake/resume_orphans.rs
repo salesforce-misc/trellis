@@ -1074,6 +1074,79 @@ mod db_tests {
             "the mismatch is returned, got {err:?}"
         );
     }
+
+    /// Issue #518: an aggregate grouped through a relationship its source no
+    /// longer declares as to-one (its catalog row edited, then deleted, by
+    /// hand) is an error the discharge backs off on, not a panic.
+    #[tokio::test]
+    async fn a_sweep_through_a_relationship_no_longer_to_one_is_an_error() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.posts (id integer primary key, author text); \
+             create table public.post_tags (id integer primary key, post integer, tag text); \
+             alter table public.posts replica identity full; \
+             alter table public.post_tags replica identity full; \
+             create index on public.post_tags (post); \
+             insert into public.posts values (1, 'alice'); \
+             insert into public.post_tags values (10, 1, 'rust')",
+        )
+        .await
+        .expect("seed posts and post_tags");
+        crate::defs::catalog::create_relationship(
+            &pool,
+            "RELATIONSHIP post FROM post_tags.post TO posts.id",
+        )
+        .await
+        .expect("create the to-one relationship");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("post".to_string(), ValueType::Numeric),
+            ("tag".to_string(), ValueType::Text),
+        ]);
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM author_tags FROM post_tags GROUP BY tag, post.author \
+             SELECT count(*) AS n",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::publication::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        assert_eq!(ids.len(), 1, "the build finished");
+
+        for (edit, reason) in [
+            (
+                "update relationship_definitions set cardinality = 'many' where name = 'post'",
+                "which is not to-one",
+            ),
+            (
+                "delete from relationship_definitions where name = 'post'",
+                "which public.post_tags doesn't declare",
+            ),
+        ] {
+            raw.batch_execute(edit)
+                .await
+                .expect("edit the catalog by hand");
+            let txn = raw.transaction().await.expect("begin");
+            let mut sweep = Sweep::default();
+            let err = sweep
+                .add(&txn, &ids, TransformStatus::CatchingUp)
+                .await
+                .expect_err("the sweep can't join through the relationship");
+            assert!(
+                matches!(
+                    &err,
+                    IntakeError::UnsweepableTarget { target, reason: r }
+                        if target == "public.author_tags" && r.ends_with(reason)
+                ),
+                "after {edit:?}, got {err:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
