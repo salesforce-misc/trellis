@@ -56,14 +56,11 @@
 //! answer for itself — "did the pause land?", "is it already gone?" — both
 //! resolve to success.
 //!
-//! **Publication shrinkage is the caller's last step, not this module's.**
-//! A `DROP TRANSFORM`/`DROP RELATIONSHIP` statement ([`crate::Trellis::apply`])
-//! calls
-//! [`crate::intake::publication::reconcile_publication`] inline once the drop
-//! commits (ADR-0014, "The publication shrinks by reconciliation"). It lives
-//! at the facade rather than here because reconciling needs a concrete
-//! `tokio_postgres::Client` and the configured publication name, neither of
-//! which this layer has — see that method's own doc comment.
+//! **A drop never touches the publication.** It only removes catalog rows.
+//! The staging worker's reconcile pass shrinks the publication from the
+//! catalog, its only source of truth for what to publish (ADR-0014, "The
+//! publication shrinks by reconciliation"; ADR-0016, issue #427), so a
+//! process that drops a transform needs no publication privileges.
 
 use tokio_postgres::Transaction;
 

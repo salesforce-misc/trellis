@@ -674,14 +674,12 @@ pub async fn create_definition(
     Ok(definition)
 }
 
-/// Like [`create_definition`], but stages *no* ring-enumeration backfill: the
-/// definition and its version bump are persisted `live`, but the source table
-/// is not enumerated into the ring. Callers that build the target directly
-/// (`defs::backfill::backfill_definition` — issue #63 M3's set-based,
-/// key-range-chunked source→target build) use this so the from-scratch build
-/// doesn't *also* flood the ring with one `Recompute` marker per source row;
-/// the ring is then left to handle only live CDC deltas after the direct
-/// build's fence.
+/// Test fixture: like [`create_definition`], but reads nothing. The
+/// definition and its version bump are persisted `live` with no backfill of
+/// any kind, for a test or benchmark that builds the target itself (with
+/// `defs::backfill::backfill_definition`, issue #63 M3's set-based build) or
+/// needs none. No production path calls this: every real definition is
+/// built through the backfill discharge (ADR-0016).
 #[cfg(any(test, feature = "test-util"))]
 pub async fn create_definition_without_backfill(
     pool: &Pool,
@@ -772,7 +770,7 @@ pub async fn install_definition(
     // failure partway through this function.
     // `create_definition_inner` (below) repeats both checks inside its own
     // transaction; that repeat is the *authoritative* one — it's the only
-    // check the ring-path entry points ([`create_definition`]/
+    // check the test-fixture entry points ([`create_definition`]/
     // [`create_definition_without_backfill`], which never call this
     // function) ever run. This one is a pure fail-fast nicety for the far
     // more common `install_definition` path, redundant-but-harmless on the
@@ -3135,7 +3133,7 @@ pub(crate) async fn resolve_relationships(
 
 /// [`resolve_relationships`] for a definition not yet persisted — the define
 /// and `ALTER` paths, which validate `def` before they've resolved (or, for
-/// the ring-path entry points, recorded) its qualified source. Resolves it
+/// the test-fixture entry points, recorded) its qualified source. Resolves it
 /// the same way [`install_definition`] does ([`resolve_source_for_install`]),
 /// but only when `def` references a relationship at all.
 ///
@@ -3213,7 +3211,7 @@ async fn resolve_source_schema_in_txn(
 ///    (issue #73's `transform_definitions.target_table`) — a legitimate
 ///    chained `FROM`/relationship endpoint, but not guaranteed to be backed
 ///    by a physical table at the instant this call names it: the
-///    catalog-only ring-path entry points
+///    catalog-only test-fixture entry points
 ///    ([`create_definition`]/[`create_definition_without_backfill`]) are
 ///    documented as expecting their *caller* to have already created the
 ///    physical target (see [`install_definition`]'s doc comment on its own
@@ -3427,7 +3425,7 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// `create_definition_inner` (further below) computes its *own* copy inside
 /// its own transaction rather than receiving this one as a parameter — see
 /// that function's doc comment on `qualified_source` for why: it's the sole,
-/// authoritative resolution the ring-path entry points ([`create_definition`]/
+/// authoritative resolution the test-fixture entry points ([`create_definition`]/
 /// [`create_definition_without_backfill`], which never call this function)
 /// ever get, so it must stand on its own regardless of what this function
 /// computed a few statements earlier. The two are expected to agree (same

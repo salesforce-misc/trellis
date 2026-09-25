@@ -496,7 +496,7 @@ async fn a_slot_recreated_under_the_same_name_is_recovered_as_lost() {
         &[&REBORN, &created],
     )
     .await
-    .expect("seed progress at the slot's start, as the handshake does");
+    .expect("seed progress at the slot's start, as fresh-install setup does");
 
     let mut session = trellis::staging::session::ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
         .await

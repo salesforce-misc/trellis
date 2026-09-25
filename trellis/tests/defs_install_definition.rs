@@ -1480,7 +1480,8 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 // ---------------------------------------------------------------------
 // Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
 // `install_definition`'s own source resolution (`resolve_source_for_install`,
-// `plan_direct_backfill_coverage`) walked bare `def.source` only through
+// and the since-retired coverage-fence planning that ran beside it) walked
+// bare `def.source` only through
 // `search_path` (`resolve_source_schema`/`resolve_source_schema_in_txn`),
 // never through `resolve_graph_identity`/`resolve_graph_identity_in_txn`'s
 // bare-target-suffix fallback the way `create_definition_inner`'s own
@@ -1498,9 +1499,7 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 /// specifically, since a plain 1-1 definition's DDL step
 /// (`ddl::source_primary_key(pool, &qualified_source)`, run directly inside
 /// `install_definition` before it registers the definition for the discharge)
-/// is the very first place this gap could fail — before `plan_direct_backfill_coverage`
-/// even runs (that function only runs for the relationship-enriched/aggregate
-/// branch, see the sibling test below).
+/// is the very first place this gap could fail.
 #[tokio::test]
 async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_default_schema_target()
 {
@@ -1575,26 +1574,23 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     );
 }
 
-/// Relationship-enriched-1-1 repro: exercises `plan_direct_backfill_coverage`'s
-/// own per-table resolution specifically. A relationship-enriched 1-1
-/// definition never takes the plain-1-1 short-circuit (registering for the
-/// discharge) — `backfill::uses_relationships` routes it
-/// through `plan_direct_backfill_coverage` instead, same as an Aggregate
-/// would, but without also exercising `create_definition_inner`'s separate
+/// Relationship-enriched-1-1 repro: the same resolution for a shape
+/// `backfill::uses_relationships` keeps off the plain-1-1 chunked build, as
+/// an Aggregate would be, but without also exercising `create_definition_inner`'s separate
 /// `assert_replica_identity_supports_aggregate` check (irrelevant to a
 /// to-one-enriched 1-1, and out of this fix's scope). `def C`'s own source
 /// is the chained, non-default-schema target — `tagrel`'s to-side
 /// (`tags`) is an ordinary, already-on-`search_path` table, so only the
 /// `bare_table == def.source` branch this fix touches is under test here.
 ///
-/// `plan_direct_backfill_coverage` runs unconditionally, before
-/// `backfill::backfill_definition` ever classifies this shape (a bare to-one
-/// passthrough enrichment, `tagrel.label` with no aggregate) as
-/// `BackfillError::Unsupported` and falls back to the ring — mirroring
+/// Registration resolves the source before the discharge ever classifies
+/// this shape (a bare to-one passthrough enrichment, `tagrel.label` with no
+/// aggregate) as `BackfillError::Unsupported` and falls back to the ring,
+/// mirroring
 /// `install_definition_falls_back_to_ring_for_relationship_enriched_definition`
-/// above. So this still proves the fix: before it, resolution failed inside
-/// `plan_direct_backfill_coverage` itself, before the fallback was ever
-/// reached.
+/// above. Before the fix, resolution failed inside registration, before the
+/// fallback was ever reached. (The coverage-fence planning this test first
+/// pinned, `plan_direct_backfill_coverage`, is retired, issues #468/#485.)
 #[tokio::test]
 async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chained_off_a_non_default_schema_target()
  {
@@ -1643,8 +1639,8 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
         .expect("relationship's bare FROM must resolve to custom.t");
 
     // Def C: a relationship-enriched 1-1 whose bare `FROM t` must resolve to
-    // def A's `custom.t` through `plan_direct_backfill_coverage`, not fail
-    // before the direct build ever runs.
+    // def A's `custom.t` at registration, not fail before the build ever
+    // runs.
     install_definition(
         &db.pool,
         "TRANSFORM u FROM t SELECT x AS y, tagrel.label AS tag_label",
@@ -1654,12 +1650,11 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
     .await
     .expect(
         "def C's bare FROM must resolve to def A's explicitly-qualified custom.t \
-         target through plan_direct_backfill_coverage, not fail as 'not found on \
-         the search path'",
+         target, not fail as 'not found on the search path'",
     );
 
     // This shape is `Unsupported` by the direct build (see this test's own
-    // doc comment), so `install_definition` falls back to the ring — the
+    // doc comment), so the discharge falls back to the ring — the
     // target starts empty and only converges once the discharge has
     // enumerated the source and the ring is drained, exactly like
     // `install_definition_falls_back_to_ring_for_relationship_enriched_definition`.

@@ -11,9 +11,8 @@
 //!
 //! Both tests reach the enumeration the same way: an aggregate `sku_totals`
 //! is chained into by a second definition, a settled marker sits on
-//! `sku_totals`, and `sku_totals` has changed since its coverage fence (a
-//! direct write here, so the enumeration can't be skipped and its effect is
-//! observable downstream). They differ in the downstream definition's shape
+//! `sku_totals`, and `sku_totals` has changed since the build (a direct
+//! write here, so the enumeration's effect is observable downstream). They differ in the downstream definition's shape
 //! and how the marker got parked:
 //!
 //! - a chunked 1-1 transform, whose `complete_direct_backfill` parks the
@@ -229,8 +228,8 @@ async fn catchup_marker_on_an_aggregate_target_feeding_a_one_to_one_discharges()
          target"
     );
 
-    // Change the aggregate target after its coverage fence, so the discharge
-    // really enumerates it (and settles the marker's fence).
+    // Change the aggregate target after the build, so the discharge's
+    // enumeration has an effect downstream to observe.
     client
         .execute("update sku_totals set total = 100 where sku = 'a'", &[])
         .await
@@ -302,7 +301,7 @@ async fn catchup_marker_on_an_aggregate_target_feeding_an_aggregate_discharges()
         "sanity check: the chained aggregate built every group, NULL included"
     );
 
-    // Park the marker as `park_backfill_catchup` does: unfenced, for the
+    // Park the marker as `park_marker` does: unfenced, for the
     // discharge to fence when it reads it.
     client
         .execute(

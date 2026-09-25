@@ -114,7 +114,11 @@ since it writes directly to the target rather than through the ring.
 > it after the source's marker fence settles. The build algorithms and the
 > chunk queue are unchanged. The registration-time wiring below, and the
 > registration-time chunk enqueue in "Backgrounding and resumability", are what
-> that ADR retires.
+> that ADR retires. So is the coverage fence "Backgrounding and resumability"
+> mentions (#468, #485). CDC deltas that drain during a build are skipped, not
+> parked, and the build's go-live catch-up recovers what they changed by
+> re-reading the tables the build read
+> ([ADR-0016](0016-single-background-capture-path.md#which-consistency-bookkeeping-stays)).
 
 `trellis::defs::install_definition` is the real entry point: it creates the
 target table, tries `backfill_definition` (direct path), persists via

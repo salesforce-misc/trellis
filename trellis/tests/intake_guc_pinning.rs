@@ -74,7 +74,7 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 /// Seeds `slot`'s `replication_progress` row at the slot's own starting
-/// position, as `initial_snapshot_handshake` does. A row behind the slot
+/// position, as `create_slot_and_park_markers` does. A row behind the slot
 /// would read as a slot recreated past this instance's confirmed position
 /// (issue #406) and fail `Intake::connect`.
 async fn seed_progress_at_slot(client: &Client, slot: &str) {

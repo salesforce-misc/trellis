@@ -201,11 +201,14 @@ can't loop.
   #431). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
-  ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). Only the
+  ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)). The two
+  exceptions rebuild some columns of a `live` transform: a column resume and
+  an `ALTER TRANSFORM` that adds columns still read those columns in-call
+  (#425, #426). Only the
   staging worker runs the `ALTER`, including the shrink after a `DROP`: a `DROP`
   removes catalog rows and the worker's reconcile pass takes the table back out
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences);
-  *Planned, #427*). The inventory in
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences),
+  #427). The inventory in
   [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
   lists every capture path and its role.
 - **A marker is deleted only by the discharge that read it.** A table has one

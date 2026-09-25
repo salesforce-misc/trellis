@@ -26,8 +26,8 @@
 //! direct/set-based path) reaching `live` in the ordinary (no unsettled
 //! marker) case is already covered extensively by `defs_install_definition.rs`
 //! and `defs_backfill_chunk_queue.rs`; this file only adds the piece those
-//! didn't cover: the deferred-to-`waiting_to_backfill` path this issue adds,
-//! and whole-transform quarantine resume.
+//! didn't cover: a definition held in `waiting_to_backfill` while its
+//! marker's fence is unsettled, and whole-transform quarantine resume.
 //!
 //! A third scenario (issue #105) drives the whole-transform fuse's *trip*
 //! half for real, rather than simulating it: five distinct keys on one
@@ -428,9 +428,9 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         .expect("reconcile adds s and leaves an unsettled pending_backfill marker");
 
     // The definition is created *while the marker is still unsettled* — the
-    // scenario issue #55 closes: without the fix, this would persist
-    // `backfilling` (the chunked path's usual speculative status) and
-    // silently start enumerating/building right away, racing the straggler.
+    // scenario issue #55 closed. Registration always leaves the definition
+    // `waiting_to_backfill` now (ADR-0016); what this pins is that the
+    // discharge doesn't build it until the straggler has ended.
     let cols = numeric(&["a"]);
     let def = install_definition(
         &db.pool,
@@ -439,13 +439,12 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         "public",
     )
     .await
-    .expect("install_definition defers instead of racing the fence");
+    .expect("install_definition");
 
     assert_eq!(
         def.status,
         TransformStatus::WaitingToBackfill,
-        "a definition created while its source table's fence is unsettled must defer, not \
-         speculatively persist backfilling/live"
+        "registration records the definition waiting_to_backfill, never backfilling/live"
     );
     assert_eq!(
         status_of(&raw, "t").await,
@@ -1245,9 +1244,8 @@ async fn a_row_committed_during_fresh_slot_creation_reaches_the_target() {
 }
 
 /// Issue #323's second concern, checked for #417: a definition registered
-/// while a fresh install's slot creation waits defers to
-/// `waiting_to_backfill` (its source's join marker is unsettled), and must
-/// still go live. Setup parks its own marker on the table after slot
+/// while a fresh install's slot creation waits (its source's join marker is
+/// unsettled) must still go live. Setup parks its own marker on the table after slot
 /// creation, merging into the join marker, and nothing discharges markers
 /// during setup, so the deferred definition's marker is always there for the
 /// discharge to promote it.

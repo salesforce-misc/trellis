@@ -68,7 +68,10 @@ is counted once.
 
 There is one capture path, and every definition's initial build goes through
 it ([ADR-0016](decisions/0016-single-background-capture-path.md)). Resumes,
-explicit `request_backfill` calls and go-live catch-ups use it too.
+explicit `request_backfill` calls and go-live catch-ups use it too. Two
+rebuilds of some columns of a `live` transform don't yet: a column resume and an
+`ALTER TRANSFORM` that adds columns read those columns' values in-call, then
+park a catch-up marker (#425, #426).
 
 ### Registration
 
@@ -92,8 +95,8 @@ drain threads.
 
 1. **Join.** The source gets a `pending_backfill` marker, parked with no
    **fence** yet. The first discharge pass to see the marker takes the fence,
-   the snapshot (`pg_current_snapshot()`) of a statement run after reading the
-   committed marker, and records it on the marker for later passes.
+   the transaction id of a statement run after reading the committed marker,
+   and records it on the marker for later passes.
    - If the table isn't in the publication yet, the staging worker's reconcile
      pass (`reconcile_publication`) adds it and parks the marker in the same
      transaction. The fence has to cover every transaction that could have
@@ -236,13 +239,17 @@ drain threads.
 ### A fresh install
 
 A fresh install creates the replication slot and parks a marker on every
-configured source table, in one transaction, after slot creation returns
+table the catalog says to publish, in one transaction, after slot creation returns
 (`intake::publication::create_slot_and_park_markers`). It reads no source table
 itself. The first discharge pass reads each table after the slot exists, so
 every commit the read misses comes after the slot's consistent point and is
 streamed. The discharge skips a table no definition reads yet, since nothing
 would consume its rows. A definition registered on it later gets its own
-capture. A lost slot is recovered the same way (`intake::slot_loss`): the slot
+capture. The marker on every table, not only those with a
+`waiting_to_backfill` definition, matters when the catalog outlives its slot
+(a new slot name, say): a definition already `live` has missed whatever
+committed before the new slot's consistent point, and that marker's
+discharge re-derives it (#393's regression test). A lost slot is recovered the same way (`intake::slot_loss`): the slot
 is recreated without a read, and each paused transform's resume parks its own
 marker.
 

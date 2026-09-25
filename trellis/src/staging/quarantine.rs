@@ -1602,10 +1602,9 @@ pub async fn resume_column(
 ///
 /// This function itself only schedules that reconciliation. It drops the
 /// definition to [`TransformStatus::WaitingToBackfill`] and re-parks a fresh
-/// `pending_backfill` marker for its source table (reusing
-/// [`crate::intake::publication::park_backfill_catchup`], the mechanism a
-/// chunked build's own post-completion catch-up uses, see
-/// `defs::catalog::complete_direct_backfill`). The target is left exactly as
+/// `pending_backfill` marker for its source table
+/// ([`crate::intake::publication::park_marker`], which every marker goes
+/// through). The target is left exactly as
 /// the freeze left it until that marker's discharge
 /// ([`crate::intake::publication::run_pending_backfills`]) runs, which in one
 /// transaction deletes every target row no current source row backs (issue
@@ -1739,7 +1738,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    crate::intake::publication::park_backfill_catchup(&*txn, &source_table).await?;
+    crate::intake::publication::park_marker(&*txn, &source_table).await?;
     // Issue #310: a transform paused by a lost replication slot stops being
     // reported as such the moment it is resumed.
     txn.execute(

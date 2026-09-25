@@ -689,14 +689,12 @@ impl ManualBackend {
         let text = sql::render_definition(def);
 
         // Issue #63 C1: `install_definition` is the same front door real
-        // callers use — it creates the target table, then tries the fast,
-        // set-based direct build first and falls back to the ring-based
-        // `create_definition` only for a shape the direct build can't render
-        // yet (`BackfillError::Unsupported`, folded into `CatalogError` —
-        // see its doc comment). Routing the fuzz harness through it, instead
-        // of hand-rolling the same create-table/backfill/persist sequence,
-        // keeps this backend exercising the exact path production traffic
-        // takes.
+        // callers use. It creates the target table and records the
+        // definition `waiting_to_backfill`; the staging worker's backfill
+        // discharge builds it in the background (ADR-0016). Routing the fuzz
+        // harness through it, instead of hand-rolling the same
+        // create-table/persist sequence, keeps this backend exercising the
+        // exact path production traffic takes.
         // Issue #234: `self.target_schema`, not a hardcoded `"public"` — see
         // that field's doc comment. `connect`/`connect_with_workers`/
         // `connect_with_options` all still resolve it to exactly what a
