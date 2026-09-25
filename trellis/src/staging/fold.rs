@@ -219,7 +219,8 @@ pub struct FoldedChange {
     /// keeps the row. These images name the groups it was born into and
     /// died from. An aggregate checks each against its horizon
     /// (`apply_aggregate::GroupPlan::horizon_check_only`) and re-derives it
-    /// only when the check says so. A key that also moved between groups more
+    /// only when the check says so (otherwise it only probes that a group
+    /// with a row still exists). A key that also moved between groups more
     /// than once inside the batch is still only named by these two.
     ///
     /// Only the no-image case carries them, so the wire cost falls on

@@ -3153,7 +3153,7 @@ async fn current_wal_lsn(client: &Client) -> PgLsn {
 async fn sku_totals(client: &Client) -> Vec<(String, String)> {
     client
         .query(
-            "select sku, trim_scale(total)::text from sku_totals order by sku",
+            "select sku, coalesce(trim_scale(total)::text, 'null') from sku_totals order by sku",
             &[],
         )
         .await
@@ -3394,5 +3394,63 @@ async fn an_insert_and_delete_folded_below_no_horizon_leave_no_group() {
     assert_eq!(
         extinct, 0,
         "a group that was never there is not an extinction"
+    );
+}
+
+/// Issue #486 with no horizon involved: a delta drained while a key's insert
+/// was still in flight (another bucket, or an earlier batch drained later)
+/// probes the group, finds it non-empty only because of that key, and keeps
+/// its row without counting the key. When the key's insert and delete then
+/// fold together to nothing, only an existence probe can find the group
+/// empty; a horizon check alone leaves a row for a group with no source rows.
+#[tokio::test]
+async fn an_insert_and_delete_folded_after_a_probe_saw_the_key_still_empty_the_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'z', 2)").await;
+
+    // Row 4 joins z; its insert is not drained yet. Row 3 leaves z, and its
+    // delete drains first: the probe sees row 4, so z's row stays, summing nothing.
+    client
+        .batch_execute(
+            "insert into sales (id, sku, amount) values (4, 'z', 1000); \
+             delete from sales where id = 3",
+        )
+        .await
+        .expect("insert row 4, delete row 3");
+    let lsn = current_wal_lsn(&client).await;
+    stage_sales(
+        &client,
+        "3",
+        "delete",
+        Some(lsn),
+        Some(&sales_image(3, "z", 2)),
+        None,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12"), ("z", "null")]),
+        "the probe saw row 4, so z's row survives without it"
+    );
+
+    client
+        .batch_execute("delete from sales where id = 4")
+        .await
+        .expect("delete row 4");
+    let delete_lsn = current_wal_lsn(&client).await;
+    let image = sales_image(4, "z", 1000);
+    stage_sales(&client, "4", "insert", Some(lsn), None, Some(&image)).await;
+    stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12")]),
+        "z has no source rows left, so its row must be removed"
     );
 }

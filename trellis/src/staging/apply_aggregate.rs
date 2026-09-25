@@ -193,7 +193,9 @@
 //! it would name no group to check (issue #486). The fold keeps the images
 //! that name its groups ([`FoldedChange::vanished_images`]); each such group
 //! is [`GroupPlan::horizon_check_only`], re-derived if its row's horizon says
-//! the key may have been counted and otherwise left untouched.
+//! the key may have been counted. Otherwise a group with a row is probed for
+//! existence, as a delta group is, and never written; one with no row is left
+//! untouched.
 //!
 //! # A recompute folded with a CDC change (issue #392)
 //!
@@ -428,9 +430,11 @@ pub(super) struct GroupPlan {
     /// Issue #486: the group is named only by a key that was born and died
     /// inside this batch ([`FoldedChange::vanished_images`]), so it has no
     /// delta of its own. [`apply_aggregate_target`] re-derives it when its
-    /// row's recompute horizon says a live read may have counted that key,
-    /// and otherwise leaves it alone: no existence probe, no write. A real
-    /// delta or a forced recompute of the group clears this.
+    /// row's recompute horizon says a live read may have counted that key.
+    /// Otherwise a group with a row gets the delta path's existence probe
+    /// (deleting the row if the group is empty) but no write, and a group
+    /// with no row is left alone. A real delta or a forced recompute of the
+    /// group clears this.
     pub horizon_check_only: bool,
 }
 
@@ -3547,9 +3551,16 @@ pub(super) async fn apply_aggregate_target(
     let mut delta_groups: Vec<(&String, &GroupPlan)> = Vec::new();
     for &key in &group_keys {
         let group = &plan.groups[key];
+        if takes_forced_path(key, group) {
+            continue;
+        }
         // Issue #486: a horizon-check-only group the check didn't re-derive
-        // has no delta to apply.
-        if takes_forced_path(key, group) || group.horizon_check_only {
+        // has no delta to apply. With no row there is nothing to correct
+        // (see `extinct_horizon`). With one, it is still probed: an earlier
+        // probe may have kept the row only because the vanished key was then
+        // live, with the key's insert still in flight, and this batch is the
+        // last chance to find the group empty.
+        if group.horizon_check_only && !row_horizons.contains_key(key.as_str()) {
             continue;
         }
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
@@ -3575,7 +3586,7 @@ pub(super) async fn apply_aggregate_target(
             continue;
         }
 
-        if group_has_activity(plan, group) {
+        if !group.horizon_check_only && group_has_activity(plan, group) {
             delta_groups.push((key, group));
         }
     }

@@ -199,10 +199,13 @@ So the live read records its basis as a WAL position, and a delta checks it:
 4. **A key born and died in the batch.** Its insert and delete fold to no image
    and a zero delta, but the fold keeps the images that name its groups
    (`vanished_images`, issue #486). Each such group gets the same check against
-   its row's horizon, and is re-derived when it fails. Otherwise it is left
-   alone: no existence probe and no write. A group with no row is left alone
-   too, because a live read that counted the key would have written one, and
-   whatever removed it since was a live read that found the group without the key.
+   its row's horizon, and is re-derived when it fails. Otherwise it gets the
+   delta path's existence probe but no write: an earlier probe may have kept
+   the row only because the key was live then, with its insert still in
+   flight, and nothing else will find the group empty. A group with no row is
+   left alone, because a live read that counted the key would have written
+   one, and whatever removed it since was a live read that found the group
+   without the key.
 
 This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
 at or below the horizon only *may* have been read, so skipping the delta would be
