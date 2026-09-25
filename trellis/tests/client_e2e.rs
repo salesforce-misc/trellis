@@ -712,9 +712,18 @@ async fn staging_and_application_threads_are_independent_knobs() {
 /// enqueues the chunks, and it's the running client's own `application_threads`
 /// drain workers — with no ring/CDC involved at all here (`staging_worker:
 /// false`) — that claim and finish its backfill chunk, completing its build
-/// and building the target correctly. The build leaves it `catching_up`: its
-/// go-live catch-up waits for a staging worker, and there is none here
-/// (issue #476).
+/// and building the target correctly.
+///
+/// The wait is for the chunk to be done and the definition applying, not for
+/// it to be `catching_up` (issue #552). The build leaves it `catching_up`, and
+/// with no staging worker nothing else moves it on, except the test's own
+/// stand-in for one: `discharge_registrations` discharges the go-live
+/// catch-up of any definition it finds `catching_up` before it returns, which
+/// takes it `live`. So a drain worker that finishes the chunk inside that call
+/// leaves it `live`, and a wait for `catching_up` never ends. Both are a
+/// finished build. The workers poll every 10ms, far below the 200ms default,
+/// so that interleaving happens on almost every run instead of only when load
+/// slows the discharge loop down, and the wait is shown to handle it.
 #[tokio::test]
 async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     let cluster = TestCluster::start();
@@ -731,6 +740,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     let options = ClientOptions {
         staging_worker: false,
         application_threads: 2,
+        poll_interval: Duration::from_millis(10),
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
@@ -750,29 +760,52 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
-    // discharge, which dispatches the chunked build (ADR-0016, #418).
+    // discharge, which dispatches the chunked build (ADR-0016, #418). It
+    // retries a fence pinned by another transaction for only a few seconds
+    // and then returns without dispatching, so check that it did: a missing
+    // chunk would otherwise surface as the wait below timing out.
     trellis::intake::publication::discharge_registrations(&db.pool)
         .await
         .expect("dispatch the chunked build");
+    let chunks: i64 = raw
+        .query_one(
+            "select count(*) from backfill_chunks where definition_id = $1",
+            &[&def.id],
+        )
+        .await
+        .expect("count widgets_calc's chunks")
+        .get(0);
+    assert!(
+        chunks > 0,
+        "the discharge must have dispatched widgets_calc's build as backfill chunks"
+    );
 
+    // Only the running drain workers run chunks here, so a finished chunk is
+    // one of them claiming and finishing it. See this test's doc comment for
+    // why `live` counts too.
     poll_until(
         Duration::from_secs(20),
         Duration::from_millis(100),
-        "widgets_calc's backfill chunk was never claimed and finished by a running drain worker",
+        "widgets_calc's backfill chunks were never all claimed and finished by a running \
+         drain worker",
         async || {
-            let status: Option<String> = raw
-                .query_opt(
-                    // Issue #73: `target_table` is persisted fully-qualified now.
-                    &format!(
-                        "select status from transform_definitions \
-                         where target_table = '{DEFAULT_TARGET_SCHEMA}.widgets_calc'"
-                    ),
-                    &[],
-                )
-                .await
-                .expect("read status")
-                .map(|row| row.get(0));
-            status.as_deref() == Some("catching_up")
+            raw.query_one(
+                "select d.status = any($2) \
+                        and not exists (select 1 from backfill_chunks bc \
+                                        where bc.definition_id = d.id and not bc.done) \
+                 from transform_definitions d where d.id = $1",
+                &[
+                    &def.id,
+                    &[
+                        TransformStatus::CatchingUp.as_str(),
+                        TransformStatus::Live.as_str(),
+                    ]
+                    .as_slice(),
+                ],
+            )
+            .await
+            .expect("read widgets_calc's build progress")
+            .get(0)
         },
     )
     .await;
