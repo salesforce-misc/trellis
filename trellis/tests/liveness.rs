@@ -4,14 +4,16 @@
 //!
 //! See docs/staging-and-claiming/04-claiming-and-the-fold.md, "Keeping a
 //! claim alive" and "Two ways a claim comes back" for the design these
-//! tests hold the implementation to. Short real-time windows throughout
-//! (ttl ~300ms, daemon interval ~50ms) so this runs fast against the real
-//! cluster.
+//! tests hold the implementation to. Staleness is made by backdating a
+//! claim's `claimed_at` rather than by waiting out a short TTL against a
+//! live heartbeat, and the daemon's timing is only ever waited on as a lower
+//! bound (issue #513), so nothing here depends on how promptly a loaded box
+//! schedules a thread.
 //!
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
 //! (`trellis/src/staging/liveness.rs`'s `#[cfg(test)]`), not here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -84,6 +86,37 @@ async fn seal_one_bucket_batch(client: &mut Client, key: &str) -> i64 {
     seal_active_segment(client).await
 }
 
+/// Backdates every claim on `seg_seq` by an hour: far past any TTL a test
+/// sweeps with, without waiting for real time to pass.
+async fn backdate_claims(client: &Client, seg_seq: i64) {
+    client
+        .execute(
+            "update seg_claims set claimed_at = now() - interval '1 hour' where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("backdate claims");
+}
+
+/// How long a test waits on something the daemon does before calling it a
+/// hang. Only ever a bound on a hang: no test asserts the daemon got there
+/// quickly.
+const HANG: Duration = Duration::from_secs(30);
+
+/// Polls `probe` every 10ms until it holds, panicking with `what` after
+/// [`HANG`].
+async fn wait_until<F, Fut>(what: &str, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + HANG;
+    while !probe().await {
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
     let cluster = TestCluster::start();
@@ -141,7 +174,9 @@ async fn a_daemon_heartbeat_survives_a_bulk_drain_that_outlives_the_ttl() {
     let daemon_seg = seal_one_bucket_batch(&mut client, "daemon-kept").await;
     let plain_seg = seal_one_bucket_batch(&mut client, "never-heartbeat").await;
 
-    let ttl = Duration::from_millis(300);
+    // A production-sized TTL: both claims are made stale by backdating them
+    // past it, never by real time elapsing against it.
+    let ttl = Duration::from_secs(60);
     let daemon = HeartbeatDaemon::spawn(
         db.dsn(),
         DEFAULT_SCHEMA,
@@ -162,10 +197,24 @@ async fn a_daemon_heartbeat_survives_a_bulk_drain_that_outlives_the_ttl() {
         .expect("claim plain batch");
     assert!(!plain_won.is_empty());
 
-    // Simulate a bulk-shape drain: no in-line `claimed_at` refresh at all,
-    // sleep well past the TTL. The daemon (registered, ticking every 50ms)
-    // is the only thing keeping `daemon_seg`'s claim alive.
-    tokio::time::sleep(ttl + Duration::from_millis(150)).await;
+    // Simulate a bulk-shape drain that has outlived the TTL: no in-line
+    // `claimed_at` refresh at all, and both claims an hour old. The daemon is
+    // the only thing that can bring `daemon_seg`'s claim back within the TTL.
+    backdate_claims(&client, daemon_seg).await;
+    backdate_claims(&client, plain_seg).await;
+    wait_until("the daemon to refresh its backdated claim", || async {
+        client
+            .query_one(
+                "select bool_and(claimed_at >= now() - (interval '1 second' * $3)) \
+                 from seg_claims where seg_seq = $1 and claimed_by = $2",
+                &[&daemon_seg, &"bulk-worker", &ttl.as_secs_f64()],
+            )
+            .await
+            .expect("read the daemon-tracked claim")
+            .get::<_, Option<bool>>(0)
+            .unwrap_or(false)
+    })
+    .await;
 
     let reclaimed = liveness::reclaim_stale(&client, ttl)
         .await
@@ -283,30 +332,38 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
         .await
         .expect("claim");
 
+    let idle_timeout = Duration::from_millis(200);
     let daemon = HeartbeatDaemon::spawn(
         db.dsn(),
         DEFAULT_SCHEMA,
         HeartbeatDaemonConfig {
             interval: Duration::from_millis(50),
-            idle_timeout: Duration::from_millis(200),
+            idle_timeout,
         },
     );
 
     daemon.register(seg_seq, "worker").await;
-    // Let a few ticks pass so the daemon actually opens its connection.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        daemon.is_connected(),
-        "the daemon must have opened a connection for a claim that outlived one interval"
-    );
+    wait_until(
+        "the daemon to open a connection for a claim that outlived one interval",
+        || async { daemon.is_connected() },
+    )
+    .await;
     assert_eq!(daemon.connections_opened(), 1);
 
+    // The idle clock starts at the first tick that sees the registry empty,
+    // which is no earlier than this, so the close can't be observed before
+    // `idle_timeout` has passed from here: a lower bound that holds however
+    // late the daemon's ticks run.
+    let deregistered_at = Instant::now();
     daemon.deregister(seg_seq, "worker").await;
-    // Wait past the idle timeout (measured in ticks past the registry going
-    // empty), plus slack for a couple of ticks to observe it.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_until(
+        "the daemon to close its connection once idle for longer than idle_timeout",
+        || async { !daemon.is_connected() },
+    )
+    .await;
     assert!(
-        !daemon.is_connected(),
-        "the daemon must close its connection once idle for longer than idle_timeout"
+        deregistered_at.elapsed() >= idle_timeout,
+        "the daemon closed its connection after {:?}, before its {idle_timeout:?} idle timeout",
+        deregistered_at.elapsed()
     );
 }

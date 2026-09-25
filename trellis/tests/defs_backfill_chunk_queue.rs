@@ -453,17 +453,16 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
 /// duration of the write, exactly as `staging::liveness::HeartbeatDaemon`
 /// does for segment claims.
 ///
-/// Simulated via a statement-level `before insert` trigger on the target
-/// table that sleeps for longer than the (deliberately short) test
-/// `reclaim_ttl` used here: the chunk's `insert ... select ... on conflict`
-/// is one statement, so the trigger fires exactly once regardless of how
-/// many rows it touches, making the whole write take ~10x the reclaim TTL.
-/// While that write is in flight, a concurrent loop sweeps for stale claims
-/// far more often than the TTL requires — mirroring the cadence
-/// `maintenance_loop`/`sweep_stale_chunks_if_due` run in production — and
-/// must never actually reclaim anything, because the heartbeat spawned
-/// inside `run_claimed_chunk` keeps refreshing `claimed_at` well within the
-/// TTL the whole time.
+/// Deterministic under any load (issue #513): nothing here races a live
+/// heartbeat against a short TTL. A statement-level `before insert` trigger
+/// on the target blocks the chunk's one write statement on an advisory lock
+/// the test holds, so the write stays in flight for exactly as long as the
+/// test needs. While it's blocked, the test backdates the claim's
+/// `claimed_at` by an hour, far past the (production-sized) TTL, and waits for
+/// the heartbeat to bring it back. Only a heartbeat running *during* the
+/// write can do that; the test does it twice, so a heartbeat that fired once
+/// and stopped fails too. After the write finishes, a sweep with a TTL the
+/// backdated claim would have failed must leave the claim alone.
 #[tokio::test]
 async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     let cluster = TestCluster::start();
@@ -488,20 +487,21 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     .await
     .expect("install and dispatch the chunk work");
 
-    // A statement-level trigger that sleeps once per `insert` statement,
-    // simulating a chunk write slow enough (~600ms) to outlast several
-    // multiples of the short `reclaim_ttl` this test uses below (150ms).
+    // A statement-level trigger that blocks each `insert` into the target on
+    // an advisory lock the test holds: the chunk's write stays in flight
+    // until the test releases it.
     client
         .batch_execute(
             "create function _slow_backfill_write() returns trigger as $$ \
-             begin perform pg_sleep(0.6); return null; end; \
+             begin perform pg_advisory_xact_lock(513); return null; end; \
              $$ language plpgsql; \
              create trigger _slow_backfill_write_trigger \
              before insert on t for each statement \
-             execute function _slow_backfill_write()",
+             execute function _slow_backfill_write(); \
+             select pg_advisory_lock(513)",
         )
         .await
-        .expect("install a slow-write trigger on the target table");
+        .expect("install a blocking-write trigger on the target and hold its lock");
 
     let claimed = chunk_queue::claim_chunks(&client, "slow-worker", 10)
         .await
@@ -509,9 +509,11 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
     let chunk = claimed[0].clone();
 
-    let ttl = Duration::from_millis(150);
-    // Far below `ttl`, the same margin `HeartbeatDaemon`'s own interval
-    // keeps under `reclaim_ttl` in production.
+    // A production-sized TTL: staleness comes from backdating `claimed_at`
+    // below, never from real time elapsing against it. It is also the write
+    // transaction's idle timeout (`ClaimFence`), which a TTL of a few hundred
+    // milliseconds would let a loaded box trip.
+    let ttl = Duration::from_secs(60);
     let heartbeat_interval = Duration::from_millis(20);
 
     let pool = db.pool.clone();
@@ -527,27 +529,38 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
         .await
     });
 
-    // While the chunk write is (slowly) in flight, repeatedly sweep for
-    // stale claims at a cadence much faster than the write's own runtime.
-    // Without Fix 1's heartbeat, this would reclaim the still-in-flight
-    // claim well before the write finishes.
-    let mut total_reclaimed = 0u64;
-    for _ in 0..8 {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        total_reclaimed += chunk_queue::reclaim_stale_chunks(&mut client, ttl)
+    wait_for_blocked_chunk_write(&client).await;
+
+    // Twice: a heartbeat must keep refreshing the claim for the whole write,
+    // not just once when it starts.
+    for round in 1..=2 {
+        client
+            .execute(
+                "update backfill_chunks set claimed_at = now() - interval '1 hour' \
+                 where id = $1",
+                &[&chunk.id],
+            )
             .await
-            .expect("reclaim_stale_chunks");
+            .expect("backdate the in-flight chunk's claim");
+        wait_for_fresh_chunk_claim(&client, chunk.id, ttl, round).await;
     }
 
+    client
+        .execute("select pg_advisory_unlock(513)", &[])
+        .await
+        .expect("release the chunk's write");
     run_task
         .await
         .expect("run_claimed_chunk task panicked")
         .expect("run_claimed_chunk");
 
+    let reclaimed = chunk_queue::reclaim_stale_chunks(&mut client, ttl)
+        .await
+        .expect("reclaim_stale_chunks");
     assert_eq!(
-        total_reclaimed, 0,
+        reclaimed, 0,
         "the heartbeat must keep the claim fresh for the whole chunk write, even though the \
-         write itself takes several multiples of the reclaim TTL"
+         write itself outlasted the reclaim TTL"
     );
 
     chunk_queue::finish_chunk(&db.pool, &chunk, "slow-worker")
@@ -579,6 +592,61 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
         .expect("read back status")
         .get(0);
     assert_eq!(status, "catching_up");
+}
+
+/// Waits until a chunk's write is blocked on the advisory lock its test
+/// holds (see `a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed`).
+/// The deadline only bounds a hang: the wait itself asserts nothing about
+/// how fast the write gets there.
+async fn wait_for_blocked_chunk_write(client: &Client) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: bool = client
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where datname = current_database() \
+                   and wait_event_type = 'Lock' and wait_event = 'advisory')",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if blocked {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the chunk's write never reached its blocking trigger"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until chunk `id`'s `claimed_at` is back within `ttl` of now, after
+/// its test backdated it: only the chunk's heartbeat moves it forward. As
+/// with [`wait_for_blocked_chunk_write`], the deadline only bounds a hang.
+async fn wait_for_fresh_chunk_claim(client: &Client, id: i64, ttl: Duration, round: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let fresh: bool = client
+            .query_one(
+                "select claimed_at >= now() - (interval '1 second' * $2) \
+                 from backfill_chunks where id = $1 and claimed_by = 'slow-worker'",
+                &[&id, &ttl.as_secs_f64()],
+            )
+            .await
+            .expect("read the chunk's claim")
+            .get(0);
+        if fresh {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "round {round}: the heartbeat never refreshed the backdated claim while its write \
+             was in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A chunk already marked done cannot be double-completed by its original
