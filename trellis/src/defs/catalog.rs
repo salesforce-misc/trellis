@@ -4795,11 +4795,7 @@ async fn ensure_relationship_projection_in_txn(
 /// re-read for changes whose CDC may never have reached its projection
 /// (issue #522, `intake::publication::park_table_catch_ups`). It diffs the
 /// whole table, about 0.7 s for a 1M-row target whose projection is already
-/// current, so no other marker asks for it. For a source to-side, CDC still
-/// pending when this runs drains after it and writes its images over what
-/// this wrote. That restores this state only when every later change to the
-/// key also reached CDC. A change lost after one still pending is undone by
-/// the pending change's older image (issue #531). Every write to a target
+/// current, so no other marker asks for it. Every write to a target
 /// reaches its projection through the target-mutation seam's CDC-shaped rows,
 /// except a rebuild's (a resumed definition's chunks or direct build), which
 /// writes the target directly. Nothing else would ever carry what the rebuild
@@ -4808,26 +4804,36 @@ async fn ensure_relationship_projection_in_txn(
 /// re-derives those consumers from the refreshed projection (its enumeration
 /// of the target reaches them by reverse propagation).
 ///
-/// Neither bookkeeping column moves on a row it rewrites. A seam row staged
-/// before this read can still be pending, and its capture of the row's
-/// `__trellis_lsn`, before or after this, still matches. If its image is the
-/// row's latest it re-applies what this already wrote. If the rebuild
-/// superseded it, putting that image back would be wrong with nothing after
-/// it to correct it, so Phase 3 checks a seam-fed to-side's images against
-/// the live row and writes the projection from the live row instead
-/// (`staging::apply::to_side_superseded`). A seam row staged after this read
-/// can't drain before the discharge commits: the discharge runs on the only
-/// sealer.
+/// Neither bookkeeping column moves on a row it rewrites. A reverse record
+/// (a to-side change's CDC, or a target's seam row) staged before this read
+/// can still be pending, and its capture of the row's `__trellis_lsn`,
+/// before or after this, still matches. If its image is the key's latest it
+/// re-applies what this already wrote. If a later change overtook it, one
+/// this read saw but no pending record carries (a rebuild's write, which
+/// bypasses the seam, or a source change whose CDC was lost after the
+/// pending one's, issue #531), putting that image back would be wrong with
+/// nothing after it to correct it. So this stamps each relationship's
+/// `relationship_projections.refreshed_lsn` with the WAL position after its
+/// reads, and Phase 3 checks a record at or below the stamp (every record,
+/// for a seam-fed to-side) against the live to-side row, writing the
+/// projection from the live row when the images no longer hold
+/// (`staging::apply::superseded_to_side`). A record above the stamp is a
+/// change this read may not have seen, so its image is no older than what
+/// this wrote. The stamp rows are locked `for update` before any projection
+/// row, and Phase 3 locks them `for share` before its own projection writes
+/// (step 3c), so a drain either commits before this reads anything or reads
+/// the stamp this commits. A seam row staged after this read can't drain
+/// before the discharge commits: the discharge runs on the only sealer.
 ///
-/// Its projection writes can deadlock with a drain's, which locks projection
-/// rows in key order (step 3c's `__trellis_gen` bump) or one record at a
-/// time (step 3d), while this locks them in scan order, and with a drain that
-/// holds a projection row while it writes an aggregate consumer's target row
-/// the same discharge's orphan sweep deleted. Postgres aborts one side, the
-/// same bounded case as the sweep's own (`intake::resume_orphans`): an
-/// aborted apply is a transient error with no quarantine charge, and an
-/// aborted discharge rolls back whole and retries after the marker's
-/// backoff.
+/// Its projection writes can deadlock with a drain's that holds a
+/// projection row while it writes an aggregate consumer's target row the
+/// same discharge's orphan sweep deleted, or with a drain that carries no
+/// reverse record for the relationship (so took no stamp lock) and locks
+/// projection rows in key order (step 3c's `__trellis_gen` bump) while this
+/// locks them in scan order. Postgres aborts one side, the same bounded case
+/// as the sweep's own (`intake::resume_orphans`): an aborted apply is a
+/// transient error with no quarantine charge, and an aborted discharge rolls
+/// back whole and retries after the marker's backoff.
 pub(crate) async fn refresh_relationship_projections_in_txn(
     client: &impl GenericClient,
     qualified_to_table: &str,
@@ -4837,20 +4843,25 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
     };
     // A projection lives in the catalog schema, the same schema as
     // `relationship_projections` itself (issue #435), which this connection's
-    // search path already resolves.
+    // search path already resolves. Issue #531: each relationship's row is
+    // locked before its projection is touched, in `relationship_id` order
+    // (the sort runs below the lock), the order Phase 3 takes the same rows
+    // `for share` in.
     let projections = client
         .query(
-            "select rp.projection_table, n.nspname::text, rd.to_col \
+            "select rp.projection_table, n.nspname::text, rd.to_col, rp.relationship_id \
              from relationship_projections rp \
              join relationship_definitions rd on rd.id = rp.relationship_id \
              join pg_class c on c.oid = 'relationship_projections'::regclass \
              join pg_namespace n on n.oid = c.relnamespace \
              where rd.to_schema = $1 and rd.to_table = $2 \
-             order by rp.relationship_id",
+             order by rp.relationship_id \
+             for update of rp",
             &[&to_schema, &to_table],
         )
         .await?;
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
+    let relationship_ids: Vec<i64> = projections.iter().map(|row| row.get(3)).collect();
     let mut changed = 0;
     for row in projections {
         let projection_table: String = row.get(0);
@@ -4930,6 +4941,15 @@ pub(crate) async fn refresh_relationship_projections_in_txn(
             )
             .await?;
     }
+    // Issue #531: taken after the diffs, so every change they read is at or
+    // below it.
+    client
+        .execute(
+            "update relationship_projections set refreshed_lsn = pg_current_wal_insert_lsn() \
+             where relationship_id = any($1)",
+            &[&relationship_ids],
+        )
+        .await?;
     Ok(changed)
 }
 

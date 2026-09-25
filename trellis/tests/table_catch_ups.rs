@@ -437,8 +437,7 @@ fn orders_update(lsn: PgLsn, id: i32, old_customer: i32, new_customer: i32) -> S
 /// refresh the resumed consumer comes back `live` with the old name, and a
 /// later from-side change reads it again. The recovery re-reads each
 /// published to-side as a catch-up that refreshes its projections, so both
-/// read the renamed customer. No CDC for any customer is staged, so no
-/// older image is pending when the refresh runs (issue #531).
+/// read the renamed customer.
 #[tokio::test]
 async fn a_slot_loss_refreshes_a_to_sides_projection_for_its_resumed_consumer() {
     const LOST: &str = "table_catch_ups_lost_slot";
@@ -698,4 +697,214 @@ async fn a_table_rejoining_the_publication_catches_up_its_readers() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(ids, vec![1, 2, 3]);
+}
+
+fn customer_update(lsn: PgLsn, id: i32, old: &str, new: &str) -> StagedChange {
+    let image = |name: &str| format!(r#"{{"id":"{id}","name":"{name}"}}"#);
+    StagedChange::Cdc {
+        src_table: "public.customers".to_string(),
+        key: id.to_string(),
+        op: CdcOp::Update,
+        lsn: Some(lsn),
+        old_image: Some(image(old)),
+        new_image: Some(image(new)),
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// The `customer` relationship's settled projection row for `id`: its
+/// `name`, or `None` when the projection has no row for the key.
+async fn projected_name(client: &Client, id: i32) -> Option<Option<String>> {
+    let projection: String = client
+        .query_one(
+            "select rp.projection_table from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             where rd.name = 'customer'",
+            &[],
+        )
+        .await
+        .expect("find the customer projection")
+        .get(0);
+    client
+        .query_opt(
+            &format!("select name from \"{projection}\" where id = $1"),
+            &[&id],
+        )
+        .await
+        .expect("read the customer projection")
+        .map(|r| r.get(0))
+}
+
+/// Issue #531: a rename streamed but not yet drained when a later rename is
+/// lost (the table is out of the publication) is older than what the
+/// rejoin's refresh writes into the projection. It drains after the refresh
+/// and must not put its image back: the refresh stamped the relationship, so
+/// a record at or below the stamp writes the projection from the live row.
+#[tokio::test]
+async fn pending_older_to_side_cdc_does_not_undo_a_rejoins_projection_refresh() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann", "ann1"),
+    )
+    .await;
+    client
+        .batch_execute(
+            "alter publication trellis_pub drop table public.customers; \
+             update public.customers set name = 'ann2' where id = 1",
+        )
+        .await
+        .expect("unpublish customers, then rename a customer");
+    publication::reconcile_publication(
+        &mut client,
+        "trellis_pub",
+        &["public.customers".to_string(), "public.orders".to_string()],
+    )
+    .await
+    .expect("reconcile the publication");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
+
+/// Issue #531's delete shape: the pending rename would re-insert the
+/// projection row the refresh removed for a customer whose delete was lost.
+#[tokio::test]
+async fn pending_older_to_side_cdc_does_not_resurrect_a_refreshed_out_projection_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann", "ann1"),
+    )
+    .await;
+    client
+        .batch_execute("delete from public.customers where id = 1")
+        .await
+        .expect("delete a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(projected_name(&client, 1).await, None);
+    assert_eq!(
+        order_names(&client).await,
+        vec![(10, None), (11, Some("bob".to_string())), (12, None)]
+    );
+}
+
+/// Issue #531 for a deferred reverse (issue #134): a rename a guard deferred
+/// before the refresh keeps its original LSN, so its retry is at or below the
+/// stamp as well and must not put its image back either.
+#[tokio::test]
+async fn a_deferred_older_reverse_does_not_undo_a_projection_refresh() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    let relationship_id: i64 = client
+        .query_one(
+            "select id from relationship_definitions where name = 'customer'",
+            &[],
+        )
+        .await
+        .expect("read the relationship id")
+        .get(0);
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| StagedChange::RelationshipReverseDeferred {
+            src_table: format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}"),
+            key: "1".to_string(),
+            old_image: Some(r#"{"id":"1","name":"ann"}"#.to_string()),
+            new_image: Some(r#"{"id":"1","name":"ann1"}"#.to_string()),
+            lsn: Some(lsn),
+            src_changed: None,
+            origin_lsn: None,
+            relationship_id,
+            retry_count: 1,
+        },
+    )
+    .await;
+    client
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
+        .await
+        .expect("rename a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
+
+/// Issue #531's cost bound: a to-side change after the refresh's stamp
+/// applies its own image without reading the live row. The live row here
+/// has moved on by a later change whose CDC was lost after the refresh, which
+/// no refresh has read, so the projection taking the image rather than the
+/// live name shows the check never ran for a record above the stamp.
+#[tokio::test]
+async fn a_to_side_change_after_the_refresh_applies_its_image_unchecked() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    client
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
+        .await
+        .expect("rename a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann3' where id = 1",
+        |lsn| customer_update(lsn, 1, "ann2", "ann3"),
+    )
+    .await;
+    client
+        .batch_execute("update public.customers set name = 'ann4' where id = 1")
+        .await
+        .expect("rename the customer again, the CDC lost");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann3".to_string()))
+    );
 }

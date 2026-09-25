@@ -519,7 +519,9 @@ when the target is a relationship's to-side. The discharge of that marker:
   instance's targets, apply compares each reverse record's images with the
   live row; when they disagree it writes the projection from the live row and
   re-derives the from-side rows by the image-less fallback rather than a
-  delta (`staging::apply::to_side_superseded`).
+  delta (`staging::apply::to_side_superseded`). A source to-side's records
+  take the same check only when the refresh may have overtaken them
+  ([A re-read table's readers](#a-re-read-tables-readers)).
 
 Considered and rejected: routing rebuild writes through the seam (every
 rebuild would pay full per-row reverse propagation), and rebuilding every
@@ -586,16 +588,35 @@ consumer from the stale projection. The refresh runs even when nothing reads
 the table yet, so a consumer registered later doesn't read a stale
 projection.
 
-CDC still pending when the refresh runs drains after it and writes its
-images over what the refresh wrote. That restores the refreshed state only
-when every later change to the same key also reached CDC, which holds when
-all the lost changes predate the oldest pending one. A change lost *after*
-one still pending is undone: the pending change drains after the refresh
-and writes its older image back, and the consumer is re-derived from that
-image. For example, an operator drops a to-side from the publication while
-a rename's CDC is still in the ring, then renames the row again. This is no
-worse than before the refresh existed, but the consumer reports `live`
-while stale. Closing it is a design call (#531).
+CDC still pending when the refresh runs drains after it. On its own, its
+image would restore the refreshed state only when every later change to the
+same key also reached CDC. A change lost *after* one still pending would be
+undone: the pending change drains after the refresh and writes its older
+image back (or re-inserts the projection row of a key whose delete was
+lost), and the consumer is re-derived from that image. For example, an
+operator drops a to-side from the publication while a rename's CDC is still
+in the ring, then renames the row again. *Decided 2026-09-25, implemented by
+#531:* the refresh stamps each relationship it rewrites with the WAL
+position after its reads (`relationship_projections.refreshed_lsn`), and a
+reverse record at or below the stamp, fresh CDC or a guard-deferred retry
+(#134), takes the live-row check a seam-fed to-side's records take ([A
+rebuilt target's readers](#a-rebuilt-targets-readers)). When the live row
+contradicts its images, it writes the projection from the live row and
+re-derives the from-side rows by the image-less fallback. A record above
+the stamp is a change the refresh may not have read, so its image is no
+older than what the refresh wrote, and it applies unchecked: a relationship
+never refreshed, and every change after a refresh, pays no live-row read.
+The only steady-state cost is one keyed read of the batch's stamps per
+Phase 3 transaction that carries reverse records. That read is `for share`,
+taken before the transaction touches any projection row, and the refresh
+locks the same rows `for update` before touching a projection, so a drain
+either commits before the refresh reads anything or reads the stamp the
+refresh commits.
+
+Considered and rejected for #531: holding the refresh until the ring has no
+undrained row for the table at or below its park position (a drain backlog,
+or a reverse deferred again and again, would hold the readers in
+`catching_up`), and accepting the gap.
 
 A marker parked only for a `waiting_to_backfill` definition's build (a
 registration's, a resume's, a failed direct build's retry) stays a plain
@@ -802,7 +823,9 @@ children, roughly in this order:
   projections are refreshed too ([A re-read table's
   readers](#a-re-read-tables-readers)). #533 added a slot-loss recovery,
   which re-reads every published to-side so a resumed consumer's rebuild
-  doesn't read a projection the lost changes never reached.
+  doesn't read a projection the lost changes never reached. #531 stopped
+  CDC still pending at the refresh from undoing it, by a refresh stamp
+  (V51) below which apply checks a record against the live row.
 
 Two rebuilds of some columns of a `live` transform still read in-call and
 then park a catch-up: a column resume (#425) and an `ALTER TRANSFORM` that
