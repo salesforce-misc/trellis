@@ -4806,6 +4806,25 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         } else {
             old_rows.resize_with(changes.len(), || None);
         }
+        // Issues #392/#486: the further group-naming images
+        // `apply_aggregate::accumulate_changes` takes as `named_rows`. Only an
+        // aggregate reads them, and only a born-and-died key or a recompute
+        // folded with CDC rows has any, so almost every change decodes none.
+        let mut named_rows: Vec<Vec<Row>> = Vec::with_capacity(changes.len());
+        let has_aggregate = defs
+            .iter()
+            .any(|def| matches!(def.def.key_space, KeySpace::Aggregate { .. }));
+        for change in &changes {
+            let mut named = Vec::new();
+            if has_aggregate {
+                let has_image = change.old_image.is_some() || change.new_image.is_some();
+                let hint = change.prior_image.as_ref().filter(|_| has_image);
+                for image_text in change.vanished_images.iter().chain(hint) {
+                    named.push(decode_image(pool, image_text).await?);
+                }
+            }
+            named_rows.push(named);
+        }
 
         // Reverse recompute (issue #30): this source is some relationship's
         // *to-side*. A change to a related row must re-derive every from-side
@@ -4930,37 +4949,50 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // propagation (a chained to-side target this apply just
             // rewrote, staged as an image-less hop) reaching its dependents
             // rather than being dropped.
-            let has_image_less = changes
-                .iter()
-                .any(|change| change.old_image.is_none() && change.new_image.is_none());
+            //
+            // Issue #392: a `recompute` that folded with the parent's own CDC
+            // change leaves a record with images, which becomes a delta
+            // record below as usual (it also advances the projection). The
+            // recompute still asked for the from-side rows to be re-derived,
+            // so they are, from both of the record's images.
+            let has_image_less = changes.iter().any(|change| {
+                (change.old_image.is_none() && change.new_image.is_none()) || change.has_recompute
+            });
             if has_image_less {
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
-                    if change.old_image.is_some() || change.new_image.is_some() {
+                    let image_less = change.old_image.is_none() && change.new_image.is_none();
+                    if !image_less && !change.has_recompute {
                         continue;
                     }
-                    // Only the live re-read can carry the join key here, by
-                    // construction — there is no image to read one from. A
-                    // re-read that came back empty (the key no longer
-                    // exists) leaves nothing to resolve a from-side row
-                    // through, exactly as the both-images-absent skip below
-                    // always intended.
-                    let Some(row) = &rows[i] else { continue };
-                    let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
-                        continue;
+                    // For an image-less change only the live re-read can
+                    // carry the join key, by construction — there is no
+                    // image to read one from. A re-read that came back empty
+                    // (the key no longer exists) leaves nothing to resolve a
+                    // from-side row through, exactly as the both-images-absent
+                    // skip below always intended.
+                    let old_row = if image_less {
+                        None
+                    } else {
+                        reverse_old_rows[i].as_ref()
                     };
-                    key_hops
-                        .entry(join_text.clone())
-                        .and_modify(|h| *h = (*h).max(change.hop_gen))
-                        .or_insert(change.hop_gen);
-                    key_src_changed
-                        .entry(join_text.clone())
-                        .and_modify(|(sc, origin)| {
-                            *sc = earliest_src_changed(*sc, change.src_changed);
-                            *origin = earliest_origin(*origin, change.origin_lsn);
-                        })
-                        .or_insert((change.src_changed, change.origin_lsn));
+                    for row in [rows[i].as_ref(), old_row].into_iter().flatten() {
+                        let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
+                            continue;
+                        };
+                        key_hops
+                            .entry(join_text.clone())
+                            .and_modify(|h| *h = (*h).max(change.hop_gen))
+                            .or_insert(change.hop_gen);
+                        key_src_changed
+                            .entry(join_text.clone())
+                            .and_modify(|(sc, origin)| {
+                                *sc = earliest_src_changed(*sc, change.src_changed);
+                                *origin = earliest_origin(*origin, change.origin_lsn);
+                            })
+                            .or_insert((change.src_changed, change.origin_lsn));
+                    }
                 }
                 accumulate_from_side_recomputes(
                     pool,
@@ -5422,6 +5454,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &changes,
                 &rows,
                 &old_rows,
+                &named_rows,
                 &def.source_columns,
                 &mut regex_cache,
                 rel_ctx.as_ref(),

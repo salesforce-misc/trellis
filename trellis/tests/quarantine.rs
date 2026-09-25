@@ -1447,6 +1447,8 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         retry_count: 0,
         prior_image: None,
         row_count: 1,
+        has_recompute: false,
+        vanished_images: Vec::new(),
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 0)
@@ -1519,6 +1521,8 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
         retry_count: 1,
         prior_image: None,
         row_count: 1,
+        has_recompute: false,
+        vanished_images: Vec::new(),
     }];
 
     let result = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
@@ -1887,6 +1891,8 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         retry_count: 0,
         prior_image: None,
         row_count: 1,
+        has_recompute: false,
+        vanished_images: Vec::new(),
     }
 }
 

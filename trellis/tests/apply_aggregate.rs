@@ -3056,3 +3056,343 @@ async fn chaining_onto_a_single_group_by_column_aggregate_target_does_not_misrea
         "the chained definition must read order_summary's real (unencoded) group key value"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #392 (the "merged into a plain delta" half) and issue #486: two ways
+// the fold used to erase what an aggregate needs to know about a key. Both
+// stage ring rows by hand and drain them directly; nothing waits to converge.
+// ---------------------------------------------------------------------------
+
+const SKU_TOTALS_SOURCE: &str =
+    "TRANSFORM sku_totals FROM sales GROUP BY sku SELECT SUM(amount) AS total";
+
+/// `sales (id, sku, amount)` seeded with `rows`, and `sku_totals` defined over
+/// it with its target table created. Every row is staged as an insert and
+/// drained, so the target starts equal to the source.
+async fn setup_sku_totals(db: &testkit::TestDatabase, client: &mut Client, rows: &str) {
+    client
+        .batch_execute(&format!(
+            "create table sales (id integer primary key, sku text, amount numeric); \
+             alter table sales replica identity full; \
+             insert into sales (id, sku, amount) values {rows}"
+        ))
+        .await
+        .expect("create + seed sales");
+    let def = parse(SKU_TOTALS_SOURCE).expect("parse sku_totals");
+    let source_columns = HashMap::from([
+        ("id".to_string(), ValueType::Numeric),
+        ("sku".to_string(), ValueType::Text),
+        ("amount".to_string(), ValueType::Numeric),
+    ]);
+    create_definition(&db.pool, SKU_TOTALS_SOURCE, &source_columns)
+        .await
+        .expect("create sku_totals");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create sku_totals target");
+    let seeded = client
+        .query(
+            "select id::text, json_build_object('id', id::text, 'sku', sku, \
+             'amount', amount::text)::text from sales",
+            &[],
+        )
+        .await
+        .expect("read seeded rows");
+    for row in seeded {
+        let key: String = row.get(0);
+        let image: String = row.get(1);
+        stage_sales(
+            client,
+            &key,
+            "insert",
+            Some(PgLsn::from(1)),
+            None,
+            Some(&image),
+        )
+        .await;
+    }
+    let seg = seal_active_segment(client).await;
+    drain(&db.pool, seg, "worker").await;
+}
+
+/// Stages one `sales` ring row into whichever ring slot is active now.
+async fn stage_sales(
+    client: &Client,
+    key: &str,
+    op: &str,
+    lsn: Option<PgLsn>,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+) {
+    let slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read the active ring slot")
+        .get(0);
+    let src_table = qualify_fixture_table("sales");
+    client
+        .execute(
+            &format!(
+                "insert into seg_{slot} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+                 values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb, 0)"
+            ),
+            &[&src_table, &key, &op, &lsn, &old_image, &new_image],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("stage {op} of sales key {key:?} into seg_{slot}: {e}"));
+}
+
+async fn current_wal_lsn(client: &Client) -> PgLsn {
+    client
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the WAL insert position")
+        .get(0)
+}
+
+async fn sku_totals(client: &Client) -> Vec<(String, String)> {
+    client
+        .query(
+            "select sku, trim_scale(total)::text from sku_totals order by sku",
+            &[],
+        )
+        .await
+        .expect("read sku_totals")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
+fn totals(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(sku, total)| (sku.to_string(), total.to_string()))
+        .collect()
+}
+
+fn sales_image(id: i32, sku: &str, amount: i32) -> String {
+    format!(r#"{{"id":"{id}","sku":"{sku}","amount":"{amount}"}}"#)
+}
+
+/// Issue #392: a `Recompute` for a key folded into the same batch as that
+/// key's CDC update must still re-derive the key's group. The fold used to
+/// take its images from the update alone, so the record became a plain
+/// delta: on a group already off by 100 (a stale 111 where the source sums
+/// to 12), `Recompute(1)` alone gives 13 but, folded with an update of row 1
+/// from 5 to 6, gave 112.
+#[tokio::test]
+async fn a_recompute_folded_with_a_cdc_update_still_rederives_the_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12"), ("b", "2")])
+    );
+
+    // The group is stale; a Recompute is what repairs it.
+    client
+        .batch_execute(
+            "update sku_totals set total = 111 where sku = 'a'; \
+             update sales set amount = 6 where id = 1",
+        )
+        .await
+        .expect("make group a stale, then update row 1");
+    let lsn = current_wal_lsn(&client).await;
+    stage_sales(&client, "1", "recompute", None, None, None).await;
+    stage_sales(
+        &client,
+        "1",
+        "update",
+        Some(lsn),
+        Some(&sales_image(1, "a", 5)),
+        Some(&sales_image(1, "a", 6)),
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "13"), ("b", "2")]),
+        "the Recompute must re-derive group a, not apply the update's +1 to the stale 111"
+    );
+}
+
+/// Issue #392, grain-migration shape: the update moves row 1 from group `a`
+/// to group `b`, and both groups are stale. The folded record's Recompute
+/// re-derives both of the groups its images name.
+#[tokio::test]
+async fn a_recompute_folded_with_a_grain_migration_rederives_both_groups() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+
+    client
+        .batch_execute(
+            "update sku_totals set total = total + 100; \
+             update sales set sku = 'b' where id = 1",
+        )
+        .await
+        .expect("make both groups stale, then move row 1 to b");
+    let lsn = current_wal_lsn(&client).await;
+    stage_sales(
+        &client,
+        "1",
+        "update",
+        Some(lsn),
+        Some(&sales_image(1, "a", 5)),
+        Some(&sales_image(1, "b", 5)),
+    )
+    .await;
+    stage_sales(&client, "1", "recompute", None, None, None).await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "7"), ("b", "7")]),
+        "both groups the folded record names must be re-derived"
+    );
+}
+
+/// Puts row 4 in group `z` into the source and re-derives `z` with a
+/// forced recompute, as a build or catch-up does, so `z` counts row 4 and
+/// carries a recompute horizon. Returns that horizon.
+async fn count_row_4_by_a_forced_recompute(
+    db: &testkit::TestDatabase,
+    client: &mut Client,
+) -> PgLsn {
+    client
+        .batch_execute("insert into sales (id, sku, amount) values (4, 'z', 1000)")
+        .await
+        .expect("insert row 4");
+    stage_sales(client, "4", "recompute", None, None, None).await;
+    let seg = seal_active_segment(client).await;
+    drain(&db.pool, seg, "worker").await;
+    // Frees the ring slots the drained batches held, so a test can seal two
+    // more before draining either.
+    trellis::staging::retire_drained_segments(client)
+        .await
+        .expect("retire drained segments");
+    assert_eq!(
+        sku_totals(client).await,
+        totals(&[("a", "12"), ("b", "2"), ("z", "1000")]),
+        "the forced recompute counts row 4"
+    );
+    client
+        .query_one(
+            "select __trellis_recompute_lsn from sku_totals where sku = 'z'",
+            &[],
+        )
+        .await
+        .expect("read z's horizon")
+        .get::<_, Option<PgLsn>>(0)
+        .expect("a forced recompute stamps its group's horizon")
+}
+
+/// Issue #486: row 4's insert commits at or below group `z`'s recompute
+/// horizon (the forced recompute counted it) and its delete above it. Both
+/// CDC changes fold into one batch, which used to leave a record with
+/// neither image: it named no group, so the horizon check never ran and `z`
+/// kept the 1000 the recompute had counted.
+#[tokio::test]
+async fn an_insert_and_delete_folded_across_a_recompute_horizon_still_empty_the_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+    let horizon = count_row_4_by_a_forced_recompute(&db, &mut client).await;
+
+    client
+        .batch_execute("delete from sales where id = 4")
+        .await
+        .expect("delete row 4");
+    let delete_lsn = current_wal_lsn(&client).await;
+    assert!(delete_lsn > horizon);
+    let image = sales_image(4, "z", 1000);
+    stage_sales(&client, "4", "insert", Some(horizon), None, Some(&image)).await;
+    stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12"), ("b", "2")]),
+        "group z lost its only row, so it must be removed"
+    );
+}
+
+/// Issue #486 across two segments coalesced by `drain_many`: each segment
+/// folds to a record with an image, but merging the insert's segment with
+/// the delete's leaves neither, so the merge has to keep the group too.
+#[tokio::test]
+async fn an_insert_and_delete_merged_across_segments_and_a_horizon_still_empty_the_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+    let horizon = count_row_4_by_a_forced_recompute(&db, &mut client).await;
+
+    client
+        .batch_execute("delete from sales where id = 4")
+        .await
+        .expect("delete row 4");
+    let delete_lsn = current_wal_lsn(&client).await;
+    let image = sales_image(4, "z", 1000);
+    stage_sales(&client, "4", "insert", Some(horizon), None, Some(&image)).await;
+    let first = seal_active_segment(&mut client).await;
+    stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
+    let second = seal_active_segment(&mut client).await;
+    apply::drain_many(
+        &db.pool,
+        &[first, second],
+        "worker",
+        1,
+        "trellis_apply_aggregate_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+    .expect("drain_many")
+    .expect("drain_many must claim and drain something");
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12"), ("b", "2")]),
+        "group z lost its only row, so it must be removed"
+    );
+}
+
+/// The control for the two tests above: with no recompute horizon involved,
+/// an insert and delete that fold to nothing leave no trace, and in
+/// particular don't create a group row.
+#[tokio::test]
+async fn an_insert_and_delete_folded_below_no_horizon_leave_no_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+
+    let insert_lsn = current_wal_lsn(&client).await;
+    let image = sales_image(4, "z", 1000);
+    stage_sales(&client, "4", "insert", Some(insert_lsn), None, Some(&image)).await;
+    let delete_lsn = current_wal_lsn(&client).await;
+    stage_sales(&client, "4", "delete", Some(delete_lsn), Some(&image), None).await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "12"), ("b", "2")])
+    );
+    let extinct: i64 = client
+        .query_one("select count(*) from aggregate_extinct_horizon", &[])
+        .await
+        .expect("read extinct horizons")
+        .get(0);
+    assert_eq!(
+        extinct, 0,
+        "a group that was never there is not an extinction"
+    );
+}

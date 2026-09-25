@@ -190,6 +190,30 @@ annihilate the write and leave a live group subtracted downstream. Issue #196
 threads the same capture through a deleted 1-1 target row's own downstream
 propagation, reusing this same guard rather than a second copy of it.
 
+Two facts the arg-extremes erase are kept on the side, because an aggregate
+needs them:
+
+- **A recompute folded with a change.** A `recompute` never wins an image, so
+  when it folds with the same key's CDC change the record carries that change's
+  images and looks like a plain delta. The recompute was staged to repair the
+  key's group from live state, and a delta would land on the stale value it was
+  meant to repair (issue #392). The fold carries `has_recompute =
+  bool_or(op = 'recompute')`, and apply re-derives every group such a record
+  names instead of applying its delta. A to-one relationship's reverse path
+  also re-derives the from-side rows, as it does for a bare trigger.
+- **A key born and died in the batch.** An insert followed by a delete folds to
+  both images NULL, the same as a bare trigger, even though its rows carried
+  images. Its delta is zero, which is right unless a forced recompute counted
+  the row in between: an insert at or below a group's recompute horizon and a
+  delete above it ([05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)).
+  With no image the record names no group, so the horizon check never ran and
+  the group kept the row (issue #486). For exactly this case the fold returns
+  `vanished_images`: one insert's post-image and one delete's pre-image (a
+  `max` each, so no extra sort). The segment merge adds the two images it drops
+  when an insert in one segment and a delete in the next leave no image. A key
+  that moved between groups more than once inside the batch is still named only
+  by those two.
+
 One field is deliberately **not** filtered: `op`, because the only load-bearing op
 is the `truncate` sentinel, and that sentinel is itself image-less. Filtering `op`
 would fold it to NULL and lose the truncate.

@@ -161,7 +161,10 @@ Skipping would leave the target frozen until the key went quiet.
 An aggregate group can also receive an absolute write. An image-less change
 (a catch-up enumeration, a chained hop's `Recompute`, a relationship fallback, a
 truncate) has no prior state to diff, so Phase 3 re-derives the whole group from
-a live `GROUP BY` read of the source. The delta path's existence probe is a live
+a live `GROUP BY` read of the source. So does a change whose fold included a
+`Recompute`, even though it carries the CDC images it folded with (issue #392,
+see [04](04-claiming-and-the-fold.md#the-two-kinds-of-missing-image)): both
+groups its images name are re-derived rather than given the delta. The delta path's existence probe is a live
 read as well: when it finds the group empty, it deletes the group's row.
 
 Either read can see a source commit whose own CDC delta has not been applied yet.
@@ -193,6 +196,13 @@ So the live read records its basis as a WAL position, and a delta checks it:
    path and is re-derived. Above, the delta applies as usual. The check runs per
    group, so the two sides of a grain migration are judged against their own
    groups.
+4. **A key born and died in the batch.** Its insert and delete fold to no image
+   and a zero delta, but the fold keeps the images that name its groups
+   (`vanished_images`, issue #486). Each such group gets the same check against
+   its row's horizon, and is re-derived when it fails. Otherwise it is left
+   alone: no existence probe and no write. A group with no row is left alone
+   too, because a live read that counted the key would have written one, and
+   whatever removed it since was a live read that found the group without the key.
 
 This is the same "re-evaluate, never skip" choice as the 1-1 basis check. An LSN
 at or below the horizon only *may* have been read, so skipping the delta would be
