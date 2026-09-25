@@ -4933,18 +4933,18 @@ mod tests {
     /// its `(rel, column)` apart and is longer than a Postgres identifier.
     #[test]
     fn synthetic_relationship_keys_are_unambiguous_and_no_column_can_have_one() {
-        let keys = [
-            forward_relationship_synthetic_column("a_b", "c"),
-            forward_relationship_synthetic_column("a", "b_c"),
-            forward_relationship_synthetic_column("a", "b.c"),
-            forward_relationship_synthetic_column("a.b", "c"),
-            pre_change_relationship_column("a_b", "c"),
-            pre_change_relationship_column("a", "b_c"),
-            pre_change_relationship_column("a", "b.c"),
-            pre_change_relationship_column("a.b", "c"),
-            synthetic_relationship_key("reverse", None, "c"),
-            synthetic_relationship_key("reverse", None, "b_c"),
-        ];
+        // Every (rel, column) over names that split, join or look like the
+        // encoding itself, empty and multi-byte ones included, in every
+        // role: `a_b`/`c` against `a`/`b_c` is the collision #521 found.
+        let names = ["", "a", "b", "c", "a_b", "b_c", "a.b", "b.c", ".", "1:a", "é", "éa"];
+        let mut keys = Vec::new();
+        for column in names {
+            keys.push(synthetic_relationship_key("reverse", None, column));
+            for rel in names {
+                keys.push(forward_relationship_synthetic_column(rel, column));
+                keys.push(pre_change_relationship_column(rel, column));
+            }
+        }
         let distinct: std::collections::HashSet<&String> = keys.iter().collect();
         assert_eq!(distinct.len(), keys.len(), "{keys:#?}");
         for key in &keys {
