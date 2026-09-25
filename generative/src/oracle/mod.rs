@@ -333,8 +333,9 @@ fn quote_ident(ident: &str) -> String {
 /// `Expr::StringLiteral`, and the five scalar functions
 /// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) the
 /// generator now draws (see `crate::generate::DerivedShape`); task B4 widens
-/// it again to the five `KeySpace::Aggregate` functions
-/// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, see `crate::generate::AggregateFn`).
+/// it again to the `KeySpace::Aggregate` functions
+/// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, plus `BOOL_AND`/`BOOL_OR` since issue
+/// #255, see `crate::generate::AggregateFn`).
 /// Every one of those renders as the same generic `name(args)` Postgres call
 /// syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
 /// argument-less `COUNT(*)`, which the grammar's AST carries with an empty
@@ -354,8 +355,8 @@ fn quote_ident(ident: &str) -> String {
 /// `.`/`*`/`+`/`?`/`[...]`/`|`/`^`/`$` — no locale-dependent POSIX bracket
 /// classes like `[[:alpha:]]`), and `COALESCE` does no comparison at all (it
 /// just returns its first non-`NULL` argument). `SUM`/`COUNT`/`AVG`/`MIN`/
-/// `MAX` are likewise all numeric aggregation with no text/collation
-/// involvement. So unlike task B1's text *ordering* concern (which that
+/// `MAX` are likewise all numeric aggregation, and `BOOL_AND`/`BOOL_OR`
+/// boolean aggregation, with no text/collation involvement. So unlike task B1's text *ordering* concern (which that
 /// task's own plan flags as the load-bearing collation risk), nothing B2 or
 /// B4 adds needs the oracle and the engine's underlying Postgres session
 /// pinned to the same collation — there is no ordering comparison in this
