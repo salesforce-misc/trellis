@@ -146,7 +146,7 @@ impl Pool {
     /// value instead of two that merely happen to agree). Exposed so
     /// [`crate::defs::catalog::create_definition`]/
     /// [`crate::defs::catalog::create_definition_without_backfill`] — the
-    /// ring-path entry points, which take no `target_schema` parameter of
+    /// test-fixture entry points, which take no `target_schema` parameter of
     /// their own — can qualify a definition's target table the same way,
     /// without widening their public signature. Gated like its only callers.
     #[cfg(any(test, feature = "test-util"))]

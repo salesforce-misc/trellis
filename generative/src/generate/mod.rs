@@ -1966,8 +1966,7 @@ pub fn build_program_multi_with_derived(
 /// By the time `defs[def_index]` installs, `program.ops[0..after_op]` have
 /// already run — including, if `after_op` is chosen past that definition's
 /// own source table's first seed insert, real pre-existing source rows for
-/// the engine's own `defs::catalog::install_definition`'s direct-backfill path to
-/// build from (exactly the scenario `generative/tests/backfill.rs` exercises
+/// the engine's backfill discharge to build from (exactly the scenario `generative/tests/backfill.rs` exercises
 /// by hand against a bare [`crate::backend::ManualBackend`], now reachable
 /// from inside [`crate::run::run_convergence`]'s own op-stream loop). This
 /// function itself does not require that ordering — it only enforces the
@@ -3258,8 +3257,8 @@ mod strategy {
     /// ([`defer_def_install`]) to some point strictly after the first seed
     /// insert into that definition's own source table — so the deferred
     /// install always has at least one real, pre-existing source row to
-    /// backfill from, exercising the same direct-backfill-over-preexisting-
-    /// rows path `generative/tests/backfill.rs` exercises by hand, now from
+    /// backfill from, exercising the same build over pre-existing rows
+    /// `generative/tests/backfill.rs` exercises by hand, now from
     /// inside the harness's own op-stream loop.
     ///
     /// A def whose source table's ops leave no room after that first insert

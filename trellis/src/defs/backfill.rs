@@ -123,8 +123,8 @@ pub enum BackfillError {
     /// The definition's shape isn't supported by the direct build yet — e.g. a
     /// relationship-enriched 1-1 definition, whose target the direct build
     /// can't render without the LEFT JOIN/correlated-subquery machinery the
-    /// ring path uses. Such definitions must keep going through
-    /// [`super::catalog::create_definition`]'s ring enumeration.
+    /// ring path uses. The backfill discharge builds such a definition by ring
+    /// enumeration instead (ADR-0016's dispatch by shape).
     Unsupported(String),
     /// Staging a changed row's downstream propagation through the
     /// target-mutation seam failed (issue #315) — only reachable from
@@ -344,13 +344,12 @@ pub(crate) fn uses_relationships(def: &TransformDef) -> bool {
 /// set of field names currently being expanded on this recursion path; a field
 /// re-encountered while already being expanded is a cyclic alias chain
 /// (`a = b + 1, b = a + 1`) and yields [`BackfillError::Unsupported`] rather
-/// than recursing forever. This guard is load-bearing, not merely defensive:
-/// transform-definition text is user-supplied DSL, and the validator's cycle
-/// check (`validate::infer_field_types` / `ValidationError::Cycle`) runs
-/// *after* the direct backfill in `install_definition`
-/// (`backfill_definition` before `create_definition` → `validate`), so a
-/// cyclic definition does reach this code — falling back to the ring lets the
-/// validator then reject it, instead of overflowing the stack here.
+/// than recursing forever. Registration's validator rejects a cyclic
+/// definition first (`validate::infer_field_types` / `ValidationError::Cycle`),
+/// so this guard is defensive: transform-definition text is user-supplied
+/// DSL, and a definition that reached a build some other way (a test
+/// fixture's catalog row, say) must fall back to the ring rather than
+/// overflow the stack here.
 ///
 /// `memo` caches each field's fully-substituted expression by field name. A
 /// field's substituted form depends only on the field (its own name scopes the
@@ -472,7 +471,7 @@ fn substitute_field_aliases(
 /// [`substitute_field_aliases`]. Any realistic transform inlines a handful of
 /// nodes; this cap is orders of magnitude above that, so it only ever trips on
 /// a pathologically self-referential definition whose inlined form would
-/// explode (which then falls back to the ring rather than OOMing the install).
+/// explode (which then falls back to the ring rather than OOMing the build).
 const MAX_SUBSTITUTED_NODES: usize = 100_000;
 
 /// Charges `cost` nodes against the remaining `budget`, or returns

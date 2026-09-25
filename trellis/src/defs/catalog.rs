@@ -137,11 +137,11 @@ pub enum CatalogError {
     /// A definition's persisted `source_columns` jsonb held a value other
     /// than `"numeric"`/`"text"`/`"boolean"`/`"uuid"` for some column —
     /// meaning the row was written by something other than
-    /// [`create_definition`], since that's the only writer and it only ever
-    /// encodes [`ValueType`]'s variants.
+    /// `create_definition_inner`, the only writer, which only ever encodes
+    /// [`ValueType`]'s variants.
     UnknownValueType { column: String, text: String },
-    /// The definition's initial backfill (issue #23) failed to enumerate its
-    /// source table.
+    /// An intake-side step failed: resolving a qualified table name, parking
+    /// a catch-up marker, or checking that a source is change-keyed.
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
@@ -252,13 +252,13 @@ pub enum CatalogError {
     /// definition's source ([`CatalogError::SourceNotChangeKeyed`]); the case
     /// that motivated it is another instance's aggregate target.
     RelationshipEndpointNotChangeKeyed { endpoint: String },
-    /// [`install_definition`]'s target-table DDL (run before either backfill
-    /// path) failed.
+    /// [`install_definition`]'s target-table DDL failed.
     Ddl(DdlError),
-    /// [`install_definition`]'s direct backfill attempt
-    /// ([`backfill::backfill_definition`]) failed with something other than
-    /// [`BackfillError::Unsupported`] — an `Unsupported` shape instead falls
-    /// back to the ring ([`create_definition`]) rather than surfacing here.
+    /// A direct-build step failed with something other than
+    /// [`BackfillError::Unsupported`]: the backfill discharge's shape check
+    /// (`intake::publication`), or an `ALTER TRANSFORM`'s added-column build.
+    /// An `Unsupported` shape gets the ring enumeration instead of surfacing
+    /// here.
     DirectBackfill(BackfillError),
     /// [`super::lifecycle::pause_transform`] was asked to pause a target with
     /// no corresponding `transform_definitions` row at all (issue #142). Its
@@ -1371,8 +1371,8 @@ pub(crate) async fn is_definition_target(
 /// **Single-pass backfill.** Every `ADD`/`ALTER`ed field this call actually
 /// changes is populated by *one* enumeration of the source
 /// ([`backfill::backfill_altered_columns`]), never a backfill per column —
-/// the same single-pass contract [`install_definition`]'s own initial build
-/// already honors, reused rather than reimplemented.
+/// the same single-pass contract a definition's initial build honors,
+/// reused rather than reimplemented.
 ///
 /// **The pause-state reuse.** While a changed field's single-pass backfill
 /// runs, it is parked in `column_status` — the exact mechanism
@@ -1754,9 +1754,8 @@ pub async fn alter_transform(
 
     // Outside the transaction (and, deliberately, holding no lock): the
     // single-pass backfill below is the same "one enumeration of the source"
-    // shape `install_definition`'s own build is, sized for however large the
-    // source table is — exactly the work a first `define` already does
-    // without holding a transaction open across it.
+    // shape a definition's initial build is, sized for however large the
+    // source table is, so it holds no transaction open across it either.
     if !real_adds.is_empty() || !real_alters.is_empty() {
         let mut written_fields: HashSet<String> =
             real_adds.iter().map(|f| f.name.clone()).collect();
@@ -3384,15 +3383,11 @@ fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) ->
 }
 
 /// Pooled (non-transaction) counterpart to [`resolve_source_schema_in_txn`],
-/// for [`install_definition`]'s own DDL/direct-build steps ([`ddl::source_primary_key`],
-/// [`ddl::target_table_ddl`], [`backfill::backfill_definition`]), which
-/// run on plain pooled connections
-/// before that function's own [`create_definition_inner`] call opens a
-/// transaction and computes its own, independent, authoritative copy —
-/// mirrors [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split.
-/// Same `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
-/// match. Also covers [`install_definition`]'s issue #55 fence check, which
-/// likewise runs before any transaction of its own is open.
+/// the `search_path` step of [`resolve_graph_identity`], for callers on plain
+/// pooled connections outside a catalog transaction — mirrors
+/// [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split. Same
+/// `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
+/// match.
 async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String, CatalogError> {
     let client = pool.get().await?;
     let row = client
@@ -3408,12 +3403,11 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
 }
 
-/// The fully-qualified source [`install_definition`]'s own DDL/direct-build
-/// steps read from (issue #76, ADR-0007 grammar clause 4) — computed once,
-/// early in that function, exactly like `target_schema`/[`effective_target_schema`]
+/// The fully-qualified source [`install_definition`]'s own DDL steps read
+/// from (issue #76, ADR-0007 grammar clause 4) — computed once, early in
+/// that function, exactly like `target_schema`/[`effective_target_schema`]
 /// immediately above it, and threaded through every one of those steps
-/// (`ddl::source_primary_key`, `ddl::target_table_ddl`,
-/// `backfill::backfill_definition`) so none of them can independently
+/// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can independently
 /// re-derive a different answer, and so every physical SQL builder among them
 /// emits the qualified identity rather than a bare `def.source` left to the
 /// executing connection's own `search_path` — the gap a reviewer flagged

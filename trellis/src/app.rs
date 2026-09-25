@@ -8,9 +8,9 @@
 //! (`defs`, `client`, `intake`, `staging`) into one coherent surface so
 //! callers never have to stitch those together themselves — and, critically,
 //! never accidentally pick the wrong path: definition registration always
-//! goes through [`defs::install_definition`], the fast direct-build entry
-//! point, rather than the lower-level
-//! `create_definition`/`create_target_table` primitives it's built from.
+//! goes through [`defs::install_definition`], which creates the target and
+//! leaves the build to the staging worker's backfill discharge (ADR-0016),
+//! rather than the lower-level primitives it's built from.
 //!
 //! The individual `defs::*`/`intake::*`/`staging::*` items remain public for
 //! internal harnesses (the benchmark and generative-test crates use them as
@@ -637,12 +637,13 @@ impl Trellis {
     }
 
     /// Re-stages `source_table`'s current rows via a `pending_backfill`
-    /// marker, so a transform registered *after* the table already joined the
-    /// replication publication gets its own backfill. Only valid for a table
-    /// that's already a publication member — a never-published table is
-    /// backfilled in full on first contact by the running staging worker, so
-    /// this is refused there (and the running staging worker must discharge
-    /// the marker).
+    /// marker, for every applying definition that reads it to re-derive from.
+    /// A newly registered transform doesn't need this: the staging worker
+    /// parks its marker itself (ADR-0016). Only valid for a table that's
+    /// already a publication member — a never-published table is backfilled
+    /// in full on first contact by the running staging worker, so this is
+    /// refused there (and the running staging worker must discharge the
+    /// marker).
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         let client = self.pool.get().await?;
         let schema_rows = client

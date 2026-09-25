@@ -110,8 +110,9 @@ pub struct ClientOptions {
     /// dropped leaves the publication (issue #427). Coarser than
     /// `maintenance_interval` by default: unlike seal/reclaim, this does a
     /// catalog query and (when a table is newly added) an `ALTER
-    /// PUBLICATION` plus a full backfill enumeration, none of which need
-    /// sub-second freshness.
+    /// PUBLICATION`, neither of which needs sub-second freshness. A freshly
+    /// parked backfill marker doesn't wait for it: the maintenance loop runs
+    /// the pass early when it sees one (issue #476).
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.

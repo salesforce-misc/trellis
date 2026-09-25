@@ -78,8 +78,8 @@ pub enum IntakeError {
     /// Rejected loudly at construction rather than silently mis-split later
     /// by [`super::publication::split_qualified`].
     DottedIdentifierComponent { component: String },
-    /// A `pg_snapshot` value read back from Postgres (the backfill fence, or
-    /// the current snapshot compared against it) wasn't in the
+    /// A `pg_snapshot` value read back from Postgres (the current snapshot a
+    /// backfill marker's fence is checked against) wasn't in the
     /// `"xmin:xmax:xip..."` text form this decodes.
     InvalidSnapshot(String),
     /// `slot` has no `replication_progress` row at connect time.

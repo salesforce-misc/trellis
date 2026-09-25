@@ -5,24 +5,28 @@
 //! (`defs::backfill`) — 100k authors, 1M posts, 4.5M comments,
 //! creating the target table took ~1 minute on the old ring path.
 //!
-//! Unlike [`crate::scenario`]'s plain `GROUP BY` pipeline, this measures the
-//! *whole* `install_definition` call (relationship creation is untimed setup;
-//! the target table's creation + direct build is what's timed) — the real
-//! front door a caller uses, not `backfill_definition` directly — so the
-//! number reported here is what an end user actually experiences.
+//! Like [`crate::scenario`], it times the build itself: the catalog row, the
+//! target table's creation and [`trellis::dev::defs::backfill_definition`]'s
+//! direct build (relationship creation is untimed setup). Registering through
+//! `install_definition` builds nothing: the staging worker's backfill
+//! discharge dispatches the same build to a drain thread later (ADR-0016), so
+//! a registration's own latency says nothing about the build.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::dev::defs::{ValueType, create_relationship, install_definition};
+use trellis::dev::defs::{
+    ValueType, backfill_definition, create_definition_without_backfill, create_relationship,
+    create_target_table, parse, source_primary_key,
+};
 
 use crate::generate;
 use crate::scenario::connect_raw;
 
 /// One relationship-aggregate scenario's measurements: the untimed load, the
-/// timed `install_definition` call, and an independent correctness check.
+/// timed build, and an independent correctness check.
 #[derive(Debug)]
 pub struct RelationshipBenchResult {
     pub scenario: String,
@@ -62,9 +66,9 @@ impl RelationshipBenchResult {
 /// Runs the relationship-aggregate scenario end to end against a fresh,
 /// ephemeral Postgres instance: loads `authors` deterministic parent rows
 /// plus `posts`/`comments` to-many children distributed evenly over them,
-/// declares both relationships, installs a `SUM`/`COUNT`-over-both-children
-/// definition through the real `install_definition` front door, and checks
-/// the result against an independent `GROUP BY`/`LEFT JOIN` oracle.
+/// declares both relationships, builds a `SUM`/`COUNT`-over-both-children
+/// definition with the direct relationship-aware build, and checks the result
+/// against an independent `GROUP BY`/`LEFT JOIN` oracle.
 pub async fn run(
     name: &str,
     authors: i64,
@@ -118,14 +122,32 @@ pub async fn run(
     let source_columns: HashMap<String, ValueType> =
         HashMap::from([("id".to_string(), ValueType::Numeric)]);
 
-    // The real end-to-end path a caller hits: target-table creation + the
-    // direct set-based build (or ring fallback, if this shape ever regresses
-    // to `Unsupported`), through `install_definition` — not
-    // `backfill_definition` called directly.
+    // The build a drain thread runs for this shape once the discharge
+    // dispatches it (`backfill_relationship_one_to_one`), preceded by the
+    // catalog row and target table registration creates. A shape that
+    // regressed to `Unsupported` fails here rather than falling back to the
+    // ring.
     let backfill_start = Instant::now();
-    install_definition(&db.pool, source_text, &source_columns, "public")
+    let def = parse(source_text).expect("parse author_totals definition");
+    create_definition_without_backfill(&db.pool, source_text, &source_columns)
         .await
-        .expect("install author_totals definition");
+        .expect("create author_totals definition");
+    let authors_pk = source_primary_key(&db.pool, "authors")
+        .await
+        .expect("introspect authors primary key");
+    create_target_table(
+        &db.pool,
+        &def,
+        "public",
+        &authors_pk,
+        &source_columns,
+        &def.source,
+    )
+    .await
+    .expect("create author_totals target table");
+    backfill_definition(&db.pool, &def, "public", &def.source, &source_columns)
+        .await
+        .expect("direct backfill author_totals");
     let backfill_ms = backfill_start.elapsed().as_millis();
 
     let correctness_ok = check_correctness(&raw).await;

@@ -284,8 +284,8 @@ pub struct Program {
     /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
     /// default). A nonzero value `N` means "install this definition only once
     /// `ops[0..N]` have already been applied" — real rows can already exist
-    /// in `defs[i].source` by then, exercising `defs::catalog::install_definition`'s
-    /// direct-backfill-over-preexisting-rows path (the same path
+    /// in `defs[i].source` by then, exercising the backfill discharge's build
+    /// over pre-existing rows (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
     /// inside the harness's own op-stream loop). Must be index-aligned with
     /// `defs` (same length) — see [`crate::generate::defer_def_install`] for

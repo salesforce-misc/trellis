@@ -171,9 +171,9 @@ const RELATIONSHIP_AUTHORS: i64 = 100_000;
 const RELATIONSHIP_POSTS: i64 = 1_000_000;
 const RELATIONSHIP_COMMENTS: i64 = 4_500_000;
 
-/// Measured ~660-670ms for `install_definition` end to end (target-table
-/// creation + the direct relationship-aware build,
-/// `backfill_relationship_one_to_one`) on this harness/box across repeated
+/// Measured ~660-670ms for target-table creation + the direct
+/// relationship-aware build (`backfill_relationship_one_to_one`, then run
+/// inside `install_definition`) on this harness/box across repeated
 /// runs against the full 100k/1M/4.5M row counts above — down from the ~1
 /// minute the ring path took on the real-world shape that motivated this
 /// benchmark (issue #63 C2's handoff doc). 10s keeps >10x headroom for

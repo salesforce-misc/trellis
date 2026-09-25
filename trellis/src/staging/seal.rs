@@ -11,8 +11,8 @@
 //! family the design doc's SQL literally shows. tokio-postgres has no
 //! `FromSql`/`ToSql` for `xid8`/`pg_snapshot`, so every value crosses the
 //! wire as text (`::text` out, `::text::xid8`/`::text::pg_snapshot` back
-//! in) — the same bridge `trellis::intake::publication`'s `fence_snapshot`
-//! handling already uses.
+//! in) — the same bridge `trellis::intake::publication`'s snapshot and
+//! `fence_xid` handling uses.
 
 use std::time::Duration;
 

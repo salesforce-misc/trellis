@@ -77,8 +77,8 @@ impl Default for EngineTuning {
         Self {
             // Not `ClientOptions::default()`'s 0: every streaming scenario
             // needs at least one drain worker to make progress at all, and
-            // `install_definition`'s Backfilling -> Live flip needs one even
-            // for an empty chunk queue (see `chain::install_chain_hops`).
+            // a definition's build runs on drain threads, so it never goes
+            // live without one (see `chain::install_chain_hops`).
             // 4 is what the reference harness's latency ladder measured
             // with; the throughput scenarios override it to 8
             // (`SEG_BUCKETS`' worth of claim parallelism per batch).

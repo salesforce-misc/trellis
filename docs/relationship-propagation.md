@@ -71,12 +71,13 @@ Two structural facts shape several cells:
   "Reverse fallback" is always in play.
 - **The direct backfill build never handles a bare to-one passthrough field.**
   `backfill_relationship_one_to_one` bails to the ring on any unsupported shape
-  (a bare to-one path, a nested relationship, a cyclic alias chain)
-  (`backfill.rs:1449-1452`). `TRANSFORM t FROM a SELECT category.name AS x` is
+  (a bare to-one path, a nested relationship, a cyclic alias chain) with
+  `BackfillError::Unsupported`, and the backfill discharge checks for that
+  before it dispatches (`backfill::check_direct_build`). `TRANSFORM t FROM a SELECT category.name AS x` is
   installed, backfilled through the *ring* (a `Recompute` per source row,
   discharged by Forward read), and never touches `backfill.rs` — confirmed by
   `install_definition_falls_back_to_ring_for_relationship_enriched_definition`
-  (`defs_install_definition.rs:950`). Backfill's fast path is real only for a
+  (`defs_install_definition.rs`). Backfill's fast path is real only for a
   to-many aggregate over a to-one's own field, not for a bare to-one value.
 
 ## The obligation table
