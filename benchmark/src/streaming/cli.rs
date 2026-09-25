@@ -293,7 +293,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 Some(knee) => eprintln!(
                     "knee: {} rows/sec kept (applied {} while offered, achieved {:.0}/sec{}){}",
                     knee.target_rows_per_sec,
-                    human_rate(knee.in_window_applied_rows_per_sec),
+                    human_rate(knee.in_window_applied),
                     knee.achieved_rows_per_sec,
                     if knee.generator_bound {
                         " — GENERATOR-BOUND, so the knee is a floor"
@@ -499,7 +499,7 @@ fn report_contention(result: &fold_in::FoldInResult) {
          {:.2} idle in txn; {} deadlocks, {} rollbacks",
         result.groups,
         result.application_threads,
-        human_rate(result.in_window_folded_rows_per_sec),
+        human_rate(result.in_window_folded),
         c.engine_busy_mean,
         c.engine_row_lock_mean,
         c.row_lock_share() * 100.0,
@@ -559,7 +559,7 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
         if result.generator_bound {
             eprintln!(
                 "GENERATOR-BOUND: {} groups — generator offered only {:.0} of {} rows/sec and \
-                 the aggregate drained all of it, so this row says nothing about T3 at the \
+                 the aggregate kept up with all of it, so this row says nothing about T3 at the \
                  target; raise --connections",
                 result.groups, result.achieved_rows_per_sec, result.target_rows_per_sec
             );
@@ -571,7 +571,7 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
                 result.groups,
                 if result.kept_target_rate { "YES" } else { "NO" },
                 result.target_rows_per_sec,
-                human_rate(result.in_window_folded_rows_per_sec),
+                human_rate(result.in_window_folded),
                 match result.folded_rows_per_sec {
                     Some(rate) => format!("{rate:.0} rows/sec end to end"),
                     None => "never caught up within the grace period".to_string(),
@@ -586,7 +586,7 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
 /// Why a throughput probe did or didn't keep its target rate, for a
 /// human-readable line.
 fn probe_outcome(probe: &throughput::ThroughputProbe) -> String {
-    let applied = human_rate(probe.in_window_applied_rows_per_sec);
+    let applied = human_rate(probe.in_window_applied);
     if probe.drained {
         format!("applied {applied} while offered, drained within grace")
     } else {
@@ -642,7 +642,7 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
         if probe.generator_bound {
             eprintln!(
                 "GENERATOR-BOUND: {} at {} rows/sec — generator offered only {:.0}/sec from {} \
-                 connections and the engine drained all of it; this row measured the \
+                 connections and the engine kept up with all of it; this row measured the \
                  generator, not the engine (raise --connections)",
                 scenario, probe.target_rows_per_sec, probe.achieved_rows_per_sec, probe.connections
             );
@@ -808,6 +808,13 @@ mod tests {
         connections(&argv(&["intake-ceiling", "--connections", "0"]));
     }
 
+    fn fit(rows_per_sec: f64) -> crate::streaming::rate::InWindowRate {
+        crate::streaming::rate::InWindowRate {
+            rows_per_sec,
+            tolerance: load::GENERATOR_UNDERSHOOT_TOLERANCE,
+        }
+    }
+
     fn probe(rows_issued: u64, changes_applied: u64) -> throughput::ThroughputProbe {
         throughput::ThroughputProbe {
             target_rows_per_sec: 20_000.0,
@@ -821,7 +828,7 @@ mod tests {
             changes_applied,
             backlog_after_grace: 0,
             drained: true,
-            in_window_applied_rows_per_sec: Some(20_000.0),
+            in_window_applied: Some(fit(20_000.0)),
             kept_target_rate: true,
             e2e_count: rows_issued,
             e2e_p50_bucket_frac: 1.0,
@@ -850,7 +857,7 @@ mod tests {
             changes_applied,
             drained: true,
             folded_rows_per_sec: Some(50_000.0),
-            in_window_folded_rows_per_sec: Some(50_000.0),
+            in_window_folded: Some(fit(50_000.0)),
             kept_target_rate: true,
             e2e_count: rows_issued,
             e2e_p50_bucket_frac: 1.0,
@@ -901,15 +908,18 @@ mod tests {
     fn a_probe_that_drains_at_half_its_target_rate_is_not_the_knee() {
         let kept = throughput::ThroughputProbe {
             target_rows_per_sec: 50_000.0,
-            in_window_applied_rows_per_sec: Some(50_000.0),
+            achieved_rows_per_sec: 50_000.0,
+            in_window_applied: Some(fit(50_000.0)),
             ..probe(1_000_000, 1_000_000)
         };
         let half_rate = throughput::ThroughputProbe {
             target_rows_per_sec: 100_000.0,
-            in_window_applied_rows_per_sec: Some(50_000.0),
+            achieved_rows_per_sec: 100_000.0,
+            in_window_applied: Some(fit(50_000.0)),
             kept_target_rate: crate::streaming::rate::kept_target_rate(
                 true,
-                Some(50_000.0),
+                Some(fit(50_000.0)),
+                100_000.0,
                 100_000.0,
             ),
             ..probe(2_000_000, 2_000_000)
@@ -951,13 +961,13 @@ mod tests {
     #[test]
     fn a_throughput_probe_reports_its_in_window_rate_and_verdict() {
         let json = throughput::ThroughputProbe {
-            in_window_applied_rows_per_sec: None,
+            in_window_applied: None,
             kept_target_rate: false,
             ..probe(200_000, 200_000)
         }
         .to_json("transaction-shape");
         assert!(
-            json.contains("\"in_window_applied_rows_per_sec\":null"),
+            json.contains("\"in_window_applied_rows_per_sec\":null,\"rate_tolerance\":null"),
             "{json}"
         );
         assert!(json.contains("\"kept_target_rate\":false"), "{json}");

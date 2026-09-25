@@ -65,14 +65,18 @@
 //!
 //! - `throughput-ramp`, `transaction-shape`, `fold-in-ratio` and
 //!   `group-contention` judge each probe by `kept_target_rate`
-//!   ([`streaming::rate`]): the pipeline processed rows at the target rate
-//!   (within 2%) *while* load was arriving — a line fitted across the offer
-//!   window (`in_window_applied_rows_per_sec` for the 1-1 chain,
-//!   `in_window_folded_rows_per_sec` for the aggregate) — **and** its backlog
-//!   drained within the grace period (`drained`). `drained` alone is not a
-//!   verdict: a pipeline at half the target still drains a 20s window inside
-//!   a 30s grace (issue #319). The ramp's knee is the highest rate that kept
-//!   its target, and the ramp stops at the first that didn't.
+//!   ([`streaming::rate`]): the pipeline processed rows at the offered rate
+//!   *while* load was arriving — a line fitted across the offer window
+//!   (`in_window_applied_rows_per_sec` for the 1-1 chain,
+//!   `in_window_folded_rows_per_sec` for the aggregate) within
+//!   `rate_tolerance` (2%, widened for commits too coarse for the window to
+//!   fit exactly) — **and** its backlog drained within the grace period
+//!   (`drained`). The offered rate is the target, or the achieved rate when
+//!   the generator undershot, which `generator_bound` then flags. `drained`
+//!   alone is not a verdict: a pipeline at half the target still drains a
+//!   20s window inside a 30s grace (issue #319). The ramp's knee is the
+//!   highest rate that kept its target, and the ramp stops at the first that
+//!   didn't.
 //! - `hop-ladder`'s T1 flags (`t1_*_pass`, `e2e_max_under_1s`) count rows
 //!   that never reached the terminal hop within the drain grace as misses
 //!   above every bound, rather than judging only the rows that landed.

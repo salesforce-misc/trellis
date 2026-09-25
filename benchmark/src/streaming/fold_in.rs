@@ -43,7 +43,8 @@ use crate::streaming::chain::{
 use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
-    self, fitted_rate, json_rate, kept_target_rate, kept_up_with_offer, sample_progress,
+    self, InWindowRate, QUERY_SAMPLE_INTERVAL, in_window_rate, json_in_window, json_rate,
+    kept_target_rate, progress_step_secs, sample_progress,
 };
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
@@ -79,10 +80,9 @@ pub struct FoldInResult {
     pub rows_issued: u64,
     pub achieved_rows_per_sec: f64,
     /// Issue #276's self-check: the generator undershot the target and the
-    /// aggregate kept up with everything it got — drained, and folded at the
-    /// achieved rate while it was offered
-    /// ([`crate::streaming::rate::kept_up_with_offer`]) — so this probe says
-    /// nothing about T3 at `target_rows_per_sec`.
+    /// aggregate kept up with everything it got (`kept_target_rate`, which
+    /// judges against the achieved rate when that is lower), so this probe
+    /// says nothing about T3 at `target_rows_per_sec`.
     pub generator_bound: bool,
     pub changes_applied: u64,
     /// Whether the target folded in every committed row before the grace
@@ -106,11 +106,13 @@ pub struct FoldInResult {
     /// window after its first [`rate::SETTLE_FRACTION`]. A pipeline that
     /// keeps up tracks the offered rate at a constant lag, so the slope equals
     /// the offered rate whatever that lag is; one that falls behind folds at
-    /// its own lower rate. `None` if too few samples landed to fit a line.
-    pub in_window_folded_rows_per_sec: Option<f64>,
+    /// its own lower rate. Carries the tolerance it is judged with (JSON
+    /// `in_window_folded_rows_per_sec` and `rate_tolerance`). `None` if too
+    /// few samples landed to fit a line ([`in_window_rate`]).
+    pub in_window_folded: Option<InWindowRate>,
     /// T3's yes-or-no at this ratio ([`kept_target_rate`]): the target
-    /// drained **and** `in_window_folded_rows_per_sec` kept up with the target
-    /// within [`crate::streaming::load::GENERATOR_UNDERSHOOT_TOLERANCE`].
+    /// drained **and** `in_window_folded` kept up with the offered rate
+    /// within its tolerance.
     /// `drained` alone can't answer T3: it only says the backlog drained
     /// within `grace`, and a long grace lets a pipeline running at a fraction
     /// of the target pass. Only meaningful when `generator_bound` is false.
@@ -148,7 +150,7 @@ impl FoldInResult {
              \"offered_duration_secs\":{:.3},\
              \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
              \"changes_applied\":{},\"drained\":{},\"folded_rows_per_sec\":{},\
-             \"in_window_folded_rows_per_sec\":{},\"kept_target_rate\":{},\
+             {},\"kept_target_rate\":{},\
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\
@@ -166,7 +168,7 @@ impl FoldInResult {
             self.changes_applied,
             self.drained,
             json_rate(self.folded_rows_per_sec),
-            json_rate(self.in_window_folded_rows_per_sec),
+            json_in_window("in_window_folded_rows_per_sec", self.in_window_folded),
             self.kept_target_rate,
             self.e2e_count,
             self.e2e_p50_bucket_frac,
@@ -325,9 +327,12 @@ pub async fn run_probe(
     let (raw_ref, terminal_ref) = (&raw, terminal.as_str());
     let (load, fold_samples, contention) = tokio::join!(
         run_parallel_load(db.dsn(), SOURCE_TABLE, 1, &load_cfg),
-        sample_progress(offer_start, offer.duration, move || async move {
-            folded_rows(raw_ref, terminal_ref).await as f64
-        }),
+        sample_progress(
+            offer_start,
+            offer.duration,
+            QUERY_SAMPLE_INTERVAL,
+            move || async move { folded_rows(raw_ref, terminal_ref).await as f64 }
+        ),
         contention::sample(
             &sampler,
             SOURCE_TABLE,
@@ -336,7 +341,14 @@ pub async fn run_probe(
         ),
     );
     let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
-    let in_window_folded_rows_per_sec = fitted_rate(&fold_samples);
+    let in_window_folded = in_window_rate(
+        &fold_samples,
+        progress_step_secs(
+            ROWS_PER_COMMIT,
+            target_rows_per_sec,
+            tuning.maintenance_interval,
+        ),
+    );
 
     // An aggregate has an exact convergence signal that a 1-1 chain's row
     // count is the analogue of: every source row is counted into exactly one
@@ -374,6 +386,12 @@ pub async fn run_probe(
     client.shutdown().await.expect("client shutdown");
 
     let achieved_rows_per_sec = load.achieved_rows_per_sec();
+    let kept = kept_target_rate(
+        drained,
+        in_window_folded,
+        target_rows_per_sec,
+        achieved_rows_per_sec,
+    );
     let folded_rows_per_sec =
         drained_after.map(|elapsed| load.rows_issued as f64 / elapsed.as_secs_f64());
     FoldInResult {
@@ -385,24 +403,12 @@ pub async fn run_probe(
         offered_duration_secs: load.elapsed.as_secs_f64(),
         rows_issued: load.rows_issued,
         achieved_rows_per_sec,
-        generator_bound: generator_bound(
-            Some(target_rows_per_sec),
-            achieved_rows_per_sec,
-            kept_up_with_offer(
-                drained,
-                in_window_folded_rows_per_sec,
-                achieved_rows_per_sec,
-            ),
-        ),
+        generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, kept),
         changes_applied: changes_now.saturating_sub(changes_before),
         drained,
         folded_rows_per_sec,
-        in_window_folded_rows_per_sec,
-        kept_target_rate: kept_target_rate(
-            drained,
-            in_window_folded_rows_per_sec,
-            target_rows_per_sec,
-        ),
+        in_window_folded,
+        kept_target_rate: kept,
         e2e_count: window.count,
         e2e_p50_bucket_frac: window.fraction(LE_P50),
         e2e_p99_bucket_frac: window.fraction(LE_P99),

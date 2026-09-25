@@ -45,9 +45,9 @@ pub const GENERATOR_UNDERSHOOT_TOLERANCE: f64 = 0.02;
 /// engine still kept up with everything it was actually offered
 /// (`engine_kept_up`: no backlog left, and — for the scenarios that fit an
 /// in-window rate — processed at the achieved rate while it was offered, see
-/// [`crate::streaming::rate::kept_up_with_offer`]). That combination means nothing on
-/// the engine side ever pushed back, so the only thing the result bounds is
-/// the generator.
+/// [`crate::streaming::rate::kept_target_rate`]). That combination means
+/// nothing on the engine side ever pushed back, so the only thing the result
+/// bounds is the generator.
 ///
 /// `target_rows_per_sec: None` is a max-rate ([`Pace::Max`]) run — there is
 /// no target to undershoot, because the generator was asked for everything it

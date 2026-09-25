@@ -13,10 +13,10 @@
 //! here instead offers load for a short window and passes
 //! (`kept_target_rate`) only when both
 //!
-//! * the pipeline applied rows at the target rate *while* load was arriving
+//! * the pipeline applied rows at the offered rate *while* load was arriving
 //!   (`in_window_applied_rows_per_sec`, a line fitted to the terminal hop's
-//!   applied-row counter across the window — see [`crate::streaming::rate`]),
-//!   and
+//!   applied-row counter across the window, within its `rate_tolerance` —
+//!   see [`crate::streaming::rate`]), and
 //! * the backlog the window left (`rows offered - rows landed`) drained
 //!   within a bounded grace period (`drained`).
 //!
@@ -33,7 +33,7 @@
 //! ([`crate::streaming::load::run_parallel_load`]) paced at the target on a
 //! shared schedule, so a high target is actually offered rather than capped
 //! by one connection. Every probe still reports `generator_bound`
-//! ([`generator_bound`]): a probe that drained but whose achieved rate
+//! ([`generator_bound`]): a probe that kept up with an achieved rate that
 //! undershot the target says nothing about the engine at that target.
 
 use std::time::{Duration, Instant};
@@ -47,7 +47,8 @@ use crate::streaming::chain::{
 };
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
-    fitted_rate, json_rate, kept_target_rate, kept_up_with_offer, sample_progress,
+    COUNTER_SAMPLE_INTERVAL, InWindowRate, in_window_rate, json_in_window, kept_target_rate,
+    progress_step_secs, sample_progress,
 };
 use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
@@ -85,10 +86,9 @@ pub struct ThroughputProbe {
     /// `target_rows_per_sec` before reading anything else here.
     pub achieved_rows_per_sec: f64,
     /// Issue #276's self-check: the generator undershot the target and the
-    /// engine kept up with everything it did get — drained, and applied at
-    /// the achieved rate while it was offered
-    /// ([`crate::streaming::rate::kept_up_with_offer`]) — so this probe measured the
-    /// generator. Its verdict says nothing about the engine at
+    /// engine kept up with everything it did get (`kept_target_rate`, which
+    /// judges against the achieved rate when that is lower), so this probe
+    /// measured the generator. Its verdict says nothing about the engine at
     /// `target_rows_per_sec`.
     pub generator_bound: bool,
     pub changes_applied: u64,
@@ -96,16 +96,17 @@ pub struct ThroughputProbe {
     /// The backlog fully landed within the grace period. Not a throughput
     /// verdict on its own (issue #319) — `kept_target_rate` is.
     pub drained: bool,
-    /// The rate the terminal hop applied rows at while load was arriving: the
-    /// least-squares slope of its `trellis_changes_applied_total` sampled
-    /// across the offer window after its first
-    /// [`crate::streaming::rate::SETTLE_FRACTION`]. `None` if too few samples
-    /// landed to fit a line.
-    pub in_window_applied_rows_per_sec: Option<f64>,
-    /// This probe's verdict: `drained` **and** `in_window_applied_rows_per_sec`
-    /// within [`crate::streaming::load::GENERATOR_UNDERSHOOT_TOLERANCE`] of
-    /// the target ([`kept_target_rate`]). Only meaningful when
-    /// `generator_bound` is false.
+    /// The rate the terminal hop applied rows at while load was arriving, and
+    /// the tolerance it is judged with: the least-squares slope of its
+    /// `trellis_changes_applied_total` sampled across the offer window after
+    /// its first [`crate::streaming::rate::SETTLE_FRACTION`] (JSON
+    /// `in_window_applied_rows_per_sec` and `rate_tolerance`). `None` if too
+    /// few samples, or too few commits, landed in the window to fit
+    /// ([`in_window_rate`]).
+    pub in_window_applied: Option<InWindowRate>,
+    /// This probe's verdict: `drained` **and** `in_window_applied` within its
+    /// tolerance of the offered rate ([`kept_target_rate`]). Only meaningful
+    /// when `generator_bound` is false.
     pub kept_target_rate: bool,
     pub e2e_count: u64,
     pub e2e_p50_bucket_frac: f64,
@@ -122,7 +123,7 @@ impl ThroughputProbe {
              \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
              \"changes_applied\":{},\
              \"backlog_after_grace\":{},\"drained\":{},\
-             \"in_window_applied_rows_per_sec\":{},\"kept_target_rate\":{},\"e2e_count\":{},\
+             {},\"kept_target_rate\":{},\"e2e_count\":{},\
              \"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_source_rows\":{},\
              \"oracle_terminal_rows\":{},\"oracle_mismatched_rows\":{},\
@@ -139,7 +140,7 @@ impl ThroughputProbe {
             self.changes_applied,
             self.backlog_after_grace,
             self.drained,
-            json_rate(self.in_window_applied_rows_per_sec),
+            json_in_window("in_window_applied_rows_per_sec", self.in_window_applied),
             self.kept_target_rate,
             self.e2e_count,
             self.e2e_p50_bucket_frac,
@@ -202,9 +203,13 @@ pub async fn run_probe(
     // The in-window rate is fitted to the applied-row counter, not to a row
     // count: a `count(*)` every 200ms is a repeated seq scan competing with
     // the drain it is watching (see the drain loop below). The counter is an
-    // in-process read with no database round trip. Its one weakness — a
-    // mid-window re-stage pushing it past rows committed — is what
-    // `report_probes`' #423 cross-check fails the probe on.
+    // in-process read with no database round trip, so it is sampled densely.
+    // It is exact otherwise: flushed only after the applying transaction
+    // commits, once per staged row, so a retried apply isn't counted twice.
+    // Its one weakness — a mid-window re-stage pushing it past rows committed
+    // — can only matter to a probe that drained (the verdict needs one), and
+    // then the extra rows show in the final count, which `report_probes`'
+    // #423 cross-check fails the probe on.
     let load_cfg = ParallelLoad {
         connections: offer.connections,
         rows_per_commit,
@@ -215,12 +220,24 @@ pub async fn run_probe(
     let offer_start = Instant::now();
     let (load, applied_samples) = tokio::join!(
         run_parallel_load(db.dsn(), &chain.source, 1, &load_cfg),
-        sample_progress(offer_start, offer.duration, move || async move {
-            counter_value(&scrape(), CHANGES_APPLIED_METRIC, terminal)
-                .saturating_sub(changes_before) as f64
-        }),
+        sample_progress(
+            offer_start,
+            offer.duration,
+            COUNTER_SAMPLE_INTERVAL,
+            move || async move {
+                counter_value(&scrape(), CHANGES_APPLIED_METRIC, terminal)
+                    .saturating_sub(changes_before) as f64
+            }
+        ),
     );
-    let in_window_applied_rows_per_sec = fitted_rate(&applied_samples);
+    let in_window_applied = in_window_rate(
+        &applied_samples,
+        progress_step_secs(
+            rows_per_commit,
+            target_rows_per_sec,
+            tuning.maintenance_interval,
+        ),
+    );
 
     // Wait for the backlog to drain, polling the cheap counter for progress
     // and confirming completion with an authoritative row count.
@@ -287,6 +304,12 @@ pub async fn run_probe(
     let backlog = load.rows_issued as i64 - landed;
     let achieved_rows_per_sec = load.achieved_rows_per_sec();
     let drained = backlog <= 0;
+    let kept = kept_target_rate(
+        drained,
+        in_window_applied,
+        target_rows_per_sec,
+        achieved_rows_per_sec,
+    );
     ThroughputProbe {
         target_rows_per_sec,
         rows_per_commit,
@@ -295,24 +318,12 @@ pub async fn run_probe(
         offered_duration_secs: offer.duration.as_secs_f64(),
         rows_issued: load.rows_issued,
         achieved_rows_per_sec,
-        generator_bound: generator_bound(
-            Some(target_rows_per_sec),
-            achieved_rows_per_sec,
-            kept_up_with_offer(
-                drained,
-                in_window_applied_rows_per_sec,
-                achieved_rows_per_sec,
-            ),
-        ),
+        generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, kept),
         changes_applied,
         backlog_after_grace: backlog,
         drained,
-        in_window_applied_rows_per_sec,
-        kept_target_rate: kept_target_rate(
-            drained,
-            in_window_applied_rows_per_sec,
-            target_rows_per_sec,
-        ),
+        in_window_applied,
+        kept_target_rate: kept,
         e2e_count: window.count,
         e2e_p50_bucket_frac: window.fraction(LE_P50),
         e2e_p99_bucket_frac: window.fraction(LE_P99),
