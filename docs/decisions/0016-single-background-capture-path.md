@@ -120,7 +120,8 @@ how many snapshots the build reads through:
 | **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job, a `backfill_chunks` row with no bounds that a drain thread runs start to finish ([The direct-build job](#the-direct-build-job)) | once per statement | the same go-live catch-up marker, parked on every table the build read (its source and each relationship to-side) |
 
 The go-live catch-up re-reads the source, so a change that drained while the
-definition was still building reaches the target. For an aggregate, a change the
+definition was still building reaches the target, and deletes the target rows
+the source no longer backs, which a re-read can't reach (#485). For an aggregate, a change the
 build read whose streamed delta drains after the flip re-derives its group
 through the recompute horizon the build records
 ([Which consistency bookkeeping stays](#which-consistency-bookkeeping-stays)).
@@ -178,35 +179,44 @@ stranded in `backfilling`:
 
 ### Which consistency bookkeeping stays
 
-The in-registration build carried three pieces of bookkeeping. With the build
-starting only after its marker's fence has settled:
+The in-registration build carried three pieces of bookkeeping: the go-live
+catch-up, the coverage record that let a catch-up skip its re-read, and
+registration's defer check. With the build starting only after its marker's
+fence has settled:
 
 - **The go-live catch-up stays, and correctness needs it.** Apply skips a
   definition whose build hasn't finished, so a change that drains while the
   job runs reaches nothing. The catch-up marker parked when the build
   finishes, on every table the build read (issue #430), re-derives from
   current state, and its discharge is what takes the definition `live`.
-- **The coverage fence and `backfill_coverage` stay, as an optimization.**
-  Without a record, every direct build's go-live catch-up enumerates the whole
-  source, and each to-side table, into the ring in one transaction: exactly the
-  cost the direct build exists to avoid. The job captures the fence before its
-  first read and commits the record after its last, while it still holds a
-  current claim. The rule that makes the record sound doesn't depend on when
-  the build runs: it only vouches for a table none of whose rows changed after
-  the fence and whose row count is unchanged. What it can't see is a commit
-  the build read *and* the stream carries, which is new now that every build
-  runs after its source joined the publication. That commit's delta can drain
-  after the flip, and no catch-up re-derives it. For a 1-1 target that's
-  harmless, since apply re-evaluates the row from live state. For an
-  aggregate, the build now records its read as a recompute horizon, on each
-  group row it writes and on the target's extinct horizon for groups it found
-  empty
+- **The go-live catch-up also deletes what the source no longer backs**
+  (issue #485). Its re-read enumerates the keys the source still has, so it
+  can't reach a key a skipped delete removed: a 1-1 row whose source row is
+  gone, or an aggregate group with no source rows left. So the discharge
+  that flips a definition `live` runs #330's anti-join first, in the same
+  transaction and before the re-read's `DECLARE`
+  (`intake::resume_orphans`): it deletes every target row no source row
+  backs, through the target-mutation seam. It reads state, so it needs no
+  argument about which deletes drained when, only that anything missing from
+  its snapshot drains after the flip, which the discharge running on the only
+  sealer gives. For a 1-1 target it is exact. For an aggregate the anti-join
+  and the re-read read two snapshots, which leaves #436's short race.
+- **The coverage fence and `backfill_coverage` are retired** (issues #468,
+  #485). A coverage record let a direct build's go-live catch-up skip a table
+  none of whose rows had changed since a fence taken before the build read
+  it, with the same row count. A row inserted after the fence, read by the
+  build and deleted again nets out on both, so the skip kept a row the source
+  no longer had (#468). No check on table state can tell that apart from an
+  unchanged table, so the skip is gone, and every go-live catch-up re-reads
+  every table its build read. That is the cost the record existed to avoid:
+  see [Consequences](#consequences).
+  A commit the build read *and* the stream carries still needs no catch-up:
+  its delta can drain after the flip. For a 1-1 target that's harmless, since
+  apply re-evaluates the row from live state. For an aggregate, the build
+  records its read as a recompute horizon, on each group row it writes and on
+  the target's extinct horizon for groups it found empty
   ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-recompute-horizon)),
   so such a delta re-derives its group instead of counting the commit twice.
-  A record also vouches only for its own build's write. A job a worker still
-  held across a resume can write its older read after the rebuild went live
-  and recorded coverage, so discarding that job clears the source's record as
-  it parks the source's catch-up, and the catch-up re-reads the source.
 - **Registration's defer check is gone.** Registration always defers now, so
   `defer_if_fence_unsettled` and the `backfill_marker_unsettled` check it asked
   are removed.
@@ -215,8 +225,9 @@ The direct build doesn't wait for intake to reach its snapshot, as a ring
 enumeration does (#312): the horizon makes that wait unnecessary for
 correctness, and it only ever made re-derivations rarer.
 
-Whether coverage is worth keeping at all is step 6's question (#420), together
-with a catch-up that reads only what changed.
+A catch-up that reads only what changed (a log of the keys apply skipped
+while a definition was building) is the known follow-up if the full re-read
+proves too costly (#456, #485's option (c)).
 
 ### The join fence
 
@@ -285,8 +296,8 @@ initial capture is still outstanding:
 - **Chunked and direct builds** finish in `catching_up`, not `live`
   (`complete_direct_backfill`), and park their go-live catch-up on every table
   the build read. The discharge of the last of those catch-ups flips the
-  definition `live`, in the same transaction as its re-read or its
-  coverage-based skip (`intake::publication::go_live_caught_up`). That
+  definition `live`, in the same transaction as its re-read and its orphan
+  sweep (`intake::publication::go_live_caught_up`, #485). That
   discharge runs on the maintenance loop, the only sealer, like ring
   enumeration's.
 - **A ring enumeration whose source is another definition's target** goes to
@@ -466,10 +477,16 @@ log.
   builder, but not off the catch-ups. Bounding it (paging the enumeration
   across transactions, or a catch-up that reads only what changed) is a
   follow-up under #415.
-- **`backfill_coverage` becomes an optimization at most.** It lets a catch-up
-  skip re-reading a table that provably hasn't changed since a build read it. No
-  path depends on it for correctness (see
-  [Which consistency bookkeeping stays](#which-consistency-bookkeeping-stays)).
+- **Every build's go-live pays a full re-read and an anti-join (accepted,
+  #485).** With `backfill_coverage` retired, the go-live catch-up of every
+  chunked or direct build enumerates each table its build read into the ring,
+  and runs the orphan anti-join over its target, in one transaction on the
+  maintenance loop, which seals nothing meanwhile. On a 5M-row source the
+  anti-join measured about 2.1 s for a 1-1 target and 0.45 s for an
+  aggregate, on top of the enumeration (about 4 s server-side) and the drain
+  of one `Recompute` per row. It scales with table size, not with what
+  changed during the build (#456). A catch-up that reads only the keys apply
+  skipped is the follow-up if that proves too costly.
 
 ## Inventory of capture paths
 
@@ -484,9 +501,10 @@ happens, and its role in this design.
 | Synchronous direct build inside registration | was `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | **Done (#419).** The discharge dispatches it as one background job (`chunk_queue::dispatch_direct_build`) that a drain thread runs ([The direct-build job](#the-direct-build-job)) |
 | Registration's defer branch | was `install_definition`'s `defer_if_fence_unsettled`, and `create_definition_inner`'s `backfill_marker_unsettled` check | **Done (#418, #419).** Registration always defers to the discharge, and the branch is gone |
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` fences and discharges | The one path. **Done (#431):** the discharge fences every marker the first time it sees it ([The join fence](#the-join-fence)) |
-| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. #436 makes it race-free |
+| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. The go-live catch-up's discharge runs the same deletion again (#485). #436 is the aggregate race left between the deletion and the re-read |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
-| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue`, all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge flips the definition `live` (`go_live_caught_up`, #476) |
+| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue`, all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge always re-reads (`backfill_coverage` is retired, #468), deletes the target rows no source row backs (#485), and flips the definition `live` (`go_live_caught_up`, #476) |
+| Direct-build coverage skip | was `backfill_coverage`, recorded by the direct-build job and read by the discharge's `coverage_covers` | **Retired (#468, #485).** It took a table whose row count and `xmin`s were unchanged since the build's fence for unchanged, which a row inserted and deleted during the build defeats. V48 drops the table |
 | Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call. The definition is `catching_up` until the marker discharges (#476) |
 | `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | Separate: a redefinition-side capture that reads the added columns' values in-call. The definition is `catching_up` until the marker discharges (#476) |
 | Publication change on `DROP` | was `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | **Done (#427).** A `DROP` only removes catalog rows, and the staging worker's reconcile pass (`client::reconcile_source_tables`) shrinks the publication from the catalog. `ClientOptions::source_tables`, the startup copy that used to act as a permanent floor, is deleted. Supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time" |

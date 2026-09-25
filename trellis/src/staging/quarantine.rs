@@ -1620,12 +1620,6 @@ pub async fn resume_column(
 /// resuming can sit in `waiting_to_backfill` for as long as some unrelated
 /// transaction pins the cluster's `xmin`, and that is correct, not a fault).
 ///
-/// Clears any stale `backfill_coverage` record for the source table first
-/// (issue #79, bug B's multi-reader contract): a quarantined definition's
-/// target may be broken or only partially written, so a coverage record
-/// that would otherwise let the discharge skip enumeration cannot be
-/// trusted here — full re-enumeration is the safe default.
-///
 /// Deletes the definition's unclaimed, undone `backfill_chunks` rows too
 /// (issue #332): the fresh backfill makes them redundant, and a pause only
 /// withheld them from dispatch. Chunks a worker still holds are left for that
@@ -1734,7 +1728,6 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     // `"schema.table"` form (issue #72) — re-resolving it via
     // `resolve_source_schema_in_txn` (bare names only) or re-`qualify`-ing it
     // would reject it outright (`DottedIdentifierComponent`).
-    crate::intake::publication::clear_backfill_coverage(&*txn, &source_table).await?;
     crate::intake::publication::park_backfill_catchup(&*txn, &source_table).await?;
     // Issue #310: a transform paused by a lost replication slot stops being
     // reported as such the moment it is resumed.

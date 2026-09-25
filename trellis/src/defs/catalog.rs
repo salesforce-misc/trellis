@@ -736,14 +736,15 @@ pub async fn create_definition_without_backfill(
 /// definitions ([`TransformStatus::is_applying`]), so no build path can have
 /// a live CDC delta folded into it while it is still being built. A delta
 /// skipped during that window is recovered rather than lost by the catch-up
-/// marker parked when the build finishes.
+/// marker parked when the build finishes: its discharge re-reads every
+/// table the build read, and deletes the target rows no source row backs
+/// any more, which the re-read can't reach (issue #485).
 /// The reverse, a delta for a commit the build already read that drains only
 /// after the flip, is harmless for a 1-1 target. For an aggregate, the
 /// recompute horizon the build stamps on every group row it writes (and on
 /// the target, for the groups it found empty) sends that delta to
 /// re-derive its group rather than count the commit a second time (issues
-/// #419, #442), so that correction never depends on the catch-up, whose
-/// coverage record may let it skip the table.
+/// #419, #442), so that correction doesn't rest on the catch-up.
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -765,9 +766,9 @@ pub async fn install_definition(
 
     // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
     // side is trusted outright rather than resolved — checked here, before
-    // any DDL or coverage-planning work runs, so a bogus explicit spelling
-    // fails fast with a friendly `ValidationError` instead of surfacing as a
-    // confusing DDL/coverage-fence failure partway through this function.
+    // any DDL work runs, so a bogus explicit spelling fails fast with a
+    // friendly `ValidationError` instead of surfacing as a confusing DDL
+    // failure partway through this function.
     // `create_definition_inner` (below) repeats both checks inside its own
     // transaction; that repeat is the *authoritative* one — it's the only
     // check the ring-path entry points ([`create_definition`]/
@@ -788,7 +789,7 @@ pub async fn install_definition(
     // An explicit `TRANSFORM <schema>.<target>` spelling overrides
     // `target_schema` (`Config::target_schema`, or this function's own
     // caller-supplied override) outright for the remainder of this call:
-    // every DDL/backfill/coverage step below, and `create_definition_inner`'s
+    // every DDL/backfill step below, and `create_definition_inner`'s
     // own persistence, all thread this (possibly-overridden) binding through
     // rather than the original parameter — so the physical target table this
     // function's DDL step is about to create and the qualified identity
@@ -987,8 +988,8 @@ async fn catch_up_if_backfilling(
 ///
 /// The catch-up marker is parked unless the definition is **frozen**. A
 /// frozen one gets nothing from it: resume
-/// ([`crate::staging::quarantine::resume_transform`]) clears its coverage,
-/// re-parks a marker of its own and rebuilds by a fresh backfill.
+/// ([`crate::staging::quarantine::resume_transform`]) re-parks a marker of
+/// its own and rebuilds by a fresh backfill.
 ///
 /// Returns the status the definition is left in:
 /// [`TransformStatus::CatchingUp`] when this call completed it or it was
@@ -1046,10 +1047,35 @@ async fn definition_tables_read(
 /// with every table it reads ([`tables_read_by`]): the definitions whose
 /// go-live catch-up the discharge of `table`'s marker may be the last of
 /// (`intake::publication::go_live_caught_up`, issue #476). The definitions
-/// are read unlocked first and only the ones reading `table` are locked, in
-/// id order; one that left `catching_up` while this waited for its lock is
-/// dropped.
+/// are read unlocked first ([`catching_up_readers_unlocked`]) and only the
+/// ones reading `table` are locked, in id order; one that left `catching_up`
+/// while this waited for its lock is dropped.
 pub(crate) async fn catching_up_readers(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
+    let mut readers = catching_up_readers_unlocked(txn, table).await?;
+    if readers.is_empty() {
+        return Ok(readers);
+    }
+    let ids: Vec<i64> = readers.iter().map(|(id, _)| *id).collect();
+    let still: Vec<i64> = txn
+        .query(
+            "select id from transform_definitions where id = any($1) and status = $2 \
+             order by id for update",
+            &[&ids, &TransformStatus::CatchingUp.as_str()],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    readers.retain(|(id, _)| still.contains(id));
+    Ok(readers)
+}
+
+/// [`catching_up_readers`] without the locks: every definition `catching_up`
+/// as of this statement that reads `table`, with every table it reads.
+pub(crate) async fn catching_up_readers_unlocked(
     txn: &tokio_postgres::Transaction<'_>,
     table: &str,
 ) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
@@ -1069,21 +1095,6 @@ pub(crate) async fn catching_up_readers(
             readers.push((row.get::<_, i64>(0), tables));
         }
     }
-    if readers.is_empty() {
-        return Ok(readers);
-    }
-    let ids: Vec<i64> = readers.iter().map(|(id, _)| *id).collect();
-    let still: Vec<i64> = txn
-        .query(
-            "select id from transform_definitions where id = any($1) and status = $2 \
-             order by id for update",
-            &[&ids, &TransformStatus::CatchingUp.as_str()],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    readers.retain(|(id, _)| still.contains(id));
     Ok(readers)
 }
 
@@ -1169,116 +1180,6 @@ async fn is_definition_target(
         )
         .await?
         .get(0))
-}
-
-/// What to do with one table's coverage once a direct build succeeds: either
-/// persist a fence captured before the build, or clear any stale record.
-pub(crate) enum CoveragePlan {
-    /// This build is the table's sole reader — record the pre-build fence.
-    Record {
-        qualified: String,
-        fence: crate::intake::publication::CoverageFence,
-    },
-    /// Another definition already reads this table (built at a different
-    /// fence), so only a full enumeration can be trusted to catch every reader
-    /// up — clear any coverage to force that.
-    Clear { qualified: String },
-}
-
-/// Plans direct-backfill coverage (issue #79, bug B) for `definition`, whose
-/// direct-build job is about to run (`chunk_queue`, issue #419): every table
-/// the build reads ([`tables_read_by`]). For each, either captures a coverage
-/// fence (row count + snapshot) or, when another definition already reads the
-/// table, marks it for clearing.
-///
-/// **Runs before the build.** The captured fence must predate every read the
-/// build makes of the table: the build reads to-side tables early (into staging
-/// tables) and the source in per-chunk statements, none under a single
-/// snapshot, so a fence taken *after* the build could be newer than a write the
-/// build never saw and wrongly certify it as covered. A pre-build fence instead
-/// leaves any build-window write invisible in the fence, so
-/// [`crate::intake::publication::coverage_covers`] falls back to enumeration.
-///
-/// Coverage is only ever an optimization: a record lets the build's
-/// go-live catch-up skip re-reading a table that hasn't changed since
-/// the fence (ADR-0016, "Which consistency bookkeeping stays").
-pub(crate) async fn plan_direct_backfill_coverage(
-    pool: &Pool,
-    definition: &Definition,
-) -> Result<Vec<CoveragePlan>, CatalogError> {
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    let tables = tables_read_by(&txn, &definition.def, &definition.source_table).await?;
-    let mut plans = Vec::with_capacity(tables.len());
-    for qualified in tables {
-        if table_has_other_reader(&txn, &qualified, definition.id).await? {
-            plans.push(CoveragePlan::Clear { qualified });
-        } else {
-            let fence =
-                crate::intake::publication::capture_backfill_coverage_fence(&*txn, &qualified)
-                    .await?;
-            plans.push(CoveragePlan::Record { qualified, fence });
-        }
-    }
-    txn.commit().await?;
-    Ok(plans)
-}
-
-/// Persists a [`plan_direct_backfill_coverage`] result once the direct build
-/// has succeeded (issue #79, bug B), inside the caller's transaction so the
-/// whole plan lands atomically.
-pub(crate) async fn commit_direct_backfill_coverage(
-    txn: &tokio_postgres::Transaction<'_>,
-    plans: &[CoveragePlan],
-) -> Result<(), CatalogError> {
-    for plan in plans {
-        match plan {
-            CoveragePlan::Record { qualified, fence } => {
-                crate::intake::publication::write_backfill_coverage(txn, qualified, fence).await?;
-            }
-            CoveragePlan::Clear { qualified } => {
-                crate::intake::publication::clear_backfill_coverage(txn, qualified).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Whether any transform definition other than `excluding` reads the
-/// qualified `qualified` — either as its own `FROM` source, or as the to-side
-/// of a relationship anchored on a table some definition transforms.
-/// Conservative on the relationship side: it does not confirm the anchoring
-/// definition's text actually references that relationship, so it may report
-/// a reader where none truly exists. That only ever suppresses a coverage
-/// record (falling back to full enumeration), which is always safe — the
-/// direction the issue's safety valve demands.
-///
-/// The first clause compares against `transform_definitions.source_table`,
-/// which holds the qualified identity (issue #72). The second joins a
-/// relationship to the definitions over its qualified from-side
-/// (`from_schema || '.' || from_table`, issue #288) and matches its qualified
-/// to-side (`to_schema || '.' || to_table`, issue #372) against `qualified`.
-async fn table_has_other_reader(
-    txn: &tokio_postgres::Transaction<'_>,
-    qualified: &str,
-    excluding: i64,
-) -> Result<bool, CatalogError> {
-    let exists: bool = txn
-        .query_one(
-            "select \
-               exists(select 1 from transform_definitions \
-                      where source_table = $1 and id <> $2) \
-               or exists( \
-                 select 1 from relationship_definitions r \
-                 join transform_definitions d \
-                   on d.source_table = r.from_schema || '.' || r.from_table \
-                 where r.to_schema || '.' || r.to_table = $1 and d.id <> $2 \
-               )",
-            &[&qualified, &excluding],
-        )
-        .await?
-        .get(0);
-    Ok(exists)
 }
 
 /// Edits an already-registered 1-1 transform's calculated fields in place —
@@ -5226,14 +5127,17 @@ struct PendingDefinition {
 /// CDC delta folded into it now — via [`transforms_for_source`], the apply
 /// path's read of this function — could permanently corrupt a value an
 /// incremental accumulator (e.g. `AVG`) computes against a baseline. Excluding
-/// those rows here means the apply path simply never attempts them; the
-/// delta is not lost, though — [`crate::intake::publication::run_pending_backfills`]'s
-/// discharge (parked via the same `pending_backfill` marker the ring-fallback
-/// path already relies on, inserted when a build finishes and the definition
-/// moves to [`TransformStatus::CatchingUp`]: by [`complete_direct_backfill`]
-/// for a chunked build or a direct-build job, on every table that build
-/// read, issue #430) re-derives the definition's target from current source
-/// state, folding in anything skipped while it wasn't applying.
+/// those rows here means the apply path simply never attempts them, and the
+/// skipped delta itself is dropped. What it changed is recovered from state
+/// instead, by the discharge of the go-live catch-up
+/// ([`crate::intake::publication::run_pending_backfills`]; the same
+/// `pending_backfill` marker the ring-fallback path relies on, parked when a
+/// build finishes and the definition moves to [`TransformStatus::CatchingUp`]:
+/// by [`complete_direct_backfill`] for a chunked build or a direct-build job,
+/// on every table that build read, issue #430). Its re-read re-derives every
+/// key the source still has. That can't reach a key whose source row a
+/// skipped delete removed, so the same discharge also deletes every target
+/// row no source row backs any more (issue #485, `intake::resume_orphans`).
 ///
 /// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0007)
 /// — matched exactly against `schema_nodes.table_name`, which is now always

@@ -199,18 +199,28 @@ drain threads.
   (`complete_direct_backfill`; a direct build also reads each relationship
   to-side). Its discharge, through this same path, re-derives the definition
   from the tables' current state, and the discharge of its last catch-up
-  flips it `live`. A `backfill_coverage` record can let a catch-up skip re-reading a
-  table that provably hasn't changed since the build. That saves work but
-  never decides correctness: the one change it can't see, a commit the build
-  read whose streamed delta drains after the flip, is harmless for a 1-1
-  target and re-derived by the recompute horizon for an aggregate (above).
-- **A resumed target drops rows its source no longer backs.** Before the read,
-  the discharge deletes every row of a dispatched definition's target that no
-  current source row backs (#330, `intake::resume_orphans`), since the read
-  only reaches keys the source still has. A chunked rebuild isn't applied
-  until long after that delete, so a source row deleted meanwhile can
-  outlive it. #485 (decided, not yet built) closes that by running the same
-  delete at the go-live flip.
+  flips it `live`. Every go-live catch-up re-reads every table its build
+  read, even one that looks unchanged: a row inserted and deleted again
+  during the build leaves the table's row count and `xmin`s as they were,
+  although the build counted it (#468). A commit the build read whose
+  streamed delta drains after the flip needs no catch-up: it's harmless for a
+  1-1 target and re-derived by the recompute horizon for an aggregate
+  (above).
+- **A target drops rows its source no longer backs.** The read only reaches
+  keys the source still has, so a 1-1 row whose source row is gone, or an
+  aggregate group with no source rows left, needs deleting outright. Before
+  the read, the discharge runs an anti-join `DELETE` against the source
+  (`intake::resume_orphans`) on two sets of targets:
+  - each definition it dispatches, for rows whose source rows went away while
+    a resumed definition was frozen (#330);
+  - each `catching_up` definition that reads the marker's table, which
+    includes every definition this discharge flips `live` (#485). A delete
+    that drained while the definition was `backfilling` was skipped, and its
+    build may have read the row first.
+
+  Each deleted row goes through the target-mutation seam, so a chained reader
+  re-derives from it. For a 1-1 target the delete is exact. For an aggregate
+  it and the read see two snapshots, which leaves a short race (#436).
 
 ### A fresh install
 

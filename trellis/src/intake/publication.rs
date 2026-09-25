@@ -749,195 +749,6 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
     Ok(())
 }
 
-/// A fence snapshot plus the row count captured at that same instant, for a
-/// table a direct backfill is about to fold into a target (issue #79, bug B).
-/// Produced by [`capture_backfill_coverage_fence`] *before* the build reads the
-/// table and later persisted by [`write_backfill_coverage`].
-#[derive(Clone, Debug)]
-pub struct CoverageFence {
-    pub fence: String,
-    pub count: i64,
-}
-
-/// Captures the fence snapshot and row count for `qualified_table` in one
-/// statement (issue #79, bug B) — so both describe the same MVCC instant.
-///
-/// **This must be called before the direct build reads the table**, not after.
-/// The build reads each relationship's to-side table once (into a staging
-/// table) and the source in progressive per-chunk statements, each under its
-/// own autocommit snapshot — there is no single build snapshot. A row that is
-/// inserted or updated *after* the build reads it but *before* a fence captured
-/// post-build would be visible in that post-build fence yet absent from the
-/// target, so [`coverage_covers`] would wrongly skip its catch-up and drop the
-/// change (the table joins the publication later still, so CDC never carries
-/// it either). A fence captured before any build read cannot vouch for such a
-/// row: its `xmin` is invisible in the earlier fence, so `coverage_covers`
-/// falls back to enumeration — the safe default the fix demands.
-pub async fn capture_backfill_coverage_fence(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<CoverageFence, IntakeError> {
-    let (schema, table) = split_qualified(qualified_table)?;
-    let row = client
-        .query_one(
-            &format!(
-                "select count(*)::bigint, pg_current_snapshot()::text \
-                 from {}.{}",
-                quote_ident(schema),
-                quote_ident(table)
-            ),
-            &[],
-        )
-        .await?;
-    Ok(CoverageFence {
-        count: row.get(0),
-        fence: row.get(1),
-    })
-}
-
-/// Persists a coverage record: as of `fence.fence`, `qualified_table` held
-/// `fence.count` rows, all of which a direct backfill folded into an
-/// already-built target (issue #79, bug B). [`coverage_covers`] later consults
-/// this to skip a redundant catch-up enumeration.
-///
-/// A plain upsert (last write wins) is correct because the caller
-/// ([`crate::defs::catalog::install_definition`]) only ever records coverage
-/// for a table with exactly one reader, and *clears* it (see
-/// [`clear_backfill_coverage`]) the moment a second reader appears — so two
-/// live recordings for one table never coexist to be reconciled.
-pub async fn write_backfill_coverage(
-    client: &impl GenericClient,
-    qualified_table: &str,
-    fence: &CoverageFence,
-) -> Result<(), IntakeError> {
-    client
-        .execute(
-            "insert into backfill_coverage (table_name, fence_snapshot, covered_row_count) \
-             values ($1, $2::text::pg_snapshot, $3) \
-             on conflict (table_name) do update set \
-               fence_snapshot = excluded.fence_snapshot, \
-               covered_row_count = excluded.covered_row_count",
-            &[&qualified_table, &fence.fence, &fence.count],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Captures a fence for `qualified_table` and immediately persists it — the
-/// capture-and-write-at-once convenience used by tests that record coverage for
-/// a table nothing is concurrently building. Real installs
-/// ([`crate::defs::catalog::install_definition`]) must instead
-/// [`capture_backfill_coverage_fence`] *before* the build and
-/// [`write_backfill_coverage`] after it (see the former's doc comment).
-#[cfg(any(test, feature = "internals"))]
-pub async fn record_backfill_coverage(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<(), IntakeError> {
-    let fence = capture_backfill_coverage_fence(client, qualified_table).await?;
-    write_backfill_coverage(client, qualified_table, &fence).await
-}
-
-/// Drops any coverage record for `qualified_table` — called when a table gains
-/// a second reader (so the single-reader assumption [`write_backfill_coverage`]
-/// relies on no longer holds). Removing the record forces [`coverage_covers`]
-/// back to full enumeration — the safe default.
-pub async fn clear_backfill_coverage(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<(), IntakeError> {
-    client
-        .execute(
-            "delete from backfill_coverage where table_name = $1",
-            &[&qualified_table],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Whether `table`'s pre-existing rows are already fully reflected in a
-/// directly-built target and its catch-up enumeration can therefore be
-/// skipped (issue #79, bug B). Returns `false` — meaning "enumerate, the safe
-/// default" — whenever anything is uncertain.
-///
-/// # Why not a plain fence comparison
-///
-/// The obvious design — "skip if the build's fence is at least as recent as
-/// the table's publication-join fence" — cannot work, because the direct
-/// build *always* precedes the join in time: a definition is built (reading
-/// the current source + relationship tables) and only *afterward* does the
-/// periodic reconcile loop notice those tables and add them to the
-/// publication. So the build snapshot's xids are always *older* than the join
-/// fence's, and any whole-snapshot `settled_since`-style test would either
-/// never skip (useless) or always skip (unsafe) — the global xid clock
-/// advances between build and join regardless of whether *this* table saw any
-/// write, so it cannot answer the only question that matters: did **this
-/// table** change in the gap between the build and the join?
-///
-/// # What we actually check
-///
-/// The build's coverage record (`backfill_coverage`) names the exact snapshot
-/// `fence` at which the table was fully folded into a target, plus the row
-/// count at that instant. The table's contribution is unchanged since the
-/// fence — and the build therefore still fully covers it — iff **all three**
-/// hold:
-///
-/// 1. No surviving row was inserted or updated after the fence: every live
-///    row's `xmin` is visible in `fence` (`pg_visible_in_snapshot`). An insert
-///    or in-place update stamps a fresh, fence-invisible `xmin`, so this
-///    catches both.
-/// 2. The current row count equals the recorded count. This is what catches a
-///    *delete*, whose tuple simply vanishes and so leaves no invisible `xmin`
-///    behind. (Insert-then-delete churn that nets to the same count is still
-///    caught by rule 1 via the inserted row's `xmin` — unless that row was
-///    also deleted, in which case the table's contribution genuinely did not
-///    change and skipping is correct.)
-/// 3. Both the fence and the current snapshot are in xid epoch 0 (their
-///    `pg_snapshot` xmax is below 2^32). The `xmin::text::xid8` cast in rule 1
-///    reads a 32-bit tuple xid as an epoch-0 `xid8`; once the xid counter has
-///    wrapped (epoch > 0) that reconstruction is wrong, so past the first
-///    wraparound we conservatively refuse to skip rather than risk comparing
-///    across epochs. Every case short of ~2^32 lifetime transactions — all
-///    tests, and any realistic build→join window — is epoch 0.
-///
-/// A concurrent writer is a non-issue: the caller only reaches here once the
-/// marker's own fence has settled, and an as-yet-uncommitted row is simply not
-/// visible in `fence`, so it lands on the safe side (rule 1 fails → enumerate).
-async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, IntakeError> {
-    let (schema, name) = split_qualified(table)?;
-    let Some(row) = txn
-        .query_opt(
-            "select fence_snapshot::text, covered_row_count \
-             from backfill_coverage where table_name = $1",
-            &[&table],
-        )
-        .await?
-    else {
-        return Ok(false);
-    };
-    let fence: String = row.get(0);
-    let count: i64 = row.get(1);
-    let covered: bool = txn
-        .query_one(
-            &format!(
-                "select \
-                   pg_snapshot_xmax($1::text::pg_snapshot) < '4294967296'::xid8 \
-                   and pg_snapshot_xmax(pg_current_snapshot()) < '4294967296'::xid8 \
-                   and (select count(*)::bigint from {sch}.{tbl}) = $2 \
-                   and not exists ( \
-                     select 1 from {sch}.{tbl} \
-                     where not pg_visible_in_snapshot(xmin::text::xid8, $1::text::pg_snapshot) \
-                   )",
-                sch = quote_ident(schema),
-                tbl = quote_ident(name),
-            ),
-            &[&fence, &count],
-        )
-        .await?
-        .get(0);
-    Ok(covered)
-}
-
 /// Runs every pending backfill whose fence has settled: dispatches the build
 /// of every `waiting_to_backfill` definition on the marker's table, stages the
 /// table's pre-existing rows by ring enumeration where something needs them,
@@ -992,15 +803,20 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// # When the table is enumerated
 ///
 /// The enumeration stages one image-less `Recompute` row per source key, for
-/// every `live` reader of the table to re-derive. It runs when a ring-built
-/// definition needs it, or when anything other than this pass's
+/// every applying reader of the table to re-derive. It runs when a
+/// ring-built definition needs it, or when anything other than this pass's
 /// background-built definitions (chunks or a direct-build job, which read the
-/// table themselves) reads the table (a catch-up for `live` readers) — unless
-/// [`coverage_covers`] shows the table unchanged since a direct build folded
-/// it in (issue #79, bug B). A marker on a table only background-built
-/// definitions read, or nothing reads at all (issue #417: a fresh install parks a marker
-/// on every configured source table, [`create_slot_and_park_markers`]), is
-/// discharged without enumerating.
+/// table themselves) reads the table (a catch-up for applying readers). A
+/// marker on a table only background-built definitions read, or nothing
+/// reads at all (issue #417: a fresh install parks a marker on every
+/// configured source table, [`create_slot_and_park_markers`]), is discharged
+/// without enumerating.
+///
+/// A go-live catch-up always enumerates. An earlier optimization let a
+/// direct build's catch-up skip a table that looked unchanged since the
+/// build read it (same row count, no row with a newer `xmin`), but a row
+/// inserted and deleted again during the build nets out on both, although
+/// the build counted it (issue #468). So it was removed.
 ///
 /// # Waiting for intake before staging (issue #312)
 ///
@@ -1053,14 +869,19 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// `client::setup_staging`); tests with no CDC stream pass
 /// [`crate::staging::StagedWatermark::saturated`].
 ///
-/// # Dropping what the source no longer backs (issue #330)
+/// # Dropping what the source no longer backs (issues #330, #485)
 ///
 /// The enumeration and the chunks only reach keys the source still has. A
 /// definition this pass rebuilds (a resumed one, above all) can hold target
 /// rows whose source rows went away while it was frozen, and nothing would
-/// ever enumerate them. So, first thing in the transaction,
-/// `resume_orphans::delete_orphaned_target_rows` deletes every row of each
-/// dispatched definition's target that no source row backs, reporting each
+/// ever enumerate them. A definition whose go-live catch-up this is can hold
+/// the same kind of row: a delete that drained while it was `backfilling`
+/// was skipped, and its build may have read the row first (issue #485). So,
+/// first thing in the transaction,
+/// `resume_orphans::delete_orphaned_target_rows` deletes every row that no
+/// source row backs from the target of each dispatched definition and of
+/// each `catching_up` definition that reads the table (a superset of the
+/// ones [`go_live_caught_up`] flips `live` at the end), reporting each
 /// through the target-mutation seam. It runs before `DECLARE`, and never
 /// after the intake wait, which would leave an aggregate group repopulated
 /// during the wait at its stale pre-pause value. The maintenance loop that
@@ -1380,16 +1201,35 @@ async fn discharge_marker(
         .collect();
 
     let txn = client.transaction().await?;
-    // Issue #330: before the enumeration's `DECLARE` and its intake wait; see
-    // "Dropping what the source no longer backs" above. On the rollback
-    // below (including the `Deferred` and error paths, since both drop
-    // `txn` without committing), the deletes roll back with everything else.
-    super::resume_orphans::delete_orphaned_target_rows(&txn, &marker.table, &waiting).await?;
-    // A ring-built definition has never read the table, so coverage can't
-    // stand in for its enumeration.
+    // Issues #330, #485: before the enumeration's `DECLARE` and its intake
+    // wait; see "Dropping what the source no longer backs" above. On the
+    // rollback below (including the `Deferred` and error paths, since both
+    // drop `txn` without committing), the deletes roll back with everything
+    // else.
+    super::resume_orphans::delete_orphaned_target_rows(
+        &txn,
+        &waiting,
+        TransformStatus::WaitingToBackfill,
+    )
+    .await?;
+    // Every definition `go_live_caught_up` flips below is among these: one
+    // that is `catching_up` by then but not now got there through
+    // `park_catch_up`, which parked a marker this pass doesn't delete on a
+    // table it reads (a new generation, if on this one), so it doesn't flip.
+    let catching_up_now: Vec<i64> =
+        crate::defs::catalog::catching_up_readers_unlocked(&txn, &marker.table)
+            .await?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+    super::resume_orphans::delete_orphaned_target_rows(
+        &txn,
+        &catching_up_now,
+        TransformStatus::CatchingUp,
+    )
+    .await?;
     let enumerate = !ring.is_empty()
-        || (crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?
-            && !coverage_covers(&txn, &marker.table).await?);
+        || crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?;
     if enumerate {
         declare_enumeration(&txn, &marker.table).await?;
         let horizon: PgLsn = txn
@@ -1584,8 +1424,9 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
 /// caller deleted `table`'s marker, with the tables it reads) to
 /// [`TransformStatus::Live`] once no go-live catch-up is left pending for it
 /// (issue #476): the discharge of `table`'s marker is then the last of its
-/// catch-ups, and this is the transaction that re-read `table` (or found
-/// that coverage lets it skip the re-read). Returns the ids it flipped.
+/// catch-ups, and this is the transaction that re-read `table` and deleted
+/// the candidates' orphaned target rows (issue #485, [`discharge_marker`]).
+/// Returns the ids it flipped.
 ///
 /// "Reads" is every table the definition's build reads: its source and each
 /// relationship to-side it references (`defs::catalog::tables_read_by`, the
@@ -1597,8 +1438,11 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
 /// change committed after a catch-up's read reaches it through apply, and
 /// every change before it is re-derived by the read's `Recompute` rows,
 /// which carry no `origin_lsn` and so gate any token taken after this flip.
-/// A catch-up that coverage lets skip its read vouches that nothing changed
-/// on the table since the build read it.
+/// The re-read only reaches keys the source still has, so a row the build
+/// wrote whose source row is gone (its delete drained while the definition
+/// was `backfilling`) is repaired by the orphan sweep earlier in the same
+/// transaction instead (issue #485). For an aggregate that sweep and the
+/// re-read read different snapshots, which leaves issue #436's short race.
 ///
 /// **Locks.** The candidates are locked before the caller deletes its
 /// marker, and whether a marker is still pending is read here, in a later
@@ -1607,8 +1451,6 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
 /// or waits for this commit (and then moves the definition back to
 /// `catching_up`).
 ///
-/// Issue #485 extends this: the definitions it flips are exactly the ones
-/// whose orphaned target rows the flip must also delete.
 async fn go_live_caught_up(
     txn: &Transaction<'_>,
     table: &str,
@@ -4161,46 +4003,6 @@ mod dispatch_tests {
             "the source is not enumerated into the ring"
         );
         assert!(markers(&client).await.is_empty());
-    }
-
-    /// A ring-built definition has never read its table, so a coverage
-    /// record an earlier direct build left behind can't stand in for its
-    /// enumeration: the discharge enumerates even though the coverage vouches
-    /// that the table hasn't changed since. Skipping it would flip the
-    /// definition `live` over an empty target.
-    #[tokio::test]
-    async fn a_ring_built_definition_is_enumerated_even_where_coverage_covers_the_table() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut client = connect(&db).await;
-        seed(&client).await;
-        define(
-            &client,
-            "public.orders",
-            "public.rollup",
-            "TRANSFORM rollup FROM orders GROUP BY g SELECT sum(a) AS total",
-            "live",
-        )
-        .await;
-        record_backfill_coverage(&client, "public.orders")
-            .await
-            .expect("record the live aggregate's coverage");
-        let id = define(
-            &client,
-            "public.orders",
-            "public.d",
-            "TRANSFORM d FROM orders SELECT b + 1 AS a, a + 1 AS b",
-            "waiting_to_backfill",
-        )
-        .await;
-        reconcile(&mut client, &["public.orders"]).await;
-
-        discharge(&mut client).await;
-        assert_eq!(status(&client, id).await, "live");
-        assert!(
-            staged(&client).await,
-            "the ring-built definition's enumeration isn't skipped for coverage"
-        );
     }
 
     /// Issue #444, closed by construction: a ring-built definition's flip to

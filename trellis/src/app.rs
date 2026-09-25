@@ -9,7 +9,7 @@
 //! callers never have to stitch those together themselves — and, critically,
 //! never accidentally pick the wrong path: definition registration always
 //! goes through [`defs::install_definition`], the fast direct-build entry
-//! point that also records backfill coverage, rather than the lower-level
+//! point, rather than the lower-level
 //! `create_definition`/`create_target_table` primitives it's built from.
 //!
 //! The individual `defs::*`/`intake::*`/`staging::*` items remain public for

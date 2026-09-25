@@ -610,15 +610,6 @@ async fn discard_resumed_chunks(
             definitions.insert(row.get::<_, i64>(2));
         }
     }
-    // The discarded chunk's write may have landed after the rebuild recorded
-    // its coverage (a direct-build job's, issue #419), and that record vouches
-    // only for the rebuild's own write: left in place, it would let the
-    // catch-up skip exactly the re-read that repairs this one.
-    for source in &sources {
-        crate::intake::publication::clear_backfill_coverage(txn, source)
-            .await
-            .map_err(CatalogError::from)?;
-    }
     // Issue #476: a rebuild that already went `live` is missing the repair
     // until the marker discharges, so it reports `catching_up` until then.
     let sources: Vec<String> = sources.into_iter().collect();
@@ -693,34 +684,24 @@ pub async fn run_claimed_chunk(
             .await?;
         }
         ChunkWork::DirectBuild => {
-            run_direct_build(pool, &definition, target_schema, chunk, claimed_by).await?;
+            run_direct_build(pool, &definition, target_schema).await?;
         }
     }
     Ok(())
 }
 
 /// Runs a [`ChunkWork::DirectBuild`] job: the whole direct set-based build
-/// of `definition` (ADR-0007, [`backfill::backfill_definition`]), bracketed
-/// by the coverage bookkeeping (issue #79, bug B) that lets its go-live
-/// catch-up skip re-reading a table that hasn't changed since the build read
-/// it (ADR-0016, "Which consistency bookkeeping stays").
+/// of `definition` (ADR-0007, [`backfill::backfill_definition`]). An
+/// aggregate's target then gets its extinct horizon raised (see
+/// [`raise_extinct_horizon_after_build`]).
 ///
-/// The coverage plan is captured before the build reads anything, and
-/// committed after it only while this worker still holds a current claim on
-/// the job (a claim reclaimed out from under it, or held across a resume,
-/// commits nothing: whoever builds the definition next records its own). An
-/// aggregate's target also gets its extinct horizon raised in that
-/// transaction (see [`raise_extinct_horizon_after_build`]).
-///
-/// Flipping `live` is [`finish_chunk`]'s job, as for every chunk.
+/// Moving the definition on to `catching_up` is [`finish_chunk`]'s job, as
+/// for every chunk.
 async fn run_direct_build(
     pool: &Pool,
     definition: &super::model::Definition,
     target_schema: &str,
-    chunk: &ClaimedChunk,
-    claimed_by: &str,
 ) -> Result<(), ChunkQueueError> {
-    let coverage = catalog::plan_direct_backfill_coverage(pool, definition).await?;
     backfill::backfill_definition(
         pool,
         &definition.def,
@@ -730,30 +711,13 @@ async fn run_direct_build(
     )
     .await?;
 
-    let mut client = pool.get().await?;
-    let txn = client.transaction().await?;
-    let current = txn
-        .query_opt(
-            &format!(
-                "select 1 from backfill_chunks bc \
-                 join transform_definitions d on d.id = bc.definition_id \
-                 where bc.id = $1 and bc.claimed_by = $2 and not bc.done and not ({STALE}) \
-                 for share of bc, d"
-            ),
-            &[&chunk.id, &claimed_by],
-        )
-        .await?
-        .is_some();
-    if current {
-        catalog::commit_direct_backfill_coverage(&txn, &coverage).await?;
-    }
     if matches!(
         definition.def.key_space,
         super::ast::KeySpace::Aggregate { .. }
     ) {
-        raise_extinct_horizon_after_build(&txn, &definition.target_table).await?;
+        let client = pool.get().await?;
+        raise_extinct_horizon_after_build(&**client, &definition.target_table).await?;
     }
-    txn.commit().await?;
     Ok(())
 }
 
@@ -767,17 +731,18 @@ async fn run_direct_build(
 /// Raising a horizon is always safe: the worst it does is send a delta to
 /// the re-deriving path.
 async fn raise_extinct_horizon_after_build(
-    txn: &tokio_postgres::Transaction<'_>,
+    client: &impl GenericClient,
     target_table: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    txn.execute(
-        "insert into aggregate_extinct_horizon (target_table, lsn) \
+    client
+        .execute(
+            "insert into aggregate_extinct_horizon (target_table, lsn) \
          values ($1, pg_current_wal_insert_lsn()) \
          on conflict (target_table) do update \
          set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
-        &[&target_table],
-    )
-    .await?;
+            &[&target_table],
+        )
+        .await?;
     Ok(())
 }
 

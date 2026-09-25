@@ -1,20 +1,29 @@
-//! Issue #330: the target rows a rebuilt definition must drop because its
+//! Issues #330 and #485: the target rows a definition must drop because its
 //! source no longer has them.
 //!
-//! A resumed definition (ADR-0014) rebuilds from a backfill marker's
-//! discharge ([`super::publication::run_pending_backfills`]), which enumerates
-//! the source's *current* keys as image-less `Recompute`s. That re-derives
-//! every target row the source still backs, but it can never reach a row the
-//! source stopped backing while the definition was frozen: a 1-1 row whose
-//! source row was deleted, or an aggregate group every one of whose source
-//! rows went away (or, for a relationship-path `GROUP BY` key, moved to
-//! another group when the to-side row changed). Nothing enumerates a key that
-//! isn't there, and an aggregate's image-less `Recompute` for a vanished key
-//! can't even say which group it left (`staging::apply_aggregate`'s module
-//! doc, "Image-less changes").
+//! A backfill marker's discharge ([`super::publication::run_pending_backfills`])
+//! re-reads a table by enumerating its *current* keys as image-less
+//! `Recompute`s, and a chunked or direct build copies the rows it reads.
+//! Neither can reach a target row the source stopped backing while the
+//! definition wasn't applying:
+//!
+//! - **A resumed definition (ADR-0014, #330)**: rows whose source rows went
+//!   away while it was frozen.
+//! - **A build's go-live catch-up (#485)**: a definition that is
+//!   `backfilling` skips the CDC for its source, so a delete that drains
+//!   meanwhile never reaches its target, and the build may have read the row
+//!   before it was deleted.
+//!
+//! Either way it is a 1-1 row whose source row was deleted, or an aggregate
+//! group every one of whose source rows went away (or, for a
+//! relationship-path `GROUP BY` key, moved to another group when the to-side
+//! row changed). Nothing enumerates a key that isn't there, and an
+//! aggregate's image-less `Recompute` for a vanished key can't even say which
+//! group it left (`staging::apply_aggregate`'s module doc, "Image-less
+//! changes").
 //!
 //! So the discharge also deletes those rows directly, one anti-join `DELETE`
-//! per rebuilt target: every target row with no source row that maps to its
+//! per swept target: every target row with no source row that maps to its
 //! key. It is a target write like any other, so it goes through the
 //! target-mutation seam (`staging::target_mutations`, issue #315): each
 //! deleted key is recorded with its prior image and flushed as a downstream
@@ -74,34 +83,51 @@
 //! the gap and refill before the drain. Reading both on one snapshot would
 //! close it.
 //!
-//! A wider window remains that has nothing to do with this module, and it
-//! also hits a fresh deferred definition's discharge. Take an aggregate
-//! group whose every row in the cursor's snapshot is deleted after `DECLARE`
-//! (during the intake wait, say) and which is refilled before the drain. It
-//! never gets a forced recompute: each enumerated key's `Recompute` either
-//! finds its row gone and is dropped, or folds with that row's CDC delete
-//! into a plain delta. So the group ends up as its target value (stale, or
-//! absent) plus the CDC deltas, not as its live contents.
+//! A wider window used to remain here, unrelated to this module's ordering
+//! choice, and it also hit a fresh deferred definition's discharge: take an
+//! aggregate group whose every row in the cursor's snapshot is deleted after
+//! `DECLARE` (during the intake wait, say) and which is refilled before the
+//! drain. Each enumerated key's `Recompute` either found its row gone and
+//! was dropped, or folded with that row's CDC delete into a plain delta, so
+//! the group ended up as its target value (stale, or absent) plus the CDC
+//! deltas, never a forced recompute of its live contents. Issue #392 (#493)
+//! closed it: the fold now carries `has_recompute` through every merge, and
+//! `accumulate_changes` forces every group such a record names onto the
+//! full-recompute path, exactly as it already did for an image-less change —
+//! so an enumerated `Recompute`'s intent survives whatever it folds with.
 //!
-//! # Only the definitions this marker rebuilds
+//! # Which definitions are swept
 //!
-//! The caller passes exactly the `waiting_to_backfill` definitions the
-//! discharge is dispatching (a resumed definition, or a new one whose target
-//! is still empty). A `live` sibling on the same source is not rebuilt, and
-//! its target is none of this pass's business.
+//! The discharge sweeps two sets, each scoped to the status the discharge
+//! read it in (a pause since then leaves the target as the pause found it):
 //!
-//! ## A chunked rebuild (issue #418)
+//! - **The `waiting_to_backfill` definitions it dispatches** (a resumed
+//!   definition, or a new one whose target is still empty). A `live` sibling
+//!   on the same source is not rebuilt, and its target is none of this
+//!   pass's business.
+//! - **Every `catching_up` definition that reads the marker's table**
+//!   (#485): a superset of the ones this discharge flips `live`
+//!   (`go_live_caught_up`). A definition that reads several tables is swept
+//!   at each of its catch-ups; only the last one flips it.
 //!
-//! Everything above assumes the ring rebuild, which goes `live` in the
-//! discharge's own transaction. A plain 1-1 definition is rebuilt by
-//! `backfill_chunks` instead (ADR-0016's dispatch by shape), which drain
-//! threads run after this pass commits, and it stays `backfilling`, so its
-//! CDC is skipped, until the last chunk finishes. A source row deleted after
-//! this anti-join ran is then not removed by anything: its chunk either
-//! copied it before the delete or never saw it, its CDC delete is skipped,
-//! and the go-live catch-up only enumerates keys that still exist. A fresh
-//! chunked build has the same window for a row deleted after its chunk
-//! copied it. Issue #436 closes the race on the new path.
+//! ## The go-live sweep (issue #485)
+//!
+//! Everything above is written for the ring rebuild, which goes `live` in
+//! the discharge's own transaction. A chunked or direct build runs on drain
+//! threads after the dispatching pass commits, and its definition stays
+//! `backfilling`, so its CDC is skipped, until the build finishes. It then
+//! moves to `catching_up` (it applies from then on) and parks its go-live
+//! catch-ups (#476). A source row deleted while it was `backfilling` is
+//! removed by nothing else: its chunk either copied it before the delete or
+//! never saw it, its CDC delete was skipped, and the catch-up's re-read only
+//! enumerates keys that still exist. So the sweep runs again at the
+//! discharge of each go-live catch-up, before its `DECLARE`, as above.
+//!
+//! The ordering argument carries over. Changes committed after the sweep
+//! drain after it, since this pass is the only sealer, and the definition
+//! applies them because it is already `catching_up`. For a 1-1 target the
+//! sweep is exact. For an aggregate the two-snapshot race described above
+//! remains (#436).
 //!
 //! # Keeping the anti-join hashable
 //!
@@ -152,33 +178,38 @@ struct Match {
     joins: String,
 }
 
-/// Deletes, from each target of `ids` that is still `waiting_to_backfill`,
-/// every row no row of `source_table` backs any more, and reports each
-/// deleted key through the target-mutation seam in `txn`. See the module doc
-/// for why this must run before the discharge's enumeration is declared.
+/// Deletes, from the target of each of `ids` that is still in `status`,
+/// every row no row of its source backs any more, and reports each deleted
+/// key through the target-mutation seam in `txn`. Returns how many rows it
+/// deleted in all. See the module doc for why this must run before the
+/// discharge's enumeration is declared.
+///
+/// `status` is the status the caller read `ids` in: `waiting_to_backfill`
+/// for the definitions a discharge dispatches, `catching_up` for the ones
+/// its catch-up may flip `live`. A pause that landed since (#331) leaves the
+/// target as the pause found it, and its own resume comes back here.
 pub(super) async fn delete_orphaned_target_rows(
     txn: &Transaction<'_>,
-    source_table: &str,
     ids: &[i64],
-) -> Result<(), IntakeError> {
+    status: TransformStatus,
+) -> Result<usize, IntakeError> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    // Still `waiting_to_backfill`: a pause that landed since the discharge
-    // read these (#331) leaves the target as the pause found it, and its own
-    // resume comes back here.
     let defs = txn
         .query(
-            "select definition_text, target_table from transform_definitions \
+            "select definition_text, target_table, source_table from transform_definitions \
              where id = any($1) and status = $2 order by id",
-            &[&ids, &TransformStatus::WaitingToBackfill.as_str()],
+            &[&ids, &status.as_str()],
         )
         .await?;
-    let source_ident = ddl::qualified_source_table(source_table);
     let mut mutations = TargetMutations::new();
+    let mut total = 0;
     for row in defs {
         let text: String = row.get(0);
         let target: String = row.get(1);
+        let source_table: String = row.get(2);
+        let source_ident = ddl::qualified_source_table(&source_table);
         let def =
             parse(&text).unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
         // Quoted: `identity_key_columns` resolves its argument with
@@ -194,7 +225,7 @@ pub(super) async fn delete_orphaned_target_rows(
         let matching = match &def.key_space {
             KeySpace::OneToOne => one_to_one_match(&key_cols),
             KeySpace::Aggregate { group_by } => {
-                aggregate_match(txn, source_table, &target, group_by, &key_cols).await?
+                aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?
             }
         };
         let deleted = delete_unbacked_rows(
@@ -210,12 +241,13 @@ pub(super) async fn delete_orphaned_target_rows(
             tracing::info!(
                 target = %target,
                 deleted,
-                "rebuild dropped target rows the source no longer backs"
+                "dropped target rows the source no longer backs"
             );
         }
+        total += deleted;
     }
     mutations.flush(txn).await?;
-    Ok(())
+    Ok(total)
 }
 
 /// A 1-1 target's key is the source's own key, column for column, by name
@@ -426,6 +458,154 @@ fn orphan_delete_sql(
         matching.joins,
         matches.join(" and "),
     )
+}
+
+#[cfg(test)]
+mod db_tests {
+    //! The sweep against a real catalog and real targets: issue #485 runs it
+    //! at every build's go-live, so a target with nothing to delete must
+    //! cost one hashed anti-join per target, not a probe of the source per
+    //! target row.
+
+    use super::*;
+    use crate::defs::ValueType;
+    use crate::pool::Pool;
+    use std::collections::HashMap;
+    use tokio_postgres::NoTls;
+
+    /// A same-crate pool plus a raw connection onto `db`.
+    async fn connect(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path");
+        (pool, raw)
+    }
+
+    /// The anti-join `DELETE` the sweep runs for `id`'s target, for the
+    /// pattern with no `NULL` key column.
+    async fn orphan_delete_for(txn: &Transaction<'_>, id: i64) -> String {
+        let row = txn
+            .query_one(
+                "select definition_text, target_table, source_table \
+                 from transform_definitions where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read the definition");
+        let def = parse(row.get::<_, &str>(0)).expect("parse");
+        let target: String = row.get(1);
+        let source: String = row.get(2);
+        let key_cols = ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(&target))
+            .await
+            .expect("read the target's key");
+        let matching = match &def.key_space {
+            KeySpace::OneToOne => one_to_one_match(&key_cols),
+            KeySpace::Aggregate { group_by } => {
+                aggregate_match(txn, &source, &target, group_by, &key_cols)
+                    .await
+                    .expect("match the grouping columns")
+            }
+        };
+        let nullable: Vec<usize> = (0..matching.parts.len())
+            .filter(|&i| matching.parts[i].nullable)
+            .collect();
+        orphan_delete_sql(
+            &ddl::qualified_target_table_ident(&target),
+            &ddl::qualified_source_table(&source),
+            &matching,
+            &nullable,
+            0,
+            "1",
+        )
+    }
+
+    /// A `catching_up` 1-1 and aggregate over a 20k-row source, with no
+    /// orphans: the sweep deletes nothing, and each target's `DELETE` plans
+    /// as a set-based anti-join (hash or merge), never a nested loop that
+    /// probes the source once per target row. A planted orphan shows the
+    /// sweep isn't vacuous.
+    #[tokio::test]
+    async fn a_sweep_with_no_orphans_deletes_nothing_through_an_anti_join() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             alter table public.orders replica identity full; \
+             insert into public.orders \
+               select n, 'g' || (n % 100), n from generate_series(1, 20000) n",
+        )
+        .await
+        .expect("seed orders");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        for text in [
+            "TRANSFORM orders_copy FROM orders SELECT a AS a",
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+        ] {
+            crate::defs::catalog::install_definition(&pool, text, &columns, "public")
+                .await
+                .expect("register");
+        }
+        crate::intake::publication::settle_builds(&pool).await;
+        raw.batch_execute("analyze public.orders, public.orders_copy, public.orders_by_g")
+            .await
+            .expect("analyze");
+        let ids: Vec<i64> = raw
+            .query(
+                "select id from transform_definitions where status = 'catching_up' order by id",
+                &[],
+            )
+            .await
+            .expect("read the built definitions")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(ids.len(), 2, "both builds finished");
+
+        let txn = raw.transaction().await.expect("begin");
+        for &id in &ids {
+            let sql = orphan_delete_for(&txn, id).await;
+            let plan: Vec<String> = txn
+                .query(&format!("explain {sql}"), &[])
+                .await
+                .expect("explain the sweep")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let plan = plan.join("\n");
+            assert!(
+                plan.contains("Anti Join") && !plan.contains("Nested Loop"),
+                "the sweep must plan as a set-based anti-join:\n{plan}"
+            );
+        }
+        let deleted = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("sweep");
+        assert_eq!(deleted, 0, "nothing to delete");
+
+        txn.batch_execute("insert into public.orders_copy (id, a) values (-1, 0)")
+            .await
+            .expect("plant an orphan");
+        let deleted = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("sweep");
+        assert_eq!(deleted, 1, "the planted orphan is the only row deleted");
+    }
 }
 
 #[cfg(test)]

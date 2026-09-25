@@ -19,10 +19,8 @@
 //! Issue #442 is the reverse case: a change the build read whose delta drains
 //! only after the build finishes, on top of the build's own count of it. For an
 //! aggregate the recompute horizon the build stamps on each group row sends
-//! that delta to re-derive its group. The build still records its coverage,
-//! which may let the go-live catch-up skip the source, so those tests check
-//! the target before the catch-up runs: the horizon alone must keep it
-//! right, however the late delta arrives (still in the ring, staged late by
+//! that delta to re-derive its group. Those tests check the target before
+//! the go-live catch-up runs: the horizon alone must keep it right, however the late delta arrives (still in the ring, staged late by
 //! a lagging intake, or released from quarantine), and whether it is on the
 //! source or on a relationship's to-side table.
 
@@ -305,10 +303,7 @@ async fn seed_sales(client: &Client) {
 
 /// Registers `sku_totals` over `public.sales` and runs its direct build to
 /// completion, as the discharge and a drain thread would (ADR-0016, #419),
-/// leaving it `catching_up` with its go-live catch-up parked (#476). Checks
-/// the build recorded its coverage of the source: the go-live catch-up may
-/// then skip re-deriving it, so whatever keeps the target right afterwards
-/// is not that catch-up.
+/// leaving it `catching_up` with its go-live catch-up parked (#476).
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(
         pool,
@@ -329,19 +324,6 @@ async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     );
     publication::settle_builds(pool).await;
     assert_eq!(status_of(client, "public.sku_totals").await, "catching_up");
-
-    let covered: bool = client
-        .query_one(
-            "select exists (select 1 from backfill_coverage where table_name = 'public.sales')",
-            &[],
-        )
-        .await
-        .expect("read backfill_coverage")
-        .get(0);
-    assert!(
-        covered,
-        "the build is the source's sole reader, so it records its coverage"
-    );
 }
 
 async fn total_of_sku_a(client: &Client) -> String {
@@ -466,8 +448,8 @@ async fn aggregate_build_does_not_double_count_a_parked_pre_fence_change_release
 /// reads the relationship's to-side table too, and a to-side change the
 /// build read can drain after go-live just the same. Moving customer 3 from
 /// `apac` to `us` before the build, with its CDC still undrained, must leave
-/// `us` at `7`, not add order 4's `4` a second time. The build records
-/// coverage for `customers` as well, so the catch-up can't be what fixes it.
+/// `us` at `7`, not add order 4's `4` a second time, before the catch-up
+/// runs.
 #[tokio::test]
 async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_after_go_live() {
     let cluster = TestCluster::start();
@@ -536,19 +518,6 @@ async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_aft
         status_of(&client, "public.region_totals").await,
         "catching_up"
     );
-    let covered: bool = client
-        .query_one(
-            "select exists (select 1 from backfill_coverage where table_name = 'public.customers')",
-            &[],
-        )
-        .await
-        .expect("read backfill_coverage")
-        .get(0);
-    assert!(
-        covered,
-        "the build records its coverage of the to-side table"
-    );
-
     let expected = vec!["eu=3".to_string(), "us=7".to_string()];
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
@@ -826,11 +795,9 @@ async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
 /// A direct-build job a worker still holds when its definition is paused and
 /// resumed again keeps running: the pause only withholds new claims. Its
 /// worker can write the target from its old read after the resume's rebuild
-/// has already gone live and recorded its coverage, and the source may not
-/// change after that at all. Discarding the stale job parks a catch-up on the
-/// source (#331) that must re-derive the target anyway, not skip the source
-/// as covered by the rebuild: the rebuild's coverage vouches for its own
-/// write, not for one that landed on top of it.
+/// has already gone live, and the source may not change after that at all.
+/// Discarding the stale job parks a catch-up on the source (#331) that must
+/// re-derive the target anyway.
 #[tokio::test]
 async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
     let cluster = TestCluster::start();
@@ -929,7 +896,7 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
         .expect("change the source");
 
     // Paused and resumed again, the held job is superseded, and the second
-    // rebuild runs past the hold, goes live and records its coverage.
+    // rebuild runs past the hold and goes live.
     pause_and_resume().await;
     client
         .batch_execute("delete from public.hold_armed")

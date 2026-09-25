@@ -13,6 +13,9 @@
 //! #476 the build's completion flipped the definition `live` and only parked
 //! that catch-up, so the reads below saw the target without the change.
 //!
+//! Issue #485 adds the deletes: a row or group whose source rows were
+//! deleted while the build ran, which the catch-up's re-read can't reach.
+//!
 //! The waits are on the contract's own signals (status, then the token). Each
 //! test holds its build at a fixed point with an advisory lock, so the
 //! interleaving that matters is set up, not raced.
@@ -329,6 +332,142 @@ async fn a_ring_build_on_another_definitions_target_is_live_only_once_caught_up(
             ("b".to_string(), "2".to_string())
         ],
         "live, and caught up to a token taken after the upstream change"
+    );
+    engine.shutdown().await.expect("shut down");
+}
+
+/// Issue #485, aggregate: the build reads a group's only row, the row is
+/// deleted and its delete drains while the build is held before its write,
+/// so apply skips it and the build then writes the group. The go-live
+/// re-read has no key in that group left to re-derive it from; the orphan
+/// sweep that runs with the flip removes it. At `live` it is gone.
+#[tokio::test]
+async fn an_aggregate_group_emptied_during_its_build_is_gone_at_live() {
+    const HOLD: i64 = 4851;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_sales(&raw).await;
+    raw.execute("insert into public.sales values (4, 'z', 1000)", &[])
+        .await
+        .expect("seed a group of one row");
+    hold_direct_builds(&raw, HOLD).await;
+    raw.execute("select pg_advisory_lock($1)", &[&HOLD])
+        .await
+        .expect("take the hold");
+
+    define_only(db.dsn())
+        .await
+        .apply("TRANSFORM sku_totals FROM sales GROUP BY sku SELECT sum(amount) AS total")
+        .await
+        .expect("register the aggregate");
+    let engine = running(db.dsn()).await;
+    wait_until_held(&raw, HOLD).await;
+
+    raw.execute("delete from public.sales where id = 4", &[])
+        .await
+        .expect("delete the group's only row while the build is held");
+    converge(&engine).await;
+    assert_eq!(
+        status(&engine, "sku_totals").await,
+        TransformStatus::Backfilling,
+        "the delete drained while the definition was still building, so apply skipped it"
+    );
+
+    raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
+        .await
+        .expect("release the build");
+    wait_for_live(&engine, "sku_totals").await;
+    converge(&engine).await;
+
+    let totals: Vec<(String, String)> = raw
+        .query("select sku, total::text from sku_totals order by sku", &[])
+        .await
+        .expect("read sku_totals")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        totals,
+        vec![
+            ("a".to_string(), "12".to_string()),
+            ("b".to_string(), "2".to_string())
+        ],
+        "live, and the group the build wrote from a deleted row is gone"
+    );
+    engine.shutdown().await.expect("shut down");
+}
+
+/// Issue #485, chunked 1-1: a row the chunk read is deleted and its delete
+/// drains while the chunk is held before its write, so apply skips it and
+/// the chunk then writes the row. The go-live re-read only visits keys the
+/// source still has; the orphan sweep that runs with the flip removes the
+/// row. At `live` it is gone.
+#[tokio::test]
+async fn a_chunked_row_deleted_during_its_build_is_gone_at_live() {
+    const HOLD: i64 = 4852;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a integer); \
+         alter table public.orders replica identity full; \
+         insert into public.orders values (1, 1), (2, 2), (3, 3)",
+    )
+    .await
+    .expect("create and seed orders");
+
+    define_only(db.dsn())
+        .await
+        .apply("TRANSFORM order_view FROM orders SELECT a AS a")
+        .await
+        .expect("register the 1-1 transform");
+    raw.batch_execute(&format!(
+        "create function hold_chunk() returns trigger language plpgsql as $$ \
+         begin \
+           perform pg_advisory_lock({HOLD}); \
+           perform pg_advisory_unlock({HOLD}); \
+           return new; \
+         end $$; \
+         create trigger hold_chunk before insert on order_view \
+           for each row execute function hold_chunk()"
+    ))
+    .await
+    .expect("install the chunk hold");
+    raw.execute("select pg_advisory_lock($1)", &[&HOLD])
+        .await
+        .expect("take the hold");
+
+    let engine = running(db.dsn()).await;
+    wait_until_held(&raw, HOLD).await;
+
+    raw.execute("delete from public.orders where id = 2", &[])
+        .await
+        .expect("delete a row the chunk already read");
+    converge(&engine).await;
+    assert_eq!(
+        status(&engine, "order_view").await,
+        TransformStatus::Backfilling,
+        "the delete drained while the definition was still building, so apply skipped it"
+    );
+
+    raw.execute("select pg_advisory_unlock($1)", &[&HOLD])
+        .await
+        .expect("release the chunk");
+    wait_for_live(&engine, "order_view").await;
+    converge(&engine).await;
+
+    let rows: Vec<(i32, i32)> = raw
+        .query("select id, a from order_view order by id", &[])
+        .await
+        .expect("read order_view")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, 1), (3, 3)],
+        "live, and the row the chunk copied from a deleted source row is gone"
     );
     engine.shutdown().await.expect("shut down");
 }

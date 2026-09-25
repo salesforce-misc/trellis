@@ -46,7 +46,6 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::staging::{has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -78,7 +77,7 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_without_panicking() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let client = connect_raw(db.dsn()).await;
 
     client
         .batch_execute(
@@ -140,14 +139,28 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
 
     // Only the builds: their go-live catch-ups (#476) re-stage the chained
     // source into the ring by design, and this checks the build itself.
+    // (`settle_builds` does discharge `stock_totals`' catch-up on
+    // `inventory`, which re-reads `inventory` into the ring, #468/#485.)
     trellis::intake::publication::settle_builds(&db.pool).await;
 
-    retire_drained_segments(&mut client)
+    let ring_slot: i16 = client
+        .query_one("select ring_slot from segment_pointer", &[])
         .await
-        .expect("retire drained segments");
-    assert!(
-        !has_pending(&client).await.expect("has_pending"),
-        "nothing should be left pending after backfill"
+        .expect("read the segment pointer")
+        .get(0);
+    let staged: i64 = client
+        .query_one(
+            &format!(
+                "select count(*) from seg_{ring_slot} where src_table = 'public.stock_totals'"
+            ),
+            &[],
+        )
+        .await
+        .expect("count rows staged for the chained source")
+        .get(0);
+    assert_eq!(
+        staged, 0,
+        "the chunked build of the chained transform stages nothing"
     );
 
     let echo_rows: HashMap<(String, String), Option<String>> = client

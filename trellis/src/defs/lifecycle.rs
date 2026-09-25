@@ -336,16 +336,11 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     ))
     .await?;
 
-    // Both of these key a *qualified table name* to pending intake work, and
-    // an enumeration marker naming a table that no longer exists would fail
+    // This keys a *qualified table name* to pending intake work, and an
+    // enumeration marker naming a table that no longer exists would fail
     // the next `run_pending_backfills` discharge with a live `42P01`.
     txn.execute(
         "delete from pending_backfill where table_name = $1",
-        &[&qualified],
-    )
-    .await?;
-    txn.execute(
-        "delete from backfill_coverage where table_name = $1",
         &[&qualified],
     )
     .await?;

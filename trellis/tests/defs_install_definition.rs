@@ -827,8 +827,10 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     .await
     .expect("install_definition builds the aggregate alias chain directly");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     // The direct build populates the target synchronously and stages nothing
     // in the ring — the fast-path signature (see the sibling fast-path tests).
@@ -904,8 +906,10 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     .await
     .expect("install_definition builds a bare alias of a SUM field declared before it");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String)> = client
         .query(
@@ -973,8 +977,10 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     .await
     .expect("install_definition shares one count column across several SUM aliases");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     // (order_id, total, grand_total, super_total)
     type Row = (String, Option<String>, Option<String>, Option<String>);
@@ -1243,8 +1249,10 @@ async fn install_definition_fast_path_builds_a_relationship_cross_field_alias_ch
     .await
     .expect("install_definition builds the relationship alias chain directly");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     // Direct build: target populated synchronously, nothing staged in the ring.
     let mut rows: Vec<(String, String, String, String)> = client
@@ -1330,8 +1338,10 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
     .await
     .expect("install_definition builds a coalesce-wrapped aggregate directly");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String)> = client
         .query(
@@ -1418,8 +1428,10 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
     .await
     .expect("install_definition builds the nested coalesce alias chain directly");
     // ADR-0016 (#419): the direct build runs as a background job the
-    // discharge dispatches; run it before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // discharge dispatches; run it before reading the target. Only the
+    // build: its go-live catch-up re-reads the source into the ring by
+    // design (#468, #485).
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     let mut rows: Vec<(String, String, String, String)> = client
         .query(
