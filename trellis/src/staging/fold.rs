@@ -351,14 +351,17 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
     //
     // Issue #492: the anti-join reads `truncates`, a `materialized` CTE of
     // just the batch's truncate rows (almost always none, at most a few),
-    // rather than `fenced` itself. Against `fenced` directly, a ring slot
-    // whose statistics were taken while it was small led the planner to a
-    // nested-loop anti-join that rescanned all of `fenced` for every row,
-    // making the fold quadratic in batch size (4.6s at 10k rows, 19s at
-    // 20k). `materialized` is load-bearing: `truncates` is referenced once,
-    // so without it Postgres inlines it back into that same rescan of
-    // `fenced`. Whatever join it picks now, its inner side is the handful
-    // of truncate rows.
+    // rather than `fenced` itself. Against `fenced` directly, the planner
+    // picked a nested-loop anti-join that rescanned all of `fenced` for
+    // every row whenever it expected almost no truncate rows, making the
+    // fold quadratic in batch size (4.6s at 10k rows, 19s at 20k). It
+    // expects that once any whole-table `analyze` has sampled `op` (a
+    // truncate is too rare to make the sample), and a retire's `truncate`
+    // keeps those statistics for good; an underestimated slot size does the
+    // same for smaller batches. `materialized` is load-bearing: `truncates`
+    // is referenced once, so without it Postgres inlines it back into that
+    // same rescan of `fenced`. Whatever join it picks now, its inner side is
+    // the handful of truncate rows.
     //
     // Issue #133: `group_key` is a real per-key set union, computed
     // separately from every other column here so it can't perturb them.
@@ -1218,21 +1221,24 @@ mod plan_tests {
                 .await
                 .expect("set search_path");
 
-            // Statistics taken while the ring slot held a handful of rows,
-            // as a reused slot's usually are: the planner then expects
-            // `fenced` to be tiny, which is exactly when it picks the
-            // nested-loop anti-join. Without this the old shape could pass
-            // by luck of a hash anti-join.
+            // Statistics on `op` from a whole-table `analyze` (trellis's own
+            // seal-time analyze covers `origin_lsn` alone; an operator's
+            // database-wide `analyze` covers every column). They say every
+            // row is an update, as nearly every real batch's do, so the
+            // planner expects no truncate rows at all. A retire's `truncate`
+            // doesn't clear them. That's what made the old anti-join a
+            // nested loop; without it the old shape passes by luck of a
+            // hash anti-join.
             client
                 .batch_execute(
                     "insert into seg_0 (src_table, key, op, lsn, src_changed, hop_gen) \
                      select 'orders', 'warmup' || g, 'update', '0/1'::pg_lsn, now(), 0 \
                      from generate_series(1, 10) g; \
                      analyze seg_0; \
-                     delete from seg_0;",
+                     truncate seg_0;",
                 )
                 .await
-                .expect("take small-slot statistics");
+                .expect("take column statistics on op");
 
             // `ROWS` updates to distinct keys, lsn 1..=ROWS, one staged row
             // each. The truncate, when present, lands halfway through.
