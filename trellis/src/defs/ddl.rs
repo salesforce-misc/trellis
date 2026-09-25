@@ -370,8 +370,9 @@ fn map_resolve_error(err: super::catalog::CatalogError) -> DdlError {
 
 /// Introspects `source_table`'s primary key from `pg_catalog`, via a bound
 /// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
-/// table name into the query. `to_regclass` resolves a schema-qualified
-/// `"schema.table"` string exactly (issue #76, ADR-0007) — every real caller
+/// table name into the query. `source_table` is the unquoted `schema.table`
+/// identity, quoted for the lookup by [`regclass_arg`] (issue #561), which
+/// `to_regclass` resolves exactly (issue #76, ADR-0007) — every real caller
 /// now passes one (`Definition::source_table`, or
 /// `catalog::resolve_source_for_install`'s equivalent at definition-acceptance
 /// time), so this no longer depends on the connection's `search_path`
@@ -461,7 +462,7 @@ pub(crate) async fn source_primary_key_in_txn(
 /// KEY`, else the qualifying `UNIQUE` index — an aggregate target's `UNIQUE
 /// NULLS NOT DISTINCT` grouping columns, issue #128), in declared order, each
 /// with its nullability. Empty when `table` has no such index; no key-type
-/// gate. `table` is anything `to_regclass` resolves.
+/// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
 ///
 /// Split out for `intake::publication::enumerate_and_append` (issue #308),
 /// which must enumerate every table a catch-up marker can name — aggregate
@@ -511,7 +512,7 @@ pub(crate) async fn identity_key_columns(
                on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
              where i.indrelid = pg_catalog.to_regclass($1)
              order by array_position(i.indkey, a.attnum)",
-            &[&table],
+            &[&regclass_arg(table)],
         )
         .await?;
     Ok(rows
@@ -1180,7 +1181,7 @@ async fn source_column_pg_types(
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attnum > 0
                and not a.attisdropped",
-            &[&source_table],
+            &[&regclass_arg(source_table)],
         )
         .await?;
     Ok(rows
@@ -1397,6 +1398,27 @@ pub(crate) fn qualified_source_table(qualified: &str) -> String {
 /// through in #76) through this function instead.
 pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
     quote_qualified_ident(qualified)
+}
+
+/// The text to bind as `pg_catalog.to_regclass($1)`'s argument for `table`,
+/// a table's unquoted `schema.table` identity (issue #561).
+///
+/// That unquoted identity is the one name every catalog lookup in this crate
+/// takes: it is what [`crate::intake::publication::qualify`] builds, what
+/// `StagedChange::src_table` and `transform_definitions.source_table`/
+/// `target_table` hold, and what `qualified_from_table()`/
+/// `qualified_to_table()` return. A quoted form exists only for splicing
+/// into SQL text, and is rendered at that site. `to_regclass` parses its
+/// argument as a SQL name, folding unquoted identifiers to lower case, so a
+/// lookup that bound the identity as-is could never find `"Shop"."Orders"`
+/// (it looked for `shop.orders`). Every lookup helper therefore quotes its
+/// argument here, and no caller may pass one already quoted: that would be
+/// quoted twice and find nothing.
+///
+/// A bare name with no `.` (tests, and a relationship endpoint that resolved
+/// to nothing) is quoted whole and resolves through `search_path`.
+pub(crate) fn regclass_arg(table: &str) -> String {
+    quote_qualified_ident(table)
 }
 
 /// Shared quoting logic for [`qualified_source_table`]/

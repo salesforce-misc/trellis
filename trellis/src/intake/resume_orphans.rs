@@ -293,9 +293,7 @@ impl Sweep {
             // of the catalog, so the marker fails and backs off (#407).
             let def = parse(&text).map_err(CatalogError::from)?;
             let target_ident = ddl::qualified_target_table_ident(&target);
-            // Quoted: `identity_key_columns` resolves its argument with
-            // `to_regclass`, which would case-fold a bare mixed-case name.
-            let key_cols = ddl::identity_key_columns(txn, &target_ident).await?;
+            let key_cols = ddl::identity_key_columns(txn, &target).await?;
             if key_cols.is_empty() {
                 // Only a target dropped since the catalog read above: every
                 // target Trellis creates has a key.

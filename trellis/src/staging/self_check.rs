@@ -794,7 +794,7 @@ async fn check_schema(
             "select a.attname::text from pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attnum > 0 and not a.attisdropped",
-            &[&def.target_table],
+            &[&ddl::regclass_arg(&def.target_table)],
         )
         .await?;
     let actual: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();

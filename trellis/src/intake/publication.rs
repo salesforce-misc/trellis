@@ -810,7 +810,7 @@ async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<St
     // primary key used to fail every catch-up marker parked on an aggregate
     // target with `MissingKeyValue`, which left the marker in place to fail
     // every later pass the same way.
-    let key_cols = crate::defs::ddl::identity_key_columns(txn, &from).await?;
+    let key_cols = crate::defs::ddl::identity_key_columns(txn, src_table).await?;
     if key_cols.is_empty() {
         return Err(IntakeError::MissingKeyValue {
             table: src_table.to_string(),

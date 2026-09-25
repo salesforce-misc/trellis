@@ -1261,7 +1261,7 @@ impl Trellis {
                  where a.attrelid = pg_catalog.to_regclass($1) \
                    and a.attnum > 0 \
                    and not a.attisdropped",
-                &[&qualified],
+                &[&defs::ddl::regclass_arg(&qualified)],
             )
             .await?;
 

@@ -195,7 +195,7 @@ pub(super) async fn source_table_missing(
     let row = client
         .query_one(
             "select pg_catalog.to_regclass($1) is null",
-            &[&source_table],
+            &[&ddl::regclass_arg(source_table)],
         )
         .await?;
     Ok(row.get(0))

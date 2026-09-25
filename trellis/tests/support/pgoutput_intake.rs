@@ -170,9 +170,18 @@ impl Pipeline {
             published, expected_published,
             "only tables this instance does not own are published (issues #315, #375)"
         );
+        // Each `schema.table` component quoted, so a mixed-case table is
+        // published as itself rather than a case-folded name (issue #561).
+        let quoted: Vec<String> = published
+            .iter()
+            .map(|name| {
+                let (schema, table) = name.split_once('.').expect("a qualified name");
+                format!("\"{schema}\".\"{table}\"")
+            })
+            .collect();
         raw.batch_execute(&format!(
             "create publication {PUBLICATION} for table {}",
-            published.join(", ")
+            quoted.join(", ")
         ))
         .await
         .expect("create publication");

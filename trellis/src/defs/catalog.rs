@@ -145,7 +145,9 @@ pub enum CatalogError {
     Backfill(crate::intake::IntakeError),
     /// `def.source` doesn't resolve to any schema on this connection's
     /// search path (see [`resolve_source_schema_in_txn`]) — the table was
-    /// dropped, renamed, or never existed under that bare name.
+    /// dropped, renamed, or never existed under that bare name. Also a table
+    /// dropped between resolving it and a later check that reads it
+    /// ([`check_source_guarantees`]).
     SourceTableNotFound(String),
     /// This definition's resolved, qualified target (`{target_schema}.{def.target}`)
     /// shares a bare table-name suffix with a *different* qualified target
@@ -2035,7 +2037,7 @@ async fn target_column_type_oid_via(
                and a.attname = $2 \
                and a.attnum > 0 \
                and not a.attisdropped",
-            &[&regclass_arg(qualified_target), &column],
+            &[&ddl::regclass_arg(qualified_target), &column],
         )
         .await?;
     Ok(row.map(|row| row.get(0)))
@@ -3552,7 +3554,7 @@ async fn column_type_oid(
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&regclass_arg(query_table), &column],
+            &[&ddl::regclass_arg(query_table), &column],
         )
         .await?;
     match row {
@@ -3599,7 +3601,7 @@ async fn column_type_in_txn(
                and a.attname = $2
                and a.attnum > 0
                and not a.attisdropped",
-            &[&regclass_arg(query_table), &column],
+            &[&ddl::regclass_arg(query_table), &column],
         )
         .await?;
     match row {
@@ -3610,17 +3612,6 @@ async fn column_type_in_txn(
         }
         .into()),
     }
-}
-
-/// The text to bind as `pg_catalog.to_regclass($1)`'s argument for `table`:
-/// a plain `schema.table` identity, or the bare name a relationship endpoint
-/// that resolved to nothing falls back to
-/// ([`resolve_relationship_endpoint_in_txn`]). `to_regclass` parses its
-/// argument as a SQL name, folding unquoted identifiers to lower case, so
-/// each component is quoted: a mixed-case `Custom.Totals` must find
-/// `"Custom"."Totals"`, not a nonexistent `custom.totals` (issue #487).
-fn regclass_arg(table: &str) -> String {
-    ddl::qualified_source_table(table)
 }
 
 /// Postgres type names that are freely joinable despite not being textually
@@ -4120,7 +4111,7 @@ async fn to_col_cardinality_in_txn(
                   and array_length(i.indkey::int2[], 1) = 1
                   and i.indkey[0] = a.attnum
              )",
-            &[&regclass_arg(to_table), &to_col],
+            &[&ddl::regclass_arg(to_table), &to_col],
         )
         .await?
         .get(0);
@@ -4183,7 +4174,7 @@ async fn assert_replica_identity_supports_to_many(
                 )
              from pg_class c
              where c.oid = pg_catalog.to_regclass($1)",
-            &[&regclass_arg(to_table), &def.to_col],
+            &[&ddl::regclass_arg(to_table), &def.to_col],
         )
         .await?
         .get(0);
@@ -4312,13 +4303,17 @@ async fn check_source_guarantees(
                 if is_definition_target(txn, &qualified_table).await? {
                     continue;
                 }
+                // `query_opt`: a table dropped since its endpoint resolved
+                // has no `pg_class` row, which is a not-found, not a
+                // row-count error (issue #561).
                 let is_full: bool = txn
-                    .query_one(
+                    .query_opt(
                         "select relreplident = 'f' from pg_class where oid = \
                          pg_catalog.to_regclass($1)",
-                        &[&regclass_arg(&qualified_table)],
+                        &[&ddl::regclass_arg(&qualified_table)],
                     )
                     .await?
+                    .ok_or_else(|| CatalogError::SourceTableNotFound(qualified_table.clone()))?
                     .get(0);
 
                 crate::intake::require_replica_identity_full(&table, !is_full)
@@ -4527,6 +4522,12 @@ impl RelationshipProjection {
             &self.projection_table,
         )
     }
+
+    /// `projection_schema.projection_table` unquoted: the identity a catalog
+    /// lookup takes ([`ddl::regclass_arg`], issue #561).
+    pub(crate) fn identity(&self) -> String {
+        format!("{}.{}", self.projection_schema, self.projection_table)
+    }
 }
 
 /// Reads back the settled parent projection for the relationship
@@ -4634,7 +4635,7 @@ async fn ensure_relationship_projection_in_txn(
     // the gap [`super::ddl::qualified_source_table`] exists to close. Every
     // DML statement built below uses this quoted form, never
     // `qualified_to_table` itself ([`column_type_in_txn`] quotes its own
-    // `to_regclass` argument the same way, via [`regclass_arg`]).
+    // `to_regclass` argument the same way, via [`ddl::regclass_arg`]).
     let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
     let to_col_ident = quote_ident(to_col);
 
@@ -5091,7 +5092,7 @@ async fn has_usable_fk_index_in_txn(
                   and am.amname = 'btree'
                   and i.indkey[0] = a.attnum
              )",
-            &[&regclass_arg(from_table), &from_col],
+            &[&ddl::regclass_arg(from_table), &from_col],
         )
         .await?
         .get(0);

@@ -262,10 +262,7 @@ async fn resolve_endpoint_feed(
     if !catalog::is_relationship_endpoint(txn, target).await? {
         return Ok(None);
     }
-    // Quoted: `identity_key_columns` resolves its argument with
-    // `to_regclass`, which would case-fold a bare mixed-case name.
-    let key_columns =
-        ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(target)).await?;
+    let key_columns = ddl::identity_key_columns(txn, target).await?;
     if key_columns.is_empty() {
         // Unreachable for a table Trellis created: a 1-1 target has a
         // primary key and an aggregate target its grouping-column
