@@ -491,15 +491,15 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     // an advisory lock the test holds: the chunk's write stays in flight
     // until the test releases it.
     client
-        .batch_execute(
+        .batch_execute(&format!(
             "create function _slow_backfill_write() returns trigger as $$ \
-             begin perform pg_advisory_xact_lock(513); return null; end; \
+             begin perform pg_advisory_xact_lock({CHUNK_WRITE_GATE}); return null; end; \
              $$ language plpgsql; \
              create trigger _slow_backfill_write_trigger \
              before insert on t for each statement \
              execute function _slow_backfill_write(); \
-             select pg_advisory_lock(513)",
-        )
+             select pg_advisory_lock({CHUNK_WRITE_GATE})"
+        ))
         .await
         .expect("install a blocking-write trigger on the target and hold its lock");
 
@@ -546,7 +546,10 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     }
 
     client
-        .execute("select pg_advisory_unlock(513)", &[])
+        .execute(
+            &format!("select pg_advisory_unlock({CHUNK_WRITE_GATE})"),
+            &[],
+        )
         .await
         .expect("release the chunk's write");
     run_task
@@ -594,22 +597,34 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     assert_eq!(status, "catching_up");
 }
 
-/// Waits until a chunk's write is blocked on the advisory lock its test
-/// holds (see `a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed`).
+/// The advisory lock key `a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed`
+/// holds its chunk's write on.
+const CHUNK_WRITE_GATE: i64 = 513;
+
+/// Waits until a chunk's write is blocked on [`CHUNK_WRITE_GATE`], which its
+/// test holds (see `a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed`).
 /// The deadline only bounds a hang: the wait itself asserts nothing about
 /// how fast the write gets there.
 async fn wait_for_blocked_chunk_write(client: &Client) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
+        // A one-`bigint` advisory key sits in `pg_locks` as its high and low
+        // 32 bits (`classid`, `objid`) with `objsubid = 1`.
         let blocked: bool = client
             .query_one(
-                "select exists (select 1 from pg_stat_activity \
-                 where datname = current_database() \
-                   and wait_event_type = 'Lock' and wait_event = 'advisory')",
+                &format!(
+                    "select exists (select 1 from pg_locks \
+                     where locktype = 'advisory' and not granted \
+                       and database = (select oid from pg_database \
+                                       where datname = current_database()) \
+                       and classid = {} and objid = {} and objsubid = 1)",
+                    CHUNK_WRITE_GATE >> 32,
+                    CHUNK_WRITE_GATE & 0xffff_ffff,
+                ),
                 &[],
             )
             .await
-            .expect("read pg_stat_activity")
+            .expect("read pg_locks")
             .get(0);
         if blocked {
             return;
