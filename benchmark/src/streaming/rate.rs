@@ -195,6 +195,16 @@ pub fn kept_target_rate(
     drained && in_window.is_some_and(|fit| fit.rows_per_sec >= offered * (1.0 - fit.tolerance))
 }
 
+/// Issue #423's cross-check: `trellis_changes_applied_total` counts staged
+/// source rows, one per committed row, so it can only pass the rows committed
+/// if something staged a source row a second time inside the window (a
+/// catch-up backfill's discharge stages every source row again). The probe
+/// then measured more work than it offered. The run fails on it, so the
+/// probe's own verdict must not claim a pass either (#509).
+pub fn restaged_in_window(changes_applied: u64, rows_issued: u64) -> bool {
+    changes_applied > rows_issued
+}
+
 /// An in-window rate as JSON: one decimal, or `null` when there is none.
 pub fn json_rate(rate: Option<f64>) -> String {
     match rate {

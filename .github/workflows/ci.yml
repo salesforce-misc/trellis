@@ -86,13 +86,27 @@ jobs:
           echo "$pg_bin" >> "$GITHUB_PATH"
 
       - name: Test
-        # Plain `--workspace`, generative crate included: every proptest
-        # property in generative/ is `#[ignore]`d (enforced by
-        # generative/tests/meta.rs), so this runs the crate's lib, coverage,
-        # meta, oracle, backend_seam, backfill and pin/regression tests but
-        # never deep-runs a property at PR time. Properties are opt-in with
-        # `-- --ignored`; see nightly.yml and generative/README.md.
-        run: cargo test --workspace
+        # `--workspace`, generative crate included: every proptest property in
+        # generative/ is `#[ignore]`d (enforced by generative/tests/meta.rs),
+        # so this runs the crate's lib, coverage, meta, oracle, backend_seam,
+        # backfill and pin/regression tests but never deep-runs a property at
+        # PR time. Properties are opt-in with `-- --ignored`; see nightly.yml
+        # and generative/README.md.
+        #
+        # `benchmark/engine-access` because the benchmark binary carries
+        # `required-features` for it, so a plain `--workspace` skips its unit
+        # tests without a word, and those are the verdict logic performance
+        # work is judged by (issue #509). The test build already has
+        # `trellis/test-util` on through generative's self dev-dependency, so
+        # naming it here adds only the benchmark crate to the build.
+        # generative's `engine_subprocess` binary needs no flag: the same
+        # dev-dependency satisfies its `required-features`.
+        run: cargo test --workspace --features benchmark/engine-access
+
+      - name: Test the otlp feature's doc example
+        # `trellis::otel` compiles only under `otlp`, which no test build
+        # turns on, so its doc example is otherwise never compiled (#509).
+        run: cargo test -p trellis --features otlp --doc otel
 
       - name: Prune target/ to third-party dependencies
         # A cold build is ~5.6GB, nearly all of it this workspace's own test

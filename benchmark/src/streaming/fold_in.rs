@@ -112,7 +112,8 @@ pub struct FoldInResult {
     pub in_window_folded: Option<InWindowRate>,
     /// T3's yes-or-no at this ratio ([`kept_target_rate`]): the target
     /// drained **and** `in_window_folded` kept up with the offered rate
-    /// within its tolerance.
+    /// within its tolerance, **and** no source row was staged twice in the
+    /// window ([`rate::restaged_in_window`], which fails the run too, #509).
     /// `drained` alone can't answer T3: it only says the backlog drained
     /// within `grace`, and a long grace lets a pipeline running at a fraction
     /// of the target pass. Only meaningful when `generator_bound` is false.
@@ -386,11 +387,14 @@ pub async fn run_probe(
     client.shutdown().await.expect("client shutdown");
 
     let achieved_rows_per_sec = load.achieved_rows_per_sec();
-    let kept = kept_target_rate(
+    let changes_applied = changes_now.saturating_sub(changes_before);
+    let kept = fold_in_kept_target_rate(
         drained,
         in_window_folded,
         target_rows_per_sec,
         achieved_rows_per_sec,
+        changes_applied,
+        load.rows_issued,
     );
     let folded_rows_per_sec =
         drained_after.map(|elapsed| load.rows_issued as f64 / elapsed.as_secs_f64());
@@ -404,7 +408,7 @@ pub async fn run_probe(
         rows_issued: load.rows_issued,
         achieved_rows_per_sec,
         generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, kept),
-        changes_applied: changes_now.saturating_sub(changes_before),
+        changes_applied,
         drained,
         folded_rows_per_sec,
         in_window_folded,
@@ -420,6 +424,25 @@ pub async fn run_probe(
         deadlocks: deadlocks_after - deadlocks_before,
         xact_rollbacks: rollbacks_after - rollbacks_before,
     }
+}
+
+/// A fold-in probe's verdict: [`kept_target_rate`], unless a source row was
+/// staged twice inside the window ([`rate::restaged_in_window`]). That fails
+/// the run, so the probe's JSON must not report a pass (#509).
+pub fn fold_in_kept_target_rate(
+    drained: bool,
+    in_window_folded: Option<InWindowRate>,
+    target_rows_per_sec: f64,
+    achieved_rows_per_sec: f64,
+    changes_applied: u64,
+    rows_issued: u64,
+) -> bool {
+    kept_target_rate(
+        drained,
+        in_window_folded,
+        target_rows_per_sec,
+        achieved_rows_per_sec,
+    ) && !rate::restaged_in_window(changes_applied, rows_issued)
 }
 
 /// The group count a fold-in `ratio` gives at `target_rows_per_sec`.
