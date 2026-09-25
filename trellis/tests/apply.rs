@@ -1062,6 +1062,66 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     assert_eq!(total, "11.50");
 }
 
+/// Issue #392's check on the 1-1 path: a `recompute` folded with the key's
+/// CDC update leaves a record that looks like a plain update, but a 1-1 write
+/// is the whole row evaluated from its image, never a delta on the stored
+/// value. So a stale target row (999 here) is still repaired, with no need
+/// for the aggregate path's `has_recompute` handling.
+#[tokio::test]
+async fn a_recompute_folded_with_a_cdc_update_still_repairs_a_stale_one_to_one_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, price numeric, tax numeric); \
+             insert into orders (id, price, tax) values (1, 20.00, 1.50)",
+        )
+        .await
+        .expect("seed source table");
+    let def = order_totals_def();
+    let source_columns = numeric_columns(&["id", "price", "tax"]);
+    create_definition(
+        &db.pool,
+        "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
+        &source_columns,
+    )
+    .await
+    .expect("create definition");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("introspect source primary key");
+    create_target_table(&db.pool, &def, "public", &pk, &source_columns, &def.source)
+        .await
+        .expect("create target table");
+    client
+        .execute("insert into order_totals (id, total) values (1, 999)", &[])
+        .await
+        .expect("a stale target row");
+
+    insert_cdc_row(&client, "seg_0", "orders", "1", "recompute", None, None).await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "update",
+        Some(r#"{"id":"1","price":"10.00","tax":"1.50"}"#),
+        Some(r#"{"id":"1","price":"20.00","tax":"1.50"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg_seq, "worker").await;
+
+    let total: String = client
+        .query_one("select total::text from order_totals where id = 1", &[])
+        .await
+        .expect("read target row")
+        .get(0);
+    assert_eq!(total, "21.50");
+}
+
 #[tokio::test]
 async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_insert_survives() {
     let cluster = TestCluster::start();

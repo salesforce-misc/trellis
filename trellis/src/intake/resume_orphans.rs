@@ -293,16 +293,18 @@ async fn aggregate_match(
                 RelationshipCardinality::ToOne,
                 "{target}'s GROUP BY reads relationship {rel:?}, which is not to-one"
             );
-            joins.push((rel.to_string(), reldef.def));
+            // Joined by its recorded to-side (issue #372), not the bare
+            // `to_table` re-resolved through this session's `search_path`.
+            joins.push((rel.to_string(), reldef.qualified_to_table(), reldef.def));
         }
     }
     Ok(Match {
         parts,
         joins: to_one_join_clauses(
-            joins.iter().map(|(rel, d)| {
+            joins.iter().map(|(rel, to_table, d)| {
                 (
                     rel.as_str(),
-                    d.to_table.as_str(),
+                    to_table.as_str(),
                     d.to_col.as_str(),
                     d.from_col.as_str(),
                 )

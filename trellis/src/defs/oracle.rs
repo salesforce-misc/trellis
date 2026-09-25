@@ -514,7 +514,11 @@ pub(crate) fn render_to_one_rel_expr_sql(expr: &Expr, source_sql: &str) -> Strin
 /// The ` left join <to_table> as <rel> on <rel>.<to_col> = <source_sql>.<from_col>`
 /// clauses a [`render_to_one_rel_expr_sql`]-rendered expression needs, one per
 /// entry of `joins` (relationship name → `(to_table, to_col, from_col)`), in
-/// the iterator's order. Left (not inner) join so a source row whose FK doesn't
+/// the iterator's order. Every production caller passes the relationship's
+/// qualified `"schema.table"` to-side
+/// ([`super::RelationshipDefinition::qualified_to_table`], issue #372), so the
+/// join never resolves through the session's `search_path`; the test oracles
+/// pass a bare name, which is quoted as one identifier. Left (not inner) join so a source row whose FK doesn't
 /// resolve still reaches the `GROUP BY` and contributes `NULL` — ADR-0006's
 /// to-one nullability rule, and the same shape
 /// [`render_relationship_select_sql`] already uses for a 1-1 target.
@@ -526,7 +530,7 @@ pub(crate) fn to_one_join_clauses<'a>(
         .map(|(rel, to_table, to_col, from_col)| {
             format!(
                 " left join {} as {alias} on {alias}.{} = {source_sql}.{}",
-                quote_ident(to_table),
+                super::ddl::qualified_source_table(to_table),
                 quote_ident(to_col),
                 quote_ident(from_col),
                 alias = quote_ident(rel),

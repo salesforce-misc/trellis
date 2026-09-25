@@ -454,15 +454,15 @@ pub(crate) async fn drop_relationship(
          using schema_nodes parent, schema_nodes child \
          where e.kind = 'relationship' \
            and e.from_node_id = parent.id and e.to_node_id = child.id \
-           and split_part(parent.table_name, '.', 2) = $1 \
+           and parent.table_name = $1 \
            and child.table_name = $2 \
            and not exists ( \
                select 1 from relationship_definitions r \
-               where r.to_table = $1 \
+               where r.to_schema || '.' || r.to_table = $1 \
                  and r.from_schema || '.' || r.from_table = $2 \
                  and r.id <> $3 \
            )",
-        &[&reldef.def.to_table, &qualified_from, &reldef.id],
+        &[&reldef.qualified_to_table(), &qualified_from, &reldef.id],
     )
     .await?;
 
@@ -546,7 +546,7 @@ async fn dependency_blockers(
     // for the reason [`relationships_naming`] gives. Its readers are
     // transforms over the target itself, which `source_edge_dependents`
     // already names; the dedup below folds them.
-    for (qualified_from, name) in relationships_naming(txn, target, qualified_target).await? {
+    for (qualified_from, name) in relationships_naming(txn, qualified_target).await? {
         // The qualified address (issue #288): `blog.posts.author` and
         // `shop.posts.author` are two blockers, and a bare `posts.author`
         // would both collapse them into one below and name a `DROP
@@ -643,10 +643,10 @@ async fn source_edge_dependents(
 /// Every relationship that names the target as either endpoint, as
 /// `(qualified from-table, name)`, the pair that identifies one (issue #288).
 ///
-/// A relationship whose **to**-side is the bare table `target` is one
-/// through which a transform over some other source can be reading
-/// `target`'s rows. `relationship_definitions.to_table` is persisted bare
-/// (the to-side has no schema of its own recorded), so this matches bare.
+/// A relationship whose **to**-side is `qualified_target` is one through
+/// which a transform over some other source can be reading the target's rows.
+/// Matched on the to-side's recorded schema (issue #372), so a same-named
+/// table in another schema is not a blocker.
 ///
 /// A relationship whose **from**-side is `qualified_target` (issue #375)
 /// has no reader to strand, but surviving the drop would leave the name a
@@ -657,14 +657,15 @@ async fn source_edge_dependents(
 /// IDENTITY FULL`.
 async fn relationships_naming(
     txn: &Transaction<'_>,
-    target: &str,
     qualified_target: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
     let rows = txn
         .query(
             "select from_schema || '.' || from_table, name from relationship_definitions \
-             where to_table = $1 or from_schema || '.' || from_table = $2 order by id",
-            &[&target, &qualified_target],
+             where to_schema || '.' || to_table = $1 \
+                or from_schema || '.' || from_table = $1 \
+             order by id",
+            &[&qualified_target],
         )
         .await?;
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())

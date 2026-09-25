@@ -106,13 +106,13 @@ impl EngineTuning {
         Self::default()
     }
 
-    /// This tuning as [`ClientOptions`], for a staging-worker client
-    /// publishing `source_tables`.
-    pub fn client_options(&self, source_tables: Vec<String>) -> ClientOptions {
+    /// This tuning as [`ClientOptions`], for a staging-worker client. The
+    /// worker publishes whatever the registered definitions read (issue
+    /// #427), so there is no table list to pass.
+    pub fn client_options(&self) -> ClientOptions {
         ClientOptions {
             staging_worker: true,
             application_threads: self.application_threads,
-            source_tables,
             poll_interval: self.poll_interval,
             maintenance_interval: self.maintenance_interval,
             reconcile_interval: self.reconcile_interval,

@@ -9,7 +9,7 @@ use trellis::defs::{
     CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition,
     RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
     create_relationship, create_target_table, edges_from, install_definition, parse,
-    relationship_by_name, source_primary_key,
+    relationship_by_name, relationship_projection, relationships_to_table, source_primary_key,
 };
 
 /// The schema this file's bare `CREATE TABLE`s land in, and so the schema a
@@ -1713,4 +1713,105 @@ async fn same_named_relationships_on_same_named_tables_in_different_schemas_coex
         .await
         .expect("a bare address naming one relationship drops it");
     assert_eq!(count("blog").await, 0);
+}
+
+/// Issue #372: a relationship's to-side is the table its `TO` resolved to when
+/// it was declared, whatever `search_path` a later reader has. The mirror of
+/// #288's from-side fix.
+///
+/// `buyer` is declared through a pool whose `search_path` finds `shop.users`,
+/// then read through one whose `search_path` finds `other.users` instead: a
+/// same-named table with no `name` column. Every reader must still land on
+/// `shop.users`: the read-back, the reverse lookup (`relationships_to_table`),
+/// and registering a transform over `shop.orders` that reads `buyer.name`
+/// (which types the column off the to-side and widens its projection).
+#[tokio::test]
+async fn a_relationship_to_side_is_read_from_the_schema_it_was_declared_in() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    {
+        let client = db.pool.get().await.expect("get connection");
+        client
+            .batch_execute(
+                "create schema shop; create schema other; \
+                 create table shop.users (id integer primary key, name text); \
+                 create table shop.orders (id integer primary key, user_id integer); \
+                 create table other.users (id integer primary key); \
+                 alter table shop.users replica identity full; \
+                 alter table shop.orders replica identity full; \
+                 alter table other.users replica identity full;",
+            )
+            .await
+            .expect("seed shop and other");
+    }
+    let schema_pool = |target_schema: &str| {
+        let config = trellis::Config::from_dsn(db.dsn().to_string())
+            .expect("valid dsn")
+            .with_target_schema(target_schema)
+            .expect("valid target schema");
+        trellis::pool::Pool::new(&config).expect("build pool")
+    };
+    let shop_pool = schema_pool("shop");
+    let other_pool = schema_pool("other");
+
+    let declared = create_relationship(
+        &shop_pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer through shop's search_path");
+    assert_eq!(declared.qualified_to_table(), "shop.users");
+
+    // The read-back through `other`'s search_path still names `shop.users`.
+    let read = relationship_by_name(&other_pool, "shop", "orders", "buyer")
+        .await
+        .expect("read query")
+        .expect("shop.orders.buyer resolves");
+    assert_eq!(read.to_schema, "shop");
+    assert_eq!(read.qualified_to_table(), "shop.users");
+
+    // The reverse lookup matches the recorded to-side exactly: a change to
+    // `other.users` re-derives nothing through `buyer`.
+    let ids = |rels: Vec<RelationshipDefinition>| rels.iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(relationships_to_table(&other_pool, "shop.users")
+            .await
+            .expect("reverse lookup")),
+        vec![declared.id]
+    );
+    assert_eq!(
+        ids(relationships_to_table(&other_pool, "other.users")
+            .await
+            .expect("reverse lookup")),
+        Vec::<i64>::new(),
+        "other.users merely shares a name with buyer's to-side"
+    );
+
+    // Registering a reader of `buyer.name` through `other`'s search_path types
+    // `name` off `shop.users` (bare `users` there is `other.users`, which has
+    // no `name` column) and widens the projection from it.
+    install_definition(
+        &other_pool,
+        "TRANSFORM buyer_names FROM shop.orders SELECT buyer.name AS buyer_name",
+        &HashMap::new(),
+        "other",
+    )
+    .await
+    .expect("buyer.name resolves against shop.users, not other.users");
+
+    let projection = relationship_projection(&other_pool, declared.id)
+        .await
+        .expect("projection query")
+        .expect("a to-one relationship has a projection");
+    let client = db.pool.get().await.expect("get connection");
+    let has_name: bool = client
+        .query_one(
+            "select exists (select 1 from information_schema.columns \
+             where table_schema = $1 and table_name = $2 and column_name = 'name')",
+            &[&projection.projection_schema, &projection.projection_table],
+        )
+        .await
+        .expect("inspect projection columns")
+        .get(0);
+    assert!(has_name, "the projection was widened with shop.users.name");
 }

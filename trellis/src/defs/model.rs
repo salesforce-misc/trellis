@@ -239,6 +239,12 @@ pub struct RelationshipDefinition {
     /// `(from_schema, from_table, name)`, so `blog.posts.author` and
     /// `shop.posts.author` are two different relationships.
     pub from_schema: String,
+    /// The schema `def.to_table` resolved to when the relationship was
+    /// declared (`relationship_definitions.to_schema`, issue #372). Like
+    /// `from_schema`, it pins the to-side to one specific table, so a reader
+    /// whose `search_path` finds a different `to_table` first still reads the
+    /// table the relationship was declared against.
+    pub to_schema: String,
     pub def: RelationshipDef,
     pub cardinality: RelationshipCardinality,
     /// Non-fatal caveats surfaced alongside this (still-successful)
@@ -260,6 +266,14 @@ impl RelationshipDefinition {
     /// table this relationship was declared against.
     pub fn qualified_from_table(&self) -> String {
         format!("{}.{}", self.from_schema, self.def.from_table)
+    }
+
+    /// The to-table's fully-qualified `"schema.table"` identity, the to-side
+    /// mirror of [`Self::qualified_from_table`] (issue #372). Anything that
+    /// reads the to-side table, or matches it against a changed table, must
+    /// use this rather than the bare `def.to_table`.
+    pub fn qualified_to_table(&self) -> String {
+        format!("{}.{}", self.to_schema, self.def.to_table)
     }
 }
 

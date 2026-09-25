@@ -416,58 +416,6 @@ impl From<crate::error::Error> for ApplyError {
 // src_table qualification
 // ---------------------------------------------------------------------
 
-/// The catalog's lookup key for a folded record's `src_table`: everything
-/// after the last `.`, if any.
-///
-/// A definition's `def.source` is always a *bare* table name — even once
-/// issue #76 taught the grammar's `TRANSFORM ... FROM <table>` clause an
-/// explicit `schema.table` spelling, `def.source` itself still only ever
-/// holds the bare table part (see `defs::ast::TransformDef`'s own doc
-/// comment for why; `defs::parser`'s grammar and `defs/mod.rs`'s own tests
-/// cover both the bare and explicitly-qualified parses). CDC intake's
-/// own producer, though, always stages changes under the qualified
-/// `"schema.table"` shape `intake::publication::qualify` builds, which
-/// [`FoldedChange::src_table`] inherits directly from the ring. This is the
-/// one seam that reconciles the two conventions: strip a schema prefix
-/// before ever asking the catalog about a folded record's source.
-///
-/// Note this produces a *bare* key even though, as of issue #72,
-/// `transform_definitions.source_table`/`source_table_versions.source_table`
-/// themselves persist the fully-qualified form. Issue #380 moved `by_source`,
-/// `ApplyPlan::versions` and [`crate::defs::source_table_version`] off this
-/// bare key and onto the canonical qualified identity
-/// ([`quarantine::CanonicalSrcTables`]), because a bare key merges same-named
-/// tables in different schemas. What is left keyed on it is
-/// `relationships_to_table`, whose `to_table` is still bare (#372).
-///
-/// Since issue #267 this module no longer *emits* a bare `src_table` at all:
-/// every row it stages carries a qualified identity, so as a matter of fact
-/// this function now only ever sees a dotted name and its strip is a stable
-/// suffix extraction rather than a conditional one. It is kept as a strip
-/// regardless, for two reasons. Ring rows are durable — a segment staged
-/// before the upgrade can still be drained after it — and the *fixtures* in
-/// this crate's own integration tests stage bare names by hand
-/// (`tests/claims.rs`, `tests/converge.rs`, `tests/liveness.rs`,
-/// `tests/app_converge.rs`, and others), which readers are expected to keep
-/// tolerating. Note what #267 *did* change is narrower than "always
-/// qualified everywhere": [`crate::defs::ddl::neighbor_table_name`] still
-/// deliberately returns a bare `def.target`, and this module still keys its
-/// own in-memory bookkeeping (`ApplyPlan::targets` and friends) on that bare
-/// name. Only the string that crosses into the ring is canonicalized.
-///
-/// This function's output stays purely a *lookup key* (issue #76's own
-/// reviewer follow-up). The *physical* SQL builders that actually read a live
-/// source row (`ddl::source_primary_key`, [`read_live_rows_batch`], the source
-/// string embedded in an [`AggregateTargetPlan`]) use the qualified
-/// `change.src_table` each bucket's own changes already carry instead — see
-/// `compute`'s `by_source` loop — never this bare key.
-fn catalog_source_key(src_table: &str) -> &str {
-    match src_table.rsplit_once('.') {
-        Some((_, table)) => table,
-        None => src_table,
-    }
-}
-
 /// Resolves `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
 /// (issue #74, ADR-0007: `schema_nodes` keys on qualified identity, so a
@@ -492,9 +440,9 @@ fn catalog_source_key(src_table: &str) -> &str {
 /// function's output is now what those rows carry into the ring in the first
 /// place, so a bare `src_table` reaching `compute` is no longer something
 /// this module itself produces. See [`accumulate_from_side_recomputes`] for
-/// the emission site, and
-/// [`catalog_source_key`] for why the reading side still tolerates a bare
-/// name anyway.
+/// the emission site. The reading side still tolerates a bare name anyway:
+/// ring rows are durable, and this crate's integration-test fixtures stage
+/// bare names by hand.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
@@ -1156,7 +1104,10 @@ pub(crate) async fn build_relationship_context(
         };
         let from_col = reldef.def.from_col.clone();
         let to_col = reldef.def.to_col.clone();
-        let to_table = reldef.def.to_table.clone();
+        // Issue #372: the to-side the relationship was declared against, quoted
+        // for interpolation and `to_regclass`, never the bare `to_table`
+        // re-resolved through this session's `search_path`.
+        let to_table = ddl::qualified_source_table(&reldef.qualified_to_table());
 
         // The join keys we need on the to-side: the distinct non-NULL
         // `from_col` values of the from-side rows this batch evaluates.
@@ -1670,7 +1621,7 @@ async fn build_reverse_relationship_shape(
         None => {
             tracing::error!(
                 relationship = %rel.def.name,
-                to_table = %rel.def.to_table,
+                to_table = %rel.qualified_to_table(),
                 "to-one relationship has no settled parent projection; every \
                  reverse record for it will be treated as an ordering-check \
                  miss (should be unreachable — #129 creates one unconditionally)"
@@ -1790,7 +1741,7 @@ async fn build_reverse_relationship_shape(
             // join, never a second lookup.
             vec![apply_aggregate::RelJoin {
                 name: rel.def.name.clone(),
-                to_table: rel.def.to_table.clone(),
+                to_table: rel.qualified_to_table(),
                 to_col: rel.def.to_col.clone(),
                 from_col: rel.def.from_col.clone(),
             }],
@@ -2938,7 +2889,8 @@ async fn apply_projection_advance(
 /// that such a to-side row carry no key. To-one relationships get exactly one
 /// row per key (`to_col` is UNIQUE); to-many get the full related set.
 /// Decodes each row's columns via the same in-SQL `jsonb_each_text` unnest
-/// [`read_live_rows_batch`] uses.
+/// [`read_live_rows_batch`] uses. `to_table` is the to-side's quoted,
+/// qualified name ([`ddl::qualified_source_table`], issue #372).
 async fn fetch_to_side_rows(
     pool: &Pool,
     to_table: &str,
@@ -2950,7 +2902,7 @@ async fn fetch_to_side_rows(
     }
     let client = pool.get().await?;
     let col_ident = quote_ident(to_col);
-    let tbl_ident = quote_ident(to_table);
+    let tbl_ident = to_table;
     let pg_type = key_column_pg_type(pool, to_table, to_col).await?;
     let filter = key_array_filter(&col_ident, pg_type.as_deref());
     // Issue #248: an explicit per-column `jsonb_build_object`, not
@@ -3007,16 +2959,9 @@ async fn fetch_to_side_rows(
 /// relationship's live to-side table) rather than the projection itself:
 /// `catalog::ensure_relationship_projection_in_txn` creates the projection's
 /// key column with exactly `to_table`'s `to_col` type, so the two always
-/// agree, and `to_table` is a plain bare/qualified table name `to_regclass`
-/// resolves directly — unlike `qualified_projection`, which arrives here
-/// already `quote_ident`-quoted for direct interpolation, not in the shape
-/// `to_regclass` expects for *this* lookup (`to_table`/`key_col` is a
-/// same-named-column shortcut, not a general rule about quoted input:
-/// [`live_row_columns`], just below, binds `qualified_projection` itself as
-/// a `to_regclass` parameter to read the projection's own live columns, and
-/// that works fine — `to_regclass` parses an already-quoted qualified name
-/// exactly like the SQL parser would parse the same text in a `FROM`
-/// clause).
+/// agree. `to_table` is the to-side's quoted, qualified name (issue #372);
+/// `to_regclass` parses an already-quoted qualified name exactly like the SQL
+/// parser would parse the same text in a `FROM` clause.
 async fn fetch_relationship_projection_rows(
     pool: &Pool,
     qualified_projection: &str,
@@ -4760,14 +4705,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // only when some definition on it is 1-1.
         let mut source_row_columns: Option<Vec<String>> = None;
 
-        // `qualified_source` (via `qualified_schema_node_key`), not
-        // `source_key`: `schema_nodes`/`schema_edges` now key on qualified
-        // identity (issue #74, ADR-0007), so `transforms_for_source` (a
-        // thin `dependents_of` wrapper) needs an exact qualified match
-        // here, not the bare catalog-lookup key `catalog_source_key`'s own
-        // doc comment already explains stays bare for
-        // `relationships_to_table` below (still bare-keyed, unaffected by
-        // #74). `qualified_source` is
+        // `qualified_source` (via `qualified_schema_node_key`):
+        // `schema_nodes`/`schema_edges` key on qualified identity (issue #74,
+        // ADR-0007), so `transforms_for_source` (a thin `dependents_of`
+        // wrapper) needs an exact qualified match here. `qualified_source` is
         // usually already fully-qualified (real CDC/backfill), but a
         // downstream-propagation hop's `src_table` is a bare target name
         // this same apply path staged — `qualified_schema_node_key` resolves
@@ -4806,6 +4747,25 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         } else {
             old_rows.resize_with(changes.len(), || None);
         }
+        // Issues #392/#486: the further group-naming images
+        // `apply_aggregate::accumulate_changes` takes as `named_rows`. Only an
+        // aggregate reads them, and only a born-and-died key or a recompute
+        // folded with CDC rows has any, so almost every change decodes none.
+        let mut named_rows: Vec<Vec<Row>> = Vec::with_capacity(changes.len());
+        let has_aggregate = defs
+            .iter()
+            .any(|def| matches!(def.def.key_space, KeySpace::Aggregate { .. }));
+        for change in &changes {
+            let mut named = Vec::new();
+            if has_aggregate {
+                let has_image = change.old_image.is_some() || change.new_image.is_some();
+                let hint = change.prior_image.as_ref().filter(|_| has_image);
+                for image_text in change.vanished_images.iter().chain(hint) {
+                    named.push(decode_image(pool, image_text).await?);
+                }
+            }
+            named_rows.push(named);
+        }
 
         // Reverse recompute (issue #30): this source is some relationship's
         // *to-side*. A change to a related row must re-derive every from-side
@@ -4826,8 +4786,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
-        let inbound_rels =
-            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
+        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
         // Decode each change's pre-image once, reused across every inbound
         // relationship below (the join key lives in the pre-image for a
         // delete/re-parent). Skipped entirely when this table is nobody's
@@ -4930,37 +4889,50 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // propagation (a chained to-side target this apply just
             // rewrote, staged as an image-less hop) reaching its dependents
             // rather than being dropped.
-            let has_image_less = changes
-                .iter()
-                .any(|change| change.old_image.is_none() && change.new_image.is_none());
+            //
+            // Issue #392: a `recompute` that folded with the parent's own CDC
+            // change leaves a record with images, which becomes a delta
+            // record below as usual (it also advances the projection). The
+            // recompute still asked for the from-side rows to be re-derived,
+            // so they are, from both of the record's images.
+            let has_image_less = changes.iter().any(|change| {
+                (change.old_image.is_none() && change.new_image.is_none()) || change.has_recompute
+            });
             if has_image_less {
                 let mut key_hops: HashMap<String, i32> = HashMap::new();
                 let mut key_src_changed: HashMap<String, Provenance> = HashMap::new();
                 for (i, change) in changes.iter().enumerate() {
-                    if change.old_image.is_some() || change.new_image.is_some() {
+                    let image_less = change.old_image.is_none() && change.new_image.is_none();
+                    if !image_less && !change.has_recompute {
                         continue;
                     }
-                    // Only the live re-read can carry the join key here, by
-                    // construction — there is no image to read one from. A
-                    // re-read that came back empty (the key no longer
-                    // exists) leaves nothing to resolve a from-side row
-                    // through, exactly as the both-images-absent skip below
-                    // always intended.
-                    let Some(row) = &rows[i] else { continue };
-                    let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
-                        continue;
+                    // For an image-less change only the live re-read can
+                    // carry the join key, by construction — there is no
+                    // image to read one from. A re-read that came back empty
+                    // (the key no longer exists) leaves nothing to resolve a
+                    // from-side row through, exactly as the both-images-absent
+                    // skip below always intended.
+                    let old_row = if image_less {
+                        None
+                    } else {
+                        reverse_old_rows[i].as_ref()
                     };
-                    key_hops
-                        .entry(join_text.clone())
-                        .and_modify(|h| *h = (*h).max(change.hop_gen))
-                        .or_insert(change.hop_gen);
-                    key_src_changed
-                        .entry(join_text.clone())
-                        .and_modify(|(sc, origin)| {
-                            *sc = earliest_src_changed(*sc, change.src_changed);
-                            *origin = earliest_origin(*origin, change.origin_lsn);
-                        })
-                        .or_insert((change.src_changed, change.origin_lsn));
+                    for row in [rows[i].as_ref(), old_row].into_iter().flatten() {
+                        let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
+                            continue;
+                        };
+                        key_hops
+                            .entry(join_text.clone())
+                            .and_modify(|h| *h = (*h).max(change.hop_gen))
+                            .or_insert(change.hop_gen);
+                        key_src_changed
+                            .entry(join_text.clone())
+                            .and_modify(|(sc, origin)| {
+                                *sc = earliest_src_changed(*sc, change.src_changed);
+                                *origin = earliest_origin(*origin, change.origin_lsn);
+                            })
+                            .or_insert((change.src_changed, change.origin_lsn));
+                    }
                 }
                 accumulate_from_side_recomputes(
                     pool,
@@ -5340,7 +5312,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     }
                     rel_joins.push(apply_aggregate::RelJoin {
                         name: rel_name.clone(),
-                        to_table: reldef.def.to_table,
+                        to_table: reldef.qualified_to_table(),
                         to_col: reldef.def.to_col,
                         from_col: reldef.def.from_col,
                     });
@@ -5422,6 +5394,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 &changes,
                 &rows,
                 &old_rows,
+                &named_rows,
                 &def.source_columns,
                 &mut regex_cache,
                 rel_ctx.as_ref(),
@@ -5664,8 +5637,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // accumulator the row-driven path uses, so it's deduped the same way
         // (issue #79) and drained through the same image-less `Recompute`
         // pipeline below — no separate emission path needed.
-        let inbound_rels =
-            catalog::relationships_to_table(pool, catalog_source_key(&source_key)).await?;
+        let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
         for rel in &inbound_rels {
             // Issue #168: for a to-one relationship, the staged recompute
             // above only re-derives the from-side row's enrichment — it

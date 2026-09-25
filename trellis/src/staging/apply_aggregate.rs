@@ -188,6 +188,22 @@
 //! the extinct horizon, because the empty group it started from was itself
 //! the result of a live read. See `delta_may_be_absorbed`, and doc 05's
 //! "Aggregate groups: the recompute horizon".
+//!
+//! A key inserted and deleted inside one batch folds to no image at all, so
+//! it would name no group to check (issue #486). The fold keeps the images
+//! that name its groups ([`FoldedChange::vanished_images`]); each such group
+//! is [`GroupPlan::horizon_check_only`], re-derived if its row's horizon says
+//! the key may have been counted. Otherwise a group with a row is probed for
+//! existence, as a delta group is, and never written; one with no row is left
+//! untouched.
+//!
+//! # A recompute folded with a CDC change (issue #392)
+//!
+//! A `recompute` row never wins the fold's images, so a key's recompute and
+//! its CDC change in one batch fold to a record that looks like a plain
+//! delta. [`FoldedChange::has_recompute`] keeps the recompute's intent, and
+//! [`accumulate_changes`] forces every group such a record names onto the
+//! full-recompute path, as it does for an image-less change.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -411,6 +427,15 @@ pub(super) struct GroupPlan {
     /// applying the delta when it is at or below. `None` (nothing image-bearing
     /// with a known LSN touched the group) never re-derives.
     pub min_image_lsn: Option<PgLsn>,
+    /// Issue #486: the group is named only by a key that was born and died
+    /// inside this batch ([`FoldedChange::vanished_images`]), so it has no
+    /// delta of its own. [`apply_aggregate_target`] re-derives it when its
+    /// row's recompute horizon says a live read may have counted that key.
+    /// Otherwise a group with a row gets the delta path's existence probe
+    /// (deleting the row if the group is empty) but no write, and a group
+    /// with no row is left alone. A real delta or a forced recompute of the
+    /// group clears this.
+    pub horizon_check_only: bool,
 }
 
 impl GroupPlan {
@@ -428,6 +453,7 @@ impl GroupPlan {
             origin: OriginAccum::Empty,
             force_full_recompute: false,
             min_image_lsn: None,
+            horizon_check_only: false,
         }
     }
 
@@ -446,10 +472,24 @@ impl GroupPlan {
     /// delta: the deepest `hop_gen`, the earliest `src_changed` origin
     /// (issue #104), and the earliest image-bearing LSN (issue #321).
     fn touch(&mut self, change: &FoldedChange) {
+        self.note_provenance(change);
+        self.note_image_lsn(change.min_image_lsn);
+        self.horizon_check_only = false;
+    }
+
+    /// The deepest `hop_gen`, the earliest `src_changed` and the earliest
+    /// origin among the changes touching this group.
+    fn note_provenance(&mut self, change: &FoldedChange) {
         self.hop_gen = self.hop_gen.max(change.hop_gen);
         self.src_changed = super::apply::earliest_src_changed(self.src_changed, change.src_changed);
         self.note_origin(change.origin_lsn);
-        self.note_image_lsn(change.min_image_lsn);
+    }
+
+    /// Puts this group on the full-recompute path for `change`.
+    fn force(&mut self, change: &FoldedChange) {
+        self.force_full_recompute = true;
+        self.horizon_check_only = false;
+        self.note_provenance(change);
     }
 
     /// Lowers [`Self::min_image_lsn`] to `lsn` when it is earlier, ignoring
@@ -500,7 +540,7 @@ pub(super) struct AggregateTargetPlan {
     pub groups: HashMap<String, GroupPlan>,
     /// The source table's fully-qualified `"schema.table"` identity (issue
     /// #76, ADR-0007) — `super::apply::compute`'s own already-qualified
-    /// `change.src_table`, not the bare `catalog_source_key`. Every probe
+    /// `change.src_table`, never a bare suffix. Every probe
     /// below (`probe_sum_and_count`, `probe_count_star`, `probe_field_value`,
     /// `probe_group_exists`) and bulk-recompute builder
     /// (`apply_forced_groups_bulk`, `probe_recompute_fields_bulk`) reads this
@@ -560,6 +600,10 @@ pub(super) struct AggregateTargetPlan {
 #[derive(Debug, Clone)]
 pub(super) struct RelJoin {
     pub name: String,
+    /// The to-side's qualified `"schema.table"` identity
+    /// ([`crate::defs::RelationshipDefinition::qualified_to_table`], issue
+    /// #372), so the join reads the table the relationship was declared
+    /// against rather than whatever the session's `search_path` finds.
     pub to_table: String,
     pub to_col: String,
     pub from_col: String,
@@ -1209,6 +1253,19 @@ fn forward_row_contribution(
 /// the change has one, and `None` otherwise (the prior state is genuinely
 /// unknown — see the module doc comment).
 ///
+/// `named_rows[i]` (issues #392/#486) holds further decoded images that name
+/// a group the change touched but that neither `rows[i]` nor `old_rows[i]`
+/// carries: [`FoldedChange::vanished_images`] for a key born and died inside
+/// the batch, and the prior-image hint of a `recompute` that folded with an
+/// image-bearing change. Empty for almost every change.
+///
+/// A change whose fold included a `recompute` ([`FoldedChange::has_recompute`])
+/// forces every group it names onto the full-recompute path, images or not:
+/// the recompute was staged to repair that group from live state, and a delta
+/// would land on the very value it was meant to repair (issue #392). A group
+/// named only by a vanished image is marked
+/// [`GroupPlan::horizon_check_only`] instead (issue #486).
+///
 /// `rel_ctx` (issue #136) is the settled-parent-projection-backed
 /// [`eval::RelationshipContext`] `super::apply::compute`'s aggregate branch
 /// built via [`super::apply::build_relationship_context`] — `Some` whenever
@@ -1224,6 +1281,7 @@ pub(super) fn accumulate_changes(
     changes: &[&FoldedChange],
     rows: &[Option<Row>],
     old_rows: &[Option<Row>],
+    named_rows: &[Vec<Row>],
     source_columns: &HashMap<String, ValueType>,
     regex_cache: &mut RegexCache,
     rel_ctx: Option<&eval::RelationshipContext>,
@@ -1254,49 +1312,49 @@ pub(super) fn accumulate_changes(
         let old_row = &old_rows[i];
         let new_row = &rows[i];
 
-        if is_image_less {
-            // Issue #315: an image-less change can still carry the key's
-            // prior image (`FoldedChange::prior_image`, decoded into
-            // `old_row` by `compute`) when it was staged by an upstream
-            // target write. A row that moved groups, or was deleted, has to
-            // leave its old group correct too, and the live re-read below
-            // only names the new one — so the prior image's group is
-            // re-derived from live state as well. Idempotent either way.
-            if let Some(row) = old_row {
-                let augmented =
-                    augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
-                let (values, key) =
-                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
-                let group = plan
-                    .groups
-                    .entry(key)
-                    .or_insert_with(|| GroupPlan::new(values));
-                group.force_full_recompute = true;
-                group.hop_gen = group.hop_gen.max(change.hop_gen);
-                group.src_changed =
-                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
-                group.note_origin(change.origin_lsn);
+        // Issues #392/#486: groups only `named_rows` names. Issue #137
+        // applies to every group key derived here and below: even on the
+        // full-recompute path, the key binds the bulk recompute's keyset
+        // (`apply_forced_groups_bulk`), so a relationship `GROUP BY` key has
+        // to resolve the same guarded way an ordinary delta's does, not
+        // straight off the row (which has no such column).
+        for row in &named_rows[i] {
+            let augmented = augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
+            let (values, key) = derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+            let group = plan.groups.entry(key).or_insert_with(|| {
+                let mut group = GroupPlan::new(values);
+                group.horizon_check_only = true;
+                group
+            });
+            if change.has_recompute {
+                group.force(change);
+            } else {
+                group.note_provenance(change);
+                group.note_image_lsn(change.min_image_lsn);
             }
-            if let Some(row) = new_row {
-                // Issue #137: even on the full-recompute path, this group's
-                // *key* — used below to bind the bulk recompute's keyset
-                // (`apply_forced_groups_bulk`) — must resolve a relationship
-                // `GROUP BY` key's value the same guarded way an ordinary
-                // delta does, not read straight off the row (which, for a
-                // relationship-path key, has no such column at all).
+        }
+
+        if is_image_less || change.has_recompute {
+            // An image-less change re-reads the key live (`new_row`), and
+            // issue #315 lets it carry the key's prior image
+            // (`FoldedChange::prior_image`, decoded into `old_row` by
+            // `compute`) when an upstream target write staged it. A row
+            // that moved groups, or was deleted, has to leave its old group
+            // correct too, and the live re-read only names the new one — so
+            // the prior image's group is re-derived from live state as well.
+            // Issue #392: a change that folded a `recompute` with CDC rows
+            // carries the CDC images here instead, and both of the groups
+            // they name are re-derived rather than given the delta.
+            // Idempotent either way.
+            for row in [old_row, new_row].into_iter().flatten() {
                 let augmented =
                     augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
                 let (values, key) =
                     derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
-                let group = plan
-                    .groups
+                plan.groups
                     .entry(key)
-                    .or_insert_with(|| GroupPlan::new(values));
-                group.force_full_recompute = true;
-                group.hop_gen = group.hop_gen.max(change.hop_gen);
-                group.src_changed =
-                    super::apply::earliest_src_changed(group.src_changed, change.src_changed);
-                group.note_origin(change.origin_lsn);
+                    .or_insert_with(|| GroupPlan::new(values))
+                    .force(change);
             }
             continue;
         }
@@ -3433,10 +3491,17 @@ pub(super) async fn apply_aggregate_target(
     // Issue #321: a delta group with no target row is judged against the
     // target's extinct horizon instead, and a row the delta path creates
     // inherits it. Only read when some delta group has no row.
-    let extinct_horizon = if group_keys
-        .iter()
-        .any(|k| !plan.groups[*k].force_full_recompute && !row_horizons.contains_key(k.as_str()))
-    {
+    //
+    // Issue #486: a horizon-check-only group with no row is left alone, so
+    // it needs no extinct horizon. A live read that counted its vanished key
+    // would have written a row, and whatever removed that row since was a
+    // live read that found the group without the key.
+    let extinct_horizon = if group_keys.iter().any(|k| {
+        let group = &plan.groups[*k];
+        !group.force_full_recompute
+            && !group.horizon_check_only
+            && !row_horizons.contains_key(k.as_str())
+    }) {
         read_extinct_horizon(txn, target).await?
     } else {
         None
@@ -3446,16 +3511,18 @@ pub(super) async fn apply_aggregate_target(
     // below its horizon may already be counted by the live read behind that
     // horizon, so it is re-derived with the forced groups instead of
     // applied. Per group, so a grain migration's two sides are judged
-    // against their own groups' horizons.
+    // against their own groups' horizons. Issue #486: a horizon-check-only
+    // group is judged by its row's horizon alone (see `extinct_horizon`).
     let rederived: HashSet<&str> = group_keys
         .iter()
         .filter(|k| {
             let group = &plan.groups[**k];
             !group.force_full_recompute && {
-                let horizon = row_horizons
-                    .get(k.as_str())
-                    .copied()
-                    .unwrap_or(extinct_horizon);
+                let horizon = match row_horizons.get(k.as_str()) {
+                    Some(horizon) => *horizon,
+                    None if group.horizon_check_only => None,
+                    None => extinct_horizon,
+                };
                 delta_may_be_absorbed(group.min_image_lsn, horizon)
             }
         })
@@ -3491,6 +3558,15 @@ pub(super) async fn apply_aggregate_target(
         if takes_forced_path(key, group) {
             continue;
         }
+        // Issue #486: a horizon-check-only group the check didn't re-derive
+        // has no delta to apply. With no row there is nothing to correct
+        // (see `extinct_horizon`). With one, it is still probed: an earlier
+        // probe may have kept the row only because the vanished key was then
+        // live, with the key's insert still in flight, and this batch is the
+        // last chance to find the group empty.
+        if group.horizon_check_only && !row_horizons.contains_key(key.as_str()) {
+            continue;
+        }
         let exists = probe_group_exists(txn, plan, &group.group_values).await?;
 
         if !exists {
@@ -3514,7 +3590,7 @@ pub(super) async fn apply_aggregate_target(
             continue;
         }
 
-        if group_has_activity(plan, group) {
+        if !group.horizon_check_only && group_has_activity(plan, group) {
             delta_groups.push((key, group));
         }
     }
@@ -4615,6 +4691,8 @@ mod tests {
             retry_count: 0,
             prior_image: None,
             row_count: 1,
+            has_recompute: false,
+            vanished_images: Vec::new(),
         }
     }
 
@@ -4690,7 +4768,7 @@ mod tests {
             HashMap::from([("total_words".to_string(), def.fields[1].expr.clone())]),
             vec![RelJoin {
                 name: "post".to_string(),
-                to_table: "posts".to_string(),
+                to_table: "public.posts".to_string(),
                 to_col: "id".to_string(),
                 from_col: "post".to_string(),
             }],
@@ -4728,6 +4806,7 @@ mod tests {
             &changes,
             &rows,
             &old_rows,
+            &[Vec::new()],
             &source_columns,
             &mut regex_cache,
             Some(&rel_ctx),

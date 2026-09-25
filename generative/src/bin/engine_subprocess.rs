@@ -19,10 +19,9 @@
 //! Required env vars: `TRELLIS_DSN`, `TRELLIS_STAGING_WORKER` (`"true"`/
 //! `"false"`), `TRELLIS_APPLICATION_THREADS` (a `usize`), `TRELLIS_SLOT`,
 //! `TRELLIS_PUBLICATION`, `TRELLIS_MAINTENANCE_INTERVAL_MS` (a `u64`),
-//! `TRELLIS_READY_MARKER` (a path). Optional: `TRELLIS_SOURCE_TABLES`
-//! (comma-separated `schema.table` names; only consulted when
-//! `TRELLIS_STAGING_WORKER=true`, same as [`trellis::ClientOptions::source_tables`]
-//! itself). Two more env vars are read directly by `staging::apply`'s
+//! `TRELLIS_READY_MARKER` (a path). There is no source-table list: the
+//! staging worker publishes what the catalog's definitions read (issue
+//! #427). Two more env vars are read directly by `staging::apply`'s
 //! own test-only pause hook, never by this binary — see
 //! `SubprocessBackend::spawn_engine`'s doc comment for why they only need to
 //! be present in this process's environment, not parsed here:
@@ -58,13 +57,6 @@ fn main() {
             eprintln!("engine_subprocess: TRELLIS_APPLICATION_THREADS must be a usize: {err}");
             std::process::exit(2);
         });
-    let source_tables: Vec<String> = std::env::var("TRELLIS_SOURCE_TABLES")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
     let slot = required_env("TRELLIS_SLOT");
     let publication = required_env("TRELLIS_PUBLICATION");
     let maintenance_interval_ms: u64 = required_env("TRELLIS_MAINTENANCE_INTERVAL_MS")
@@ -78,7 +70,6 @@ fn main() {
     let options = ClientOptions {
         staging_worker,
         application_threads,
-        source_tables,
         slot,
         publication,
         maintenance_interval: Duration::from_millis(maintenance_interval_ms),

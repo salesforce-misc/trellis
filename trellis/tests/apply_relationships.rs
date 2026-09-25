@@ -26,8 +26,8 @@ use trellis::defs::ast::{
     Expr, FieldDef, KeySpace, Predicate, RelationshipDef, TransformDef, ValueType,
 };
 use trellis::defs::{
-    create_definition, create_relationship, create_target_table, render_relationship_select_sql,
-    source_primary_key,
+    create_definition, create_relationship, create_target_table, install_definition,
+    render_relationship_select_sql, source_primary_key,
 };
 use trellis::staging::{
     StagedWatermark, TRUNCATE_SENTINEL_KEY, has_pending, retire_drained_segments,
@@ -275,8 +275,8 @@ async fn target_to_one(client: &Client) -> HashMap<String, Option<String>> {
         .collect()
 }
 
-/// The bare (schema-resolved-via-`search_path`) table name of `relationship_id`'s
-/// settled parent projection (issue #129). Issue #130 (epic #127) moved the
+/// The quoted, schema-qualified table name of `relationship_id`'s settled
+/// parent projection (issue #129), so it never depends on `search_path` order. Issue #130 (epic #127) moved the
 /// forward to-one read off a live to-side lookup onto this projection, but
 /// nothing yet advances a projection row's *data* columns when its
 /// underlying parent changes — that's #131's job, not built yet. This test
@@ -290,7 +290,7 @@ async fn projection_table_name(pool: &trellis::Pool, relationship_id: i64) -> St
         .await
         .expect("read projection catalog row")
         .expect("to-one relationship has a projection")
-        .projection_table
+        .qualified_table()
 }
 
 #[tokio::test]
@@ -1226,4 +1226,217 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(target_to_one(&client).await, sci);
     assert_eq!(target_to_one(&client).await, oracle_to_one(&client).await);
+}
+
+// ---------------------------------------------------------------------
+// Issue #372: the to-side is the table the relationship was declared against
+// ---------------------------------------------------------------------
+
+/// A pool on `db` whose `search_path` puts `target_schema` right after the
+/// Trellis schema, so a bare table name finds that schema's copy first.
+fn search_path_pool(db: &testkit::TestDatabase, target_schema: &str) -> trellis::Pool {
+    let config = trellis::Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_target_schema(target_schema)
+        .expect("valid target schema");
+    trellis::pool::Pool::new(&config).expect("build pool")
+}
+
+/// Every `(key, value)` pair `sql` selects, both columns cast to text by the
+/// caller, sorted by key.
+async fn text_pairs(client: &Client, sql: &str) -> Vec<(String, Option<String>)> {
+    let mut pairs: Vec<(String, Option<String>)> = client
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// A to-many relationship declared where bare `orders` is `shop.orders`, read
+/// by a transform that is built and applied through a pool where bare
+/// `orders` is `other.orders`. The direct build (the to-many staging table)
+/// and the live apply (the reverse lookup from a `shop.orders` change and the
+/// forward to-side fetch) must all read `shop.orders`.
+#[tokio::test]
+async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create schema shop; create schema other; \
+             create table shop.users (id integer primary key, name text); \
+             create table shop.orders (id integer primary key, user_id integer, amount integer); \
+             create table other.orders (id integer primary key, user_id integer, amount integer); \
+             alter table shop.users replica identity full; \
+             alter table shop.orders replica identity full; \
+             alter table other.orders replica identity full; \
+             insert into shop.users values (1, 'a'); \
+             insert into shop.orders values (10, 1, 5), (11, 1, 7); \
+             insert into other.orders values (90, 1, 1000);",
+        )
+        .await
+        .expect("seed shop and other");
+    let shop_pool = search_path_pool(&db, "shop");
+    let other_pool = search_path_pool(&db, "other");
+
+    create_relationship(
+        &shop_pool,
+        "RELATIONSHIP placed FROM users.id TO orders.user_id",
+    )
+    .await
+    .expect("declare placed through shop's search_path");
+    install_definition(
+        &other_pool,
+        "TRANSFORM user_spend FROM shop.users SELECT SUM(placed.amount) AS spent",
+        &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
+        "other",
+    )
+    .await
+    .expect("install user_spend through other's search_path");
+    trellis::intake::publication::settle_registrations(&other_pool).await;
+    assert_eq!(
+        text_pairs(
+            &client,
+            "select id::text, spent::text from other.user_spend"
+        )
+        .await,
+        vec![("1".to_string(), Some("12".to_string()))],
+        "the direct build sums shop.orders, not other.orders"
+    );
+
+    client
+        .execute("insert into shop.orders values (12, 1, 100)", &[])
+        .await
+        .expect("insert a shop order");
+    stage_cdc(
+        &client,
+        "shop.orders",
+        "12",
+        "insert",
+        None,
+        Some(r#"{"id":"12","user_id":"1","amount":"100"}"#),
+    )
+    .await;
+    drain_to_quiescence(&other_pool, &mut client).await;
+    assert_eq!(
+        text_pairs(
+            &client,
+            "select id::text, spent::text from other.user_spend"
+        )
+        .await,
+        vec![("1".to_string(), Some("112".to_string()))],
+        "a shop.orders change re-derives user 1 from shop.orders"
+    );
+}
+
+/// An aggregate grouped by a to-one relationship path, declared where bare
+/// `users` is `shop.users` and built and applied through a pool where bare
+/// `users` is `other.users` (same keys, different names). The direct
+/// aggregate build's join, the live apply's `RelJoin`, and the reverse path
+/// from a `shop.users` change must all read `shop.users`.
+#[tokio::test]
+async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create schema shop; create schema other; \
+             create table shop.users (id integer primary key, name text); \
+             create table shop.orders (id integer primary key, user_id integer, amount integer); \
+             create table other.users (id integer primary key, name text); \
+             alter table shop.users replica identity full; \
+             alter table shop.orders replica identity full; \
+             alter table other.users replica identity full; \
+             insert into shop.users values (1, 'a'), (2, 'b'); \
+             insert into shop.orders values (10, 1, 5), (11, 2, 7); \
+             insert into other.users values (1, 'wrong'), (2, 'wrong');",
+        )
+        .await
+        .expect("seed shop and other");
+    let shop_pool = search_path_pool(&db, "shop");
+    let other_pool = search_path_pool(&db, "other");
+
+    create_relationship(
+        &shop_pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer through shop's search_path");
+    install_definition(
+        &other_pool,
+        "TRANSFORM spend_by_name FROM shop.orders GROUP BY buyer.name \
+         SELECT SUM(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "other",
+    )
+    .await
+    .expect("install spend_by_name through other's search_path");
+    trellis::intake::publication::settle_registrations(&other_pool).await;
+    drain_to_quiescence(&other_pool, &mut client).await;
+    let expected = |a: &str, b: &str| {
+        vec![
+            ("a".to_string(), Some(a.to_string())),
+            ("b".to_string(), Some(b.to_string())),
+        ]
+    };
+    assert_eq!(
+        text_pairs(&client, "select name, total::text from other.spend_by_name").await,
+        expected("5", "7"),
+        "the direct build groups by shop.users.name"
+    );
+
+    client
+        .execute("insert into shop.orders values (12, 1, 100)", &[])
+        .await
+        .expect("insert a shop order");
+    stage_cdc(
+        &client,
+        "shop.orders",
+        "12",
+        "insert",
+        None,
+        Some(r#"{"id":"12","user_id":"1","amount":"100"}"#),
+    )
+    .await;
+    drain_to_quiescence(&other_pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, "select name, total::text from other.spend_by_name").await,
+        expected("105", "7"),
+        "the live apply joins shop.users for the new order's group"
+    );
+
+    // A change to `shop.users` itself reaches the aggregate through the
+    // reverse lookup, and regroups by the renamed `shop.users` row.
+    client
+        .execute("update shop.users set name = 'c' where id = 1", &[])
+        .await
+        .expect("rename a shop user");
+    stage_cdc(
+        &client,
+        "shop.users",
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"a"}"#),
+        Some(r#"{"id":"1","name":"c"}"#),
+    )
+    .await;
+    drain_to_quiescence(&other_pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, "select name, total::text from other.spend_by_name").await,
+        vec![
+            ("b".to_string(), Some("7".to_string())),
+            ("c".to_string(), Some("105".to_string())),
+        ],
+        "a shop.users rename regroups user 1's orders"
+    );
 }

@@ -448,6 +448,69 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
     );
 }
 
+/// Issue #392 on the reverse path: a `recompute` of parent `posts` row 1,
+/// folded with that row's own CDC update, still re-derives the from-side
+/// groups that read it. Without it the fold leaves a plain parent update,
+/// whose reverse delta lands on whatever stale value the recompute was
+/// staged to repair (here `rust`'s total, 1000 too high).
+#[tokio::test]
+async fn a_parent_recompute_folded_with_its_update_still_rederives_the_from_side_groups() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .batch_execute(
+            "update tag_totals set total_words = total_words + 1000 where tag = 'rust'; \
+             update posts set word_count = 400 where id = 1",
+        )
+        .await
+        .expect("make rust stale, then update post 1");
+    // Above the build's recompute horizon, so the delta isn't re-derived
+    // on that account.
+    let lsn: PgLsn = client
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the WAL insert position")
+        .get(0);
+    let lsn = u64::from(lsn);
+    stage_cdc_at_lsn(&client, "posts", "1", "recompute", None, None, lsn).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "update",
+        Some("{\"id\":1,\"word_count\":100}"),
+        Some("{\"id\":1,\"word_count\":400}"),
+        lsn,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("650".to_string())))
+    );
+    assert_eq!(
+        totals.get("db"),
+        Some(&(Some("2".to_string()), Some("400".to_string())))
+    );
+}
+
 // ---------------------------------------------------------------------
 // 2. N parent changes to the same key in one batch fold to one record.
 // ---------------------------------------------------------------------

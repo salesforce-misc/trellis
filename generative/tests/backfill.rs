@@ -12,22 +12,15 @@
 //! folds a post-build CDC delta onto the directly-built row (the build/CDC
 //! fence).
 //!
-//! **Why the mid-test `quiesce` is load-bearing.** Phase 1's `install` starts
-//! the engine client (its source-table set is non-empty), which creates the
-//! replication slot; the seed inserts that follow are therefore captured by
-//! CDC and staged into the ring as `Recompute` markers. Without draining them
-//! first, those markers stay *pending* — and the moment phase 2 persists the
-//! definition, the applier folds them onto the freshly-created target,
-//! computing the very same values the direct build would. That masks M3
-//! completely: the test would still pass even if `install_definition`'s
-//! `backfill_definition` call were a no-op (the CDC fold, not the direct
-//! build, would be doing the work). Quiescing *before* the definition exists
-//! drains those seed markers while no definition references the source, so
-//! they fold into nothing and leave the ring empty. After that, the direct
-//! build is the *only* thing that can populate the target — which is exactly
-//! the real M3 production scenario (a new definition installed over a source
-//! already live under CDC with pre-existing rows), and what makes this test
-//! actually discriminate: no-op the direct build and it fails.
+//! **Why the target can only come from the build.** Phase 1's `install`
+//! starts the engine client, but no definition reads the source yet, so the
+//! staging worker doesn't publish it (it publishes exactly what registered
+//! definitions read, issue #427): the seed inserts are never streamed, and no
+//! CDC fold can stand in for the build. The table joins the publication only
+//! once phase 2's definition registers, and the discharge of its join marker
+//! dispatches the build. So the build is the *only* thing that can populate
+//! the target: no-op it and this test fails. The mid-test `quiesce` is kept
+//! so that stays true should an unread table ever be streamed again.
 
 use std::time::{Duration, Instant};
 
@@ -104,11 +97,9 @@ async fn direct_backfill_builds_the_target_from_preexisting_source_rows() {
             .expect("seed source row");
     }
 
-    // Drain the CDC markers the seed inserts staged, *before* any definition
-    // exists to fold them onto. This is what forces the target to be built by
-    // the direct backfill alone in phase 2 rather than by a still-pending CDC
-    // fold — see this module's doc comment. Remove it and the test silently
-    // stops testing M3 (it would pass even against a no-op direct build).
+    // Drain anything the seed inserts staged *before* any definition exists
+    // to fold it onto, so the target can only be built by the backfill in
+    // phase 2 — see this module's doc comment.
     backend
         .quiesce()
         .await
@@ -261,9 +252,8 @@ async fn quiesce_blocks_until_a_slow_backfill_actually_reaches_live() {
 
     // Phase 1, exactly like `direct_backfill_builds_the_target_from_preexisting_source_rows`
     // above: install only the source table, seed rows into it, then quiesce
-    // *before* the definition exists so the seed CDC markers drain into
-    // nothing rather than being available for the applier to (mis)use in
-    // place of the direct build.
+    // *before* the definition exists, so nothing staged is left for the
+    // applier to (mis)use in place of the build.
     let source_only = Program {
         tables: vec![source.clone()],
         relationships: Vec::new(),

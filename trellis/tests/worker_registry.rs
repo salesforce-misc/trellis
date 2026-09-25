@@ -409,7 +409,6 @@ async fn a_staging_only_client_never_registers_a_worker_row() {
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 0,
-        source_tables: vec![format!("{DEFAULT_SCHEMA}.orders")],
         ..Default::default()
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");

@@ -205,10 +205,6 @@ async fn spike_a_real_replication_delivers_both_parent_images_on_an_author_chang
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 0,
-        source_tables: vec![
-            format!("{DEFAULT_SCHEMA}.posts"),
-            format!("{DEFAULT_SCHEMA}.post_tags"),
-        ],
         ..Default::default()
     };
     let _client = TrellisClient::start(db.dsn(), options).expect("client start");

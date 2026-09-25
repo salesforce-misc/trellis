@@ -57,10 +57,11 @@ missing some. A `live` transform that gets a catch-up of its own (an
 `ALTER TRANSFORM` that adds columns, a column resumed from quarantine) reports
 `catching_up` again until that has run.
 
-*Planned (#427):* `DROP` still changes the publication from the process that
-applies it, so a process that drops transforms still needs publication
-privileges; the decided design moves that shrink to the staging worker's
-reconcile pass, driven from the catalog.
+Dropping a transform is the same: `DROP` removes catalog rows and nothing else,
+and the worker takes the source out of the publication on its next reconcile
+pass once nothing reads it (#427). The worker also doesn't need any transforms
+registered before it starts; it picks up each one on the pass after `apply`
+registers it.
 
 ```rust
 // The one dedicated worker process for this fleet.

@@ -131,12 +131,14 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The projection's quoted, schema-qualified name, so a read never depends on
+/// `search_path` order.
 async fn projection_table(pool: &trellis::Pool, relationship: &RelationshipDefinition) -> String {
     relationship_projection(pool, relationship.id)
         .await
         .expect("read the projection catalog row")
         .expect("a to-one relationship has a projection")
-        .projection_table
+        .qualified_table()
 }
 
 /// A hand-staged source change, standing in for intake.

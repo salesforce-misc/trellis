@@ -444,6 +444,17 @@ log.
   This removes `reconcile_publication_after_drop`, stops treating the startup
   `source_tables` copy as a permanent floor, and supersedes
   [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time".
+  **Done (#427).** `ClientOptions::source_tables` is deleted rather than kept
+  as an additive list for engine-level callers: any list the worker unions in
+  is a second source of truth, and one that outlives the definitions behind
+  it re-adds a dropped table on every pass. The worker reads
+  `defs::publication_tables` at startup (`setup_staging`) and on every
+  reconcile pass, and nothing else. A caller that wants a table published
+  registers a definition that reads it. With the list gone, a staging worker
+  no longer needs a definition to start (`TrellisError::NoDefinitions` and
+  `ClientError::NoSourceTables` are removed): it starts with an empty
+  publication and adds each table on the pass after something registers a
+  reader.
 - **A ring read is one transaction (known limitation).** The ring
   enumeration stages one `Recompute` row per source key inside the discharge
   transaction. That's the `Unsupported` fallback's whole build, and it's also
@@ -467,7 +478,7 @@ happens, and its role in this design.
 
 | Path | Where in code | Role in the design |
 |---|---|---|
-| Fresh-install handshake read | was `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | **Retired (#417).** `create_slot_and_park_markers` creates the slot, seeds `replication_progress`, and parks a marker on every configured source table in the same transaction, after slot creation returns. It reads nothing, the same shape slot-loss recovery (`intake::slot_loss`) already has. The discharge skips a table no definition reads (`defs::catalog::table_has_reader`) |
+| Fresh-install handshake read | was `intake::publication::initial_snapshot_handshake`, called by `client::setup_staging` when the slot is new | **Retired (#417).** `create_slot_and_park_markers` creates the slot, seeds `replication_progress`, and parks a marker on every table the catalog says to publish in the same transaction, after slot creation returns. It reads nothing, the same shape slot-loss recovery (`intake::slot_loss`) already has. The discharge skips a table no definition reads (`defs::catalog::table_has_reader`) |
 | Ring enumeration inside registration | was `defs::catalog::create_definition_inner`'s `enumerate_and_append`, reached through `create_definition` and `install_definition`'s `Unsupported` fallback | **Done (#418).** The discharge's ring fallback does it (`intake::publication::run_pending_backfills`, dispatch by shape). `create_definition` survives only as a test fixture that stands in for that discharge |
 | Plain 1-1 chunk enqueue at registration | was `install_definition` → `install_plain_one_to_one` → `chunk_queue::enqueue_one_to_one` | **Done (#418).** The discharge plans the chunks and enqueues them in its own transaction (`chunk_queue::dispatch_one_to_one`); drain threads still execute them |
 | Synchronous direct build inside registration | was `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | **Done (#419).** The discharge dispatches it as one background job (`chunk_queue::dispatch_direct_build`) that a drain thread runs ([The direct-build job](#the-direct-build-job)) |
@@ -478,7 +489,7 @@ happens, and its role in this design.
 | Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue`, all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge flips the definition `live` (`go_live_caught_up`, #476) |
 | Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call. The definition is `catching_up` until the marker discharges (#476) |
 | `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | Separate: a redefinition-side capture that reads the added columns' values in-call. The definition is `catching_up` until the marker discharges (#476) |
-| Publication change on `DROP` | `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | Moves to the staging worker: a `DROP` only removes catalog rows, and the worker's reconcile pass shrinks the publication from the catalog. `reconcile_publication_after_drop` is removed, and the startup `source_tables` copy stops being a permanent floor. Supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time" |
+| Publication change on `DROP` | was `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | **Done (#427).** A `DROP` only removes catalog rows, and the staging worker's reconcile pass (`client::reconcile_source_tables`) shrinks the publication from the catalog. `ClientOptions::source_tables`, the startup copy that used to act as a permanent floor, is deleted. Supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time" |
 
 ## Open questions
 

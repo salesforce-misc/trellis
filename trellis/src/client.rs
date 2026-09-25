@@ -20,14 +20,14 @@
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
 //!
-//! **Source-table discovery**: the catalog (`defs::catalog`) has no "list
-//! every distinct source table" query — only per-table lookups
-//! (`transforms_for_source`, `source_table_version`) — so rather than add
-//! one speculatively, [`ClientOptions::source_tables`] takes an explicit,
-//! fully-qualified (`"schema.table"`) list. An embedder that wants
-//! catalog-derived discovery can build that list itself from whatever
-//! tracks its own transform definitions and pass it in; this keeps the
-//! catalog's read surface exactly what stage 05 needed and no more.
+//! **Which tables to publish** (issue #427, ADR-0016): the staging worker
+//! derives them from the catalog alone ([`defs::publication_tables`]), at
+//! startup and on every reconcile pass. There is no caller-supplied list: a
+//! table joins the publication once a registered definition reads it and
+//! leaves once none does, and the staging worker is the only process that
+//! changes the publication, including after a `DROP`. A staging worker may
+//! start with an empty catalog; it publishes nothing until something is
+//! registered.
 //!
 //! **Wake channel**: [`ClientOptions::wake_channel`] is the one Postgres
 //! `LISTEN/NOTIFY` channel intake's linchpin (`stage_and_advance`), the
@@ -67,8 +67,7 @@ use crate::staging::{
 ///
 /// Every field beyond `staging_worker`/`application_threads` has a sensible
 /// default (see [`Default`]) — most embedders should only need to set the
-/// two the constructor contract calls out, plus `source_tables` if
-/// `staging_worker` is set.
+/// two the constructor contract calls out.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     /// Whether this client owns CDC intake and ring maintenance
@@ -78,10 +77,6 @@ pub struct ClientOptions {
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
     pub application_threads: usize,
-    /// Fully-qualified (`"schema.table"`) source tables intake should
-    /// publish and stream. Only consulted when `staging_worker` is set;
-    /// required (non-empty) in that case.
-    pub source_tables: Vec<String>,
     /// The logical replication slot name intake owns.
     pub slot: String,
     /// The publication name intake reconciles membership against. Created
@@ -107,15 +102,16 @@ pub struct ClientOptions {
     /// How often the maintenance loop (seal/recover/reclaim) ticks.
     pub maintenance_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
-    /// set from `transform_definitions` (issue #14) and re-runs
+    /// set from the catalog (issue #14) and re-runs
     /// [`intake::publication::reconcile_publication`] /
     /// [`intake::publication::run_pending_backfills`] against it — so a
-    /// transform registered against a table not in `source_tables` at
-    /// [`Client::start`] time still gets published and backfilled without a
-    /// restart. Coarser than `maintenance_interval` by default: unlike
-    /// seal/reclaim, this does a catalog query and (when a table is newly
-    /// added) an `ALTER PUBLICATION` plus a full backfill enumeration, none
-    /// of which need sub-second freshness.
+    /// transform registered while the client runs gets published and
+    /// backfilled without a restart, and a table whose last reader was
+    /// dropped leaves the publication (issue #427). Coarser than
+    /// `maintenance_interval` by default: unlike seal/reclaim, this does a
+    /// catalog query and (when a table is newly added) an `ALTER
+    /// PUBLICATION` plus a full backfill enumeration, none of which need
+    /// sub-second freshness.
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.
@@ -154,7 +150,6 @@ impl Default for ClientOptions {
         Self {
             staging_worker: false,
             application_threads: 0,
-            source_tables: Vec::new(),
             slot: "trellis_slot".to_string(),
             publication: "trellis_pub".to_string(),
             wake_channel: "trellis_wake".to_string(),
@@ -174,9 +169,6 @@ impl Default for ClientOptions {
 /// The option checks [`Client::start_with_config`] runs before spawning
 /// anything, split out so they're unit-testable without a database.
 fn validate_options(options: &ClientOptions) -> Result<(), ClientError> {
-    if options.staging_worker && options.source_tables.is_empty() {
-        return Err(ClientError::NoSourceTables);
-    }
     if options.heartbeat.interval.saturating_mul(2) > options.reclaim_ttl {
         return Err(ClientError::HeartbeatNotUnderReclaimTtl {
             heartbeat_interval: options.heartbeat.interval,
@@ -198,9 +190,6 @@ fn validate_options(options: &ClientOptions) -> Result<(), ClientError> {
 /// message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
 pub enum ClientError {
-    /// `staging_worker` was set but `source_tables` was empty — nothing to
-    /// publish or stream.
-    NoSourceTables,
     /// `heartbeat.interval` is more than half of `reclaim_ttl`. Claims
     /// would go stale between two refreshes of a live worker and be
     /// reclaimed and re-run by a peer while the worker is still running
@@ -226,6 +215,8 @@ pub enum ClientError {
     /// runs itself (publication existence check/creation, the
     /// `replication_progress` existence check).
     Db(tokio_postgres::Error),
+    /// Reading the catalog for the tables to publish at startup failed.
+    Catalog(CatalogError),
     /// A failure from the staging ring (session guards, seal, liveness).
     Staging(StagingError),
     /// A failure from CDC intake (connect, publication/slot setup, run).
@@ -241,16 +232,13 @@ impl ClientError {
     /// category this crate already has one for.
     pub fn code(&self) -> ErrorCode {
         match self {
-            // `staging_worker` set with no source tables is a rejected
-            // call, same category as any other invalid-configuration error.
-            ClientError::NoSourceTables | ClientError::HeartbeatNotUnderReclaimTtl { .. } => {
-                ErrorCode::Validation
-            }
+            ClientError::HeartbeatNotUnderReclaimTtl { .. } => ErrorCode::Validation,
             ClientError::Spawn(_)
             | ClientError::ThreadExitedBeforeReady
             | ClientError::ThreadPanicked => ErrorCode::Internal,
             ClientError::Config(err) => err.code(),
             ClientError::Db(err) => error_code::classify_pg_error(err),
+            ClientError::Catalog(err) => err.code(),
             ClientError::Staging(err) => err.code(),
             ClientError::Intake(err) => err.code(),
             ClientError::Apply(err) => err.code(),
@@ -261,11 +249,6 @@ impl ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::NoSourceTables => write!(
-                f,
-                "staging_worker is set but ClientOptions::source_tables is empty; nothing to \
-                 publish or stream"
-            ),
             ClientError::HeartbeatNotUnderReclaimTtl {
                 heartbeat_interval,
                 reclaim_ttl,
@@ -293,6 +276,7 @@ impl fmt::Display for ClientError {
                 write!(f, "client setup database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
+            ClientError::Catalog(err) => write!(f, "{err}"),
             ClientError::Staging(err) => write!(f, "{err}"),
             ClientError::Intake(err) => write!(f, "{err}"),
             ClientError::Apply(err) => write!(f, "{err}"),
@@ -306,11 +290,11 @@ impl std::error::Error for ClientError {
             ClientError::Spawn(err) => Some(err),
             ClientError::Config(err) => Some(err),
             ClientError::Db(err) => Some(err),
+            ClientError::Catalog(err) => Some(err),
             ClientError::Staging(err) => Some(err),
             ClientError::Intake(err) => Some(err),
             ClientError::Apply(err) => Some(err),
-            ClientError::NoSourceTables
-            | ClientError::HeartbeatNotUnderReclaimTtl { .. }
+            ClientError::HeartbeatNotUnderReclaimTtl { .. }
             | ClientError::ThreadExitedBeforeReady
             | ClientError::ThreadPanicked => None,
         }
@@ -320,6 +304,12 @@ impl std::error::Error for ClientError {
 impl From<crate::error::Error> for ClientError {
     fn from(err: crate::error::Error) -> Self {
         ClientError::Config(err)
+    }
+}
+
+impl From<CatalogError> for ClientError {
+    fn from(err: CatalogError) -> Self {
+        ClientError::Catalog(err)
     }
 }
 
@@ -592,7 +582,6 @@ async fn run(
             schema: config.schema().to_string(),
             pool: pool.clone(),
             publication: options.publication.clone(),
-            base_source_tables: options.source_tables.clone(),
             wake_channel: options.wake_channel.clone(),
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
@@ -892,10 +881,14 @@ fn uniqueish_id() -> String {
 // Staging setup: publication + slot
 // ---------------------------------------------------------------------
 
-/// Reconciles the publication's membership against
-/// `options.source_tables`, then creates the slot if it is fresh (no
-/// `replication_progress` row yet), parking a backfill marker on every source
-/// table ([`intake::publication::create_slot_and_park_markers`]). For an
+/// Reconciles the publication's membership against the tables the catalog
+/// says to publish ([`defs::publication_tables`], the same set every
+/// [`reconcile_source_tables`] pass derives), then creates the slot if it is
+/// fresh (no `replication_progress` row yet), parking a backfill marker on
+/// every one of those tables
+/// ([`intake::publication::create_slot_and_park_markers`]). An empty catalog
+/// is fine: the publication and slot start empty, and the maintenance loop
+/// adds each table once something registered reads it. For an
 /// existing slot, first recovers from that slot's loss if it has been lost
 /// ([`intake::slot_loss::pause_if_slot_lost`], issue #310). Either way, every
 /// backfill marker is left for the maintenance loop (issue #312; see the
@@ -916,15 +909,12 @@ async fn setup_staging(
     options: &ClientOptions,
     pool: &Pool,
 ) -> Result<(), ClientError> {
+    let tables = defs::publication_tables(pool).await?;
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
 
     ensure_publication_exists(session.client(), &options.publication).await?;
-    intake::publication::reconcile_publication(
-        session.client_mut(),
-        &options.publication,
-        &options.source_tables,
-    )
-    .await?;
+    intake::publication::reconcile_publication(session.client_mut(), &options.publication, &tables)
+        .await?;
 
     let has_progress: bool = session
         .client()
@@ -960,12 +950,8 @@ async fn setup_staging(
         // Issue #417: reads nothing. For the same reason as above, the
         // markers this parks are discharged by the maintenance loop once
         // intake is running.
-        intake::publication::create_slot_and_park_markers(
-            &mut session,
-            &options.slot,
-            &options.source_tables,
-        )
-        .await?;
+        intake::publication::create_slot_and_park_markers(&mut session, &options.slot, &tables)
+            .await?;
     }
 
     // Release the producer singleton on the server before `Intake::connect`
@@ -1060,7 +1046,6 @@ struct MaintenanceConfig {
     schema: String,
     pool: Pool,
     publication: String,
-    base_source_tables: Vec<String>,
     wake_channel: String,
     interval: Duration,
     reclaim_ttl: Duration,
@@ -1089,7 +1074,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         schema,
         pool,
         publication,
-        base_source_tables,
         wake_channel,
         interval,
         reclaim_ttl,
@@ -1201,7 +1185,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     c,
                     &pool,
                     &publication,
-                    &base_source_tables,
                     &wake_channel,
                     &watermark,
                     backfill_catch_up_timeout,
@@ -1371,17 +1354,20 @@ impl From<IntakeError> for ReconcileError {
 /// stay `waiting_to_backfill`.
 const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Issue #14: re-derives the desired source-table set as the union of
-/// `base_source_tables` (whatever [`ClientOptions::source_tables`] was at
-/// [`Client::start`] time — kept so an embedder that only ever passes an
-/// explicit list, with no `transform_definitions` row for a table, still
-/// gets exactly the old, static behavior) and every source table
-/// [`defs::all_source_tables`] finds registered in the catalog right now,
-/// then reconciles the publication and discharges any resulting backfill
-/// against that set, re-run periodically so a transform registered against a
-/// new table while this client is already running is picked up without a
-/// restart. [`setup_staging`] reconciles once at startup but leaves the
-/// discharge to this function's first run, once intake is up.
+/// Issue #14: re-derives the desired source-table set from the catalog
+/// ([`defs::publication_tables`]), then reconciles the publication and
+/// discharges any resulting backfill against that set, re-run periodically
+/// so a transform registered against a new table while this client is
+/// already running is picked up without a restart. [`setup_staging`]
+/// reconciles once at startup but leaves the discharge to this function's
+/// first run, once intake is up.
+///
+/// Issue #427, ADR-0016: the catalog is the only input. Nothing else keeps a
+/// table published, so a table leaves the publication on the first pass
+/// after its last reader is dropped, and this is the only place that happens:
+/// a `DROP` removes catalog rows and nothing more. (A startup copy of the set
+/// used to be unioned in as a permanent floor, which re-added a table
+/// registered before the worker started on every pass after its drop.)
 ///
 /// Issue #75, ADR-0007: [`defs::all_source_tables`] returns each table's own
 /// actual, already-persisted qualified identity — this used to instead
@@ -1403,16 +1389,12 @@ async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     publication: &str,
-    base_source_tables: &[String],
     wake_channel: &str,
     watermark: &staging::StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), ReconcileError> {
-    let mut desired: std::collections::BTreeSet<String> =
-        base_source_tables.iter().cloned().collect();
-    desired.extend(defs::publication_tables(pool).await?);
-    let desired: Vec<String> = desired.into_iter().collect();
+    let desired = defs::publication_tables(pool).await?;
 
     intake::publication::reconcile_publication(client, publication, &desired).await?;
     // The markers whose discharge failed are already logged and backed off on
@@ -2661,7 +2643,6 @@ mod maintenance_failure_tests {
             schema: "no_trellis_here".to_string(),
             pool,
             publication: "test_pub".to_string(),
-            base_source_tables: Vec::new(),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             reclaim_ttl: Duration::from_secs(30),
@@ -2696,11 +2677,6 @@ mod maintenance_failure_tests {
 #[cfg(test)]
 mod error_code_tests {
     use super::*;
-
-    #[test]
-    fn no_source_tables_is_validation() {
-        assert_eq!(ClientError::NoSourceTables.code(), ErrorCode::Validation);
-    }
 
     #[test]
     fn thread_panicked_is_internal() {
@@ -3034,7 +3010,6 @@ mod backfill_shutdown_tests {
             schema: DEFAULT_SCHEMA.to_string(),
             pool,
             publication: "test_pub".to_string(),
-            base_source_tables: vec!["public.s".to_string()],
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(50),
             reclaim_ttl: Duration::from_secs(30),
@@ -3089,6 +3064,211 @@ mod backfill_shutdown_tests {
         assert_eq!(
             markers, 1,
             "the deferred marker must survive for the next start"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    //! Issue #427, ADR-0016: the staging worker's reconcile pass is the only
+    //! thing that changes the publication, and the catalog is its only source
+    //! of truth for what to publish. These call [`reconcile_source_tables`]
+    //! directly rather than waiting on a running client (#297).
+    use super::*;
+    use crate::config::DEFAULT_SCHEMA;
+    use crate::defs::ast::ValueType;
+
+    const PUBLICATION: &str = "test_pub";
+
+    struct Fixture {
+        raw: tokio_postgres::Client,
+        pool: Pool,
+        _db: testkit::TestDatabase,
+        _cluster: testkit::TestCluster,
+    }
+
+    /// `public.s`, already published (as the worker's startup reconcile
+    /// left it), with one registered definition per name in `readers`.
+    async fn fixture(readers: &[&str]) -> Fixture {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+            .await
+            .expect("connect");
+        raw.batch_execute(&format!(
+            "create table public.s (id bigint primary key, a numeric); \
+             insert into public.s (id, a) select g, g from generate_series(1, 5) g; \
+             create publication {PUBLICATION} for table public.s;"
+        ))
+        .await
+        .expect("seed a published source table");
+        // `testkit`'s pool is the published crate's `Pool`, a different type
+        // from this `--lib` build's own, so build one from the same DSN.
+        let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("valid config"))
+            .expect("build a same-crate pool");
+        let columns = std::collections::HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        for reader in readers {
+            defs::install_definition(
+                &pool,
+                &format!("TRANSFORM {reader} FROM s SELECT a + 1 AS f"),
+                &columns,
+                "public",
+            )
+            .await
+            .expect("register a reader of `s`");
+        }
+        Fixture {
+            raw,
+            pool,
+            _db: db,
+            _cluster: cluster,
+        }
+    }
+
+    async fn drop_reader(pool: &Pool, target: &str) {
+        defs::lifecycle::pause_transform(pool, target)
+            .await
+            .expect("pause");
+        let outcome = defs::lifecycle::drop_transform(pool, target)
+            .await
+            .expect("drop");
+        assert_eq!(outcome, defs::lifecycle::DropOutcome::Dropped);
+    }
+
+    /// One pass of the staging worker's reconcile, as the maintenance loop
+    /// runs it. Intake never runs here, so a marker's discharge could only
+    /// wait out the catch-up timeout: keep it short.
+    async fn reconcile_pass(f: &mut Fixture) {
+        reconcile_source_tables(
+            &mut f.raw,
+            &f.pool,
+            PUBLICATION,
+            "wake",
+            &staging::StagedWatermark::new(),
+            Duration::from_millis(200),
+            &|| false,
+        )
+        .await
+        .expect("reconcile pass");
+    }
+
+    async fn is_published(raw: &tokio_postgres::Client) -> bool {
+        raw.query_one(
+            "select exists(select 1 from pg_publication_tables \
+             where pubname = $1 and schemaname = 'public' and tablename = 's')",
+            &[&PUBLICATION],
+        )
+        .await
+        .expect("read publication membership")
+        .get(0)
+    }
+
+    async fn marker_count(raw: &tokio_postgres::Client) -> i64 {
+        raw.query_one(
+            "select count(*) from pending_backfill where table_name = 'public.s'",
+            &[],
+        )
+        .await
+        .expect("count markers")
+        .get(0)
+    }
+
+    /// The table was registered (and published) before the worker started.
+    /// The facade used to hand the worker a startup copy of the publication
+    /// set, which every pass unioned back in, so after the drop the table was
+    /// re-added (with a fresh marker) on every pass until a restart. Dropping
+    /// its last reader must take it out of the publication on the next pass
+    /// and keep it out.
+    #[tokio::test]
+    async fn a_pass_after_the_last_reader_drops_unpublishes_the_table_for_good() {
+        let mut f = fixture(&["t"]).await;
+        drop_reader(&f.pool, "t").await;
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            !is_published(&f.raw).await,
+            "the pass removes a table nothing reads any more"
+        );
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            !is_published(&f.raw).await,
+            "a later pass must not add it back"
+        );
+        assert_eq!(
+            marker_count(&f.raw).await,
+            0,
+            "no capture marker is parked for a table nothing reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_with_a_remaining_reader_stays_published() {
+        let mut f = fixture(&["t", "u"]).await;
+        drop_reader(&f.pool, "t").await;
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            is_published(&f.raw).await,
+            "`u` still reads `s`, so it stays published"
+        );
+    }
+
+    /// Issue #427: a staging worker may start with nothing registered, so its
+    /// publication starts empty. The pass after the first registration must
+    /// add the table and leave the registration with a capture (a marker, or
+    /// already dispatched by the same pass's discharge), not stranded
+    /// `waiting_to_backfill` with nothing to discharge it.
+    #[tokio::test]
+    async fn a_first_registration_after_an_empty_start_joins_the_publication() {
+        let mut f = fixture(&[]).await;
+        f.raw
+            .batch_execute(&format!(
+                "alter publication {PUBLICATION} drop table public.s"
+            ))
+            .await
+            .expect("start from an empty publication");
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            !is_published(&f.raw).await,
+            "nothing reads `s` yet, so the pass leaves it out"
+        );
+
+        let columns = std::collections::HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        defs::install_definition(
+            &f.pool,
+            "TRANSFORM t FROM s SELECT a + 1 AS f",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register the first reader");
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            is_published(&f.raw).await,
+            "the pass after the first registration publishes its source"
+        );
+        let status: String = f
+            .raw
+            .query_one(
+                "select status from transform_definitions where target_table = 'public.t'",
+                &[],
+            )
+            .await
+            .expect("read status")
+            .get(0);
+        assert!(
+            status != "waiting_to_backfill" || marker_count(&f.raw).await == 1,
+            "the registration is captured: dispatched, or its join marker is still parked \
+             (status {status})"
         );
     }
 }
