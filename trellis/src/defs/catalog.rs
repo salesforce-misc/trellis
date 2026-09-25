@@ -6338,6 +6338,57 @@ mod column_dependents_tests {
     }
 }
 
+/// Issue #487: the `ALTER` type-change guard reads a mixed-case target's
+/// column, not the nonexistent lower-case table an unquoted `to_regclass`
+/// folds its name to (which read as "no such column" and let the type change
+/// through).
+#[cfg(test)]
+mod type_changing_alter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_type_change_on_a_mixed_case_target_is_refused() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        client
+            .batch_execute(
+                "create schema \"Custom\"; \
+                 create table \"Custom\".\"Totals\" (id bigint primary key, total numeric)",
+            )
+            .await
+            .expect("seed the mixed-case target");
+
+        let field = FieldDef {
+            name: "total".to_string(),
+            expr: Expr::Column("a".to_string()),
+        };
+        let err = check_no_type_changing_alter_via(
+            &**client,
+            "Custom.Totals",
+            "Totals",
+            &field,
+            &HashMap::from([("total".to_string(), ValueType::Boolean)]),
+        )
+        .await
+        .expect_err("numeric to boolean is a type change");
+        assert!(
+            matches!(err, CatalogError::UnsupportedAlter(_)),
+            "expected UnsupportedAlter, got {err:?}"
+        );
+
+        check_no_type_changing_alter_via(
+            &**client,
+            "Custom.Totals",
+            "Totals",
+            &field,
+            &HashMap::from([("total".to_string(), ValueType::Numeric)]),
+        )
+        .await
+        .expect("an unchanged type passes");
+    }
+}
+
 #[cfg(test)]
 mod error_code_tests {
     use super::*;
