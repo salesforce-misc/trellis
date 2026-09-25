@@ -24,8 +24,8 @@ tokio-postgres = "0.7.13"
 #
 # Run the benchmark with:
 #   cargo run -p benchmark --features engine-access --release -- <args>
-# CI still type-checks it: `cargo clippy --all-targets --all-features` turns
-# this feature on.
+# CI still type-checks it, both under `--all-features` and on its own with
+# `cargo clippy -p benchmark --features engine-access` (issue #473).
 engine-access = ["trellis/test-util"]
 
 [[bin]]

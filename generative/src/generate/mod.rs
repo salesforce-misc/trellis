@@ -222,10 +222,7 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 
-use crate::model::{
-    Cardinality, Column, NamePool, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, Op,
-    OpOutcome, Program, Relationship, Table,
-};
+use crate::model::{Cardinality, Column, NamePool, Op, OpOutcome, Program, Relationship, Table};
 
 /// The inclusive upper bound of the calculated-field value domain.
 ///
@@ -2430,7 +2427,10 @@ pub fn adversarial_noise_table() -> Table {
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
-    use crate::model::{DbAdminAction, DbAdminEvent, DbAdminPlan, RestartMode, SlotLossKind};
+    use crate::model::{
+        DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent, NoiseEventKind,
+        NoisePlan, RestartMode, SlotLossKind,
+    };
     use proptest::prelude::*;
 
     /// One in this many awkward-value draws comes back `None` (SQL `NULL`)

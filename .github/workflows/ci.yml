@@ -33,7 +33,17 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # `--all-features` alone makes code whose only caller is feature-gated
+        # look live, so dead code and unused imports in narrower builds slip
+        # through (issue #473). The extra runs cover the feature sets that
+        # actually get built: the production default, and trellis with
+        # `test-util` but not `internals` (benchmark, generative's
+        # engine_subprocess). They share the build cache with the first.
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --workspace -- -D warnings
+          cargo clippy -p benchmark --features engine-access -- -D warnings
+          cargo clippy -p generative --features subprocess-backend -- -D warnings
 
       - name: Install PostgreSQL server binaries
         # the shared test harness (see testkit/src/cluster.rs) shells out to

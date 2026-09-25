@@ -562,6 +562,10 @@ const BACKFILL_CURSOR: &str = "trellis_backfill_cursor";
 /// enumerates its source exactly once here regardless of how many
 /// calculated fields it declares, preserving the "N columns, one backfill"
 /// property as the definition model becomes first-class.
+///
+/// Its only caller is the `create_definition` test fixture, so it carries the
+/// same gate; production backfill drives the two halves itself.
+#[cfg(any(test, feature = "internals"))]
 pub(crate) async fn enumerate_and_append(
     txn: &Transaction<'_>,
     src_table: &str,

@@ -51,7 +51,9 @@ pub struct Pool {
     /// [`Pool::schema`].
     schema: String,
     /// A copy of the [`Config::target_schema`] this pool was built from —
-    /// see [`Pool::target_schema`].
+    /// see [`Pool::target_schema`]. Only the test-fixture registration
+    /// entry points read it, so it is compiled out of production builds.
+    #[cfg(any(test, feature = "test-util"))]
     target_schema: String,
 }
 
@@ -108,6 +110,7 @@ impl Pool {
         Ok(Self {
             inner,
             schema: config.schema().to_string(),
+            #[cfg(any(test, feature = "test-util"))]
             target_schema: config.target_schema().to_string(),
         })
     }
@@ -145,7 +148,8 @@ impl Pool {
     /// [`crate::defs::catalog::create_definition_without_backfill`] — the
     /// ring-path entry points, which take no `target_schema` parameter of
     /// their own — can qualify a definition's target table the same way,
-    /// without widening their public signature.
+    /// without widening their public signature. Gated like its only callers.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn target_schema(&self) -> &str {
         &self.target_schema
     }
