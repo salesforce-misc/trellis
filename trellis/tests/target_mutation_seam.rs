@@ -845,7 +845,7 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
             src_table: "public.orders".to_string(),
             key: "1".to_string(),
             op: trellis::staging::CdcOp::Update,
-            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            lsn: Some(testkit::wal_insert_lsn(&txn).await),
             old_image: Some(r#"{"id":"1","a":"1"}"#.to_string()),
             new_image: Some(r#"{"id":"1","a":"100"}"#.to_string()),
             origin_lsn: None,

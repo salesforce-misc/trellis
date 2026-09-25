@@ -1339,7 +1339,7 @@ async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
 /// aggregate build's join, the live apply's `RelJoin`, and the reverse path
 /// from a `shop.users` change must all read `shop.users`.
 #[tokio::test]
-#[ignore = "real bug found by #512: see a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group"]
+#[ignore = "#516: the reverse fallback never re-derives the old group of a to-side rename; see a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group"]
 async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1441,7 +1441,8 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     );
 }
 
-/// Issue #512's reproduction, the smallest shape of the failure that made
+/// Issue #516's reproduction, found by #512: the smallest shape of the
+/// failure that made
 /// [`an_aggregate_joins_the_to_one_side_it_was_declared_against`] fail once
 /// its CDC was staged at real LSNs. An aggregate grouped by a to-one path
 /// (`buyer.name`); a new order for user 1 drains as an ordinary delta; then
@@ -1453,7 +1454,7 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
 /// At LSN 1 the drained order sat below the projection's LSN, the fast path
 /// ran, and its per-group diff emptied `a`.
 #[tokio::test]
-#[ignore = "real bug found by #512: the reverse fallback never re-derives the group a to-side change moves rows out of"]
+#[ignore = "#516: the reverse fallback never re-derives the group a to-side change moves rows out of"]
 async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
