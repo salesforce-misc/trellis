@@ -301,7 +301,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                         ""
                     },
                     match probes.last() {
-                        Some(last) if !last.kept_target_rate => format!(
+                        Some(last) if last.stops_ramp() => format!(
                             ", {} rows/sec not ({})",
                             last.target_rows_per_sec,
                             probe_outcome(last)
@@ -587,13 +587,19 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
 /// human-readable line.
 fn probe_outcome(probe: &throughput::ThroughputProbe) -> String {
     let applied = human_rate(probe.in_window_applied);
-    if probe.drained {
+    let outcome = if probe.drained {
         format!("applied {applied} while offered, drained within grace")
     } else {
         format!(
             "applied {applied} while offered, backlog {} after grace",
             probe.backlog_after_grace
         )
+    };
+    // A rate that reads as kept would otherwise sit next to a NO (#509).
+    if probe.counter_disagrees() {
+        format!("void, the applied-changes counter disagrees with the rows committed; {outcome}")
+    } else {
+        outcome
     }
 }
 
@@ -950,6 +956,52 @@ mod tests {
                 "applied {changes_applied} of {rows_issued}: {json}"
             );
         }
+    }
+
+    /// Issue #509: a probe voided by its counter reads as failed, but it
+    /// measured nothing, so the ramp steps past it and finds the knee above
+    /// it instead of reporting the rate below it.
+    #[test]
+    fn a_void_probe_neither_stops_the_ramp_nor_is_the_knee() {
+        let at = |target: f64, applied: f64, rows_issued: u64, changes_applied: u64| {
+            throughput::ThroughputProbe {
+                target_rows_per_sec: target,
+                achieved_rows_per_sec: target,
+                in_window_applied: Some(fit(applied)),
+                kept_target_rate: throughput::probe_kept_target_rate(
+                    true,
+                    Some(fit(applied)),
+                    target,
+                    target,
+                    changes_applied,
+                    rows_issued,
+                ),
+                ..probe(rows_issued, changes_applied)
+            }
+        };
+        let probes = [
+            at(50_000.0, 50_000.0, 500_000, 500_000),
+            // #423: re-staged mid-window, so the counter ran past the rows.
+            at(100_000.0, 100_000.0, 1_000_000, 1_400_000),
+            // #266: drained, but the counter missed rows.
+            at(125_000.0, 125_000.0, 1_250_000, 1_200_000),
+            at(150_000.0, 150_000.0, 1_500_000, 1_500_000),
+            // Genuinely slow: half its target while offered.
+            at(200_000.0, 100_000.0, 2_000_000, 2_000_000),
+        ];
+        for void in &probes[1..3] {
+            assert!(!void.kept_target_rate);
+            assert!(void.counter_disagrees());
+            assert!(
+                probe_outcome(void).starts_with("void"),
+                "{}",
+                probe_outcome(void)
+            );
+        }
+        let stops: Vec<bool> = probes.iter().map(|p| p.stops_ramp()).collect();
+        assert_eq!(stops, [false, false, false, false, true]);
+        let knee = throughput::knee(&probes).expect("150k kept its rate");
+        assert_eq!(knee.target_rows_per_sec, 150_000.0);
     }
 
     /// Issue #319: a probe applying at half its target drains a short

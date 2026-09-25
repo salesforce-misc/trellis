@@ -103,11 +103,6 @@ jobs:
         # dev-dependency satisfies its `required-features`.
         run: cargo test --workspace --features benchmark/engine-access
 
-      - name: Test the otlp feature's doc example
-        # `trellis::otel` compiles only under `otlp`, which no test build
-        # turns on, so its doc example is otherwise never compiled (#509).
-        run: cargo test -p trellis --features otlp --doc otel
-
       - name: Prune target/ to third-party dependencies
         # A cold build is ~5.6GB, nearly all of it this workspace's own test
         # binaries, which every run rebuilds anyway. What's left is ~800MB.

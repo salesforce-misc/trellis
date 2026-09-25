@@ -76,7 +76,10 @@
 //!   alone is not a verdict: a pipeline at half the target still drains a
 //!   20s window inside a 30s grace (issue #319). The ramp's knee is the
 //!   highest rate that kept its target, and the ramp stops at the first that
-//!   didn't.
+//!   didn't. A probe whose applied-changes counter disagrees with the rows
+//!   it committed (issues #266, #423) fails the run and reads
+//!   `kept_target_rate: false`, but it measured nothing, so the ramp steps
+//!   past it rather than stopping (issue #509).
 //! - `hop-ladder`'s T1 flags (`t1_*_pass`, `e2e_max_under_1s`) count rows
 //!   that never reached the terminal hop within the drain grace as misses
 //!   above every bound, rather than judging only the rows that landed.
