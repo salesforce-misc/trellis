@@ -150,11 +150,15 @@ pub async fn reconcile_publication(
             &[],
         )
         .await?;
-        // In the *same* transaction as the ADD, so the marker is exactly as
-        // durable as the join. Its fence is taken later, by the discharge
-        // that first reads the committed marker (issue #431, [`park_marker`]).
-        park_marker(&txn, table).await?;
     }
+    // In the *same* transaction as the ADDs, so each marker is exactly as
+    // durable as its join. Its fence is taken later, by the discharge that
+    // first reads the committed marker (issue #431, [`park_marker`]). A table
+    // normally joins with nothing applying from it yet. One that left the
+    // publication while something did (an operator dropped it) has missed
+    // everything written meanwhile, so its readers catch up (issue #522).
+    let joined: Vec<String> = to_add.iter().map(|t| t.to_string()).collect();
+    park_table_catch_ups(&txn, &joined).await?;
     park_registration_markers(&txn, desired_tables).await?;
     txn.commit().await?;
     Ok(())
@@ -243,11 +247,51 @@ pub(crate) async fn park_target_catchup_if_read(
     request_projection_refresh(client, &tables).await
 }
 
+/// Parks a marker on each of `tables` that re-reads it for definitions
+/// already applying from it, which may be missing changes to it that never
+/// reached them: a fresh install's slot ([`create_slot_and_park_markers`]),
+/// a table joining the publication ([`reconcile_publication`]) and an
+/// explicit re-backfill ([`crate::Trellis::request_backfill`], issue #522).
+///
+/// Each marker is a go-live catch-up ([`park_catch_up`]) for every applying
+/// definition that reads its table, directly or through a relationship
+/// ([`crate::defs::catalog::applying_readers`]). Such a reader reports
+/// `catching_up` until the discharge has re-read the table, which
+/// re-derives the rows it still has, and swept the reader's target of rows
+/// the table no longer backs, which no re-read reaches.
+///
+/// A table that is a relationship's to-side also has its settled projections
+/// refreshed by the discharge ([`request_projection_refresh`]): a to-one
+/// consumer reads the projection, never the table, and a re-read's
+/// image-less `Recompute` re-derives the consumer from the projection
+/// without correcting it. With no reader the marker is a plain one, and the
+/// refresh still runs, so a consumer registered later doesn't read a stale
+/// projection.
+pub(crate) async fn park_table_catch_ups(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<(), IntakeError> {
+    let mut readers = Vec::new();
+    let mut to_sides = Vec::new();
+    for table in tables {
+        readers.extend(crate::defs::catalog::applying_readers(client, table).await?);
+        if is_relationship_to_side(client, table).await? {
+            to_sides.push(table.clone());
+        }
+    }
+    readers.sort_unstable();
+    readers.dedup();
+    park_catch_up(client, &readers, tables).await?;
+    request_projection_refresh(client, &to_sides).await
+}
+
 /// Asks the discharge of each of `tables`' markers, just parked by this
 /// transaction, to refresh the relationship projections on it
 /// (`pending_backfill.refresh_projections`, issue #507): each is a target a
-/// rebuild rewrote outside the seam. The markers are already locked by the
-/// park, so this takes no new lock.
+/// rebuild rewrote outside the seam, or a to-side a catch-up re-reads
+/// because some of its changes may never have reached the projection
+/// ([`park_table_catch_ups`]). The markers are already locked by the park,
+/// so this takes no new lock.
 async fn request_projection_refresh(
     client: &impl GenericClient,
     tables: &[String],
@@ -1352,13 +1396,13 @@ async fn discharge_marker(
     }
     let swept = sweep.finish(&txn).await?;
     // Issue #507: a target's rebuild wrote it outside the seam, so no seam
-    // row carried its changes into a relationship's settled projection. Only
-    // the catch-up parked for such a rewrite asks for the refresh: it diffs
-    // the whole target, and every other write reaches the projection
-    // through the seam.
-    if marker.refresh_projections
-        && crate::defs::catalog::is_definition_target(&txn, &marker.table).await?
-    {
+    // row carried its changes into a relationship's settled projection.
+    // Issue #522: a source to-side re-read by a catch-up may have had changes
+    // whose CDC never reached its projection either. Only those catch-ups
+    // ask for the refresh (`request_projection_refresh`): it diffs the whole
+    // table, and every other write reaches the projection through the seam
+    // or CDC.
+    if marker.refresh_projections {
         let refreshed =
             crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
                 .await?;
@@ -1750,13 +1794,14 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
 /// the same name is `slot_loss`'s case instead). Such a definition has missed
 /// whatever committed before this slot's consistent point, and only this
 /// marker's discharge repairs it. So the markers are go-live catch-ups
-/// ([`park_catch_up`]) for every applying reader of the tables: each reader
-/// reports `catching_up` until the discharge has re-read the table, which
-/// re-derives the rows it still has, and swept the reader's target for rows
-/// it no longer backs, which a re-read can't reach (issue #393's regression
-/// tests, `a_row_committed_during_fresh_slot_creation_reaches_the_target`
+/// ([`park_table_catch_ups`]) for every applying reader of the tables: each
+/// reader reports `catching_up` until the discharge has re-read the table,
+/// which re-derives the rows it still has, and swept the reader's target for
+/// rows it no longer backs, which a re-read can't reach (issue #393's
+/// regression tests, `a_row_committed_during_fresh_slot_creation_reaches_the_target`
 /// and `a_delete_committed_during_fresh_slot_creation_reaches_a_live_target`).
-/// On a first install nothing reads the tables yet, so this parks plain
+/// A relationship's to-side has its settled projections refreshed too
+/// (issue #522). On a first install nothing reads the tables yet, so this parks plain
 /// markers, and the discharge skips a table no definition reads
 /// ([`run_pending_backfills`]'s "When the table is enumerated").
 ///
@@ -1805,13 +1850,7 @@ pub async fn create_slot_and_park_markers(
         )
         .await?;
     let consistent_point: PgLsn = slot_row.get(0);
-    let mut readers = Vec::new();
-    for table in tables {
-        readers.extend(crate::defs::catalog::applying_readers(&txn, table).await?);
-    }
-    readers.sort_unstable();
-    readers.dedup();
-    park_catch_up(&txn, &readers, tables).await?;
+    park_table_catch_ups(&txn, tables).await?;
     txn.execute(
         "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
         &[&slot, &consistent_point],

@@ -104,6 +104,7 @@ use crate::defs::{
     self, CatalogError, Definition, ParseError, RelationshipDefinition, TransformStatus, ValueType,
 };
 use crate::error_code::{self, ErrorCode};
+use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
 use crate::staging::quarantine;
@@ -636,16 +637,26 @@ impl Trellis {
             .collect())
     }
 
-    /// Re-stages `source_table`'s current rows via a `pending_backfill`
-    /// marker, for every applying definition that reads it to re-derive from.
-    /// A newly registered transform doesn't need this: the staging worker
-    /// parks its marker itself (ADR-0016). Only valid for a table that's
-    /// already a publication member — a never-published table is backfilled
-    /// in full on first contact by the running staging worker, so this is
-    /// refused there (and the running staging worker must discharge the
-    /// marker).
+    /// Re-reads `source_table` via a `pending_backfill` marker, for every
+    /// applying definition that reads it, directly or through a
+    /// relationship, to re-derive from. A newly registered transform doesn't
+    /// need this: the staging worker parks its marker itself (ADR-0016).
+    ///
+    /// The marker is a go-live catch-up (issue #522, ADR-0016's "A re-read
+    /// table's readers"): each `live` reader reports `catching_up` from this
+    /// call until the staging worker has discharged it. The discharge
+    /// re-derives every row the table still has, deletes each reader's
+    /// target rows the table no longer backs (a delete that never reached the
+    /// target, say), refreshes the settled projections of a relationship
+    /// whose to-side the table is, and flips the readers back `live`.
+    ///
+    /// Only valid for a table that's already a publication member: a
+    /// never-published table is backfilled in full on first contact by the
+    /// running staging worker, so this is refused there
+    /// ([`TrellisError::TableNotPublished`]). The running staging worker
+    /// discharges the marker.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         let schema_rows = client
             .query(
                 "select table_schema from information_schema.tables \
@@ -675,8 +686,16 @@ impl Trellis {
             });
         }
 
-        // A failure here is a plain `Db` error.
-        crate::intake::publication::park_marker(&**client, &qualified).await?;
+        // A failure to park is a plain `Db` error.
+        let txn = client.transaction().await?;
+        crate::intake::publication::park_table_catch_ups(&*txn, std::slice::from_ref(&qualified))
+            .await
+            .map_err(|err| match err {
+                IntakeError::Db(err) => TrellisError::Db(err),
+                IntakeError::Catalog(err) => TrellisError::Catalog(*err),
+                err => TrellisError::Client(ClientError::Intake(err)),
+            })?;
+        txn.commit().await?;
         Ok(())
     }
 

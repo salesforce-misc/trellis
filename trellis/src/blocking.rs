@@ -178,8 +178,8 @@ impl BlockingTrellis {
         self.submit(Job::Relationships)
     }
 
-    /// Re-stages `source_table`'s current rows for backfill. See
-    /// [`Trellis::request_backfill`].
+    /// Re-reads `source_table` for every definition applying from it, as a
+    /// go-live catch-up. See [`Trellis::request_backfill`].
     pub fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         let source_table = source_table.to_string();
         self.submit(|reply| Job::RequestBackfill(source_table, reply))

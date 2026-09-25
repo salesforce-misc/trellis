@@ -194,8 +194,9 @@ quarantine are two arcs of one lifecycle:
   was building. The staging worker discharges a fresh marker on its next
   maintenance tick, and that discharge flips the transform `live`. A `live`
   transform comes back here for its own catch-up: an `ALTER TRANSFORM` that
-  added columns, a resumed column, or a stale backfill chunk given up after
-  its rebuild. A catch-up that keeps failing keeps the transform here, with
+  added columns, a resumed column, a rebuild of a transform whose target it
+  reads, or a re-read of a table it reads (`Trellis::request_backfill`, a
+  fresh replication slot, or the table rejoining the publication). A catch-up that keeps failing keeps the transform here, with
   the error on `Trellis::status` when the failing marker is on its source.
 * **`live`** — the steady state: a watermark token taken after a commit and
   awaited with `Trellis::await_converged` guarantees the target reflects that

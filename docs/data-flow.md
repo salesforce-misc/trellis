@@ -256,6 +256,11 @@ a go-live catch-up for the table's applying readers. They report
 targets for rows the source no longer backs, which a re-read alone can't
 reach
 ([ADR-0016](decisions/0016-single-background-capture-path.md#a-fresh-install)).
+An explicit `Trellis::request_backfill`, and a table rejoining the
+publication after an operator dropped it, park the same catch-ups for the
+same reason, and a re-read table that is a relationship's to-side also has
+its settled projections refreshed
+([ADR-0016](decisions/0016-single-background-capture-path.md#a-re-read-tables-readers)).
 A slot lost under the same name is recovered differently
 (`intake::slot_loss`): the slot is recreated without a read, every transform
 it fed is paused, and each one's resume parks its own marker.

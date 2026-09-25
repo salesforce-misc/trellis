@@ -4791,9 +4791,14 @@ async fn ensure_relationship_projection_in_txn(
 ///
 /// The catch-up discharge runs this for a marker parked because a rebuild
 /// rewrote a definition's target (`pending_backfill.refresh_projections`,
-/// `intake::publication::discharge_marker`). It diffs the whole target, about
-/// 0.7 s for a 1M-row target whose projection is already current, so no
-/// other marker asks for it. Every write to a target
+/// `intake::publication::discharge_marker`), or because a source to-side is
+/// re-read for changes whose CDC may never have reached its projection
+/// (issue #522, `intake::publication::park_table_catch_ups`). It diffs the
+/// whole table, about 0.7 s for a 1M-row target whose projection is already
+/// current, so no other marker asks for it. For a source to-side, CDC still
+/// pending when this runs was committed before the discharge's read, so
+/// once it has drained, in commit order, each row is back at the state this
+/// wrote. Every write to a target
 /// reaches its projection through the target-mutation seam's CDC-shaped rows,
 /// except a rebuild's (a resumed definition's chunks or direct build), which
 /// writes the target directly. Nothing else would ever carry what the rebuild
