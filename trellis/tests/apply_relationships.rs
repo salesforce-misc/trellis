@@ -2613,7 +2613,7 @@ async fn a_to_side_truncate_then_reinsert_in_the_next_batch_leaves_no_stale_grou
 /// cleared projection, naming `(eu, NULL)`. `(eu, a)` is left stale. The
 /// #516 fallback builds its image from the live row too.
 #[tokio::test]
-#[ignore = "a from-side change pending across a to-side truncate leaves its old group stale (found reviewing #520, not yet filed)"]
+#[ignore = "a from-side change pending across a to-side truncate leaves its old group stale (#528)"]
 async fn a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group() {
     truncate_scenario(
         "truncate users, then move order 10's region, drained a batch later",
