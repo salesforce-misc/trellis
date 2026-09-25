@@ -1339,7 +1339,6 @@ async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
 /// aggregate build's join, the live apply's `RelJoin`, and the reverse path
 /// from a `shop.users` change must all read `shop.users`.
 #[tokio::test]
-#[ignore = "#516: the reverse fallback never re-derives the old group of a to-side rename; see a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group"]
 async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1448,13 +1447,13 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
 /// (`buyer.name`); a new order for user 1 drains as an ordinary delta; then
 /// user 1 is renamed. The drained order's ring row is above the projection's
 /// LSN, so `relationship_fast_path_precondition_holds` sends the rename to
-/// the reverse fallback, which stages image-less recomputes for orders 10
-/// and 12. Those re-derive the group the orders are in now (`c`), but
-/// nothing reaches the group they left (`a`), which keeps its 105 forever.
-/// At LSN 1 the drained order sat below the projection's LSN, the fast path
+/// the reverse fallback, which stages recomputes for orders 10 and 12. A
+/// bare recompute re-derives only the group the orders are in now (`c`), so
+/// the group they left (`a`) kept its 105 forever; the fallback now stages
+/// each with a prior image carrying the old name, which names `a` too. At
+/// LSN 1 the drained order sat below the projection's LSN, the fast path
 /// ran, and its per-group diff emptied `a`.
 #[tokio::test]
-#[ignore = "#516: the reverse fallback never re-derives the group a to-side change moves rows out of"]
 async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1528,5 +1527,513 @@ async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
             ("c".to_string(), Some("105".to_string())),
         ],
         "user 1's orders leave group a for group c"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #516: a to-side change must leave no aggregate group stale, on
+// either reverse path
+// ---------------------------------------------------------------------
+
+/// The to-side (`users`) change a [`to_side_change_scenario`] applies.
+#[derive(Debug, Clone, Copy)]
+enum ToSideChange {
+    /// User 1 `a` -> `c`: its orders move to a new group.
+    Rename,
+    /// User 1 `a` -> `b`: its orders merge into user 2's existing group.
+    RenameIntoExisting,
+    /// User 1 deleted: its orders fall into the `NULL` group.
+    Delete,
+    /// User 3 inserted: its orphaned orders leave the `NULL` group.
+    Insert,
+}
+
+impl ToSideChange {
+    const ALL: [ToSideChange; 4] = [
+        ToSideChange::Rename,
+        ToSideChange::RenameIntoExisting,
+        ToSideChange::Delete,
+        ToSideChange::Insert,
+    ];
+
+    /// The user whose orders the change regroups.
+    fn user(self) -> &'static str {
+        match self {
+            ToSideChange::Insert => "3",
+            _ => "1",
+        }
+    }
+
+    async fn apply(self, client: &Client) {
+        let (sql, op, old, new) = match self {
+            ToSideChange::Rename => (
+                "update users set name = 'c' where id = 1",
+                "update",
+                Some(r#"{"id":"1","name":"a"}"#),
+                Some(r#"{"id":"1","name":"c"}"#),
+            ),
+            ToSideChange::RenameIntoExisting => (
+                "update users set name = 'b' where id = 1",
+                "update",
+                Some(r#"{"id":"1","name":"a"}"#),
+                Some(r#"{"id":"1","name":"b"}"#),
+            ),
+            ToSideChange::Delete => (
+                "delete from users where id = 1",
+                "delete",
+                Some(r#"{"id":"1","name":"a"}"#),
+                None,
+            ),
+            ToSideChange::Insert => (
+                "insert into users values (3, 'z')",
+                "insert",
+                None,
+                Some(r#"{"id":"3","name":"z"}"#),
+            ),
+        };
+        client.execute(sql, &[]).await.expect("change users");
+        stage_cdc(client, "users", self.user(), op, old, new).await;
+    }
+}
+
+/// Which reverse path a [`to_side_change_scenario`] drives the change down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReversePath {
+    /// Issue #131's delta: nothing in the ring touches the changed user's
+    /// orders, so `relationship_fast_path_precondition_holds` passes.
+    Fast,
+    /// `stage_reverse_recompute_fallback`: a drained order for the changed
+    /// user still sits in the ring above the projection's LSN, so the
+    /// precondition fails (and a `RecomputeOnly` aggregate always lands
+    /// here).
+    Fallback,
+}
+
+/// One aggregate shape grouped by the `buyer` relationship, checked against
+/// Postgres's own `LEFT JOIN ... GROUP BY`.
+struct AggregateCase {
+    /// The definition's `GROUP BY` list.
+    group_by: &'static str,
+    /// The same keys as target columns, and as oracle expressions.
+    group_cols: &'static [(&'static str, &'static str)],
+    /// The single aggregate field, named `v`.
+    select: &'static str,
+    /// The oracle's aggregate over `orders o left join users u`.
+    oracle: &'static str,
+    /// Whether `v` compares as a rounded number (`false`: as text).
+    numeric: bool,
+}
+
+impl AggregateCase {
+    fn key_sql(&self, oracle: bool) -> String {
+        let parts: Vec<String> = self
+            .group_cols
+            .iter()
+            .map(|(target, oracle_expr)| {
+                let expr = if oracle { oracle_expr } else { target };
+                format!("coalesce(({expr})::text, '<null>')")
+            })
+            .collect();
+        format!("concat_ws('|', {})", parts.join(", "))
+    }
+
+    fn value_sql(&self, expr: &str) -> String {
+        if self.numeric {
+            format!("round(({expr})::numeric, 6)::text")
+        } else {
+            format!("({expr})::text")
+        }
+    }
+
+    async fn target(&self, client: &Client) -> Vec<(String, Option<String>)> {
+        let sql = format!(
+            "select {}, {} from agg_516",
+            self.key_sql(false),
+            self.value_sql("v")
+        );
+        text_pairs(client, &sql).await
+    }
+
+    async fn oracle(&self, client: &Client) -> Vec<(String, Option<String>)> {
+        let group: Vec<&str> = self.group_cols.iter().map(|(_, o)| *o).collect();
+        let sql = format!(
+            "select {}, {} from orders o left join users u on u.id = o.user_id group by {}",
+            self.key_sql(true),
+            self.value_sql(self.oracle),
+            group.join(", ")
+        );
+        text_pairs(client, &sql).await
+    }
+}
+
+const BY_NAME: &[(&str, &str)] = &[("name", "u.name")];
+const BY_REGION_AND_NAME: &[(&str, &str)] = &[("region", "o.region"), ("name", "u.name")];
+
+/// Builds `case` over users `a`/`b` and a spread of orders (one orphaned on
+/// user 3), drives `change` down `path`, and checks the target against the
+/// oracle once it settles. The changed user's order 12 is what picks the
+/// path: seeded before the build for [`ReversePath::Fast`], or staged as CDC
+/// and drained after it for [`ReversePath::Fallback`], leaving its ring row
+/// above the projection's LSN.
+async fn to_side_change_scenario(case: &AggregateCase, change: ToSideChange, path: ReversePath) {
+    let label = format!("{} / {change:?} / {path:?}", case.select);
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let user = change.user();
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table orders (id integer primary key, user_id integer, region text, \
+                                  amount integer, paid boolean); \
+             alter table users replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into orders values (10, 1, 'eu', 5, true), (11, 2, 'eu', 7, false), \
+                                       (13, 1, 'us', 3, true), (14, 3, 'eu', 9, false);",
+        )
+        .await
+        .expect("seed users and orders");
+    let sibling = format!("insert into orders values (12, {user}, 'eu', 100, true)");
+    if path == ReversePath::Fast {
+        client.execute(&sibling, &[]).await.expect("seed order 12");
+    }
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer");
+    install_definition(
+        &db.pool,
+        &format!(
+            "TRANSFORM agg_516 FROM orders GROUP BY {} SELECT {}",
+            case.group_by, case.select
+        ),
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("region", ValueType::Text),
+            ("amount", ValueType::Numeric),
+            ("paid", ValueType::Boolean),
+        ]),
+        "public",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{label}: install: {e}"));
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    if path == ReversePath::Fallback {
+        client
+            .execute(&sibling, &[])
+            .await
+            .expect("insert order 12");
+        stage_cdc(
+            &client,
+            "orders",
+            "12",
+            "insert",
+            None,
+            Some(&format!(
+                r#"{{"id":"12","user_id":"{user}","region":"eu","amount":"100","paid":"t"}}"#
+            )),
+        )
+        .await;
+        drain_to_quiescence(&db.pool, &mut client).await;
+    }
+    assert_eq!(
+        case.target(&client).await,
+        case.oracle(&client).await,
+        "{label}: before the change"
+    );
+
+    change.apply(&client).await;
+    let recomputed = reverse_keys_for_to_side_change(&db.pool, &mut client, "orders").await;
+    assert_eq!(
+        !recomputed.is_empty(),
+        path == ReversePath::Fallback,
+        "{label}: the change took the other reverse path (fallback recomputes: {recomputed:?})"
+    );
+    assert_eq!(
+        case.target(&client).await,
+        case.oracle(&client).await,
+        "{label}: after the change"
+    );
+}
+
+/// Every to-side change, down both reverse paths, for an invertible
+/// aggregate (the only kind the fast path takes).
+async fn every_change_down_both_paths(case: &AggregateCase) {
+    for change in ToSideChange::ALL {
+        for path in [ReversePath::Fast, ReversePath::Fallback] {
+            to_side_change_scenario(case, change, path).await;
+        }
+    }
+}
+
+/// Every to-side change for a `RecomputeOnly` aggregate, which always takes
+/// the fallback.
+async fn every_change_down_the_fallback(case: &AggregateCase) {
+    for change in ToSideChange::ALL {
+        to_side_change_scenario(case, change, ReversePath::Fallback).await;
+    }
+}
+
+#[tokio::test]
+async fn a_to_side_change_regroups_a_sum_on_both_reverse_paths() {
+    every_change_down_both_paths(&AggregateCase {
+        group_by: "buyer.name",
+        group_cols: BY_NAME,
+        select: "SUM(amount) AS v",
+        oracle: "sum(o.amount)",
+        numeric: true,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_to_side_change_regroups_a_count_on_both_reverse_paths() {
+    every_change_down_both_paths(&AggregateCase {
+        group_by: "buyer.name",
+        group_cols: BY_NAME,
+        select: "COUNT(*) AS v",
+        oracle: "count(*)",
+        numeric: true,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_to_side_change_regroups_an_avg_on_both_reverse_paths() {
+    every_change_down_both_paths(&AggregateCase {
+        group_by: "buyer.name",
+        group_cols: BY_NAME,
+        select: "AVG(amount) AS v",
+        oracle: "avg(o.amount)",
+        numeric: true,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_to_side_change_regroups_a_min_and_a_max() {
+    for (select, oracle) in [
+        ("MIN(amount) AS v", "min(o.amount)"),
+        ("MAX(amount) AS v", "max(o.amount)"),
+    ] {
+        every_change_down_the_fallback(&AggregateCase {
+            group_by: "buyer.name",
+            group_cols: BY_NAME,
+            select,
+            oracle,
+            numeric: true,
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_to_side_change_regroups_a_bool_and_and_a_bool_or() {
+    for (select, oracle) in [
+        ("BOOL_AND(paid) AS v", "bool_and(o.paid)"),
+        ("BOOL_OR(paid) AS v", "bool_or(o.paid)"),
+    ] {
+        every_change_down_the_fallback(&AggregateCase {
+            group_by: "buyer.name",
+            group_cols: BY_NAME,
+            select,
+            oracle,
+            numeric: false,
+        })
+        .await;
+    }
+}
+
+/// A `GROUP BY` pairing a from-side column with the relationship path: the
+/// old group is the row's own `region` with the parent's old `name`.
+#[tokio::test]
+async fn a_to_side_change_regroups_a_from_side_and_relationship_group_by() {
+    every_change_down_both_paths(&AggregateCase {
+        group_by: "region, buyer.name",
+        group_cols: BY_REGION_AND_NAME,
+        select: "SUM(amount) AS v",
+        oracle: "sum(o.amount)",
+        numeric: true,
+    })
+    .await;
+    every_change_down_the_fallback(&AggregateCase {
+        group_by: "region, buyer.name",
+        group_cols: BY_REGION_AND_NAME,
+        select: "MAX(amount) AS v",
+        oracle: "max(o.amount)",
+        numeric: true,
+    })
+    .await;
+}
+
+/// Relationship paths are one hop (`<rel>.<column>`, declared on the
+/// definition's own source), so a relationship change reaches a group two
+/// transforms away by chaining: a 1-1 target resolves `buyer.name`, and an
+/// aggregate groups that target. The 1-1 target always takes the reverse
+/// fallback; its rewrite reaches the aggregate through the target seam with
+/// the row's prior image (issue #315), which names the group it left.
+#[tokio::test]
+async fn a_to_side_rename_regroups_an_aggregate_chained_off_a_relationship_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table orders (id integer primary key, user_id integer, amount integer); \
+             alter table users replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into orders values (10, 1, 5), (11, 2, 7), (12, 1, 100);",
+        )
+        .await
+        .expect("seed users and orders");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer");
+    install_definition(
+        &db.pool,
+        "TRANSFORM order_buyer FROM orders SELECT buyer.name AS bname, amount AS spent",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install order_buyer");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM spend_by_bname FROM order_buyer GROUP BY bname SELECT SUM(spent) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("bname", ValueType::Text),
+            ("spent", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install spend_by_bname");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let totals = "select bname, total::text from spend_by_bname";
+    assert_eq!(
+        text_pairs(&client, totals).await,
+        vec![
+            ("a".to_string(), Some("105".to_string())),
+            ("b".to_string(), Some("7".to_string())),
+        ],
+    );
+
+    client
+        .execute("update users set name = 'c' where id = 1", &[])
+        .await
+        .expect("rename user 1");
+    stage_cdc(
+        &client,
+        "users",
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"a"}"#),
+        Some(r#"{"id":"1","name":"c"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, totals).await,
+        vec![
+            ("b".to_string(), Some("7".to_string())),
+            ("c".to_string(), Some("105".to_string())),
+        ],
+        "user 1's orders leave group a for group c two transforms away"
+    );
+}
+
+/// An aggregate grouped by two relationships always takes the reverse
+/// fallback. The prior image carries the changed relationship's old value;
+/// the other one resolves as usual, so the old group is `(a, s)`.
+#[tokio::test]
+async fn a_to_side_rename_regroups_an_aggregate_grouped_by_two_relationships() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table shops (id integer primary key, title text); \
+             create table orders (id integer primary key, user_id integer, shop_id integer, \
+                                  amount integer); \
+             alter table users replica identity full; \
+             alter table shops replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into shops values (1, 's'), (2, 't'); \
+             insert into orders values (10, 1, 1, 5), (11, 2, 1, 7), (12, 1, 2, 100);",
+        )
+        .await
+        .expect("seed users, shops and orders");
+    for rel in [
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+        "RELATIONSHIP seller FROM orders.shop_id TO shops.id",
+    ] {
+        create_relationship(&db.pool, rel)
+            .await
+            .expect("declare relationship");
+    }
+    install_definition(
+        &db.pool,
+        "TRANSFORM spend_by_pair FROM orders GROUP BY buyer.name, seller.title \
+         SELECT SUM(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("shop_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install spend_by_pair");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let totals = "select concat_ws('|', name, title), total::text from spend_by_pair";
+    let oracle = "select concat_ws('|', u.name, s.title), sum(o.amount)::text from orders o \
+                  left join users u on u.id = o.user_id left join shops s on s.id = o.shop_id \
+                  group by u.name, s.title";
+    assert_eq!(
+        text_pairs(&client, totals).await,
+        text_pairs(&client, oracle).await
+    );
+
+    client
+        .execute("update users set name = 'c' where id = 1", &[])
+        .await
+        .expect("rename user 1");
+    stage_cdc(
+        &client,
+        "users",
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"a"}"#),
+        Some(r#"{"id":"1","name":"c"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, totals).await,
+        text_pairs(&client, oracle).await,
+        "user 1's orders leave (a, s) and (a, t)"
     );
 }

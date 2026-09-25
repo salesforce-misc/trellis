@@ -1276,8 +1276,9 @@ pub(crate) async fn build_relationship_context(
 // rather than reinventing it. Anything that mechanism can't cover (a 1-1
 // target, a `MIN`/`MAX` field, a definition reading more than one
 // relationship — see [`build_reverse_relationship_shape`]'s doc comment)
-// falls back to the pre-#131 image-less `Recompute`, unchanged — the same
-// fallback any of #132's four guards also uses when it rejects a record.
+// falls back to the pre-#131 image-less `Recompute` (carrying a prior image
+// since issue #516, so an aggregate re-derives the group a row left) — the
+// same fallback any of #132's four guards also uses when it rejects a record.
 
 /// One to-one relationship's reverse-delta shape (issue #131): everything
 /// Phase 3 needs to apply a [`RelationshipReverseRecord`] for this
@@ -1296,6 +1297,11 @@ pub(crate) struct ReverseRelationshipShape {
     /// (`catalog::relationship_by_id`) on a later drain without re-deriving
     /// it from anything else persisted.
     id: i64,
+    /// The relationship's declared name — what a from-side definition's
+    /// `<rel>.<column>` path reads. Issue #516: the fallback names its
+    /// Recomputes' prior images' relationship values under
+    /// [`apply_aggregate::forward_relationship_synthetic_column`]`(name, ..)`.
+    name: String,
     /// Empty (`String::new()`) in the should-be-unreachable case where this
     /// relationship has no projection row at all (#129 creates one
     /// unconditionally at `create_relationship` time) — Phase 3 treats that
@@ -1822,6 +1828,7 @@ async fn build_reverse_relationship_shape(
 
     Ok(ReverseRelationshipShape {
         id: rel.id,
+        name: rel.def.name.clone(),
         qualified_projection,
         projection_table_bare,
         projection_schema,
@@ -2651,7 +2658,8 @@ type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 /// One key a drain re-derives by plain image-less recompute:
 /// `(src_table, key, hop_gen, src_changed, origin_lsn)`. The shape of
 /// [`ApplyPlan::reverse_recomputes`], a relationship reverse's fallback
-/// (`stage_reverse_recompute_fallback`), and a key Phase 3 re-stages.
+/// (`stage_reverse_recompute_fallback`, paired with a prior image as a
+/// [`FallbackRecompute`]), and a key Phase 3 re-stages.
 type DerivedRecompute = (
     String,
     String,
@@ -2660,8 +2668,13 @@ type DerivedRecompute = (
     Option<PgLsn>,
 );
 
-/// Stages the pre-#131 image-less `Recompute` fallback (issue #131's own
-/// stopgap, shared since by every guard rejection before #134 and by
+/// One from-side row the reverse fallback re-derives: the key to recompute,
+/// plus the row's prior image (issue #516) — see
+/// [`stage_reverse_recompute_fallback`].
+type FallbackRecompute = (DerivedRecompute, String);
+
+/// Stages the pre-#131 `Recompute` fallback (issue #131's own stopgap,
+/// shared since by every guard rejection before #134 and by
 /// `ReverseRelationshipShape::needs_recompute_fallback`/`!fast_path_safe`
 /// since) for every from-side row currently matching `old_key`/`new_key` via
 /// `shape.from_col` — live-enumerated inside the already-locked Phase 3
@@ -2674,6 +2687,21 @@ type DerivedRecompute = (
 /// fairness escalation (see this module's own design section above) can
 /// lean on it as the always-safe exit from the guard-gated retry loop.
 ///
+/// **Each `Recompute` carries a prior image (issue #516).** A live re-read
+/// only names the aggregate group a from-side row is in *now*. A parent
+/// change that moves the row between groups (a renamed `GROUP BY buyer.name`
+/// value, a deleted or newly inserted parent) also leaves the group it
+/// moved *out of* needing re-derivation, and only this record knows what
+/// that group was: the parent's old image. So the prior image is the live
+/// from-side row with this relationship's value, as it stood before the
+/// record, spliced in under each to-side column's
+/// [`apply_aggregate::forward_relationship_synthetic_column`] name — the
+/// parent's old image for a row matching `old_key`, and `NULL` for a row
+/// matching only `new_key` (it had no parent before). `accumulate_changes`
+/// takes a pre-resolved synthetic value as given rather than resolving it
+/// from the (already advanced) projection, so the old group is named and
+/// forced onto the full-recompute path alongside the live one.
+///
 /// `row_columns` is `shape.from_table`'s live column list, resolved once by
 /// the caller via [`cached_row_columns`] — not re-introspected per call here
 /// — since this function's own caller (the "3d" step's `for record in
@@ -2682,19 +2710,29 @@ type DerivedRecompute = (
 /// this same `from_table`. See [`from_side_rows_for_trigger_txn`]'s doc
 /// comment for why that function takes the same parameter rather than
 /// introspecting it itself.
-#[allow(clippy::too_many_arguments)]
 async fn stage_reverse_recompute_fallback(
     txn: &Transaction<'_>,
-    shape: &ReverseRelationshipShape,
+    record: &RelationshipReverseRecord,
     old_key: &Option<String>,
     new_key: &Option<String>,
-    hop_gen: i32,
-    (src_changed, origin_lsn): Provenance,
     seen_keys: &mut std::collections::HashSet<String>,
-    fallback: &mut Vec<DerivedRecompute>,
+    fallback: &mut Vec<FallbackRecompute>,
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
+    let shape = &record.shape;
+    // Every to-side column either image carries, so a row with no parent
+    // before this record still gets each synthetic column, as `NULL`.
+    let to_columns: std::collections::BTreeSet<&String> = [&record.old_row, &record.new_row]
+        .into_iter()
+        .flatten()
+        .flat_map(|row| row.keys())
+        .collect();
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
+        let parent_before = if old_key.as_ref() == Some(&key) {
+            record.old_row.as_ref()
+        } else {
+            None
+        };
         let trigger = ReverseTrigger::Keys(std::slice::from_ref(&key));
         let from_rows = from_side_rows_for_trigger_txn(
             txn,
@@ -2705,19 +2743,49 @@ async fn stage_reverse_recompute_fallback(
             row_columns,
         )
         .await?;
-        for (from_key, _) in from_rows {
+        for (from_key, from_row) in from_rows {
             if seen_keys.insert(from_key.clone()) {
+                let prior_image =
+                    fallback_prior_image(from_row, &shape.name, &to_columns, parent_before);
                 fallback.push((
-                    shape.from_table.clone(),
-                    from_key,
-                    hop_gen,
-                    src_changed,
-                    origin_lsn,
+                    (
+                        shape.from_table.clone(),
+                        from_key,
+                        record.hop_gen + 1,
+                        record.src_changed,
+                        record.origin_lsn,
+                    ),
+                    prior_image,
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// A reverse-fallback `Recompute`'s prior image (issue #516, see
+/// [`stage_reverse_recompute_fallback`]): `from_row` with relationship
+/// `rel_name`'s value as it stood before the parent change — each of
+/// `to_columns` read off `parent_before`, or `NULL` when the row had no
+/// parent — spliced in under its forward synthetic column name, as JSON
+/// text.
+fn fallback_prior_image(
+    mut from_row: Row,
+    rel_name: &str,
+    to_columns: &std::collections::BTreeSet<&String>,
+    parent_before: Option<&Row>,
+) -> String {
+    for column in to_columns {
+        let value = parent_before
+            .and_then(|parent| parent.get(*column))
+            .cloned()
+            .flatten();
+        from_row.insert(
+            apply_aggregate::forward_relationship_synthetic_column(rel_name, column),
+            value,
+        );
+    }
+    row_to_json_text(&from_row)
 }
 
 /// Splices `parent_row`'s referenced to-side columns into a clone of
@@ -3334,6 +3402,33 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
+
+    /// Issue #516: a fallback prior image is the from-side row with the
+    /// parent's value before the change spliced in under each to-side
+    /// column's forward synthetic name — `NULL` for every column when the row
+    /// had no parent — so `accumulate_changes` names the group it left.
+    #[test]
+    fn a_fallback_prior_image_carries_the_parents_value_before_the_change() {
+        let from_row: Row = HashMap::from([
+            ("id".to_string(), Some("10".to_string())),
+            ("user_id".to_string(), Some("1".to_string())),
+        ]);
+        let id = "id".to_string();
+        let name = "name".to_string();
+        let to_columns = std::collections::BTreeSet::from([&id, &name]);
+        let parent: Row = HashMap::from([
+            ("id".to_string(), Some("1".to_string())),
+            ("name".to_string(), Some("a".to_string())),
+        ]);
+        assert_eq!(
+            fallback_prior_image(from_row.clone(), "buyer", &to_columns, Some(&parent)),
+            r#"{"__trellis_fwd_buyer_id":"1","__trellis_fwd_buyer_name":"a","id":"10","user_id":"1"}"#
+        );
+        assert_eq!(
+            fallback_prior_image(from_row, "buyer", &to_columns, None),
+            r#"{"__trellis_fwd_buyer_id":null,"__trellis_fwd_buyer_name":null,"id":"10","user_id":"1"}"#
+        );
+    }
 
     /// Issue #344: a basis is compared to the source's current row as jsonb,
     /// so it must be valid JSON whatever text a column holds, keep SQL NULL
@@ -7067,7 +7162,7 @@ pub async fn apply_and_mark_drained_many(
     // comment), so this only matters when *two different* parent keys in
     // one drain happen to feed the same target (e.g. an aggregate grouped
     // by a column unrelated to the relationship).
-    let mut relationship_reverse_fallback: Vec<DerivedRecompute> = Vec::new();
+    let mut relationship_reverse_fallback: Vec<FallbackRecompute> = Vec::new();
     // Issue #134: guard-rejected records are re-staged as
     // `StagedChange::RelationshipReverseDeferred` (never touching `hop_gen`)
     // rather than folded into `recompute_changes` (which enforces
@@ -7129,11 +7224,9 @@ pub async fn apply_and_mark_drained_many(
                     std::collections::HashSet::new();
                 stage_reverse_recompute_fallback(
                     txn,
-                    shape,
+                    record,
                     &old_key,
                     &new_key,
-                    record.hop_gen + 1,
-                    (record.src_changed, record.origin_lsn),
                     &mut seen_keys,
                     &mut relationship_reverse_fallback,
                     &row_columns,
@@ -7457,11 +7550,9 @@ pub async fn apply_and_mark_drained_many(
             let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             stage_reverse_recompute_fallback(
                 txn,
-                shape,
+                record,
                 &old_key,
                 &new_key,
-                record.hop_gen + 1,
-                (record.src_changed, record.origin_lsn),
                 &mut seen_keys,
                 &mut relationship_reverse_fallback,
                 &row_columns,
@@ -7518,10 +7609,6 @@ pub async fn apply_and_mark_drained_many(
         });
     }
 
-    // Issue #131: the same image-less recompute staging, for step 3d's own
-    // two fallback cases — the ordering-check-miss stopgap, and definitions
-    // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
-    // fast path.
     // Issue #344: keys `reconcile_with_source` couldn't re-evaluate in Phase
     // 3, staged at their own `hop_gen` — a re-read of the same hop, not a
     // step further downstream.
@@ -7537,20 +7624,28 @@ pub async fn apply_and_mark_drained_many(
         });
     }
 
-    for (from_table, key, hop_gen, src_changed, origin_lsn) in &relationship_reverse_fallback {
-        if *hop_gen > MAX_HOP_GEN {
-            hop_bound_tables.push(from_table.clone());
-            worst_hop_gen = worst_hop_gen.max(*hop_gen);
+    // Issue #131: the same recompute staging, for step 3d's own fallback
+    // cases — a guard rejection's fairness escalation, a record the fast
+    // path can't take safely, and definitions
+    // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
+    // fast path. Issue #516: each carries its row's prior image, so an
+    // aggregate re-derives the group the parent change moved the row out of.
+    for ((from_table, key, hop_gen, src_changed, origin_lsn), prior_image) in
+        relationship_reverse_fallback
+    {
+        if hop_gen > MAX_HOP_GEN {
+            hop_bound_tables.push(from_table);
+            worst_hop_gen = worst_hop_gen.max(hop_gen);
             continue;
         }
         recompute_changes.push(StagedChange::Recompute {
-            src_table: from_table.clone(),
-            key: key.clone(),
-            hop_gen: *hop_gen,
+            src_table: from_table,
+            key,
+            hop_gen,
             group_key: None,
-            src_changed: *src_changed,
-            prior_image: None,
-            origin_lsn: *origin_lsn,
+            src_changed,
+            prior_image: Some(prior_image),
+            origin_lsn,
         });
     }
 
