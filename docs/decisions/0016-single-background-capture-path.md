@@ -545,22 +545,28 @@ targets:
 - **A slot-loss recovery** (`intake::slot_loss::pause_if_slot_lost`, #533).
   Every change between the lost slot's last confirmed position and the new
   slot's start is gone. The recovery pauses every definition the slot fed,
-  and each resume rebuilds one by a fresh backfill, but a to-one consumer's
-  rebuild reads the to-side's projection, which those changes never reached
+  and each resume rebuilds one by a fresh backfill, but a to-one lookup's
+  consumer is rebuilt by the ring, whose `Recompute`s re-derive each row
+  through the to-side's projection, which those changes never reached
   either. So the recovery re-reads each published to-side, in the
   transaction that commits the new slot's start. A crash before that commit
   leaves the slot looking lost, and the next startup redoes the recovery and
-  parks the markers then. The recovery parks them before any resume can
-  park its own, and a discharge pass takes markers in park order and stops
-  behind one it defers, so the refresh commits before a resumed consumer's
-  build reads the projection. The exception is a refresh whose discharge
-  failed and is backing off (#407), which doesn't hold later markers back:
-  a consumer resumed meanwhile can build from the stale projection, and the
-  retry's re-read of the to-side re-derives it only if its build has
-  finished by then. Its readers are usually all paused, so the
-  marker is a plain one; a reader the slot didn't feed (a definition over an
-  unpublished table that reads a published to-side) is still applying and
-  catches up like any other.
+  parks the markers then. A resume normally parks its marker later, and a
+  discharge pass takes markers in park order and stops behind one it
+  defers, so the refresh commits before a resumed consumer's ring build
+  reads the projection. Three things can put the consumer's marker first: a
+  refresh whose discharge failed and is backing off (#407), which doesn't
+  hold later markers back; a resume that commits between the recovery's
+  pauses and its commit; and a later park on the to-side (a re-backfill,
+  say), which moves its marker behind. The ring build then re-derives the
+  consumer from the stale projection and flips it `live` (a ring go-live
+  doesn't wait on a pending marker on a to-side, unlike `go_live_caught_up`).
+  It is wrong only until the refresh discharges: the consumer is applying
+  by then, so the refresh's re-read re-derives it from the refreshed
+  projection. Its readers are usually all paused, so the marker is a plain
+  one, and its table is enumerated for no reader; a reader the slot didn't
+  feed (a definition over an unpublished table that reads a published
+  to-side) is still applying and catches up like any other.
 
 All four park through `intake::publication::park_table_catch_ups`: each
 marker is a go-live catch-up for every applying definition that reads the

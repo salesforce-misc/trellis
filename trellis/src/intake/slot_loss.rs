@@ -30,11 +30,14 @@
 //!    that already exists, with no new sequencing between it and intake.
 //!    The same transaction that commits the new slot's start re-reads every
 //!    published relationship to-side (issue #533,
-//!    [`super::publication::park_table_catch_ups`]): a to-one consumer's
-//!    rebuild reads the to-side's settled projection, never the table, and
-//!    the lost changes never reached the projection either. The discharge
-//!    refreshes it from the table before any resume's marker, which is
-//!    parked later, rebuilds a consumer from it.
+//!    [`super::publication::park_table_catch_ups`]): a consumer of a to-one
+//!    lookup is rebuilt by the ring, whose `Recompute`s re-derive each row
+//!    through the to-side's settled projection, never the table, and the
+//!    lost changes never reached the projection either. The discharge
+//!    refreshes it from the table, normally before a resume's marker, which
+//!    is parked later, rebuilds a consumer from it (ADR-0016's "A re-read
+//!    table's readers" has the exceptions, which the refresh heals when it
+//!    discharges).
 //! 3. **Logs loudly and keeps logging.** One `error` naming the slot, the
 //!    lost position and every affected transform, then a `warn` reminder from
 //!    the maintenance loop every [`SLOT_LOSS_REMINDER_INTERVAL`]
@@ -47,7 +50,10 @@
 //! Pending backfill markers whose table has no unfrozen definition left are
 //! discarded too: discharging one would enumerate a whole table into the ring
 //! for no reader, which is the "expensive work the operator didn't ask for"
-//! this path exists to avoid. Each resume parks its own marker.
+//! this path exists to avoid. Each resume parks its own marker. The to-side
+//! refreshes step 2 parks afterwards are the exception: each still enumerates
+//! its table even when every reader is frozen, one read per to-side per slot
+//! loss, next to the full-table diff its projection refresh does anyway.
 //!
 //! **Crash safety.** The record is written before the pause, and the pause
 //! before the slot is recreated, so a crash anywhere in the sequence leaves the
@@ -119,11 +125,14 @@ pub struct SlotLossRecovery {
 /// [`crate::defs::catalog::all_source_tables`]: the question is what the slot
 /// *actually* delivered, and a definition whose table the publication doesn't
 /// carry was never fed by it. The recursive step follows `source_table =
-/// target_table`, which is how one transform reads another's output. In a
-/// reconciled install every definition's source is published (reconciliation
-/// publishes every `source_table`, targets included), so this names every
-/// transform; the chain walk is what keeps that true while a newly defined
-/// table is still waiting for the next reconcile pass.
+/// target_table`, which is how one transform reads another's output. A
+/// definition's own target is never published (issue #315,
+/// [`crate::defs::publication_tables`]): the target-mutation seam, not CDC,
+/// feeds its readers, so a chained definition is reached only by this walk,
+/// from the upstream the slot fed. In a reconciled install every other
+/// source is published, so this names every transform. One over a table
+/// still waiting for the next reconcile pass to publish it isn't named: the
+/// slot never carried that table, so it lost nothing.
 pub async fn transforms_fed_by_publication(
     client: &impl GenericClient,
     publication: &str,
