@@ -145,7 +145,7 @@ fn numeric(names: &[&str]) -> std::collections::HashMap<String, ValueType> {
 /// freed by [`chunk_queue::reclaim_stale_chunks`] once its claim goes stale,
 /// exactly like a stale `seg_claims` row is today — and a second worker that
 /// then claims and finishes it must both build the target correctly and
-/// flip the definition to `Live`.
+/// complete the definition's build (`CatchingUp`, issue #476).
 #[tokio::test]
 async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another_worker() {
     let cluster = TestCluster::start();
@@ -249,8 +249,8 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         .expect("read back status")
         .get(0);
     assert_eq!(
-        status, "live",
-        "finishing the one remaining chunk must flip the definition to live"
+        status, "catching_up",
+        "finishing the one remaining chunk must complete the definition's build"
     );
 }
 
@@ -316,7 +316,7 @@ async fn a_chunk_of_an_explicitly_schema_qualified_target_is_written_into_that_s
         .await
         .expect("read back status")
         .get(0);
-    assert_eq!(status, "live");
+    assert_eq!(status, "catching_up");
 }
 
 /// Issue #297: the composite-key counterpart of
@@ -435,8 +435,8 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
         .expect("read back status")
         .get(0);
     assert_eq!(
-        status, "live",
-        "finishing the one remaining chunk must flip the definition to live"
+        status, "catching_up",
+        "finishing the one remaining chunk must complete the definition's build"
     );
 }
 
@@ -565,7 +565,7 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
         .await
         .expect("read back status")
         .get(0);
-    assert_eq!(status, "live");
+    assert_eq!(status, "catching_up");
 }
 
 /// A chunk already marked done cannot be double-completed by its original
@@ -640,7 +640,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
         .await
         .expect("read back status")
         .get(0);
-    assert_eq!(status, "live");
+    assert_eq!(status, "catching_up");
 }
 
 /// The CDC race docs/decisions/0007's amendment closes: a delta arriving on
@@ -648,7 +648,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
 /// one must apply normally to the `live` definition while being excluded
 /// from the `backfilling` one — not corrupting/pre-populating it with a
 /// premature partial fold — and once the `backfilling` definition's chunk
-/// work finishes (flipping it `live`), the parked catch-up
+/// work finishes (leaving it `catching_up`, issue #476), the parked catch-up
 /// (`pending_backfill`, reused from the ring-fallback path — see
 /// `defs::catalog::complete_direct_backfill`) must fold in whatever changed
 /// on the source table while it sat excluded.
@@ -670,7 +670,7 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     let cols = numeric(&["a"]);
 
     // Definition A: install and fully drain its chunk work now, so it's
-    // `live` before the CDC delta below arrives.
+    // applying before the CDC delta below arrives.
     install_and_dispatch(
         &db.pool,
         "TRANSFORM a_calc FROM s SELECT a AS x",
@@ -699,7 +699,10 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .unwrap()
         .get(0);
-    assert_eq!(status_a, "live", "A must be live before the delta arrives");
+    assert_eq!(
+        status_a, "catching_up",
+        "A's build is done, so it applies the delta that arrives next"
+    );
 
     // Definition B: install (its target table now exists, one chunk
     // enumerated) but do NOT drain its chunk — claim and *execute* it (so
@@ -750,13 +753,16 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
-    // A (live): the delta applied normally.
+    // A (applying): the delta applied normally.
     let a_x: i64 = client
         .query_one("select x::bigint from a_calc where id = 1", &[])
         .await
         .expect("read a_calc after the delta")
         .get(0);
-    assert_eq!(a_x, 99, "the live definition A must see the delta normally");
+    assert_eq!(
+        a_x, 99,
+        "the applying definition A must see the delta normally"
+    );
 
     // B (still backfilling): must NOT have been touched by the delta —
     // `dependents_of`/`transforms_for_source`'s status filter excludes it.
@@ -770,8 +776,9 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         "B must not observe the delta while still non-live — it was excluded, not folded in"
     );
 
-    // Finish B's chunk: flips it to live and parks the pending_backfill
-    // catch-up marker for `s` (see `complete_direct_backfill`).
+    // Finish B's chunk: leaves it `catching_up` and parks the
+    // pending_backfill catch-up marker for `s` (see
+    // `complete_direct_backfill`).
     chunk_queue::finish_chunk(&db.pool, &claimed_b[0], "worker-b")
         .await
         .expect("finish B's chunk");
@@ -785,15 +792,18 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .unwrap()
         .get(0);
-    assert_eq!(status_b, "live");
+    assert_eq!(
+        status_b, "catching_up",
+        "B is missing the delta, so it must not report live yet (issue #476)"
+    );
 
-    // Immediately after going live, B still hasn't been caught up — the
+    // Immediately after its build, B still hasn't been caught up — the
     // discharge is a separate, deliberate step (`run_pending_backfills`),
     // not folded into `finish_chunk` itself.
     let b_y_still_stale: i64 = client
         .query_one("select y::bigint from b_calc where id = 1", &[])
         .await
-        .expect("read b_calc immediately after going live")
+        .expect("read b_calc immediately after its build")
         .get(0);
     assert_eq!(
         b_y_still_stale, 10,
@@ -822,6 +832,17 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         b_y_after_discharge, 99,
         "discharging the parked marker must fold in the delta B missed while backfilling"
     );
+    let status_b: String = client
+        .query_one(
+            &format!(
+                "select status from transform_definitions where target_table = '{DEFAULT_TARGET_SCHEMA}.b_calc'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status_b, "live", "the catch-up's discharge takes B live");
 
     // A must be unaffected by the redundant re-enumeration (idempotent
     // overwrite recomputes the same, already-correct value).

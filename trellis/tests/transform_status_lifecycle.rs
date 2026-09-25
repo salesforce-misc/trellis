@@ -243,6 +243,11 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // The staging worker's next pass: the builds' go-live catch-ups
+            // take them `live` (issue #476).
+            trellis::intake::publication::discharge_registrations(pool)
+                .await
+                .expect("discharge the go-live catch-ups");
             return;
         }
         for chunk in &claimed {

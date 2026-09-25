@@ -81,6 +81,13 @@ pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String 
 /// `Backfilling` -> `Live` (ADR-0007's "Backgrounding and resumability"
 /// amendment) still needs a running drain worker to claim and finish that
 /// empty chunk queue — there is no synchronous fallback path.
+///
+/// Waits for each hop to go live before registering the next one on top of
+/// it (#471): registration returns with a definition `waiting_to_backfill`
+/// (#418), and a transform can't be defined on another's target until that
+/// one's build has finished. Since #476 the staging worker discharges each
+/// hop's go-live catch-up on its next maintenance tick; registering the next
+/// hop still waits for a reconcile pass to park its marker.
 pub async fn install_chain_hops(pool: &Pool, source: &str, depth: usize) -> Chain {
     assert!(depth >= 1, "a chain needs at least one hop");
     let prefix = source
@@ -101,6 +108,10 @@ pub async fn install_chain_hops(pool: &Pool, source: &str, depth: usize) -> Chai
             def.def.target, target,
             "install_definition must keep the bare target name"
         );
+        if i < depth {
+            let conn = pool.get().await.expect("acquire a connection");
+            wait_for_live(&conn, &target, Instant::now() + HOP_LIVE_TIMEOUT).await;
+        }
         hops.push(target);
         current_source = format!("public.{}", hops.last().expect("just pushed"));
     }
@@ -110,6 +121,10 @@ pub async fn install_chain_hops(pool: &Pool, source: &str, depth: usize) -> Chai
         hops,
     }
 }
+
+/// How long [`install_chain_hops`] waits for one hop to go live before it
+/// registers the next.
+const HOP_LIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Polls `transform_definitions.status` for `target` (bare name; the catalog
 /// stores it fully qualified) until it reads `'live'`, or panics at
@@ -149,9 +164,14 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
 /// Call it after the transforms are live and **before** the first source row
 /// is written, warm-up row included.
 ///
-/// A definition going live parks a catch-up marker on its source, and the
-/// staging worker discharges it on its next reconcile pass, up to
-/// `reconcile_interval` later. The discharge enumerates every row the source
+/// Since #476 a chunked or direct build reports `live` only once its go-live
+/// catch-up has been discharged, and the staging worker discharges a freshly
+/// parked marker on its next maintenance tick rather than its next reconcile
+/// pass, so after [`wait_for_live`] this normally returns at once. It stays
+/// as a guard against any other marker still pending when the offer starts.
+///
+/// Before #476 a definition went live with its catch-up marker only parked,
+/// discharged up to `reconcile_interval` later. The discharge enumerates every row the source
 /// holds at that moment as an image-less `Recompute` and stages it. Each one
 /// is applied and counted into `trellis_changes_applied_total` like any other
 /// staged row, although nothing about the row changed. If the pass lands

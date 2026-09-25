@@ -616,8 +616,7 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
 mod tests {
     use super::*;
     use crate::streaming::tuning::{
-        ISOLATED_PROPAGATION_RECONCILE_INTERVAL, STOCK_MAINTENANCE_INTERVAL, STOCK_POLL_INTERVAL,
-        STOCK_RECONCILE_INTERVAL,
+        STOCK_MAINTENANCE_INTERVAL, STOCK_POLL_INTERVAL, STOCK_RECONCILE_INTERVAL,
     };
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -668,18 +667,18 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_keeps_the_reconcile_pass_quiet_but_yields_to_the_flag() {
+    fn the_ladder_runs_the_stock_reconcile_pass_but_yields_to_the_flag() {
         assert_eq!(
             tuning(&argv(&["hop-ladder"]), EngineTuning::multi_hop()).reconcile_interval,
-            ISOLATED_PROPAGATION_RECONCILE_INTERVAL
+            STOCK_RECONCILE_INTERVAL
         );
         assert_eq!(
             tuning(
-                &argv(&["hop-ladder", "--reconcile-interval-ms", "5000"]),
+                &argv(&["hop-ladder", "--reconcile-interval-ms", "250"]),
                 EngineTuning::multi_hop()
             )
             .reconcile_interval,
-            STOCK_RECONCILE_INTERVAL
+            Duration::from_millis(250)
         );
     }
 

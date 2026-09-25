@@ -3,11 +3,13 @@
 //!
 //! The backfill discharge dispatches these shapes' build as one background job
 //! (ADR-0016, #419), which a drain worker runs while the definition sits
-//! `backfilling`, and the apply path skips any definition that isn't `live`
+//! `backfilling`, and the apply path skips any definition still being built
 //! (`catalog::dependents_of`). A change to an already-published source that
-//! commits after the build's read and drains before go-live is therefore
-//! skipped by the drain and missing from what the build wrote. Only a catch-up
-//! marker parked at go-live (`complete_direct_backfill`) brings it back.
+//! commits after the build's read and drains before the build finishes is
+//! therefore skipped by the drain and missing from what the build wrote. Only
+//! a catch-up marker parked when the build finishes
+//! (`complete_direct_backfill`) brings it back, and the definition reports
+//! `catching_up` rather than `live` until that catch-up has run (#476).
 //!
 //! The tests hold the build between its read and its target write with an
 //! event trigger (see [`install_build_hold`]) that blocks on an advisory lock
@@ -15,7 +17,7 @@
 //! stages its CDC row and drains it, then lets the build finish.
 //!
 //! Issue #442 is the reverse case: a change the build read whose delta drains
-//! only after go-live, on top of the build's own count of it. For an
+//! only after the build finishes, on top of the build's own count of it. For an
 //! aggregate the recompute horizon the build stamps on each group row sends
 //! that delta to re-derive its group. The build still records its coverage,
 //! which may let the go-live catch-up skip the source, so those tests check
@@ -203,6 +205,12 @@ fn cdc_insert(src_table: &str, key: &str, lsn: PgLsn, new_image: &str) -> Staged
 /// source, held between its read and its target write while a change to the
 /// source drains. Before the fix the target ended one change short and no
 /// catch-up marker was parked.
+///
+/// Issue #476's repro is the same schedule read at the moment the definition
+/// reports `live`: that used to be the build's completion, with the target
+/// still at `12`. Now the build leaves it `catching_up`, and only the
+/// catch-up's discharge, with `1012` in the target once its enumeration
+/// drains, takes it `live`.
 #[tokio::test]
 async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     let cluster = TestCluster::start();
@@ -235,7 +243,7 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
     .await
     .expect("install the aggregate");
     let pool = db.pool.clone();
-    let build = tokio::spawn(async move { publication::settle_registrations(&pool).await });
+    let build = tokio::spawn(async move { publication::settle_builds(&pool).await });
     wait_for_build_held(&client).await;
 
     commit_and_stage_insert(
@@ -253,28 +261,33 @@ async fn aggregate_build_recovers_a_change_drained_during_the_build() {
         .await
         .expect("release the build");
     build.await.expect("build task");
-    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     client
         .batch_execute("drop event trigger hold_direct_build")
         .await
         .expect("drop the build hold");
-
-    let markers = pending_markers(&client).await;
-    discharge_markers(&db.pool, &mut client).await;
-
-    let total: String = client
-        .query_one("select total::text from sku_totals where sku = 'a'", &[])
-        .await
-        .expect("read sku_totals")
-        .get(0);
+    drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(
-        total, "1012",
-        "the change drained while the build was running is folded in"
+        total_of_sku_a(&client).await,
+        "12",
+        "the build's own read misses the change that drained while it ran"
     );
     assert_eq!(
-        markers,
+        status_of(&client, "public.sku_totals").await,
+        "catching_up",
+        "so the finished build doesn't report live"
+    );
+    assert_eq!(
+        pending_markers(&client).await,
         vec!["public.sales".to_string()],
-        "going live parks a catch-up marker on the source, as the chunked path does"
+        "the build parks a catch-up marker on the source, as the chunked path does"
+    );
+
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+    assert_eq!(
+        total_of_sku_a(&client).await,
+        "1012",
+        "at live, the change drained while the build was running is folded in"
     );
 }
 
@@ -291,10 +304,11 @@ async fn seed_sales(client: &Client) {
 }
 
 /// Registers `sku_totals` over `public.sales` and runs its direct build to
-/// go-live, as the discharge and a drain thread would (ADR-0016, #419).
-/// Checks the build recorded its coverage of the source: the go-live
-/// catch-up may then skip re-deriving it, so whatever keeps the target right
-/// afterwards is not that catch-up.
+/// completion, as the discharge and a drain thread would (ADR-0016, #419),
+/// leaving it `catching_up` with its go-live catch-up parked (#476). Checks
+/// the build recorded its coverage of the source: the go-live catch-up may
+/// then skip re-deriving it, so whatever keeps the target right afterwards
+/// is not that catch-up.
 async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
     let definition = install_definition(
         pool,
@@ -313,8 +327,8 @@ async fn build_sku_totals_to_go_live(pool: &trellis::Pool, client: &Client) {
         TransformStatus::WaitingToBackfill,
         "registration only records the definition; the build is a background job"
     );
-    publication::settle_registrations(pool).await;
-    assert_eq!(status_of(client, "public.sku_totals").await, "live");
+    publication::settle_builds(pool).await;
+    assert_eq!(status_of(client, "public.sku_totals").await, "catching_up");
 
     let covered: bool = client
         .query_one(
@@ -351,6 +365,7 @@ async fn assert_the_read_change_is_counted_once(pool: &trellis::Pool, client: &m
         "the change the build read is counted once, not again by its drained delta"
     );
     discharge_markers(pool, client).await;
+    assert_eq!(status_of(client, "public.sku_totals").await, "live");
     assert_eq!(total_of_sku_a(client).await, "1012");
 }
 
@@ -516,8 +531,11 @@ async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_aft
     )
     .await
     .expect("install the aggregate");
-    publication::settle_registrations(&db.pool).await;
-    assert_eq!(status_of(&client, "public.region_totals").await, "live");
+    publication::settle_builds(&db.pool).await;
+    assert_eq!(
+        status_of(&client, "public.region_totals").await,
+        "catching_up"
+    );
     let covered: bool = client
         .query_one(
             "select exists (select 1 from backfill_coverage where table_name = 'public.customers')",
@@ -539,6 +557,7 @@ async fn aggregate_build_does_not_double_count_a_read_to_side_change_drained_aft
         "the to-side change the build read is counted once, not again by its drained delta"
     );
     discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(status_of(&client, "public.region_totals").await, "live");
     assert_eq!(region_totals(&client).await, expected);
 }
 
@@ -595,7 +614,7 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
     .await
     .expect("install the relationship-enriched 1-1");
     let pool = db.pool.clone();
-    let build = tokio::spawn(async move { publication::settle_registrations(&pool).await });
+    let build = tokio::spawn(async move { publication::settle_builds(&pool).await });
     wait_for_build_held(&client).await;
 
     commit_and_stage_insert(
@@ -613,7 +632,10 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
         .await
         .expect("release the build");
     build.await.expect("build task");
-    assert_eq!(status_of(&client, "public.author_totals").await, "live");
+    assert_eq!(
+        status_of(&client, "public.author_totals").await,
+        "catching_up"
+    );
     client
         .batch_execute("drop event trigger hold_direct_build")
         .await
@@ -621,6 +643,11 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
 
     let markers = pending_markers(&client).await;
     discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(
+        status_of(&client, "public.author_totals").await,
+        "live",
+        "live once the catch-ups on both tables the build read have run"
+    );
 
     let count: String = client
         .query_one(
@@ -637,7 +664,7 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
     assert_eq!(
         markers,
         vec!["public.authors".to_string(), "public.comments".to_string()],
-        "going live parks a catch-up marker on every table the build read"
+        "the build parks a catch-up marker on every table it read"
     );
 }
 

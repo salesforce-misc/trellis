@@ -208,29 +208,91 @@ pub(crate) async fn park_registration_markers(
 }
 
 /// Parks a catch-up marker for `definition_id`'s *target* table when some
-/// `live` definition reads it (issue #315). Called wherever a definition goes
-/// live after a build that wrote its target outside the target-mutation seam
-/// (`staging::target_mutations`): a reader already attached (only possible
-/// for a rebuilt, resumed upstream, since `defs::catalog` refuses to attach a
-/// new one to a non-`live` target) re-derives from the rebuilt state once
-/// the marker discharges. A no-op for a target nothing reads.
+/// applying definition reads it (issue #315), moving each such reader that
+/// is `live` to `catching_up` until the marker is discharged (issue #476).
+/// Called wherever a definition's build finishes after writing its target
+/// outside the target-mutation seam (`staging::target_mutations`): a reader
+/// already attached (only possible for a rebuilt, resumed upstream, since
+/// `defs::catalog` refuses to attach a new one to a target still being
+/// built) re-derives from the rebuilt state once the marker discharges, and
+/// until then it may be missing what the rebuild wrote. A no-op for a target
+/// nothing reads.
 pub(crate) async fn park_target_catchup_if_read(
     client: &impl GenericClient,
     definition_id: i64,
 ) -> Result<(), IntakeError> {
-    let target: Option<String> = client
-        .query_opt(
-            "select d.target_table from transform_definitions d \
-             where d.id = $1 and exists ( \
-                 select 1 from transform_definitions r \
-                 where r.source_table = d.target_table and r.status = 'live' \
-             )",
-            &[&definition_id],
+    let rows = client
+        .query(
+            "select d.target_table, r.id from transform_definitions d \
+             join transform_definitions r on r.source_table = d.target_table \
+             where d.id = $1 and r.status = any($2) \
+             order by r.id",
+            &[&definition_id, &TransformStatus::applying()],
         )
-        .await?
-        .map(|row| row.get(0));
-    if let Some(target) = target {
-        park_backfill_catchup(client, &target).await?;
+        .await?;
+    let Some(target) = rows.first().map(|row| row.get::<_, String>(0)) else {
+        return Ok(());
+    };
+    let readers: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+    park_catch_up(client, &readers, &[target]).await
+}
+
+/// Parks a go-live catch-up marker on each of `tables` for the definitions
+/// `ids`, and moves each of those that is `live` to `catching_up` (issue
+/// #476, ADR-0016's "What `live` promises"). A catch-up re-reads a table
+/// because a definition reading it may be missing changes it didn't apply,
+/// so that definition can't honestly report its steady state until the
+/// catch-up has run. It stays applying meanwhile: `catching_up` is
+/// maintained exactly as `live` is. The discharge that runs its last pending
+/// catch-up flips it back ([`go_live_caught_up`]).
+///
+/// Locks follow one order everywhere a definition's catch-up is parked or
+/// discharged: the definition rows first (in id order), then the marker
+/// rows (in name order, so two transactions parking overlapping tables can't
+/// deadlock on each other's marker rows). A build's completion already holds
+/// its definition's lock when it parks, and the discharge locks the
+/// definitions it may flip before it deletes its marker. Each of `ids` is
+/// locked even when it is already `catching_up`, so a discharge that could
+/// flip it either commits first, and this moves it back, or waits for this
+/// commit and then sees the new marker.
+pub(crate) async fn park_catch_up(
+    client: &impl GenericClient,
+    ids: &[i64],
+    tables: &[String],
+) -> Result<(), IntakeError> {
+    if !ids.is_empty() {
+        client
+            .execute(
+                "select 1 from transform_definitions where id = any($1) order by id for update",
+                &[&ids],
+            )
+            .await?;
+        let moved: Vec<i64> = client
+            .query(
+                "update transform_definitions set status = $1 \
+                 where id = any($2) and status = $3 returning id",
+                &[
+                    &TransformStatus::CatchingUp.as_str(),
+                    &ids,
+                    &TransformStatus::Live.as_str(),
+                ],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !moved.is_empty() {
+            tracing::info!(
+                ids = ?moved,
+                from = %TransformStatus::Live.as_str(),
+                to = %TransformStatus::CatchingUp.as_str(),
+                "transform status transition: go-live catch-up parked"
+            );
+        }
+    }
+    let tables: BTreeSet<&String> = tables.iter().collect();
+    for table in tables {
+        park_marker(client, table).await?;
     }
     Ok(())
 }
@@ -238,18 +300,17 @@ pub(crate) async fn park_target_catchup_if_read(
 /// Parks a fresh catch-up marker for `qualified_table`, reusing the exact
 /// `pending_backfill` mechanism [`reconcile_publication`] already relies on
 /// for a table newly joining the publication (docs/decisions/0007's
-/// amendment). `defs::catalog::complete_direct_backfill` calls this, once
-/// per table the build read, the moment a chunk- or job-built definition
-/// flips `backfilling` -> `live`: while it
-/// sat non-`live`, [`super::super::defs::dependents_of`]'s status filter kept
-/// any live CDC delta for `qualified_table` from being folded into its
-/// target, so the definition's target may be missing whatever changed on
-/// that table during the build. This marker's later discharge
-/// ([`run_pending_backfills`]) re-derives every definition on `qualified_table`
-/// (now including the newly-`live` one) from current source state, folding
-/// in anything skipped meanwhile — the same `run_pending_backfills`-shaped
-/// event the amendment describes, just triggered by "every chunk done"
-/// instead of "a table newly joined the publication."
+/// amendment). It moves no definition to `catching_up`: a caller whose
+/// catch-up is some definition's go-live parks through [`park_catch_up`]
+/// instead, as `defs::catalog::complete_direct_backfill` does, once per
+/// table the build read, the moment a chunk- or job-built definition's
+/// build finishes: while it was building,
+/// [`super::super::defs::dependents_of`]'s status filter kept any live CDC
+/// delta for `qualified_table` from being folded into its target, so the
+/// definition's target may be missing whatever changed on that table during
+/// the build. The marker's later discharge ([`run_pending_backfills`])
+/// re-derives every definition on `qualified_table` from current source
+/// state, folding in anything skipped meanwhile.
 ///
 /// See [`park_marker`] for what happens when a marker for this table already
 /// exists.
@@ -315,6 +376,32 @@ pub(crate) async fn park_marker(
         )
         .await?;
     Ok(())
+}
+
+/// Whether some `pending_backfill` marker is waiting for a discharge pass to
+/// see it for the first time: parked (or re-parked) since the last pass read
+/// it, so it has no fence yet, and not backing off after a failure. The
+/// maintenance loop asks this every tick and runs its reconcile pass at
+/// once when it's `true`, rather than waiting out
+/// `ClientOptions::reconcile_interval` (issue #476).
+///
+/// That keeps time to `live` short. A finished chunked or direct build
+/// parks its go-live catch-up and is `live` only once that discharges, and
+/// the build finishes on a drain thread, possibly in another process, with
+/// nothing else to tell the staging worker. Each fresh marker triggers at
+/// most one early pass: the pass that sees it fences it
+/// ([`confirm_fence`]), after which this no longer counts it. A marker whose
+/// fence doesn't settle in that pass, or whose enumeration defers on intake,
+/// waits for the regular interval, as before.
+pub(crate) async fn discharge_wanted(client: &impl GenericClient) -> Result<bool, IntakeError> {
+    Ok(client
+        .query_one(
+            "select exists (select 1 from pending_backfill \
+             where fence_xid is null and coalesce(next_attempt_at <= now(), true))",
+            &[],
+        )
+        .await?
+        .get(0))
 }
 
 /// Takes `marker`'s fence and records it on the marker's row, so later
@@ -1263,8 +1350,10 @@ async fn plan_waiting_builds(
 
 /// Runs `marker`'s discharge in one transaction: the orphan delete, the
 /// enumeration (see [`run_pending_backfills`]'s "When the table is
-/// enumerated"), each waiting definition's dispatch, the marker's delete and
-/// the ring-built definitions' flip to `live`. An error drops the
+/// enumerated"), each waiting definition's dispatch, the marker's delete, the
+/// ring-built definitions' flip ([`go_live`]) and the flip to `live` of every
+/// `catching_up` definition this was the last catch-up of
+/// ([`go_live_caught_up`]). An error drops the
 /// transaction, which rolls it back, so the marker survives either way the
 /// discharge falls short.
 async fn discharge_marker(
@@ -1326,6 +1415,9 @@ async fn discharge_marker(
             Build::Ring => {}
         }
     }
+    // Locked before the marker's delete, the order `park_catch_up` takes
+    // the same rows in (issue #476).
+    let catching_up = crate::defs::catalog::catching_up_readers(&txn, &marker.table).await?;
     // Delete only the marker this pass read (issues #311/#367). A park
     // since then gave the row a new generation, so it stays for the next
     // pass: this enumeration's snapshot may predate that park's change.
@@ -1343,6 +1435,7 @@ async fn discharge_marker(
     )
     .await?;
     go_live(&txn, &ring).await?;
+    go_live_caught_up(&txn, &marker.table, catching_up).await?;
     if enumerate {
         txn.execute("select pg_notify($1, '')", &[&wake_channel])
             .await?;
@@ -1380,44 +1473,57 @@ async fn intake_caught_up(
     }
 }
 
-/// Flips exactly `ids` (the discharge's ring-built definitions)
-/// `waiting_to_backfill` -> [`TransformStatus::Live`] inside the discharge's
-/// transaction, and parks the go-live catch-ups the flip calls for in that
-/// same transaction, so the enumeration, the flip and the catch-ups commit
-/// together or not at all (issues #404/#444).
+/// Flips exactly `ids` (the discharge's ring-built definitions) out of
+/// `waiting_to_backfill` inside the discharge's transaction, and parks the
+/// go-live catch-ups the flip calls for in that same transaction, so the
+/// enumeration, the flip and the catch-ups commit together or not at all
+/// (issues #404/#444).
+///
+/// A definition goes straight to [`TransformStatus::Live`]: the discharge
+/// runs on the maintenance loop, the only sealer, so nothing staged after
+/// the enumeration's read drains before this flip commits, and its
+/// `Recompute` rows carry no `origin_lsn`, so they gate any token. The
+/// exception is a definition whose source is another definition's target
+/// (issue #476, below), which goes to [`TransformStatus::CatchingUp`].
 ///
 /// Scoped `status = 'waiting_to_backfill'` (issue #331): an operator pause
 /// (or a quarantine) that landed on one of `ids` since the discharge read it
 /// leaves it frozen — its resume re-parks a marker of its own — rather than
 /// forcing it `live` behind the operator's back.
 ///
-/// Two kinds of catch-up, both issue #315, parked in name order so two
-/// transactions parking overlapping tables can't deadlock on each other's
-/// marker rows:
+/// Two kinds of catch-up, both issue #315, parked through [`park_catch_up`]:
 ///
-/// - A flipped definition's target that some `live` definition reads (see
+/// - A flipped definition's target that some applying definition reads (see
 ///   [`park_target_catchup_if_read`]): its readers re-derive from the
-///   rebuilt target.
+///   rebuilt target, and are `catching_up` until they have.
 /// - A flipped definition's source that is another definition's target: it
-///   was enumerated while the definition wasn't `live`, which the
+///   was enumerated while the definition wasn't applying, which the
 ///   target-mutation seam skips, and that target is never in the
 ///   publication. A write to it between the enumeration and the flip reached
-///   nobody. The next discharge flips nothing, so this doesn't loop.
+///   nobody. Its writers are drain workers, which don't wait for a seal, so
+///   the only-sealer argument above doesn't cover them: the definition
+///   applies from this flip on, and reports `live` only once this catch-up
+///   has run ([`go_live_caught_up`]). The next discharge flips nothing out of
+///   `waiting_to_backfill`, so this doesn't loop.
 ///
 /// Parking inside the transaction is enough for both. The discharge takes a
 /// marker's fence only after reading it committed ([`confirm_fence`]), so the
 /// fence postdates the flip and waits out a seam writer that checked for
-/// `live` readers before the flip committed (issue #431).
+/// applying readers before the flip committed (issue #431).
 async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> {
     if ids.is_empty() {
         return Ok(());
     }
-    let flipped: Vec<i64> = txn
+    let flipped: Vec<(i64, String)> = txn
         .query(
-            "update transform_definitions set status = $1 \
-             where id = any($2) and status = $3 \
-             returning id",
+            "update transform_definitions d set status = case \
+                 when exists ( \
+                     select 1 from transform_definitions u where u.target_table = d.source_table \
+                 ) then $1 else $2 end \
+             where d.id = any($3) and d.status = $4 \
+             returning d.id, d.status",
             &[
+                &TransformStatus::CatchingUp.as_str(),
                 &TransformStatus::Live.as_str(),
                 &ids,
                 &TransformStatus::WaitingToBackfill.as_str(),
@@ -1425,16 +1531,17 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
         )
         .await?
         .into_iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
-    if !flipped.is_empty() {
+    for (id, status) in &flipped {
         tracing::info!(
-            ids = ?flipped,
+            definition_id = id,
             from = %TransformStatus::WaitingToBackfill.as_str(),
-            to = %TransformStatus::Live.as_str(),
+            to = %status,
             "transform status transition: backfill enumeration committed"
         );
     }
+    let flipped: Vec<i64> = flipped.into_iter().map(|(id, _)| id).collect();
     if flipped.len() < ids.len() {
         let skipped: Vec<i64> = ids
             .iter()
@@ -1447,57 +1554,119 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
              meanwhile; leaving their status as it is"
         );
     }
-    let read_targets: Vec<String> = txn
+    let read_targets = txn
         .query(
-            "select d.target_table from transform_definitions d \
-             where d.id = any($1) and exists ( \
-                 select 1 from transform_definitions r \
-                 where r.source_table = d.target_table and r.status = 'live' \
-             )",
-            &[&flipped],
+            "select d.target_table, r.id from transform_definitions d \
+             join transform_definitions r on r.source_table = d.target_table \
+             where d.id = any($1) and r.status = any($2)",
+            &[&flipped, &TransformStatus::applying()],
         )
-        .await?
-        .into_iter()
+        .await?;
+    let chained_sources = txn
+        .query(
+            "select d.source_table from transform_definitions d \
+             where d.id = any($1) and d.status = $2",
+            &[&flipped, &TransformStatus::CatchingUp.as_str()],
+        )
+        .await?;
+    let tables: Vec<String> = read_targets
+        .iter()
+        .chain(&chained_sources)
         .map(|row| row.get(0))
         .collect();
-    let chained_sources: Vec<String> = txn
-        .query(
-            "select distinct d.source_table from transform_definitions d \
-             where d.id = any($1) and exists ( \
-                 select 1 from transform_definitions u where u.target_table = d.source_table \
-             )",
-            &[&flipped],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    let mut tables: Vec<&String> = read_targets.iter().chain(&chained_sources).collect();
-    tables.sort_unstable();
-    tables.dedup();
-    for table in tables {
-        park_backfill_catchup(txn, table).await?;
-    }
-    Ok(())
+    let readers: Vec<i64> = read_targets.iter().map(|row| row.get(1)).collect();
+    park_catch_up(txn, &readers, &tables).await
 }
 
-/// Test stand-in for the staging worker's maintenance pass over newly
-/// registered definitions (ADR-0016), for a test with no staging worker and
-/// no publication: parks the marker [`reconcile_publication`] would on every
-/// `waiting_to_backfill` definition's source (treating every source as
-/// published), then discharges every settled marker with intake taken as
-/// caught up. Retries for a few seconds while a fence is still pinned by some
-/// other transaction in the cluster (other tests share it), and returns once
-/// no definition is left `waiting_to_backfill` or the retries run out. Chunks
-/// it enqueues still need a drain worker (or a test's own chunk loop).
-/// [`discharge_registrations`], then claims and runs every backfill chunk it
-/// (or anything before it) enqueued until none is left: a synchronous
-/// stand-in for the staging worker and a drain thread together, for a test
-/// that needs its plain 1-1 definitions `live` before it goes on (to chain a
-/// definition off one, say). Ring enumerations it stages are left in the
-/// ring for the test to drain. Panics on any failure: it is test harness.
+/// Flips each of `candidates` (every `catching_up` definition that reads
+/// `table`, locked by `defs::catalog::catching_up_readers` before the
+/// caller deleted `table`'s marker, with the tables it reads) to
+/// [`TransformStatus::Live`] once no go-live catch-up is left pending for it
+/// (issue #476): the discharge of `table`'s marker is then the last of its
+/// catch-ups, and this is the transaction that re-read `table` (or found
+/// that coverage lets it skip the re-read). Returns the ids it flipped.
+///
+/// "Reads" is every table the definition's build reads: its source and each
+/// relationship to-side it references (`defs::catalog::tables_read_by`, the
+/// tables its catch-ups are parked on). A definition with a marker still
+/// pending on another of them waits for that one's discharge.
+///
+/// **Why `live` is honest here.** A `catching_up` definition has been
+/// applying since before any of its pending catch-ups was fenced, so every
+/// change committed after a catch-up's read reaches it through apply, and
+/// every change before it is re-derived by the read's `Recompute` rows,
+/// which carry no `origin_lsn` and so gate any token taken after this flip.
+/// A catch-up that coverage lets skip its read vouches that nothing changed
+/// on the table since the build read it.
+///
+/// **Locks.** The candidates are locked before the caller deletes its
+/// marker, and whether a marker is still pending is read here, in a later
+/// statement, so a concurrent [`park_catch_up`] for one of them either
+/// commits first (and this sees its marker, since the lock waited for it)
+/// or waits for this commit (and then moves the definition back to
+/// `catching_up`).
+///
+/// Issue #485 extends this: the definitions it flips are exactly the ones
+/// whose orphaned target rows the flip must also delete.
+async fn go_live_caught_up(
+    txn: &Transaction<'_>,
+    table: &str,
+    candidates: Vec<(i64, Vec<String>)>,
+) -> Result<Vec<i64>, IntakeError> {
+    let mut flipped = Vec::new();
+    for (id, tables) in candidates {
+        let went_live = txn
+            .execute(
+                "update transform_definitions set status = $1 \
+                 where id = $2 and status = $3 and not exists ( \
+                     select 1 from pending_backfill where table_name = any($4) \
+                 )",
+                &[
+                    &TransformStatus::Live.as_str(),
+                    &id,
+                    &TransformStatus::CatchingUp.as_str(),
+                    &tables,
+                ],
+            )
+            .await?;
+        if went_live == 1 {
+            flipped.push(id);
+        }
+    }
+    if !flipped.is_empty() {
+        tracing::info!(
+            ids = ?flipped,
+            table = %table,
+            from = %TransformStatus::CatchingUp.as_str(),
+            to = %TransformStatus::Live.as_str(),
+            "transform status transition: go-live catch-up discharged"
+        );
+    }
+    Ok(flipped)
+}
+
+/// [`settle_builds`], then [`discharge_registrations`] again for the go-live
+/// catch-ups those builds parked: a synchronous stand-in for the staging
+/// worker and a drain thread together, for a test that needs its
+/// definitions `live` before it goes on (to chain a definition off one,
+/// say). Ring enumerations it stages are left in the ring for the test to
+/// drain. Panics on any failure: it is test harness.
 #[cfg(any(test, feature = "internals"))]
 pub async fn settle_registrations(pool: &crate::pool::Pool) {
+    settle_builds(pool).await;
+    discharge_registrations(pool)
+        .await
+        .expect("discharge the builds' go-live catch-ups");
+}
+
+/// [`discharge_registrations`], then claims and runs every backfill chunk it
+/// (or anything before it) enqueued until none is left: every registered
+/// build finishes, and a chunked or direct one is left `catching_up` with its
+/// go-live catch-up parked (issue #476), for a test that looks at that state
+/// before the staging worker's next pass would discharge it. Panics on any
+/// failure: it is test harness.
+#[cfg(any(test, feature = "internals"))]
+pub async fn settle_builds(pool: &crate::pool::Pool) {
     use crate::defs::chunk_queue;
     const CLAIMED_BY: &str = "settle_registrations";
     discharge_registrations(pool)
@@ -1523,6 +1692,18 @@ pub async fn settle_registrations(pool: &crate::pool::Pool) {
     }
 }
 
+/// Test stand-in for the staging worker's maintenance pass over newly
+/// registered definitions (ADR-0016), for a test with no staging worker and
+/// no publication: parks the marker [`reconcile_publication`] would on every
+/// `waiting_to_backfill` definition's source (treating every source as
+/// published), then discharges every settled marker with intake taken as
+/// caught up. That includes the go-live catch-up of every `catching_up`
+/// definition, which takes it `live` (issue #476). Retries for a few seconds
+/// while a fence is still pinned by some other transaction in the cluster
+/// (other tests share it), and returns once no definition is left
+/// `waiting_to_backfill` or `catching_up`, or the retries run out. Chunks it
+/// enqueues still need a drain worker (or a test's own chunk loop):
+/// [`settle_registrations`] runs them.
 #[cfg(any(test, feature = "internals"))]
 pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), IntakeError> {
     let mut client = pool
@@ -1539,7 +1720,14 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        if sources.is_empty() {
+        let catching_up: bool = client
+            .query_one(
+                "select exists (select 1 from transform_definitions where status = $1)",
+                &[&TransformStatus::CatchingUp.as_str()],
+            )
+            .await?
+            .get(0);
+        if sources.is_empty() && !catching_up {
             return Ok(());
         }
         park_registration_markers(&**client, &sources).await?;
@@ -3002,6 +3190,17 @@ mod catch_up_tests {
         assert_eq!(totals, ["42"], "w's row reaches the target");
     }
 
+    async fn definition_status(client: &tokio_postgres::Client, id: i64) -> String {
+        client
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read the definition's status")
+            .get(0)
+    }
+
     /// The marker's fence, or `None` while the discharge hasn't taken it
     /// yet.
     async fn marker_fence(client: &tokio_postgres::Client) -> Option<i64> {
@@ -3088,6 +3287,9 @@ mod catch_up_tests {
     /// fence must wait for it, or the catch-up reads the target without its
     /// write. The discharge used to re-park after commit to get a later
     /// fence; the fence taken at first read replaces that.
+    ///
+    /// Issue #476: the reader applies from the flip on, but reports `live`
+    /// only once that catch-up has run.
     #[tokio::test]
     async fn a_chained_catchup_waits_for_a_seam_writer_racing_the_flip() {
         let cluster = testkit::TestCluster::start();
@@ -3109,7 +3311,8 @@ mod catch_up_tests {
             .query_one(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.t', 1, '', 'waiting_to_backfill') returning id",
+                 values ('public.d', 'public.t', 1, 'TRANSFORM d FROM t SELECT id AS x', \
+                         'waiting_to_backfill') returning id",
                 &[],
             )
             .await
@@ -3122,18 +3325,29 @@ mod catch_up_tests {
         let mut seam = connect(&db).await;
         let (seam_writer, _) = open_writer(&mut seam).await;
         flip.commit().await.expect("commit the flip");
+        assert_eq!(
+            definition_status(&discharger, reader).await,
+            "catching_up",
+            "applying, with its chained-source catch-up still to run"
+        );
 
         pass(&mut discharger).await;
         assert!(
             marker_generation(&discharger).await.is_some(),
             "the seam writer that raced the flip is still open, so the catch-up waits"
         );
+        assert_eq!(definition_status(&discharger, reader).await, "catching_up");
         seam_writer.commit().await.expect("commit the seam writer");
         pass(&mut discharger).await;
         assert_eq!(
             marker_generation(&discharger).await,
             None,
             "the catch-up discharges once the seam writer has ended"
+        );
+        assert_eq!(
+            definition_status(&discharger, reader).await,
+            "live",
+            "the catch-up's discharge takes it live"
         );
     }
 

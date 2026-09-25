@@ -54,7 +54,10 @@ marker-discharge machinery (`intake::publication::run_pending_backfills_until`):
    included). Ring enumeration is the `Unsupported` fallback, not a size
    threshold. A definition moves to `backfilling` only in the transaction
    that commits the work driving it.
-4. **Go live.** The definition flips to `live` when its build finishes.
+4. **Go live.** A ring enumeration flips its definition to `live` in the
+   discharge transaction. A chunked or direct build's completion moves it to
+   `catching_up` and parks its go-live catch-up, and the discharge of that
+   catch-up flips it `live` (see [What `live` promises](#what-live-promises)).
 
 The marker discharge is the only capture path. It handles a table joining the
 publication, a resumed transform, an explicit `request_backfill`, and every
@@ -104,19 +107,20 @@ later too.
 The capture snapshot is taken after the fence has settled, so every commit it
 doesn't see comes from a transaction that began after the join, and the stream
 carries it. A source that is another definition's target is the exception: it
-isn't streamed, and the target-mutation seam carries its writes only to a `live`
-reader. Apply skips a definition that isn't `live`, so every build also needs
+isn't streamed, and the target-mutation seam carries its writes only to an
+applying reader (`live` or `catching_up`). Apply skips a definition whose build
+hasn't finished, so every build also needs
 something to cover the changes that drain while it runs. What that is depends on
 how many snapshots the build reads through:
 
 | Build | Dispatched as | Reads the source | Covers changes during the build by |
 |---|---|---|---|
-| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target also gets a go-live catch-up marker (`intake::publication::go_live`): its writes arrive through the seam from drain workers, which don't wait for a seal |
-| **Plain 1-1 chunks** | chunk boundaries enumerated and enqueued as `backfill_chunks`, executed by drain threads | once per chunk, each under its own snapshot | the catch-up marker parked when the last chunk goes live (`complete_direct_backfill`), discharged by this same path |
+| **Ring enumeration** (any shape; the universal fallback) | one cursor inside the discharge transaction | once, at the capture snapshot | the discharge running on the maintenance loop, the only sealer: nothing staged after the pass starts drains before the flip to `live`. A source that is another definition's target instead gets a go-live catch-up marker, and the definition goes to `catching_up` (`intake::publication::go_live`): its writes arrive through the seam from drain workers, which don't wait for a seal |
+| **Plain 1-1 chunks** | chunk boundaries enumerated and enqueued as `backfill_chunks`, executed by drain threads | once per chunk, each under its own snapshot | the catch-up marker parked when the last chunk finishes (`complete_direct_backfill`), discharged by this same path |
 | **Direct set-based build** (aggregates, relationship-enriched 1-1) | one background job, a `backfill_chunks` row with no bounds that a drain thread runs start to finish ([The direct-build job](#the-direct-build-job)) | once per statement | the same go-live catch-up marker, parked on every table the build read (its source and each relationship to-side) |
 
 The go-live catch-up re-reads the source, so a change that drained while the
-definition wasn't `live` reaches the target. For an aggregate, a change the
+definition was still building reaches the target. For an aggregate, a change the
 build read whose streamed delta drains after the flip re-derives its group
 through the recompute horizon the build records
 ([Which consistency bookkeeping stays](#which-consistency-bookkeeping-stays)).
@@ -139,8 +143,8 @@ enqueues it as a `backfill_chunks` row with no bounds
 (`chunk_queue::dispatch_direct_build`), in the transaction that moves the
 definition to `backfilling`. That gives it the chunk queue's whole driver
 contract unchanged: a drain thread claims it, heartbeats the claim for as long
-as the build runs, and finishing it flips the definition `live` with its
-go-live catch-ups (`chunk_queue::finish_chunk`, `complete_direct_backfill`). A
+as the build runs, and finishing it moves the definition to `catching_up` with
+its go-live catch-ups (`chunk_queue::finish_chunk`, `complete_direct_backfill`). A
 pause withholds it and a resume supersedes it, exactly as for a chunk. The
 staging worker was the other option, and a poor one: its maintenance loop is
 the only sealer, so a build that runs for minutes there would stall every
@@ -178,9 +182,10 @@ The in-registration build carried three pieces of bookkeeping. With the build
 starting only after its marker's fence has settled:
 
 - **The go-live catch-up stays, and correctness needs it.** Apply skips a
-  definition that isn't `live`, so a change that drains while the job runs
-  reaches nothing. The catch-up marker parked with the flip, on every table the
-  build read (issue #430), re-derives from current state.
+  definition whose build hasn't finished, so a change that drains while the
+  job runs reaches nothing. The catch-up marker parked when the build
+  finishes, on every table the build read (issue #430), re-derives from
+  current state, and its discharge is what takes the definition `live`.
 - **The coverage fence and `backfill_coverage` stay, as an optimization.**
   Without a record, every direct build's go-live catch-up enumerates the whole
   source, and each to-side table, into the ring in one transaction: exactly the
@@ -259,11 +264,12 @@ what keeps the join step gap-free.
 
 ### What `live` promises
 
-*Decided 2026-09-24.* `live` tells an operator that a transform is in its
-**steady state**. Once a definition reports `live`, a watermark token taken
-after any commit and awaited with `Trellis::await_converged` guarantees that
-the transform's values reflect every commit at or before that token. Nothing
-else is needed: no marker checks, no extra waits.
+*Decided 2026-09-24, implemented by #476.* `live` tells an operator that a
+transform is in its **steady state**. Once a definition reports `live`, a
+watermark token taken after any commit and awaited with
+`Trellis::await_converged` guarantees that the transform's values reflect
+every commit at or before that token. Nothing else is needed: no marker
+checks, no extra waits.
 
 The two signals stay separate on purpose. `await_converged` is a pure LSN wait
 over captured changes. It never reads definition status or backfill markers,
@@ -272,17 +278,82 @@ rows. Backfill is an operator concern, reported by `Trellis::status`. A reader
 that needs a settled target checks both: `live` from status, then its token.
 
 For that to hold, a definition may flip to `live` only once nothing from its
-initial capture is still outstanding. Ring enumeration already works that
-way: it flips in the same transaction as its read, and its `Recompute` rows
-carry no `origin_lsn`, so they gate any token. **Chunked and direct builds
-don't yet.** They flip to `live` in `complete_direct_backfill` and only
-*park* their go-live catch-up, which runs on a later maintenance pass. A
-change that drained while the build ran reaches the target only then, and
-neither signal waits for it. #476 moves their flip into the catch-up's own
-discharge, and settles the same question for catch-ups parked on a definition
-that is already `live` (column resume, `ALTER TRANSFORM`, stale-chunk parks).
-Until it lands, a test that needs a settled target also checks that no
-`pending_backfill` marker is left, as the generative harness's `quiesce` does.
+initial capture is still outstanding:
+
+- **Ring enumeration** flips in the same transaction as its read, and its
+  `Recompute` rows carry no `origin_lsn`, so they gate any token.
+- **Chunked and direct builds** finish in `catching_up`, not `live`
+  (`complete_direct_backfill`), and park their go-live catch-up on every table
+  the build read. The discharge of the last of those catch-ups flips the
+  definition `live`, in the same transaction as its re-read or its
+  coverage-based skip (`intake::publication::go_live_caught_up`). That
+  discharge runs on the maintenance loop, the only sealer, like ring
+  enumeration's.
+- **A ring enumeration whose source is another definition's target** goes to
+  `catching_up` and parks its catch-up on that source (`go_live`). Its
+  source's writes reach it only through the target-mutation seam, from drain
+  workers that don't wait for a seal, and only once it applies, so it must
+  apply before the catch-up's fence is taken, and report `live` only after
+  the catch-up has read.
+
+**`catching_up` is applied exactly as `live` is.** Apply, the seam and every
+"does anything read this?" check treat the two alike
+(`TransformStatus::is_applying`). Only the status an operator reads differs.
+That is what makes each flip sound: the definition has been applying since
+before any of its pending catch-ups was fenced, so every change committed
+after a catch-up's read reaches it through apply, and everything before is
+re-derived by the read's `Recompute` rows, which gate any token taken after
+the flip. A definition that reads several tables (a direct build's source and
+relationship to-sides) flips only when no marker is pending on any of them,
+which is correct however many passes the catch-ups span, because it applied
+the whole time.
+
+#### Catch-ups on a definition that is already `live`
+
+Some catch-ups are parked on a definition that is already `live`: a column
+resume (`staging::quarantine::resume_column`), an `ALTER TRANSFORM` that
+added columns, a stale backfill chunk discarded after its rebuild went live
+(`chunk_queue`), and an upstream rebuild that wrote a reader's source outside
+the seam (`park_target_catchup_if_read`). Each leaves the target missing
+something until the catch-up runs.
+
+**Decision:** such a park moves the definition from `live` to `catching_up`
+in the same transaction (`intake::publication::park_catch_up`), and the
+catch-up's discharge flips it back. It keeps applying throughout, so nothing
+stops. Considered and rejected:
+
+- **Moving it back to `backfilling`.** Apply skips a definition that isn't
+  applying, so it would stop taking new changes for as long as the catch-up
+  waited, and those would then need a catch-up of their own.
+- **Leaving it `live` and reporting the pending marker beside the status**
+  (a flag on `DefinitionStatus`). Every reader of `live` would have to know
+  to check the flag too, which is the contract this section exists to make
+  unnecessary; a status word keeps `live` meaning one thing.
+- **Deriving the state from pending markers when status is read.** A marker
+  is per table, not per definition: a new registration's join marker on a
+  shared source would report every `live` definition on it as catching up,
+  though none of them is missing anything.
+
+**Locks.** A park locks the definition rows before it parks the markers, and
+the discharge locks the `catching_up` definitions it may flip before it
+deletes its marker, then checks for pending markers in a later statement. A
+park racing a discharge therefore either commits first (and the discharge
+sees its marker) or waits for the flip (and moves the definition back).
+
+**Time to `live`.** A chunked or direct build's go-live now waits for one
+discharge pass, and nothing but the maintenance loop's reconcile timer used
+to start one, up to `ClientOptions::reconcile_interval` (5 s) later. The
+maintenance loop now checks every tick for a marker no pass has fenced yet
+(`intake::publication::discharge_wanted`) and runs its reconcile pass at
+once when it finds one. Each fresh marker triggers one early pass: the pass
+fences it, and a marker whose fence doesn't settle in that pass, or whose
+enumeration defers on intake, waits for the regular interval as before.
+
+**A catch-up that keeps failing keeps its definition `catching_up`**, and
+the discharge's backoff and error reporting (#407) apply. `Trellis::status`
+shows the error when the failing marker is on the definition's source; a
+failing marker on a relationship to-side is only in the staging worker's
+log.
 
 ## Why
 
@@ -333,13 +404,13 @@ Until it lands, a test that needs a settled target also checks that no
   build that hasn't started. A ring enumeration flips to `live` once its rows
   are staged, before they drain. Their `Recompute` rows carry no `origin_lsn`,
   which the predicate treats as older than any token, so the wait covers them.
-  Until #476, a chunked or direct build flips to `live` with its go-live
-  catch-up marker still waiting for a later maintenance pass, and neither
-  signal waits for that.
+  A chunked or direct build reports `catching_up` until its go-live catch-up
+  has been discharged (#476).
 - **A running staging worker is required for anything to go live.** That's
   already true: live apply needs intake, and a deferred definition needs the
   discharge ([embedding](../embedding.md#the-silent-stall-hazard-issue-144)).
-  Chunked builds also still need drain threads.
+  Chunked builds also still need drain threads. A fleet of drain threads
+  with no staging worker finishes builds but leaves them `catching_up`.
 - **The discharge's failure handling reaches every registration**, because it's
   the single path. Two rules:
   - **A failing marker never starves the ones behind it.** An error on one
@@ -398,12 +469,13 @@ happens, and its role in this design.
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` fences and discharges | The one path. **Done (#431):** the discharge fences every marker the first time it sees it ([The join fence](#the-join-fence)) |
 | Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. #436 makes it race-free |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
-| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs |
-| Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call |
-| `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | Separate: a redefinition-side capture that reads the added columns' values in-call |
+| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue`, all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge flips the definition `live` (`go_live_caught_up`, #476) |
+| Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | Separate: a redefinition-side capture that reads one column's values in-call. The definition is `catching_up` until the marker discharges (#476) |
+| `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | Separate: a redefinition-side capture that reads the added columns' values in-call. The definition is `catching_up` until the marker discharges (#476) |
 | Publication change on `DROP` | `Trellis::reconcile_publication_after_drop`, run by whichever process applied the `DROP` | Moves to the staging worker: a `DROP` only removes catalog rows, and the worker's reconcile pass shrinks the publication from the catalog. `reconcile_publication_after_drop` is removed, and the startup `source_tables` copy stops being a permanent floor. Supersedes [ADR-0014](0014-pause-and-drop-a-transform.md)'s "applied at drop time" |
 
 ## Open questions
 
-- None. "What `live` promises" was settled on 2026-09-24; see
-  [What `live` promises](#what-live-promises) and #476.
+- None. "What `live` promises" was settled on 2026-09-24 and implemented by
+  #476, including how a catch-up on an already-`live` definition shows; see
+  [What `live` promises](#what-live-promises).

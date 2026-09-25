@@ -604,6 +604,27 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "the dependent must NOT be auto-resumed — it has its own independent reason"
     );
 
+    // Issue #476: the resume's catch-up re-reads the source for changes the
+    // recompute's single read missed, so until it has run the transform
+    // reports `catching_up` (it keeps applying), and its discharge takes it
+    // back to `live`.
+    let status_of = async |client: &tokio_postgres::Client| -> String {
+        client
+            .query_one(
+                "select status from transform_definitions \
+                 where split_part(target_table, '.', 2) = 'order_totals'",
+                &[],
+            )
+            .await
+            .expect("read order_totals' status")
+            .get(0)
+    };
+    assert_eq!(status_of(&client).await, "catching_up");
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the resume's catch-up");
+    assert_eq!(status_of(&client).await, "live");
+
     assert_eq!(
         column_status_row(&client, "order_totals", "total").await,
         None,

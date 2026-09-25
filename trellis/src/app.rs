@@ -51,7 +51,8 @@
 //! [`Trellis::status`] until it reports [`TransformStatus::Live`] — which
 //! requires a staging worker and *some* client in the fleet running with
 //! `drain_threads > 0` (a define-only connection, with no such client
-//! anywhere, leaves the transform queued indefinitely).
+//! anywhere, leaves the transform queued indefinitely) — then take a
+//! [`Trellis::watermark_token`] and [`Trellis::await_converged`] on it.
 //!
 //! # Lifecycle
 //!
@@ -522,6 +523,16 @@ impl Trellis {
     /// polls after [`apply`](Trellis::apply) registers a definition, per
     /// `docs/decisions/0008-public-api-design.md`'s decision 1 ("define, then poll status
     /// until live").
+    ///
+    /// [`TransformStatus::Live`] means the transform is in its steady state
+    /// (ADR-0016, "What `live` promises"): from then on, a
+    /// [`Trellis::watermark_token`] taken after a commit and awaited with
+    /// [`Trellis::await_converged`] guarantees its target reflects that
+    /// commit. A transform whose build has finished but whose go-live
+    /// catch-up hasn't run yet reports [`TransformStatus::CatchingUp`]
+    /// instead, as does a `live` one given a catch-up of its own (an
+    /// `ALTER TRANSFORM` that added columns, a resumed column): it is applying
+    /// changes, but its target may still be missing some (issue #476).
     ///
     /// Also reports why a definition isn't getting there, when the cause is a
     /// failing backfill of its source table
@@ -1132,9 +1143,11 @@ impl Trellis {
     ///
     /// This waits for captured changes only. It doesn't read definition
     /// status or backfill progress: a definition that isn't
-    /// [`TransformStatus::Live`] yet may still be missing rows after this
-    /// returns. Check [`Trellis::status`] for that (ADR-0016, "What `live`
-    /// promises").
+    /// [`TransformStatus::Live`] yet (including one still
+    /// [`TransformStatus::CatchingUp`]) may still be missing rows after this
+    /// returns. Check [`Trellis::status`] for that. Once it reports `live`,
+    /// a token taken after a commit and awaited here covers that commit
+    /// (ADR-0016, "What `live` promises").
     ///
     /// Holds one pooled connection for the whole call (it polls on it), so a
     /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw
@@ -1360,7 +1373,7 @@ pub struct DefinitionStatus {
     /// of a direct build that failed and was handed back to it (issue #419).
     /// That discharge runs
     /// every build of a `waiting_to_backfill` definition on the table and the
-    /// catch-up of every `live` one, so its failure is reported on each
+    /// catch-up of every `catching_up` one, so its failure is reported on each
     /// definition that reads the table, whatever its status. A definition
     /// stuck in `waiting_to_backfill` with this set is waiting on the cause
     /// named in [`BackfillFailure::last_error`], not on the discharge's turn.
@@ -1569,6 +1582,9 @@ pub enum QuarantineState {
     Live,
     WaitingToBackfill,
     Backfilling,
+    /// Applied like a live transform, with a go-live catch-up still pending
+    /// (mirrors [`TransformStatus::CatchingUp`], issue #476).
+    CatchingUp,
     /// A whole transform's keyspace fuse has tripped (mirrors
     /// [`TransformStatus::Quarantined`]).
     Quarantined,
@@ -1594,6 +1610,7 @@ impl From<TransformStatus> for QuarantineState {
         match status {
             TransformStatus::WaitingToBackfill => QuarantineState::WaitingToBackfill,
             TransformStatus::Backfilling => QuarantineState::Backfilling,
+            TransformStatus::CatchingUp => QuarantineState::CatchingUp,
             TransformStatus::Live => QuarantineState::Live,
             TransformStatus::Quarantined => QuarantineState::Quarantined,
             TransformStatus::Paused => QuarantineState::Paused,

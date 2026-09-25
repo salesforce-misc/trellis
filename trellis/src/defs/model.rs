@@ -61,21 +61,39 @@ pub struct Definition {
 /// ([`super::catalog::install_definition`]) persists
 /// [`TransformStatus::WaitingToBackfill`], and the backfill discharge
 /// (ADR-0016) moves it on: to [`TransformStatus::Backfilling`] together with
-/// the chunks or job that build it, then [`TransformStatus::Live`] when the last one
-/// finishes (or its direct-build job does, for an aggregate or
-/// relationship-enriched 1-1 definition), or straight to `live` for a
-/// ring-built definition.
+/// the chunks or job that build it, then [`TransformStatus::CatchingUp`] when
+/// the last one finishes (or its direct-build job does, for an aggregate or
+/// relationship-enriched 1-1 definition), and [`TransformStatus::Live`] once
+/// the go-live catch-up that build parked has been discharged (issue #476).
+/// A ring-built definition goes straight to `live`, or to `catching_up` when
+/// its source is another definition's target.
+///
+/// Apply maintains a definition that is [`TransformStatus::is_applying`]:
+/// `live` or `catching_up`. Only `live` tells an operator the target is in
+/// its steady state (ADR-0016, "What `live` promises").
 ///
 /// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
 /// two triggers of ADR-0014's single "frozen" state: the poison fuse trips
 /// the first, an operator [`PAUSE`](crate::Trellis::apply) sets the
-/// second, and nothing else distinguishes them — both are simply *not*
-/// `live`, which is the one gate the claim-time fold has ever honored (the
-/// `t.status = 'live'` predicate in [`super::catalog::dependents_of`]).
+/// second, and nothing else distinguishes them — neither is applying, which
+/// is the one gate the claim-time fold has ever honored (the status
+/// predicate in [`super::catalog::dependents_of`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,
+    /// Maintained by apply exactly as a `live` definition is, but a go-live
+    /// catch-up (a re-read of a table it reads, parked as a
+    /// `pending_backfill` marker) hasn't been discharged yet, so its target
+    /// may still be missing changes it didn't apply (issue #476). Reached
+    /// when a chunked or direct build finishes, when a ring enumeration reads
+    /// a source that is another definition's target, and when a `live`
+    /// definition gets a catch-up of its own: a column resume, an `ALTER
+    /// TRANSFORM` that added columns, a stale backfill chunk discarded after
+    /// its rebuild, or an upstream rebuild written outside the
+    /// target-mutation seam. The discharge that runs its last pending
+    /// catch-up flips it to `live`.
+    CatchingUp,
     Live,
     Quarantined,
     /// Deliberately frozen by an operator (issue #142, ADR-0014) — the same
@@ -104,9 +122,10 @@ impl TransformStatus {
     /// and [`Self::from_persisted`] (both of which the compiler will already
     /// stop you on) and to `transform_definitions.status`' `check`
     /// constraint; `every_variant_is_listed_in_all` below is the reminder.
-    pub const ALL: [TransformStatus; 5] = [
+    pub const ALL: [TransformStatus; 6] = [
         TransformStatus::WaitingToBackfill,
         TransformStatus::Backfilling,
+        TransformStatus::CatchingUp,
         TransformStatus::Live,
         TransformStatus::Quarantined,
         TransformStatus::Paused,
@@ -124,6 +143,24 @@ impl TransformStatus {
     /// nowhere else.
     pub fn is_frozen(self) -> bool {
         matches!(self, TransformStatus::Paused | TransformStatus::Quarantined)
+    }
+
+    /// Whether apply maintains the definition: it folds every change to
+    /// what it reads into its target, and the target-mutation seam stages
+    /// its source's writes for it. `live` and `catching_up`; a definition
+    /// whose build hasn't finished, or that is frozen, is skipped.
+    pub fn is_applying(self) -> bool {
+        matches!(self, TransformStatus::Live | TransformStatus::CatchingUp)
+    }
+
+    /// The persisted words of every [`Self::is_applying`] status, for a SQL
+    /// predicate (`status = any($n)`) that has to agree with it.
+    pub fn applying() -> Vec<&'static str> {
+        TransformStatus::ALL
+            .iter()
+            .filter(|status| status.is_applying())
+            .map(|status| status.as_str())
+            .collect()
     }
 
     /// The persisted words of every status a definition may still be handed
@@ -151,6 +188,7 @@ impl TransformStatus {
         match self {
             TransformStatus::WaitingToBackfill => "waiting_to_backfill",
             TransformStatus::Backfilling => "backfilling",
+            TransformStatus::CatchingUp => "catching_up",
             TransformStatus::Live => "live",
             TransformStatus::Quarantined => "quarantined",
             TransformStatus::Paused => "paused",
@@ -160,7 +198,7 @@ impl TransformStatus {
     /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
     /// other text — meaning the row was written by something other than
     /// this module's own writers, since `transform_definitions.status`'s
-    /// `check` constraint only allows these five values. Named
+    /// `check` constraint only allows these six values. Named
     /// `from_persisted` for the same reason [`RelationshipCardinality::from_persisted`]
     /// is: this isn't `std::str::FromStr` (no matching `Err` type worth
     /// inventing for a value that should only ever come from this table's
@@ -169,6 +207,7 @@ impl TransformStatus {
         match text {
             "waiting_to_backfill" => Some(TransformStatus::WaitingToBackfill),
             "backfilling" => Some(TransformStatus::Backfilling),
+            "catching_up" => Some(TransformStatus::CatchingUp),
             "live" => Some(TransformStatus::Live),
             "quarantined" => Some(TransformStatus::Quarantined),
             "paused" => Some(TransformStatus::Paused),
@@ -374,6 +413,7 @@ mod tests {
             match status {
                 TransformStatus::WaitingToBackfill
                 | TransformStatus::Backfilling
+                | TransformStatus::CatchingUp
                 | TransformStatus::Live
                 | TransformStatus::Quarantined
                 | TransformStatus::Paused => {}
@@ -386,7 +426,7 @@ mod tests {
         }
         assert_eq!(
             TransformStatus::ALL.len(),
-            5,
+            6,
             "bump this alongside `ALL` when a status is added"
         );
     }
@@ -397,8 +437,13 @@ mod tests {
     fn dispatchable_is_every_unfrozen_status() {
         assert_eq!(
             TransformStatus::dispatchable(),
-            vec!["waiting_to_backfill", "backfilling", "live"],
+            vec!["waiting_to_backfill", "backfilling", "catching_up", "live"],
             "a frozen definition is handed no new work; everything else is"
+        );
+        assert_eq!(
+            TransformStatus::applying(),
+            vec!["catching_up", "live"],
+            "apply maintains a finished build whether or not its catch-up has run"
         );
         assert!(TransformStatus::Paused.is_frozen());
         assert!(TransformStatus::Quarantined.is_frozen());

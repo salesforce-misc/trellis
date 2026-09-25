@@ -41,50 +41,14 @@ pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 /// the single-hop scenarios run at: they have no intermediate hops for the
 /// reconcile pass to publish, so the stock value is the honest one.
 ///
-/// It still matters to them in one way: the reconcile pass is what discharges
-/// the catch-up backfill a definition parks when it goes live, and that
-/// discharge re-stages every row the source holds by then (#423). The
-/// throughput and fold-in probes wait it out before writing their first row
-/// (`chain::wait_for_catch_up_discharged`), which costs setup up to one
-/// interval.
+/// It used to matter to them in one way: the reconcile pass discharged the
+/// catch-up backfill a definition parked when it went live, and that
+/// discharge re-stages every row the source holds by then (#423). Since #476
+/// a definition reports live only once that catch-up has been discharged,
+/// and the maintenance loop discharges a freshly parked marker on its next
+/// tick, so the probes' wait for it (`chain::wait_for_catch_up_discharged`)
+/// no longer costs setup a reconcile interval.
 pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-
-/// What the multi-hop latency ladder runs at — longer than any single run, so
-/// the reconcile pass never fires and intermediate hop tables never join the
-/// CDC publication.
-///
-/// The reference harness this was ported from used the same value as a
-/// workaround for #267 (propagation staged `src_table` bare while intake
-/// staged it fully-qualified, so a live 2+ hop chain deadlocked the moment an
-/// intermediate hop joined the publication). **#267 landed on `main` (PR
-/// #282), and a chain measured at the stock 5 s reconcile no longer deadlocks
-/// — verified while porting this.** The interval stays long for a different,
-/// still-current reason, which the port measured directly:
-///
-/// An intermediate hop table is both a propagation target and the next
-/// transform's source, so once it is published, each of its writes is staged
-/// **twice** — once in-transaction by apply's downstream `Recompute`, and
-/// again by CDC decoding the very same write. #267's fix makes the two
-/// spellings coalesce instead of conflicting, so this is now merely duplicated
-/// work rather than a deadlock, but it still:
-///
-/// * breaks #266's metric cross-check outright — `trellis_changes_applied_total`
-///   stops being comparable to rows committed (measured: 137 applied changes
-///   for 100 committed rows at depth 2), and
-/// * changes what is being measured — per-hop latency over two concurrent
-///   propagation paths, with roughly twice the ring load, rather than over the
-///   one path the hop-count ladder is about (measured: 185 ms/hop published vs
-///   304 ms/hop unpublished, at the same stock tick).
-///
-/// Keeping the reconcile pass quiet keeps propagation purely on the
-/// in-transaction `Recompute` path, which needs no publication membership.
-/// This is sound for these scenarios specifically because they never write
-/// directly to an intermediate hop table — the only writer is the hop above.
-/// `--reconcile-interval-ms` overrides it, which is how the two numbers above
-/// were obtained; the duplicate-staging cost itself is a real finding about
-/// chained transforms and belongs in its own issue, not in a benchmark
-/// default.
-pub const ISOLATED_PROPAGATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// One scenario's engine configuration. [`Default`] is stock `main` in every
 /// field, so a scenario that overrides nothing measures the shipped defaults.
@@ -128,14 +92,18 @@ impl Default for EngineTuning {
 }
 
 impl EngineTuning {
-    /// The multi-hop latency ladder's defaults: stock in every field except
-    /// the reconcile interval — see
-    /// [`ISOLATED_PROPAGATION_RECONCILE_INTERVAL`] for why that one isn't.
+    /// The multi-hop latency ladder's defaults: stock in every field.
+    ///
+    /// The ladder used to run with an hour-long reconcile interval, so the
+    /// reconcile pass never fired and intermediate hop tables never joined
+    /// the CDC publication, where each of their writes was staged twice
+    /// (once by apply's in-transaction `Recompute`, again by CDC decoding).
+    /// #315 keeps every definition's target out of the publication, so that
+    /// reason is gone (#471). And the reconcile pass is what parks a newly
+    /// registered hop's backfill marker, so an hour-long interval kept every
+    /// hop after the first `waiting_to_backfill` for an hour.
     pub fn multi_hop() -> Self {
-        Self {
-            reconcile_interval: ISOLATED_PROPAGATION_RECONCILE_INTERVAL,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// This tuning as [`ClientOptions`], for a staging-worker client

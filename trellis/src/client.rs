@@ -1174,6 +1174,17 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 next_slot_loss_reminder =
                     Instant::now() + intake::slot_loss::SLOT_LOSS_REMINDER_INTERVAL;
             }
+            if !failed && Instant::now() < next_reconcile {
+                // Issue #476: a marker nothing has fenced yet (a finished
+                // build's go-live catch-up, say) is discharged on this tick,
+                // not a whole `reconcile_interval` later.
+                let wanted = intake::publication::discharge_wanted(&*c).await;
+                match failures.check("discharge_wanted", wanted) {
+                    Ok(true) => next_reconcile = Instant::now(),
+                    Ok(false) => {}
+                    Err(_) => failed = true,
+                }
+            }
             if !failed && Instant::now() >= next_reconcile {
                 // A backfill enumeration can sit waiting for intake to catch
                 // up (issue #312), and intake is the first task shutdown
@@ -2905,7 +2916,7 @@ mod backfill_chunk_claim_tests {
             .await
             .expect("read status")
             .get(0);
-        assert_eq!(status, "live");
+        assert_eq!(status, "catching_up", "the build finished");
     }
 }
 

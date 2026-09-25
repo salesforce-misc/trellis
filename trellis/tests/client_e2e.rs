@@ -717,8 +717,10 @@ async fn staging_and_application_threads_are_independent_knobs() {
 /// (non-relationship) 1-1 transform returns immediately, its discharge
 /// enqueues the chunks, and it's the running client's own `application_threads`
 /// drain workers — with no ring/CDC involved at all here (`staging_worker:
-/// false`) — that claim and finish its backfill chunk, flipping it to `Live`
-/// and building the target correctly.
+/// false`) — that claim and finish its backfill chunk, completing its build
+/// and building the target correctly. The build leaves it `catching_up`: its
+/// go-live catch-up waits for a staging worker, and there is none here
+/// (issue #476).
 #[tokio::test]
 async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     let cluster = TestCluster::start();
@@ -776,7 +778,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
                 .await
                 .expect("read status")
                 .map(|row| row.get(0));
-            status.as_deref() == Some("live")
+            status.as_deref() == Some("catching_up")
         },
     )
     .await;
@@ -811,8 +813,9 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
 /// This simulates exactly that crash: a chunk is claimed by a `"dead-worker"`
 /// that never executes or finishes it — *before* any `Client` exists at
 /// all — then a single `staging_worker: false` client is started and must,
-/// entirely on its own, reclaim that stale claim, execute it, and flip the
-/// definition to `Live`. The dead claim is backdated past the default
+/// entirely on its own, reclaim that stale claim, execute it, and complete
+/// the definition's build (`catching_up`: with no staging worker, its go-live
+/// catch-up isn't discharged, issue #476). The dead claim is backdated past the default
 /// `reclaim_ttl` (see [`backdate_dead_claims`]) rather than the client being
 /// given a tiny TTL, so the client's first sweep frees it at once.
 #[tokio::test]
@@ -890,7 +893,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
                 .await
                 .expect("read status")
                 .map(|row| row.get(0));
-            status.as_deref() == Some("live")
+            status.as_deref() == Some("catching_up")
         },
     )
     .await;
@@ -1034,7 +1037,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
                 .await
                 .expect("read status")
                 .map(|row| row.get(0));
-            status.as_deref() == Some("live")
+            status.as_deref() == Some("catching_up")
         },
     )
     .await;

@@ -17,7 +17,8 @@ where they're stuck, and what work is pending or blocked. The counterpart to
   whatever the operator already runs.
 * **Structured logs** — through a facade that can export OpenTelemetry.
 * **Transform status** — every transform carries an observable lifecycle status
-  (`waiting_to_backfill` → `backfilling` → `live`, plus `quarantined`), so an
+  (`waiting_to_backfill` → `backfilling` → `catching_up` → `live`, plus
+  `quarantined` and `paused`), so an
   operator can tell a new transform is still populating rather than live — the
   right-sized answer to the silent-stall problem (#14).
 * **Fleet-level worker liveness** — `Trellis::has_live_drain_workers`
@@ -164,10 +165,10 @@ an observable **status**. This is the same lever quarantine uses
 quarantine are two arcs of one lifecycle:
 
 ```
-(new transform)──► waiting_to_backfill ──► backfilling ──► live
-                          ▲                                  │
-                          │ (resume re-runs backfill)        │ (fuse trips)
-                          └──────────── quarantined ◄─────────┘
+(new transform)──► waiting_to_backfill ──► backfilling ──► catching_up ◄──► live
+                          ▲                                                    │
+                          │ (resume re-runs backfill)                          │ (fuse trips)
+                          └───────────────────── quarantined ◄─────────────────┘
 ```
 
 * **`waiting_to_backfill`** — defined, but its source's existing rows haven't
@@ -184,11 +185,23 @@ quarantine are two arcs of one lifecycle:
   set-based build job, on drain threads. The target is partial. A ring enumeration
   (the fallback for a shape neither build can render) never shows this: it
   goes from `waiting_to_backfill` straight to `live` in the discharge's own
-  transaction.
-* **`live`** — build complete; tracking live changes only. The steady state.
-  Not yet a promise that the target is complete: a ring enumeration's rows may
-  still be draining, and a chunked or direct build's go-live catch-up may still
-  be pending ([data-flow](data-flow.md#what-it-asks-of-a-deployment)).
+  transaction (or to `catching_up`, when its source is another transform's
+  target).
+* **`catching_up`** — the build has finished and apply maintains the
+  transform exactly as a `live` one, but a go-live catch-up (a re-read of a
+  table it reads, parked as a `pending_backfill` marker) hasn't been
+  discharged yet, so the target may be missing changes that drained while it
+  was building. The staging worker discharges a fresh marker on its next
+  maintenance tick, and that discharge flips the transform `live`. A `live`
+  transform comes back here for its own catch-up: an `ALTER TRANSFORM` that
+  added columns, a resumed column, or a stale backfill chunk given up after
+  its rebuild. A catch-up that keeps failing keeps the transform here, with
+  the error on `Trellis::status` when the failing marker is on its source.
+* **`live`** — the steady state: a watermark token taken after a commit and
+  awaited with `Trellis::await_converged` guarantees the target reflects that
+  commit. A ring enumeration's rows may still be draining when it flips, but
+  they gate every token, so the await covers them
+  ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
 * **`quarantined`** — the fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**

@@ -594,11 +594,12 @@ async fn discard_resumed_chunks(
         .query(
             "delete from backfill_chunks bc using transform_definitions d \
              where bc.id = any($1) and d.id = bc.definition_id \
-             returning d.source_table, d.status",
+             returning d.source_table, d.status, d.id",
             &[&ids],
         )
         .await?;
     let mut sources = std::collections::BTreeSet::new();
+    let mut definitions = std::collections::BTreeSet::new();
     for row in discarded {
         let status_text: String = row.get(1);
         let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
@@ -606,18 +607,25 @@ async fn discard_resumed_chunks(
         });
         if !status.is_frozen() {
             sources.insert(row.get::<_, String>(0));
+            definitions.insert(row.get::<_, i64>(2));
         }
     }
     // The discarded chunk's write may have landed after the rebuild recorded
     // its coverage (a direct-build job's, issue #419), and that record vouches
     // only for the rebuild's own write: left in place, it would let the
     // catch-up skip exactly the re-read that repairs this one.
-    for source in sources {
-        crate::intake::publication::clear_backfill_coverage(txn, &source)
+    for source in &sources {
+        crate::intake::publication::clear_backfill_coverage(txn, source)
             .await
             .map_err(CatalogError::from)?;
-        crate::intake::publication::park_marker(txn, &source).await?;
     }
+    // Issue #476: a rebuild that already went `live` is missing the repair
+    // until the marker discharges, so it reports `catching_up` until then.
+    let sources: Vec<String> = sources.into_iter().collect();
+    let definitions: Vec<i64> = definitions.into_iter().collect();
+    crate::intake::publication::park_catch_up(txn, &definitions, &sources)
+        .await
+        .map_err(CatalogError::from)?;
     Ok(())
 }
 
@@ -1081,17 +1089,17 @@ mod tests {
 
     /// An empty source plans zero chunks, so nothing would ever finish a last
     /// chunk: the dispatch completes the definition itself, parking its
-    /// go-live catch-up.
+    /// go-live catch-up, whose discharge takes it `live` (issue #476).
     #[tokio::test]
-    async fn dispatching_an_empty_source_takes_it_live() {
+    async fn dispatching_an_empty_source_completes_its_build() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, raw) = connect(&db).await;
         let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 0).await;
 
         let status = dispatch(&pool, id, &def, "public.orders").await;
-        assert_eq!(status, Some(TransformStatus::Live));
-        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(status, Some(TransformStatus::CatchingUp));
+        assert_eq!(status_of(&raw, id).await, "catching_up");
         assert!(
             marker_generation(&raw, "public.orders").await.is_some(),
             "the go-live catch-up is parked"
@@ -1223,8 +1231,8 @@ mod tests {
     /// Issues #397/#418: a resumed plain 1-1 definition's rebuild is chunked
     /// too. A chunk held across the resume that finishes while the rebuild's
     /// own chunks are outstanding must not complete the definition, and must
-    /// not keep the rebuild from completing: the rebuild's last chunk takes
-    /// it `live`. The held chunk is retired and the catch-up its completion
+    /// not keep the rebuild from completing: the rebuild's last chunk
+    /// completes it (`catching_up`, issue #476). The held chunk is retired and the catch-up its completion
     /// would have parked is parked.
     #[tokio::test]
     async fn a_chunk_held_across_a_resume_neither_completes_nor_blocks_the_rebuild() {
@@ -1267,7 +1275,7 @@ mod tests {
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
-        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
     }
 
     /// The rebuild's last chunk completes the definition even while a chunk
@@ -1294,12 +1302,12 @@ mod tests {
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
-        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
 
         release_chunk(&mut raw, held.id, WORKER)
             .await
             .expect("release held");
-        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
         assert_eq!(
             chunk_count(&raw, id).await,
             0,
@@ -1399,7 +1407,7 @@ mod tests {
             .await
             .expect("finish a lost claim");
 
-        assert_eq!(status_of(&raw, id).await, "live");
+        assert_eq!(status_of(&raw, id).await, "catching_up");
         assert_eq!(chunk_count(&raw, id).await, 0);
         assert!(marker_generation(&raw, "public.orders").await.is_some());
         let rows: Vec<(String, String, bool)> = raw

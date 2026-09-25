@@ -303,12 +303,13 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     // added V43 (`pending_backfill`'s retry state). Issue #419 added V44
     // (`backfill_chunks`' unbounded direct-build job rows). Issue #431
     // added V45 (`pending_backfill.fence_xid`, null until the discharge
-    // fences the marker).
+    // fences the marker). Issue #476 added V46 (the `catching_up` transform
+    // status).
     assert_eq!(
         applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45
+            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46
         ]
     );
 }

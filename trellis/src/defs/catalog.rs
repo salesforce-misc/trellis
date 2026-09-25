@@ -305,7 +305,8 @@ pub enum CatalogError {
         column_detail: Vec<String>,
     },
     /// [`alter_transform`] was asked to edit a target that isn't currently
-    /// [`TransformStatus::Live`] (ADR-0015) — most concretely, still
+    /// applying ([`TransformStatus::is_applying`]: `live`, or `catching_up`
+    /// once its build has finished; ADR-0015) — most concretely, still
     /// `backfilling` behind its own initial build, or already frozen
     /// (`paused`/`quarantined`). Mirrors [`crate::staging::apply::ApplyError::DefinitionNotLive`]'s
     /// exact reasoning for [`crate::staging::quarantine::resume_column`]: a
@@ -657,12 +658,17 @@ pub async fn create_definition(
     definition.status = TransformStatus::Live;
     // Issue #315: a source that is another definition's target is never
     // published, and its writer's target-mutation seam only reached this
-    // definition once it was live. The discharge fences the marker when it
-    // reads it (issue #431), after this commit, so the fence waits out every
-    // such writer.
+    // definition once it was applying. The discharge fences the marker when
+    // it reads it (issue #431), after this commit, so the fence waits out
+    // every such writer, and flips the definition `live` (issue #476).
     if is_definition_target(&**client, &definition.source_table).await? {
-        crate::intake::publication::park_backfill_catchup(&**client, &definition.source_table)
-            .await?;
+        crate::intake::publication::park_catch_up(
+            &**client,
+            &[definition.id],
+            std::slice::from_ref(&definition.source_table),
+        )
+        .await?;
+        definition.status = TransformStatus::CatchingUp;
     }
     Ok(definition)
 }
@@ -718,16 +724,19 @@ pub async fn create_definition_without_backfill(
 /// settled. A plain 1-1 definition gets `backfill_chunks`, an aggregate or
 /// relationship-enriched 1-1 definition one direct-build job
 /// (`chunk_queue::dispatch_direct_build`); drain threads execute either, and
-/// the last one to finish flips it `live` ([`complete_direct_backfill`]). A
-/// shape the direct build can't render ([`BackfillError::Unsupported`]) gets
-/// a ring enumeration flipped `live` in the discharge's own transaction. A
-/// caller polls [`crate::Trellis::status`] until it reads `live`.
+/// the last one to finish moves it to `catching_up`
+/// ([`complete_direct_backfill`]), and the discharge of the go-live catch-up
+/// that parks flips it `live` (issue #476). A shape the direct build can't
+/// render ([`BackfillError::Unsupported`]) gets a ring enumeration flipped
+/// `live` in the discharge's own transaction. A caller polls
+/// [`crate::Trellis::status`] until it reads `live`.
 ///
-/// **Why nothing is folded into a non-`live` target.**
-/// [`dependents_of`]/[`transforms_for_source`] filter to `status = 'live'`,
-/// so no build path can have a live CDC delta folded into it while it is
-/// still being built. A delta skipped during that window is recovered rather
-/// than lost by the catch-up marker parked when the definition goes live.
+/// **Why nothing is folded into a target still being built.**
+/// [`dependents_of`]/[`transforms_for_source`] filter to applying
+/// definitions ([`TransformStatus::is_applying`]), so no build path can have
+/// a live CDC delta folded into it while it is still being built. A delta
+/// skipped during that window is recovered rather than lost by the catch-up
+/// marker parked when the build finishes.
 /// The reverse, a delta for a commit the build already read that drains only
 /// after the flip, is harmless for a 1-1 target. For an aggregate, the
 /// recompute horizon the build stamps on every group row it writes (and on
@@ -863,56 +872,57 @@ pub async fn install_definition(
     .await
 }
 
-/// What [`go_live_if_backfilling`] did to a definition whose build finished.
+/// What [`catch_up_if_backfilling`] did to a definition whose build finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GoLive {
-    /// It was still `backfilling`, and is now `live`.
-    Flipped,
+enum BuildFinished {
+    /// It was still `backfilling`, and is now `catching_up`.
+    CatchingUp,
     /// It had already left `backfilling` (paused, quarantined, or resumed back
     /// to `waiting_to_backfill`), and was left in this status untouched.
     LeftAs(TransformStatus),
 }
 
-impl GoLive {
+impl BuildFinished {
     /// The status the definition is in afterward.
     fn status(self) -> TransformStatus {
         match self {
-            GoLive::Flipped => TransformStatus::Live,
-            GoLive::LeftAs(status) => status,
+            BuildFinished::CatchingUp => TransformStatus::CatchingUp,
+            BuildFinished::LeftAs(status) => status,
         }
     }
 }
 
-/// Flips an already-persisted definition row `backfilling` -> `live` once its
-/// build finishes (issue #55) — but only if it is *still* `backfilling`
-/// (issue #331). A build runs unlocked against the definition row for as long
-/// as it takes, and an operator pause, the poison fuse, or a resume can move
-/// the row on meanwhile; an unconditional flip would silently undo that. A
-/// definition that moved on is left where it is: whatever moved it owns its
-/// way back to `live` (a frozen definition's resume rebuilds it by a fresh
-/// backfill; a `waiting_to_backfill` one already sits behind a marker).
-async fn go_live_if_backfilling(
+/// Moves an already-persisted definition row `backfilling` -> `catching_up`
+/// once its build finishes (issues #55, #476) — but only if it is *still*
+/// `backfilling` (issue #331). A build runs unlocked against the definition
+/// row for as long as it takes, and an operator pause, the poison fuse, or a
+/// resume can move the row on meanwhile; an unconditional flip would
+/// silently undo that. A definition that moved on is left where it is:
+/// whatever moved it owns its way back to `live` (a frozen definition's
+/// resume rebuilds it by a fresh backfill; a `waiting_to_backfill` one
+/// already sits behind a marker).
+async fn catch_up_if_backfilling(
     client: &impl GenericClient,
     id: i64,
-) -> Result<GoLive, CatalogError> {
-    let flipped = client
+) -> Result<BuildFinished, CatalogError> {
+    let moved = client
         .execute(
             "update transform_definitions set status = $1 where id = $2 and status = $3",
             &[
-                &TransformStatus::Live.as_str(),
+                &TransformStatus::CatchingUp.as_str(),
                 &id,
                 &TransformStatus::Backfilling.as_str(),
             ],
         )
         .await?;
-    if flipped == 1 {
+    if moved == 1 {
         tracing::info!(
             definition_id = id,
             from = %TransformStatus::Backfilling.as_str(),
-            to = %TransformStatus::Live.as_str(),
+            to = %TransformStatus::CatchingUp.as_str(),
             "transform status transition: backfill build finished"
         );
-        return Ok(GoLive::Flipped);
+        return Ok(BuildFinished::CatchingUp);
     }
     let status_text: String = client
         .query_one(
@@ -930,52 +940,59 @@ async fn go_live_if_backfilling(
         "backfill finished, but the definition is no longer backfilling; \
          leaving its status as it is"
     );
-    Ok(GoLive::LeftAs(status))
+    Ok(BuildFinished::LeftAs(status))
 }
 
-/// Flips `definition_id` from [`TransformStatus::Backfilling`] to
-/// [`TransformStatus::Live`] and parks a catch-up marker for its source table
-/// — the "every chunk done" completion event
-/// `chunk_queue::finish_chunk` calls once every `backfill_chunks` row for
-/// `definition_id` is done (docs/decisions/0007's amendment). Runs inside the
-/// caller's transaction, which must already hold a `for update` lock on
-/// `definition_id`'s `transform_definitions` row (see `finish_chunk`) — that
-/// lock is what makes two workers finishing different chunks of the same
-/// definition near-simultaneously unable to race this completion in either
-/// direction (both flipping it, or neither).
+/// Moves `definition_id` from [`TransformStatus::Backfilling`] to
+/// [`TransformStatus::CatchingUp`] and parks its go-live catch-up markers —
+/// the "every chunk done" completion event `chunk_queue::finish_chunk` calls
+/// once every `backfill_chunks` row for `definition_id` is done
+/// (docs/decisions/0007's amendment). Runs inside the caller's transaction,
+/// which must already hold a `for update` lock on `definition_id`'s
+/// `transform_definitions` row (see `finish_chunk`) — that lock is what
+/// makes two workers finishing different chunks of the same definition
+/// near-simultaneously unable to race this completion in either direction
+/// (both completing it, or neither).
 ///
 /// The parked marker (reusing the exact `pending_backfill` mechanism the
 /// ring-fallback path already relies on — see
-/// [`crate::intake::publication::park_backfill_catchup`]) is what makes
-/// excluding a non-`live` definition from [`dependents_of`]/[`transforms_for_source`]
+/// [`crate::intake::publication::park_catch_up`]) is what makes excluding a
+/// definition still being built from [`dependents_of`]/[`transforms_for_source`]
 /// safe rather than lossy: any CDC delta for this source table that arrived
 /// while this definition sat `backfilling` was never folded into its target
 /// (the exclusion), but this marker's later discharge re-derives the target
 /// from current source state, folding that delta in after all.
 ///
+/// **Not `live` yet (issue #476).** Until that discharge has run, the target
+/// may be missing those deltas, and a watermark token wouldn't wait for
+/// them, so the definition reports `catching_up`: applied exactly as a
+/// `live` one is, flipped `live` by the discharge of its last catch-up
+/// (`intake::publication::go_live_caught_up`). ADR-0016, "What `live`
+/// promises".
+///
 /// Completes every build that runs through `backfill_chunks`: a plain 1-1
 /// definition's chunks, and an aggregate or relationship-enriched 1-1
 /// definition's direct-build job (issue #419). The catch-up is parked on
 /// every table the build read: the source, and each relationship to-side
-/// table (issue #430), in name order so two completions sharing tables can't
-/// deadlock on each other's marker rows.
+/// table (issue #430).
 ///
 /// **Only a still-`backfilling` definition completes (issue #331).** The
 /// pause gates new chunk claims, not a chunk a worker already holds, so the
 /// last chunk can finish after the definition has been paused or quarantined.
-/// [`go_live_if_backfilling`] leaves a definition that has moved on exactly as
-/// it is; the chunk itself is still retired by the caller. A chunk held across
-/// a *resume* never reaches here: `finish_chunk` discards it instead, since
-/// the resumed definition's rebuild owns its way back to `live` (issues
-/// #360/#397).
+/// [`catch_up_if_backfilling`] leaves a definition that has moved on exactly
+/// as it is; the chunk itself is still retired by the caller. A chunk held
+/// across a *resume* never reaches here: `finish_chunk` discards it instead,
+/// since the resumed definition's rebuild owns its way back to `live`
+/// (issues #360/#397).
 ///
 /// The catch-up marker is parked unless the definition is **frozen**. A
 /// frozen one gets nothing from it: resume
 /// ([`crate::staging::quarantine::resume_transform`]) clears its coverage,
 /// re-parks a marker of its own and rebuilds by a fresh backfill.
 ///
-/// Returns the status the definition is left in: [`TransformStatus::Live`]
-/// when this call completed it, its unchanged current status otherwise.
+/// Returns the status the definition is left in:
+/// [`TransformStatus::CatchingUp`] when this call completed it or it was
+/// already applying, its unchanged current status otherwise.
 pub(crate) async fn complete_direct_backfill(
     txn: &tokio_postgres::Transaction<'_>,
     definition_id: i64,
@@ -989,26 +1006,85 @@ pub(crate) async fn complete_direct_backfill(
     // so handing it an already-qualified `"schema.table"` string would never
     // match anything and this would fail every time with
     // [`CatalogError::SourceTableNotFound`].
-    let status = go_live_if_backfilling(txn, definition_id).await?.status();
-    if status == TransformStatus::Live {
+    let status = catch_up_if_backfilling(txn, definition_id).await?.status();
+    if status == TransformStatus::CatchingUp {
         // Issue #315: the chunks wrote this target outside the seam; a
         // reader already attached to it (a resumed upstream's) re-derives.
         crate::intake::publication::park_target_catchup_if_read(txn, definition_id).await?;
     }
-    if !status.is_frozen() {
-        let row = txn
-            .query_one(
-                "select source_table, definition_text from transform_definitions where id = $1",
-                &[&definition_id],
-            )
-            .await?;
-        let qualified: String = row.get(0);
-        let def = parse(row.get::<_, &str>(1))?;
-        for table in tables_read_by(txn, &def, &qualified).await? {
-            crate::intake::publication::park_backfill_catchup(txn, &table).await?;
+    if status.is_frozen() {
+        return Ok(status);
+    }
+    let tables = definition_tables_read(txn, definition_id).await?;
+    crate::intake::publication::park_catch_up(txn, &[definition_id], &tables).await?;
+    // The park moves a `live` definition (one a leftover chunk wrote under)
+    // to `catching_up` too.
+    Ok(if status.is_applying() {
+        TransformStatus::CatchingUp
+    } else {
+        status
+    })
+}
+
+/// [`tables_read_by`] for the persisted definition `definition_id`.
+async fn definition_tables_read(
+    txn: &tokio_postgres::Transaction<'_>,
+    definition_id: i64,
+) -> Result<Vec<String>, CatalogError> {
+    let row = txn
+        .query_one(
+            "select source_table, definition_text from transform_definitions where id = $1",
+            &[&definition_id],
+        )
+        .await?;
+    let qualified: String = row.get(0);
+    let def = parse(row.get::<_, &str>(1))?;
+    tables_read_by(txn, &def, &qualified).await
+}
+
+/// Every `catching_up` definition that reads `table`, locked `for update`,
+/// with every table it reads ([`tables_read_by`]): the definitions whose
+/// go-live catch-up the discharge of `table`'s marker may be the last of
+/// (`intake::publication::go_live_caught_up`, issue #476). The definitions
+/// are read unlocked first and only the ones reading `table` are locked, in
+/// id order; one that left `catching_up` while this waited for its lock is
+/// dropped.
+pub(crate) async fn catching_up_readers(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<Vec<(i64, Vec<String>)>, CatalogError> {
+    let rows = txn
+        .query(
+            "select id, source_table, definition_text from transform_definitions \
+             where status = $1 order by id",
+            &[&TransformStatus::CatchingUp.as_str()],
+        )
+        .await?;
+    let mut readers = Vec::new();
+    for row in rows {
+        let qualified: String = row.get(1);
+        let def = parse(row.get::<_, &str>(2))?;
+        let tables = tables_read_by(txn, &def, &qualified).await?;
+        if tables.iter().any(|t| t == table) {
+            readers.push((row.get::<_, i64>(0), tables));
         }
     }
-    Ok(status)
+    if readers.is_empty() {
+        return Ok(readers);
+    }
+    let ids: Vec<i64> = readers.iter().map(|(id, _)| *id).collect();
+    let still: Vec<i64> = txn
+        .query(
+            "select id from transform_definitions where id = any($1) and status = $2 \
+             order by id for update",
+            &[&ids, &TransformStatus::CatchingUp.as_str()],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    readers.retain(|(id, _)| still.contains(id));
+    Ok(readers)
 }
 
 /// Every table `def`'s direct build reads, fully qualified, sorted and
@@ -1043,15 +1119,16 @@ async fn tables_read_by(
 }
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
-/// source, `qualified_source`, is the target of another definition that
-/// isn't [`TransformStatus::Live`] yet (issue #315), and likewise a
+/// source, `qualified_source`, is the target of another definition whose
+/// build hasn't finished yet (issue #315): one that isn't
+/// [`TransformStatus::is_applying`]. And likewise a
 /// relationship endpoint that is such a target ([`create_relationship`],
 /// issue #403). A target's initial build
 /// (`defs::backfill`, the chunk queue) writes it directly, outside the
 /// target-mutation seam that tells a chained reader about every other target
 /// write, so a reader attached mid-build would silently miss whatever the
-/// rest of the build writes. Wait for the upstream definition to go live,
-/// then define the chained one.
+/// rest of the build writes. Wait for the upstream definition to go live
+/// (or at least reach `catching_up`), then define the chained one.
 async fn reject_non_live_upstream(
     client: &impl GenericClient,
     qualified_source: &str,
@@ -1070,7 +1147,9 @@ async fn reject_non_live_upstream(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if status == TransformStatus::Live {
+    // A `catching_up` upstream's build has finished: every write to its
+    // target goes through the seam now (issue #476).
+    if status.is_applying() {
         return Ok(());
     }
     Err(CatalogError::TransformNotLive {
@@ -1305,7 +1384,7 @@ pub async fn alter_transform(
             transform: alter.target.clone(),
         });
     };
-    if current.status != TransformStatus::Live {
+    if !current.status.is_applying() {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
             status: current.status,
@@ -1478,7 +1557,7 @@ pub async fn alter_transform(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    if status != TransformStatus::Live {
+    if !status.is_applying() {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
             status,
@@ -1678,7 +1757,15 @@ pub async fn alter_transform(
             )
             .await?;
         }
-        crate::intake::publication::park_backfill_catchup(&*txn, &current.source_table).await?;
+        // Issue #476: the target is missing the changes this marker's
+        // discharge folds in, so the definition reports `catching_up` until
+        // then (it keeps applying).
+        crate::intake::publication::park_catch_up(
+            &*txn,
+            &[current.id],
+            std::slice::from_ref(&current.source_table),
+        )
+        .await?;
         txn.commit().await?;
     }
 
@@ -5141,7 +5228,8 @@ struct PendingDefinition {
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
 /// come back with zero entries, not disappear from the result entirely.
 ///
-/// **`status = 'live'` only** (the public API design's ADR-0007 amendment,
+/// **Applying definitions only** ([`TransformStatus::is_applying`]: `live`
+/// or `catching_up`; the public API design's ADR-0007 amendment,
 /// closing the CDC race commit 1fa8570 reopened): a `waiting_to_backfill`/
 /// `backfilling`/`quarantined` definition's target may not yet reflect every
 /// pre-existing source row (the direct-build chunk queue, or a
@@ -5149,15 +5237,14 @@ struct PendingDefinition {
 /// CDC delta folded into it now — via [`transforms_for_source`], the apply
 /// path's read of this function — could permanently corrupt a value an
 /// incremental accumulator (e.g. `AVG`) computes against a baseline. Excluding
-/// non-`live` rows here means the apply path simply never attempts them; the
+/// those rows here means the apply path simply never attempts them; the
 /// delta is not lost, though — [`crate::intake::publication::run_pending_backfills`]'s
 /// discharge (parked via the same `pending_backfill` marker the ring-fallback
-/// path already relies on, inserted when a definition flips to
-/// [`TransformStatus::Live`]: by [`complete_direct_backfill`] for a chunked
-/// build or a direct-build job, on every table that build read, issue #430)
-/// re-derives the definition's target from
-/// current source state once it goes live, folding in anything skipped while
-/// it wasn't.
+/// path already relies on, inserted when a build finishes and the definition
+/// moves to [`TransformStatus::CatchingUp`]: by [`complete_direct_backfill`]
+/// for a chunked build or a direct-build job, on every table that build
+/// read, issue #430) re-derives the definition's target from current source
+/// state, folding in anything skipped while it wasn't applying.
 ///
 /// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0007)
 /// — matched exactly against `schema_nodes.table_name`, which is now always
@@ -5185,9 +5272,9 @@ pub async fn dependents_of(
              join schema_nodes to_node on to_node.id = se.to_node_id
              join transform_definitions t on t.target_table = to_node.table_name
              left join lateral jsonb_each_text(t.source_columns) e on true
-             where from_node.table_name = $1 and t.status = 'live'
+             where from_node.table_name = $1 and t.status = any($3)
              order by t.id",
-            &[&node_table, &kind.as_str()],
+            &[&node_table, &kind.as_str(), &TransformStatus::applying()],
         )
         .await?;
 
@@ -5840,14 +5927,14 @@ fn expr_references_column(
 
 /// Issue #331: every build-finished flip (the chunk queue's completion of a
 /// definition's last chunk or its direct-build job) goes through
-/// [`go_live_if_backfilling`], which must only ever move a definition that is
+/// [`catch_up_if_backfilling`], which must only ever move a definition that is
 /// still `backfilling` — never one paused, quarantined or resumed meanwhile.
 #[cfg(test)]
 mod go_live_tests {
     use super::*;
 
     #[tokio::test]
-    async fn only_a_still_backfilling_definition_goes_live() {
+    async fn only_a_still_backfilling_definition_starts_catching_up() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let client = db.pool.get().await.expect("acquire connection");
@@ -5872,9 +5959,9 @@ mod go_live_tests {
                 .expect("seed a definition")
                 .get(0);
 
-            let outcome = go_live_if_backfilling(&**client, id)
+            let outcome = catch_up_if_backfilling(&**client, id)
                 .await
-                .expect("go_live_if_backfilling");
+                .expect("catch_up_if_backfilling");
             let persisted: String = client
                 .query_one(
                     "select status from transform_definitions where id = $1",
@@ -5885,10 +5972,10 @@ mod go_live_tests {
                 .get(0);
 
             if status == TransformStatus::Backfilling {
-                assert_eq!(outcome, GoLive::Flipped);
-                assert_eq!(persisted, "live");
+                assert_eq!(outcome, BuildFinished::CatchingUp);
+                assert_eq!(persisted, "catching_up");
             } else {
-                assert_eq!(outcome, GoLive::LeftAs(status));
+                assert_eq!(outcome, BuildFinished::LeftAs(status));
                 assert_eq!(persisted, status.as_str(), "{status:?} is left untouched");
             }
         }
@@ -5948,8 +6035,8 @@ mod go_live_tests {
                 .await
                 .expect("read markers")
                 .get(0);
-            let expected = if status == TransformStatus::Backfilling {
-                TransformStatus::Live
+            let expected = if status == TransformStatus::Backfilling || status.is_applying() {
+                TransformStatus::CatchingUp
             } else {
                 status
             };

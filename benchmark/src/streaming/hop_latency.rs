@@ -185,11 +185,9 @@ pub async fn run_depth(
     //
     // The completion signal is the terminal table's own row count, not
     // `trellis_changes_applied_total`: a change can legitimately be applied
-    // more than once for one source row (the same write arriving both as an
-    // in-transaction `Recompute` and as a CDC-decoded copy — see
-    // `tuning::ISOLATED_PROPAGATION_RECONCILE_INTERVAL`), so the counter can
-    // reach the row count while rows are still in flight, and waiting on it
-    // would cut the window short. A row count can't overshoot.
+    // more than once for one source row (a catch-up's re-derive, say), so the
+    // counter can reach the row count while rows are still in flight, and
+    // waiting on it would cut the window short. A row count can't overshoot.
     let expected_rows = load.rows_issued as i64 + 1; // + the warm-up row
     let grace_deadline =
         Instant::now() + tuning.maintenance_interval * depth as u32 * 2 + Duration::from_secs(5);

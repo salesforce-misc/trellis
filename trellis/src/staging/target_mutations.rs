@@ -200,6 +200,7 @@ use super::apply::{
 use super::fold::earliest_origin;
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
+use crate::defs::model::TransformStatus;
 use crate::pool::{quote_ident, quote_literal};
 
 /// One changed key's accumulated state — see [`TargetMutations::record`].
@@ -351,14 +352,14 @@ impl TargetMutations {
                 });
         }
         if !self.targets.contains_key(target) {
-            // Mirrors `catalog::dependents_of`'s own `status = 'live'`
-            // filter: a reader that isn't live yet is excluded from applies
-            // anyway, and catches up from its own backfill or catch-up marker.
+            // Mirrors `catalog::dependents_of`'s own status filter: a reader
+            // apply doesn't maintain yet is excluded from applies anyway, and
+            // catches up from its own backfill or catch-up marker.
             let direct_readers: bool = txn
                 .query_one(
                     "select exists (select 1 from transform_definitions \
-                     where source_table = $1 and status = 'live')",
-                    &[&target],
+                     where source_table = $1 and status = any($2))",
+                    &[&target, &TransformStatus::applying()],
                 )
                 .await?
                 .get(0);

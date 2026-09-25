@@ -35,7 +35,8 @@ doesn't read the source table's rows and doesn't touch the replication
 publication or slot, so it takes the same time against an empty table as
 against a billion-row one. The dedicated worker does
 the rest in the background: it publishes the source, reads its existing rows,
-builds the target, and flips the transform to `live`
+builds the target, catches it up with whatever changed while it was
+building, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 So a web process needs no publication ownership or replication privileges; only
 the worker does. It does need to create tables: each target table in the target
@@ -50,9 +51,11 @@ the backfill's staged rows drain. That pair is the
 contract: `live` means the transform is in its steady state, so a token awaited
 after it covers every commit at or before the token
 ([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
-Until #476 lands, a chunked or direct build's go-live catch-up can still be
-pending after `live`
-([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
+A transform whose build has finished but whose catch-up hasn't run yet reports
+`catching_up`: it is already applying changes, but its target may still be
+missing some. A `live` transform that gets a catch-up of its own (an
+`ALTER TRANSFORM` that adds columns, a column resumed from quarantine) reports
+`catching_up` again until that has run.
 
 *Planned (#427):* `DROP` still changes the publication from the process that
 applies it, so a process that drops transforms still needs publication

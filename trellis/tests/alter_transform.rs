@@ -595,6 +595,11 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // The staging worker's next pass: the builds' go-live catch-ups
+            // take them `live` (issue #476).
+            trellis::intake::publication::discharge_registrations(pool)
+                .await
+                .expect("discharge the go-live catch-ups");
             return;
         }
         for chunk in &claimed {
@@ -850,6 +855,10 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
         Some("live"),
         "ALTER TRANSFORM requires a live target"
     );
+    // Drain the go-live catch-up's enumeration before the gate goes in, or
+    // its re-derive of GATE_ID would wait on the gate.
+    let mut ring = connect_raw(db.dsn()).await;
+    drain_to_quiescence(&db.pool, &mut ring).await;
 
     // The gate: any write to the target's GATE_ID row waits for GATE_KEY,
     // which `gate` holds until the checkpoint is done.
@@ -957,7 +966,6 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
     .await
     .expect("update the source row");
     stage_orders_update(&raw, LIVE_ID, LIVE_ID, LIVE_NEW_A).await;
-    let mut ring = connect_raw(db.dsn()).await;
     tokio::time::timeout(
         Duration::from_secs(60),
         drain_to_quiescence(&db.pool, &mut ring),
@@ -1020,6 +1028,37 @@ async fn the_new_column_pauses_while_backfilling_and_the_rest_of_the_target_stay
     let (missing, wrong): (i64, i64) = (row.get(0), row.get(1));
     assert_eq!(missing, 0, "the backfill must cover every row");
     assert_eq!(wrong, 0, "every backfilled double_a must equal a + a");
+
+    // Issue #476: row LIVE_ID still holds the stale double_a, so the target
+    // isn't in its steady state and the definition doesn't report `live`
+    // (it keeps applying meanwhile). The staging worker's next pass runs the
+    // catch-up and flips it; once that drains, the row is repaired.
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("catching_up"),
+        "an ALTER that added a column leaves its catch-up to run before `live`"
+    );
+    trellis::intake::publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the ALTER's catch-up");
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live")
+    );
+    drain_to_quiescence(&db.pool, &mut ring).await;
+    let double_a: String = raw
+        .query_one(
+            &format!("select double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc where id = $1"),
+            &[&LIVE_ID],
+        )
+        .await
+        .expect("read the repaired row")
+        .get(0);
+    assert_eq!(
+        double_a,
+        (2 * LIVE_NEW_A).to_string(),
+        "at `live`, the row changed mid-backfill is repaired"
+    );
 
     Arc::into_inner(trellis)
         .expect("the ALTER task released its handle")

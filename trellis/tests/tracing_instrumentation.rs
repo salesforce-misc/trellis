@@ -580,8 +580,9 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
 /// Issue #56's backfill status transition events (#55's lifecycle):
 /// `waiting_to_backfill` -> `backfilling` from
 /// `intake::publication::run_pending_backfills`'s discharge dispatching a
-/// plain 1-1 definition's chunks (ADR-0016), then `backfilling` -> `live`
-/// from its last chunk finishing — mirrors `transform_status_lifecycle.rs`'s
+/// plain 1-1 definition's chunks (ADR-0016), then `backfilling` ->
+/// `catching_up` from its last chunk finishing and `catching_up` -> `live`
+/// from its go-live catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
 /// `a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live`'s straggler
 /// setup, trimmed to just the settle-and-discharge half this test cares
 /// about (that file already covers the full status/data correctness story;
@@ -653,6 +654,26 @@ async fn backfill_status_transitions_emit_info_events() {
         Some("waiting_to_backfill")
     );
 
+    // Issue #476: the build's completion leaves it `catching_up`, and the
+    // discharge of its go-live catch-up takes it `live`.
+    let to_catching_up = events.iter().find(|e| {
+        e.level == tracing::Level::INFO
+            && e.message().contains("transform status transition")
+            && e.fields.get("to").map(String::as_str) == Some("catching_up")
+    });
+    assert!(
+        to_catching_up.is_some(),
+        "expected an info event for backfilling -> catching_up: {events:#?}"
+    );
+    assert_eq!(
+        to_catching_up
+            .unwrap()
+            .fields
+            .get("from")
+            .map(String::as_str),
+        Some("backfilling")
+    );
+
     let to_live = events.iter().find(|e| {
         e.level == tracing::Level::INFO
             && e.message().contains("transform status transition")
@@ -660,10 +681,10 @@ async fn backfill_status_transitions_emit_info_events() {
     });
     assert!(
         to_live.is_some(),
-        "expected an info event for backfilling -> live: {events:#?}"
+        "expected an info event for catching_up -> live: {events:#?}"
     );
     assert_eq!(
         to_live.unwrap().fields.get("from").map(String::as_str),
-        Some("backfilling")
+        Some("catching_up")
     );
 }

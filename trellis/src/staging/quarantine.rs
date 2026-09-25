@@ -1416,7 +1416,8 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 ///
 /// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
 /// all, checked before any of this function's deletes run — if `transform`
-/// isn't currently [`TransformStatus::Live`] (most concretely, still
+/// isn't currently applying ([`TransformStatus::is_applying`]: `live`, or
+/// `catching_up` once its build has finished; most concretely, still
 /// `Backfilling` behind an in-flight `backfill_chunks` queue). See that
 /// variant's doc comment for why: [`recompute_column`] takes one snapshot of
 /// the source table, and a row a still-running backfill chunk inserts into
@@ -1462,7 +1463,7 @@ pub async fn resume_column(
         // through and let the loop below's own lookup handle it the way it
         // already does.
         if let Some(def) = catalog::definition_by_target(pool, transform).await?
-            && def.status != TransformStatus::Live
+            && !def.status.is_applying()
         {
             return Err(ApplyError::DefinitionNotLive {
                 transform: transform.to_string(),
@@ -1491,7 +1492,7 @@ pub async fn resume_column(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
-        if def.status != TransformStatus::Live {
+        if !def.status.is_applying() {
             // Reached via cascade (the initial pair was already gated above
             // before any side effects ran): a downstream dependent this
             // pause cascaded onto (`column_dependents`, unlike the
@@ -1525,7 +1526,14 @@ pub async fn resume_column(
             &[&t, &c],
         )
         .await?;
-        crate::intake::publication::park_backfill_catchup(&*txn, &def.source_table).await?;
+        // Issue #476: until that discharge, the definition reports
+        // `catching_up` (it keeps applying).
+        crate::intake::publication::park_catch_up(
+            &*txn,
+            &[def.id],
+            std::slice::from_ref(&def.source_table),
+        )
+        .await?;
         let affected = txn
             .query(
                 "delete from column_pause_cascades \

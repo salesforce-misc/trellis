@@ -227,7 +227,14 @@ Every defined transform carries an observable **status**:
   Every new transform starts here: defining one returns before any source row
   is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
 * **`backfilling`** — those rows have been read and the target is being built.
-* **`live`** — backfill complete; tracking live changes only. The steady state.
+* **`catching_up`** — the build is done and live changes are applied, but the
+  target may still be missing changes made while it was building. A catch-up
+  re-reads the source and takes it `live`. A `live` transform comes back here
+  for its own catch-up after an `ALTER TRANSFORM` adds columns or a
+  quarantined column is resumed.
+* **`live`** — the steady state: once a transform reports `live`, awaiting a
+  watermark token taken after a commit guarantees its target reflects that
+  commit ([embedding](embedding.md)).
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
   resuming re-runs the backfill, returning it to `waiting_to_backfill`.
 * **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the

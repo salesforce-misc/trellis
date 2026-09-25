@@ -105,11 +105,6 @@ pub enum SubprocessBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
-    /// Issue #432: see `ManualBackendError::PendingBackfillTimeout`.
-    PendingBackfillTimeout {
-        tables: Vec<String>,
-        waited: Duration,
-    },
     Config(trellis::Error),
     Catalog(CatalogError),
     Ddl(DdlError),
@@ -124,9 +119,6 @@ impl From<sql::QuiesceError> for SubprocessBackendError {
             sql::QuiesceError::Staging(err) => SubprocessBackendError::Staging(err),
             sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
                 SubprocessBackendError::DefinitionSettleTimeout { unsettled, waited }
-            }
-            sql::QuiesceError::BackfillsPending { tables, waited } => {
-                SubprocessBackendError::PendingBackfillTimeout { tables, waited }
             }
         }
     }

@@ -148,21 +148,26 @@ drain threads.
    A definition only reaches `backfilling` together with the work that drives
    it (#404): a chunked build commits `backfilling` with its `backfill_chunks`
    rows, a direct build with its job row. A ring-built definition skips it,
-   flipping from `waiting_to_backfill` to `live` as the discharge
-   transaction's last statement. A drain thread that dies holding a chunk or a
+   flipping from `waiting_to_backfill` to `live` (or `catching_up`, below) as
+   the discharge transaction's last statement. A drain thread that dies holding a chunk or a
    job loses its claim to the reclaim sweep, and another reruns it. A direct
    build that fails goes back to `waiting_to_backfill` behind a marker that
    carries the error and a backoff, the same retry state a failed discharge
    gets (#407), so `Trellis::status` reports it.
-4. **Go live.** The definition flips to `live` when its build finishes. For
-   ring enumeration that's inside the discharge transaction itself. For
-   chunks it's when the last chunk commits. For a direct build it's when the
-   job commits. Apply doesn't fold a live change into a definition until it's
-   `live`, so a reader sees a partial target while the status says
-   `backfilling`. `live` doesn't yet mean complete, though. A ring
-   enumeration's rows are staged but not yet drained when it flips, and a
-   chunked or direct build flips with its go-live catch-up (below) still
-   waiting for a later maintenance pass.
+4. **Go live.** A ring enumeration flips its definition to `live` inside
+   the discharge transaction itself. A chunked or direct build doesn't flip
+   it `live` when it finishes (#476): the last chunk's commit, or the job's,
+   moves it to `catching_up` and parks its go-live catch-up (below), and the
+   discharge of that catch-up flips it `live` in the same transaction as its
+   re-read. The staging worker checks for a fresh marker on every
+   maintenance tick and discharges it at once, so this adds a tick, not a
+   `reconcile_interval`. Apply doesn't fold a live change into a definition
+   until its build has finished, so a reader sees a partial target while the
+   status says `backfilling`. `live` means the steady state: a watermark
+   token awaited after it covers every commit at or before the token. A ring
+   enumeration's rows are still undrained when it flips, but they carry no
+   `origin_lsn`, so they gate every token
+   ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
 
 ### Why the path is gap-free
 
@@ -189,13 +194,15 @@ drain threads.
   staged before it committed before the capture snapshot. A source that is
   another definition's target is different. Its writes reach readers through
   the target-mutation seam, from drain workers that don't wait for a seal, and
-  only to `live` ones, so going live parks a catch-up marker on it
-  (`go_live` in `intake::publication`, #315). Chunked and direct builds read the source
-  through many snapshots over a longer time, so going live parks a fresh
-  catch-up marker on every table the build read (`complete_direct_backfill`;
-  a direct build also reads each relationship to-side). Its discharge,
-  through this same path, re-derives the definition from the tables' current
-  state. A `backfill_coverage` record can let a catch-up skip re-reading a
+  only to applying ones, so the enumeration moves the definition to
+  `catching_up` (applying, not yet `live`) and parks a catch-up marker on it
+  (`go_live` in `intake::publication`, #315, #476). Chunked and direct builds
+  read the source through many snapshots over a longer time, so finishing one
+  parks a fresh catch-up marker on every table the build read
+  (`complete_direct_backfill`; a direct build also reads each relationship
+  to-side). Its discharge, through this same path, re-derives the definition
+  from the tables' current state, and the discharge of its last catch-up
+  flips it `live`. A `backfill_coverage` record can let a catch-up skip re-reading a
   table that provably hasn't changed since the build. That saves work but
   never decides correctness: the one change it can't see, a commit the build
   read whose streamed delta drains after the flip, is harmless for a 1-1
@@ -203,9 +210,10 @@ drain threads.
 - **A resumed target drops rows its source no longer backs.** Before the read,
   the discharge deletes every row of a dispatched definition's target that no
   current source row backs (#330, `intake::resume_orphans`), since the read
-  only reaches keys the source still has. A chunked rebuild stays non-`live`
-  long after that delete, so a source row deleted meanwhile can outlive it;
-  #436 closes that on the new path.
+  only reaches keys the source still has. A chunked rebuild isn't applied
+  until long after that delete, so a source row deleted meanwhile can
+  outlive it. #485 (decided, not yet built) closes that by running the same
+  delete at the go-live flip.
 
 ### A fresh install
 
@@ -231,10 +239,10 @@ a row committed during that wait would be neither read nor streamed (#393).
   it is, then take `Trellis::watermark_token` and `await_converged` on it.
   `await_converged` checks the ring and intake's progress, never a
   definition's status, so on its own it doesn't wait for a build that hasn't
-  started. After `live` it does wait for a ring enumeration's staged rows to
-  drain. Neither signal waits for a chunked or direct build's go-live catch-up,
-  which a later maintenance pass discharges
-  ([ADR-0016](decisions/0016-single-background-capture-path.md#consequences)).
+  started. After `live` it covers everything: `live` waits for a chunked or
+  direct build's go-live catch-up (the definition reports `catching_up` until
+  then), and a ring enumeration's staged rows gate every token
+  ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
   live without its maintenance loop. Chunked and direct builds also need drain threads
   ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).

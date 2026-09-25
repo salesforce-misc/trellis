@@ -186,14 +186,6 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
-    /// Issue #432: [`ManualBackend::quiesce`] ran out of [`QUIESCE_TIMEOUT`]
-    /// with a `pending_backfill` (catch-up) marker still undischarged for
-    /// each of `tables`. A definition's go-live parks one, and its
-    /// enumeration can still re-derive a target that is already `live`.
-    PendingBackfillTimeout {
-        tables: Vec<String>,
-        waited: Duration,
-    },
     /// Issue #236: [`ManualBackend::stop_engine`] shut the engine down, but
     /// the server still reported its replication slot active after
     /// `waited`, so the slot can't be dropped or invalidated yet.
@@ -268,9 +260,6 @@ impl From<sql::QuiesceError> for ManualBackendError {
             sql::QuiesceError::Staging(err) => ManualBackendError::Staging(err),
             sql::QuiesceError::DefinitionsUnsettled { unsettled, waited } => {
                 ManualBackendError::DefinitionSettleTimeout { unsettled, waited }
-            }
-            sql::QuiesceError::BackfillsPending { tables, waited } => {
-                ManualBackendError::PendingBackfillTimeout { tables, waited }
             }
         }
     }

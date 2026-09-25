@@ -40,7 +40,9 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// drain worker, since `install_definition` no longer runs a plain
 /// (non-relationship) 1-1 definition's backfill in-call: it now returns as
 /// soon as the chunk work is enumerated and persisted, `Backfilling` until a
-/// drain worker actually claims and finishes each chunk. Panics (via
+/// drain worker actually claims and finishes each chunk. Then runs the
+/// staging worker's discharge of the go-live catch-ups those builds parked,
+/// which takes them `live` (issue #476). Panics (via
 /// `expect`) rather than swallowing an error, matching this file's other
 /// harness helpers (`drain_to_quiescence`) — a chunk-execution failure here
 /// means the test itself is broken, not something to retry past.
@@ -58,6 +60,11 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             .expect("claim_chunks");
         drop(client);
         if claimed.is_empty() {
+            // The staging worker's next pass: the builds' go-live catch-ups
+            // take them `live` (issue #476).
+            trellis::intake::publication::discharge_registrations(pool)
+                .await
+                .expect("discharge the go-live catch-ups");
             return;
         }
         for chunk in &claimed {
@@ -232,8 +239,9 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     // The direct build's chunk work is now enumerated and persisted, not
     // executed in-call (docs/decisions/0007's amendment) — drive it to
     // completion the way a running `application_threads` drain worker would
-    // before asserting on the target's contents.
-    drain_backfill_chunks(&db.pool).await;
+    // before asserting on the target's contents. Only the build: its go-live
+    // catch-up (#476) re-reads the source into the ring by design.
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     let mismatches: i64 = client
         .query_one(
@@ -739,7 +747,9 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
 
     // The direct build's chunk work is enumerated/persisted, not executed
     // in-call — drive it to completion before reading the target.
-    drain_backfill_chunks(&db.pool).await;
+    // Only the build: its go-live catch-up (#476) re-reads the source into
+    // the ring by design.
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     // The direct build populates the target and stages nothing in the ring
     // — the fast-path signature (see the sibling fast-path test).

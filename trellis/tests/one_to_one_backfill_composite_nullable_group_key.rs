@@ -110,7 +110,7 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     )
     .await
     .expect("install the aggregate");
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     let null_group_count: i64 = client
         .query_one("select count(*) from stock_totals where sku is null", &[])
@@ -138,7 +138,9 @@ async fn backfill_across_a_composite_nullable_group_key_skips_the_null_group_wit
     .await
     .expect("install the chained OneToOne");
 
-    trellis::intake::publication::settle_registrations(&db.pool).await;
+    // Only the builds: their go-live catch-ups (#476) re-stage the chained
+    // source into the ring by design, and this checks the build itself.
+    trellis::intake::publication::settle_builds(&db.pool).await;
 
     retire_drained_segments(&mut client)
         .await
