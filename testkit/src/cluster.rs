@@ -381,23 +381,68 @@ impl TestDatabase {
     }
 }
 
+/// How many times [`TestDatabase`]'s `Drop` tries `dropdb` before giving up,
+/// [`DROP_RETRY_DELAY`] apart.
+const DROP_ATTEMPTS: u32 = 50;
+const DROP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 impl Drop for TestDatabase {
     fn drop(&mut self) {
         // `--force` (PG 13+) disconnects any backends still attached before
         // dropping, so teardown doesn't race connections just released to
-        // `pool`.
-        let _ = Command::new("dropdb")
-            .arg("-h")
-            .arg(&self.socket_dir)
-            .arg("-p")
-            .arg(self.port.to_string())
-            .arg("-U")
-            .arg("postgres")
-            .arg("--force")
-            .arg(&self.name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // `pool`. It does not cover a logical slot that is still *active*:
+        // `dropdb` refuses that outright, before `--force` terminates
+        // anything. A `trellis::Client` whose best-effort shutdown hasn't
+        // finished leaves exactly that. Were the failure ignored, the
+        // database and its slot would leak, and the slot, inactive a moment
+        // later, would pin the cluster's WAL from then on. A deep nightly
+        // run puts hundreds of cases on one cluster, so that retained WAL
+        // grew to gigabytes and filled the tmpfs quota. So end the slot's
+        // walsender and retry; once the slot is inactive, `dropdb` drops it
+        // along with the database.
+        for _ in 0..DROP_ATTEMPTS {
+            let dropped = Command::new("dropdb")
+                .arg("-h")
+                .arg(&self.socket_dir)
+                .arg("-p")
+                .arg(self.port.to_string())
+                .arg("-U")
+                .arg("postgres")
+                .arg("--force")
+                .arg("--if-exists")
+                .arg(&self.name)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if dropped {
+                return;
+            }
+            let _ = Command::new("psql")
+                .arg("-h")
+                .arg(&self.socket_dir)
+                .arg("-p")
+                .arg(self.port.to_string())
+                .arg("-U")
+                .arg("postgres")
+                .arg("-d")
+                .arg("postgres")
+                .arg("-c")
+                .arg(format!(
+                    "select pg_terminate_backend(active_pid) from pg_replication_slots \
+                     where database = '{}' and active_pid is not null",
+                    self.name
+                ))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            std::thread::sleep(DROP_RETRY_DELAY);
+        }
+        eprintln!(
+            "testkit: could not drop database {} after {DROP_ATTEMPTS} attempts; \
+             it and any replication slot on it are leaked",
+            self.name
+        );
     }
 }
 
@@ -440,24 +485,28 @@ fn spawn_server(data_dir: &Path, socket_dir: &Path, port: u16, log_path: &Path) 
         .arg(port.to_string())
         .arg("-c")
         .arg("wal_level=logical")
-        // Headroom, not a tuning knob: a `TestDatabase`'s `dropdb
-        // --force` fails silently while that database still has an
-        // *active* logical slot (see `TestDatabase::drop`), so a case
-        // whose `trellis::Client` hasn't finished its best-effort
-        // shutdown leaves both behind. Issue #188 gives every
-        // shared-cluster generative case its own slot *name*, which
-        // removes the cross-case collision but means such leaks
-        // accumulate rather than reusing one name — and a deep nightly
-        // run puts hundreds of cases on one cluster. 10 left only a
-        // handful of leaks' worth of room before
+        // Headroom, not a tuning knob: issue #188 gives every
+        // shared-cluster generative case its own slot *name*, so any slot
+        // a case does leave behind (a `TestDatabase` drop that gave up, see
+        // its `Drop`) accumulates rather than reusing one name, and a deep
+        // nightly run puts hundreds of cases on one cluster. 10 left only
+        // a handful of leaks' worth of room before
         // `pg_create_logical_replication_slot` would start failing with
-        // "all replication slots are in use"; 50 is still trivial
-        // shared memory (a slot is a small fixed struct) and takes that
-        // off the table.
+        // "all replication slots are in use"; 50 is still trivial shared
+        // memory (a slot is a small fixed struct) and takes that off the
+        // table.
         .arg("-c")
         .arg("max_replication_slots=50")
         .arg("-c")
         .arg("max_wal_senders=50")
+        // The default (`posix`) puts dynamic shared memory segments in
+        // `/dev/shm`, outside the cluster's temp dir. A postgres that is
+        // SIGKILLed (the teardown fallback, or a killed test binary) never
+        // unlinks them, and neither `Drop` nor the orphan reaper knows they
+        // exist, so they pile up until `/dev/shm`'s quota is gone. `mmap`
+        // keeps them in `$PGDATA/pg_dynshmem`, which both already delete.
+        .arg("-c")
+        .arg("dynamic_shared_memory_type=mmap")
         // Tests that assert on what the server logged (`log_statement =
         // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
         // file the two `Stdio::from` handles below point at. That only

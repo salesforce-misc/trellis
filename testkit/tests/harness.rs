@@ -43,6 +43,19 @@ async fn harness_starts_runs_a_query_and_tears_down_cleanly() {
         "shared memory segment {shmid} from postmaster.pid should be live before teardown"
     );
 
+    // Dynamic shared memory lives inside the temp dir (where teardown and
+    // the orphan reaper delete it), not in `/dev/shm`, where a SIGKILLed
+    // server would leak it. The control segment exists from startup.
+    let dynshmem = root.join("data").join("pg_dynshmem");
+    assert!(
+        std::fs::read_dir(&dynshmem)
+            .expect("read pg_dynshmem")
+            .next()
+            .is_some(),
+        "dynamic shared memory segments should be in {}",
+        dynshmem.display()
+    );
+
     drop(db);
     drop(cluster);
 
@@ -113,6 +126,84 @@ async fn isolated_databases_do_not_bleed_into_each_other() {
 
     assert_eq!(rows_a, vec![(1, "from-a".to_string())]);
     assert_eq!(rows_b, vec![(1, "from-b".to_string())]);
+}
+
+/// `dropdb --force` refuses a database whose logical slot is still being
+/// streamed from, which is what a case whose client hasn't finished shutting
+/// down leaves. Dropping the handle must still remove the database and the
+/// slot, or the slot pins the cluster's WAL for the rest of the run.
+#[tokio::test]
+async fn dropping_a_database_with_an_actively_streamed_slot_removes_it_and_the_slot() {
+    let cluster = TestCluster::start();
+    let admin = cluster.create_empty_database().await;
+    let db = cluster.create_empty_database().await;
+    let name = db.name().to_string();
+
+    let recvlogical = |extra: &[&str]| {
+        let mut cmd = Command::new("pg_recvlogical");
+        cmd.arg("-h")
+            .arg(db.socket_dir())
+            .arg("-p")
+            .arg(db.port().to_string())
+            .arg("-U")
+            .arg("postgres")
+            .arg("-d")
+            .arg(&name)
+            .arg("--slot")
+            .arg("held_slot")
+            .args(extra)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+    let created = recvlogical(&["--create-slot"])
+        .status()
+        .expect("run pg_recvlogical --create-slot");
+    assert!(created.success(), "create the slot");
+    let mut consumer = recvlogical(&["--start", "-f", "/dev/null"])
+        .spawn()
+        .expect("spawn pg_recvlogical --start");
+
+    let admin_client = admin.pool.get().await.expect("acquire connection");
+    let active = async {
+        loop {
+            let row = admin_client
+                .query_one(
+                    "select count(*) from pg_replication_slots \
+                     where slot_name = 'held_slot' and active",
+                    &[],
+                )
+                .await
+                .expect("read pg_replication_slots");
+            if row.get::<_, i64>(0) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), active)
+        .await
+        .expect("the consumer should make the slot active");
+
+    drop(db);
+
+    let databases: i64 = admin_client
+        .query_one(
+            "select count(*) from pg_database where datname = $1",
+            &[&name],
+        )
+        .await
+        .expect("read pg_database")
+        .get(0);
+    let slots: i64 = admin_client
+        .query_one("select count(*) from pg_replication_slots", &[])
+        .await
+        .expect("read pg_replication_slots")
+        .get(0);
+    let _ = consumer.kill();
+    let _ = consumer.wait();
+    assert_eq!(databases, 0, "the database should be dropped");
+    assert_eq!(slots, 0, "the slot should be dropped with it");
 }
 
 #[tokio::test]
