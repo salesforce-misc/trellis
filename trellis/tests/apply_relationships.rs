@@ -2236,7 +2236,8 @@ const TRUNCATE_AGGREGATES: &[TruncateAggregate] = &[
 ];
 
 /// One step of a [`truncate_scenario`]'s batch: a statement run against the
-/// sources, or the CDC row it produced, staged at the current WAL position.
+/// sources, the CDC row it produced, staged at the current WAL position, or
+/// a single seal and drain that ends one batch and starts the next.
 enum Step {
     Sql(&'static str),
     Cdc {
@@ -2246,6 +2247,9 @@ enum Step {
         old: Option<&'static str>,
         new: Option<&'static str>,
     },
+    /// Seals the active segment and drains it once, without draining the
+    /// recomputes that drain stages.
+    Drain,
 }
 
 /// The CDC sentinel a `TRUNCATE` of `table` stages.
@@ -2263,7 +2267,8 @@ fn truncate_cdc(table: &'static str) -> Step {
 /// plus an order with no user, one whose user doesn't exist and one with no
 /// shop, with every [`TRUNCATE_AGGREGATES`] aggregate installed. Runs
 /// `steps` and stages their CDC into one segment, so they drain as one
-/// batch, then checks every aggregate against its oracle.
+/// batch unless a [`Step::Drain`] splits them, then drains to quiescence
+/// and checks every aggregate against its oracle.
 async fn truncate_scenario(label: &str, steps: &[Step]) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -2322,6 +2327,24 @@ async fn truncate_scenario(label: &str, steps: &[Step]) {
 
     for step in steps {
         match step {
+            Step::Drain => {
+                let seg = seal_active_segment(&mut client).await;
+                while apply::drain_once(
+                    &db.pool,
+                    seg,
+                    "reverse_test",
+                    1,
+                    "trellis_apply_test",
+                    &StagedWatermark::saturated(),
+                )
+                .await
+                .expect("drain_once")
+                .is_some()
+                {}
+                retire_drained_segments(&mut client)
+                    .await
+                    .expect("retire drained segments");
+            }
             Step::Sql(sql) => client
                 .batch_execute(sql)
                 .await
@@ -2523,6 +2546,81 @@ async fn a_to_side_truncate_with_from_side_changes_in_the_same_batch_leaves_no_s
                     r#"{"id":"12","user_id":"1","shop_id":"2","region":"us","amount":"100"}"#,
                 ),
                 new: Some(r#"{"id":"12","user_id":"1","shop_id":"2","region":"us","amount":"60"}"#),
+            },
+        ],
+    )
+    .await;
+}
+
+/// Every parent re-inserted in the batch after the truncate's, which drains
+/// the truncate's imaged recomputes alongside the inserts. Nothing clears the
+/// projection in that batch, so the inserts' reverse records take the fast
+/// path; the recomputes' images still name the groups (`a`) the rows left.
+#[tokio::test]
+async fn a_to_side_truncate_then_reinsert_in_the_next_batch_leaves_no_stale_group() {
+    truncate_scenario(
+        "truncate users, re-insert them next batch",
+        &[
+            Step::Sql("delete from orders where id = 14"),
+            Step::Cdc {
+                table: "orders",
+                key: "14",
+                op: "delete",
+                old: Some(r#"{"id":"14","user_id":"9","shop_id":"1","region":"us","amount":"2"}"#),
+                new: None,
+            },
+            Step::Sql("truncate users"),
+            truncate_cdc("users"),
+            Step::Drain,
+            Step::Sql("insert into users values (1, 'z'), (2, 'b'), (3, 'c')"),
+            Step::Cdc {
+                table: "users",
+                key: "1",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"1","name":"z"}"#),
+            },
+            Step::Cdc {
+                table: "users",
+                key: "2",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"2","name":"b"}"#),
+            },
+            Step::Cdc {
+                table: "users",
+                key: "3",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"3","name":"c"}"#),
+            },
+        ],
+    )
+    .await;
+}
+
+/// A from-side change committed after the truncate but drained a batch
+/// later. The truncate's image is built from the live row (`us`), which is
+/// already ahead of the target (`eu`), so it names `(us, a)`, never
+/// `(eu, a)`. The later CDC resolves its old image's `buyer` against the
+/// cleared projection, naming `(eu, NULL)`. `(eu, a)` is left stale. The
+/// #516 fallback builds its image from the live row too.
+#[tokio::test]
+#[ignore = "a from-side change pending across a to-side truncate leaves its old group stale (found reviewing #520, not yet filed)"]
+async fn a_from_side_change_pending_across_a_to_side_truncate_leaves_no_stale_group() {
+    truncate_scenario(
+        "truncate users, then move order 10's region, drained a batch later",
+        &[
+            Step::Sql("truncate users"),
+            Step::Sql("update orders set region = 'us' where id = 10"),
+            truncate_cdc("users"),
+            Step::Drain,
+            Step::Cdc {
+                table: "orders",
+                key: "10",
+                op: "update",
+                old: Some(r#"{"id":"10","user_id":"1","shop_id":"1","region":"eu","amount":"5"}"#),
+                new: Some(r#"{"id":"10","user_id":"1","shop_id":"1","region":"us","amount":"5"}"#),
             },
         ],
     )

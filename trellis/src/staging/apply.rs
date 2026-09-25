@@ -8166,9 +8166,7 @@ pub async fn apply_and_mark_drained_many(
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
     // Issue #520: a to-side `TRUNCATE`'s recomputes carry a prior image when
-    // an aggregate groups by the truncated relationship. Staged before step
-    // 3d's fallback below, so a row both stage keeps this pre-batch image:
-    // the fold keeps a key's first.
+    // an aggregate groups by the truncated relationship.
     for ((from_table, key, hop_gen, src_changed, origin_lsn), prior_image) in
         &plan.reverse_recomputes
     {
@@ -8210,9 +8208,26 @@ pub async fn apply_and_mark_drained_many(
     // fast path. Issue #516: each carries its row's prior image when an
     // aggregate groups by the relationship, so the aggregate re-derives the
     // group the parent change moved the row out of.
+    //
+    // Issue #520: except a row a to-side `TRUNCATE` imaged above. The fold
+    // keeps one prior image per key, and only the truncate's names the group
+    // the target still holds the row in: it is read in Phase 2, before this
+    // batch clears or advances any projection, while this fallback's is read
+    // after (a re-inserted parent's "no parent before", or a sibling rename's
+    // image with the truncated relationship already `NULL`). Dropped here
+    // rather than left to the fold's first-image-wins order, which depends on
+    // staging order and on no earlier producer imaging the same key.
+    let truncate_imaged: std::collections::HashSet<(&str, &str)> = plan
+        .reverse_recomputes
+        .iter()
+        .filter(|(_, prior_image)| prior_image.is_some())
+        .map(|((from_table, key, ..), _)| (from_table.as_str(), key.as_str()))
+        .collect();
     for ((from_table, key, hop_gen, src_changed, origin_lsn), prior_image) in
         relationship_reverse_fallback
     {
+        let prior_image =
+            prior_image.filter(|_| !truncate_imaged.contains(&(from_table.as_str(), key.as_str())));
         if hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table);
             worst_hop_gen = worst_hop_gen.max(hop_gen);
