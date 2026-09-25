@@ -953,8 +953,10 @@ pub fn build_program_multi_with_shapes(
                     (source.pk_col.clone(), Some(pk.to_string())),
                     (c1.clone(), render(*a)),
                     (c2.clone(), render(*b)),
-                    // Task B1: seeded once, here, and never touched again —
-                    // see [`Mutate`]/the module doc comment's scope cut.
+                    // Task B1: seeded once, here, and never touched again
+                    // (except the Boolean column, which issue #255's
+                    // [`Mutate::UpdateFlag`] rewrites) — see [`Mutate`]/the
+                    // module doc comment's scope cut.
                     (text_col.clone(), spec.text_values[i].clone()),
                     (bool_col.clone(), spec.bool_values[i].clone()),
                     (uuid_col.clone(), spec.uuid_values[i].clone()),
@@ -2818,7 +2820,7 @@ mod strategy {
     /// Weighted evenly so both shapes get substantial, comparable coverage
     /// across a run — this is the dimension `tests/coverage.rs`'s B4 floor
     /// tests sample against, so it must not be so lopsided that 500 samples
-    /// has a real chance of missing one of the five aggregate functions.
+    /// has a real chance of missing one of the aggregate functions.
     fn def_shape() -> impl Strategy<Value = DefShape> {
         prop_oneof![
             1 => Just(DefShape::OneToOne),
@@ -3026,10 +3028,10 @@ mod strategy {
     /// seed `1..=MAX_SEED_ROWS` rows with random values (now including one
     /// `Text`/`Boolean`/`Uuid` value and one grain value per row, tasks
     /// B1/B4), then append `0..=MAX_MUTATES` mutates over the numeric columns
-    /// only (the new columns are never mutated — see the module doc
-    /// comment's scope cuts) — the per-table shape [`trivial_program_with`]
-    /// always drew, now reusable once per table in a multi-table program
-    /// (improvement-plan task B3).
+    /// and the Boolean column (the other new columns are never mutated — see
+    /// the module doc comment's scope cuts) — the per-table shape
+    /// [`trivial_program_with`] always drew, now reusable once per table in a
+    /// multi-table program (improvement-plan task B3).
     fn table_spec(awkward_values: bool) -> impl Strategy<Value = TableSpec> {
         (1..=MAX_SEED_ROWS)
             .prop_flat_map(move |seed_count| {
@@ -3102,9 +3104,10 @@ mod strategy {
     /// unconditionally — see its own doc comment for issue #128, the engine
     /// bug that used to force a scope cut here), nor does it affect
     /// [`Mutate::DuplicateInsert`], [`def_shape`] (which of a def's fields
-    /// are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over), or [`DerivedShape`] (every
-    /// `OneToOne` def always gets one `derived` field) — all distinct,
-    /// structural widenings, always available regardless of the flag.
+    /// are `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`/`BOOL_AND`/`BOOL_OR` over), or
+    /// [`DerivedShape`] (every `OneToOne` def always gets one `derived`
+    /// field) — all distinct, structural widenings, always available
+    /// regardless of the flag.
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
