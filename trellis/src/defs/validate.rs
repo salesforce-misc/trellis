@@ -173,6 +173,19 @@ pub enum ValidationError {
     /// resolve to exactly one value per source row, which only a to-one
     /// relationship path guarantees.
     GroupByRelationshipMustBeToOne { rel: String, column: String },
+    /// Two of an [`super::ast::KeySpace::Aggregate`] definition's `GROUP BY`
+    /// keys map to the same target column name (issue #519) — e.g.
+    /// `GROUP BY buyer.name, seller.name`, a plain `name` alongside
+    /// `buyer.name`, or one key listed twice. A key's target column is named
+    /// after its bare column ([`GroupByKey::target_column_name`]), and the
+    /// grammar has no `GROUP BY ... AS` alias yet, so the target DDL would
+    /// declare that column twice. `first`/`second` are the clashing keys as
+    /// written (`rel.column` or `column`), in `GROUP BY` order.
+    GroupByKeysShareTargetColumn {
+        first: String,
+        second: String,
+        column: String,
+    },
     /// An [`super::ast::KeySpace::Aggregate`] definition's field references a
     /// source column that is neither a grouping key nor wrapped in exactly
     /// one of `SUM`/`MIN`/`MAX`/`AVG` — every row in a group must be folded
@@ -519,6 +532,27 @@ impl fmt::Display for ValidationError {
                  the many related rows on the other end of a to-many relationship has no \
                  defined semantics, so a GROUP BY relationship path must be to-one"
             ),
+            ValidationError::GroupByKeysShareTargetColumn {
+                first,
+                second,
+                column,
+            } if first == second => write!(
+                f,
+                "GROUP BY lists '{first}' twice, which would declare target column '{column}' \
+                 twice; list each GROUP BY key once"
+            ),
+            ValidationError::GroupByKeysShareTargetColumn {
+                first,
+                second,
+                column,
+            } => write!(
+                f,
+                "GROUP BY keys '{first}' and '{second}' would both become target column \
+                 '{column}', and a target table can't have two columns with the same name. \
+                 GROUP BY keys can't be aliased yet, so group by only one of them (or by the \
+                 relationship's from-side column instead), or group over a 1-1 transform \
+                 that selects them under distinct names (e.g. `buyer.name AS buyer_name`)"
+            ),
             ValidationError::UngroupedColumnReference { field, column } => write!(
                 f,
                 "calculated field '{field}' references source column '{column}' outside of \
@@ -749,6 +783,8 @@ pub fn validate(
             // relationship name or a to-many cardinality is rejected here,
             // ahead of the per-field checks below, so a bad `GROUP BY`
             // clause is never masked by a field error instead.
+            let mut keys_by_target_column: HashMap<&str, &GroupByKey> =
+                HashMap::with_capacity(group_by.len());
             for key in group_by {
                 match key {
                     GroupByKey::Column(column) => {
@@ -777,6 +813,20 @@ pub fn validate(
                         };
                         reject_unsupported_group_by_key_type(column, *value_type)?;
                     }
+                }
+                // Issue #519: each key becomes a target column named after
+                // its bare column, so two keys sharing that name (two
+                // relationships onto the same table, a relationship column
+                // named like a from-side one, or a repeated key) would reach
+                // the target DDL as a duplicate column. Checked after the key
+                // itself resolves, so an unknown relationship or column is
+                // reported as such rather than as a clash.
+                if let Some(earlier) = keys_by_target_column.insert(key.target_column_name(), key) {
+                    return Err(ValidationError::GroupByKeysShareTargetColumn {
+                        first: group_by_key_as_written(earlier),
+                        second: group_by_key_as_written(key),
+                        column: key.target_column_name().to_string(),
+                    });
                 }
             }
             for field in &def.fields {
@@ -876,6 +926,15 @@ pub fn validate(
     infer_field_types(def, source_columns, relationships)?;
 
     Ok(())
+}
+
+/// A `GROUP BY` key spelled the way the definition wrote it: `column` or
+/// `rel.column`.
+fn group_by_key_as_written(key: &GroupByKey) -> String {
+    match key {
+        GroupByKey::Column(column) => column.clone(),
+        GroupByKey::RelationshipPath { rel, column } => format!("{rel}.{column}"),
+    }
 }
 
 /// Walks a field's expression enforcing ADR-0006's cardinality rules on every
@@ -3373,6 +3432,117 @@ mod tests {
                 column: "author".to_string(),
             }
         );
+    }
+
+    fn count_star_field() -> FieldDef {
+        FieldDef {
+            name: "c".to_string(),
+            expr: Expr::FunctionCall {
+                name: "COUNT".to_string(),
+                args: Vec::new(),
+            },
+        }
+    }
+
+    fn rel_key(rel: &str, column: &str) -> GroupByKey {
+        GroupByKey::RelationshipPath {
+            rel: rel.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    /// `buyer` and `seller` both to-one onto `users`, each exposing `name`.
+    fn buyer_and_seller_rels() -> HashMap<String, ResolvedRelationship> {
+        let mut rels = to_one_rel("buyer", "users", "name");
+        rels.extend(to_one_rel("seller", "users", "name"));
+        rels
+    }
+
+    #[test]
+    fn two_group_by_relationship_paths_sharing_a_column_name_are_rejected() {
+        // Issue #519: `GROUP BY buyer.name, seller.name` maps both keys to a
+        // target column named `name`, which used to reach Postgres as a raw
+        // "column \"name\" appears twice in unique constraint" from the target DDL.
+        let d = aggregate_def_with_keys(
+            vec![rel_key("buyer", "name"), rel_key("seller", "name")],
+            vec![count_star_field()],
+        );
+        let source_columns = numeric_columns(&["buyer_id", "seller_id"]);
+        let err = validate(&d, &source_columns, &buyer_and_seller_rels()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupByKeysShareTargetColumn {
+                first: "buyer.name".to_string(),
+                second: "seller.name".to_string(),
+                column: "name".to_string(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("'buyer.name'"), "{message}");
+        assert!(message.contains("'seller.name'"), "{message}");
+        assert!(message.contains("buyer.name AS buyer_name"), "{message}");
+        assert_eq!(err.code(), ErrorCode::Validation);
+    }
+
+    #[test]
+    fn a_group_by_relationship_path_sharing_a_plain_group_by_columns_name_is_rejected() {
+        // The from-side twin the issue calls out: a plain `name` source
+        // column and `buyer.name` would both become target column `name`.
+        let d = aggregate_def_with_keys(
+            vec![
+                GroupByKey::Column("name".to_string()),
+                rel_key("buyer", "name"),
+            ],
+            vec![count_star_field()],
+        );
+        let source_columns = numeric_columns(&["name", "buyer_id"]);
+        let err = validate(&d, &source_columns, &buyer_and_seller_rels()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupByKeysShareTargetColumn {
+                first: "name".to_string(),
+                second: "buyer.name".to_string(),
+                column: "name".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_group_by_key_listed_twice_is_rejected() {
+        let d = aggregate_def_with_keys(
+            vec![
+                GroupByKey::Column("region".to_string()),
+                GroupByKey::Column("region".to_string()),
+            ],
+            vec![count_star_field()],
+        );
+        let source_columns = numeric_columns(&["region"]);
+        let err = validate(&d, &source_columns, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::GroupByKeysShareTargetColumn {
+                first: "region".to_string(),
+                second: "region".to_string(),
+                column: "region".to_string(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("lists 'region' twice"), "{message}");
+    }
+
+    #[test]
+    fn group_by_relationship_paths_with_distinct_column_names_still_pass() {
+        let mut rels = buyer_and_seller_rels();
+        rels.get_mut("seller")
+            .unwrap()
+            .column_types
+            .insert("email".to_string(), ValueType::Numeric);
+        let d = aggregate_def_with_keys(
+            vec![rel_key("buyer", "name"), rel_key("seller", "email")],
+            vec![count_star_field()],
+        );
+        let source_columns = numeric_columns(&["buyer_id", "seller_id"]);
+        validate(&d, &source_columns, &rels).unwrap();
     }
 
     #[test]

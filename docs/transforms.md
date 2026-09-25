@@ -64,6 +64,13 @@ wrapped in exactly one of `SUM`, `AVG`, `MIN`, or `MAX` (numeric-only). `COUNT(*
 counts rows in the group (#75); `COUNT(<column>)` is not yet implemented (see
 ADR-0004).
 
+A grouping key can also be a to-one relationship path (`GROUP BY post.author`).
+Each key becomes a target column named after its bare column, and keys can't be
+aliased yet, so two keys that share a column name (`GROUP BY buyer.name,
+seller.name`, or `name` alongside `buyer.name`) are rejected. To group by both,
+group over a 1-1 transform that selects them under distinct names
+(`buyer.name AS buyer_name`).
+
 ```
 TRANSFORM order_totals FROM order_line_items GROUP BY order_id
 SELECT
