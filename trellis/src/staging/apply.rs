@@ -451,30 +451,115 @@ async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<Strin
     Ok(catalog::resolve_graph_identity(pool, src_table).await?)
 }
 
-/// Decodes a staged jsonb image (bound as text — this crate has no
+/// Decodes staged jsonb images (each bound as text: this crate has no
 /// `serde_json` dependency, matching `append.rs`/`fold.rs`'s convention)
-/// into a [`Row`] via `jsonb_each_text`, so the evaluator never has to
-/// parse JSON itself. A JSON `null` value decodes to `None`, matching
-/// `Row`'s "absent column" vs. "present but NULL" distinction the evaluator
-/// depends on (`eval.rs`'s `MissingColumn` vs. plain `None` propagation).
-/// The intermediate `::text` cast matters, same as `append.rs`: `$1::jsonb`
-/// alone makes Postgres describe the placeholder as `jsonb`, which
-/// `&str`'s `ToSql` rejects before the value is ever sent.
-async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> {
-    let client = pool.get().await?;
-    let rows = client
-        .query(
-            "select key, value from jsonb_each_text($1::text::jsonb)",
-            &[&image_text],
-        )
-        .await?;
-    let mut row = Row::with_capacity(rows.len());
-    for r in rows {
-        let key: String = r.get(0);
-        let value: Option<String> = r.get(1);
-        row.insert(key, value);
+/// into [`Row`]s via `jsonb_each_text`, so the evaluator never has to parse
+/// JSON itself. The result is in `images`' order, one [`Row`] per image. A
+/// JSON `null` value decodes to `None`, matching `Row`'s "absent column" vs.
+/// "present but NULL" distinction the evaluator depends on (`eval.rs`'s
+/// `MissingColumn` vs. plain `None` propagation). An empty image (`{}`)
+/// decodes to an empty [`Row`].
+///
+/// Issue #327: one round trip per [`DECODE_CHUNK_IMAGES`] images (or
+/// [`DECODE_CHUNK_BYTES`] of image text, whichever fills first), not one
+/// per image. Each image still goes through the same `::jsonb` cast and
+/// `jsonb_each_text` a lone decode would, so the decoded text is
+/// byte-for-byte what a per-image query returns; `with ordinality` only
+/// says which image a pair came from. The chunk bounds keep one statement's
+/// bind message and buffered result to a few megabytes however many images
+/// a batch carries.
+async fn decode_images(pool: &Pool, images: &[&str]) -> Result<Vec<Row>, ApplyError> {
+    decode_images_in_chunks(pool, images, DECODE_CHUNK_IMAGES, DECODE_CHUNK_BYTES).await
+}
+
+/// [`decode_images`] with its chunk bounds as parameters, so a test can put
+/// chunk boundaries anywhere in a small corpus.
+async fn decode_images_in_chunks(
+    pool: &Pool,
+    images: &[&str],
+    max_images: usize,
+    max_bytes: usize,
+) -> Result<Vec<Row>, ApplyError> {
+    let mut rows: Vec<Row> = vec![Row::new(); images.len()];
+    if images.is_empty() {
+        return Ok(rows);
     }
-    Ok(row)
+    let client = pool.get().await?;
+    let mut start = 0;
+    while start < images.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        // Always at least one image, however large, so a chunk is never empty.
+        while end < images.len()
+            && (end == start
+                || (end - start < max_images && bytes + images[end].len() <= max_bytes))
+        {
+            bytes += images[end].len();
+            end += 1;
+        }
+        let chunk = &images[start..end];
+        let pairs = client
+            .query(
+                "select i.ord, e.key, e.value \
+                 from unnest($1::text[]) with ordinality as i(image, ord) \
+                 cross join lateral jsonb_each_text(i.image::jsonb) as e",
+                &[&chunk],
+            )
+            .await?;
+        for pair in pairs {
+            let ord: i64 = pair.get(0);
+            let key: String = pair.get(1);
+            let value: Option<String> = pair.get(2);
+            rows[start + ord as usize - 1].insert(key, value);
+        }
+        start = end;
+    }
+    Ok(rows)
+}
+
+/// At most this many images per [`decode_images`] round trip.
+const DECODE_CHUNK_IMAGES: usize = 4096;
+
+/// At most this much image text per [`decode_images`] round trip, unless a
+/// single image is larger on its own.
+const DECODE_CHUNK_BYTES: usize = 4 << 20;
+
+/// Collects the images one [`compute`] step needs decoded, so they all go
+/// through a single [`decode_images`] call, then hands each caller back its
+/// own [`Row`] by the slot [`ImageBatch::push`] returned.
+#[derive(Default)]
+struct ImageBatch<'a> {
+    images: Vec<&'a str>,
+}
+
+impl<'a> ImageBatch<'a> {
+    /// Queues `image` for decoding, returning the slot its [`Row`] lands in.
+    fn push(&mut self, image: &'a str) -> usize {
+        self.images.push(image);
+        self.images.len() - 1
+    }
+
+    /// [`ImageBatch::push`], passing a missing image through as `None`.
+    fn push_opt(&mut self, image: Option<&'a String>) -> Option<usize> {
+        image.map(|image| self.push(image))
+    }
+
+    async fn decode(self, pool: &Pool) -> Result<DecodedImages, ApplyError> {
+        Ok(DecodedImages(decode_images(pool, &self.images).await?))
+    }
+}
+
+/// [`ImageBatch::decode`]'s result: each slot's [`Row`], taken exactly once.
+struct DecodedImages(Vec<Row>);
+
+impl DecodedImages {
+    fn take(&mut self, slot: usize) -> Row {
+        std::mem::take(&mut self.0[slot])
+    }
+
+    fn take_opt(&mut self, slot: Option<usize>) -> Option<Row> {
+        slot.map(|slot| self.take(slot))
+    }
 }
 
 /// Re-reads every one of `keys`' current rows from `source_table` live, in
@@ -487,9 +572,9 @@ async fn decode_image(pool: &Pool, image_text: &str) -> Result<Row, ApplyError> 
 ///
 /// The `jsonb_each_text` unnest happens in the same query as the `any($1)`
 /// row lookup — a `cross join lateral`, one column per matched row — so
-/// decoding costs no extra round trip either; [`decode_image`]'s per-image
-/// query is only paid for images that arrive already staged (`new_image`),
-/// never for a live refetch. A key absent from the returned map means its
+/// decoding costs no extra round trip either; [`decode_images`] is only
+/// paid for images that arrive already staged (`new_image`), never for a
+/// live refetch. A key absent from the returned map means its
 /// row is gone (already deleted, or never existed), which [`compute`]
 /// treats as a delete, matching `read_live_row`'s old `None` case exactly.
 ///
@@ -3855,6 +3940,192 @@ mod tests {
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
 
+    /// Issue #327: the per-image decode [`decode_images`] replaced, kept
+    /// verbatim as the differential oracle.
+    async fn decode_image_one_round_trip_each(pool: &Pool, image: &str) -> Row {
+        let client = pool.get().await.expect("pool checkout");
+        let rows = client
+            .query(
+                "select key, value from jsonb_each_text($1::text::jsonb)",
+                &[&image],
+            )
+            .await
+            .expect("decode one image");
+        let mut row = Row::with_capacity(rows.len());
+        for r in rows {
+            row.insert(r.get(0), r.get(1));
+        }
+        row
+    }
+
+    /// Issue #327: the batched decode returns exactly what one
+    /// `jsonb_each_text` round trip per image did, over images of every
+    /// column type in each shape the ring carries them in, NULLs, empty
+    /// images, unicode and escapes, wherever the chunk boundaries fall.
+    #[tokio::test]
+    async fn batched_image_decode_matches_one_round_trip_per_image() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        // A same-crate pool: see
+        // `compute_only_buffers_metrics_and_a_single_flush_records_them_exactly_once`.
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        )
+        .expect("build a same-crate pool");
+        let client = pool.get().await.expect("pool checkout");
+        client
+            .batch_execute(
+                r#"create type mood as enum ('sad', 'ok', 'happy');
+                create table corpus (
+                    id integer primary key, i2 smallint, i8 bigint, num numeric,
+                    r4 real, f8 double precision, t text, vc varchar(20), ch char(3),
+                    b boolean, u uuid, d date, tm time, tmz timetz, ts timestamp,
+                    tsz timestamptz, iv interval, by bytea, j json, jb jsonb, ip inet,
+                    cidr_ cidr, mac macaddr, mac8 macaddr8, bt bit(4), vb varbit,
+                    m money, x xml, tv tsvector, tq tsquery, o oid, e mood,
+                    ia integer[], ta text[]);
+                insert into corpus values
+                (1, 7, 9007199254740993, 1.50, 1.5, 0.1, 'plain', 'v', 'ab', true,
+                 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-02-29', '13:45:00.5',
+                 '13:45:00+05:30', '2024-02-29 13:45:00.123456',
+                 '2024-02-29 13:45:00+00', '1 year 2 mons 3 days 04:05:06',
+                 '\x00ff10', '{"b": [1, 2.50, "x"], "a": {"n": null}}',
+                 '{"b": 1e3, "a": "é", "c": [true, null]}', '10.0.0.1/8', '10.0.0.0/8',
+                 '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', B'1010', B'10101',
+                 12.34, '<a>x</a>', 'a fat cat', 'fat & rat', 42, 'happy',
+                 '{1,NULL,3}', '{"a b",NULL,"c\"d","e\\f",""}'),
+                (2, -32768, -9223372036854775808, 'NaN', 'Infinity', '-0',
+                 E'quote " backslash \\ newline \n tab \t bell \x07 é 值 🎉', '', '   ',
+                 false, '00000000-0000-0000-0000-000000000000', 'infinity', '00:00',
+                 '00:00-12', '-infinity', 'infinity', '-1 days -00:00:01', '\x', '[]',
+                 '{}', '::1', '::/0', '00:00:00:00:00:00', '00:00:00:00:00:00:00:00',
+                 B'0000', B'', -0.01, '', '', 'a', 0, 'sad', '{}', '{}'),
+                (3, null, null, 123456789012345678901234567890.000000000000000000001,
+                 '-Infinity', 1e308, E'ключ 😀 \u200b', null, null, null, null, null,
+                 null, null, null, null, null, null, 'null', 'null', null, null, null,
+                 null, null, null, null, null, null, null, null, null, null, null),
+                (4, null, null, null, null, null, null, null, null, null, null, null,
+                 null, null, null, null, null, null, null, null, null, null, null,
+                 null, null, null, null, null, null, null, null, null, null, null);"#,
+            )
+            .await
+            .expect("seed the corpus table");
+        let columns: Vec<String> = client
+            .query(
+                "select attname::text from pg_attribute \
+                 where attrelid = 'corpus'::regclass and attnum > 0 and not attisdropped \
+                 order by attnum",
+                &[],
+            )
+            .await
+            .expect("read corpus columns")
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let mut corpus: Vec<String> = Vec::new();
+        // The shape a live-row-derived image (a recompute's prior image)
+        // carries: every value as its text, NULL as JSON null.
+        let text_sql = format!(
+            "select ({})::text from corpus t order by id",
+            row_as_text_jsonb_sql("t", &columns)
+        );
+        for r in client.query(&text_sql, &[]).await.expect("text images") {
+            corpus.push(r.get(0));
+        }
+        // Native JSON values: numbers, booleans, nested objects and arrays.
+        for r in client
+            .query("select to_jsonb(t.*)::text from corpus t order by id", &[])
+            .await
+            .expect("to_jsonb images")
+        {
+            corpus.push(r.get(0));
+        }
+        // The CDC shape, hand-encoded by intake's own `json_string`.
+        let values_sql = format!(
+            "select {} from corpus t order by id",
+            columns
+                .iter()
+                .map(|c| format!("t.{}::text", quote_ident(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for r in client.query(&values_sql, &[]).await.expect("cdc values") {
+            let row: Row = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.clone(), r.get::<_, Option<String>>(i)))
+                .collect();
+            corpus.push(row_to_json_text(&row));
+        }
+        for image in [
+            "{}",
+            " { } ",
+            r#"{"a":null}"#,
+            r#"{"":""}"#,
+            r#"{"a":"1","a":"2"}"#,
+            r#"{"b":"2","a":"1","c":null}"#,
+            r#"{"\u00e9t\u00e9":"\ud83c\udf89","ключ":"值 🎉","esc":"\"\\\/\b\f\n\r\t\u0001"}"#,
+            r#"{"n1":1.50,"n2":1e3,"n3":-0,"n4":0.000001,"n5":12345678901234567890,"n6":-1.5E-7}"#,
+            r#"{"t":true,"f":false,"z":null,"arr":[1,"a",null,{"y":2,"x":1}],"obj":{"b":{},"a":[]}}"#,
+            "{\n  \"spaced\" :\t\"out\" ,\r\n \"k\": [ 1 , 2 ] }",
+            r#"{"line\nbreak key":"v","tab\tkey":null}"#,
+        ] {
+            corpus.push(image.to_string());
+        }
+        let images: Vec<&str> = corpus.iter().map(String::as_str).collect();
+        let mut expected = Vec::with_capacity(images.len());
+        for image in &images {
+            expected.push(decode_image_one_round_trip_each(&pool, image).await);
+        }
+        assert!(
+            expected.iter().any(Row::is_empty)
+                && expected.iter().any(|row| row.values().any(Option::is_none))
+                && expected.iter().any(|row| row.len() == columns.len()),
+            "the corpus covers empty images, NULLs and every column"
+        );
+
+        for (max_images, max_bytes) in [
+            (DECODE_CHUNK_IMAGES, DECODE_CHUNK_BYTES),
+            (1, usize::MAX),
+            (2, usize::MAX),
+            (5, usize::MAX),
+            (usize::MAX, 1),
+            (usize::MAX, 200),
+            (0, 0),
+        ] {
+            let decoded = decode_images_in_chunks(&pool, &images, max_images, max_bytes)
+                .await
+                .expect("batched decode");
+            assert_eq!(
+                decoded, expected,
+                "chunks of at most {max_images} images / {max_bytes} bytes"
+            );
+        }
+
+        // Many chunks at the production bounds, with empty images at the
+        // edges and between chunks.
+        let mut many: Vec<&str> = vec!["{}"];
+        let mut many_expected: Vec<Row> = vec![Row::new()];
+        for i in 0..(2 * DECODE_CHUNK_IMAGES + 3) {
+            many.push(images[i % images.len()]);
+            many_expected.push(expected[i % images.len()].clone());
+        }
+        many.push("{}");
+        many_expected.push(Row::new());
+        assert_eq!(
+            decode_images(&pool, &many).await.expect("batched decode"),
+            many_expected
+        );
+        assert_eq!(
+            decode_images(&pool, &[]).await.expect("empty batch"),
+            Vec::<Row>::new()
+        );
+        assert!(
+            decode_images(&pool, &["{}", "not json"]).await.is_err(),
+            "an undecodable image fails the batch, as it failed its own decode"
+        );
+    }
+
     /// Issue #516: a fallback prior image is the from-side row with the
     /// parent's value before the change — `NULL` for every column when the
     /// row had no parent — and each sibling relationship's snapshot, under
@@ -5254,40 +5525,6 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             Err(err) => return Err(err.into()),
         };
 
-        // Decoded/re-read once per change here — not once per (definition,
-        // change) — since every definition subscribed to this source
-        // evaluates the exact same row (issue #69): the image a change
-        // carries, or the live re-read for an image-less recompute trigger,
-        // doesn't depend on which definition is reading it. The `(None,
-        // None)` shape — a bare recompute trigger with no image, the shape
-        // every backfill enumeration produces — is collected instead of
-        // re-read immediately, so every such key in this batch is fetched
-        // in one [`read_live_rows_batch`] round trip rather than one
-        // round trip per key (issue #13).
-        let mut rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
-        let mut live_refetch_indices: Vec<usize> = Vec::new();
-        for (i, change) in changes.iter().enumerate() {
-            let row = match (&change.new_image, &change.old_image) {
-                (Some(image_text), _) => Some(decode_image(pool, image_text).await?),
-                (None, Some(_)) => None,
-                (None, None) => {
-                    live_refetch_indices.push(i);
-                    None
-                }
-            };
-            rows.push(row);
-        }
-        if !live_refetch_indices.is_empty() {
-            let live_keys: Vec<&str> = live_refetch_indices
-                .iter()
-                .map(|&i| changes[i].key.as_str())
-                .collect();
-            let mut live_rows =
-                read_live_rows_batch(pool, qualified_source, &pk, &live_keys).await?;
-            for &i in &live_refetch_indices {
-                rows[i] = live_rows.remove(changes[i].key.as_str());
-            }
-        }
         // Issue #344: the source column list a 1-1 target's Phase 3 check
         // renders the current row with. Loaded at most once per source, and
         // only when some definition on it is 1-1.
@@ -5307,54 +5544,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         )
         .await?;
 
-        // Aggregate definitions need each change's *old*-side row too (to
-        // derive a grain-migrating change's old group key and its old
-        // contribution — see `apply_aggregate`'s doc comment), decoded once
-        // here and shared across every aggregate definition on this source,
-        // same as `rows` above. Only decoded when this source actually has
-        // an aggregate reader, to avoid the extra round trips for the
-        // (overwhelmingly common) 1-1-only source. Issue #130 widens this
-        // same gate: a 1-1 definition reading a to-one relationship also
-        // needs each change's old-image join-key value, to bump `gen` for
-        // the parent a re-point/delete moved *away* from (see
-        // `RelationshipGenBump`'s doc comment) — sharing one decode here
-        // rather than a second pass over the same images.
+        // Which of the image decodes below this source's readers need.
         let needs_old_rows = defs.iter().any(|def| {
             matches!(def.def.key_space, KeySpace::Aggregate { .. })
                 || !eval::relationship_references(&def.def).is_empty()
         });
-        let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
-        if needs_old_rows {
-            for change in &changes {
-                let old_row = match old_side_image(change) {
-                    Some(image_text) => Some(decode_image(pool, image_text).await?),
-                    None => None,
-                };
-                old_rows.push(old_row);
-            }
-        } else {
-            old_rows.resize_with(changes.len(), || None);
-        }
-        // Issues #392/#486: the further group-naming images
-        // `apply_aggregate::accumulate_changes` takes as `named_rows`. Only an
-        // aggregate reads them, and only a born-and-died key or a recompute
-        // folded with CDC rows has any, so almost every change decodes none.
-        let mut named_rows: Vec<Vec<Row>> = Vec::with_capacity(changes.len());
         let has_aggregate = defs
             .iter()
             .any(|def| matches!(def.def.key_space, KeySpace::Aggregate { .. }));
-        for change in &changes {
-            let mut named = Vec::new();
-            if has_aggregate {
-                let has_image = change.old_image.is_some() || change.new_image.is_some();
-                let hint = change.prior_image.as_ref().filter(|_| has_image);
-                for image_text in change.vanished_images.iter().chain(hint) {
-                    named.push(decode_image(pool, image_text).await?);
-                }
-            }
-            named_rows.push(named);
-        }
-
         // Reverse recompute (issue #30): this source is some relationship's
         // *to-side*. A change to a related row must re-derive every from-side
         // row whose enrichment reads it. For each relationship pointing at
@@ -5375,22 +5572,81 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
         let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
-        // Decode each change's pre-image once, reused across every inbound
-        // relationship below (the join key lives in the pre-image for a
-        // delete/re-parent). Skipped entirely when this table is nobody's
-        // to-side, so the common no-relationship source pays nothing.
-        let reverse_old_rows: Vec<Option<Row>> = if inbound_rels.is_empty() {
-            Vec::new()
-        } else {
-            let mut decoded = Vec::with_capacity(changes.len());
-            for change in &changes {
-                decoded.push(match old_side_image(change) {
-                    Some(image_text) => Some(decode_image(pool, image_text).await?),
-                    None => None,
-                });
+
+        // Decoded/re-read once per change here — not once per (definition,
+        // change) — since every definition subscribed to this source
+        // evaluates the exact same row (issue #69): the image a change
+        // carries, or the live re-read for an image-less recompute trigger,
+        // doesn't depend on which definition is reading it. The `(None,
+        // None)` shape — a bare recompute trigger with no image, the shape
+        // every backfill enumeration produces — is collected instead of
+        // re-read immediately, so every such key in this batch is fetched
+        // in one [`read_live_rows_batch`] round trip rather than one
+        // round trip per key (issue #13).
+        //
+        // Every image this source's changes need is decoded in one
+        // [`decode_images`] call (issue #327), not one round trip each:
+        // - `rows`: each change's new image.
+        // - `old_rows`: each change's old-side image ([`old_side_image`]),
+        //   decoded only when something reads it. An aggregate needs it for
+        //   a grain-migrating change's old group key and old contribution
+        //   (see `apply_aggregate`'s doc comment); a definition reading a
+        //   to-one relationship needs the old join-key value, to bump `gen`
+        //   for the parent a re-point/delete moved *away* from (issue #130,
+        //   see `RelationshipGenBump`'s doc comment); and each relationship
+        //   pointing at this table as its to-side reads the join key off it
+        //   for a delete/re-parent. The overwhelmingly common 1-1-only,
+        //   relationship-free source decodes none.
+        // - `named_rows` (issues #392/#486): the further group-naming images
+        //   `apply_aggregate::accumulate_changes` takes. Only an aggregate
+        //   reads them, and only a born-and-died key or a recompute folded
+        //   with CDC rows has any, so almost every change decodes none.
+        let decode_old_side = needs_old_rows || !inbound_rels.is_empty();
+        let mut batch = ImageBatch::default();
+        let mut slots: Vec<(Option<usize>, Option<usize>, Vec<usize>)> =
+            Vec::with_capacity(changes.len());
+        let mut live_refetch_indices: Vec<usize> = Vec::new();
+        for (i, change) in changes.iter().enumerate() {
+            if change.new_image.is_none() && change.old_image.is_none() {
+                live_refetch_indices.push(i);
             }
-            decoded
-        };
+            let new_slot = batch.push_opt(change.new_image.as_ref());
+            let old_slot = if decode_old_side {
+                batch.push_opt(old_side_image(change))
+            } else {
+                None
+            };
+            let mut named = Vec::new();
+            if has_aggregate {
+                let has_image = change.old_image.is_some() || change.new_image.is_some();
+                let hint = change.prior_image.as_ref().filter(|_| has_image);
+                for image_text in change.vanished_images.iter().chain(hint) {
+                    named.push(batch.push(image_text));
+                }
+            }
+            slots.push((new_slot, old_slot, named));
+        }
+        let mut decoded = batch.decode(pool).await?;
+        let mut rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
+        let mut old_rows: Vec<Option<Row>> = Vec::with_capacity(changes.len());
+        let mut named_rows: Vec<Vec<Row>> = Vec::with_capacity(changes.len());
+        for (new_slot, old_slot, named) in slots {
+            rows.push(decoded.take_opt(new_slot));
+            old_rows.push(decoded.take_opt(old_slot));
+            named_rows.push(named.into_iter().map(|slot| decoded.take(slot)).collect());
+        }
+        if !live_refetch_indices.is_empty() {
+            let live_keys: Vec<&str> = live_refetch_indices
+                .iter()
+                .map(|&i| changes[i].key.as_str())
+                .collect();
+            let mut live_rows =
+                read_live_rows_batch(pool, qualified_source, &pk, &live_keys).await?;
+            for &i in &live_refetch_indices {
+                rows[i] = live_rows.remove(changes[i].key.as_str());
+            }
+        }
+
         for rel in &inbound_rels {
             // Issue #131, epic #127: to-one relationships get the new
             // parent-keyed reverse record + delta mechanism below;
@@ -5426,7 +5682,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     if let Some(row) = &rows[i] {
                         note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                     }
-                    if let Some(old) = &reverse_old_rows[i] {
+                    if let Some(old) = &old_rows[i] {
                         note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
                     }
                 }
@@ -5503,7 +5759,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                     let old_row = if image_less {
                         None
                     } else {
-                        reverse_old_rows[i].as_ref()
+                        old_rows[i].as_ref()
                     };
                     for row in [rows[i].as_ref(), old_row].into_iter().flatten() {
                         let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
@@ -5560,7 +5816,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 if change.old_image.is_none() && change.new_image.is_none() {
                     continue;
                 }
-                let old_row = reverse_old_rows[i].clone();
+                let old_row = old_rows[i].clone();
                 let new_row = rows[i].clone();
                 let read_key = relationship_key_text(&old_row, &rel.def.to_col)
                     .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
@@ -6013,7 +6269,20 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // same cache the by-source loop above populates, so a relationship
     // touched by both a genuine parent CDC row and a deferred retry in the
     // same batch only ever builds its shape once.
-    for change in &relationship_reverse_deferrals {
+    // Every deferred reverse's images, decoded in one batch (issue #327).
+    let mut deferred_images = ImageBatch::default();
+    let deferred_slots: Vec<(Option<usize>, Option<usize>)> = relationship_reverse_deferrals
+        .iter()
+        .map(|change| {
+            (
+                deferred_images.push_opt(change.old_image.as_ref()),
+                deferred_images.push_opt(change.new_image.as_ref()),
+            )
+        })
+        .collect();
+    let mut deferred_decoded = deferred_images.decode(pool).await?;
+    for (change, (old_slot, new_slot)) in relationship_reverse_deferrals.iter().zip(deferred_slots)
+    {
         let Some(rel_id) = change.relationship_reverse_deferred else {
             unreachable!("filtered on relationship_reverse_deferred.is_some() above")
         };
@@ -6039,14 +6308,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 shape
             }
         };
-        let old_row = match &change.old_image {
-            Some(text) => Some(decode_image(pool, text).await?),
-            None => None,
-        };
-        let new_row = match &change.new_image {
-            Some(text) => Some(decode_image(pool, text).await?),
-            None => None,
-        };
+        let old_row = deferred_decoded.take_opt(old_slot);
+        let new_row = deferred_decoded.take_opt(new_slot);
         if old_row.is_none() && new_row.is_none() {
             // Should be unreachable: a deferred row is only ever staged
             // from a `RelationshipReverseRecord` that already had at least

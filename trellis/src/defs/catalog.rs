@@ -5412,7 +5412,7 @@ struct PendingDefinition {
 /// One query, not one-per-definition-row (issue #69): a `left join lateral
 /// jsonb_each_text(...)` unnests every dependent definition's persisted
 /// `source_columns` map inline, so this is still "decode JSON via SQL, no
-/// serde_json dependency" — matching `staging::apply::decode_image`'s
+/// serde_json dependency" — matching `staging::apply::decode_images`'s
 /// convention — just decoded for every row in one round trip instead of one
 /// per definition. The `left join` (rather than an inner join/`cross join
 /// lateral`) matters: a definition whose `source_columns` is `{}` must still
