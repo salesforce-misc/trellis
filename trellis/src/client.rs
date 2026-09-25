@@ -2329,7 +2329,8 @@ mod intake_supervisor_tests {
 
     /// The supervisor must feed each attempt's real uptime into the backoff:
     /// two quick failures escalate the delay, then a failure after an attempt
-    /// that stayed up at least `max` restarts from `initial` again.
+    /// that stayed up at least `max` restarts from `initial` again, and
+    /// starts a new failure streak rather than extending the old one.
     #[tokio::test(start_paused = true)]
     async fn supervisor_resets_backoff_after_a_long_running_attempt() {
         let (_guard, captured) = install_capture();
@@ -2364,12 +2365,22 @@ mod intake_supervisor_tests {
         }
 
         let events = captured.0.lock().unwrap().clone();
-        let retry_in: Vec<_> = events
+        let errors: Vec<_> = events
             .iter()
             .filter(|e| e.level == tracing::Level::ERROR)
-            .map(|e| e.fields.get("retry_in").cloned().expect("retry_in field"))
             .collect();
-        assert_eq!(retry_in, ["1ms", "2ms", "1ms"], "{events:?}");
+        let field = |name: &str| -> Vec<String> {
+            errors
+                .iter()
+                .map(|e| e.fields.get(name).cloned().expect(name))
+                .collect()
+        };
+        assert_eq!(field("retry_in"), ["1ms", "2ms", "1ms"], "{events:?}");
+        assert_eq!(
+            field("consecutive_failures"),
+            ["1", "2", "1"],
+            "the healthy run's own failure starts a new streak: {events:?}"
+        );
     }
 
     #[test]
