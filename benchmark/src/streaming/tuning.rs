@@ -46,8 +46,8 @@ pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 /// discharge re-stages every row the source holds by then (#423). Since #476
 /// a definition reports live only once that catch-up has been discharged,
 /// and the maintenance loop discharges a freshly parked marker on its next
-/// tick, so the probes' wait for it (`chain::wait_for_catch_up_discharged`)
-/// no longer costs setup a reconcile interval.
+/// tick, so the probes' wait for `live` covers it and costs no reconcile
+/// interval.
 pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One scenario's engine configuration. [`Default`] is stock `main` in every

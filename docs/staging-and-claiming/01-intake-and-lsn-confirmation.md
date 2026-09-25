@@ -248,8 +248,8 @@ can't loop.
   and, as the `lsn`, a write token read after the writer's last row lock.
 - **A fresh install reads nothing while it creates the slot.** It creates the
   slot, seeds `replication_progress` at the slot's consistent point, and parks a
-  `pending_backfill` marker on every configured source table, all in one
-  transaction (`intake::publication::create_slot_and_park_markers`). The first
+  `pending_backfill` marker on every table the catalog says to publish, all
+  in one transaction (`intake::publication::create_slot_and_park_markers`). The first
   discharge then reads each table at a snapshot taken after the slot exists, so
   anything that read misses commits after the consistent point and is streamed.
   Slot-loss recovery already works this way (`intake::slot_loss`). Reading
@@ -263,7 +263,11 @@ can't loop.
   replication client Trellis uses supports it
   ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
   The discharge skips a table no definition reads yet, since no apply would
-  consume its `Recompute` rows.
+  consume its `Recompute` rows. A catalog that outlived its old slot can
+  already hold applying definitions, so each marker is a go-live catch-up
+  for the table's applying readers: they report `catching_up` until its
+  discharge has re-read the table and swept their targets
+  ([ADR-0016](../decisions/0016-single-background-capture-path.md#a-fresh-install)).
 
 ## The load-bearing invariants
 

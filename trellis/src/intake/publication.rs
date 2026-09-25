@@ -411,7 +411,6 @@ pub(crate) async fn park_marker(
              on conflict (table_name) do update set \
                fence_xid = null, \
                generation = default, \
-               added_at = now(), \
                attempts = 0, \
                last_error = null, \
                next_attempt_at = null",
@@ -917,8 +916,8 @@ pub(super) async fn fetch_read(
 /// background-built definitions (chunks or a direct-build job, which read the
 /// table themselves) reads the table (a catch-up for applying readers). A
 /// marker on a table only background-built definitions read, or nothing
-/// reads at all (issue #417: a fresh install parks a marker on every
-/// configured source table, [`create_slot_and_park_markers`]), is discharged
+/// reads at all (issue #417: a fresh install parks a marker on every table
+/// the catalog publishes, [`create_slot_and_park_markers`]), is discharged
 /// without enumerating.
 ///
 /// A go-live catch-up always enumerates. An earlier optimization let a
@@ -1744,14 +1743,22 @@ pub async fn discharge_registrations(pool: &crate::pool::Pool) -> Result<(), Int
 ///
 /// Every table in `tables` gets a marker, not only the newly published ones
 /// or those with a `waiting_to_backfill` definition (which the worker's
-/// reconcile pass would park anyway, [`park_registration_markers`]). A
-/// definition already `live` or `catching_up` when a fresh slot is created
-/// (the catalog outlived its old slot: a new slot name, say) has missed
-/// every commit before this slot's consistent point, and only this marker's
-/// discharge re-derives it (issue #393's regression test,
-/// `a_row_committed_during_fresh_slot_creation_reaches_the_target`, fails
-/// without it). The discharge skips a table no definition reads yet
-/// ([`run_pending_backfills`]'s "A table nothing reads").
+/// reconcile pass would park anyway, [`park_registration_markers`]). A slot
+/// is fresh whenever this `replication_progress` row is missing, so the
+/// catalog can already hold applying definitions: it outlived the slot it
+/// was built under (setup pointed at a new slot name, say; a slot lost under
+/// the same name is `slot_loss`'s case instead). Such a definition has missed
+/// whatever committed before this slot's consistent point, and only this
+/// marker's discharge repairs it. So the markers are go-live catch-ups
+/// ([`park_catch_up`]) for every applying reader of the tables: each reader
+/// reports `catching_up` until the discharge has re-read the table, which
+/// re-derives the rows it still has, and swept the reader's target for rows
+/// it no longer backs, which a re-read can't reach (issue #393's regression
+/// tests, `a_row_committed_during_fresh_slot_creation_reaches_the_target`
+/// and `a_delete_committed_during_fresh_slot_creation_reaches_a_live_target`).
+/// On a first install nothing reads the tables yet, so this parks plain
+/// markers, and the discharge skips a table no definition reads
+/// ([`run_pending_backfills`]'s "When the table is enumerated").
 ///
 /// **Not one atomic unit.** `pg_create_logical_replication_slot` persists the
 /// slot to disk the moment it returns, independent of the surrounding
@@ -1798,9 +1805,13 @@ pub async fn create_slot_and_park_markers(
         )
         .await?;
     let consistent_point: PgLsn = slot_row.get(0);
+    let mut readers = Vec::new();
     for table in tables {
-        park_marker(&txn, table).await?;
+        readers.extend(crate::defs::catalog::applying_readers(&txn, table).await?);
     }
+    readers.sort_unstable();
+    readers.dedup();
+    park_catch_up(&txn, &readers, tables).await?;
     txn.execute(
         "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
         &[&slot, &consistent_point],

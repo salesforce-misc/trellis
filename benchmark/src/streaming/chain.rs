@@ -160,29 +160,16 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
 }
 
 /// Polls until no `pending_backfill` marker is left, or panics at `deadline`.
-/// Call it after the transforms are live and **before** the first source row
-/// is written, warm-up row included.
 ///
-/// Since #476 a chunked or direct build reports `live` only once its go-live
-/// catch-up has been discharged, and the staging worker discharges a freshly
-/// parked marker on its next maintenance tick rather than its next reconcile
-/// pass, so after [`wait_for_live`] this normally returns at once. It stays
-/// as a guard against any other marker still pending when the offer starts.
-///
-/// Before #476 a definition went live with its catch-up marker only parked,
-/// discharged up to `reconcile_interval` later. The discharge enumerates every row the source
-/// holds at that moment as an image-less `Recompute` and stages it. Each one
-/// is applied and counted into `trellis_changes_applied_total` like any other
-/// staged row, although nothing about the row changed. If the pass lands
-/// inside the measurement window, the probe measures a re-derive of however
-/// much of the table exists by then on top of the offered load, and the
-/// counter runs ahead of the rows committed by that many. Issue #423 measured
-/// exactly that: at 20k rows/sec the discharge ran about 5 s into the offer
-/// and added 95,878-100,001 to each 400,000-row probe.
-///
-/// Waiting here, while the source is still empty, lets the catch-up discharge
-/// enumerate nothing.
-pub async fn wait_for_catch_up_discharged(raw: &RawClient, deadline: Instant) {
+/// For a scenario whose transform never goes live, so [`wait_for_live`] has
+/// nothing to wait for: [`crate::streaming::intake_ceiling`] runs no drain
+/// threads, so its transform's build never runs. Its source's join marker is
+/// still discharged by the staging worker, and waiting for that while the
+/// source is empty keeps the discharge out of the measurement window. A
+/// scenario that waits for `live` needs no such wait: a definition reports
+/// `live` only once its go-live catch-up has been discharged (#476), and
+/// nothing parks another marker until the source changes.
+pub async fn wait_for_markers_discharged(raw: &RawClient, deadline: Instant) {
     loop {
         let pending: Vec<String> = raw
             .query("select table_name from pending_backfill", &[])
@@ -196,9 +183,8 @@ pub async fn wait_for_catch_up_discharged(raw: &RawClient, deadline: Instant) {
         }
         assert!(
             Instant::now() < deadline,
-            "catch-up backfill markers for {pending:?} never discharged in time (the staging \
-             worker discharges them on its reconcile pass; is `reconcile_interval` longer \
-             than the setup timeout?)"
+            "backfill markers for {pending:?} never discharged in time (is the staging \
+             worker running?)"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

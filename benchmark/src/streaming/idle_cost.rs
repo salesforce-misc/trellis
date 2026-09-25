@@ -32,10 +32,7 @@ use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
-use crate::streaming::chain::{
-    create_chain_source_table, install_chain_hops, wait_for_catch_up_discharged,
-    wait_for_chain_live,
-};
+use crate::streaming::chain::{create_chain_source_table, install_chain_hops, wait_for_chain_live};
 use crate::streaming::tuning::EngineTuning;
 
 /// How long installing the one transform and capturing its (empty) source may
@@ -137,11 +134,6 @@ pub async fn run(warmup: Duration, duration: Duration, tuning: &EngineTuning) ->
     let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
     let chain = install_chain_hops(&db.pool, &source, 1).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
-    wait_for_catch_up_discharged(
-        &raw,
-        Instant::now() + SETUP_TIMEOUT + tuning.reconcile_interval,
-    )
-    .await;
 
     tokio::time::sleep(warmup).await;
 

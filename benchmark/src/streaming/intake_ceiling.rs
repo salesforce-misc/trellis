@@ -38,7 +38,7 @@ use trellis::ClientOptions;
 use trellis::config::DEFAULT_SCHEMA;
 
 use crate::scenario::connect_raw;
-use crate::streaming::chain::{install_chain_hops, wait_for_catch_up_discharged};
+use crate::streaming::chain::{install_chain_hops, wait_for_markers_discharged};
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
 use crate::streaming::load::{
     GENERATOR_UNDERSHOOT_TOLERANCE, Pace, ParallelLoad, generator_bound, run_parallel_load,
@@ -210,7 +210,7 @@ pub async fn run(
         },
     )
     .expect("client start");
-    wait_for_catch_up_discharged(&raw, Instant::now() + SETUP_TIMEOUT).await;
+    wait_for_markers_discharged(&raw, Instant::now() + SETUP_TIMEOUT).await;
 
     let baseline_ring_rows = total_ring_rows(&raw).await;
     let wal_lsn_before = wal_lsn(&raw).await;

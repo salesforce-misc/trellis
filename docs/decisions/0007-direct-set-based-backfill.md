@@ -118,7 +118,7 @@ since it writes directly to the target rather than through the ring.
 > mentions (#468, #485). CDC deltas that drain during a build are skipped, not
 > parked, and the build's go-live catch-up recovers what they changed by
 > re-reading the tables the build read
-> ([ADR-0016](0016-single-background-capture-path.md#which-consistency-bookkeeping-stays)).
+> ([ADR-0016](0016-single-background-capture-path.md#covering-changes-during-a-build)).
 
 `trellis::defs::install_definition` is the real entry point: it creates the
 target table, tries `backfill_definition` (direct path), persists via

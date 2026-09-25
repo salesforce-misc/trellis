@@ -478,7 +478,8 @@ async fn table_add_backfills_existing_rows_once_the_fence_settles_and_retries_sa
 
 /// Issue #417: a marker on a table no definition reads is discharged without
 /// enumerating it, since nothing would consume the `Recompute` rows. A fresh
-/// install parks one on every configured source table, used or not.
+/// install parks one on every table the catalog publishes, whether or not an
+/// applying definition reads it yet.
 #[tokio::test]
 async fn a_marker_on_a_table_nothing_reads_is_discharged_without_staging() {
     let cluster = TestCluster::start();

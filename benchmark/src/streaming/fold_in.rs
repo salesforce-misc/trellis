@@ -37,9 +37,7 @@ use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
-use crate::streaming::chain::{
-    numeric_columns, wait_for_catch_up_discharged, wait_for_live, warm_up_aggregate,
-};
+use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
 use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
@@ -304,11 +302,6 @@ pub async fn run_probe(
     let terminal = def.def.target.clone();
 
     wait_for_live(&raw, &terminal, Instant::now() + SETUP_TIMEOUT).await;
-    wait_for_catch_up_discharged(
-        &raw,
-        Instant::now() + SETUP_TIMEOUT + tuning.reconcile_interval,
-    )
-    .await;
     warm_up_aggregate(&raw, SOURCE_TABLE, &terminal, GROUP_COLUMN, SETUP_TIMEOUT).await;
 
     let before = scrape();

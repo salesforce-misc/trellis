@@ -1243,6 +1243,91 @@ async fn a_row_committed_during_fresh_slot_creation_reaches_the_target() {
         .expect("drop the slot");
 }
 
+/// #393's gap for a delete, on a definition already `live` when a fresh slot
+/// is created (the catalog outlived its old slot). A delete committed during
+/// slot creation is neither streamed nor reachable by a re-read, which only
+/// enumerates the keys the source still has. Setup's marker is a go-live
+/// catch-up for the table's applying readers: it moves `t` to `catching_up`,
+/// and its discharge sweeps the row no source row backs before flipping `t`
+/// back `live`.
+#[tokio::test]
+async fn a_delete_committed_during_fresh_slot_creation_reaches_a_live_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    let source = format!("{DEFAULT_SCHEMA}.s");
+
+    raw.batch_execute(
+        "create table s (id bigint primary key, a numeric); \
+         insert into s (id, a) values (1, 1), (2, 2); \
+         create publication test_pub for table s;",
+    )
+    .await
+    .expect("seed an already-published source table");
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a + a AS x",
+        &numeric(&["a"]),
+        "public",
+    )
+    .await
+    .expect("install_definition");
+    drain_backfill_chunks(&db.pool).await;
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge the go-live catch-up");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
+
+    let writer = OpenTransaction::begin(db.dsn()).await;
+    writer
+        .execute(&format!("delete from {source} where id = 2"))
+        .await;
+    tokio::join!(create_slot(db.dsn(), "gap_slot", &source), async {
+        wait_until_slot_creation_blocks(&raw).await;
+        writer.commit().await;
+    });
+    assert_eq!(
+        status_of(&raw, "t").await,
+        TransformStatus::CatchingUp,
+        "a live definition may be missing commits from before the new slot's consistent \
+         point, so it isn't in its steady state until setup's catch-up has run"
+    );
+
+    publication::run_pending_backfills(
+        &mut raw,
+        "wake",
+        &trellis::staging::StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge setup's marker");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let ids: Vec<i64> = raw
+        .query("select id from t order by id", &[])
+        .await
+        .expect("read t")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "a row deleted during slot creation must leave the target"
+    );
+    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
+
+    raw.execute("select pg_drop_replication_slot('gap_slot')", &[])
+        .await
+        .expect("drop the slot");
+}
+
 /// Issue #323's second concern, checked for #417: a definition registered
 /// while a fresh install's slot creation waits (its source's join marker is
 /// unsettled) must still go live. Setup parks its own marker on the table after slot

@@ -43,7 +43,7 @@ use testkit::TestCluster;
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{
     ChainOracle, check_chain_oracle, create_chain_source_table, install_chain_hops,
-    wait_for_catch_up_discharged, wait_for_chain_live, warm_up,
+    wait_for_chain_live, warm_up,
 };
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
@@ -206,11 +206,6 @@ pub async fn run_probe(
 
     let chain = install_chain_hops(&db.pool, &source, 1).await;
     wait_for_chain_live(&raw, &chain, SETUP_TIMEOUT).await;
-    wait_for_catch_up_discharged(
-        &raw,
-        Instant::now() + SETUP_TIMEOUT + tuning.reconcile_interval,
-    )
-    .await;
     warm_up(&raw, &chain, SETUP_TIMEOUT).await;
 
     let terminal = chain.terminal();
@@ -266,8 +261,8 @@ pub async fn run_probe(
     // * `trellis_changes_applied_total` counts staged rows (#409), which
     //   matches rows committed only while nothing stages a source row a second
     //   time. A catch-up backfill does exactly that: its discharge stages every
-    //   row the source holds as a `Recompute`. Setup waits out the one that
-    //   going live parks (see `wait_for_catch_up_discharged`), and with it
+    //   row the source holds as a `Recompute`. The one that going live parks
+    //   has run before setup's wait for `live` returns (#476), and with it
     //   gone the counter has measured exact. But if one ran mid-window, the
     //   counter would reach `rows_issued` with rows still in flight and end
     //   the grace period early. Issue #423 measured that before setup waited:
