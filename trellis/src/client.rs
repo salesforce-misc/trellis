@@ -785,7 +785,10 @@ where
     let mut standing_by = false;
     crate::metrics::set_intake_consecutive_failures(slot, 0);
     loop {
-        let started = Instant::now();
+        // Tokio's clock, not `std`'s: they agree in production, and a test
+        // with paused time controls it, so an attempt's uptime is exactly
+        // the time it spent waiting, never scheduler noise.
+        let started = tokio::time::Instant::now();
         let run = attempt();
         tokio::pin!(run);
         let outcome = tokio::select! {
@@ -2212,6 +2215,16 @@ mod intake_supervisor_tests {
         assert_eq!(events, 1, "the capture missed its own thread's event");
     }
 
+    /// Every supervisor test runs with tokio's clock paused
+    /// (`start_paused`), so time only moves when the whole runtime is
+    /// waiting on a timer. An attempt that fails without awaiting a timer
+    /// ran for exactly zero, however long a loaded box takes to run it, and
+    /// one that sleeps ran for exactly its sleep. That makes the healthy
+    /// window below a deterministic boundary rather than a race against the
+    /// scheduler (issue #365), and all the backoff sleeps cost no wall-clock
+    /// time. The tests' 10s `timeout` guards are virtual too: a supervisor
+    /// that stopped restarting leaves the runtime idle, so the clock jumps
+    /// straight to the guard and the test fails at once instead of hanging.
     const FAST: RestartBackoff =
         RestartBackoff::new(Duration::from_millis(1), Duration::from_millis(4));
 
@@ -2219,7 +2232,7 @@ mod intake_supervisor_tests {
     /// error discarded (`let _ = intake.run().await`) — no log, no retry.
     /// Now every failure is logged at `error!` with the error text and slot,
     /// and intake is restarted rather than left dead.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_run_is_logged_at_error_and_restarted() {
         let (_guard, captured) = install_capture();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2279,7 +2292,7 @@ mod intake_supervisor_tests {
     /// A clean `Ok(())` from `run()` means the replication stream ended —
     /// the client never configures a stop LSN, so that's just as dead as an
     /// error and must be surfaced and restarted too.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stream_end_is_logged_and_restarted() {
         let (_guard, captured) = install_capture();
         let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2317,7 +2330,7 @@ mod intake_supervisor_tests {
     /// The supervisor must feed each attempt's real uptime into the backoff:
     /// two quick failures escalate the delay, then a failure after an attempt
     /// that stayed up at least `max` restarts from `initial` again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn supervisor_resets_backoff_after_a_long_running_attempt() {
         let (_guard, captured) = install_capture();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2378,12 +2391,6 @@ mod intake_supervisor_tests {
         assert_eq!(backoff.next_delay(short), Duration::from_secs(2));
     }
 
-    /// For tests that assert on the streak gauge: a healthy window wide
-    /// enough that an instantly-failing attempt never outlasts it, even on a
-    /// loaded box (FAST's 4ms could, which would reset the streak mid-test).
-    const STREAK: RestartBackoff =
-        RestartBackoff::new(Duration::from_millis(1), Duration::from_millis(500));
-
     fn lock_held() -> IntakeError {
         IntakeError::Staging(StagingError::ProducerAlreadyRunning)
     }
@@ -2405,14 +2412,14 @@ mod intake_supervisor_tests {
     /// repeats are `debug!`, and the restart counter records them under their
     /// own outcome. Intake still isn't running, so the streak gauge counts
     /// them.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn producer_lock_contention_logs_below_error() {
         let (_guard, captured) = install_capture();
         let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
         let mut resumed_tx = Some(resumed_tx);
         let mut n = 0;
 
-        let supervisor = supervise_intake("slot_341", STREAK, move || {
+        let supervisor = supervise_intake("slot_341", FAST, move || {
             n += 1;
             let resumed = if n == 4 { resumed_tx.take() } else { None };
             async move {
@@ -2464,7 +2471,7 @@ mod intake_supervisor_tests {
     /// a row that ends (error, stream end or lock refusal), and drops back to
     /// 0 once a running attempt passes the healthy window, without waiting
     /// for that attempt to end.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn consecutive_failures_tracks_the_streak_and_clears_while_healthy() {
         const SLOT: &str = "slot_342";
         let seen_at_attempt_start = Arc::new(Mutex::new(Vec::new()));
@@ -2473,7 +2480,7 @@ mod intake_supervisor_tests {
         let mut n = 0;
 
         let seen = seen_at_attempt_start.clone();
-        let supervisor = supervise_intake(SLOT, STREAK, move || {
+        let supervisor = supervise_intake(SLOT, FAST, move || {
             seen.lock().unwrap().push(consecutive_failures(SLOT));
             n += 1;
             let resumed = if n == 6 { resumed_tx.take() } else { None };
@@ -2494,13 +2501,13 @@ mod intake_supervisor_tests {
 
         tokio::select! {
             // Polled first, so by the time the second branch's sleep (past
-            // STREAK's 500ms healthy window) completes, the supervisor has
-            // already been woken for its own, earlier healthy-window timer.
+            // the healthy window) completes, the supervisor has already been
+            // woken for its own, earlier healthy-window timer.
             biased;
             _ = supervisor => panic!("supervise_intake must never return"),
             got = tokio::time::timeout(Duration::from_secs(10), async {
                 resumed_rx.await.expect("sender dropped");
-                tokio::time::sleep(Duration::from_millis(700)).await;
+                tokio::time::sleep(FAST.healthy_after() * 2).await;
             }) => got.expect("intake was never restarted"),
         }
 
