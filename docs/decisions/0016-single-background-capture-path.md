@@ -528,9 +528,10 @@ consumer on every upstream resume).
 
 #### A re-read table's readers
 
-*Implemented by #420 (a fresh install) and #522.* Three parks re-read a
-source table because definitions already applying from it may have missed
-some of its changes, which reached neither CDC nor their targets:
+*Implemented by #420 (a fresh install), #522 and #533 (slot loss).* Four
+parks re-read a source table because definitions already applying from it
+may have missed some of its changes, which reached neither CDC nor their
+targets:
 
 - **A fresh install** under a catalog that outlived its slot
   (`create_slot_and_park_markers`, [A fresh install](#a-fresh-install)).
@@ -541,8 +542,27 @@ some of its changes, which reached neither CDC nor their targets:
   marker). A table normally joins with nothing applying from it yet, but one
   an operator dropped from the publication while something applied from it
   has missed everything written meanwhile.
+- **A slot-loss recovery** (`intake::slot_loss::pause_if_slot_lost`, #533).
+  Every change between the lost slot's last confirmed position and the new
+  slot's start is gone. The recovery pauses every definition the slot fed,
+  and each resume rebuilds one by a fresh backfill, but a to-one consumer's
+  rebuild reads the to-side's projection, which those changes never reached
+  either. So the recovery re-reads each published to-side, in the
+  transaction that commits the new slot's start. A crash before that commit
+  leaves the slot looking lost, and the next startup redoes the recovery and
+  parks the markers then. The recovery parks them before any resume can
+  park its own, and a discharge pass takes markers in park order and stops
+  behind one it defers, so the refresh commits before a resumed consumer's
+  build reads the projection. The exception is a refresh whose discharge
+  failed and is backing off (#407), which doesn't hold later markers back:
+  a consumer resumed meanwhile can build from the stale projection, and the
+  retry's re-read of the to-side re-derives it only if its build has
+  finished by then. Its readers are usually all paused, so the
+  marker is a plain one; a reader the slot didn't feed (a definition over an
+  unpublished table that reads a published to-side) is still applying and
+  catches up like any other.
 
-All three park through `intake::publication::park_table_catch_ups`: each
+All four park through `intake::publication::park_table_catch_ups`: each
 marker is a go-live catch-up for every applying definition that reads the
 table, directly or through a relationship (`defs::catalog::applying_readers`).
 Each reports `catching_up` until the discharge has re-read the table, which
@@ -774,7 +794,9 @@ children, roughly in this order:
   table rejoining the publication, which parked plain markers; all three now
   park through `park_table_catch_ups`, and a re-read to-side's settled
   projections are refreshed too ([A re-read table's
-  readers](#a-re-read-tables-readers)).
+  readers](#a-re-read-tables-readers)). #533 added a slot-loss recovery,
+  which re-reads every published to-side so a resumed consumer's rebuild
+  doesn't read a projection the lost changes never reached.
 
 Two rebuilds of some columns of a `live` transform still read in-call and
 then park a catch-up: a column resume (#425) and an `ALTER TRANSFORM` that
@@ -796,7 +818,7 @@ happens, and its role in this design.
 | Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs when it dispatches (#330), so a reader doesn't see them for the length of the rebuild; the direct build doesn't visit a group with no source rows. The go-live catch-up's discharge runs the same deletion again (#485), judged on its re-read's snapshot, and that one is exact for aggregates too (#436) |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker through `park_table_catch_ups` | The one path. **Done (#522):** the marker is a go-live catch-up for every applying reader of the table, so each reports `catching_up` until the discharge has re-read the table and swept its target, and a to-side's settled projections are refreshed ([A re-read table's readers](#a-re-read-tables-readers)) |
 | Test fixtures | `defs::create_definition`, `create_definition_without_backfill`, the unfenced `defs::backfill::backfill_definition` | Not a capture path: compiled only for tests and the benchmark (`cfg(test)`, `test-util`, `internals`) |
-| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, and `park_table_catch_ups` (`create_slot_and_park_markers`, `request_backfill`, a join marker), all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge always re-reads (`backfill_coverage` is retired, #468), deletes the target rows no source row backs (#485), and flips the definition `live` (`go_live_caught_up`, #476) |
+| Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, and `park_table_catch_ups` (`create_slot_and_park_markers`, `request_backfill`, a join marker, a slot-loss recovery's to-sides), all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge always re-reads (`backfill_coverage` is retired, #468), deletes the target rows no source row backs (#485), and flips the definition `live` (`go_live_caught_up`, #476) |
 | Direct-build coverage skip | was `backfill_coverage`, recorded by the direct-build job and read by the discharge's `coverage_covers` | **Retired (#468, #485).** It took a table whose row count and `xmin`s were unchanged since the build's fence for unchanged, which a row inserted and deleted during the build defeats. V48 drops the table |
 | Column resume | `staging::quarantine::resume_column` → `recompute_column`, then a catch-up marker | **Not rerouted yet (#425).** A redefinition-side capture that reads one column's values in-call. The definition is `catching_up` until the marker discharges (#476) |
 | `ALTER TRANSFORM` added columns | `defs::alter_transform` → `backfill::backfill_altered_columns`, then a catch-up marker ([ADR-0015](0015-transform-redefinition.md)) | **Not rerouted yet (#426).** A redefinition-side capture that reads the added columns' values in-call. The definition is `catching_up` until the marker discharges (#476) |

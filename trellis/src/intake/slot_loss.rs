@@ -28,6 +28,13 @@
 //!    fence and relies on the stream for everything after. Recreating it now,
 //!    rather than at the first resume, means a resume is exactly the resume
 //!    that already exists, with no new sequencing between it and intake.
+//!    The same transaction that commits the new slot's start re-reads every
+//!    published relationship to-side (issue #533,
+//!    [`super::publication::park_table_catch_ups`]): a to-one consumer's
+//!    rebuild reads the to-side's settled projection, never the table, and
+//!    the lost changes never reached the projection either. The discharge
+//!    refreshes it from the table before any resume's marker, which is
+//!    parked later, rebuilds a consumer from it.
 //! 3. **Logs loudly and keeps logging.** One `error` naming the slot, the
 //!    lost position and every affected transform, then a `warn` reminder from
 //!    the maintenance loop every [`SLOT_LOSS_REMINDER_INTERVAL`]
@@ -58,7 +65,7 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::types::PgLsn;
 
 use super::error::IntakeError;
-use super::publication::require_slot_healthy;
+use super::publication::{park_table_catch_ups, require_slot_healthy};
 use crate::defs::catalog::CatalogError;
 use crate::defs::lifecycle::{PauseOutcome, pause_transform};
 use crate::defs::model::TransformStatus;
@@ -228,7 +235,7 @@ pub async fn pause_if_slot_lost(
         )
         .await?;
 
-    let new_slot_lsn = recreate_slot(session, slot).await?;
+    let new_slot_lsn = recreate_slot(session, slot, publication).await?;
 
     tracing::error!(
         slot = %slot,
@@ -258,14 +265,20 @@ pub async fn pause_if_slot_lost(
 /// invalidated one can never stream again, and one recreated under the same
 /// name starts past the gap, so dropping either loses nothing), creates
 /// it fresh, and moves `replication_progress` to the new slot's start in the
-/// same transaction as the create.
+/// same transaction as the create, along with a catch-up on each of
+/// `publication`'s relationship to-sides that refreshes their projections
+/// (the module doc's step 2).
 ///
 /// `pg_create_logical_replication_slot` is the transaction's first statement,
 /// as Postgres requires of a transaction that creates a logical slot (it
 /// refuses one that has already written); the slot itself persists the moment
 /// the call returns, independent of the commit — see the module doc for why a
 /// crash in between is harmless here.
-async fn recreate_slot(session: &mut ProducerSession, slot: &str) -> Result<PgLsn, IntakeError> {
+async fn recreate_slot(
+    session: &mut ProducerSession,
+    slot: &str,
+    publication: &str,
+) -> Result<PgLsn, IntakeError> {
     session
         .client()
         .execute(
@@ -287,8 +300,28 @@ async fn recreate_slot(session: &mut ProducerSession, slot: &str) -> Result<PgLs
         &[&slot, &lsn],
     )
     .await?;
+    let to_sides = published_to_sides(&txn, publication).await?;
+    park_table_catch_ups(&txn, &to_sides).await?;
     txn.commit().await?;
     Ok(lsn)
+}
+
+/// Every table in `publication` that is some relationship's to-side, fully
+/// qualified and sorted.
+async fn published_to_sides(
+    client: &impl GenericClient,
+    publication: &str,
+) -> Result<Vec<String>, IntakeError> {
+    let rows = client
+        .query(
+            "select distinct p.schemaname || '.' || p.tablename from pg_publication_tables p \
+             join relationship_definitions rd \
+               on rd.to_schema = p.schemaname and rd.to_table = p.tablename \
+             where p.pubname = $1 order by 1",
+            &[&publication],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
 /// Every `slot_loss_pauses` record whose transform is still frozen, in

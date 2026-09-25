@@ -250,8 +250,10 @@ pub(crate) async fn park_target_catchup_if_read(
 /// Parks a marker on each of `tables` that re-reads it for definitions
 /// already applying from it, which may be missing changes to it that never
 /// reached them: a fresh install's slot ([`create_slot_and_park_markers`]),
-/// a table joining the publication ([`reconcile_publication`]) and an
-/// explicit re-backfill ([`crate::Trellis::request_backfill`], issue #522).
+/// a table joining the publication ([`reconcile_publication`]), an
+/// explicit re-backfill ([`crate::Trellis::request_backfill`], issue #522)
+/// and a lost slot's recreation, for its to-sides
+/// ([`super::slot_loss::pause_if_slot_lost`], issue #533).
 ///
 /// Each marker is a go-live catch-up ([`park_catch_up`]) for every applying
 /// definition that reads its table, directly or through a relationship

@@ -1,8 +1,9 @@
 //! Issue #522: a marker that re-reads a table because its applying readers
 //! may have missed changes to it is a go-live catch-up for every one of them
 //! (issue #476, ADR-0016's "What `live` promises"): an explicit
-//! `Trellis::request_backfill`, a fresh install's slot, and a table rejoining
-//! the publication (`intake::publication::park_table_catch_ups`).
+//! `Trellis::request_backfill`, a fresh install's slot, a table rejoining
+//! the publication, and a lost slot's to-sides (issue #533)
+//! (`intake::publication::park_table_catch_ups`).
 //!
 //! Someone asks for a re-backfill because a target may have drifted from its
 //! source, a delete that never reached it being the case a re-read alone
@@ -26,7 +27,7 @@ use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, create_relationship, install_definition};
-use trellis::intake::publication;
+use trellis::intake::{publication, slot_loss};
 use trellis::staging::session::ProducerSession;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
@@ -411,6 +412,87 @@ async fn a_fresh_slot_catches_up_a_to_sides_relationship_consumer() {
         )
         .await
         .expect("drop the slot");
+}
+
+fn orders_update(lsn: PgLsn, id: i32, old_customer: i32, new_customer: i32) -> StagedChange {
+    let image = |customer: i32| format!(r#"{{"id":"{id}","customer_id":"{customer}"}}"#);
+    StagedChange::Cdc {
+        src_table: "public.orders".to_string(),
+        key: id.to_string(),
+        op: CdcOp::Update,
+        lsn: Some(lsn),
+        old_image: Some(image(old_customer)),
+        new_image: Some(image(new_customer)),
+        origin_lsn: None,
+        src_changed: None,
+        hop_gen: 0,
+        group_key: None,
+    }
+}
+
+/// Issue #533: a to-side change lost with the slot never reached the
+/// to-side's projection. The resumed consumer's rebuild reads the to-side
+/// itself, so its rows look right, but a later from-side change re-derives
+/// its row through the projection. The recovery re-reads each published
+/// to-side as a catch-up that refreshes its projections, so that change
+/// reads the renamed customer. No CDC for any customer is staged, so no
+/// older image is pending when the refresh runs (issue #531).
+#[tokio::test]
+async fn a_slot_loss_refreshes_a_to_sides_projection_for_its_resumed_consumer() {
+    const LOST: &str = "table_catch_ups_lost_slot";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    client
+        .batch_execute(&format!(
+            "insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
+             update public.customers set name = 'ann2' where id = 1"
+        ))
+        .await
+        .expect("lose the slot, and rename a customer it never delivered");
+    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+        .await
+        .expect("connect producer session");
+    let recovery = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "trellis_pub")
+        .await
+        .expect("recover from the lost slot")
+        .expect("a slot that doesn't exist is lost");
+    assert_eq!(recovery.paused, vec!["order_names"]);
+    discharge_markers(&db.pool, &mut client).await;
+
+    trellis
+        .apply("RESUME TRANSFORM order_names")
+        .await
+        .expect("resume the consumer");
+    bring_live(&db.pool, &mut client).await;
+    assert_eq!(order_names(&client).await, renamed());
+
+    // Order 11 moves to customer 1: its row is re-derived through the
+    // projection, not by a read of `customers`.
+    commit_and_stage(
+        &mut client,
+        "update public.orders set customer_id = 1 where id = 11",
+        |lsn| orders_update(lsn, 11, 2, 1),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        order_names(&client).await,
+        vec![
+            (10, Some("ann2".to_string())),
+            (11, Some("ann2".to_string())),
+            (12, Some("ann2".to_string())),
+        ],
+        "the from-side change reads the rename the lost slot never delivered"
+    );
+
+    drop(session);
+    client
+        .execute("select pg_drop_replication_slot($1)", &[&LOST])
+        .await
+        .expect("drop the recreated slot");
 }
 
 /// A table an operator dropped from the publication while a definition
