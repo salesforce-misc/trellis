@@ -116,7 +116,11 @@ target, 1-1 or aggregate. A source-table endpoint needs a primary key (or
 `REPLICA IDENTITY USING INDEX`), like any table Trellis reads over logical
 replication. A target endpoint needs neither: Trellis's own writes to it reach
 the relationship directly (issue #375), so it must be `live` when the
-relationship is declared: its initial build writes it outside that path. The
+relationship is declared: its initial build writes it outside that path. Both
+endpoints are written as bare table names and resolved once, through the
+declaring connection's `search_path`; the relationship stays pinned to the two
+tables found then, even if a same-named table later appears earlier on some
+connection's `search_path`. `trellis status` shows each endpoint's schema. The
 referencing table keeps its own primary
 key and granularity — a 1-1 table stays 1-1 — and calculated fields on it
 reference the related table's columns
