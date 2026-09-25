@@ -86,6 +86,15 @@
 //! discharge's commit, not across the intake wait, where a drain of an
 //! already-sealed segment that touched it used to wait for the discharge.
 //!
+//! That tail can still deadlock with such a drain: the sweep locks its rows
+//! in the cursor's order, not apply's ascending key order, so a drain that
+//! touches two of them there (a bulk delete's CDC for a `catching_up`
+//! definition, say) can wait on the discharge while the discharge waits on
+//! it. Postgres aborts one side. An aborted apply is a transient error
+//! (40P01) with no quarantine charge, and an aborted discharge rolls back
+//! with nothing deleted and retries after the marker's backoff. Neither
+//! leaves anything stuck or wrong.
+//!
 //! Each delete also re-checks the definition's status, which by then is
 //! after the intake wait: a pause that landed since the discharge read it
 //! (#331) leaves the target as the pause found it, and its own resume comes
@@ -842,6 +851,29 @@ mod db_tests {
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
+        // The catch-all's nested loop costs nothing while no target row has
+        // an unlisted pattern: its filter rejects every row, so the source
+        // side never runs.
+        let plan: Vec<String> = txn
+            .query(
+                &format!(
+                    "explain (analyze, costs off, timing off, summary off) {}",
+                    catch_all[0]
+                ),
+                &[],
+            )
+            .await
+            .expect("run the catch-all")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let source_scans: Vec<&String> =
+            plan.iter().filter(|l| l.contains(" on orders ")).collect();
+        assert!(
+            !source_scans.is_empty() && source_scans.iter().all(|l| l.contains("never executed")),
+            "the catch-all must not scan the source when no row has a new pattern:\n{}",
+            plan.join("\n")
+        );
         let swept = sweep(&txn, &ids).await;
         assert_eq!(swept.deleted, 0, "nothing to delete");
         assert!(swept.emptied_aggregates.is_empty());
