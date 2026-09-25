@@ -100,11 +100,16 @@ pub struct LoadSummary {
     pub commits_issued: u64,
     pub rows_issued: u64,
     /// The offer window: the configured duration. Both generators check the
-    /// deadline before issuing a commit, so every commit counted here was
-    /// issued inside it.
+    /// deadline before claiming a commit, and a paced commit must also be
+    /// due before it, so every commit counted here belongs to the window. An
+    /// unpaced commit is sent the moment it is claimed; a paced one is sent
+    /// at its due time, which can land a timer wake-up past the deadline.
     pub window: Duration,
     /// Wall-clock time from the window opening until the last issued commit
-    /// returned: `window` plus the [`commit_tail`](Self::commit_tail).
+    /// returned. Past `window` by the [`commit_tail`](Self::commit_tail)
+    /// when commits were in flight at the deadline; short of it when a
+    /// [`Pace::RowsPerSec`] run's last commit (due one commit interval
+    /// before the deadline) returned before the window closed.
     pub elapsed: Duration,
 }
 
@@ -122,8 +127,9 @@ impl LoadSummary {
     }
 
     /// How long past the window's close the generator waited for commits it
-    /// had issued inside it: `elapsed - window`, reported separately so a
-    /// slow tail stays visible without distorting the offered rate.
+    /// had issued inside it: `elapsed - window`, or zero when the run
+    /// finished inside the window. Reported separately so a slow tail stays
+    /// visible without distorting the offered rate.
     pub fn commit_tail(&self) -> Duration {
         self.elapsed.saturating_sub(self.window)
     }
@@ -471,9 +477,11 @@ mod tests {
             paced_summary(20_000, Duration::ZERO).commit_tail(),
             Duration::ZERO
         );
-        // Never negative, even if a clock reading lands inside the window.
+        // Zero, not negative, when a paced run finishes inside its window:
+        // the usual case, since its last commit is due at 995ms here, and
+        // a run on an idle box returns at about 996ms.
         let early = LoadSummary {
-            elapsed: Duration::from_millis(999),
+            elapsed: Duration::from_millis(996),
             ..paced_summary(20_000, Duration::ZERO)
         };
         assert_eq!(early.commit_tail(), Duration::ZERO);
