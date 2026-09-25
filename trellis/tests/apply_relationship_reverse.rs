@@ -1110,6 +1110,105 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
     );
 }
 
+/// Issue #327 review: a deferred reverse's retry must read its old and new
+/// images the right way round. A retry never takes the fast-path delta
+/// (`!fast_path_safe`), so an update's retry recomputes from live rows and
+/// can't tell them apart; a delete's can. Its retry must delete the parent's
+/// projection row (old image only). Read backwards, it would see a keyless
+/// old side and an imageless new side, touch nothing, and leave the deleted
+/// parent's row serving its last value forever.
+#[tokio::test]
+async fn a_deferred_parent_delete_retries_as_a_delete() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    create_schema(&client).await;
+
+    let relationship = create_relationship(
+        &db.pool,
+        "RELATIONSHIP post FROM post_tags.post TO posts.id",
+    )
+    .await
+    .expect("create to-one relationship");
+    install_definition(&db.pool, TAG_TOTALS, &post_tags_columns(), "public")
+        .await
+        .expect("install the aggregate-over-to-one definition");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    let projection_table = projection_table_for(&db.pool, relationship.id).await;
+    let projection_has_post_1 = async |client: &Client| {
+        client
+            .query_opt(
+                &format!("select 1 from {projection_table} where id = 1"),
+                &[],
+            )
+            .await
+            .expect("read the projection")
+            .is_some()
+    };
+    assert!(projection_has_post_1(&client).await, "seeded");
+
+    client
+        .execute("delete from posts where id = 1", &[])
+        .await
+        .expect("delete the related post");
+    let base = staging_base(&client).await;
+    stage_cdc_at_lsn(
+        &client,
+        "posts",
+        "1",
+        "delete",
+        Some("{\"id\":1,\"word_count\":100}"),
+        None,
+        base + 100,
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    let plan = claim_fold_compute(&db.pool, seg, "worker_a").await;
+
+    // Guard (a) rejects against a watermark that never moves, so the delete
+    // is deferred rather than applied.
+    let mut phase3 = db.pool.get().await.expect("connection");
+    let txn = phase3.transaction().await.expect("begin phase 3");
+    apply::apply_and_mark_drained(
+        &txn,
+        seg,
+        "worker_a",
+        &plan,
+        "trellis_reverse_test",
+        &StagedWatermark::new(),
+    )
+    .await
+    .expect("apply (rejected internally by guard (a))");
+    txn.commit().await.expect("commit");
+    assert_eq!(
+        staged_deferred_reverses(&client, relationship.id).await,
+        vec![("1".to_string(), 1, 0)],
+        "guard (a) must defer the delete"
+    );
+    assert!(
+        projection_has_post_1(&client).await,
+        "a rejected delete leaves the projection alone"
+    );
+
+    retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert!(
+        !projection_has_post_1(&client).await,
+        "the retried delete must remove the deleted parent's projection row"
+    );
+    let totals = target_totals(&client).await;
+    assert_eq!(
+        totals.get("rust"),
+        Some(&(Some("3".to_string()), Some("250".to_string()))),
+    );
+    assert_eq!(totals.get("db"), Some(&(Some("2".to_string()), None)));
+}
+
 /// Guard (b) (plan doc §2; ablation 82/3000): a reverse record whose
 /// captured `prev_gen` no longer matches the projection row's current
 /// `__trellis_gen`, re-read under `FOR UPDATE` in Phase 3, must not apply —
