@@ -3184,10 +3184,10 @@ mod catch_up_tests {
     }
 
     /// Issue #315, now covered by #431's fence: a definition reading another
-    /// definition's target goes live in a discharge's transaction, which
-    /// parks a catch-up on that target (never published, so only the
+    /// definition's target starts applying in a discharge's transaction,
+    /// which parks a catch-up on that target (never published, so only the
     /// target-mutation seam reaches the new reader). A seam writer that
-    /// checked for `live` readers before the flip committed reached nobody.
+    /// checked for applying readers before the flip committed reached nobody.
     /// If it is still open when the discharge first reads the catch-up, the
     /// fence must wait for it, or the catch-up reads the target without its
     /// write. The discharge used to re-park after commit to get a later

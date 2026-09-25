@@ -316,11 +316,12 @@ pub enum CatalogError {
     /// only ever starts from a settled, fully-built target.
     ///
     /// Also returned (issue #315) when a new definition's source is another
-    /// definition's target that isn't live yet. A target's own initial build
+    /// definition's target whose build hasn't finished (one that isn't
+    /// applying yet). A target's own initial build
     /// writes it outside the target-mutation seam
     /// (`staging::target_mutations`), so a reader attached mid-build would
     /// never hear about the rows the rest of the build writes. The same
-    /// goes for a relationship naming a non-`live` target as an endpoint
+    /// goes for a relationship naming such a target as an endpoint
     /// (issue #403), since the seam is that endpoint's only feed.
     TransformNotLive {
         transform: String,

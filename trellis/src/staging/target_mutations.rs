@@ -42,27 +42,28 @@
 //!
 //! The only target writes that bypass the seam are a definition's own
 //! initial build (`defs::backfill::backfill_definition` and the chunk queue),
-//! which run while that definition is not yet `live`. Nothing can read a
-//! target in that state: `defs::catalog::create_definition_inner` refuses a
-//! definition whose source is a non-`live` target (`CatalogError::TransformNotLive`),
-//! `create_relationship` refuses a non-`live` target as an endpoint the
-//! same way (#403), and a target that goes `live` with readers already attached (a resumed
-//! upstream) parks a catch-up marker for itself so those readers re-derive
-//! from its rebuilt state.
+//! which run while that definition is not yet applying
+//! (`TransformStatus::is_applying`). Nothing can read a target in that state:
+//! `defs::catalog::create_definition_inner` refuses a definition whose source
+//! is a target still being built (`CatalogError::TransformNotLive`),
+//! `create_relationship` refuses such a target as an endpoint the same way
+//! (#403), and a target whose build finishes with readers already attached (a
+//! resumed upstream) parks a catch-up marker for itself so those readers
+//! re-derive from its rebuilt state (and report `catching_up` until then).
 //!
-//! The seam only stages for readers that are already `live` when the writer
-//! checks, so a *new* reader parks a catch-up on its source target once it
-//! goes live, whichever way it was built (`defs::catalog::install_definition`,
+//! The seam only stages for readers that are already applying when the
+//! writer checks, so a *new* reader parks a catch-up on its source target
+//! once it starts applying, whichever way it was built (`defs::catalog::install_definition`,
 //! `create_definition_inner`, `complete_direct_backfill`, or
 //! `intake::publication`'s deferred-backfill flip). A write that raced the
 //! reader's build reaches it through that catch-up: its fence is captured
-//! after the reader is visibly live, so it waits out every writer that
+//! after the reader is visibly applying, so it waits out every writer that
 //! checked before then.
 //!
 //! # What gets staged
 //!
 //! One `StagedChange::Recompute` per changed key, for every target at least
-//! one `live` definition reads (a relationship-endpoint target the seam
+//! one applying definition reads (a relationship-endpoint target the seam
 //! feeds gets a CDC-shaped row instead; see the last section). The row is
 //! image-less, so a downstream
 //! aggregate re-derives the affected group from live state and a downstream
@@ -120,7 +121,7 @@
 //! (see `staging::converge::converged_through`).
 //!
 //! It is read only when this transaction stages something (some key of a
-//! target a `live` definition reads, or that the seam feeds as an
+//! target an applying definition reads, or that the seam feeds as an
 //! endpoint), so a terminal target pays no extra round trip.
 //!
 //! # Standing in for a relationship endpoint's CDC (issues #402, #403)
@@ -131,7 +132,7 @@
 //! target that is a relationship endpoint gets them from the seam alone
 //! (#375's direction 1): endpoint targets are unpublished like every other
 //! target. For such a target ([`TargetInfo::endpoint_feed`], any relationship
-//! naming it on either side, whether or not a live definition reads through
+//! naming it on either side, whether or not an applying definition reads through
 //! it yet), each changed key is staged as a [`StagedChange::Cdc`] row rather
 //! than a `Recompute`:
 //!
@@ -218,7 +219,7 @@ struct KeyMutation {
 /// accumulator (so once per Phase 3 transaction).
 #[derive(Debug, Clone)]
 struct TargetInfo {
-    /// Whether anything consumes this target's changes: a `live` definition
+    /// Whether anything consumes this target's changes: an applying definition
     /// reads it as its source, or the seam feeds it as a relationship
     /// endpoint (`endpoint_feed`).
     has_readers: bool,
@@ -388,7 +389,7 @@ impl TargetMutations {
 
     /// The SQL expression (over `alias`) that renders one of `target`'s rows
     /// as the prior-image text a writer should capture, or `None` when no
-    /// `live` definition reads `target` and so nothing would ever consume it.
+    /// applying definition reads `target` and so nothing would ever consume it.
     /// Built with `apply::row_as_text_jsonb_sql`, the same rendering every
     /// other image in the ring uses (issue #248).
     pub async fn image_sql(
@@ -447,7 +448,7 @@ impl TargetMutations {
             .unwrap_or_default()
     }
 
-    /// Turns every recorded key of a target with a `live` reader into its
+    /// Turns every recorded key of a target with an applying reader into its
     /// downstream `Recompute` row at `hop_gen + 1`, or, for a target the seam
     /// feeds as a relationship endpoint, its CDC-shaped row (re-reading each
     /// key's new image; see the module doc). A key whose next hop

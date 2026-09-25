@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
+use trellis::dev::defs::registry;
 
 use crate::model::{Cardinality, Op, OpOutcome, Program, Relationship};
 
@@ -101,6 +102,17 @@ pub struct Coverage {
     /// accumulator about, which is exactly the "coverage that silently drops
     /// out" case a floor test should catch.
     pub relationship_shapes: HashMap<&'static str, usize>,
+    /// How many recorded programs (cases, not fields) contain each aggregate
+    /// call shape, keyed `(key_space, function, argument)` — e.g.
+    /// `("Aggregate", "COUNT", "rel")` for `COUNT(<rel>.<col>)` inside a
+    /// `GROUP BY` def (issue #294), or `("Aggregate", "BOOL_AND", "column")`
+    /// (issue #255). `functions` above only says a name appeared somewhere;
+    /// this says how often each *shape* was actually driven, which is what a
+    /// deep run needs to report to show a newly-drawn shape got real
+    /// exercise. Only calls to `registry::AGGREGATE_FUNCTIONS` names are
+    /// tallied; the argument is `"*"` (no argument), `"column"`, `"rel"` (a
+    /// relationship path), or `"expr"` (anything else).
+    pub aggregate_call_cases: HashMap<(&'static str, &'static str, &'static str), usize>,
     /// The largest [`Op::BulkInsert`] row count seen across every recorded
     /// program (improvement-plan task E6) — a floor test asserts this
     /// actually gets large across enough samples of
@@ -160,6 +172,18 @@ impl Coverage {
             if let Op::BulkInsert { rows, .. } = op {
                 self.max_bulk_insert_rows = self.max_bulk_insert_rows.max(rows.len());
             }
+        }
+
+        // Issues #255/#294: per-case aggregate call shapes.
+        let mut aggregate_calls = HashSet::new();
+        for def in &program.defs {
+            let key_space = key_space_name(&def.key_space);
+            for field in &def.fields {
+                collect_aggregate_calls(&field.expr, key_space, &mut aggregate_calls);
+            }
+        }
+        for shape in aggregate_calls {
+            *self.aggregate_call_cases.entry(shape).or_insert(0) += 1;
         }
 
         // Issue #34.
@@ -278,6 +302,40 @@ impl Coverage {
     }
 }
 
+/// Adds every aggregate call in `expr` to `out` as a
+/// [`Coverage::aggregate_call_cases`] key.
+fn collect_aggregate_calls(
+    expr: &Expr,
+    key_space: &'static str,
+    out: &mut HashSet<(&'static str, &'static str, &'static str)>,
+) {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            if registry::AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
+                let argument = match args.as_slice() {
+                    [] => "*",
+                    [Expr::Column(_)] => "column",
+                    [Expr::RelationshipPath { .. }] => "rel",
+                    _ => "expr",
+                };
+                out.insert((key_space, function_name(name), argument));
+            }
+            for arg in args {
+                collect_aggregate_calls(arg, key_space, out);
+            }
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_aggregate_calls(lhs, key_space, out);
+            collect_aggregate_calls(rhs, key_space, out);
+        }
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::RelationshipPath { .. } => {}
+    }
+}
+
 fn op_kind(op: &Op) -> &'static str {
     match op {
         Op::Insert { .. } => "Insert",
@@ -348,6 +406,8 @@ fn function_name(name: &str) -> &'static str {
         "MAX" => "MAX",
         "AVG" => "AVG",
         "COUNT" => "COUNT",
+        "BOOL_AND" => "BOOL_AND",
+        "BOOL_OR" => "BOOL_OR",
         _ => "Other",
     }
 }
@@ -421,6 +481,13 @@ impl fmt::Display for Coverage {
         write!(f, "relationship_shapes:")?;
         for (name, count) in sorted_counts(&self.relationship_shapes) {
             write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        write!(f, "aggregate_call_cases:")?;
+        let mut calls: Vec<_> = self.aggregate_call_cases.iter().collect();
+        calls.sort_unstable();
+        for ((key_space, function, argument), count) in calls {
+            write!(f, " {key_space}:{function}({argument})={count}")?;
         }
         writeln!(f)
     }

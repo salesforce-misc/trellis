@@ -737,9 +737,10 @@ fn all_function_call_names(program: &Program) -> HashSet<String> {
     names
 }
 
-/// Improvement-plan task B4 (the widening unit's coverage meta-test): all
-/// five aggregate functions (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
-/// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`) must actually get drawn
+/// Improvement-plan task B4 (the widening unit's coverage meta-test): every
+/// aggregate function the generator draws (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
+/// plus `BOOL_AND`/`BOOL_OR` since issue #255 — see
+/// [`AGGREGATE_FUNCTION_NAMES`]) must actually get drawn
 /// across enough sampled programs — this is the floor that would catch B4's
 /// aggregate-function widening silently regressing (design doc §3 "coverage
 /// that silently drops out"), the same principle every other floor test in
@@ -756,7 +757,7 @@ fn all_function_call_names(program: &Program) -> HashSet<String> {
 /// aggregate def — let alone `AVG` specifically — has actually been drawn.
 /// The loop now only counts aggregate names toward the early exit.
 #[test]
-fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
+fn trivial_program_draws_every_aggregate_function_across_enough_samples() {
     let mut runner = TestRunner::default();
     let strategy = trivial_program();
     let mut seen: HashSet<String> = HashSet::new();
@@ -783,12 +784,12 @@ fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
     }
 }
 
-/// The five `KeySpace::Aggregate` function names
-/// (`trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
+/// The `KeySpace::Aggregate` function names the generator draws (a subset of
+/// `trellis::dev::defs::registry::AGGREGATE_FUNCTIONS`), duplicated here as a
 /// `const` rather than imported: `generative` doesn't re-export the engine's
-/// `registry` module, and this list is short/stable enough (the same
-/// `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` five [`AggregateFn`] already hardcodes) that
-/// a local copy is clearer than plumbing a new import through for one test.
+/// `registry` module, and this list is short/stable enough (the same seven
+/// [`AggregateFn`] already hardcodes) that a local copy is clearer than
+/// plumbing a new import through for one test.
 ///
 /// **Why this filter is needed post-merge.** [`all_function_call_names`]
 /// collects *every* `FunctionCall` name in a program's defs, including the
@@ -804,7 +805,8 @@ fn trivial_program_draws_all_five_aggregate_functions_across_enough_samples() {
 /// meant to check.
 ///
 /// [`AggregateFn`]: generative::generate::AggregateFn
-const AGGREGATE_FUNCTION_NAMES: &[&str] = &["SUM", "COUNT", "AVG", "MIN", "MAX"];
+const AGGREGATE_FUNCTION_NAMES: &[&str] =
+    &["SUM", "COUNT", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR"];
 
 /// The other half of B4's coverage floor: both invertibility classes
 /// (`trellis::dev::defs::invertibility::Invertibility`) must appear across a run —
@@ -832,10 +834,10 @@ fn trivial_program_draws_both_invertibility_classes_across_enough_samples() {
             .into_iter()
             .filter(|name| AGGREGATE_FUNCTION_NAMES.contains(&name.as_str()))
         {
-            let arg = if name == "COUNT" {
-                AggregateArg::Count(CountArg::Star)
-            } else {
-                AggregateArg::Column(ValueType::Numeric)
+            let arg = match name.as_str() {
+                "COUNT" => AggregateArg::Count(CountArg::Star),
+                "BOOL_AND" | "BOOL_OR" => AggregateArg::Column(ValueType::Boolean),
+                _ => AggregateArg::Column(ValueType::Numeric),
             };
             let verdict = classify(&name, arg)
                 .unwrap_or_else(|| panic!("{name} must be a known aggregate function"));
@@ -1324,6 +1326,72 @@ fn trivial_program_draws_every_supported_relationship_reference_shape() {
         "the generator drew a relationship reference shape the coverage accumulator cannot \
          classify — in this generator that can only be a shape validate() rejects: {coverage}"
     );
+}
+
+/// Issues #255/#294: the generator can draw each aggregate shape it used to
+/// leave out — `BOOL_AND`/`BOOL_OR` over the `Boolean` column in a `GROUP BY`
+/// def, `COUNT(<rel>.<col>)` over a to-one path inside a `GROUP BY` def — and
+/// pairs a `BOOL_*` def with an in-place flip of the column it folds
+/// ([`Mutate::UpdateFlag`]), so the recompute path sees a value retracted
+/// from a live group, not only rows joining and leaving it.
+///
+/// Sampled with [`TestRunner::deterministic`] rather than `default()`, so
+/// this pins what a fixed seed draws instead of being a probabilistic floor.
+#[test]
+fn trivial_program_draws_bool_aggregates_and_count_of_a_relationship_path_in_a_group_by() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    let mut saw_flag_flip_under_a_bool_aggregate = false;
+    for _ in 0..500 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+        saw_flag_flip_under_a_bool_aggregate |= flips_a_column_a_bool_aggregate_folds(&program);
+    }
+    for (function, argument) in [
+        ("BOOL_AND", "column"),
+        ("BOOL_OR", "column"),
+        ("COUNT", "rel"),
+    ] {
+        assert!(
+            coverage
+                .aggregate_call_cases
+                .get(&("Aggregate", function, argument))
+                .is_some_and(|&n| n > 0),
+            "the generator must draw {function}({argument}) inside a GROUP BY def across 500 \
+             deterministic samples: {coverage}"
+        );
+    }
+    assert!(
+        saw_flag_flip_under_a_bool_aggregate,
+        "the generator must sometimes flip the Boolean column a BOOL_AND/BOOL_OR def folds, on a \
+         live row, across 500 deterministic samples"
+    );
+}
+
+/// Whether `program` has a `BOOL_AND`/`BOOL_OR` field and a successful
+/// `UPDATE` of that field's argument column on the same source table.
+fn flips_a_column_a_bool_aggregate_folds(program: &Program) -> bool {
+    program.defs.iter().any(|def| {
+        def.fields.iter().any(|field| match &field.expr {
+            Expr::FunctionCall { name, args } if name == "BOOL_AND" || name == "BOOL_OR" => {
+                let [Expr::Column(column)] = args.as_slice() else {
+                    return false;
+                };
+                program.ops.iter().any(|op| {
+                    matches!(
+                        op,
+                        Op::Update { table, changes, expect: generative::model::OpOutcome::Succeeds, .. }
+                            if *table == def.source && changes.iter().any(|(c, _)| c == column)
+                    )
+                })
+            }
+            _ => false,
+        })
+    })
 }
 
 /// The relationship key/foreign-key columns must really exercise all three
