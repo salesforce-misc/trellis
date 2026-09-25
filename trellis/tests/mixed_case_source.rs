@@ -39,14 +39,13 @@ fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
 }
 
 async fn install(db: &testkit::TestDatabase, text: &str) {
-    install_definition(
-        &db.pool,
-        text,
-        &numeric_columns(&["id", "order_id", "qty"]),
-        "public",
-    )
-    .await
-    .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
+    install_over(db, text, &["id", "order_id", "qty"]).await;
+}
+
+async fn install_over(db: &testkit::TestDatabase, text: &str, source_columns: &[&str]) {
+    install_definition(&db.pool, text, &numeric_columns(source_columns), "public")
+        .await
+        .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
     trellis::intake::publication::settle_registrations(&db.pool).await;
 }
 
@@ -190,6 +189,79 @@ async fn a_relationship_between_mixed_case_tables_backfills_and_applies_cdc() {
         pipeline.rows(ENRICHED).await,
         rows(&[("1", "15"), ("2", "20"), ("3", "15")]),
         "the to-side update and the from-side insert both reached the target"
+    );
+
+    pipeline.finish().await;
+}
+
+/// A relationship whose to-side is one of this instance's own targets, in a
+/// mixed-case schema (`"Shop"."Catalog"`). Such a to-side is fed by the
+/// target-mutation seam, so every write to it takes the reverse path's
+/// live-row check: a keyed read of the to-side, typed from its catalog
+/// entry (and a projection refresh from the live row when the image is
+/// stale). Those read the to-side under its quoted name and look it up under
+/// its unquoted identity. The plain source to-side above never reaches them.
+#[tokio::test]
+async fn a_relationship_to_a_mixed_case_target_applies_cdc_through_the_seam() {
+    let (cluster, db, raw) = pgoutput_intake::database().await;
+    raw.batch_execute(
+        "create schema \"Shop\"; \
+         create table public.products (id bigint primary key, price numeric); \
+         alter table public.products replica identity full; \
+         create table public.\"OrderItems\" (id bigint primary key, product_id bigint); \
+         create index on public.\"OrderItems\" (product_id); \
+         alter table public.\"OrderItems\" replica identity full",
+    )
+    .await
+    .expect("seed the tables");
+    install_over(
+        &db,
+        "TRANSFORM Shop.Catalog FROM products SELECT price AS price",
+        &["id", "price"],
+    )
+    .await;
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM OrderItems.product_id TO Catalog.id",
+    )
+    .await
+    .expect("declare the relationship");
+    assert_eq!(created.to_schema, "Shop");
+    install_over(
+        &db,
+        "TRANSFORM enriched FROM OrderItems SELECT product.price AS price",
+        &["id", "product_id"],
+    )
+    .await;
+
+    let mut pipeline =
+        Pipeline::attach(cluster, db, raw, &["public.products", "public.OrderItems"]).await;
+    const ENRICHED: &str = "select id::text, price::text from enriched";
+    pipeline
+        .raw
+        .batch_execute(
+            "insert into public.products (id, price) values (1, 10), (2, 20); \
+             insert into public.\"OrderItems\" (id, product_id) values (1, 1), (2, 2)",
+        )
+        .await
+        .expect("seed the rows");
+    pipeline.settle().await;
+    assert_eq!(
+        pipeline.rows(ENRICHED).await,
+        rows(&[("1", "10"), ("2", "20")]),
+        "each order item resolved its product through the target"
+    );
+
+    pipeline
+        .raw
+        .batch_execute("update public.products set price = 15 where id = 1")
+        .await
+        .expect("update a product");
+    pipeline.settle().await;
+    assert_eq!(
+        pipeline.rows(ENRICHED).await,
+        rows(&[("1", "15"), ("2", "20")]),
+        "the target's seam-fed update reached the reader"
     );
 
     pipeline.finish().await;

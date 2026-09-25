@@ -821,13 +821,10 @@ fn key_array_filter(col_ident: &str, pg_type: Option<&str>) -> String {
 /// The live, `attnum`-ordered column names of `table` — the same
 /// `to_regclass`-bound `pg_attribute` introspection [`to_column_types`]/
 /// [`key_column_pg_type`] already use, but the whole live column list rather
-/// than a caller-supplied subset. `table` may be either the bare/qualified
-/// form `to_regclass` parses unquoted (e.g. `key_column_pg_type`'s own
-/// `table` argument) or an already `quote_ident`-quoted `"schema"."table"`
-/// string (e.g. [`ddl::qualified_relationship_projection_table`]'s output):
-/// `to_regclass` parses a quoted-identifier bind parameter exactly the way
-/// the SQL parser would parse the same text in a `FROM` clause, so either
-/// shape resolves to the right relation.
+/// than a caller-supplied subset. `table` is the unquoted `schema.table`
+/// identity, quoted for the lookup by [`ddl::regclass_arg`] (issue #561).
+/// An already-quoted name (e.g. a [`ddl::qualified_relationship_projection_table`]
+/// output) is quoted twice, finds nothing, and yields an empty column list.
 ///
 /// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
 /// this to build an explicit per-column `jsonb_build_object` (see
@@ -5081,6 +5078,56 @@ mod tests {
              (rows 1-3), the NULL-keyed row (4) must not, and none of them report a \
              specific matched key"
         );
+    }
+
+    /// Issue #561: a [`ToSide`] types its key filter from the catalog entry
+    /// of its unquoted `identity`, and reads the row under its quoted
+    /// `table`. Handed the quoted name, the lookup would find nothing
+    /// (`to_regclass` of a twice-quoted name is `NULL`) and the filter would
+    /// silently fall back to casting the column, which no index serves
+    /// (#125) — correct rows, so nothing downstream notices. Pinned here on a
+    /// mixed-case to-side in a mixed-case schema.
+    #[tokio::test]
+    async fn to_side_key_filter_types_a_mixed_case_to_side_by_its_identity() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create schema \"Shop\"; \
+                 create table \"Shop\".\"Catalog\" (id bigint primary key, price numeric); \
+                 insert into \"Shop\".\"Catalog\" (id, price) values (1, 10)",
+            )
+            .await
+            .expect("seed a mixed-case to-side");
+
+        let identity = "Shop.Catalog".to_string();
+        let to_side = ToSide {
+            table: ddl::qualified_source_table(&identity),
+            identity,
+            seam_fed: true,
+            key_pg_type: std::sync::OnceLock::new(),
+        };
+        let txn = client.transaction().await.expect("open txn");
+        let filter = to_side.key_filter(&txn, "id").await.expect("key filter");
+        assert_eq!(
+            filter, r#"t."id" = $1::text::bigint"#,
+            "the key filter compares the native column, typed from the catalog"
+        );
+        let price: String = txn
+            .query_one(
+                &format!("select price::text from {} t where {filter}", to_side.table),
+                &[&"1"],
+            )
+            .await
+            .expect("read the to-side row by key")
+            .get(0);
+        assert_eq!(price, "10");
     }
 
     /// [`ReverseTrigger::Keys`] via [`from_side_rows_for_trigger_txn`] — the
