@@ -1426,7 +1426,8 @@ struct ReverseAggregateShape {
     /// [`augment_row_with_relationship_value`]). `template.group_by` itself
     /// cannot be reused for this: it holds each key's **target** column name
     /// (`author`, say), never the synthetic name
-    /// (`__trellis_rev_author`-shaped) an augmented row actually carries —
+    /// ([`synthetic_relationship_column`]`("author")`) an augmented row
+    /// actually carries —
     /// reading `template.group_by` directly against an augmented row would
     /// silently find nothing for a relationship-path key and always resolve
     /// it to `NULL`.
@@ -1558,13 +1559,13 @@ pub(crate) struct RelationshipReverseRecord {
 }
 
 /// The synthetic source-column name [`build_reverse_relationship_shape`]
-/// substitutes for a `RelationshipPath { column, .. }` reference — the
-/// `__trellis_`-prefixed hidden-column convention
-/// [`ddl::PROJECTION_GEN_COLUMN`]'s doc comment already flags as carrying a
-/// (small, accepted) collision risk with a real source column, reused here
-/// for the same reason.
+/// substitutes for a `RelationshipPath { column, .. }` reference. Scoped by
+/// `column` alone: a reverse shape reads exactly one relationship. Issue
+/// #521: no real column can have it (it used to be `__trellis_rev_<column>`,
+/// which a source column of that name was overwritten by) — see
+/// [`apply_aggregate::synthetic_relationship_key`].
 fn synthetic_relationship_column(column: &str) -> String {
-    format!("__trellis_rev_{column}")
+    apply_aggregate::synthetic_relationship_key("reverse", None, column)
 }
 
 /// Issue #134: the synthetic `src_table` every
@@ -1825,7 +1826,7 @@ async fn build_reverse_relationship_shape(
         // own `rewritten.key_space` rewrite. Without this,
         // `eval::evaluate_aggregate`'s `group_by` set (keyed by each key's
         // *target* column name, e.g. `author`) never matches a field whose
-        // expression was just substituted to `Column("__trellis_rev_author")`
+        // expression was just substituted to the synthetic `Column`
         // — any field bare-passthrough-referencing the relationship path
         // (e.g. `SELECT post.author AS author`, the exact shape
         // `validate::a_group_by_relationship_path_bare_passthrough_field_is_allowed`
@@ -1913,6 +1914,26 @@ async fn group_by_relationships(
     qualified_from_table: &str,
     defs: &[crate::defs::model::Definition],
 ) -> Result<(Vec<String>, Vec<GroupBySibling>), ApplyError> {
+    let mut columns_by_rel = group_by_columns_by_relationship(defs);
+    let Some(own_columns) = columns_by_rel.remove(rel.def.name.as_str()) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut siblings = Vec::new();
+    for (name, columns) in columns_by_rel {
+        if let Some(sibling) =
+            group_by_snapshot_source(pool, qualified_from_table, name, columns).await?
+        {
+            siblings.push(sibling);
+        }
+    }
+    Ok((own_columns, siblings))
+}
+
+/// Every relationship an aggregate in `defs` groups by, keyed by name, with
+/// the to-side columns it groups by (each once, in `GROUP BY` order).
+fn group_by_columns_by_relationship(
+    defs: &[crate::defs::model::Definition],
+) -> std::collections::BTreeMap<&str, Vec<String>> {
     let mut columns_by_rel: std::collections::BTreeMap<&str, Vec<String>> =
         std::collections::BTreeMap::new();
     for def in defs {
@@ -1928,41 +1949,44 @@ async fn group_by_relationships(
             }
         }
     }
-    let Some(own_columns) = columns_by_rel.remove(rel.def.name.as_str()) else {
-        return Ok((Vec::new(), Vec::new()));
+    columns_by_rel
+}
+
+/// Where to read relationship `name`'s current `columns` for a from-side
+/// row of `qualified_from_table`: its settled parent projection, as a
+/// [`GroupBySibling`]. `None` unless `name` is a to-one relationship on that
+/// table with a projection.
+async fn group_by_snapshot_source(
+    pool: &Pool,
+    qualified_from_table: &str,
+    name: &str,
+    columns: Vec<String>,
+) -> Result<Option<GroupBySibling>, ApplyError> {
+    let Some(rel) = catalog::relationship_on_source(pool, qualified_from_table, name).await? else {
+        return Ok(None);
     };
-    let mut siblings = Vec::new();
-    for (name, columns) in columns_by_rel {
-        let Some(sibling) =
-            catalog::relationship_on_source(pool, qualified_from_table, name).await?
-        else {
-            continue;
-        };
-        if sibling.cardinality != RelationshipCardinality::ToOne {
-            continue;
-        }
-        let Some(projection) = catalog::relationship_projection(pool, sibling.id).await? else {
-            continue;
-        };
-        let qualified_projection = projection.qualified_table();
-        // A column the projection doesn't hold resolves as `NULL`, the same
-        // as the forward path's projection read.
-        let projection_columns =
-            live_row_columns(&**pool.get().await?, &qualified_projection).await?;
-        let to_table = ddl::qualified_source_table(&sibling.qualified_to_table());
-        siblings.push(GroupBySibling {
-            name: name.to_string(),
-            from_col: sibling.def.from_col.clone(),
-            qualified_projection,
-            to_col_pg_type: key_column_pg_type(pool, &to_table, &sibling.def.to_col).await?,
-            to_col: sibling.def.to_col.clone(),
-            columns: columns
-                .into_iter()
-                .filter(|c| projection_columns.contains(c))
-                .collect(),
-        });
+    if rel.cardinality != RelationshipCardinality::ToOne {
+        return Ok(None);
     }
-    Ok((own_columns, siblings))
+    let Some(projection) = catalog::relationship_projection(pool, rel.id).await? else {
+        return Ok(None);
+    };
+    let qualified_projection = projection.qualified_table();
+    // A column the projection doesn't hold resolves as `NULL`, the same as
+    // the forward path's projection read.
+    let projection_columns = live_row_columns(&**pool.get().await?, &qualified_projection).await?;
+    let to_table = ddl::qualified_source_table(&rel.qualified_to_table());
+    Ok(Some(GroupBySibling {
+        name: name.to_string(),
+        from_col: rel.def.from_col.clone(),
+        qualified_projection,
+        to_col_pg_type: key_column_pg_type(pool, &to_table, &rel.def.to_col).await?,
+        to_col: rel.def.to_col.clone(),
+        columns: columns
+            .into_iter()
+            .filter(|c| projection_columns.contains(c))
+            .collect(),
+    }))
 }
 
 /// The `to_col` text value off `row`, or `None` if `row` is absent or the
@@ -2779,11 +2803,11 @@ async fn reverse_ordering_still_holds(
 /// [`earliest_src_changed`] and [`earliest_origin`] respectively.
 type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 
-/// One key a drain re-derives by plain image-less recompute:
-/// `(src_table, key, hop_gen, src_changed, origin_lsn)`. The shape of
-/// [`ApplyPlan::reverse_recomputes`], a relationship reverse's fallback
-/// (`stage_reverse_recompute_fallback`, paired with a prior image as a
-/// [`FallbackRecompute`]), and a key Phase 3 re-stages.
+/// One key a drain re-derives by recompute:
+/// `(src_table, key, hop_gen, src_changed, origin_lsn)`. Paired with an
+/// optional prior image as an [`ImagedRecompute`] for
+/// [`ApplyPlan::reverse_recomputes`] and a relationship reverse's fallback
+/// (`stage_reverse_recompute_fallback`); bare for a key Phase 3 re-stages.
 type DerivedRecompute = (
     String,
     String,
@@ -2792,10 +2816,11 @@ type DerivedRecompute = (
     Option<PgLsn>,
 );
 
-/// One from-side row the reverse fallback re-derives: the key to recompute,
-/// plus the row's prior image, if it needs one (issue #516) — see
-/// [`stage_reverse_recompute_fallback`].
-type FallbackRecompute = (DerivedRecompute, Option<String>);
+/// One from-side row a reverse path re-derives: the key to recompute, plus
+/// the row's prior image, if it needs one — see
+/// [`stage_reverse_recompute_fallback`] (issue #516) and
+/// [`truncated_from_side_images`] (issue #520).
+type ImagedRecompute = (DerivedRecompute, Option<String>);
 
 /// Stages the pre-#131 `Recompute` fallback (issue #131's own stopgap,
 /// shared since by every guard rejection before #134 and by
@@ -2857,7 +2882,7 @@ async fn stage_reverse_recompute_fallback(
     old_key: &Option<String>,
     new_key: &Option<String>,
     seen_keys: &mut std::collections::HashSet<String>,
-    fallback: &mut Vec<FallbackRecompute>,
+    fallback: &mut Vec<ImagedRecompute>,
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
     let shape = &record.shape;
@@ -2988,6 +3013,68 @@ async fn sibling_projection_rows(
             .insert(db_row.get(1), db_row.get(2));
     }
     Ok(rows)
+}
+
+/// Issue #520: the from-side rows a `TRUNCATE` of a relationship's to-side
+/// re-derives (every row whose `from_col` isn't `NULL`, as for
+/// [`ReverseTrigger::WholeKeyspace`]), each keyed by its primary-key text
+/// with a prior image. The image is the live row plus, under
+/// [`apply_aggregate::pre_change_relationship_column`], each of `snapshots`'
+/// columns as the relationship's projection holds it for the row, or `NULL`
+/// when it holds nothing. The truncated relationship is one of
+/// `snapshots`, so its image names the group the row is leaving.
+///
+/// Read in Phase 2, before this batch's Phase 3 clears the truncated
+/// relationship's projection or advances any other, so every value is the
+/// one the aggregate target still has the row grouped under. One query, one
+/// hash join per snapshot, over the same rows the image-less path lists.
+async fn truncated_from_side_images(
+    pool: &Pool,
+    from_table: &str,
+    from_pk: &[PrimaryKeyColumn],
+    from_col: &str,
+    snapshots: &[GroupBySibling],
+) -> Result<Vec<(String, String)>, ApplyError> {
+    let client = pool.get().await?;
+    let row_columns = live_row_columns(&**client, from_table).await?;
+    let mut image_expr = row_as_text_jsonb_sql("t", &row_columns);
+    let mut joins = String::new();
+    for (i, snapshot) in snapshots.iter().enumerate() {
+        if snapshot.columns.is_empty() {
+            continue;
+        }
+        let alias = format!("p{i}");
+        let pairs: Vec<String> = snapshot
+            .columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "{}, {alias}.{}::text",
+                    quote_literal(&apply_aggregate::pre_change_relationship_column(
+                        &snapshot.name,
+                        column
+                    )),
+                    quote_ident(column)
+                )
+            })
+            .collect();
+        image_expr = format!("{image_expr} || jsonb_build_object({})", pairs.join(", "));
+        joins.push_str(&format!(
+            " left join {projection} {alias} \
+               on {alias}.{to_col}::text = t.{snapshot_from_col}::text",
+            projection = snapshot.qualified_projection,
+            to_col = quote_ident(&snapshot.to_col),
+            snapshot_from_col = quote_ident(&snapshot.from_col),
+        ));
+    }
+    let sql = format!(
+        "select {pk}, ({image_expr})::text from {tbl} t{joins} where t.{col} is not null",
+        pk = ddl::pk_key_sql_expr(from_pk, Some("t")),
+        tbl = ddl::qualified_source_table(from_table),
+        col = quote_ident(from_col),
+    );
+    let rows = client.query(&sql, &[]).await?;
+    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
 /// Splices `parent_row`'s referenced to-side columns into a clone of
@@ -4857,7 +4944,12 @@ pub struct ApplyPlan {
     /// `src_changed`, fan-in tie-broken by [`earliest_src_changed`] when more
     /// than one to-side change resolves to the same `(from_table,
     /// from_key)` (issues #51/#52's multi-hop gap).
-    reverse_recomputes: Vec<DerivedRecompute>,
+    ///
+    /// Issue #520: each paired with the prior image a to-side `TRUNCATE`
+    /// stages when an aggregate on `from_table` groups by the truncated
+    /// relationship (see the `truncated` loop in [`compute`]); `None`
+    /// otherwise.
+    reverse_recomputes: Vec<ImagedRecompute>,
     /// Epic #49 cross-cutting review fix (issues #51/#52): every
     /// [`TransformObservation`] [`buffer_transform_apply_metrics`]
     /// buffered during this `compute` call, in place of recording each one
@@ -5081,6 +5173,9 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // deliberately the opposite merge direction from `hop_gen`'s `max`, see
     // that function's doc comment.
     let mut reverse_recomputes: HashMap<(String, String), (i32, Provenance)> = HashMap::new();
+    // Issue #520: the prior image a to-side `TRUNCATE` stages with some of
+    // `reverse_recomputes`' keys — see the `truncated` loop below.
+    let mut reverse_recompute_images: HashMap<(String, String), String> = HashMap::new();
     // Issue #130, epic #127: accumulated across every source/definition this
     // `compute` pass evaluates a to-one relationship for — see
     // [`ApplyPlan::relationship_gen_bumps`]'s doc comment.
@@ -6123,13 +6218,14 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // the reverse-recompute mechanism (issue #30) that the row-driven
         // `by_source` loop above feeds for exactly this situation, staging
         // every from-side row currently pointing at this (now-empty) table
-        // as an image-less recompute — see `ReverseTrigger::WholeKeyspace`'s
-        // doc comment for why "every non-NULL join column", not a specific
-        // value list, is the right query for a TRUNCATE. Pushed into the
-        // same `reverse_recomputes`
-        // accumulator the row-driven path uses, so it's deduped the same way
-        // (issue #79) and drained through the same image-less `Recompute`
-        // pipeline below — no separate emission path needed.
+        // as a recompute — see `ReverseTrigger::WholeKeyspace`'s doc comment
+        // for why "every non-NULL join column", not a specific value list,
+        // is the right query for a TRUNCATE. Pushed into the same
+        // `reverse_recomputes` accumulator the row-driven path uses, so it's
+        // deduped the same way (issue #79) and drained through the same
+        // `Recompute` pipeline below — no separate emission path needed.
+        // Image-less, unless an aggregate groups by the relationship (issue
+        // #520, below).
         let inbound_rels = catalog::relationships_to_table(pool, &source_key).await?;
         for rel in &inbound_rels {
             // Issue #168: for a to-one relationship, the staged recompute
@@ -6166,16 +6262,59 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // `src_table` verbatim.
             let qualified_from_table = rel.qualified_from_table();
             let from_pk = ddl::source_primary_key(pool, &qualified_from_table).await?;
-            let from_keys = from_side_keys(
-                pool,
-                &qualified_from_table,
-                &from_pk,
-                &rel.def.from_col,
-                &ReverseTrigger::WholeKeyspace,
-            )
-            .await?;
+            // Issue #520: every row this relationship grouped moves to the
+            // `NULL` group, and the live re-read names only that one. When
+            // an aggregate on the from-table groups by this relationship,
+            // each recompute carries a prior image naming the group the row
+            // is leaving: the value of every relationship some aggregate
+            // there groups by, snapshotted off the projections now, before
+            // Phase 3 clears this one's (see `truncated_from_side_images`).
+            let from_defs = catalog::transforms_for_source(pool, &qualified_from_table).await?;
+            let group_by_columns = group_by_columns_by_relationship(&from_defs);
+            let from_keys: Vec<(String, Option<String>)> = if group_by_columns
+                .contains_key(rel.def.name.as_str())
+            {
+                let mut snapshots = Vec::with_capacity(group_by_columns.len());
+                for (name, columns) in group_by_columns {
+                    if let Some(snapshot) =
+                        group_by_snapshot_source(pool, &qualified_from_table, name, columns).await?
+                    {
+                        snapshots.push(snapshot);
+                    }
+                }
+                truncated_from_side_images(
+                    pool,
+                    &qualified_from_table,
+                    &from_pk,
+                    &rel.def.from_col,
+                    &snapshots,
+                )
+                .await?
+                .into_iter()
+                .map(|(key, image)| (key, Some(image)))
+                .collect()
+            } else {
+                from_side_keys(
+                    pool,
+                    &qualified_from_table,
+                    &from_pk,
+                    &rel.def.from_col,
+                    &ReverseTrigger::WholeKeyspace,
+                )
+                .await?
+                .into_iter()
+                .map(|(key, _)| (key, None))
+                .collect()
+            };
             let hop = change.hop_gen + 1;
-            for (from_key, _) in from_keys {
+            for (from_key, prior_image) in from_keys {
+                // The first image staged for a row wins: every one is a
+                // pre-batch snapshot of the same relationships.
+                if let Some(image) = prior_image {
+                    reverse_recompute_images
+                        .entry((qualified_from_table.clone(), from_key.clone()))
+                        .or_insert(image);
+                }
                 reverse_recomputes
                     .entry((qualified_from_table.clone(), from_key))
                     .and_modify(|(h, (sc, origin))| {
@@ -6251,11 +6390,16 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         }
     }
 
-    let reverse_recomputes: Vec<DerivedRecompute> = reverse_recomputes
+    let reverse_recomputes: Vec<ImagedRecompute> = reverse_recomputes
         .into_iter()
         .map(
             |((from_table, from_key), (hop, (src_changed, origin_lsn)))| {
-                (from_table, from_key, hop, src_changed, origin_lsn)
+                let prior_image =
+                    reverse_recompute_images.remove(&(from_table.clone(), from_key.clone()));
+                (
+                    (from_table, from_key, hop, src_changed, origin_lsn),
+                    prior_image,
+                )
             },
         )
         .collect();
@@ -7556,7 +7700,7 @@ pub async fn apply_and_mark_drained_many(
     // comment), so this only matters when *two different* parent keys in
     // one drain happen to feed the same target (e.g. an aggregate grouped
     // by a column unrelated to the relationship).
-    let mut relationship_reverse_fallback: Vec<FallbackRecompute> = Vec::new();
+    let mut relationship_reverse_fallback: Vec<ImagedRecompute> = Vec::new();
     // Issue #134: guard-rejected records are re-staged as
     // `StagedChange::RelationshipReverseDeferred` (never touching `hop_gen`)
     // rather than folded into `recompute_changes` (which enforces
@@ -7756,8 +7900,17 @@ pub async fn apply_and_mark_drained_many(
         // projection follows the live row.
         let superseded =
             superseded_to_side(txn, &mut row_columns_cache, record, &old_key, &new_key).await?;
+        // Issue #520: a record landing after its to-side's `TRUNCATE` in this
+        // batch diffs against the cleared projection (an insert against "no
+        // parent"), but the target still groups the rows under their
+        // pre-truncate parent until the truncate's recomputes drain. Its
+        // delta would come off the wrong group, so it takes the fallback,
+        // whose recomputes fold with the truncate's.
         let fast_path_safe = superseded.is_none()
             && record.retry_count == 0
+            && !plan
+                .relationship_projection_clears
+                .contains(&shape.qualified_projection)
             && relationship_fast_path_precondition_holds(
                 txn,
                 &shape.from_table,
@@ -8012,7 +8165,13 @@ pub async fn apply_and_mark_drained_many(
     // re-derive, resolved in Phase 2 and staged here as ordinary image-less
     // recomputes — the same shape and same hop bound forward propagation uses,
     // just keyed by the from-side table/PK rather than a touched target key.
-    for (from_table, key, hop_gen, src_changed, origin_lsn) in &plan.reverse_recomputes {
+    // Issue #520: a to-side `TRUNCATE`'s recomputes carry a prior image when
+    // an aggregate groups by the truncated relationship. Staged before step
+    // 3d's fallback below, so a row both stage keeps this pre-batch image:
+    // the fold keeps a key's first.
+    for ((from_table, key, hop_gen, src_changed, origin_lsn), prior_image) in
+        &plan.reverse_recomputes
+    {
         if *hop_gen > MAX_HOP_GEN {
             hop_bound_tables.push(from_table.clone());
             worst_hop_gen = worst_hop_gen.max(*hop_gen);
@@ -8024,7 +8183,7 @@ pub async fn apply_and_mark_drained_many(
             hop_gen: *hop_gen,
             group_key: None,
             src_changed: *src_changed,
-            prior_image: None,
+            prior_image: prior_image.clone(),
             origin_lsn: *origin_lsn,
         });
     }

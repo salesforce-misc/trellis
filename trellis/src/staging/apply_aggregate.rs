@@ -131,14 +131,16 @@
 //! was in before, if different, is named only when the change carries a
 //! prior-image hint ([`FoldedChange::prior_image`], issue #315), so every
 //! producer whose recompute can follow a move between groups has to stage
-//! one. Two do: a target write's downstream propagation (the row's
-//! pre-write image, issue #315), and a to-one relationship's reverse
-//! fallback, `super::apply::stage_reverse_recompute_fallback`, which stages
-//! the from-side row with every `GROUP BY` relationship's pre-change value
+//! one. Three do: a target write's downstream propagation (the row's
+//! pre-write image, issue #315); a to-one relationship's reverse fallback,
+//! `super::apply::stage_reverse_recompute_fallback`, which stages the
+//! from-side row with every `GROUP BY` relationship's pre-change value
 //! already spliced in (issue #516 — a renamed, deleted or inserted parent
 //! moves every row grouped by it; [`augment_row_with_forward_relationships`]
 //! keeps those values rather than re-resolving them from the
-//! already-advanced projections).
+//! already-advanced projections); and a to-side `TRUNCATE`'s recomputes,
+//! the same image read off the projections before the truncate clears one
+//! (issue #520, `super::apply::truncated_from_side_images`).
 //! Backfill, definition re-derive and the other reverse recomputes stage
 //! none. **If a hint-less change's live re-read finds the key already gone,
 //! there is no group to locate at all and the change is dropped**, leaving
@@ -1011,34 +1013,61 @@ pub(super) fn contribution_def(def: &TransformDef) -> TransformDef {
 /// share a to-side column name (e.g. both `author` and `editor` relate to a
 /// `users` table and both read `.name`) must not collide on the same
 /// synthetic column.
+///
+/// Issue #521: see [`synthetic_relationship_key`] for why no two
+/// `(rel, column)` pairs, and no real column, can share the name.
 fn forward_relationship_synthetic_column(rel: &str, column: &str) -> String {
-    format!("__trellis_fwd_{rel}_{column}")
+    synthetic_relationship_key("forward", Some(rel), column)
 }
 
 /// Issue #516: the key a relationship reverse fallback's `Recompute` prior
 /// image carries relationship `rel`'s `column` value under, as it stood
 /// before the parent change (see
-/// `super::apply::stage_reverse_recompute_fallback`).
+/// `super::apply::stage_reverse_recompute_fallback`, and issue #520's
+/// `super::apply::truncated_from_side_images`).
 /// [`augment_row_with_forward_relationships`] takes a value found under it as
 /// given rather than resolving it from the projection, which has already
 /// moved on.
 ///
-/// Every such key starts with [`PRE_CHANGE_RELATIONSHIP_PREFIX`], which is
-/// longer than any Postgres identifier (63 bytes), so no real column of a
-/// source row, CDC image or target row can carry it: only the fallback puts
-/// a value there. The forward synthetic name
-/// ([`forward_relationship_synthetic_column`]) has no such guarantee, since a
-/// table may have a column literally named `__trellis_fwd_...`.
+/// Distinct from [`forward_relationship_synthetic_column`], so a prior image
+/// is never mistaken for a row the forward path already augmented, and, like
+/// it, no real column's name (see [`synthetic_relationship_key`]): only a
+/// prior image puts a value there.
 pub(super) fn pre_change_relationship_column(rel: &str, column: &str) -> String {
-    format!("{PRE_CHANGE_RELATIONSHIP_PREFIX}{rel}.{column}")
+    synthetic_relationship_key("pre_change", Some(rel), column)
 }
 
-/// See [`pre_change_relationship_column`].
-const PRE_CHANGE_RELATIONSHIP_PREFIX: &str =
-    "__trellis_pre_change_relationship_value/longer_than_any_postgres_identifier/";
+/// Issue #521: every key Trellis splices a relationship value into a row
+/// under, for `role` (which splice it is), relationship `rel` (when the key
+/// is scoped by one) and to-side `column`.
+///
+/// Two properties make it safe to add to any row:
+///
+/// - **No real column has it.** It starts with
+///   [`SYNTHETIC_RELATIONSHIP_PREFIX`], longer than any Postgres identifier
+///   (63 bytes), so no column of a source row, CDC image or target row can
+///   carry it. `__trellis_rev_<column>` used to overwrite a real source
+///   column of that name on the reverse fast path.
+/// - **No two `(role, rel, column)` share it.** `rel` is length-prefixed, so
+///   where it ends is never a guess: `__trellis_fwd_<rel>_<column>` named
+///   relationship `a_b`'s `c` and relationship `a`'s `b_c` alike. `role` is a
+///   fixed word without a `/`, and the `/` after it ends it.
+pub(super) fn synthetic_relationship_key(role: &str, rel: Option<&str>, column: &str) -> String {
+    match rel {
+        Some(rel) => format!(
+            "{SYNTHETIC_RELATIONSHIP_PREFIX}{role}/{}:{rel}.{column}",
+            rel.len()
+        ),
+        None => format!("{SYNTHETIC_RELATIONSHIP_PREFIX}{role}/{column}"),
+    }
+}
+
+/// See [`synthetic_relationship_key`].
+const SYNTHETIC_RELATIONSHIP_PREFIX: &str =
+    "__trellis_relationship_value/longer_than_any_postgres_identifier_so_no_column_has_it/";
 
 // Postgres truncates an identifier to NAMEDATALEN - 1 = 63 bytes.
-const _: () = assert!(PRE_CHANGE_RELATIONSHIP_PREFIX.len() > 63);
+const _: () = assert!(SYNTHETIC_RELATIONSHIP_PREFIX.len() > 63);
 
 /// One resolved `<rel>.<column>` reference [`build_forward_relationship_shape`]
 /// rewrote into a synthetic `Column` — `from_col` is the from-row's own join
@@ -4898,12 +4927,37 @@ mod tests {
         );
     }
 
+    /// Issue #521: `__trellis_fwd_{rel}_{column}` named relationship `a_b`'s
+    /// `c` and relationship `a`'s `b_c` alike, and nothing stopped a real
+    /// column from having a synthetic name. Every synthetic key now tells
+    /// its `(rel, column)` apart and is longer than a Postgres identifier.
+    #[test]
+    fn synthetic_relationship_keys_are_unambiguous_and_no_column_can_have_one() {
+        let keys = [
+            forward_relationship_synthetic_column("a_b", "c"),
+            forward_relationship_synthetic_column("a", "b_c"),
+            forward_relationship_synthetic_column("a", "b.c"),
+            forward_relationship_synthetic_column("a.b", "c"),
+            pre_change_relationship_column("a_b", "c"),
+            pre_change_relationship_column("a", "b_c"),
+            pre_change_relationship_column("a", "b.c"),
+            pre_change_relationship_column("a.b", "c"),
+            synthetic_relationship_key("reverse", None, "c"),
+            synthetic_relationship_key("reverse", None, "b_c"),
+        ];
+        let distinct: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:#?}");
+        for key in &keys {
+            assert!(key.len() > 63, "{key} fits in a Postgres identifier");
+        }
+    }
+
     /// Issue #516: a row carrying a relationship's pre-change value (a
     /// reverse fallback's prior image, holding the parent's value before it
     /// changed) keeps it; any other row resolves it from the settled
     /// projection, which already holds the new value. That includes a row
-    /// with a real column that happens to share the forward synthetic name:
-    /// only the out-of-band pre-change key counts.
+    /// already carrying a value under the forward synthetic name: only the
+    /// pre-change key counts.
     #[test]
     fn a_pre_change_relationship_value_is_not_resolved_again() {
         use crate::defs::model::RelationshipCardinality;
@@ -4939,15 +4993,15 @@ mod tests {
             pre_change_relationship_column("buyer", "name"),
             Some("a".to_string()),
         );
-        let mut colliding = live.clone();
-        colliding.insert(synthetic_name.clone(), Some("a real column".to_string()));
+        let mut forward_only = live.clone();
+        forward_only.insert(synthetic_name.clone(), Some("a".to_string()));
 
         let resolved = augment_row_with_forward_relationships(&live, Some(&rel_ctx), &synthetic);
         assert_eq!(resolved.get(&synthetic_name), Some(&Some("c".to_string())));
         let kept = augment_row_with_forward_relationships(&prior, Some(&rel_ctx), &synthetic);
         assert_eq!(kept.get(&synthetic_name), Some(&Some("a".to_string())));
         let not_kept =
-            augment_row_with_forward_relationships(&colliding, Some(&rel_ctx), &synthetic);
+            augment_row_with_forward_relationships(&forward_only, Some(&rel_ctx), &synthetic);
         assert_eq!(not_kept.get(&synthetic_name), Some(&Some("c".to_string())));
     }
 

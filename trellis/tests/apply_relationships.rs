@@ -2185,28 +2185,453 @@ async fn two_single_relationship_aggregates_whose_relationships_change_in_one_ba
     .await;
 }
 
-/// A to-side `TRUNCATE` moves every from-side row into the `NULL` group. Its
-/// reverse recomputes (the `WholeKeyspace` trigger's, staged through
-/// `reverse_recomputes`, not the #516 fallback) carry no prior image, so
-/// only the `NULL` group is re-derived and every group the rows left keeps
-/// its old total. Found reviewing #516.
-#[tokio::test]
-#[ignore = "a to-side TRUNCATE leaves every relationship-keyed aggregate group stale (found reviewing #516, not yet filed)"]
-async fn a_to_side_truncate_leaves_no_stale_relationship_group() {
+// ---------------------------------------------------------------------
+// Issue #520: a to-side TRUNCATE must leave no relationship-keyed aggregate
+// group stale
+// ---------------------------------------------------------------------
+
+/// One aggregate over `orders` a [`truncate_scenario`] checks: its
+/// definition, and the same result as `(key, value)` text pairs read off
+/// the target and computed by Postgres's own `LEFT JOIN ... GROUP BY`.
+struct TruncateAggregate {
+    definition: &'static str,
+    target: &'static str,
+    oracle: &'static str,
+}
+
+/// Every aggregate a [`truncate_scenario`] installs: grouped by one
+/// relationship, by both, by a from-side column paired with one, and by the
+/// other relationship alone, over invertible and `RecomputeOnly` fields.
+const TRUNCATE_AGGREGATES: &[TruncateAggregate] = &[
+    TruncateAggregate {
+        definition: "TRANSFORM by_buyer FROM orders GROUP BY buyer.name SELECT SUM(amount) AS v",
+        target: "select coalesce(name, '<null>'), v::text from by_buyer",
+        oracle: "select coalesce(u.name, '<null>'), sum(o.amount)::text from orders o \
+                 left join users u on u.id = o.user_id group by u.name",
+    },
+    TruncateAggregate {
+        definition: "TRANSFORM by_pair FROM orders GROUP BY buyer.name, seller.title \
+                     SELECT COUNT(*) AS v",
+        target: "select coalesce(name, '<null>') || '|' || coalesce(title, '<null>'), v::text \
+                 from by_pair",
+        oracle: "select coalesce(u.name, '<null>') || '|' || coalesce(s.title, '<null>'), \
+                        count(*)::text \
+                 from orders o left join users u on u.id = o.user_id \
+                 left join shops s on s.id = o.shop_id group by u.name, s.title",
+    },
+    TruncateAggregate {
+        definition: "TRANSFORM by_region_buyer FROM orders GROUP BY region, buyer.name \
+                     SELECT MAX(amount) AS v",
+        target: "select region || '|' || coalesce(name, '<null>'), v::text from by_region_buyer",
+        oracle: "select o.region || '|' || coalesce(u.name, '<null>'), max(o.amount)::text \
+                 from orders o left join users u on u.id = o.user_id group by o.region, u.name",
+    },
+    TruncateAggregate {
+        definition: "TRANSFORM by_seller FROM orders GROUP BY seller.title \
+                     SELECT MIN(amount) AS v",
+        target: "select coalesce(title, '<null>'), v::text from by_seller",
+        oracle: "select coalesce(s.title, '<null>'), min(o.amount)::text from orders o \
+                 left join shops s on s.id = o.shop_id group by s.title",
+    },
+];
+
+/// One step of a [`truncate_scenario`]'s batch: a statement run against the
+/// sources, or the CDC row it produced, staged at the current WAL position.
+enum Step {
+    Sql(&'static str),
+    Cdc {
+        table: &'static str,
+        key: &'static str,
+        op: &'static str,
+        old: Option<&'static str>,
+        new: Option<&'static str>,
+    },
+}
+
+/// The CDC sentinel a `TRUNCATE` of `table` stages.
+fn truncate_cdc(table: &'static str) -> Step {
+    Step::Cdc {
+        table,
+        key: TRUNCATE_SENTINEL_KEY,
+        op: "truncate",
+        old: None,
+        new: None,
+    }
+}
+
+/// Orders over users `a`/`b`/`c` (`buyer`) and shops `s`/`t` (`seller`),
+/// plus an order with no user, one whose user doesn't exist and one with no
+/// shop, with every [`TRUNCATE_AGGREGATES`] aggregate installed. Runs
+/// `steps` and stages their CDC into one segment, so they drain as one
+/// batch, then checks every aggregate against its oracle.
+async fn truncate_scenario(label: &str, steps: &[Step]) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     client
         .batch_execute(
             "create table users (id integer primary key, name text); \
-             create table orders (id integer primary key, user_id integer, amount integer); \
+             create table shops (id integer primary key, title text); \
+             create table orders (id integer primary key, user_id integer, shop_id integer, \
+                                  region text, amount integer); \
              alter table users replica identity full; \
+             alter table shops replica identity full; \
              alter table orders replica identity full; \
-             insert into users values (1, 'a'), (2, 'b'); \
-             insert into orders values (10, 1, 5), (11, 2, 7);",
+             insert into users values (1, 'a'), (2, 'b'), (3, 'c'); \
+             insert into shops values (1, 's'), (2, 't'); \
+             insert into orders values (10, 1, 1, 'eu', 5), (11, 2, 2, 'eu', 7), \
+                 (12, 1, 2, 'us', 100), (13, null, 1, 'eu', 1), (14, 9, 1, 'us', 2), \
+                 (15, 3, null, 'eu', 4);",
         )
         .await
-        .expect("seed");
+        .expect("seed users, shops and orders");
+    for rel in [
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+        "RELATIONSHIP seller FROM orders.shop_id TO shops.id",
+    ] {
+        create_relationship(&db.pool, rel)
+            .await
+            .expect("declare relationship");
+    }
+    for aggregate in TRUNCATE_AGGREGATES {
+        install_definition(
+            &db.pool,
+            aggregate.definition,
+            &columns(&[
+                ("id", ValueType::Numeric),
+                ("user_id", ValueType::Numeric),
+                ("shop_id", ValueType::Numeric),
+                ("region", ValueType::Text),
+                ("amount", ValueType::Numeric),
+            ]),
+            "public",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("install {}: {e}", aggregate.definition));
+    }
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    for aggregate in TRUNCATE_AGGREGATES {
+        assert_eq!(
+            text_pairs(&client, aggregate.target).await,
+            text_pairs(&client, aggregate.oracle).await,
+            "{label}: {}: before the batch",
+            aggregate.definition
+        );
+    }
+
+    for step in steps {
+        match step {
+            Step::Sql(sql) => client
+                .batch_execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {sql}: {e}")),
+            Step::Cdc {
+                table,
+                key,
+                op,
+                old,
+                new,
+            } => stage_cdc(&client, table, key, op, *old, *new).await,
+        }
+    }
+    drain_to_quiescence(&db.pool, &mut client).await;
+    for aggregate in TRUNCATE_AGGREGATES {
+        assert_eq!(
+            text_pairs(&client, aggregate.target).await,
+            text_pairs(&client, aggregate.oracle).await,
+            "{label}: {}: after the batch",
+            aggregate.definition
+        );
+    }
+}
+
+/// A to-side `TRUNCATE` moves every from-side row into the `NULL` group. Its
+/// reverse recomputes (the `WholeKeyspace` trigger's, staged through
+/// `reverse_recomputes`, not the #516 fallback) carried no prior image, so
+/// only the `NULL` group was re-derived and every group the rows left kept
+/// its old total. `by_pair` also needs the untouched `seller` value in the
+/// image to name `(a, s)`, and `by_seller` must come through unchanged.
+#[tokio::test]
+async fn a_to_side_truncate_leaves_no_stale_relationship_group() {
+    truncate_scenario(
+        "truncate users",
+        &[Step::Sql("truncate users"), truncate_cdc("users")],
+    )
+    .await;
+}
+
+/// The same from the other relationship's side.
+#[tokio::test]
+async fn a_truncate_of_the_other_to_side_leaves_no_stale_relationship_group() {
+    truncate_scenario(
+        "truncate shops",
+        &[Step::Sql("truncate shops"), truncate_cdc("shops")],
+    )
+    .await;
+}
+
+/// Both to-sides truncated in one statement: two sentinels, each staging a
+/// recompute of every order. Whichever image survives the fold has to name
+/// both relationships' values from before the batch.
+#[tokio::test]
+async fn truncating_both_to_sides_in_one_batch_leaves_no_stale_relationship_group() {
+    truncate_scenario(
+        "truncate users, shops",
+        &[
+            Step::Sql("truncate users, shops"),
+            truncate_cdc("users"),
+            truncate_cdc("shops"),
+        ],
+    )
+    .await;
+}
+
+/// A rename the truncate voids in the same batch: the rows leave the group
+/// the target still has them in (`a`), not the name the voided rename gave.
+#[tokio::test]
+async fn a_to_side_truncate_after_a_rename_in_the_same_batch_leaves_no_stale_group() {
+    truncate_scenario(
+        "rename then truncate users",
+        &[
+            Step::Sql("update users set name = 'x' where id = 1"),
+            Step::Cdc {
+                table: "users",
+                key: "1",
+                op: "update",
+                old: Some(r#"{"id":"1","name":"a"}"#),
+                new: Some(r#"{"id":"1","name":"x"}"#),
+            },
+            Step::Sql("truncate users"),
+            truncate_cdc("users"),
+        ],
+    )
+    .await;
+}
+
+/// Every parent re-inserted after the truncate in the same batch: user 1
+/// under a new name, users 2 and 3 under their old ones. Each insert's
+/// reverse record sees no old parent in the cleared projection, but the
+/// target still has the rows in the groups the truncate's images name, so a
+/// fast-path delta would come off the `NULL` group. With order 14 (the only
+/// dangling user) deleted, nothing else re-derives that group.
+#[tokio::test]
+async fn a_to_side_truncate_then_reinsert_in_the_same_batch_leaves_no_stale_group() {
+    truncate_scenario(
+        "truncate then re-insert users",
+        &[
+            Step::Sql("delete from orders where id = 14"),
+            Step::Cdc {
+                table: "orders",
+                key: "14",
+                op: "delete",
+                old: Some(r#"{"id":"14","user_id":"9","shop_id":"1","region":"us","amount":"2"}"#),
+                new: None,
+            },
+            Step::Sql("truncate users"),
+            truncate_cdc("users"),
+            Step::Sql("insert into users values (1, 'z'), (2, 'b'), (3, 'c')"),
+            Step::Cdc {
+                table: "users",
+                key: "1",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"1","name":"z"}"#),
+            },
+            Step::Cdc {
+                table: "users",
+                key: "2",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"2","name":"b"}"#),
+            },
+            Step::Cdc {
+                table: "users",
+                key: "3",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"3","name":"c"}"#),
+            },
+        ],
+    )
+    .await;
+}
+
+/// A sibling relationship's parent renamed in the same batch: its fallback
+/// stages a recompute of the same orders with its own prior image, read
+/// after Phase 3 cleared the users projection. The fold keeps the
+/// truncate's pre-batch image, which names `(a, s)`.
+#[tokio::test]
+async fn a_to_side_truncate_with_a_sibling_rename_in_the_same_batch_leaves_no_stale_group() {
+    truncate_scenario(
+        "truncate users, rename shop 1",
+        &[
+            Step::Sql("truncate users"),
+            truncate_cdc("users"),
+            Step::Sql("update shops set title = 'u' where id = 1"),
+            Step::Cdc {
+                table: "shops",
+                key: "1",
+                op: "update",
+                old: Some(r#"{"id":"1","title":"s"}"#),
+                new: Some(r#"{"id":"1","title":"u"}"#),
+            },
+        ],
+    )
+    .await;
+}
+
+/// From-side changes on both sides of the truncate in one batch: an order
+/// moved to another user and region, one inserted, one deleted.
+#[tokio::test]
+async fn a_to_side_truncate_with_from_side_changes_in_the_same_batch_leaves_no_stale_group() {
+    truncate_scenario(
+        "orders change around truncate users",
+        &[
+            Step::Sql("update orders set user_id = 2, region = 'us' where id = 10"),
+            Step::Cdc {
+                table: "orders",
+                key: "10",
+                op: "update",
+                old: Some(r#"{"id":"10","user_id":"1","shop_id":"1","region":"eu","amount":"5"}"#),
+                new: Some(r#"{"id":"10","user_id":"2","shop_id":"1","region":"us","amount":"5"}"#),
+            },
+            Step::Sql("delete from orders where id = 11"),
+            Step::Cdc {
+                table: "orders",
+                key: "11",
+                op: "delete",
+                old: Some(r#"{"id":"11","user_id":"2","shop_id":"2","region":"eu","amount":"7"}"#),
+                new: None,
+            },
+            Step::Sql("truncate users"),
+            truncate_cdc("users"),
+            Step::Sql("insert into orders values (16, 1, 2, 'eu', 50)"),
+            Step::Cdc {
+                table: "orders",
+                key: "16",
+                op: "insert",
+                old: None,
+                new: Some(r#"{"id":"16","user_id":"1","shop_id":"2","region":"eu","amount":"50"}"#),
+            },
+            Step::Sql("update orders set amount = 60 where id = 12"),
+            Step::Cdc {
+                table: "orders",
+                key: "12",
+                op: "update",
+                old: Some(
+                    r#"{"id":"12","user_id":"1","shop_id":"2","region":"us","amount":"100"}"#,
+                ),
+                new: Some(r#"{"id":"12","user_id":"1","shop_id":"2","region":"us","amount":"60"}"#),
+            },
+        ],
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #521: synthetic relationship columns collide neither with each
+// other nor with a real column
+// ---------------------------------------------------------------------
+
+/// Relationship `x_y`'s column `z` and relationship `x`'s column `y_z` were
+/// both spliced into a forward-path row as `__trellis_fwd_x_y_z`, so one
+/// value overwrote the other and an order inserted by CDC landed in a group
+/// named twice by the same parent.
+#[tokio::test]
+async fn two_relationship_columns_with_the_same_joined_name_group_apart() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, z text); \
+             create table shops (id integer primary key, y_z text); \
+             create table orders (id integer primary key, user_id integer, shop_id integer, \
+                                  amount integer); \
+             alter table users replica identity full; \
+             alter table shops replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'u1'), (2, 'u2'); \
+             insert into shops values (1, 's1'), (2, 's2'); \
+             insert into orders values (10, 1, 2, 5);",
+        )
+        .await
+        .expect("seed users, shops and orders");
+    for rel in [
+        "RELATIONSHIP x_y FROM orders.user_id TO users.id",
+        "RELATIONSHIP x FROM orders.shop_id TO shops.id",
+    ] {
+        create_relationship(&db.pool, rel)
+            .await
+            .expect("declare relationship");
+    }
+    install_definition(
+        &db.pool,
+        "TRANSFORM by_pair FROM orders GROUP BY x_y.z, x.y_z SELECT SUM(amount) AS v",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("shop_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install by_pair");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let target = "select z || '|' || y_z, v::text from by_pair";
+    let oracle = "select u.z || '|' || s.y_z, sum(o.amount)::text from orders o \
+                  join users u on u.id = o.user_id join shops s on s.id = o.shop_id \
+                  group by u.z, s.y_z";
+    assert_eq!(
+        text_pairs(&client, target).await,
+        text_pairs(&client, oracle).await,
+        "before the insert"
+    );
+
+    client
+        .execute("insert into orders values (11, 2, 1, 7)", &[])
+        .await
+        .expect("insert order 11");
+    stage_cdc(
+        &client,
+        "orders",
+        "11",
+        "insert",
+        None,
+        Some(r#"{"id":"11","user_id":"2","shop_id":"1","amount":"7"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, target).await,
+        text_pairs(&client, oracle).await,
+        "order 11 lands in (u2, s1)"
+    );
+}
+
+/// A source column literally named `__trellis_rev_name` was overwritten by
+/// the reverse fast path's splice of `buyer.name`, so a rename summed the
+/// user's name in place of the column's value.
+#[tokio::test]
+async fn a_source_column_named_like_a_reverse_synthetic_column_is_read_as_itself() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table orders (id integer primary key, user_id integer, \
+                                  __trellis_rev_name integer); \
+             alter table users replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, '1000'), (2, '2000'); \
+             insert into orders values (10, 1, 5), (11, 2, 7), (12, 1, 100);",
+        )
+        .await
+        .expect("seed users and orders");
     create_relationship(
         &db.pool,
         "RELATIONSHIP buyer FROM orders.user_id TO users.id",
@@ -2215,41 +2640,49 @@ async fn a_to_side_truncate_leaves_no_stale_relationship_group() {
     .expect("declare buyer");
     install_definition(
         &db.pool,
-        "TRANSFORM agg FROM orders GROUP BY buyer.name SELECT SUM(amount) AS v",
+        "TRANSFORM by_buyer FROM orders GROUP BY buyer.name \
+         SELECT SUM(__trellis_rev_name) AS v",
         &columns(&[
             ("id", ValueType::Numeric),
             ("user_id", ValueType::Numeric),
-            ("amount", ValueType::Numeric),
+            ("__trellis_rev_name", ValueType::Numeric),
         ]),
         "public",
     )
     .await
-    .expect("install");
+    .expect("install by_buyer");
     trellis::intake::publication::settle_registrations(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
-    let target = "select coalesce(name, '<null>'), v::text from agg";
-    let oracle = "select coalesce(u.name, '<null>'), sum(o.amount)::text from orders o \
+    let target = "select name, v::text from by_buyer";
+    let oracle = "select u.name, sum(o.__trellis_rev_name)::text from orders o \
                   left join users u on u.id = o.user_id group by u.name";
     assert_eq!(
         text_pairs(&client, target).await,
-        text_pairs(&client, oracle).await
+        text_pairs(&client, oracle).await,
+        "before the rename"
     );
+
     client
-        .execute("truncate users", &[])
+        .execute("update users set name = '3000' where id = 1", &[])
         .await
-        .expect("truncate");
+        .expect("rename user 1");
     stage_cdc(
         &client,
         "users",
-        TRUNCATE_SENTINEL_KEY,
-        "truncate",
-        None,
-        None,
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"1000"}"#),
+        Some(r#"{"id":"1","name":"3000"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    let recomputed = reverse_keys_for_to_side_change(&db.pool, &mut client, "orders").await;
+    assert!(
+        recomputed.is_empty(),
+        "the rename should take the fast path, not recompute {recomputed:?}"
+    );
     assert_eq!(
         text_pairs(&client, target).await,
-        text_pairs(&client, oracle).await
+        text_pairs(&client, oracle).await,
+        "user 1's orders move to 3000 with their own values"
     );
 }
