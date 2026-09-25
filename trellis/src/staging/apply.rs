@@ -8096,9 +8096,7 @@ pub async fn apply_and_mark_drained_many(
         // whose recomputes fold with the truncate's.
         let fast_path_safe = !superseded
             && record.retry_count == 0
-            && !plan
-                .relationship_projection_clears
-                .contains(&shape.qualified_projection)
+            && !plan.relationship_projection_clears.contains_key(&shape.id)
             && relationship_fast_path_precondition_holds(
                 txn,
                 &shape.from_table,
