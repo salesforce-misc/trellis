@@ -19,11 +19,13 @@
 mod coverage;
 mod db_admin;
 mod noise;
+mod restore;
 mod two_instance;
 
 pub use coverage::Coverage;
 pub use db_admin::{check_slot_loss_detected, run_convergence_with_db_admin};
 pub use noise::run_convergence_with_noise;
+pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use two_instance::{
     InstanceLabel, InstanceRun, TwoInstanceError, run_two_instance_convergence,
 };
@@ -160,6 +162,32 @@ pub enum RunError {
     SlotLossUndetected {
         op_index: usize,
         not_paused: Vec<(String, String)>,
+    },
+    /// Issue #236: carrying out a backup or restore failed (the harness's
+    /// side of it: reconnecting after the backup's stop, stopping the
+    /// original engine, starting one on the restored database). `step`
+    /// names which.
+    Restore {
+        op_index: usize,
+        step: &'static str,
+        error: String,
+    },
+    /// Issue #236: the restored database's source tables are not what the
+    /// original's were after the backup op `op_index`, so the restore itself
+    /// lost or kept something it shouldn't have. Only the source tables:
+    /// the targets are judged by the oracle.
+    RestoreDiffers {
+        op_index: usize,
+        at_backup: Snapshot,
+        restored: Snapshot,
+    },
+    /// Issue #236: after a cold-copy restore, which brings the replication
+    /// slot back with everything else, these `(target, status)` definitions
+    /// were `paused` once the engine caught up with `op_index`. Nothing about
+    /// the restore warrants a pause (the 2026-09-24 decision on #236).
+    PausedAfterRestore {
+        op_index: usize,
+        paused: Vec<(String, String)>,
     },
 }
 

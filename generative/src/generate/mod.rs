@@ -2471,8 +2471,8 @@ pub fn adversarial_noise_table() -> Table {
 mod strategy {
     use super::*;
     use crate::model::{
-        DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent, NoiseEventKind,
-        NoisePlan, RestartMode, SlotLossKind,
+        BackupKind, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent,
+        NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SlotLossKind,
     };
     use proptest::prelude::*;
 
@@ -3252,6 +3252,16 @@ mod strategy {
         prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
     }
 
+    /// Issue #236: a backup-and-restore plan for `program`, backing up after
+    /// any of its ops. Every plan is a [`BackupKind::ColdCopy`] today; the
+    /// `pg_basebackup` kind is held for #558 (see [`BackupKind`]).
+    pub fn restore_plan_for(program: &Program) -> impl Strategy<Value = RestorePlan> + use<> {
+        (0..program.ops.len()).prop_map(|backup_op| RestorePlan {
+            backup_op,
+            kind: BackupKind::ColdCopy,
+        })
+    }
+
     /// Improvement-plan task E2: draws a [`trivial_program_with`] program,
     /// then defers exactly one of its definitions' installs
     /// ([`defer_def_install`]) to some point strictly after the first seed
@@ -3435,7 +3445,7 @@ mod strategy {
 pub use strategy::{
     bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, noise_plan_for,
     program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    trivial_one_to_one_program_with, trivial_program, trivial_program_with,
+    restore_plan_for, trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]

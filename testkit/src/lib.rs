@@ -20,5 +20,5 @@ pub mod crash;
 pub mod fixtures;
 pub mod lsn;
 
-pub use cluster::{StopMode, TestCluster, TestDatabase};
+pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};
 pub use lsn::wal_insert_lsn;

@@ -295,8 +295,13 @@ Sequencing, cheapest-first (each its own future story under the epic):
    change still in flight and the engine must reconnect by itself. A slot
    loss puts the anchor op in the gap and restarts the engine, which must
    pause every transform (issue #310) before the harness resumes them as the
-   operator would. Not built yet: backup/restore with a cloned oracle, and
-   losing the slot while the engine is running.
+   operator would. Backup/restore is built for a cold file-level copy
+   (`model::RestorePlan`, driven by `run::run_convergence_with_restore`,
+   swept by `tests/backup_restore.rs`): back up right after op *k* with its
+   change in flight, run to the end, restore into a fresh cluster, replay
+   *k+1..n*, converge with no pause (§8 has the decision behind that). Not
+   built yet: the `pg_basebackup` variant (held for #558), and losing the
+   slot while the engine is running.
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
    tables; promotes the auditor's negative wiring test to a swept property.
 
@@ -326,6 +331,20 @@ Two structural notes for when faults enter the stream:
 - **Layer 3** is reachable only because a fault action is an oracle identity (§7)
   and because the generative and scripted harnesses **share one action vocabulary**:
   a scripted scenario is a generated program with its draws pinned.
+- **A restore needs no restore-specific handling** (decided on #236,
+  2026-09-24). Trellis keeps its catalog, staging ring, `replication_progress`
+  and targets in the database it reads, so a restore rolls them all back to
+  one point and what comes back is consistent with itself. Only the
+  replication slot differs by kind of restore, and each outcome is already
+  handled: a cold file-level copy of a stopped cluster keeps the slot where
+  the restored progress row expects it, so intake carries on with no pause; a
+  `pg_basebackup`/PITR or `pg_dump` restore has no slot, so #310 pauses every
+  transform until the operator resumes it; a slot recreated under the same
+  name is detected as a gap (#406) and treated as a loss. Detecting a restore
+  itself (e.g. by the cluster's system identifier) was rejected as machinery
+  slot-loss detection already covers. Layer 3's backup/restore action checks
+  the consistency assumption: today the cold-copy case (restore, replay,
+  converge, no pause); the `pg_basebackup` case waits on #558.
 
 ## 9. Operational shape
 

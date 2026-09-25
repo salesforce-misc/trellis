@@ -246,7 +246,9 @@ Every defined transform carries an observable **status**:
   target stops being written to and holds its current, now-stale value. Resuming
   likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
   transforms itself when the replication slot feeding them is lost, for
-  example after the source database is restored from a backup. It logs which
+  example after the source database is restored from a backup that doesn't
+  carry the slot (a `pg_basebackup`, say; a cold copy of the stopped cluster
+  does carry it, so nothing pauses). It logs which
   transforms it paused and why until each one is resumed
   ([intake failure modes](staging-and-claiming/01-intake-and-lsn-confirmation.md#failure-modes)).
 

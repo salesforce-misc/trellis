@@ -215,6 +215,86 @@ impl TestCluster {
     /// Panics if the server doesn't stop or doesn't come back, like the rest
     /// of this module.
     pub fn restart(&self, mode: StopMode) {
+        self.while_stopped(mode, || {});
+    }
+
+    /// Takes a cold, file-level backup: stops the server with a
+    /// [`StopMode::Fast`] shutdown (so the copy is of a cleanly shut-down
+    /// cluster, shutdown checkpoint and all), copies the whole data
+    /// directory, and starts the server again on the original. Every open
+    /// connection is severed, as with [`TestCluster::restart`].
+    ///
+    /// The copy carries everything in the data directory, replication slots
+    /// (`pg_replslot/`) included, so a cluster restored from it with
+    /// [`TestCluster::from_backup`] has each slot exactly where it stood at
+    /// the shutdown. That is the difference from a `pg_basebackup`, which
+    /// leaves `pg_replslot/` out.
+    ///
+    /// The backup lives in its own temp directory until the returned
+    /// [`ClusterBackup`] is dropped. It is a full copy of the cluster, WAL
+    /// included, so drop it as soon as it has been restored from.
+    pub fn cold_backup(&self) -> ClusterBackup {
+        let root = std::env::temp_dir().join(format!("trellis-testkit-{}", unique_suffix()));
+        let backup = ClusterBackup { root };
+        fs::create_dir_all(&backup.root).expect("create backup dir");
+        self.while_stopped(StopMode::Fast, || {
+            copy_data_dir(&self.data_dir, &backup.data_dir());
+        });
+        backup
+    }
+
+    /// Starts a new, independent cluster on a copy of `backup`'s data
+    /// directory, in its own temp directory and on its own socket, and waits
+    /// until it accepts connections. The server comes up the way a restored
+    /// production server would: from the backed-up files, with no `initdb`
+    /// and no migration. Every database the backed-up cluster had is there
+    /// under the same name; [`TestCluster::database_dsn`] reaches one.
+    ///
+    /// `backup` is copied, not consumed, so it can be restored from more
+    /// than once. Torn down on drop like any other [`TestCluster`].
+    pub fn from_backup(backup: &ClusterBackup) -> Self {
+        reap_orphans_once();
+        let permit = ClusterPermit::acquire();
+
+        let root = std::env::temp_dir().join(format!("trellis-testkit-{}", unique_suffix()));
+        let data_dir = root.join("data");
+        let socket_dir = root.join("sock");
+        fs::create_dir_all(&socket_dir).expect("create socket dir");
+        copy_data_dir(&backup.data_dir(), &data_dir);
+
+        let port: u16 = 5432;
+        let log_path = root.join("postgres.log");
+        let server = spawn_server(&data_dir, &socket_dir, port, &log_path);
+
+        let cluster = Self {
+            root,
+            data_dir,
+            socket_dir,
+            port,
+            server: Mutex::new(server),
+            _permit: permit,
+        };
+        cluster.wait_ready(&log_path);
+        cluster
+    }
+
+    /// The libpq keyword/value connection string for database `name` on
+    /// this cluster. Mostly for reaching a database on a cluster started
+    /// [`TestCluster::from_backup`], which has no [`TestDatabase`] handle
+    /// for it.
+    pub fn database_dsn(&self, name: &str) -> String {
+        format!(
+            "host={} port={} user=postgres dbname={}",
+            self.socket_dir.display(),
+            self.port,
+            name
+        )
+    }
+
+    /// Stops the server in `mode`, runs `while_down` with it stopped, then
+    /// starts it again on the same data directory, socket and port and
+    /// waits until it accepts connections.
+    fn while_stopped(&self, mode: StopMode, while_down: impl FnOnce()) {
         let mut server = self.server.lock().expect("server lock");
         run_to_completion(
             Command::new("pg_ctl")
@@ -229,6 +309,7 @@ impl TestCluster {
             "pg_ctl stop",
         );
         let _ = server.wait();
+        while_down();
         let log_path = self.root.join("postgres.log");
         *server = spawn_server(&self.data_dir, &self.socket_dir, self.port, &log_path);
         drop(server);
@@ -254,12 +335,7 @@ impl TestCluster {
             "createdb",
         );
 
-        let dsn = format!(
-            "host={} port={} user=postgres dbname={}",
-            self.socket_dir.display(),
-            self.port,
-            name
-        );
+        let dsn = self.database_dsn(&name);
 
         let config = Config::from_dsn(dsn.clone()).expect("valid schema");
         let pool = Pool::new(&config).expect("build pool for isolated database");
@@ -341,6 +417,46 @@ impl Drop for TestCluster {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// A cold, file-level copy of a stopped [`TestCluster`]'s data directory,
+/// from [`TestCluster::cold_backup`]. Restore it with
+/// [`TestCluster::from_backup`]. The copy is deleted when this is dropped.
+///
+/// It sits in a `trellis-testkit-<pid>-<n>` temp directory like a cluster's
+/// own, so if the test process is killed before `Drop` runs, the next
+/// [`TestCluster::start`]'s orphan reaper removes it (it has no
+/// `postmaster.pid`, and its owning process is dead).
+pub struct ClusterBackup {
+    root: PathBuf,
+}
+
+impl ClusterBackup {
+    fn data_dir(&self) -> PathBuf {
+        self.root.join("data")
+    }
+
+    /// The temp directory holding the copy. Exposed so tests of the harness
+    /// itself can assert it's gone after drop.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for ClusterBackup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Copies a stopped cluster's data directory `from` to `to` (which must not
+/// exist yet), keeping permissions: Postgres refuses to start on a data
+/// directory anyone but its owner can read.
+fn copy_data_dir(from: &Path, to: &Path) {
+    run_to_completion(
+        Command::new("cp").arg("-Rp").arg(from).arg(to),
+        "copy data directory",
+    );
 }
 
 /// A uniquely-named database on a [`TestCluster`], with its own connection

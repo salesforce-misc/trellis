@@ -111,3 +111,39 @@ impl ClusterControl for testkit::TestCluster {
         });
     }
 }
+
+/// Backing a Postgres server up and restoring it into a fresh one (issue
+/// #236): what `crate::run::run_convergence_with_restore` needs. A trait for
+/// the same reason as [`ClusterControl`].
+pub trait BackupRestore: Sized {
+    /// A backup, kept until it has been restored from.
+    type Backup;
+
+    /// Stops the server, copies its whole data directory while it's down,
+    /// and starts it again, returning once it accepts connections. Every
+    /// open connection is severed, as by a restart.
+    fn cold_backup(&self) -> Self::Backup;
+
+    /// Starts a new server on a copy of `backup`, returning once it accepts
+    /// connections.
+    fn restore(backup: &Self::Backup) -> Self;
+
+    /// The connection string for database `name` on this server.
+    fn database_dsn(&self, name: &str) -> String;
+}
+
+impl BackupRestore for testkit::TestCluster {
+    type Backup = testkit::ClusterBackup;
+
+    fn cold_backup(&self) -> Self::Backup {
+        testkit::TestCluster::cold_backup(self)
+    }
+
+    fn restore(backup: &Self::Backup) -> Self {
+        testkit::TestCluster::from_backup(backup)
+    }
+
+    fn database_dsn(&self, name: &str) -> String {
+        testkit::TestCluster::database_dsn(self, name)
+    }
+}

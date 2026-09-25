@@ -954,6 +954,37 @@ impl ManualBackend {
         }
     }
 
+    /// A second backend over a restored copy of this backend's database at
+    /// `dsn` (issue #236), with this one's engine client already started on
+    /// it. Nothing is installed: the restored database already holds the
+    /// program's tables, catalog, ring and targets as of the backup, so this
+    /// only carries over what the harness itself remembers (the tables and
+    /// definitions it snapshots, and the client options, slot and
+    /// publication names included) and starts an equivalent client, the way
+    /// an operator would start Trellis again on a restored server.
+    ///
+    /// Fails with [`ManualBackendError::NoClientStarted`] if this backend
+    /// never installed anything.
+    pub async fn connect_to_restore(
+        &self,
+        dsn: impl Into<String>,
+    ) -> Result<Self, ManualBackendError> {
+        let mut restored = Self::connect_with_instance(
+            dsn,
+            self.config.schema(),
+            self.target_schema.clone(),
+            self.application_threads,
+            Some(self.maintenance_interval),
+        )
+        .await?;
+        restored.slot_and_publication = self.slot_and_publication.clone();
+        restored.client_options = self.client_options.clone();
+        restored.tables = self.tables.clone();
+        restored.defs = self.defs.clone();
+        restored.start_engine().await?;
+        Ok(restored)
+    }
+
     /// Every installed definition's persisted status, as
     /// `(target, status)` in install order. A definition with no catalog
     /// row at all reads as `"<missing>"`.

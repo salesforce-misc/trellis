@@ -1,7 +1,8 @@
 //! Tests of the harness itself (issue #21): that it spins up and tears down
 //! cleanly, that isolated databases don't bleed into each other, and that
 //! the instance is genuinely configured for logical replication, and that a
-//! restart keeps the data while severing every connection (issue #236).
+//! restart keeps the data while severing every connection, and that a cold
+//! backup restores into an independent cluster (issue #236).
 
 use std::process::{Command, Stdio};
 use testkit::{StopMode, TestCluster, fixtures};
@@ -329,6 +330,87 @@ async fn restart_severs_connections_and_keeps_data_and_slots() {
         .await
         .expect("acquire connection")
         .execute("select pg_drop_replication_slot('restart_slot')", &[])
+        .await
+        .expect("drop the slot");
+}
+
+/// Issue #236: a cold backup restores into an independent cluster holding
+/// the data and the replication slots exactly as they were at the backup,
+/// and later writes to either cluster don't reach the other. Both the
+/// backup's and the restored cluster's temp directories go on drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_backup_restores_data_and_slots_as_of_the_backup() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    fixtures::create_source_table(&db.pool, "widgets").await;
+    fixtures::insert_row(&db.pool, "widgets", 1, "before").await;
+    db.pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select pg_create_logical_replication_slot('backup_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .expect("create a slot");
+
+    let backup = cluster.cold_backup();
+    let backup_root = backup.root().to_path_buf();
+    assert!(backup_root.exists());
+
+    // The original comes back up, and moves on past the backup.
+    fixtures::insert_row(&db.pool, "widgets", 2, "after").await;
+
+    let restored = TestCluster::from_backup(&backup);
+    drop(backup);
+    assert!(
+        !backup_root.exists(),
+        "the backup's copy is deleted on drop"
+    );
+    let restored_root = restored.root().to_path_buf();
+    assert_ne!(restored_root, cluster.root());
+
+    let config =
+        trellis::Config::from_dsn(restored.database_dsn(db.name())).expect("restored config");
+    let restored_pool = trellis::Pool::new(&config).expect("restored pool");
+    assert_eq!(
+        fixtures::read_rows(&restored_pool, "widgets").await,
+        vec![(1, "before".to_string())],
+        "the restore holds exactly what the backup did"
+    );
+    fixtures::insert_row(&restored_pool, "widgets", 3, "restored").await;
+    assert_eq!(
+        fixtures::read_rows(&db.pool, "widgets").await,
+        vec![(1, "before".to_string()), (2, "after".to_string())],
+        "a write to the restore doesn't reach the original"
+    );
+
+    let restored_slots: i64 = restored_pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .query_one(
+            "select count(*) from pg_replication_slots where slot_name = 'backup_slot'",
+            &[],
+        )
+        .await
+        .expect("count slots")
+        .get(0);
+    assert_eq!(restored_slots, 1, "a cold copy carries the slot");
+
+    drop(restored_pool);
+    drop(restored);
+    assert!(
+        !restored_root.exists(),
+        "the restored cluster's dir is deleted on drop"
+    );
+
+    db.pool
+        .get()
+        .await
+        .expect("acquire connection")
+        .execute("select pg_drop_replication_slot('backup_slot')", &[])
         .await
         .expect("drop the slot");
 }

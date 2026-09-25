@@ -470,6 +470,36 @@ pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
 }
 
+/// How a [`RestorePlan`] backs the source cluster up (issue #236). The kinds
+/// differ in whether the replication slot survives the restore, which is
+/// the only thing about a restore Trellis sees differently (the 2026-09-24
+/// decision on issue #236: its catalog, ring, progress row and targets live
+/// in the backed-up database, so a restore rolls them all back together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupKind {
+    /// A file-level copy of the whole data directory, taken while the
+    /// server is stopped. The slot comes back exactly where the restored
+    /// progress row expects it, so intake carries on from the restored
+    /// point with no pause.
+    ColdCopy,
+    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. It leaves
+    // `pg_replslot/` out, so the restored source has no slot: expect
+    // issue #310's pause, an operator resume, then a fresh backfill (#558's
+    // scenario 10). `crate::run::run_convergence_with_restore` marks where
+    // that expectation goes.
+}
+
+/// A backup-and-restore schedule for one program run (issue #236), driven by
+/// `crate::run::run_convergence_with_restore`: back the cluster up right
+/// after `ops[backup_op]` is applied, run the program to its end, restore
+/// the backup into a fresh cluster, then replay `ops[backup_op + 1..]`
+/// against the restored database and converge again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub backup_op: usize,
+    pub kind: BackupKind,
+}
+
 /// The composite row-key convention for an [`trellis::dev::defs::ast::KeySpace::Aggregate`]
 /// target (improvement-plan task B4): every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1
