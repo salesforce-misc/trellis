@@ -1300,7 +1300,7 @@ pub(crate) struct ReverseRelationshipShape {
     /// The relationship's declared name — what a from-side definition's
     /// `<rel>.<column>` path reads. Issue #516: the fallback names its
     /// Recomputes' prior images' relationship values under
-    /// [`apply_aggregate::forward_relationship_synthetic_column`]`(name, ..)`.
+    /// [`apply_aggregate::pre_change_relationship_column`]`(name, ..)`.
     name: String,
     /// Empty (`String::new()`) in the should-be-unreachable case where this
     /// relationship has no projection row at all (#129 creates one
@@ -1339,6 +1339,34 @@ pub(crate) struct ReverseRelationshipShape {
     /// from-side row still needs the pre-#131 image-less `Recompute`
     /// treatment when this is `true`.
     needs_recompute_fallback: bool,
+    /// Issue #516: the to-side columns of this relationship that some
+    /// aggregate on `from_table` groups by. A parent change moves a
+    /// from-side row between groups only through these, so the fallback
+    /// stages a prior image only when this is non-empty — see
+    /// [`stage_reverse_recompute_fallback`].
+    group_by_columns: Vec<String>,
+    /// Issue #516: every *other* to-one relationship some aggregate on
+    /// `from_table` groups by. The fallback snapshots each one's current
+    /// value into its prior images alongside this relationship's old value,
+    /// so the image names the group a row left even when a sibling
+    /// relationship changes in the same batch. Empty whenever
+    /// `group_by_columns` is.
+    group_by_siblings: Vec<GroupBySibling>,
+}
+
+/// One other to-one relationship a [`ReverseRelationshipShape`]'s fallback
+/// snapshots (issue #516, see
+/// [`ReverseRelationshipShape::group_by_siblings`]).
+#[derive(Debug)]
+struct GroupBySibling {
+    name: String,
+    from_col: String,
+    qualified_projection: String,
+    to_col: String,
+    /// `to_col`'s type, for [`key_array_filter`].
+    to_col_pg_type: Option<String>,
+    /// The to-side columns some aggregate groups by.
+    columns: Vec<String>,
 }
 
 /// One aggregate target's issue #131 fast-path shape: everything needed to
@@ -1826,6 +1854,8 @@ async fn build_reverse_relationship_shape(
         });
     }
 
+    let (group_by_columns, group_by_siblings) =
+        group_by_relationships(pool, rel, &qualified_from_table, &defs).await?;
     Ok(ReverseRelationshipShape {
         id: rel.id,
         name: rel.def.name.clone(),
@@ -1838,7 +1868,72 @@ async fn build_reverse_relationship_shape(
         from_pk,
         aggregate_shapes,
         needs_recompute_fallback,
+        group_by_columns,
+        group_by_siblings,
     })
+}
+
+/// [`ReverseRelationshipShape::group_by_columns`] and
+/// [`ReverseRelationshipShape::group_by_siblings`] for `rel`: the to-side
+/// columns an aggregate in `defs` (every definition on `rel`'s from-table)
+/// groups by, for `rel` and for every other to-one relationship. Both empty,
+/// at no catalog cost, unless some aggregate groups by `rel`.
+async fn group_by_relationships(
+    pool: &Pool,
+    rel: &RelationshipDefinition,
+    qualified_from_table: &str,
+    defs: &[crate::defs::model::Definition],
+) -> Result<(Vec<String>, Vec<GroupBySibling>), ApplyError> {
+    let mut columns_by_rel: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for def in defs {
+        let KeySpace::Aggregate { group_by } = &def.def.key_space else {
+            continue;
+        };
+        for key in group_by {
+            if let GroupByKey::RelationshipPath { rel: name, column } = key {
+                let columns = columns_by_rel.entry(name).or_default();
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
+        }
+    }
+    let Some(own_columns) = columns_by_rel.remove(rel.def.name.as_str()) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut siblings = Vec::new();
+    for (name, columns) in columns_by_rel {
+        let Some(sibling) =
+            catalog::relationship_on_source(pool, qualified_from_table, name).await?
+        else {
+            continue;
+        };
+        if sibling.cardinality != RelationshipCardinality::ToOne {
+            continue;
+        }
+        let Some(projection) = catalog::relationship_projection(pool, sibling.id).await? else {
+            continue;
+        };
+        let qualified_projection = projection.qualified_table();
+        // A column the projection doesn't hold resolves as `NULL`, the same
+        // as the forward path's projection read.
+        let projection_columns =
+            live_row_columns(&**pool.get().await?, &qualified_projection).await?;
+        let to_table = ddl::qualified_source_table(&sibling.qualified_to_table());
+        siblings.push(GroupBySibling {
+            name: name.to_string(),
+            from_col: sibling.def.from_col.clone(),
+            qualified_projection,
+            to_col_pg_type: key_column_pg_type(pool, &to_table, &sibling.def.to_col).await?,
+            to_col: sibling.def.to_col.clone(),
+            columns: columns
+                .into_iter()
+                .filter(|c| projection_columns.contains(c))
+                .collect(),
+        });
+    }
+    Ok((own_columns, siblings))
 }
 
 /// The `to_col` text value off `row`, or `None` if `row` is absent or the
@@ -2669,9 +2764,9 @@ type DerivedRecompute = (
 );
 
 /// One from-side row the reverse fallback re-derives: the key to recompute,
-/// plus the row's prior image (issue #516) — see
+/// plus the row's prior image, if it needs one (issue #516) — see
 /// [`stage_reverse_recompute_fallback`].
-type FallbackRecompute = (DerivedRecompute, String);
+type FallbackRecompute = (DerivedRecompute, Option<String>);
 
 /// Stages the pre-#131 `Recompute` fallback (issue #131's own stopgap,
 /// shared since by every guard rejection before #134 and by
@@ -2694,13 +2789,30 @@ type FallbackRecompute = (DerivedRecompute, String);
 /// moved *out of* needing re-derivation, and only this record knows what
 /// that group was: the parent's old image. So the prior image is the live
 /// from-side row with this relationship's value, as it stood before the
-/// record, spliced in under each to-side column's
-/// [`apply_aggregate::forward_relationship_synthetic_column`] name — the
-/// parent's old image for a row matching `old_key`, and `NULL` for a row
-/// matching only `new_key` (it had no parent before). `accumulate_changes`
-/// takes a pre-resolved synthetic value as given rather than resolving it
-/// from the (already advanced) projection, so the old group is named and
-/// forced onto the full-recompute path alongside the live one.
+/// record, spliced in for each to-side column an aggregate groups by
+/// ([`ReverseRelationshipShape::group_by_columns`]) — the parent's old image
+/// for a row matching `old_key`, and `NULL` for a row matching only
+/// `new_key` (it had no parent before). `accumulate_changes` takes that
+/// value as given rather than resolving it from the (already advanced)
+/// projection, so the old group is named and forced onto the full-recompute
+/// path alongside the live one. When no aggregate groups by this
+/// relationship, a parent change can't move a row between groups, and the
+/// `Recompute` carries no image, as before #516.
+///
+/// The image also snapshots, from their projections, the current value of
+/// every other relationship an aggregate on `from_table` groups by
+/// ([`ReverseRelationshipShape::group_by_siblings`]). Without it, the image
+/// would resolve those from the projection when the recompute drains, and a
+/// sibling that changed in the meantime would name the wrong old group. Two
+/// relationships of one row changing in the same batch each stage a
+/// recompute of it, and the fold keeps the first prior image
+/// (`fold::fold`, `order by lsn, change_id`): the first-staged record's
+/// snapshot is taken before any sibling's projection advanced in this
+/// transaction, so it names the group the row was really in.
+///
+/// Values go under [`apply_aggregate::pre_change_relationship_column`], a
+/// key no real column can have, so a table column that happens to share a
+/// forward synthetic name is never mistaken for one.
 ///
 /// `row_columns` is `shape.from_table`'s live column list, resolved once by
 /// the caller via [`cached_row_columns`] — not re-introspected per call here
@@ -2720,13 +2832,7 @@ async fn stage_reverse_recompute_fallback(
     row_columns: &[String],
 ) -> Result<(), ApplyError> {
     let shape = &record.shape;
-    // Every to-side column either image carries, so a row with no parent
-    // before this record still gets each synthetic column, as `NULL`.
-    let to_columns: std::collections::BTreeSet<&String> = [&record.old_row, &record.new_row]
-        .into_iter()
-        .flatten()
-        .flat_map(|row| row.keys())
-        .collect();
+    let stage_images = !shape.group_by_columns.is_empty();
     for key in [old_key.clone(), new_key.clone()].into_iter().flatten() {
         let parent_before = if old_key.as_ref() == Some(&key) {
             record.old_row.as_ref()
@@ -2743,10 +2849,22 @@ async fn stage_reverse_recompute_fallback(
             row_columns,
         )
         .await?;
+        let mut sibling_values = Vec::with_capacity(shape.group_by_siblings.len());
+        for sibling in &shape.group_by_siblings {
+            let rows = sibling_projection_rows(txn, sibling, &from_rows).await?;
+            sibling_values.push((sibling, rows));
+        }
         for (from_key, from_row) in from_rows {
             if seen_keys.insert(from_key.clone()) {
-                let prior_image =
-                    fallback_prior_image(from_row, &shape.name, &to_columns, parent_before);
+                let prior_image = stage_images.then(|| {
+                    fallback_prior_image(
+                        from_row,
+                        &shape.name,
+                        &shape.group_by_columns,
+                        parent_before,
+                        &sibling_values,
+                    )
+                });
                 fallback.push((
                     (
                         shape.from_table.clone(),
@@ -2766,26 +2884,81 @@ async fn stage_reverse_recompute_fallback(
 /// A reverse-fallback `Recompute`'s prior image (issue #516, see
 /// [`stage_reverse_recompute_fallback`]): `from_row` with relationship
 /// `rel_name`'s value as it stood before the parent change — each of
-/// `to_columns` read off `parent_before`, or `NULL` when the row had no
-/// parent — spliced in under its forward synthetic column name, as JSON
-/// text.
+/// `columns` read off `parent_before`, or `NULL` when the row had no
+/// parent — and each sibling's current value (its projection row keyed by
+/// `from_row`'s join key, or `NULL` when it has none), spliced in under
+/// [`apply_aggregate::pre_change_relationship_column`], as JSON text.
 fn fallback_prior_image(
     mut from_row: Row,
     rel_name: &str,
-    to_columns: &std::collections::BTreeSet<&String>,
+    columns: &[String],
     parent_before: Option<&Row>,
+    siblings: &[(&GroupBySibling, HashMap<String, Row>)],
 ) -> String {
-    for column in to_columns {
+    let mut pre_change: Vec<(String, Option<String>)> = Vec::new();
+    for column in columns {
         let value = parent_before
-            .and_then(|parent| parent.get(*column))
+            .and_then(|parent| parent.get(column))
             .cloned()
             .flatten();
-        from_row.insert(
-            apply_aggregate::forward_relationship_synthetic_column(rel_name, column),
+        pre_change.push((
+            apply_aggregate::pre_change_relationship_column(rel_name, column),
             value,
-        );
+        ));
     }
+    for (sibling, rows) in siblings {
+        let parent = from_row
+            .get(&sibling.from_col)
+            .cloned()
+            .flatten()
+            .and_then(|key| rows.get(&key));
+        for column in &sibling.columns {
+            let value = parent.and_then(|p| p.get(column)).cloned().flatten();
+            pre_change.push((
+                apply_aggregate::pre_change_relationship_column(&sibling.name, column),
+                value,
+            ));
+        }
+    }
+    from_row.extend(pre_change);
     row_to_json_text(&from_row)
+}
+
+/// `sibling`'s projection rows (issue #516, see
+/// [`stage_reverse_recompute_fallback`]) for the join keys `from_rows`
+/// carry, keyed by join-key text, each holding just `sibling.columns` as
+/// text — read inside Phase 3's `txn`.
+async fn sibling_projection_rows(
+    txn: &Transaction<'_>,
+    sibling: &GroupBySibling,
+    from_rows: &[(String, Row)],
+) -> Result<HashMap<String, Row>, ApplyError> {
+    let keys: Vec<String> = from_rows
+        .iter()
+        .filter_map(|(_, row)| row.get(&sibling.from_col).cloned().flatten())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if keys.is_empty() || sibling.columns.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let key_ident = quote_ident(&sibling.to_col);
+    let filter = key_array_filter(&format!("p.{key_ident}"), sibling.to_col_pg_type.as_deref());
+    let doc_expr = row_as_text_jsonb_sql("p", &sibling.columns);
+    let sql = format!(
+        "select p.{key_ident}::text, e.key, e.value \
+         from {} p \
+         cross join lateral jsonb_each_text({doc_expr}) e \
+         where {filter}",
+        sibling.qualified_projection
+    );
+    let mut rows: HashMap<String, Row> = HashMap::new();
+    for db_row in txn.query(&sql, &[&keys]).await? {
+        rows.entry(db_row.get(0))
+            .or_default()
+            .insert(db_row.get(1), db_row.get(2));
+    }
+    Ok(rows)
 }
 
 /// Splices `parent_row`'s referenced to-side columns into a clone of
@@ -3404,29 +3577,58 @@ mod tests {
     use tokio_postgres::types::PgLsn;
 
     /// Issue #516: a fallback prior image is the from-side row with the
-    /// parent's value before the change spliced in under each to-side
-    /// column's forward synthetic name — `NULL` for every column when the row
-    /// had no parent — so `accumulate_changes` names the group it left.
+    /// parent's value before the change — `NULL` for every column when the
+    /// row had no parent — and each sibling relationship's snapshot, under
+    /// the out-of-band pre-change keys, so `accumulate_changes` names the
+    /// group it left.
     #[test]
     fn a_fallback_prior_image_carries_the_parents_value_before_the_change() {
         let from_row: Row = HashMap::from([
             ("id".to_string(), Some("10".to_string())),
             ("user_id".to_string(), Some("1".to_string())),
+            ("shop_id".to_string(), Some("7".to_string())),
         ]);
-        let id = "id".to_string();
-        let name = "name".to_string();
-        let to_columns = std::collections::BTreeSet::from([&id, &name]);
+        let columns = ["id".to_string(), "name".to_string()];
         let parent: Row = HashMap::from([
             ("id".to_string(), Some("1".to_string())),
             ("name".to_string(), Some("a".to_string())),
         ]);
+        let seller = GroupBySibling {
+            name: "seller".to_string(),
+            from_col: "shop_id".to_string(),
+            qualified_projection: String::new(),
+            to_col: "id".to_string(),
+            to_col_pg_type: None,
+            columns: vec!["title".to_string(), "city".to_string()],
+        };
+        let shops = HashMap::from([(
+            "7".to_string(),
+            Row::from([("title".to_string(), Some("s".to_string()))]),
+        )]);
+        let siblings = [(&seller, shops)];
+        let key = apply_aggregate::pre_change_relationship_column;
+        let expected = |buyer_id: Option<&str>, buyer_name: Option<&str>| {
+            let mut row = from_row.clone();
+            row.insert(key("buyer", "id"), buyer_id.map(str::to_string));
+            row.insert(key("buyer", "name"), buyer_name.map(str::to_string));
+            row.insert(key("seller", "title"), Some("s".to_string()));
+            row.insert(key("seller", "city"), None);
+            row_to_json_text(&row)
+        };
+
         assert_eq!(
-            fallback_prior_image(from_row.clone(), "buyer", &to_columns, Some(&parent)),
-            r#"{"__trellis_fwd_buyer_id":"1","__trellis_fwd_buyer_name":"a","id":"10","user_id":"1"}"#
+            fallback_prior_image(
+                from_row.clone(),
+                "buyer",
+                &columns,
+                Some(&parent),
+                &siblings
+            ),
+            expected(Some("1"), Some("a"))
         );
         assert_eq!(
-            fallback_prior_image(from_row, "buyer", &to_columns, None),
-            r#"{"__trellis_fwd_buyer_id":null,"__trellis_fwd_buyer_name":null,"id":"10","user_id":"1"}"#
+            fallback_prior_image(from_row.clone(), "buyer", &columns, None, &siblings),
+            expected(None, None)
         );
     }
 
@@ -7628,8 +7830,9 @@ pub async fn apply_and_mark_drained_many(
     // cases — a guard rejection's fairness escalation, a record the fast
     // path can't take safely, and definitions
     // `ReverseRelationshipShape::needs_recompute_fallback` excludes from the
-    // fast path. Issue #516: each carries its row's prior image, so an
-    // aggregate re-derives the group the parent change moved the row out of.
+    // fast path. Issue #516: each carries its row's prior image when an
+    // aggregate groups by the relationship, so the aggregate re-derives the
+    // group the parent change moved the row out of.
     for ((from_table, key, hop_gen, src_changed, origin_lsn), prior_image) in
         relationship_reverse_fallback
     {
@@ -7644,7 +7847,7 @@ pub async fn apply_and_mark_drained_many(
             hop_gen,
             group_key: None,
             src_changed,
-            prior_image: Some(prior_image),
+            prior_image,
             origin_lsn,
         });
     }

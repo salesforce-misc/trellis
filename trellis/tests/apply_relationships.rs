@@ -2037,3 +2037,219 @@ async fn a_to_side_rename_regroups_an_aggregate_grouped_by_two_relationships() {
         "user 1's orders leave (a, s) and (a, t)"
     );
 }
+
+/// One aggregate a [`both_relationships_change_in_one_batch`] scenario
+/// checks: its definition, and the same result as `(key, value)` text pairs
+/// read off the target and computed by Postgres from the sources.
+struct TwoRelationshipAggregate {
+    definition: &'static str,
+    target: &'static str,
+    oracle: &'static str,
+}
+
+/// Orders over users `a`/`b` and shops `s`/`t` (`buyer` and `seller`), with
+/// `aggregates` installed. Order 10 is user 1's and shop 1's only order.
+/// Renames user 1 to `c` and shop 1 to `u` in one batch, so each record's
+/// reverse fallback stages a recompute of order 10 and the two fold into one
+/// when they drain. Checks every aggregate against its oracle before and
+/// after.
+async fn both_relationships_change_in_one_batch(aggregates: &[TwoRelationshipAggregate]) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table shops (id integer primary key, title text); \
+             create table orders (id integer primary key, user_id integer, shop_id integer, \
+                                  amount integer); \
+             alter table users replica identity full; \
+             alter table shops replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into shops values (1, 's'), (2, 't'); \
+             insert into orders values (10, 1, 1, 5), (11, 2, 2, 7);",
+        )
+        .await
+        .expect("seed users, shops and orders");
+    for rel in [
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+        "RELATIONSHIP seller FROM orders.shop_id TO shops.id",
+    ] {
+        create_relationship(&db.pool, rel)
+            .await
+            .expect("declare relationship");
+    }
+    for aggregate in aggregates {
+        install_definition(
+            &db.pool,
+            aggregate.definition,
+            &columns(&[
+                ("id", ValueType::Numeric),
+                ("user_id", ValueType::Numeric),
+                ("shop_id", ValueType::Numeric),
+                ("amount", ValueType::Numeric),
+            ]),
+            "public",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("install {}: {e}", aggregate.definition));
+    }
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    for aggregate in aggregates {
+        assert_eq!(
+            text_pairs(&client, aggregate.target).await,
+            text_pairs(&client, aggregate.oracle).await,
+            "{}: before the change",
+            aggregate.definition
+        );
+    }
+
+    client
+        .batch_execute(
+            "update users set name = 'c' where id = 1; update shops set title = 'u' where id = 1",
+        )
+        .await
+        .expect("rename user 1 and shop 1");
+    stage_cdc(
+        &client,
+        "users",
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"a"}"#),
+        Some(r#"{"id":"1","name":"c"}"#),
+    )
+    .await;
+    stage_cdc(
+        &client,
+        "shops",
+        "1",
+        "update",
+        Some(r#"{"id":"1","title":"s"}"#),
+        Some(r#"{"id":"1","title":"u"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    for aggregate in aggregates {
+        assert_eq!(
+            text_pairs(&client, aggregate.target).await,
+            text_pairs(&client, aggregate.oracle).await,
+            "{}: order 10 leaves its old group",
+            aggregate.definition
+        );
+    }
+}
+
+/// Grouped by both relationships, order 10's old group is `(a, s)`. Each
+/// record's prior image carries its own relationship's old value; unless it
+/// also snapshots the other one, the surviving image resolves that from the
+/// already advanced projection and names `(a, u)` or `(c, s)` instead.
+#[tokio::test]
+async fn both_relationships_of_a_two_relationship_group_by_changing_in_one_batch_leave_no_stale_group()
+ {
+    both_relationships_change_in_one_batch(&[TwoRelationshipAggregate {
+        definition: "TRANSFORM spend_by_pair FROM orders GROUP BY buyer.name, seller.title \
+                     SELECT SUM(amount) AS total",
+        target: "select concat_ws('|', name, title), total::text from spend_by_pair",
+        oracle: "select concat_ws('|', u.name, s.title), sum(o.amount)::text from orders o \
+                 left join users u on u.id = o.user_id left join shops s on s.id = o.shop_id \
+                 group by u.name, s.title",
+    }])
+    .await;
+}
+
+/// Two aggregates, each grouped by one relationship (both `MIN`, so both
+/// take the fallback). The fold keeps one of order 10's two prior images,
+/// and whichever survives has to name `a` for the buyer aggregate and `s`
+/// for the seller one: order 10 is the only order in either.
+#[tokio::test]
+async fn two_single_relationship_aggregates_whose_relationships_change_in_one_batch_leave_no_stale_group()
+ {
+    both_relationships_change_in_one_batch(&[
+        TwoRelationshipAggregate {
+            definition: "TRANSFORM min_by_buyer FROM orders GROUP BY buyer.name \
+                         SELECT MIN(amount) AS least",
+            target: "select name, least::text from min_by_buyer",
+            oracle: "select u.name, min(o.amount)::text from orders o \
+                     left join users u on u.id = o.user_id group by u.name",
+        },
+        TwoRelationshipAggregate {
+            definition: "TRANSFORM min_by_seller FROM orders GROUP BY seller.title \
+                         SELECT MIN(amount) AS least",
+            target: "select title, least::text from min_by_seller",
+            oracle: "select s.title, min(o.amount)::text from orders o \
+                     left join shops s on s.id = o.shop_id group by s.title",
+        },
+    ])
+    .await;
+}
+
+/// A to-side `TRUNCATE` moves every from-side row into the `NULL` group. Its
+/// reverse recomputes (the `WholeKeyspace` trigger's, staged through
+/// `reverse_recomputes`, not the #516 fallback) carry no prior image, so
+/// only the `NULL` group is re-derived and every group the rows left keeps
+/// its old total. Found reviewing #516.
+#[tokio::test]
+#[ignore = "a to-side TRUNCATE leaves every relationship-keyed aggregate group stale (found reviewing #516, not yet filed)"]
+async fn a_to_side_truncate_leaves_no_stale_relationship_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table orders (id integer primary key, user_id integer, amount integer); \
+             alter table users replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into orders values (10, 1, 5), (11, 2, 7);",
+        )
+        .await
+        .expect("seed");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer");
+    install_definition(
+        &db.pool,
+        "TRANSFORM agg FROM orders GROUP BY buyer.name SELECT SUM(amount) AS v",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    let target = "select coalesce(name, '<null>'), v::text from agg";
+    let oracle = "select coalesce(u.name, '<null>'), sum(o.amount)::text from orders o \
+                  left join users u on u.id = o.user_id group by u.name";
+    assert_eq!(
+        text_pairs(&client, target).await,
+        text_pairs(&client, oracle).await
+    );
+    client
+        .execute("truncate users", &[])
+        .await
+        .expect("truncate");
+    stage_cdc(
+        &client,
+        "users",
+        TRUNCATE_SENTINEL_KEY,
+        "truncate",
+        None,
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(
+        text_pairs(&client, target).await,
+        text_pairs(&client, oracle).await
+    );
+}

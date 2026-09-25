@@ -134,10 +134,11 @@
 //! one. Two do: a target write's downstream propagation (the row's
 //! pre-write image, issue #315), and a to-one relationship's reverse
 //! fallback, `super::apply::stage_reverse_recompute_fallback`, which stages
-//! the from-side row with the parent's pre-change value already spliced in
-//! (issue #516 — a renamed, deleted or inserted parent moves every row
-//! grouped by it; [`augment_row_with_forward_relationships`] keeps that value
-//! rather than re-resolving it from the already-advanced projection).
+//! the from-side row with every `GROUP BY` relationship's pre-change value
+//! already spliced in (issue #516 — a renamed, deleted or inserted parent
+//! moves every row grouped by it; [`augment_row_with_forward_relationships`]
+//! keeps those values rather than re-resolving them from the
+//! already-advanced projections).
 //! Backfill, definition re-derive and the other reverse recomputes stage
 //! none. **If a hint-less change's live re-read finds the key already gone,
 //! there is no group to locate at all and the change is dropped**, leaving
@@ -1010,14 +1011,34 @@ pub(super) fn contribution_def(def: &TransformDef) -> TransformDef {
 /// share a to-side column name (e.g. both `author` and `editor` relate to a
 /// `users` table and both read `.name`) must not collide on the same
 /// synthetic column.
-///
-/// Issue #516: also the name a relationship reverse fallback's `Recompute`
-/// prior image carries the parent's *old* value under (see
-/// `super::apply::stage_reverse_recompute_fallback`), which
-/// [`augment_row_with_forward_relationships`] then takes as given.
-pub(super) fn forward_relationship_synthetic_column(rel: &str, column: &str) -> String {
+fn forward_relationship_synthetic_column(rel: &str, column: &str) -> String {
     format!("__trellis_fwd_{rel}_{column}")
 }
+
+/// Issue #516: the key a relationship reverse fallback's `Recompute` prior
+/// image carries relationship `rel`'s `column` value under, as it stood
+/// before the parent change (see
+/// `super::apply::stage_reverse_recompute_fallback`).
+/// [`augment_row_with_forward_relationships`] takes a value found under it as
+/// given rather than resolving it from the projection, which has already
+/// moved on.
+///
+/// Every such key starts with [`PRE_CHANGE_RELATIONSHIP_PREFIX`], which is
+/// longer than any Postgres identifier (63 bytes), so no real column of a
+/// source row, CDC image or target row can carry it: only the fallback puts
+/// a value there. The forward synthetic name
+/// ([`forward_relationship_synthetic_column`]) has no such guarantee, since a
+/// table may have a column literally named `__trellis_fwd_...`.
+pub(super) fn pre_change_relationship_column(rel: &str, column: &str) -> String {
+    format!("{PRE_CHANGE_RELATIONSHIP_PREFIX}{rel}.{column}")
+}
+
+/// See [`pre_change_relationship_column`].
+const PRE_CHANGE_RELATIONSHIP_PREFIX: &str =
+    "__trellis_pre_change_relationship_value/longer_than_any_postgres_identifier/";
+
+// Postgres truncates an identifier to NAMEDATALEN - 1 = 63 bytes.
+const _: () = assert!(PRE_CHANGE_RELATIONSHIP_PREFIX.len() > 63);
 
 /// One resolved `<rel>.<column>` reference [`build_forward_relationship_shape`]
 /// rewrote into a synthetic `Column` — `from_col` is the from-row's own join
@@ -1030,6 +1051,8 @@ struct ForwardRelationshipSynthetic {
     from_col: String,
     to_col: String,
     synthetic: String,
+    /// [`pre_change_relationship_column`] for this reference (issue #516).
+    pre_change: String,
 }
 
 /// Issue #136's forward-path counterpart to [`super::apply`]'s
@@ -1119,6 +1142,7 @@ fn build_forward_relationship_shape(
                 from_col: join.from_col.clone(),
                 to_col: column.clone(),
                 synthetic: synthetic_name.clone(),
+                pre_change: pre_change_relationship_column(&join.name, column),
             });
             synthetic_map.insert(column.clone(), synthetic_name);
         }
@@ -1204,9 +1228,9 @@ fn group_by_row_columns(group_by: &[GroupByKey]) -> Vec<String> {
 /// augmented row, it just has no resolved value for this particular
 /// row/side.
 ///
-/// A synthetic column `row` already carries is kept as-is (issue #516): only
-/// a reverse fallback's prior image carries one, holding the value the row
-/// read before its parent changed.
+/// A value `row` carries under [`pre_change_relationship_column`] is taken
+/// as given (issue #516): only a reverse fallback's prior image carries one,
+/// holding the value the row read before its parent changed.
 ///
 /// # Panics
 ///
@@ -1232,7 +1256,8 @@ fn augment_row_with_forward_relationships<'a>(
         // value this row read before its parent changed. The projection has
         // moved on to the new value by now, so resolving it again would name
         // the row's current group, not the one it left.
-        if row.contains_key(&s.synthetic) {
+        if let Some(value) = row.get(&s.pre_change) {
+            augmented.insert(s.synthetic.clone(), value.clone());
             continue;
         }
         let value = row.get(&s.from_col).cloned().flatten().and_then(|key| {
@@ -4873,12 +4898,14 @@ mod tests {
         );
     }
 
-    /// Issue #516: a row that already carries a relationship's synthetic
-    /// value (a reverse fallback's prior image, holding the parent's value
-    /// before it changed) keeps it; any other row resolves it from the
-    /// settled projection, which already holds the new value.
+    /// Issue #516: a row carrying a relationship's pre-change value (a
+    /// reverse fallback's prior image, holding the parent's value before it
+    /// changed) keeps it; any other row resolves it from the settled
+    /// projection, which already holds the new value. That includes a row
+    /// with a real column that happens to share the forward synthetic name:
+    /// only the out-of-band pre-change key counts.
     #[test]
-    fn a_pre_resolved_relationship_value_is_not_resolved_again() {
+    fn a_pre_change_relationship_value_is_not_resolved_again() {
         use crate::defs::model::RelationshipCardinality;
         let synthetic_name = forward_relationship_synthetic_column("buyer", "name");
         let synthetic = vec![ForwardRelationshipSynthetic {
@@ -4886,6 +4913,7 @@ mod tests {
             from_col: "user_id".to_string(),
             to_col: "name".to_string(),
             synthetic: synthetic_name.clone(),
+            pre_change: pre_change_relationship_column("buyer", "name"),
         }];
         let rel_ctx = eval::RelationshipContext::new(HashMap::from([(
             "buyer".to_string(),
@@ -4907,12 +4935,20 @@ mod tests {
             ("user_id".to_string(), Some("1".to_string())),
         ]);
         let mut prior = live.clone();
-        prior.insert(synthetic_name.clone(), Some("a".to_string()));
+        prior.insert(
+            pre_change_relationship_column("buyer", "name"),
+            Some("a".to_string()),
+        );
+        let mut colliding = live.clone();
+        colliding.insert(synthetic_name.clone(), Some("a real column".to_string()));
 
         let resolved = augment_row_with_forward_relationships(&live, Some(&rel_ctx), &synthetic);
         assert_eq!(resolved.get(&synthetic_name), Some(&Some("c".to_string())));
         let kept = augment_row_with_forward_relationships(&prior, Some(&rel_ctx), &synthetic);
         assert_eq!(kept.get(&synthetic_name), Some(&Some("a".to_string())));
+        let not_kept =
+            augment_row_with_forward_relationships(&colliding, Some(&rel_ctx), &synthetic);
+        assert_eq!(not_kept.get(&synthetic_name), Some(&Some("c".to_string())));
     }
 
     /// A plan with `Sum`, `Avg`, `Count`, and `RecomputeOnly` fields over
