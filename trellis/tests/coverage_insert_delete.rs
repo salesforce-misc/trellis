@@ -3,20 +3,22 @@
 //! group, so the horizon check never ran and a group the delete emptied kept
 //! the value a forced recompute had counted.
 //!
-//! Here the horizon is a direct aggregate build's: the row is inserted after
-//! the build's coverage fence and read by the build, then deleted after
-//! go-live, and both CDC changes drain live in one batch. The test drops the
-//! build's coverage record so the go-live catch-up enumerates the source,
-//! which on its own can't repair the group: it only visits keys the source
-//! still has. (Found while investigating #468; the reproduction comes from
-//! that investigation's WIP commit 41d260b.) `apply_aggregate.rs` covers the
-//! same fold deterministically, without a build.
+//! Here the horizon is a direct aggregate build's: the row is inserted while
+//! the build is held just before its source read, so the build's own read
+//! picks it up, then deleted after go-live, and both CDC changes drain live
+//! in one batch. The go-live catch-up always re-reads its source now
+//! (`backfill_coverage` is retired, issues #468/#485), which on its own can't
+//! repair the group: enumeration only visits keys the source still has, and
+//! by the time it runs the row is gone. (Found while investigating #468; the
+//! reproduction comes from that investigation's WIP commit 41d260b.)
+//! `apply_aggregate.rs` covers the same fold deterministically, without a
+//! build.
 //!
 //! The build is held with event triggers on advisory locks the test holds:
-//! one at the aggregate build's first `DROP TABLE` (after the coverage fence,
-//! before the source read) and one at its `ALTER TABLE` (after the read,
-//! before the target write). Neither statement has an xid when the trigger
-//! fires, so the held build doesn't hold back the seal gate.
+//! one at the aggregate build's first `DROP TABLE` (before the source read)
+//! and one at its `ALTER TABLE` (after the read, before the target write).
+//! Neither statement has an xid when the trigger fires, so the held build
+//! doesn't hold back the seal gate.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -215,10 +217,11 @@ fn row_4(sku: &str) -> String {
 }
 
 /// The issue's probe (deleted after go-live) with a group of one row, and the
-/// catch-up forced to enumerate. The insert (below the build's recompute
-/// horizon) and the delete (above it) drain live in one batch and fold to a
-/// change with neither image, which names no group, so the horizon check
-/// never runs and group `z` keeps the build's `1000`.
+/// catch-up's always-on enumeration (`backfill_coverage` retired, #468/#485).
+/// The insert (below the build's recompute horizon) and the delete (above it)
+/// drain live in one batch and fold to a change with neither image, which
+/// names no group, so the horizon check never runs and group `z` keeps the
+/// build's `1000`.
 #[tokio::test]
 async fn a_group_emptied_across_the_build_horizon_is_removed_even_by_an_enumerating_catch_up() {
     let cluster = TestCluster::start();
@@ -244,10 +247,6 @@ async fn a_group_emptied_across_the_build_horizon_is_removed_even_by_an_enumerat
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
-    client
-        .batch_execute("delete from backfill_coverage")
-        .await
-        .expect("drop coverage");
     discharge_markers(&db.pool, &mut client).await;
     assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "2")]));
 }
