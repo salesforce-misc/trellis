@@ -144,9 +144,13 @@ async fn commit_and_stage(client: &mut Client, sql: &str, change: impl Fn(PgLsn)
 }
 
 fn cdc(op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedChange {
+    cdc_for("4", op, lsn, old, new)
+}
+
+fn cdc_for(key: &str, op: CdcOp, lsn: PgLsn, old: Option<&str>, new: Option<&str>) -> StagedChange {
     StagedChange::Cdc {
         src_table: "public.sales".to_string(),
-        key: "4".to_string(),
+        key: key.to_string(),
         op,
         lsn: Some(lsn),
         old_image: old.map(str::to_string),
@@ -216,7 +220,10 @@ async fn status_of(client: &Client, target: &str) -> String {
 
 async fn totals(client: &Client) -> Vec<(String, String)> {
     client
-        .query("select sku, total::text from sku_totals order by sku", &[])
+        .query(
+            "select sku, coalesce(total::text, 'NULL') from sku_totals order by sku",
+            &[],
+        )
         .await
         .expect("read sku_totals")
         .into_iter()
@@ -419,4 +426,72 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(ids, vec![1, 2, 3]);
+}
+
+/// The sweep also runs over a definition that is already applying, which can
+/// have deltas staged but not yet drained. Group `b`'s only row is deleted
+/// once the definition is `catching_up`, so that delete is applied rather
+/// than skipped, but it hasn't drained when the go-live sweep finds `b`
+/// empty and drops its row. A new row lands in `b` after the discharge, and
+/// both deltas drain against a group with no row. The sweep raised the
+/// target's extinct horizon above the delete, so `b` is re-derived from the
+/// source (50). Folded as deltas from nothing instead, the delete subtracts
+/// a row the target no longer counts: `b` would be left at a count of 0 and
+/// a `NULL` total, with row 5 in the source.
+#[tokio::test]
+async fn a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let build = start_held_build(&db.pool, &client).await;
+    release(&client, BEFORE_READ).await;
+    release(&client, AFTER_READ).await;
+    build.await.expect("build task");
+    assert_eq!(status_of(&client, "public.sku_totals").await, "catching_up");
+
+    commit_and_stage(
+        &mut client,
+        "delete from public.sales where id = 3",
+        |lsn| {
+            cdc_for(
+                "3",
+                CdcOp::Delete,
+                lsn,
+                Some(r#"{"id":"3","sku":"b","amount":"2"}"#),
+                None,
+            )
+        },
+    )
+    .await;
+    publication::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
+    assert_eq!(
+        totals(&client).await,
+        expected(&[("a", "12")]),
+        "the sweep dropped group b before its delete drained"
+    );
+
+    commit_and_stage(
+        &mut client,
+        "insert into public.sales values (5, 'b', 50)",
+        |lsn| {
+            cdc_for(
+                "5",
+                CdcOp::Insert,
+                lsn,
+                None,
+                Some(r#"{"id":"5","sku":"b","amount":"50"}"#),
+            )
+        },
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+    assert_eq!(totals(&client).await, expected(&[("a", "12"), ("b", "50")]));
 }

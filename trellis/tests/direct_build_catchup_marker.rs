@@ -20,9 +20,10 @@
 //! only after the build finishes, on top of the build's own count of it. For an
 //! aggregate the recompute horizon the build stamps on each group row sends
 //! that delta to re-derive its group. Those tests check the target before
-//! the go-live catch-up runs: the horizon alone must keep it right, however the late delta arrives (still in the ring, staged late by
-//! a lagging intake, or released from quarantine), and whether it is on the
-//! source or on a relationship's to-side table.
+//! the go-live catch-up runs: the horizon alone must keep it right, however
+//! the late delta arrives (still in the ring, staged late by a lagging
+//! intake, or released from quarantine), and whether it is on the source or
+//! on a relationship's to-side table.
 
 use std::collections::HashMap;
 use std::time::Duration;

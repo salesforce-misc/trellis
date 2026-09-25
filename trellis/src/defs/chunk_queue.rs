@@ -1338,8 +1338,8 @@ mod tests {
     }
 
     /// Issue #419: a direct-build job whose worker dies is reclaimed and
-    /// rerun by another worker, and finishing it flips the definition `live`
-    /// with its go-live catch-up. The build records its read as the recompute
+    /// rerun by another worker, and finishing it moves the definition to
+    /// `catching_up` with its go-live catch-up parked. The build records its read as the recompute
     /// horizon of every group row it writes and of the target itself, so a
     /// streamed delta for a commit it read re-derives its group rather than
     /// counting the commit twice.

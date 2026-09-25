@@ -200,7 +200,11 @@ fence has settled:
   argument about which deletes drained when, only that anything missing from
   its snapshot drains after the flip, which the discharge running on the only
   sealer gives. For a 1-1 target it is exact. For an aggregate the anti-join
-  and the re-read read two snapshots, which leaves #436's short race.
+  and the re-read read two snapshots, which leaves #436's short race. A
+  `catching_up` definition already applies CDC, so a group the anti-join
+  deletes can still have deltas staged for it. Like any live read that finds
+  a group empty, the discharge raises the target's extinct horizon (#321),
+  and such a delta re-derives the group rather than applying to nothing.
 - **The coverage fence and `backfill_coverage` are retired** (issues #468,
   #485). A coverage record let a direct build's go-live catch-up skip a table
   none of whose rows had changed since a fence taken before the build read

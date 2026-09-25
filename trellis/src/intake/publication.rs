@@ -782,16 +782,17 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
 ///   ([`crate::defs::backfill::plan_one_to_one_chunks`]), and the transaction
 ///   persists them as `backfill_chunks` rows and moves the definition to
 ///   `backfilling` together (`defs::chunk_queue::dispatch_one_to_one`). Drain
-///   threads execute the chunks, and the last one flips it `live` and parks
-///   its go-live catch-up.
+///   threads execute the chunks, and the last one moves it to `catching_up`
+///   and parks its go-live catch-up, whose discharge flips it `live`
+///   ([`go_live_caught_up`]).
 /// - **An aggregate or relationship-enriched 1-1 definition**: the
 ///   transaction enqueues one direct-build job as a `backfill_chunks` row and
 ///   moves the definition to `backfilling` together
 ///   (`defs::chunk_queue::dispatch_direct_build`), after a catalog-only check
 ///   that the direct build can render it
 ///   ([`crate::defs::backfill::check_direct_build`]). A drain thread runs the
-///   whole ADR-0007 build, and finishing it flips the definition `live` and
-///   parks its go-live catch-ups, as for the last chunk.
+///   whole ADR-0007 build, and finishing it moves the definition to
+///   `catching_up` and parks its go-live catch-ups, as for the last chunk.
 /// - **The `Unsupported` fallback** goes through the ring enumeration below,
 ///   and flips `waiting_to_backfill` -> `live` as the last statement of the
 ///   transaction, together with its go-live catch-up parks. There is no
@@ -1206,12 +1207,13 @@ async fn discharge_marker(
     // rollback below (including the `Deferred` and error paths, since both
     // drop `txn` without committing), the deletes roll back with everything
     // else.
-    super::resume_orphans::delete_orphaned_target_rows(
+    let mut emptied = super::resume_orphans::delete_orphaned_target_rows(
         &txn,
         &waiting,
         TransformStatus::WaitingToBackfill,
     )
-    .await?;
+    .await?
+    .emptied_aggregates;
     // Every definition `go_live_caught_up` flips below is among these: one
     // that is `catching_up` by then but not now got there through
     // `park_catch_up`, which parked a marker this pass doesn't delete on a
@@ -1222,12 +1224,15 @@ async fn discharge_marker(
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-    super::resume_orphans::delete_orphaned_target_rows(
-        &txn,
-        &catching_up_now,
-        TransformStatus::CatchingUp,
-    )
-    .await?;
+    emptied.extend(
+        super::resume_orphans::delete_orphaned_target_rows(
+            &txn,
+            &catching_up_now,
+            TransformStatus::CatchingUp,
+        )
+        .await?
+        .emptied_aggregates,
+    );
     let enumerate = !ring.is_empty()
         || crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?;
     if enumerate {
@@ -1277,6 +1282,9 @@ async fn discharge_marker(
     .await?;
     go_live(&txn, &ring).await?;
     go_live_caught_up(&txn, &marker.table, catching_up).await?;
+    // A group the sweeps deleted can still have deltas staged for it; see
+    // `resume_orphans`' "Pending deltas on a deleted group".
+    super::resume_orphans::raise_extinct_horizons(&txn, &emptied).await?;
     if enumerate {
         txn.execute("select pg_notify($1, '')", &[&wake_channel])
             .await?;

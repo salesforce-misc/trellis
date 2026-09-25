@@ -220,7 +220,11 @@ drain threads.
 
   Each deleted row goes through the target-mutation seam, so a chained reader
   re-derives from it. For a 1-1 target the delete is exact. For an aggregate
-  it and the read see two snapshots, which leaves a short race (#436).
+  it and the read see two snapshots, which leaves a short race (#436). A
+  deleted group can also still have deltas staged for it (a `catching_up`
+  definition applies CDC), so the discharge raises the target's extinct
+  horizon (#321) too, and such a delta re-derives the group from the source
+  instead of subtracting from nothing.
 
 ### A fresh install
 

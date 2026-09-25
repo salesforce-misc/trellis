@@ -96,6 +96,32 @@
 //! full-recompute path, exactly as it already did for an image-less change —
 //! so an enumerated `Recompute`'s intent survives whatever it folds with.
 //!
+//! The "gap" before `DECLARE` is not one statement long: the discharge
+//! sweeps every target first (each a full anti-join over its source), so
+//! the first target's gap also spans the sweeps after it.
+//!
+//! ## Pending deltas on a deleted group
+//!
+//! A group the sweep deletes can still have deltas staged for it: CDC
+//! committed before the sweep that hasn't drained yet, which the definition
+//! applies once it drains (it is `live` or `catching_up` by then). That is
+//! routine for a `catching_up` definition, which has been applying since
+//! its build finished. Such a delta lands on a group with no row, and if
+//! the group has been refilled by then, apply's existence check keeps it,
+//! so a delete the sweep already accounted for is subtracted from nothing
+//! (the group is left at a count of 0 and a `NULL` total, with a row in the
+//! source).
+//!
+//! This is the situation issue #321's extinct horizon exists for: a live
+//! read (here, the anti-join) found a group empty while deltas for commits
+//! it saw may still be in flight. So the discharge raises the extinct
+//! horizon of every aggregate target the sweep deleted from
+//! ([`raise_extinct_horizons`]), in the same transaction, and a delta on a
+//! group with no row at or below it re-derives the group from the source.
+//! `a_group_swept_with_its_delete_still_staged_is_rederived_when_refilled`
+//! pins this. A direct-build rebuild raises it again after its read, which
+//! is at least as high.
+//!
 //! # Which definitions are swept
 //!
 //! The discharge sweeps two sets, each scoped to the status the discharge
@@ -178,11 +204,24 @@ struct Match {
     joins: String,
 }
 
+/// What one [`delete_orphaned_target_rows`] call deleted.
+#[derive(Debug, Default)]
+pub(super) struct Swept {
+    /// Target rows deleted, across every swept target.
+    pub(super) deleted: usize,
+    /// The aggregate targets it deleted at least one group from, whose
+    /// extinct horizons the caller must raise before it commits
+    /// ([`raise_extinct_horizons`]).
+    pub(super) emptied_aggregates: BTreeSet<String>,
+}
+
 /// Deletes, from the target of each of `ids` that is still in `status`,
 /// every row no row of its source backs any more, and reports each deleted
-/// key through the target-mutation seam in `txn`. Returns how many rows it
-/// deleted in all. See the module doc for why this must run before the
-/// discharge's enumeration is declared.
+/// key through the target-mutation seam in `txn`. See the module doc for why
+/// this must run before the discharge's enumeration is declared, and
+/// "Pending deltas on a deleted group" for why the caller must pass the
+/// returned [`Swept::emptied_aggregates`] to [`raise_extinct_horizons`]
+/// in the same transaction.
 ///
 /// `status` is the status the caller read `ids` in: `waiting_to_backfill`
 /// for the definitions a discharge dispatches, `catching_up` for the ones
@@ -192,9 +231,10 @@ pub(super) async fn delete_orphaned_target_rows(
     txn: &Transaction<'_>,
     ids: &[i64],
     status: TransformStatus,
-) -> Result<usize, IntakeError> {
+) -> Result<Swept, IntakeError> {
+    let mut swept = Swept::default();
     if ids.is_empty() {
-        return Ok(0);
+        return Ok(swept);
     }
     let defs = txn
         .query(
@@ -204,7 +244,6 @@ pub(super) async fn delete_orphaned_target_rows(
         )
         .await?;
     let mut mutations = TargetMutations::new();
-    let mut total = 0;
     for row in defs {
         let text: String = row.get(0);
         let target: String = row.get(1);
@@ -243,11 +282,39 @@ pub(super) async fn delete_orphaned_target_rows(
                 deleted,
                 "dropped target rows the source no longer backs"
             );
+            if matches!(def.key_space, KeySpace::Aggregate { .. }) {
+                swept.emptied_aggregates.insert(target);
+            }
         }
-        total += deleted;
+        swept.deleted += deleted;
     }
     mutations.flush(txn).await?;
-    Ok(total)
+    Ok(swept)
+}
+
+/// Raises the extinct horizon (issue #321, `aggregate_extinct_horizon`) of
+/// each of `targets` to the current WAL insert position: the sweep's
+/// counterpart of the raise apply makes after a live read finds a group
+/// empty. See "Pending deltas on a deleted group" in the module doc. The
+/// discharge calls it last, just before it commits, so it takes each
+/// horizon row's lock only for the transaction's final statements rather
+/// than across the intake wait; a later position is still at or above every
+/// commit the sweep saw.
+pub(super) async fn raise_extinct_horizons(
+    txn: &Transaction<'_>,
+    targets: &BTreeSet<String>,
+) -> Result<(), IntakeError> {
+    for target in targets {
+        txn.execute(
+            "insert into aggregate_extinct_horizon (target_table, lsn) \
+             values ($1, pg_current_wal_insert_lsn()) \
+             on conflict (target_table) do update \
+             set lsn = greatest(aggregate_extinct_horizon.lsn, excluded.lsn)",
+            &[target],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// A 1-1 target's key is the source's own key, column for column, by name
@@ -593,18 +660,26 @@ mod db_tests {
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
-        let deleted = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
+        let swept = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
             .await
             .expect("sweep");
-        assert_eq!(deleted, 0, "nothing to delete");
+        assert_eq!(swept.deleted, 0, "nothing to delete");
+        assert!(swept.emptied_aggregates.is_empty());
 
         txn.batch_execute("insert into public.orders_copy (id, a) values (-1, 0)")
             .await
             .expect("plant an orphan");
-        let deleted = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
+        let swept = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
             .await
             .expect("sweep");
-        assert_eq!(deleted, 1, "the planted orphan is the only row deleted");
+        assert_eq!(
+            swept.deleted, 1,
+            "the planted orphan is the only row deleted"
+        );
+        assert!(
+            swept.emptied_aggregates.is_empty(),
+            "a 1-1 target has no extinct horizon"
+        );
     }
 }
 
