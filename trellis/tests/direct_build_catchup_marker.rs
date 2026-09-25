@@ -668,6 +668,87 @@ async fn relationship_build_recovers_a_to_side_change_drained_during_the_build()
     );
 }
 
+/// Issue #476: a definition that reads several tables goes `live` only with
+/// the discharge of the last of its catch-ups. Discharging the source's
+/// catch-up while the to-side's is still pending (held back here by a
+/// failure backoff) leaves it `catching_up`: the to-side changes that drained
+/// while it was building are still missing.
+#[tokio::test]
+async fn a_multi_table_build_goes_live_only_with_its_last_catch_up() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table public.authors (id integer primary key, name text); \
+             create table public.comments (id integer primary key, author_id integer); \
+             alter table public.comments replica identity full; \
+             insert into public.authors values (1, 'a'); \
+             insert into public.comments values (200, 1)",
+        )
+        .await
+        .expect("create + seed authors and comments");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP comments FROM authors.id TO comments.author_id",
+    )
+    .await
+    .expect("create the comments relationship");
+    install_definition(
+        &db.pool,
+        "TRANSFORM author_totals FROM authors SELECT COUNT(comments.id) AS comment_count",
+        &columns(&[("id", ValueType::Numeric), ("name", ValueType::Text)]),
+        "public",
+    )
+    .await
+    .expect("install the relationship-enriched 1-1");
+    publication::settle_builds(&db.pool).await;
+    assert_eq!(
+        status_of(&client, "public.author_totals").await,
+        "catching_up"
+    );
+    assert_eq!(
+        pending_markers(&client).await,
+        vec!["public.authors".to_string(), "public.comments".to_string()]
+    );
+
+    client
+        .execute(
+            "update pending_backfill set next_attempt_at = now() + interval '1 hour' \
+             where table_name = 'public.comments'",
+            &[],
+        )
+        .await
+        .expect("hold the to-side's catch-up back");
+    discharge_markers(&db.pool, &mut client).await;
+    assert_eq!(
+        pending_markers(&client).await,
+        vec!["public.comments".to_string()],
+        "only the source's catch-up was due"
+    );
+    assert_eq!(
+        status_of(&client, "public.author_totals").await,
+        "catching_up",
+        "the to-side's catch-up is still pending"
+    );
+
+    client
+        .execute(
+            "update pending_backfill set next_attempt_at = null \
+             where table_name = 'public.comments'",
+            &[],
+        )
+        .await
+        .expect("let the to-side's catch-up run");
+    discharge_markers(&db.pool, &mut client).await;
+    assert!(pending_markers(&client).await.is_empty());
+    assert_eq!(
+        status_of(&client, "public.author_totals").await,
+        "live",
+        "the last catch-up's discharge takes it live"
+    );
+}
+
 /// Going live and parking the catch-ups commit together: when a park fails,
 /// the definition is not left `live` with some of its tables uncovered, which
 /// would lose a build-window change exactly as before the fix. The failure is
@@ -888,6 +969,11 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
         vec!["public.sales".to_string()],
         "discarding the superseded job parks the source's catch-up"
     );
+    assert_eq!(
+        status_of(&client, "public.sku_totals").await,
+        "catching_up",
+        "the target holds the superseded job's stale write until the catch-up runs (#476)"
+    );
     client
         .batch_execute("select txid_current()")
         .await
@@ -899,4 +985,5 @@ async fn a_superseded_job_writing_after_the_rebuild_went_live_is_repaired() {
         "1012",
         "the catch-up re-derives what the superseded job overwrote"
     );
+    assert_eq!(status_of(&client, "public.sku_totals").await, "live");
 }

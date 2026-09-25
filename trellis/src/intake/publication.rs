@@ -3201,6 +3201,60 @@ mod catch_up_tests {
             .get(0)
     }
 
+    /// Issue #476: an upstream rebuild writes its target outside the seam,
+    /// so finishing it parks a catch-up on that target and moves each
+    /// applying reader that is `live` to `catching_up` until it has run. A
+    /// frozen reader is left as it is; its resume rebuilds it anyway.
+    #[tokio::test]
+    async fn an_upstream_rebuild_moves_its_live_readers_to_catching_up() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = connect(&db).await;
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.u', 1)",
+            )
+            .await
+            .expect("seed source_table_versions");
+        let insert = async |target: &str, source: &str, status: &str| -> i64 {
+            client
+                .query_one(
+                    "insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, status) \
+                     values ($1, $2, 1, '', $3) returning id",
+                    &[&target, &source, &status],
+                )
+                .await
+                .expect("seed a definition")
+                .get(0)
+        };
+        let upstream = insert("public.u", "public.s", "catching_up").await;
+        let live = insert("public.r1", "public.u", "live").await;
+        let catching_up = insert("public.r2", "public.u", "catching_up").await;
+        let paused = insert("public.r3", "public.u", "paused").await;
+
+        park_target_catchup_if_read(&client, upstream)
+            .await
+            .expect("park the target catch-up");
+
+        assert_eq!(definition_status(&client, live).await, "catching_up");
+        assert_eq!(definition_status(&client, catching_up).await, "catching_up");
+        assert_eq!(definition_status(&client, paused).await, "paused");
+        let parked: Vec<String> = client
+            .query("select table_name from pending_backfill", &[])
+            .await
+            .expect("read markers")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            parked,
+            ["public.u"],
+            "the catch-up is on the rebuilt target"
+        );
+    }
+
     /// The marker's fence, or `None` while the discharge hasn't taken it
     /// yet.
     async fn marker_fence(client: &tokio_postgres::Client) -> Option<i64> {
