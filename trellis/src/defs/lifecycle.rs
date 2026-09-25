@@ -2,10 +2,10 @@
 //! **pause** and **drop**.
 //!
 //! ```text
-//! [*] --define--> Backfilling --> Live --pause--> Paused --drop--> [*]
-//!                                  ^                 |
-//!                                  +---- resume -----+   (a fresh backfill,
-//!                                                         not a catch-up)
+//! [*] --define--> Backfilling --> CatchingUp --> Live --pause--> Paused --drop--> [*]
+//!                                                ^                 |
+//!                                                +---- resume -----+   (a fresh backfill,
+//!                                                                       not a catch-up)
 //! ```
 //!
 //! Three things this module deliberately does *not* do, each straight out of
@@ -16,9 +16,10 @@
 //!    column the poison fuse already writes
 //!    [`TransformStatus::Quarantined`] into, and the claim-time fold stops
 //!    dispatching to the target for exactly the reason it already stops for a
-//!    quarantined one: [`super::catalog::dependents_of`]'s `t.status = 'live'`
-//!    predicate, the single gate every target resolution goes through. The
-//!    one place that gate did not previously reach is the durable
+//!    quarantined one: [`super::catalog::dependents_of`]'s applying-status
+//!    predicate ([`TransformStatus::is_applying`]), the single gate every
+//!    target resolution goes through. The one place that gate did not
+//!    previously reach is the durable
 //!    backfill-chunk queue, which is why
 //!    [`super::chunk_queue::claim_chunks`] now consults the same column —
 //!    same gate, extended to the one dispatch path that was outside it, not a
@@ -75,8 +76,8 @@ use crate::pool::{Pool, quote_ident};
 /// successes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PauseOutcome {
-    /// The definition was live (or backfilling, or waiting to backfill) and
-    /// is now [`TransformStatus::Paused`].
+    /// The definition was live (or catching up, backfilling, or waiting to
+    /// backfill) and is now [`TransformStatus::Paused`].
     Paused,
     /// The definition was already frozen — by an earlier pause, or by the
     /// poison fuse — and was left exactly as it was. ADR-0014's idempotency
@@ -609,7 +610,7 @@ async fn dependency_blockers(
 /// `FROM <target>`.
 ///
 /// The same graph walk [`super::catalog::dependents_of`] does, deliberately
-/// *without* its `t.status = 'live'` filter (issue #231): that filter is
+/// *without* its applying-status filter (issue #231): that filter is
 /// right for the claim-time fold, which must not write a CDC delta into a
 /// target whose baseline isn't settled, and wrong for a drop, which is asking
 /// the different question of whether anything still *needs* the target. It is
@@ -673,7 +674,7 @@ async fn relationships_naming(
 
 /// The bare target names of every registered transform that still reads the
 /// relationship `name` declared on the qualified `qualified_from` — every
-/// status, not only `live` (issue #231: a frozen reader still needs the
+/// status, not only applying ones (issue #231: a frozen reader still needs the
 /// relationship the day it resumes, and resuming rebuilds from source).
 ///
 /// Scoped to definitions whose own qualified source *is* `qualified_from`: a

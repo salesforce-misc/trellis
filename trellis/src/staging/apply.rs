@@ -175,20 +175,21 @@ pub enum ApplyError {
     /// gets a specific error rather than silently doing nothing.
     ColumnNotPaused { transform: String, column: String },
     /// [`super::quarantine::resume_column`] was asked to resume a column
-    /// whose owning definition is not currently [`crate::defs::model::TransformStatus::Live`]
-    /// — most concretely, a definition still `Backfilling` behind an
-    /// in-flight `backfill_chunks` queue nothing is draining. `resume_column`
+    /// whose owning definition is not currently applying
+    /// ([`crate::defs::model::TransformStatus::is_applying`]: `live` or
+    /// `catching_up`) — most concretely, a definition still `Backfilling`
+    /// behind an in-flight `backfill_chunks` queue nothing is draining. `resume_column`
     /// takes one snapshot of the *source* table and only clears
     /// `column_status` after writing it back, so any row a still-running
     /// backfill chunk inserts into the target *during* that window is never
     /// in the snapshot and never revisited once the column is unpaused —
     /// permanently stranding that row's column at NULL/default while
     /// `resume_column` reports success. This branch's cascade pause
-    /// (`defs::catalog::column_dependents`, unlike the `status = 'live'`
+    /// (`defs::catalog::column_dependents`, unlike the applying-status
     /// filtered paths CDC apply uses) can reach a downstream definition in
     /// exactly this state, so the gate is not just theoretical. Refusing to
-    /// resume until the definition reaches `Live` closes the window instead
-    /// of racing it.
+    /// resume until the definition's build has finished closes the window
+    /// instead of racing it.
     DefinitionNotLive { transform: String },
     /// A failure from [`crate::intake::publication`]'s backfill-marker
     /// machinery (issue #55: [`super::quarantine::resume_transform`]

@@ -328,7 +328,7 @@ pub async fn claim_chunks(
             // quiesces in-flight work, and a *backfilling* definition's
             // in-flight work lives here rather than in the claim-time fold.
             // So this consults the same `transform_definitions.status` the
-            // fold's own `status = 'live'` gate reads, and stops handing out
+            // fold's own applying-status gate reads, and stops handing out
             // new chunks for a frozen definition. A chunk a worker already
             // holds is deliberately left alone: per the ADR it is released on
             // its own heartbeat/TTL ([`reclaim_stale_chunks`]), never

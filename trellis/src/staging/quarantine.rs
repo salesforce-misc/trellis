@@ -1496,13 +1496,13 @@ pub async fn resume_column(
             // Reached via cascade (the initial pair was already gated above
             // before any side effects ran): a downstream dependent this
             // pause cascaded onto (`column_dependents`, unlike the
-            // `status = 'live'`-filtered lookups CDC apply uses, does not
-            // require the dependent to be live) can still be mid-backfill.
+            // applying-status-filtered lookups CDC apply uses, does not
+            // require the dependent to be applying) can still be mid-backfill.
             // Aborting the whole call here would misrepresent what already
             // happened, since earlier pairs in this queue may already be
             // fully resumed and committed — instead this pair alone is left
             // exactly as it was, still paused, to be resumed on a later
-            // call once its own definition reaches live.
+            // call once its own build has finished.
             continue;
         }
         recompute_column(pool, &def, &c).await?;

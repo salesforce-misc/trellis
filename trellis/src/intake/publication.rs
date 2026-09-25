@@ -992,10 +992,10 @@ async fn coverage_covers(txn: &Transaction<'_>, table: &str) -> Result<bool, Int
 /// # When the table is enumerated
 ///
 /// The enumeration stages one image-less `Recompute` row per source key, for
-/// every `live` reader of the table to re-derive. It runs when a ring-built
+/// every applying reader of the table to re-derive. It runs when a ring-built
 /// definition needs it, or when anything other than this pass's
 /// background-built definitions (chunks or a direct-build job, which read the
-/// table themselves) reads the table (a catch-up for `live` readers) — unless
+/// table themselves) reads the table (a catch-up for applying readers) — unless
 /// [`coverage_covers`] shows the table unchanged since a direct build folded
 /// it in (issue #79, bug B). A marker on a table only background-built
 /// definitions read, or nothing reads at all (issue #417: a fresh install parks a marker
@@ -3334,10 +3334,10 @@ mod catch_up_tests {
     }
 
     /// Issue #315, now covered by #431's fence: a definition reading another
-    /// definition's target goes live in a discharge's transaction, which
-    /// parks a catch-up on that target (never published, so only the
+    /// definition's target starts applying in a discharge's transaction,
+    /// which parks a catch-up on that target (never published, so only the
     /// target-mutation seam reaches the new reader). A seam writer that
-    /// checked for `live` readers before the flip committed reached nobody.
+    /// checked for applying readers before the flip committed reached nobody.
     /// If it is still open when the discharge first reads the catch-up, the
     /// fence must wait for it, or the catch-up reads the target without its
     /// write. The discharge used to re-park after commit to get a later
