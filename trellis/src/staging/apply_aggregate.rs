@@ -2259,7 +2259,7 @@ async fn upsert_group(
 /// `unnest(...)` — see [`keyset_unnest`]. Named `c0`, `c1`, … so they never
 /// collide with the source/target's own (arbitrarily-named) grouping columns
 /// when both appear in one query's join condition.
-fn keyset_col(i: usize) -> String {
+pub(crate) fn keyset_col(i: usize) -> String {
     format!("c{i}")
 }
 
@@ -2298,7 +2298,7 @@ fn keyset_unnest(group_by_types: &[ValueType], start: usize, with_ordinality: bo
 /// column `i` is `NULL`. Sorted, so the SQL [`keyset_match`] renders from
 /// them is deterministic. A batch with no `NULL` key has exactly one pattern,
 /// all `false`.
-fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
+pub(crate) fn null_patterns(arrays: &[Vec<Option<String>>]) -> Vec<Vec<bool>> {
     let group_count = arrays.first().map_or(0, Vec::len);
     (0..group_count)
         .map(|g| arrays.iter().map(|a| a[g].is_none()).collect())
@@ -2350,7 +2350,7 @@ fn keyset_match_source(plan: &AggregateTargetPlan, alias: &str, patterns: &[Vec<
 }
 
 /// [`keyset_match`]'s rendering over already-rendered column references.
-fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
+pub(crate) fn keyset_match_cols(cols: &[String], patterns: &[Vec<bool>]) -> String {
     let arms: Vec<String> = patterns
         .iter()
         .map(|pattern| {

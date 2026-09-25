@@ -246,18 +246,40 @@ fence has settled:
   (issue #485). Its re-read enumerates the keys the source still has, so it
   can't reach a key a skipped delete removed: a 1-1 row whose source row is
   gone, or an aggregate group with no source rows left. So the discharge
-  that flips a definition `live` runs #330's anti-join first, in the same
-  transaction and before the re-read's `DECLARE`
-  (`intake::resume_orphans`): it deletes every target row no source row
+  that flips a definition `live` also runs #330's anti-join
+  (`intake::resume_orphans`), and deletes every target row no source row
   backs, through the target-mutation seam. It reads state, so it needs no
-  argument about which deletes drained when, only that anything missing from
-  its snapshot drains after the flip, which the discharge running on the only
-  sealer gives. For a 1-1 target it is exact. For an aggregate the anti-join
-  and the re-read read two snapshots, which leaves #436's short race. A
-  `catching_up` definition already applies CDC, so a group the anti-join
-  deletes can still have deltas staged for it. Like any live read that finds
-  a group empty, the discharge raises the target's extinct horizon (#321),
-  and such a delta re-derives the group rather than applying to nothing.
+  argument about which deletes drained when, only that anything its
+  snapshot misses drains after the flip, which the discharge running on the
+  only sealer gives. A `catching_up` definition already applies CDC, so a
+  group the anti-join deletes can still have deltas staged for it. Like any
+  live read that finds a group empty, the discharge raises the target's
+  extinct horizon (#321), and such a delta re-derives the group rather than
+  applying to nothing.
+- **The anti-join is judged on the re-read's own snapshot** (issue #436). It
+  is a branch of the same cursor that enumerates the table, so one
+  statement reads both, and the discharge deletes the rows it returns by key
+  as the cursor is fetched, after the intake wait. A row unbacked on that
+  snapshot is deleted and rebuilt from nothing by whatever changes after
+  it; a row backed on it is re-derived by the enumeration's `Recompute`.
+  Neither depends on when the source changed, so it is exact for aggregates
+  as well as 1-1. An anti-join on a snapshot of its own, before or after the
+  re-read's, leaves an aggregate group stale either way: one emptied between
+  the anti-join and the re-read and refilled after the re-read is neither
+  deleted nor enumerated (#391 measured 103 where the source said 100), and
+  one empty at the re-read and refilled before a later anti-join is kept.
+  The other way #436 offered was to have each build clear exactly the key
+  space it enumerates: stage a group-level `Recompute` for every target
+  group as well as every source key, and let apply re-derive or delete each
+  one. That needs a new kind of ring row, keyed by target group rather than
+  source key and addressed to one definition rather than every reader of
+  the table, and apply would learn to consume it. The shared snapshot
+  needs neither, and it keeps what #330 settled: nothing is cleared up
+  front, so readers never see an empty target, and a discharge that rolls
+  back (a deferred intake wait, an error) deletes nothing, so no status
+  commits without its driver (#404). Deleting after the wait also means
+  the deleted rows stay locked only for the end of the discharge, not
+  across the intake wait (#503).
 - **The coverage fence and `backfill_coverage` are retired** (issues #468,
   #485). A coverage record let a direct build's go-live catch-up skip a table
   none of whose rows had changed since a fence taken before the build read
@@ -557,7 +579,7 @@ happens, and its role in this design.
 | Synchronous direct build inside registration | was `install_definition` → `backfill::backfill_definition` for aggregates and relationship-enriched 1-1 | **Done (#419).** The discharge dispatches it as one background job (`chunk_queue::dispatch_direct_build`) that a drain thread runs ([The direct-build job](#the-direct-build-job)) |
 | Registration's defer branch | was `install_definition`'s `defer_if_fence_unsettled`, and `create_definition_inner`'s `backfill_marker_unsettled` check | **Done (#418, #419).** Registration always defers to the discharge, and the branch is gone |
 | Publication-join discharge | `reconcile_publication` parks; `run_pending_backfills_until` fences and discharges | The one path. **Done (#431):** the discharge fences every marker the first time it sees it ([The join fence](#the-join-fence)) |
-| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs before it dispatches (#330); the direct build doesn't visit a group with no source rows, so it relies on that. The go-live catch-up's discharge runs the same deletion again (#485). #436 is the aggregate race left between the deletion and the re-read |
+| Transform resume (after `PAUSE`, quarantine or slot loss) | `staging::quarantine::resume_transform` parks a marker; the discharge reads | The one path. Dispatch by shape reroutes the rebuild onto the chunked or direct builder like any other capture, ring only for `Unsupported`. **Done (#418, #419):** a plain 1-1 rebuild is chunked, an aggregate or relationship-enriched 1-1 rebuild is a direct-build job, and a chunk or job planned before the resume is told apart by the definition's `fuse_rearmed_at` it recorded (`backfill_chunks.fuse_rearmed_at`). The discharge still deletes the target rows no source row backs when it dispatches (#330), so a reader doesn't see them for the length of the rebuild; the direct build doesn't visit a group with no source rows. The go-live catch-up's discharge runs the same deletion again (#485), judged on its re-read's snapshot, and that one is exact for aggregates too (#436) |
 | Explicit re-backfill | `Trellis::request_backfill` parks a marker | The one path |
 | Go-live catch-ups | `defs::catalog::complete_direct_backfill`, `intake::publication::go_live`, `park_target_catchup_if_read`, discarded-chunk parks in `chunk_queue`, all through `park_catch_up` | The one path. A chunked or direct build's go-live catch-up stays, because starting a build after the fence doesn't cover the changes that drain while it runs. Its discharge always re-reads (`backfill_coverage` is retired, #468), deletes the target rows no source row backs (#485), and flips the definition `live` (`go_live_caught_up`, #476) |
 | Direct-build coverage skip | was `backfill_coverage`, recorded by the direct-build job and read by the discharge's `coverage_covers` | **Retired (#468, #485).** It took a table whose row count and `xmin`s were unchanged since the build's fence for unchanged, which a row inserted and deleted during the build defeats. V48 drops the table |

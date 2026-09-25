@@ -211,9 +211,9 @@ drain threads.
   (above).
 - **A target drops rows its source no longer backs.** The read only reaches
   keys the source still has, so a 1-1 row whose source row is gone, or an
-  aggregate group with no source rows left, needs deleting outright. Before
-  the read, the discharge runs an anti-join `DELETE` against the source
-  (`intake::resume_orphans`) on two sets of targets:
+  aggregate group with no source rows left, needs deleting outright. The
+  discharge runs an anti-join against the source (`intake::resume_orphans`)
+  on two sets of targets:
   - each definition it dispatches, for rows whose source rows went away while
     a resumed definition was frozen (#330);
   - each `catching_up` definition that reads the marker's table, which
@@ -221,13 +221,17 @@ drain threads.
     that drained while the definition was `backfilling` was skipped, and its
     build may have read the row first.
 
-  Each deleted row goes through the target-mutation seam, so a chained reader
-  re-derives from it. For a 1-1 target the delete is exact. For an aggregate
-  it and the read see two snapshots, which leaves a short race (#436). A
-  deleted group can also still have deltas staged for it (a `catching_up`
-  definition applies CDC), so the discharge raises the target's extinct
-  horizon (#321) too, and such a delta re-derives the group from the source
-  instead of subtracting from nothing.
+  The anti-joins are branches of the read's own cursor, so a row is judged
+  unbacked on exactly the snapshot the read enumerates (#436). The discharge
+  deletes those rows by key as it fetches the cursor, after the intake wait.
+  A row unbacked on that snapshot is gone, and any later change that backs
+  it again rebuilds it; a row backed on it is re-derived by the read's
+  `Recompute`. So the sweep is exact for aggregates as well as 1-1. Each
+  deleted row goes through the target-mutation seam, so a chained reader
+  re-derives from it. A deleted group can also still have deltas staged for
+  it (a `catching_up` definition applies CDC), so the discharge raises the
+  target's extinct horizon (#321) too, and such a delta re-derives the group
+  from the source instead of subtracting from nothing.
 
 ### A fresh install
 

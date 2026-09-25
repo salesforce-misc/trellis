@@ -1,5 +1,5 @@
-//! Issues #330 and #485: the target rows a definition must drop because its
-//! source no longer has them.
+//! Issues #330, #485 and #436: the target rows a definition must drop because
+//! its source no longer has them.
 //!
 //! A backfill marker's discharge ([`super::publication::run_pending_backfills`])
 //! re-reads a table by enumerating its *current* keys as image-less
@@ -22,88 +22,80 @@
 //! group it left (`staging::apply_aggregate`'s module doc, "Image-less
 //! changes").
 //!
-//! So the discharge also deletes those rows directly, one anti-join `DELETE`
-//! per swept target: every target row with no source row that maps to its
-//! key. It is a target write like any other, so it goes through the
-//! target-mutation seam (`staging::target_mutations`, issue #315): each
-//! deleted key is recorded with its prior image and flushed as a downstream
-//! `Recompute` in the discharge's own transaction. The prior image is what
-//! lets a chained aggregate one hop down find the group the deleted row
-//! belonged to, since the live re-read finds nothing.
+//! So the discharge also deletes those rows directly: every target row with
+//! no source row that maps to its key, found by one anti-join per swept
+//! target ([`Sweep`]). It is a target write like any other, so it goes
+//! through the target-mutation seam (`staging::target_mutations`, issue
+//! #315): each deleted key is recorded with its prior image and flushed as a
+//! downstream `Recompute` in the discharge's own transaction. The prior image
+//! is what lets a chained aggregate one hop down find the group the deleted
+//! row belonged to, since the live re-read finds nothing.
 //!
-//! # Ordering: why this runs before the enumeration's `DECLARE`
+//! # One snapshot for the anti-join and the read (issue #436)
 //!
-//! [`delete_orphaned_target_rows`] runs inside the discharge transaction
-//! before the enumeration cursor is declared, so its snapshot is at or before
-//! the cursor's. Each statement in that `READ COMMITTED` transaction reads
-//! its own snapshot, so there is a short gap between the two, and a source
-//! change can commit in it. What makes CDC committed during the pass safe to
-//! lean on: its ring rows land in the active segment, and the maintenance
-//! loop running this pass is the only thing that seals one, so they drain
-//! only after the pass has flipped the definition `live` and are never
-//! skipped for it.
+//! The anti-joins are branches of the discharge's read: the one cursor that
+//! also enumerates the marker's table
+//! (`publication::declare_read`). One statement reads one snapshot, so a
+//! row is judged unbacked on exactly the snapshot, call it *S*, whose keys
+//! the enumeration stages. The cursor returns each unbacked row's key, and
+//! [`Sweep::delete`] deletes by key after the intake wait, when the read is
+//! fetched.
 //!
-//! - **A key deleted in the gap** is not orphaned yet when this runs and is
-//!   not enumerated either. Its CDC delete removes it. For an aggregate, the
-//!   delete's apply probes the group, finds no source row and deletes it
-//!   (`apply_aggregate_target`'s existence check), provided nothing has
-//!   repopulated the group by then (see the limits below).
-//! - **A key re-inserted in the gap** (after this deleted it) is enumerated,
-//!   and its `Recompute` re-derives it from live state.
-//! - **Anything after the `DECLARE`** is ordinary CDC, applied once the
-//!   definition is `live`, and ordered against the enumeration by the #312
-//!   catch-up gate.
+//! Every commit visible to *S* is in both halves of the read. Every commit
+//! after *S* reaches the ring's active segment, and the maintenance loop
+//! running this pass is the only thing that seals one, so its CDC drains
+//! only after this discharge commits, when a swept definition is `live` or
+//! `catching_up` and applies it. For a key of a swept target:
 //!
-//! Running it after the intake wait (as #330's spike did) is wrong for
-//! aggregates over a window as long as the wait: a group empty at the
-//! cursor's snapshot and repopulated before the anti-join survives at its
-//! pre-pause value, nothing enumerates it, and the new rows' CDC folds into
-//! that stale value as deltas. Deleting the group first means those deltas
-//! build it from nothing. `a_group_repopulated_after_the_enumeration_snapshot_holds_only_its_new_rows`
-//! pins this.
+//! - **Unbacked at *S***: deleted, whatever the source holds by the time the
+//!   delete runs. A change after *S* that backs the key again drains after
+//!   the commit and re-derives it: a 1-1 upsert, or an aggregate delta onto a
+//!   group with no row, which builds it from nothing or, at or below the
+//!   extinct horizon, re-derives it (see "Pending deltas on a deleted group").
+//! - **Backed at *S***: kept, and the source row backing it at *S* is
+//!   enumerated, so its `Recompute` re-derives the row or group from live
+//!   state. A change after *S* that empties the group folds with that
+//!   `Recompute` and still forces the re-derive (issue #392, #493), and
+//!   apply's existence check then deletes the group.
 //!
-//! Deleting a row the source *does* still back (a group repopulated in the
-//! gap) is harmless: the enumeration or CDC re-derives it. So the anti-join
-//! only has to be exact in one direction. It must never keep a row that no
-//! source row backs.
+//! Neither case depends on when, between *S* and the drain, the source
+//! changed, which is what closes the race #436 was filed for. Before it, the
+//! anti-join was a `DELETE` of its own, one per target, before the cursor's
+//! `DECLARE`. Its snapshot preceded *S*, by as much as every later target's
+//! anti-join (#485), so a group still backed when its anti-join ran, emptied
+//! before *S* and refilled after it, was neither deleted nor enumerated. It
+//! kept its stale value, and the CDC for the emptying and the refill folded
+//! onto it as deltas (#391 measured 103 where the source said 100). Moving
+//! that `DELETE` after the intake wait instead (as #330's spike did) opens
+//! the mirror race: a group empty at *S* and refilled before the `DELETE`
+//! survives at its stale value, since nothing enumerates it. Judging on *S*
+//! and deleting later has neither.
 //!
-//! ## What no placement closes (aggregates only)
+//! One kind of swept definition is outside that argument: one this discharge
+//! dispatches to a chunked or direct build is `backfilling` once it commits,
+//! so it skips the CDC after *S*. Its sweep here only removes early what its
+//! target held from before the pause, so a reader doesn't see those rows for
+//! the length of the build. The build's go-live catch-up sweeps again, and
+//! that sweep is exact by the argument above.
 //!
-//! The anti-join and the cursor read different snapshots, so *either* order
-//! leaves a short race. The two races mirror each other:
+//! # Why the delete comes last (issue #503)
 //!
-//! - Immediately after `DECLARE`: a group empty at the cursor's snapshot and
-//!   repopulated before the anti-join keeps its stale pre-pause value.
-//! - Before `DECLARE` (this code): a group still backed when the anti-join
-//!   runs, whose last rows are deleted before `DECLARE` and which is
-//!   repopulated before those deletes drain, keeps its stale value, and the
-//!   deletes and inserts fold onto it as deltas.
+//! The delete runs as the read is fetched, after the intake wait, and the
+//! enumeration branch comes first, so it runs at the end of the fetch. A
+//! target row the sweep deletes stays locked only from there to the
+//! discharge's commit, not across the intake wait, where a drain of an
+//! already-sealed segment that touched it used to wait for the discharge.
 //!
-//! This order was chosen because its race needs a group to both empty inside
-//! the gap and refill before the drain. Reading both on one snapshot would
-//! close it.
+//! Each delete also re-checks the definition's status, which by then is
+//! after the intake wait: a pause that landed since the discharge read it
+//! (#331) leaves the target as the pause found it, and its own resume comes
+//! back here. The dispatch and the flips that move a swept definition out of
+//! the status it was read in come after the fetch.
 //!
-//! A wider window used to remain here, unrelated to this module's ordering
-//! choice, and it also hit a fresh deferred definition's discharge: take an
-//! aggregate group whose every row in the cursor's snapshot is deleted after
-//! `DECLARE` (during the intake wait, say) and which is refilled before the
-//! drain. Each enumerated key's `Recompute` either found its row gone and
-//! was dropped, or folded with that row's CDC delete into a plain delta, so
-//! the group ended up as its target value (stale, or absent) plus the CDC
-//! deltas, never a forced recompute of its live contents. Issue #392 (#493)
-//! closed it: the fold now carries `has_recompute` through every merge, and
-//! `accumulate_changes` forces every group such a record names onto the
-//! full-recompute path, exactly as it already did for an image-less change —
-//! so an enumerated `Recompute`'s intent survives whatever it folds with.
-//!
-//! The "gap" before `DECLARE` is not one statement long: the discharge
-//! sweeps every target first (each a full anti-join over its source), so
-//! the first target's gap also spans the sweeps after it.
-//!
-//! ## Pending deltas on a deleted group
+//! # Pending deltas on a deleted group
 //!
 //! A group the sweep deletes can still have deltas staged for it: CDC
-//! committed before the sweep that hasn't drained yet, which the definition
+//! committed before *S* that hasn't drained yet, which the definition
 //! applies once it drains (it is `live` or `catching_up` by then). That is
 //! routine for a `catching_up` definition, which has been applying since
 //! its build finished. Such a delta lands on a group with no row, and if
@@ -136,24 +128,27 @@
 //!   (`go_live_caught_up`). A definition that reads several tables is swept
 //!   at each of its catch-ups; only the last one flips it.
 //!
+//! A discharge with nothing to enumerate (only background builds read the
+//! table) still declares the read over its sweep's branches alone, and
+//! fetches it at once: there is no intake wait to hold it.
+//!
 //! ## The go-live sweep (issue #485)
 //!
-//! Everything above is written for the ring rebuild, which goes `live` in
-//! the discharge's own transaction. A chunked or direct build runs on drain
-//! threads after the dispatching pass commits, and its definition stays
-//! `backfilling`, so its CDC is skipped, until the build finishes. It then
-//! moves to `catching_up` (it applies from then on) and parks its go-live
-//! catch-ups (#476). A source row deleted while it was `backfilling` is
-//! removed by nothing else: its chunk either copied it before the delete or
-//! never saw it, its CDC delete was skipped, and the catch-up's re-read only
-//! enumerates keys that still exist. So the sweep runs again at the
-//! discharge of each go-live catch-up, before its `DECLARE`, as above.
+//! A ring rebuild goes `live` in the discharge's own transaction. A chunked
+//! or direct build runs on drain threads after the dispatching pass
+//! commits, and its definition stays `backfilling`, so its CDC is skipped,
+//! until the build finishes. It then moves to `catching_up` (it applies from
+//! then on) and parks its go-live catch-ups (#476). A source row deleted
+//! while it was `backfilling` is removed by nothing else: its chunk either
+//! copied it before the delete or never saw it, its CDC delete was skipped,
+//! and the catch-up's re-read only enumerates keys that still exist. So the
+//! sweep runs again in the discharge of each go-live catch-up, in its read.
 //!
-//! The ordering argument carries over. Changes committed after the sweep
-//! drain after it, since this pass is the only sealer, and the definition
-//! applies them because it is already `catching_up`. For a 1-1 target the
-//! sweep is exact. For an aggregate the two-snapshot race described above
-//! remains (#436).
+//! A catch-up on a relationship's to-side table enumerates that table, not
+//! the definition's source, so a group its sweep keeps isn't re-derived by
+//! it. Its source's own catch-up does that: the definition goes `live` only
+//! once every table its build read has been re-read, and it applies every
+//! change after each re-read.
 //!
 //! # Keeping the anti-join hashable
 //!
@@ -162,16 +157,22 @@
 //! 50k-row 1-1 target in #330's spike. `=` lets Postgres hash it. A 1-1
 //! target's key is its `PRIMARY KEY`, all `NOT NULL`, so it always gets `=`.
 //! Every aggregate grouping column is nullable (`ddl::create_aggregate_target_table`,
-//! issue #128), so the delete is split by which grouping columns are `NULL`
-//! in the target row: within one such pattern a `NULL` column matches a
-//! source row whose key is `IS NULL`, and every other column matches with
+//! issue #128), so the anti-join is split by which grouping columns are
+//! `NULL` in the target row: within one such pattern a `NULL` column matches
+//! a source row whose key is `IS NULL`, and every other column matches with
 //! `=`. That's the same rule `apply_aggregate::keyset_match` applies per
-//! batch. There is one statement per pattern actually present in the target,
-//! usually one.
+//! batch. There is one branch per pattern present in the target when the
+//! sweep is planned, usually one. The patterns are read before *S*, so one
+//! more branch catches a row with any other pattern, with `IS NOT DISTINCT
+//! FROM`: it scans only the target rows no other branch covers, normally
+//! none. The cursor is planned for all its rows (`cursor_tuple_fraction`),
+//! not the first 10% a cursor is planned for by default, which could favor
+//! a nested loop.
 
 use std::collections::BTreeSet;
 
 use tokio_postgres::Transaction;
+use tokio_postgres::types::ToSql;
 
 use crate::defs::ast::{GroupByKey, KeySpace};
 use crate::defs::catalog::relationship_by_name_in;
@@ -180,6 +181,7 @@ use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
 use crate::defs::{TransformStatus, parse};
 use crate::pool::quote_ident;
+use crate::staging::apply_aggregate;
 use crate::staging::target_mutations::TargetMutations;
 
 use super::IntakeError;
@@ -204,7 +206,7 @@ struct Match {
     joins: String,
 }
 
-/// What one [`delete_orphaned_target_rows`] call deleted.
+/// What a discharge's sweep deleted ([`Sweep::finish`]).
 #[derive(Debug, Default)]
 pub(super) struct Swept {
     /// Target rows deleted, across every swept target.
@@ -215,81 +217,225 @@ pub(super) struct Swept {
     pub(super) emptied_aggregates: BTreeSet<String>,
 }
 
-/// Deletes, from the target of each of `ids` that is still in `status`,
-/// every row no row of its source backs any more, and reports each deleted
-/// key through the target-mutation seam in `txn`. See the module doc for why
-/// this must run before the discharge's enumeration is declared, and
-/// "Pending deltas on a deleted group" for why the caller must pass the
-/// returned [`Swept::emptied_aggregates`] to [`raise_extinct_horizons`]
-/// in the same transaction.
-///
-/// `status` is the status the caller read `ids` in: `waiting_to_backfill`
-/// for the definitions a discharge dispatches, `catching_up` for the ones
-/// its catch-up may flip `live`. A pause that landed since (#331) leaves the
-/// target as the pause found it, and its own resume comes back here.
-pub(super) async fn delete_orphaned_target_rows(
-    txn: &Transaction<'_>,
-    ids: &[i64],
+/// The tag the discharge read's enumeration branch selects. Each swept
+/// target's branches select its index in [`Sweep`] instead.
+pub(super) const ENUMERATION_TAG: i32 = -1;
+
+/// One target a [`Sweep`] covers.
+struct SweptTarget {
+    /// The definition, and the status the discharge read it in.
+    id: i64,
     status: TransformStatus,
-) -> Result<Swept, IntakeError> {
-    let mut swept = Swept::default();
-    if ids.is_empty() {
-        return Ok(swept);
-    }
-    let defs = txn
-        .query(
-            "select definition_text, target_table, source_table from transform_definitions \
-             where id = any($1) and status = $2 order by id",
-            &[&ids, &status.as_str()],
-        )
-        .await?;
-    let mut mutations = TargetMutations::new();
-    for row in defs {
-        let text: String = row.get(0);
-        let target: String = row.get(1);
-        let source_table: String = row.get(2);
-        let source_ident = ddl::qualified_source_table(&source_table);
-        let def =
-            parse(&text).unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
-        // Quoted: `identity_key_columns` resolves its argument with
-        // `to_regclass`, which would case-fold a bare mixed-case name.
-        let key_cols =
-            ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(&target)).await?;
-        if key_cols.is_empty() {
-            // Only a target dropped since the catalog read above: every
-            // target Trellis creates has a key.
-            tracing::debug!(target = %target, "rebuilt target is gone; nothing to sweep");
-            continue;
+    target: String,
+    target_ident: String,
+    key_cols: Vec<PrimaryKeyColumn>,
+    aggregate: bool,
+    /// The read's `UNION ALL` branches that find this target's unbacked
+    /// rows ([`orphan_branch_sql`]).
+    branches: Vec<String>,
+    /// The deleted row's encoded key, then its prior image if the seam wants
+    /// one.
+    returning: String,
+    has_image: bool,
+}
+
+/// The targets one discharge sweeps, and what it has deleted from them so
+/// far. See the module doc for the protocol: [`Sweep::add`] each set of
+/// definitions, declare the read over [`Sweep::branches`] (with the
+/// enumeration, if any, in the same statement), then pass each fetched page
+/// of unbacked keys to [`Sweep::delete`] and end with [`Sweep::finish`].
+#[derive(Default)]
+pub(super) struct Sweep {
+    targets: Vec<SweptTarget>,
+    mutations: TargetMutations,
+    swept: Swept,
+}
+
+impl Sweep {
+    /// Adds the target of each of `ids` that is still in `status`.
+    ///
+    /// `status` is the status the caller read `ids` in: `waiting_to_backfill`
+    /// for the definitions a discharge dispatches, `catching_up` for the ones
+    /// its catch-up may flip `live`. [`Sweep::delete`] checks it again, so a
+    /// pause that landed since (#331) leaves the target as the pause found
+    /// it, and its own resume comes back here.
+    pub(super) async fn add(
+        &mut self,
+        txn: &Transaction<'_>,
+        ids: &[i64],
+        status: TransformStatus,
+    ) -> Result<(), IntakeError> {
+        if ids.is_empty() {
+            return Ok(());
         }
-        let matching = match &def.key_space {
-            KeySpace::OneToOne => one_to_one_match(&key_cols),
-            KeySpace::Aggregate { group_by } => {
-                aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?
+        let defs = txn
+            .query(
+                "select id, definition_text, target_table, source_table \
+                 from transform_definitions where id = any($1) and status = $2 order by id",
+                &[&ids, &status.as_str()],
+            )
+            .await?;
+        for row in defs {
+            let id: i64 = row.get(0);
+            let text: String = row.get(1);
+            let target: String = row.get(2);
+            let source_table: String = row.get(3);
+            let def = parse(&text)
+                .unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
+            let target_ident = ddl::qualified_target_table_ident(&target);
+            // Quoted: `identity_key_columns` resolves its argument with
+            // `to_regclass`, which would case-fold a bare mixed-case name.
+            let key_cols = ddl::identity_key_columns(txn, &target_ident).await?;
+            if key_cols.is_empty() {
+                // Only a target dropped since the catalog read above: every
+                // target Trellis creates has a key.
+                tracing::debug!(target = %target, "swept target is gone; nothing to sweep");
+                continue;
             }
-        };
-        let deleted = delete_unbacked_rows(
-            txn,
-            &source_ident,
-            &target,
-            &key_cols,
-            &matching,
-            &mut mutations,
-        )
-        .await?;
-        if deleted > 0 {
-            tracing::info!(
-                target = %target,
-                deleted,
-                "dropped target rows the source no longer backs"
-            );
-            if matches!(def.key_space, KeySpace::Aggregate { .. }) {
-                swept.emptied_aggregates.insert(target);
+            let matching = match &def.key_space {
+                KeySpace::OneToOne => one_to_one_match(&key_cols),
+                KeySpace::Aggregate { group_by } => {
+                    aggregate_match(txn, &source_table, &target, group_by, &key_cols).await?
+                }
+            };
+            let tag = i32::try_from(self.targets.len()).expect("fewer than 2^31 swept targets");
+            let branches = orphan_branches(
+                txn,
+                tag,
+                &target_ident,
+                &ddl::qualified_source_table(&source_table),
+                &matching,
+            )
+            .await?;
+            let image_expr = self.mutations.image_sql(txn, &target, "t").await?;
+            let mut returning = ddl::pk_key_sql_expr(&key_cols, Some("t"));
+            if let Some(expr) = &image_expr {
+                returning.push_str(&format!(", ({expr})::text"));
             }
+            self.targets.push(SweptTarget {
+                id,
+                status,
+                target,
+                target_ident,
+                key_cols,
+                aggregate: matches!(def.key_space, KeySpace::Aggregate { .. }),
+                branches,
+                returning,
+                has_image: image_expr.is_some(),
+            });
         }
-        swept.deleted += deleted;
+        Ok(())
     }
-    mutations.flush(txn).await?;
-    Ok(swept)
+
+    /// Whether there is no target to sweep.
+    pub(super) fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Every target's `UNION ALL` branches for the discharge's read. Each
+    /// selects `(tag, NULL, key columns as text)`: the tag names the target
+    /// (for [`Sweep::delete`]), and the text array holds the unbacked row's
+    /// key columns in key order.
+    pub(super) fn branches(&self) -> impl Iterator<Item = &str> {
+        self.targets
+            .iter()
+            .flat_map(|t| t.branches.iter().map(String::as_str))
+    }
+
+    /// Deletes `keys` (key-column values as text, in key order) from the
+    /// target `tag` names, if its definition is still in the status
+    /// [`Sweep::add`] read it in, and records each deleted row through the
+    /// target-mutation seam.
+    ///
+    /// The read judged these rows unbacked on its snapshot, so this deletes
+    /// them by key, whatever the source holds by now: a key the source has
+    /// since backed again is re-derived by the change that backed it, which
+    /// drains after this discharge commits (see the module doc).
+    pub(super) async fn delete(
+        &mut self,
+        txn: &Transaction<'_>,
+        tag: i32,
+        keys: &[Vec<Option<String>>],
+    ) -> Result<(), IntakeError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let target = usize::try_from(tag)
+            .ok()
+            .and_then(|i| self.targets.get(i))
+            .unwrap_or_else(|| panic!("the discharge read returned an unknown sweep tag {tag}"));
+        let arity = target.key_cols.len();
+        let arrays: Vec<Vec<Option<String>>> = (0..arity)
+            .map(|j| keys.iter().map(|key| key[j].clone()).collect())
+            .collect();
+        let cols: Vec<String> = (0..arity).map(apply_aggregate::keyset_col).collect();
+        // Each value is cast back from its text on its own (rather than the
+        // array as a whole), so any key type with a text input works, an
+        // array-typed one included.
+        let typed: Vec<String> = target
+            .key_cols
+            .iter()
+            .zip(&cols)
+            .map(|(c, k)| format!("{k}::{} as {k}", c.data_type))
+            .collect();
+        let arrays_sql: Vec<String> = (1..=arity).map(|i| format!("${i}::text[]")).collect();
+        let target_cols: Vec<String> = target
+            .key_cols
+            .iter()
+            .map(|c| format!("t.{}", quote_ident(&c.name)))
+            .collect();
+        let sql = format!(
+            "delete from {} as t using (select {} from unnest({}) as u({})) as k \
+             where {} and exists ( \
+                 select 1 from transform_definitions where id = ${} and status = ${} \
+             ) \
+             returning {}",
+            target.target_ident,
+            typed.join(", "),
+            arrays_sql.join(", "),
+            cols.join(", "),
+            apply_aggregate::keyset_match_cols(
+                &target_cols,
+                &apply_aggregate::null_patterns(&arrays)
+            ),
+            arity + 1,
+            arity + 2,
+            target.returning,
+        );
+        let status = target.status.as_str();
+        let mut params: Vec<&(dyn ToSql + Sync)> =
+            arrays.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
+        params.push(&target.id);
+        params.push(&status);
+        let rows = txn.query(&sql, &params).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            target = %target.target,
+            deleted = rows.len(),
+            "dropped target rows the source no longer backs"
+        );
+        for row in &rows {
+            let prior = target.has_image.then(|| row.get::<_, String>(1));
+            self.mutations
+                .record(&target.target, row.get(0), prior, 0, None, None);
+        }
+        if target.aggregate {
+            self.swept.emptied_aggregates.insert(target.target.clone());
+        }
+        self.swept.deleted += rows.len();
+        Ok(())
+    }
+
+    /// Flushes every deleted row through the target-mutation seam, in `txn`,
+    /// and returns what the sweep deleted. The caller passes
+    /// [`Swept::emptied_aggregates`] to [`raise_extinct_horizons`] in the
+    /// same transaction ("Pending deltas on a deleted group").
+    pub(super) async fn finish(self, txn: &Transaction<'_>) -> Result<Swept, IntakeError> {
+        self.mutations.flush(txn).await?;
+        Ok(self.swept)
+    }
 }
 
 /// Raises the extinct horizon (issue #321, `aggregate_extinct_horizon`) of
@@ -413,114 +559,154 @@ async fn aggregate_match(
     })
 }
 
-/// Runs the anti-join `DELETE` for one target, once per pattern of `NULL`
-/// grouping columns present in it (see the module doc), recording every
-/// deleted key into `mutations`. Returns how many rows it deleted.
-async fn delete_unbacked_rows(
+/// The read's `UNION ALL` branches that select `target_ident`'s unbacked
+/// rows under `tag`: one per pattern of `NULL` grouping columns present in
+/// the target now (see the module doc), and, for a target with a nullable
+/// key column, one more for any other pattern.
+///
+/// The patterns are read here, before the read's snapshot, so a group with
+/// a new pattern can reach the target in between. The last branch catches
+/// it with `IS NOT DISTINCT FROM`, which can't hash, but it only scans the
+/// target rows no earlier branch covers: normally none.
+async fn orphan_branches(
     txn: &Transaction<'_>,
+    tag: i32,
+    target_ident: &str,
     source_ident: &str,
-    target: &str,
-    key_cols: &[PrimaryKeyColumn],
     matching: &Match,
-    mutations: &mut TargetMutations,
-) -> Result<usize, IntakeError> {
-    let target_ident = ddl::qualified_target_table_ident(target);
+) -> Result<Vec<String>, IntakeError> {
     let nullable: Vec<usize> = (0..matching.parts.len())
         .filter(|&i| matching.parts[i].nullable)
         .collect();
+    if nullable.is_empty() {
+        return Ok(vec![orphan_branch_sql(
+            tag,
+            target_ident,
+            source_ident,
+            matching,
+            &nullable,
+            OrphanPattern::Exactly(0),
+        )]);
+    }
     // Bit `j` set: the `j`th nullable column is `NULL`.
-    let patterns: Vec<u64> = if nullable.is_empty() {
-        vec![0]
-    } else {
-        let mask = nullable
-            .iter()
-            .enumerate()
-            .map(|(j, &i)| {
-                format!(
-                    "(case when t.{} is null then {} else 0 end)",
-                    matching.parts[i].target_col,
-                    1u64 << j
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" + ");
-        txn.query(
+    let mask = null_mask_sql(matching, &nullable);
+    let patterns: Vec<i64> = txn
+        .query(
             &format!("select distinct ({mask})::bigint from {target_ident} as t"),
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| row.get::<_, i64>(0) as u64)
-        .collect()
-    };
-
-    let key_expr = ddl::pk_key_sql_expr(key_cols, Some("t"));
-    let image_expr = mutations.image_sql(txn, target, "t").await?;
-    let image_select = match &image_expr {
-        Some(expr) => format!(", ({expr})::text"),
-        None => String::new(),
-    };
-    let returning = format!("{key_expr}{image_select}");
-    let mut deleted = 0;
-    for pattern in patterns {
-        let rows = txn
-            .query(
-                &orphan_delete_sql(
-                    &target_ident,
-                    source_ident,
-                    matching,
-                    &nullable,
-                    pattern,
-                    &returning,
-                ),
-                &[],
+        .map(|row| row.get::<_, i64>(0))
+        .collect();
+    let mut branches: Vec<String> = patterns
+        .iter()
+        .map(|&pattern| {
+            orphan_branch_sql(
+                tag,
+                target_ident,
+                source_ident,
+                matching,
+                &nullable,
+                OrphanPattern::Exactly(pattern as u64),
             )
-            .await?;
-        deleted += rows.len();
-        for row in rows {
-            let prior = image_expr.as_ref().map(|_| row.get::<_, String>(1));
-            mutations.record(target, row.get(0), prior, 0, None, None);
-        }
-    }
-    Ok(deleted)
+        })
+        .collect();
+    branches.push(orphan_branch_sql(
+        tag,
+        target_ident,
+        source_ident,
+        matching,
+        &nullable,
+        OrphanPattern::NoneOf(&patterns),
+    ));
+    Ok(branches)
 }
 
-/// The anti-join `DELETE` for the target rows whose nullable key columns are
-/// `NULL` exactly where `pattern` says (bit `j` for `nullable[j]`). Every
-/// other column matches with `=`, which is what lets Postgres hash the
-/// anti-join (see the module doc).
-fn orphan_delete_sql(
+/// The bitmask of which of the `nullable` key columns are `NULL` in target
+/// row `t`.
+fn null_mask_sql(matching: &Match, nullable: &[usize]) -> String {
+    nullable
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| {
+            format!(
+                "(case when t.{} is null then {} else 0 end)",
+                matching.parts[i].target_col,
+                1u64 << j
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// Which target rows one [`orphan_branch_sql`] branch covers.
+enum OrphanPattern<'a> {
+    /// Rows whose nullable key columns are `NULL` exactly where the bits say
+    /// (bit `j` for `nullable[j]`): matched with `=` and `IS NULL`, so the
+    /// anti-join hashes.
+    Exactly(u64),
+    /// Rows with any other pattern: matched with `IS NOT DISTINCT FROM`.
+    NoneOf(&'a [i64]),
+}
+
+/// One branch of the read: `(tag, NULL, key columns as text)` for every
+/// row of the target that `pattern` covers and no source row backs.
+fn orphan_branch_sql(
+    tag: i32,
     target_ident: &str,
     source_ident: &str,
     matching: &Match,
     nullable: &[usize],
-    pattern: u64,
-    returning: &str,
+    pattern: OrphanPattern<'_>,
 ) -> String {
-    let is_null = |i: usize| {
-        nullable
-            .iter()
-            .position(|&n| n == i)
-            .is_some_and(|j| pattern & (1 << j) != 0)
-    };
     let mut filter = Vec::new();
     let mut matches = Vec::new();
-    for (i, part) in matching.parts.iter().enumerate() {
-        let col = &part.target_col;
-        if is_null(i) {
-            filter.push(format!("t.{col} is null and "));
-            matches.push(format!("{} is null", part.source_sql));
-        } else {
-            if part.nullable {
-                filter.push(format!("t.{col} is not null and "));
+    match pattern {
+        OrphanPattern::Exactly(pattern) => {
+            let is_null = |i: usize| {
+                nullable
+                    .iter()
+                    .position(|&n| n == i)
+                    .is_some_and(|j| pattern & (1 << j) != 0)
+            };
+            for (i, part) in matching.parts.iter().enumerate() {
+                let col = &part.target_col;
+                if is_null(i) {
+                    filter.push(format!("t.{col} is null and "));
+                    matches.push(format!("{} is null", part.source_sql));
+                } else {
+                    if part.nullable {
+                        filter.push(format!("t.{col} is not null and "));
+                    }
+                    matches.push(format!("{} = t.{col}", part.source_sql));
+                }
             }
-            matches.push(format!("{} = t.{col}", part.source_sql));
+        }
+        OrphanPattern::NoneOf(patterns) => {
+            let listed: Vec<String> = patterns.iter().map(i64::to_string).collect();
+            filter.push(format!(
+                "({})::bigint <> all('{{{}}}'::bigint[]) and ",
+                null_mask_sql(matching, nullable),
+                listed.join(",")
+            ));
+            for part in &matching.parts {
+                matches.push(format!(
+                    "{} is not distinct from t.{}",
+                    part.source_sql, part.target_col
+                ));
+            }
         }
     }
+    let key: Vec<String> = matching
+        .parts
+        .iter()
+        .map(|p| format!("t.{}::text", p.target_col))
+        .collect();
     format!(
-        "delete from {target_ident} as t \
-         where {}not exists (select 1 from {source_ident} as s{} where {}) \
-         returning {returning}",
+        "select {tag}::int4, null::text, array[{}]::text[] from {target_ident} as t \
+         where {}not exists (select 1 from {source_ident} as s{} where {})",
+        key.join(", "),
         filter.concat(),
         matching.joins,
         matches.join(" and "),
@@ -559,49 +745,45 @@ mod db_tests {
         (pool, raw)
     }
 
-    /// The anti-join `DELETE` the sweep runs for `id`'s target, for the
-    /// pattern with no `NULL` key column.
-    async fn orphan_delete_for(txn: &Transaction<'_>, id: i64) -> String {
-        let row = txn
-            .query_one(
-                "select definition_text, target_table, source_table \
-                 from transform_definitions where id = $1",
-                &[&id],
-            )
+    /// Runs `ids`' sweep on its own: the discharge's read with nothing to
+    /// enumerate.
+    async fn sweep(txn: &Transaction<'_>, ids: &[i64]) -> Swept {
+        let mut sweep = Sweep::default();
+        sweep
+            .add(txn, ids, TransformStatus::CatchingUp)
             .await
-            .expect("read the definition");
-        let def = parse(row.get::<_, &str>(0)).expect("parse");
-        let target: String = row.get(1);
-        let source: String = row.get(2);
-        let key_cols = ddl::identity_key_columns(txn, &ddl::qualified_target_table_ident(&target))
+            .expect("plan the sweep");
+        if super::super::publication::declare_read(txn, None, &sweep)
             .await
-            .expect("read the target's key");
-        let matching = match &def.key_space {
-            KeySpace::OneToOne => one_to_one_match(&key_cols),
-            KeySpace::Aggregate { group_by } => {
-                aggregate_match(txn, &source, &target, group_by, &key_cols)
-                    .await
-                    .expect("match the grouping columns")
-            }
-        };
-        let nullable: Vec<usize> = (0..matching.parts.len())
-            .filter(|&i| matching.parts[i].nullable)
-            .collect();
-        orphan_delete_sql(
-            &ddl::qualified_target_table_ident(&target),
-            &ddl::qualified_source_table(&source),
-            &matching,
-            &nullable,
-            0,
-            "1",
+            .expect("declare the read")
+        {
+            super::super::publication::fetch_read(txn, "", &mut sweep)
+                .await
+                .expect("fetch the read");
+        }
+        sweep.finish(txn).await.expect("flush the sweep")
+    }
+
+    /// The `catching_up` definitions, by id.
+    async fn catching_up(raw: &tokio_postgres::Client) -> Vec<i64> {
+        raw.query(
+            "select id from transform_definitions where status = 'catching_up' order by id",
+            &[],
         )
+        .await
+        .expect("read the built definitions")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
     }
 
     /// A `catching_up` 1-1 and aggregate over a 20k-row source, with no
-    /// orphans: the sweep deletes nothing, and each target's `DELETE` plans
-    /// as a set-based anti-join (hash or merge), never a nested loop that
-    /// probes the source once per target row. A planted orphan shows the
-    /// sweep isn't vacuous.
+    /// orphans: the sweep deletes nothing, and each target's branch of the
+    /// read plans as a set-based anti-join (hash or merge), never a nested
+    /// loop that probes the source once per target row. The aggregate's
+    /// catch-all branch, for a `NULL` pattern that turned up after the sweep
+    /// read the patterns, is the exception: it only scans rows no other
+    /// branch covers. A planted orphan shows the sweep isn't vacuous.
     #[tokio::test]
     async fn a_sweep_with_no_orphans_deletes_nothing_through_an_anti_join() {
         let cluster = testkit::TestCluster::start();
@@ -632,21 +814,21 @@ mod db_tests {
         raw.batch_execute("analyze public.orders, public.orders_copy, public.orders_by_g")
             .await
             .expect("analyze");
-        let ids: Vec<i64> = raw
-            .query(
-                "select id from transform_definitions where status = 'catching_up' order by id",
-                &[],
-            )
-            .await
-            .expect("read the built definitions")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
+        let ids = catching_up(&raw).await;
         assert_eq!(ids.len(), 2, "both builds finished");
 
         let txn = raw.transaction().await.expect("begin");
-        for &id in &ids {
-            let sql = orphan_delete_for(&txn, id).await;
+        let mut planned = Sweep::default();
+        planned
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        let (catch_all, hashable): (Vec<&str>, Vec<&str>) = planned
+            .branches()
+            .partition(|sql| sql.contains("is not distinct from"));
+        assert_eq!(hashable.len(), 2, "one branch per target: {hashable:?}");
+        assert_eq!(catch_all.len(), 1, "the aggregate's catch-all");
+        for sql in hashable {
             let plan: Vec<String> = txn
                 .query(&format!("explain {sql}"), &[])
                 .await
@@ -660,18 +842,14 @@ mod db_tests {
                 "the sweep must plan as a set-based anti-join:\n{plan}"
             );
         }
-        let swept = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("sweep");
+        let swept = sweep(&txn, &ids).await;
         assert_eq!(swept.deleted, 0, "nothing to delete");
         assert!(swept.emptied_aggregates.is_empty());
 
         txn.batch_execute("insert into public.orders_copy (id, a) values (-1, 0)")
             .await
             .expect("plant an orphan");
-        let swept = delete_orphaned_target_rows(&txn, &ids, TransformStatus::CatchingUp)
-            .await
-            .expect("sweep");
+        let swept = sweep(&txn, &ids).await;
         assert_eq!(
             swept.deleted, 1,
             "the planted orphan is the only row deleted"
@@ -680,6 +858,87 @@ mod db_tests {
             swept.emptied_aggregates.is_empty(),
             "a 1-1 target has no extinct horizon"
         );
+    }
+
+    /// Issue #436: the sweep judges a row on its read's snapshot, and deletes
+    /// what it judged whatever the source holds by the time it fetches. Group
+    /// `a` has no source rows when the read is declared and gets one before
+    /// the fetch: it is deleted (the refill's own change re-derives it once it
+    /// drains). Group `b` is backed when the read is declared and loses its
+    /// rows before the fetch: it is kept (the read's enumeration, or those
+    /// deletes' changes, re-derive it). A group with a `NULL` pattern that
+    /// appeared after the sweep read the patterns is still found.
+    #[tokio::test]
+    async fn a_sweep_judges_rows_on_its_reads_snapshot() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             alter table public.orders replica identity full; \
+             insert into public.orders values (1, 'a', 1), (2, 'b', 2), (3, 'b', 3)",
+        )
+        .await
+        .expect("seed orders");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::publication::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        raw.batch_execute("delete from public.orders where g = 'a'")
+            .await
+            .expect("empty group a");
+        let (_, other) = connect(&db).await;
+
+        let txn = raw.transaction().await.expect("begin");
+        let mut sweep = Sweep::default();
+        sweep
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect("plan the sweep");
+        // A group whose `NULL` pattern the sweep didn't see, unbacked.
+        other
+            .batch_execute("insert into public.orders_by_g (g, total) values (null, 7)")
+            .await
+            .expect("plant a NULL group");
+        assert!(
+            super::super::publication::declare_read(&txn, None, &sweep)
+                .await
+                .expect("declare the read")
+        );
+        other
+            .batch_execute(
+                "insert into public.orders values (4, 'a', 100); \
+                 delete from public.orders where g = 'b'",
+            )
+            .await
+            .expect("refill group a and empty group b");
+        super::super::publication::fetch_read(&txn, "", &mut sweep)
+            .await
+            .expect("fetch the read");
+        let swept = sweep.finish(&txn).await.expect("flush the sweep");
+        txn.commit().await.expect("commit");
+
+        assert_eq!(swept.deleted, 2, "group a and the NULL group");
+        assert!(swept.emptied_aggregates.contains("public.orders_by_g"));
+        let groups: Vec<Option<String>> = raw
+            .query("select g from public.orders_by_g order by g", &[])
+            .await
+            .expect("read the target")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(groups, vec![Some("b".to_string())]);
     }
 }
 
@@ -704,19 +963,19 @@ mod tests {
             joins: String::new(),
         };
         assert_eq!(
-            orphan_delete_sql(
+            orphan_branch_sql(
+                3,
                 r#""public"."t""#,
                 r#""public"."src""#,
                 &matching,
                 &[],
-                0,
-                "k"
+                OrphanPattern::Exactly(0),
             ),
-            r#"delete from "public"."t" as t where not exists (select 1 from "public"."src" as s where s."a" = t."a" and s."b" = t."b") returning k"#
+            r#"select 3::int4, null::text, array[t."a"::text, t."b"::text]::text[] from "public"."t" as t where not exists (select 1 from "public"."src" as s where s."a" = t."a" and s."b" = t."b")"#
         );
     }
 
-    /// A nullable grouping column gets one statement per `NULL` pattern: `=`
+    /// A nullable grouping column gets one branch per `NULL` pattern: `=`
     /// where the target row's value is present, `IS NULL` on the source side
     /// where it is `NULL`, never `IS NOT DISTINCT FROM`.
     #[test]
@@ -730,11 +989,46 @@ mod tests {
         };
         let nullable = [0, 1];
         assert_eq!(
-            orphan_delete_sql("t", "src", &matching, &nullable, 0b10, "k"),
-            r#"delete from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s left join "c" as "c" on "c"."id" = s."cid" where (s."g")::numeric = t."g" and (s."h")::text is null) returning k"#
+            orphan_branch_sql(
+                0,
+                "t",
+                "src",
+                &matching,
+                &nullable,
+                OrphanPattern::Exactly(0b10)
+            ),
+            r#"select 0::int4, null::text, array[t."g"::text, t."h"::text]::text[] from t as t where t."g" is not null and t."h" is null and not exists (select 1 from src as s left join "c" as "c" on "c"."id" = s."cid" where (s."g")::numeric = t."g" and (s."h")::text is null)"#
         );
-        let none_null = orphan_delete_sql("t", "src", &matching, &nullable, 0, "k");
+        let none_null = orphan_branch_sql(
+            0,
+            "t",
+            "src",
+            &matching,
+            &nullable,
+            OrphanPattern::Exactly(0),
+        );
         assert!(none_null.contains(r#"t."g" is not null and t."h" is not null and "#));
         assert!(!none_null.contains("distinct"), "{none_null}");
+    }
+
+    /// The catch-all branch covers every pattern the others don't, matching
+    /// with `IS NOT DISTINCT FROM`.
+    #[test]
+    fn the_catch_all_covers_the_unlisted_patterns() {
+        let matching = Match {
+            parts: vec![part("g", r#"(s."g")::numeric"#, true)],
+            joins: String::new(),
+        };
+        assert_eq!(
+            orphan_branch_sql(
+                1,
+                "t",
+                "src",
+                &matching,
+                &[0],
+                OrphanPattern::NoneOf(&[0, 1])
+            ),
+            r#"select 1::int4, null::text, array[t."g"::text]::text[] from t as t where ((case when t."g" is null then 1 else 0 end))::bigint <> all('{0,1}'::bigint[]) and not exists (select 1 from src as s where (s."g")::numeric is not distinct from t."g")"#
+        );
     }
 }

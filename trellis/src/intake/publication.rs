@@ -654,18 +654,60 @@ pub(crate) async fn enumerate_and_append(
     txn: &Transaction<'_>,
     src_table: &str,
 ) -> Result<(), IntakeError> {
-    declare_enumeration(txn, src_table).await?;
-    append_enumeration(txn, src_table).await
+    let mut sweep = super::resume_orphans::Sweep::default();
+    declare_read(txn, Some(src_table), &sweep).await?;
+    fetch_read(txn, src_table, &mut sweep).await
 }
 
-/// The first half of [`enumerate_and_append`]: declares the enumeration
-/// cursor over `src_table`'s identity key.
+/// The first half of the discharge's read: declares one cursor over
+/// `enumerate`'s identity keys (if given) and over every row `sweep` must
+/// delete ([`super::resume_orphans::Sweep::branches`]), in one statement, so
+/// both are judged on one snapshot (issue #436). Returns whether it declared
+/// anything: with no table to enumerate and nothing to sweep there is no
+/// cursor.
 ///
 /// Split out for issue #312: the cursor's snapshot is fixed here, at
 /// `DECLARE`, so [`run_pending_backfills`] can capture the WAL position that
 /// bounds everything that snapshot sees, and wait for intake to stage up to
-/// it, *before* [`append_enumeration`] writes a single `Recompute` row.
-async fn declare_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<(), IntakeError> {
+/// it, *before* [`fetch_read`] writes a single `Recompute` row or deletes a
+/// single target row.
+///
+/// Every branch selects `(tag, key, key columns)`: the enumeration's rows
+/// are tagged [`super::resume_orphans::ENUMERATION_TAG`] and carry the
+/// encoded key, and a swept target's rows carry its tag and their key
+/// columns. The enumeration comes first, so the deletes come last and hold
+/// their row locks only for the end of the discharge. Nothing depends on
+/// that order.
+pub(super) async fn declare_read(
+    txn: &Transaction<'_>,
+    enumerate: Option<&str>,
+    sweep: &super::resume_orphans::Sweep,
+) -> Result<bool, IntakeError> {
+    let mut branches = Vec::new();
+    if let Some(src_table) = enumerate {
+        branches.push(enumeration_branch(txn, src_table).await?);
+    }
+    branches.extend(sweep.branches().map(str::to_string));
+    if branches.is_empty() {
+        return Ok(false);
+    }
+    if !sweep.is_empty() {
+        // A cursor is planned for its first 10% of rows by default, which can
+        // turn an anti-join into a nested loop that probes the source once
+        // per target row. The discharge reads every row.
+        txn.batch_execute("set local cursor_tuple_fraction = 1")
+            .await?;
+    }
+    txn.batch_execute(&format!(
+        "declare {BACKFILL_CURSOR} cursor for {}",
+        branches.join(" union all ")
+    ))
+    .await?;
+    Ok(true)
+}
+
+/// The read's branch enumerating `src_table`'s identity key.
+async fn enumeration_branch(txn: &Transaction<'_>, src_table: &str) -> Result<String, IntakeError> {
     let (schema, table) = split_qualified(src_table)?;
     let from = format!("{}.{}", quote_ident(schema), quote_ident(table));
     // Issue #308: the table's row-identity key as `ddl` defines it — its
@@ -691,17 +733,21 @@ async fn declare_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<(
     // composite separator escape at arity > 1 (issue #200), all in declared
     // key order (issue #163).
     let key_expr = crate::defs::ddl::pk_key_sql_expr(&key_cols, None);
-    txn.batch_execute(&format!(
-        "declare {BACKFILL_CURSOR} cursor for select {key_expr} from {from}"
+    Ok(format!(
+        "select ({})::int4, {key_expr}, null::text[] from {from}",
+        super::resume_orphans::ENUMERATION_TAG
     ))
-    .await?;
-    Ok(())
 }
 
-/// The second half of [`enumerate_and_append`]: pages the cursor
-/// [`declare_enumeration`] opened into the active ring segment as
-/// image-less `Recompute` rows, then closes it.
-async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<(), IntakeError> {
+/// The second half of the discharge's read: pages the cursor
+/// [`declare_read`] opened, appending each enumerated key into the active
+/// ring segment as an image-less `Recompute` for `src_table`, and deleting
+/// each swept row through `sweep`. Then closes the cursor.
+pub(super) async fn fetch_read(
+    txn: &Transaction<'_>,
+    src_table: &str,
+    sweep: &mut super::resume_orphans::Sweep,
+) -> Result<(), IntakeError> {
     loop {
         let rows = txn
             .query(
@@ -713,9 +759,17 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
             break;
         }
         let mut page = Vec::with_capacity(rows.len());
+        let mut unbacked: std::collections::BTreeMap<i32, Vec<Vec<Option<String>>>> =
+            std::collections::BTreeMap::new();
         for row in &rows {
-            // Already fully encoded by `key_expr` above.
-            let key: String = row.get(0);
+            let tag: i32 = row.get(0);
+            if tag != super::resume_orphans::ENUMERATION_TAG {
+                unbacked.entry(tag).or_default().push(row.get(2));
+                continue;
+            }
+            // Already fully encoded by the enumeration branch's key
+            // expression.
+            let key: String = row.get(1);
             page.push(StagedChange::Recompute {
                 src_table: src_table.to_string(),
                 key,
@@ -742,7 +796,12 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
                 origin_lsn: None,
             });
         }
-        append::append(txn, &page).await?;
+        if !page.is_empty() {
+            append::append(txn, &page).await?;
+        }
+        for (tag, keys) in &unbacked {
+            sweep.delete(txn, *tag, keys).await?;
+        }
     }
     txn.batch_execute(&format!("close {BACKFILL_CURSOR}"))
         .await?;
@@ -870,27 +929,25 @@ async fn append_enumeration(txn: &Transaction<'_>, src_table: &str) -> Result<()
 /// `client::setup_staging`); tests with no CDC stream pass
 /// [`crate::staging::StagedWatermark::saturated`].
 ///
-/// # Dropping what the source no longer backs (issues #330, #485)
+/// # Dropping what the source no longer backs (issues #330, #485, #436)
 ///
 /// The enumeration and the chunks only reach keys the source still has. A
 /// definition this pass rebuilds (a resumed one, above all) can hold target
 /// rows whose source rows went away while it was frozen, and nothing would
 /// ever enumerate them. A definition whose go-live catch-up this is can hold
 /// the same kind of row: a delete that drained while it was `backfilling`
-/// was skipped, and its build may have read the row first (issue #485). So,
-/// first thing in the transaction,
-/// `resume_orphans::delete_orphaned_target_rows` deletes every row that no
-/// source row backs from the target of each dispatched definition and of
+/// was skipped, and its build may have read the row first (issue #485). So
+/// the discharge also sweeps the target of each dispatched definition and of
 /// each `catching_up` definition that reads the table (a superset of the
-/// ones [`go_live_caught_up`] flips `live` at the end), reporting each
-/// through the target-mutation seam. It runs before `DECLARE`, and never
-/// after the intake wait, which would leave an aggregate group repopulated
-/// during the wait at its stale pre-pause value. The maintenance loop that
-/// runs this pass is also the only sealer, so any source change committed
-/// after the pass starts is drained only once a ring-built definition is
-/// `live`. The anti-join and the cursor still read different snapshots, which
-/// leaves a short race for aggregates in either order (issue #436). That
-/// module's doc comment has the full argument and its limits.
+/// ones [`go_live_caught_up`] flips `live` at the end) for rows no source row
+/// backs, and deletes them through the target-mutation seam.
+///
+/// The sweep's anti-joins are branches of the same cursor as the enumeration
+/// ([`declare_read`]), so both are judged on one snapshot, and the deletes
+/// run as that cursor is fetched, after the intake wait ([`fetch_read`]).
+/// Judging the two on different snapshots left an aggregate group stale
+/// whichever order they ran in (issue #436). The `resume_orphans` module doc
+/// has the full argument.
 // The maintenance loop calls [`run_pending_backfills_until`] so it can stop
 // the wait on shutdown. This no-stop form is the tests' entry point, so
 // nothing in the crate calls it unless `internals` exposes it.
@@ -1171,9 +1228,9 @@ async fn plan_waiting_builds(
     Ok(builds)
 }
 
-/// Runs `marker`'s discharge in one transaction: the orphan delete, the
-/// enumeration (see [`run_pending_backfills`]'s "When the table is
-/// enumerated"), each waiting definition's dispatch, the marker's delete, the
+/// Runs `marker`'s discharge in one transaction: the read (the enumeration,
+/// see [`run_pending_backfills`]'s "When the table is enumerated", and the
+/// orphan sweep's anti-joins), each waiting definition's dispatch, the marker's delete, the
 /// ring-built definitions' flip ([`go_live`]) and the flip to `live` of every
 /// `catching_up` definition this was the last catch-up of
 /// ([`go_live_caught_up`]). An error drops the
@@ -1202,18 +1259,13 @@ async fn discharge_marker(
         .collect();
 
     let txn = client.transaction().await?;
-    // Issues #330, #485: before the enumeration's `DECLARE` and its intake
-    // wait; see "Dropping what the source no longer backs" above. On the
-    // rollback below (including the `Deferred` and error paths, since both
-    // drop `txn` without committing), the deletes roll back with everything
-    // else.
-    let mut emptied = super::resume_orphans::delete_orphaned_target_rows(
-        &txn,
-        &waiting,
-        TransformStatus::WaitingToBackfill,
-    )
-    .await?
-    .emptied_aggregates;
+    // Issues #330, #485, #436: the targets whose unbacked rows this discharge
+    // deletes, judged on its read's snapshot; see "Dropping what the source
+    // no longer backs" above.
+    let mut sweep = super::resume_orphans::Sweep::default();
+    sweep
+        .add(&txn, &waiting, TransformStatus::WaitingToBackfill)
+        .await?;
     // Every definition `go_live_caught_up` flips below is among these: one
     // that is `catching_up` by then but not now got there through
     // `park_catch_up`, which parked a marker this pass doesn't delete on a
@@ -1224,19 +1276,13 @@ async fn discharge_marker(
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-    emptied.extend(
-        super::resume_orphans::delete_orphaned_target_rows(
-            &txn,
-            &catching_up_now,
-            TransformStatus::CatchingUp,
-        )
-        .await?
-        .emptied_aggregates,
-    );
+    sweep
+        .add(&txn, &catching_up_now, TransformStatus::CatchingUp)
+        .await?;
     let enumerate = !ring.is_empty()
         || crate::defs::catalog::table_has_reader(&txn, &marker.table, &background).await?;
+    let declared = declare_read(&txn, enumerate.then_some(marker.table.as_str()), &sweep).await?;
     if enumerate {
-        declare_enumeration(&txn, &marker.table).await?;
         let horizon: PgLsn = txn
             .query_one("select pg_current_wal_insert_lsn()", &[])
             .await?
@@ -1248,8 +1294,15 @@ async fn discharge_marker(
             txn.rollback().await?;
             return Ok(Discharge::Deferred { horizon });
         }
-        append_enumeration(&txn, &marker.table).await?;
     }
+    // Before the dispatch below, which moves the waiting definitions out of
+    // the status the sweep checks. On the rollback (the `Deferred` path above
+    // and any error, since both drop `txn` without committing) the deletes
+    // roll back with everything else.
+    if declared {
+        fetch_read(&txn, &marker.table, &mut sweep).await?;
+    }
+    let swept = sweep.finish(&txn).await?;
     for (id, build) in &builds {
         match build {
             Build::Chunks(ranges) => {
@@ -1284,7 +1337,7 @@ async fn discharge_marker(
     go_live_caught_up(&txn, &marker.table, catching_up).await?;
     // A group the sweeps deleted can still have deltas staged for it; see
     // `resume_orphans`' "Pending deltas on a deleted group".
-    super::resume_orphans::raise_extinct_horizons(&txn, &emptied).await?;
+    super::resume_orphans::raise_extinct_horizons(&txn, &swept.emptied_aggregates).await?;
     if enumerate {
         txn.execute("select pg_notify($1, '')", &[&wake_channel])
             .await?;
@@ -1448,9 +1501,8 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
 /// which carry no `origin_lsn` and so gate any token taken after this flip.
 /// The re-read only reaches keys the source still has, so a row the build
 /// wrote whose source row is gone (its delete drained while the definition
-/// was `backfilling`) is repaired by the orphan sweep earlier in the same
-/// transaction instead (issue #485). For an aggregate that sweep and the
-/// re-read read different snapshots, which leaves issue #436's short race.
+/// was `backfilling`) is deleted by the orphan sweep in the same read, on the
+/// same snapshot (issues #485, #436).
 ///
 /// **Locks.** The candidates are locked before the caller deletes its
 /// marker, and whether a marker is still pending is read here, in a later
@@ -3646,13 +3698,13 @@ mod catch_up_tests {
         );
     }
 
-    /// Group 1's last row is deleted after the orphan delete kept the group
-    /// and before the job reads the source, so the job writes nothing for it
-    /// and its pre-pause row survives the rebuild (#436's race). The row's
-    /// CDC delete is what removes the group, applied once the definition is
-    /// `live`.
+    /// Group 1's last row is deleted after the dispatch's sweep kept the
+    /// group and before the job reads the source, so the job writes nothing
+    /// for it and its pre-pause row survives the rebuild. The go-live
+    /// discharge's sweep finds the group unbacked and deletes it; the row's
+    /// CDC delete, applied once the definition is `live`, finds nothing.
     #[tokio::test]
-    async fn a_group_emptied_after_the_orphan_delete_is_dropped_by_its_cdc() {
+    async fn a_group_emptied_after_the_dispatch_sweep_is_dropped_at_go_live() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, mut discharger) =
@@ -3672,7 +3724,7 @@ mod catch_up_tests {
         assert_eq!(
             rollup_rows(&discharger).await,
             vec![(0, "12".to_string())],
-            "group 1 went extinct after the orphan delete ran; its CDC delete drops it"
+            "group 1 went extinct after the dispatch sweep ran; the go-live sweep drops it"
         );
     }
 
@@ -3729,6 +3781,474 @@ mod catch_up_tests {
             vec![(0, "100".to_string()), (1, "9".to_string())],
             "group 0 holds only its new row: the deletes the build already read don't reach it"
         );
+    }
+
+    /// One change to `public.orders` to stage as intake would: its key, op,
+    /// and old and new images.
+    type OrderCdc<'a> = (
+        &'a str,
+        crate::staging::CdcOp,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    /// Runs `sql` on `writer`, then stages `cdc` for it the way intake would,
+    /// at a real LSN past the write's commit: an apply that compares it with
+    /// a recompute horizon must see it as the later commit it is.
+    async fn write_orders(writer: &mut tokio_postgres::Client, sql: &str, cdc: &[OrderCdc<'_>]) {
+        writer.batch_execute(sql).await.expect("write orders");
+        let lsn: PgLsn = writer
+            .query_one("select pg_current_wal_insert_lsn()", &[])
+            .await
+            .expect("read the commit's LSN")
+            .get(0);
+        let changes: Vec<StagedChange> = cdc
+            .iter()
+            .map(|&(key, op, old, new)| StagedChange::Cdc {
+                src_table: "public.orders".to_string(),
+                key: key.to_string(),
+                op,
+                lsn: Some(lsn),
+                old_image: old.map(str::to_string),
+                new_image: new.map(str::to_string),
+                origin_lsn: None,
+                src_changed: None,
+                hop_gen: 0,
+                group_key: None,
+            })
+            .collect();
+        let txn = writer.transaction().await.expect("begin");
+        append::append(&txn, &changes).await.expect("stage cdc");
+        txn.commit().await.expect("commit cdc");
+    }
+
+    /// Fences `public.orders`' pending marker and waits for the fence to
+    /// settle, so the discharge a test runs next takes no fence of its own.
+    /// A fresh fence would wait out the test's own lock-holding transaction.
+    async fn settle_orders_marker(client: &tokio_postgres::Client) {
+        let generation: i64 = client
+            .query_one(
+                "select generation from pending_backfill where table_name = 'public.orders'",
+                &[],
+            )
+            .await
+            .expect("a marker is pending on orders")
+            .get(0);
+        let fence = confirm_fence(client, "public.orders", generation)
+            .await
+            .expect("fence the marker")
+            .expect("the marker was unfenced");
+        let now = fresh_fences_settled(client, fence, Duration::from_secs(60), &|| false)
+            .await
+            .expect("wait for the fence");
+        assert!(now.settled_since(fence), "the fence settles");
+    }
+
+    /// Waits until backend `pid` is blocked on a lock. A precondition the
+    /// test sets up itself (it holds the lock), not a convergence wait.
+    async fn wait_for_lock_wait(client: &tokio_postgres::Client, pid: i32) {
+        for _ in 0..6000 {
+            let blocked: bool = client
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity \
+                     where pid = $1 and wait_event_type = 'Lock')",
+                    &[&pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if blocked {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the discharge never blocked on the held lock");
+    }
+
+    /// Issue #436, made deterministic. Runs one discharge of
+    /// `public.orders`' settled marker while `locker` holds
+    /// `public.order_copy` `ACCESS EXCLUSIVE`, a target the discharge reads
+    /// after `public.order_rollup`'s. Once the discharge blocks on that lock,
+    /// `gap` empties a group and the lock is released. Once the discharge
+    /// has fixed its read's snapshot and waits for intake, `refill` puts new
+    /// rows in the group, and intake is let through.
+    ///
+    /// Before #436 the orphan sweep ran one anti-join per target, each on its
+    /// own snapshot, ahead of the read's `DECLARE`. The rollup's ran before
+    /// the lock, found the group backed and kept it, the read found it empty,
+    /// and the group's CDC folded onto its stale value as deltas.
+    async fn discharge_across_the_gap(
+        discharger: &mut tokio_postgres::Client,
+        writer: &mut tokio_postgres::Client,
+        locker: &tokio_postgres::Client,
+        gap: (&str, &[OrderCdc<'_>]),
+        refill: (&str, &[OrderCdc<'_>]),
+    ) {
+        let pid: i32 = discharger
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("read the discharger's pid")
+            .get(0);
+        let watermark = StagedWatermark::new();
+        let waiting = tokio::sync::Notify::new();
+        // `stop` is polled only while the enumeration waits for intake.
+        let stop = || {
+            waiting.notify_one();
+            false
+        };
+        let discharge = async {
+            let failures = run_pending_backfills_until(
+                discharger,
+                "wake",
+                &watermark,
+                Duration::from_secs(600),
+                &stop,
+            )
+            .await
+            .expect("run_pending_backfills_until");
+            assert!(failures.is_empty(), "the discharge failed: {failures:?}");
+        };
+        let drive = async {
+            wait_for_lock_wait(writer, pid).await;
+            write_orders(writer, gap.0, gap.1).await;
+            locker
+                .batch_execute("rollback")
+                .await
+                .expect("release the lock");
+            waiting.notified().await;
+            write_orders(writer, refill.0, refill.1).await;
+            watermark.advance(PgLsn::from(u64::MAX));
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(discharge, drive);
+        })
+        .await
+        .expect("the discharge finishes once released");
+    }
+
+    /// `public.orders` (group 0 holds ids 2, 4, 6 and group 1 holds 1, 3, 5,
+    /// with `a = id`), summed by `order_rollup` and copied 1-1 by
+    /// `order_copy`, registered in that order. Returns a same-crate pool and
+    /// a connection.
+    async fn orders_with_rollup_and_copy(
+        db: &testkit::TestDatabase,
+        rollup: &str,
+    ) -> (crate::pool::Pool, tokio_postgres::Client) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = crate::pool::Pool::new(&config).expect("build a same-crate pool");
+        let client = connect(db).await;
+        client
+            .batch_execute(
+                "create table public.orders (id bigint primary key, g bigint, a numeric); \
+                 alter table public.orders replica identity full; \
+                 insert into public.orders select s, s % 2, s from generate_series(1, 6) s;",
+            )
+            .await
+            .expect("seed orders");
+        let columns: std::collections::HashMap<String, crate::defs::ValueType> = [
+            ("id", crate::defs::ValueType::Numeric),
+            ("g", crate::defs::ValueType::Numeric),
+            ("a", crate::defs::ValueType::Numeric),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+        for text in [rollup, "TRANSFORM order_copy FROM orders SELECT a AS a"] {
+            crate::defs::install_definition(&pool, text, &columns, "public")
+                .await
+                .unwrap_or_else(|e| panic!("install {text:?}: {e}"));
+        }
+        (pool, client)
+    }
+
+    const CLAIMED_BY: &str = "catch_up_tests";
+
+    /// Claims and runs the rollup's direct-build job and the copy's chunk,
+    /// without finishing either: the definitions stay `backfilling`.
+    async fn run_claimed_builds(
+        pool: &crate::pool::Pool,
+        client: &tokio_postgres::Client,
+    ) -> Vec<crate::defs::chunk_queue::ClaimedChunk> {
+        let chunks = crate::defs::chunk_queue::claim_chunks(client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim the builds");
+        assert_eq!(chunks.len(), 2, "one direct-build job and one chunk");
+        for chunk in &chunks {
+            crate::defs::chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run the build");
+        }
+        chunks
+    }
+
+    /// Finishes `chunks`, which moves both definitions to `catching_up` and
+    /// parks their go-live catch-up on `public.orders`.
+    async fn finish_builds(
+        pool: &crate::pool::Pool,
+        chunks: &[crate::defs::chunk_queue::ClaimedChunk],
+    ) {
+        for chunk in chunks {
+            crate::defs::chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish the build");
+        }
+    }
+
+    async fn copy_ids(client: &tokio_postgres::Client) -> Vec<i64> {
+        client
+            .query("select id::bigint from public.order_copy order by id", &[])
+            .await
+            .expect("read order_copy")
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+
+    fn deleted(id: i64) -> String {
+        format!(r#"{{"id":"{id}","g":"{}","a":"{id}"}}"#, id % 2)
+    }
+
+    /// Issue #436 on a fresh build's go-live (#485). The direct build reads
+    /// group 1 as 9 (ids 1, 3, 5); id 3 is deleted before the build finishes,
+    /// and its CDC drains while the definition is `backfilling`, so it's
+    /// skipped. The go-live discharge must then leave group 1 exactly as the
+    /// source has it. Its last rows (1, 5) are deleted in the discharge's gap
+    /// and id 10 (100) lands after its read: the right answer is 100. Folding
+    /// the gap's deletes and the refill onto the stale 9 gives 103.
+    #[tokio::test]
+    async fn a_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) = orders_with_rollup_and_copy(
+            &db,
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        )
+        .await;
+        park_registration_markers(&discharger, &["public.orders".to_string()])
+            .await
+            .expect("park the registrations' marker");
+        run_pending_backfills(
+            &mut discharger,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("dispatch both builds");
+
+        let chunks = run_claimed_builds(&pool, &discharger).await;
+        write_orders(
+            &mut discharger,
+            "delete from public.orders where id = 3",
+            &[("3", crate::staging::CdcOp::Delete, Some(&deleted(3)), None)],
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+        finish_builds(&pool, &chunks).await;
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "12".to_string()), (1, "9".to_string())],
+            "the build counted id 3, and its delete was skipped"
+        );
+
+        settle_orders_marker(&discharger).await;
+        let mut writer = connect(&db).await;
+        let locker = connect(&db).await;
+        locker
+            .batch_execute("begin; lock table public.order_copy in access exclusive mode")
+            .await
+            .expect("lock order_copy");
+        discharge_across_the_gap(
+            &mut discharger,
+            &mut writer,
+            &locker,
+            (
+                "delete from public.orders where id in (1, 5)",
+                &[
+                    ("1", crate::staging::CdcOp::Delete, Some(&deleted(1)), None),
+                    ("5", crate::staging::CdcOp::Delete, Some(&deleted(5)), None),
+                ],
+            ),
+            (
+                "insert into public.orders values (10, 1, 100)",
+                &[(
+                    "10",
+                    crate::staging::CdcOp::Insert,
+                    None,
+                    Some(r#"{"id":"10","g":"1","a":"100"}"#),
+                )],
+            ),
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "12".to_string()), (1, "100".to_string())],
+            "group 1 holds only its new row"
+        );
+        assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
+    }
+
+    /// Issue #436 on a resume, #391's reproduction made deterministic. The
+    /// rollup is paused at group 1 = 9 (ids 1, 3, 5), and id 3 is deleted
+    /// meanwhile. The resume's discharge keeps group 1 (ids 1 and 5 still
+    /// back it); they are deleted before the rebuild reads, so it writes
+    /// nothing for group 1 and the pre-pause 9 survives it; id 7 lands after
+    /// the read. Every one of those changes drains while the rollup is
+    /// `backfilling`, so none reaches it. The go-live discharge must then
+    /// leave group 1 exactly as the source has it. Its last row (7) is
+    /// deleted in the discharge's gap and id 10 (100) lands after its read:
+    /// the right answer is 100. Folding those onto the stale 9 gives 102.
+    #[tokio::test]
+    async fn a_resumed_group_emptied_before_a_go_live_read_and_refilled_after_it_holds_only_its_new_rows()
+     {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) = orders_with_rollup_and_copy(
+            &db,
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        )
+        .await;
+        settle_registrations(&pool).await;
+        drain_all(&pool, &mut discharger).await;
+        for name in ["order_rollup", "order_copy"] {
+            crate::defs::lifecycle::pause_transform(&pool, name)
+                .await
+                .expect("pause");
+        }
+        write_orders(
+            &mut discharger,
+            "delete from public.orders where id = 3",
+            &[("3", crate::staging::CdcOp::Delete, Some(&deleted(3)), None)],
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+        for name in ["order_rollup", "order_copy"] {
+            crate::staging::quarantine::resume_transform(&pool, name)
+                .await
+                .expect("resume");
+        }
+        run_pending_backfills(
+            &mut discharger,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("dispatch both rebuilds");
+
+        write_orders(
+            &mut discharger,
+            "delete from public.orders where id in (1, 5)",
+            &[
+                ("1", crate::staging::CdcOp::Delete, Some(&deleted(1)), None),
+                ("5", crate::staging::CdcOp::Delete, Some(&deleted(5)), None),
+            ],
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+        let chunks = run_claimed_builds(&pool, &discharger).await;
+        write_orders(
+            &mut discharger,
+            "insert into public.orders values (7, 1, 7)",
+            &[(
+                "7",
+                crate::staging::CdcOp::Insert,
+                None,
+                Some(r#"{"id":"7","g":"1","a":"7"}"#),
+            )],
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+        finish_builds(&pool, &chunks).await;
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "12".to_string()), (1, "9".to_string())],
+            "group 1 still holds its pre-pause value"
+        );
+
+        settle_orders_marker(&discharger).await;
+        let mut writer = connect(&db).await;
+        let locker = connect(&db).await;
+        locker
+            .batch_execute("begin; lock table public.order_copy in access exclusive mode")
+            .await
+            .expect("lock order_copy");
+        discharge_across_the_gap(
+            &mut discharger,
+            &mut writer,
+            &locker,
+            (
+                "delete from public.orders where id = 7",
+                &[(
+                    "7",
+                    crate::staging::CdcOp::Delete,
+                    Some(r#"{"id":"7","g":"1","a":"7"}"#),
+                    None,
+                )],
+            ),
+            (
+                "insert into public.orders values (10, 1, 100)",
+                &[(
+                    "10",
+                    crate::staging::CdcOp::Insert,
+                    None,
+                    Some(r#"{"id":"10","g":"1","a":"100"}"#),
+                )],
+            ),
+        )
+        .await;
+        drain_all(&pool, &mut discharger).await;
+
+        assert_eq!(
+            rollup_rows(&discharger).await,
+            vec![(0, "12".to_string()), (1, "100".to_string())],
+            "group 1 holds only its new row"
+        );
+        assert_eq!(copy_ids(&discharger).await, vec![2, 4, 6, 10]);
+    }
+
+    /// Issue #503: the sweep takes its target row locks only after the intake
+    /// wait. While the go-live discharge waits for intake, a writer that
+    /// touches the row the sweep will delete (a drain applying an earlier
+    /// sealed segment, say) doesn't wait on the discharge.
+    #[tokio::test]
+    async fn the_sweep_holds_no_target_row_lock_across_the_intake_wait() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut discharger) = orders_with_rollup_and_copy(
+            &db,
+            "TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total",
+        )
+        .await;
+        settle_builds(&pool).await;
+        discharger
+            .batch_execute("insert into public.order_copy (id, a) values (-1, 0)")
+            .await
+            .expect("plant a row no source row backs");
+        settle_orders_marker(&discharger).await;
+        let writer = connect(&db).await;
+        writer
+            .batch_execute("set lock_timeout = '5s'")
+            .await
+            .expect("bound the writer's lock wait");
+        discharge_racing(&mut discharger, |go, done| async move {
+            writer
+                .batch_execute("update public.order_copy set a = 1 where id = -1")
+                .await
+                .expect("the row is not locked during the intake wait");
+            go.send(()).expect("release the discharge");
+            done.await.expect("the discharge commits");
+        })
+        .await;
+        assert_eq!(copy_ids(&discharger).await, vec![1, 2, 3, 4, 5, 6]);
     }
 }
 

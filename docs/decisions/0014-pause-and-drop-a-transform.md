@@ -55,7 +55,7 @@ siblings and is not recoverable by replay.
 Resume therefore reconciles the target with current source data rather than catching up
 over buffered changes, because there are none. The target is not cleared and rebuilt.
 Readers keep seeing its rows throughout, and the reconciliation has two halves, committed
-together in one transaction (issue #330):
+together in one transaction (issue #330) and read on one snapshot (issue #436):
 
 - Every target row that no current source row backs is deleted. That covers a 1-1 row
   whose source row was deleted, and an aggregate group whose rows were all deleted or,
