@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never attaches a debugger, and line tables keep file:line in panic
+  # backtraces. Full debug info made the ~115 statically linked test
+  # binaries ~13GB and a fifth of the build was linking them.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   ci:
@@ -21,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        id: toolchain
         # Local composite action (mirrors peg) so we don't need an allowlisted
         # third-party toolchain action. Pinned to the version in
         # rust-toolchain.toml so CI and local dev never drift.
@@ -28,6 +33,24 @@ jobs:
         with:
           toolchain: "1.98.0"
           components: rustfmt, clippy
+
+      - name: Restore Cargo dependency cache
+        # Compiled third-party dependencies (see prune-cargo-target.sh), keyed
+        # on everything that decides them: the compiler, the debug-info
+        # setting above and Cargo.lock. A lockfile change still restores the
+        # nearest older entry, so only the changed dependencies rebuild. PRs
+        # restore the entry main saved.
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -60,3 +83,23 @@ jobs:
         # never deep-runs a property at PR time. Properties are opt-in with
         # `-- --ignored`; see nightly.yml and generative/README.md.
         run: cargo test --workspace
+
+      - name: Prune target/ to third-party dependencies
+        # A cold build is ~5.6GB, nearly all of it this workspace's own test
+        # binaries, which every run rebuilds anyway. What's left is ~800MB.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        run: .github/scripts/prune-cargo-target.sh
+
+      - name: Save Cargo dependency cache
+        # Only when the exact key missed: an entry's dependencies never change,
+        # so most runs restore and save nothing, and the repo's 10GB cache
+        # quota holds roughly one entry per lockfile.
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
