@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::streaming::rate::human_rate;
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::{
     fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, throughput,
@@ -41,7 +42,7 @@ const RAMP_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 const RAMP_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 
 /// The transaction-shape sweep's default target rate: comfortably under the
-/// measured single-hop knee, so a `sustained: false` there means the *shape*
+/// measured single-hop knee, so a `kept_target_rate: false` there means the *shape*
 /// hurt rather than that the rate alone had already saturated the pipeline
 /// regardless of shape.
 const SHAPE_DEFAULT_TARGET_RATE: f64 = 20_000.0;
@@ -56,7 +57,7 @@ const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 /// write count is close to the row count — near the same write load as a 1-1
 /// chain, whose own knee sits at ~210-230k rows/sec. Measured directly: ratio
 /// 1000:1 needs on the order of 90-120s to fully drain and pass its oracle;
-/// 30s reports every ratio as `sustained: false` with `oracle_ok: null`
+/// 30s reports every ratio as `drained: false` with `oracle_ok: null`
 /// (unevaluated, not failed — see `check_aggregate_oracle`), which is not a
 /// real reproduction of a T3 measurement. A low ratio (e.g. 10:1, 40,000
 /// groups at this target rate) may still not drain even at 120s — that is
@@ -288,10 +289,11 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 
             let probes = runtime().block_on(throughput::run_ramp(&rates, offer, &tuning));
             let ok = report_probes(&probes, "throughput-ramp");
-            match probes.iter().rev().find(|p| p.sustained) {
+            match throughput::knee(&probes) {
                 Some(knee) => eprintln!(
-                    "knee: {} rows/sec sustained (achieved {:.0}/sec{}){}",
+                    "knee: {} rows/sec kept (applied {} while offered, achieved {:.0}/sec{}){}",
                     knee.target_rows_per_sec,
+                    human_rate(knee.in_window_applied_rows_per_sec),
                     knee.achieved_rows_per_sec,
                     if knee.generator_bound {
                         " — GENERATOR-BOUND, so the knee is a floor"
@@ -299,19 +301,24 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                         ""
                     },
                     match probes.last() {
-                        Some(last) if !last.sustained => format!(
-                            ", {} rows/sec not (backlog {} after grace)",
-                            last.target_rows_per_sec, last.backlog_after_grace
+                        Some(last) if !last.kept_target_rate => format!(
+                            ", {} rows/sec not ({})",
+                            last.target_rows_per_sec,
+                            probe_outcome(last)
                         ),
                         _ =>
                             ", no tested rate failed — extend --rates to find the knee".to_string(),
                     }
                 ),
-                None => eprintln!(
-                    "no candidate rate sustained — even the lowest tested rate ({} rows/sec) \
-                     left a backlog after the grace period",
-                    rates.first().copied().unwrap_or(0.0)
-                ),
+                None => match probes.first() {
+                    Some(first) => eprintln!(
+                        "no candidate rate kept its target — even the lowest tested rate ({} \
+                         rows/sec) didn't ({})",
+                        first.target_rows_per_sec,
+                        probe_outcome(first)
+                    ),
+                    None => eprintln!("no candidate rates given"),
+                },
             }
             Some(ok)
         }
@@ -477,16 +484,22 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
 /// Issue #277's one-line reading of a probe's [`contention`] sample.
 fn report_contention(result: &fold_in::FoldInResult) {
     let c = &result.contention;
+    if c.samples == 0 {
+        // All-zero means over no samples would read as "no contention".
+        eprintln!(
+            "{} groups x {} drain workers: no contention samples landed in the window — \
+             lock-wait attribution unavailable, not zero",
+            result.groups, result.application_threads
+        );
+        return;
+    }
     eprintln!(
         "{} groups x {} drain workers: folded {} while offered; engine busy {:.2} backends, \
          {:.2} waiting on row locks ({:.0}%, {:.2} in the aggregate pre-lock), {:.2} running, \
          {:.2} idle in txn; {} deadlocks, {} rollbacks",
         result.groups,
         result.application_threads,
-        match result.in_window_folded_rows_per_sec {
-            Some(rate) => format!("{rate:.0} rows/sec"),
-            None => "(too few samples to fit)".to_string(),
-        },
+        human_rate(result.in_window_folded_rows_per_sec),
         c.engine_busy_mean,
         c.engine_row_lock_mean,
         c.row_lock_share() * 100.0,
@@ -507,12 +520,26 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
     let mut ok = true;
     for result in results {
         println!("{}", result.to_json(scenario));
-        if result.oracle_ok == Some(false) {
-            eprintln!(
-                "CORRECTNESS FAILURE: {} groups — {} of {} groups disagree with the oracle",
-                result.groups, result.oracle_mismatched_groups, result.oracle_groups
-            );
-            ok = false;
+        match result.oracle_ok {
+            Some(true) => {}
+            Some(false) => {
+                eprintln!(
+                    "CORRECTNESS FAILURE: {} groups — {} of {} groups disagree with the oracle",
+                    result.groups,
+                    result
+                        .oracle_mismatched_groups
+                        .map_or_else(|| "?".to_string(), |n| n.to_string()),
+                    result.oracle_groups
+                );
+                ok = false;
+            }
+            // Not a failure — a partially drained aggregate legitimately
+            // holds partial sums — but not a pass either (#335).
+            None => eprintln!(
+                "oracle SKIPPED: {} groups — the target never folded in every row within the \
+                 grace period, so this probe's correctness was not checked",
+                result.groups
+            ),
         }
         // Same cross-check as `report_probes` (#423): the counter counts
         // staged source rows, one per committed row, so any excess is a
@@ -544,10 +571,7 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
                 result.groups,
                 if result.kept_target_rate { "YES" } else { "NO" },
                 result.target_rows_per_sec,
-                match result.in_window_folded_rows_per_sec {
-                    Some(rate) => format!("{rate:.0} rows/sec"),
-                    None => "(too few samples to fit)".to_string(),
-                },
+                human_rate(result.in_window_folded_rows_per_sec),
                 match result.folded_rows_per_sec {
                     Some(rate) => format!("{rate:.0} rows/sec end to end"),
                     None => "never caught up within the grace period".to_string(),
@@ -559,7 +583,22 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
     ok
 }
 
-/// Prints one JSON line per probe and flags correctness/cross-check failures.
+/// Why a throughput probe did or didn't keep its target rate, for a
+/// human-readable line.
+fn probe_outcome(probe: &throughput::ThroughputProbe) -> String {
+    let applied = human_rate(probe.in_window_applied_rows_per_sec);
+    if probe.drained {
+        format!("applied {applied} while offered, drained within grace")
+    } else {
+        format!(
+            "applied {applied} while offered, backlog {} after grace",
+            probe.backlog_after_grace
+        )
+    }
+}
+
+/// Prints one JSON line per probe, flags correctness/cross-check failures,
+/// and states each probe's verdict — or that it measured the generator.
 fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool {
     let mut ok = true;
     for probe in probes {
@@ -575,13 +614,13 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
             );
             ok = false;
         }
-        // A sustained probe drained its whole backlog, so every committed row
+        // A drained probe landed its whole backlog, so every committed row
         // must have been applied *and* counted: a shortfall there is the
         // #266 metric cross-check failing, not a slow pipeline.
-        if probe.sustained && probe.changes_applied < probe.rows_issued {
+        if probe.drained && probe.changes_applied < probe.rows_issued {
             eprintln!(
-                "HARNESS FAILURE: {} at {} rows/sec reported sustained but applied only {} of \
-                 {} committed rows",
+                "HARNESS FAILURE: {} at {} rows/sec drained but applied only {} of {} \
+                 committed rows",
                 scenario, probe.target_rows_per_sec, probe.changes_applied, probe.rows_issued
             );
             ok = false;
@@ -606,6 +645,16 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
                  connections and the engine drained all of it; this row measured the \
                  generator, not the engine (raise --connections)",
                 scenario, probe.target_rows_per_sec, probe.achieved_rows_per_sec, probe.connections
+            );
+        } else {
+            eprintln!(
+                "{} at {} rows/sec ({} rows/commit) — kept target rate {}: {} (offered {:.0}/sec)",
+                scenario,
+                probe.target_rows_per_sec,
+                probe.rows_per_commit,
+                if probe.kept_target_rate { "YES" } else { "NO" },
+                probe_outcome(probe),
+                probe.achieved_rows_per_sec,
             );
         }
     }
@@ -771,7 +820,9 @@ mod tests {
             generator_bound: false,
             changes_applied,
             backlog_after_grace: 0,
-            sustained: true,
+            drained: true,
+            in_window_applied_rows_per_sec: Some(20_000.0),
+            kept_target_rate: true,
             e2e_count: rows_issued,
             e2e_p50_bucket_frac: 1.0,
             e2e_p99_bucket_frac: 1.0,
@@ -797,7 +848,7 @@ mod tests {
             achieved_rows_per_sec: 50_000.0,
             generator_bound: false,
             changes_applied,
-            sustained: true,
+            drained: true,
             folded_rows_per_sec: Some(50_000.0),
             in_window_folded_rows_per_sec: Some(50_000.0),
             kept_target_rate: true,
@@ -807,7 +858,7 @@ mod tests {
             e2e_max_frac: 1.0,
             oracle_ok: Some(true),
             oracle_groups: 50,
-            oracle_mismatched_groups: 0,
+            oracle_mismatched_groups: Some(0),
             contention: Default::default(),
             deadlocks: 0,
             xact_rollbacks: 0,
@@ -825,12 +876,13 @@ mod tests {
             &[probe(200_000, 297_601)],
             "throughput-ramp"
         ));
-        let unsustained = throughput::ThroughputProbe {
-            sustained: false,
+        let undrained = throughput::ThroughputProbe {
+            drained: false,
+            kept_target_rate: false,
             backlog_after_grace: 10,
             ..probe(200_000, 200_001)
         };
-        assert!(!report_probes(&[unsustained], "throughput-ramp"));
+        assert!(!report_probes(&[undrained], "throughput-ramp"));
 
         assert!(report_fold_in(
             &[fold_in(500_000, 500_000)],
@@ -840,6 +892,77 @@ mod tests {
             &[fold_in(500_000, 596_001)],
             "fold-in-ratio"
         ));
+    }
+
+    /// Issue #319: a probe applying at half its target drains a short
+    /// window's backlog inside the grace period. That used to be the knee;
+    /// the in-window rate now keeps it out.
+    #[test]
+    fn a_probe_that_drains_at_half_its_target_rate_is_not_the_knee() {
+        let kept = throughput::ThroughputProbe {
+            target_rows_per_sec: 50_000.0,
+            in_window_applied_rows_per_sec: Some(50_000.0),
+            ..probe(1_000_000, 1_000_000)
+        };
+        let half_rate = throughput::ThroughputProbe {
+            target_rows_per_sec: 100_000.0,
+            in_window_applied_rows_per_sec: Some(50_000.0),
+            kept_target_rate: crate::streaming::rate::kept_target_rate(
+                true,
+                Some(50_000.0),
+                100_000.0,
+            ),
+            ..probe(2_000_000, 2_000_000)
+        };
+        assert!(half_rate.drained);
+        assert!(!half_rate.kept_target_rate);
+        let probes = [kept, half_rate];
+        let knee = throughput::knee(&probes).expect("the 50k probe kept its rate");
+        assert_eq!(knee.target_rows_per_sec, 50_000.0);
+        assert!(probe_outcome(&probes[1]).contains("drained within grace"));
+    }
+
+    /// Issue #335: an oracle that never ran reads as skipped — `null`, not a
+    /// `0`-mismatch pass — and isn't reported as a correctness failure either.
+    #[test]
+    fn a_skipped_aggregate_oracle_reads_as_skipped() {
+        let skipped = fold_in::FoldInResult {
+            drained: false,
+            kept_target_rate: false,
+            folded_rows_per_sec: None,
+            oracle_ok: None,
+            oracle_mismatched_groups: None,
+            ..fold_in(500_000, 400_000)
+        };
+        let json = skipped.to_json("fold-in-ratio");
+        assert!(json.contains("\"oracle_ok\":null"), "{json}");
+        assert!(json.contains("\"oracle_mismatched_groups\":null"), "{json}");
+        assert!(json.contains("\"drained\":false"), "{json}");
+        assert!(report_fold_in(&[skipped], "fold-in-ratio"));
+
+        let checked = fold_in(500_000, 500_000).to_json("fold-in-ratio");
+        assert!(checked.contains("\"oracle_ok\":true"), "{checked}");
+        assert!(
+            checked.contains("\"oracle_mismatched_groups\":0"),
+            "{checked}"
+        );
+    }
+
+    #[test]
+    fn a_throughput_probe_reports_its_in_window_rate_and_verdict() {
+        let json = throughput::ThroughputProbe {
+            in_window_applied_rows_per_sec: None,
+            kept_target_rate: false,
+            ..probe(200_000, 200_000)
+        }
+        .to_json("transaction-shape");
+        assert!(
+            json.contains("\"in_window_applied_rows_per_sec\":null"),
+            "{json}"
+        );
+        assert!(json.contains("\"kept_target_rate\":false"), "{json}");
+        assert!(json.contains("\"drained\":true"), "{json}");
+        assert!(!json.contains("sustained"), "{json}");
     }
 
     #[test]

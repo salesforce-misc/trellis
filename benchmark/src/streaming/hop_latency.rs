@@ -205,9 +205,13 @@ pub async fn run_depth(
             .since(&e2e_baseline);
     let changes_applied =
         counter_value(&after, CHANGES_APPLIED_METRIC, terminal).saturating_sub(changes_before);
-    let eval = T1Evaluation::evaluate(&window);
     let per_hop = per_hop_mean_ms(&after, &chain.hops, &hop_baseline);
     let oracle = check_chain_oracle(&raw, &chain).await;
+    // Rows the terminal still lacked once the grace ran out never reached the
+    // histogram; T1 counts them as misses rather than judging the fast
+    // subset that did land.
+    let unlanded = (oracle.source_rows - oracle.terminal_rows).max(0) as u64;
+    let eval = T1Evaluation::evaluate(&window, unlanded);
 
     client.shutdown().await.expect("client shutdown");
 

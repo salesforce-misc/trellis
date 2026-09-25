@@ -43,7 +43,9 @@ pub const GENERATOR_UNDERSHOOT_TOLERANCE: f64 = 0.02;
 /// True when the generator materially undershot the offered target
 /// (`achieved < target * (1 - GENERATOR_UNDERSHOOT_TOLERANCE)`) **and** the
 /// engine still kept up with everything it was actually offered
-/// (`engine_kept_up`: no backlog left). That combination means nothing on
+/// (`engine_kept_up`: no backlog left, and — for the scenarios that fit an
+/// in-window rate — processed at the achieved rate while it was offered, see
+/// [`crate::streaming::rate::kept_up_with_offer`]). That combination means nothing on
 /// the engine side ever pushed back, so the only thing the result bounds is
 /// the generator.
 ///

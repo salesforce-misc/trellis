@@ -42,6 +42,8 @@
 //!   how much load the instrument itself can offer.
 //! - [`scrape`]: `render_prometheus()` readers — T1's bucket-fraction
 //!   convention, exact per-hop means, plain counters.
+//! - [`rate`]: the in-window rate fit and the `kept_target_rate` verdict the
+//!   throughput and fold-in scenarios share (#276, #319).
 //! - [`hop_latency`]: the hop-depth latency ladder (V-LAT / T1).
 //! - [`throughput`]: the single-hop probe, the throughput ramp (V-THRU / T2)
 //!   and the transaction-shape sweep (V-SHAPE).
@@ -63,6 +65,7 @@ pub mod hop_latency;
 pub mod idle_cost;
 pub mod intake_ceiling;
 pub mod load;
+pub mod rate;
 pub mod scrape;
 pub mod throughput;
 pub mod tuning;

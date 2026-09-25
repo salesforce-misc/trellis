@@ -59,7 +59,31 @@
 //! Every result carrying a target reports `generator_bound`
 //! ([`streaming::load::generator_bound`]): true when the achieved rate
 //! materially undershot the target while the engine kept up, i.e. the row
-//! measured the generator. Read it before reading `sustained`.
+//! measured the generator. Read it before reading `kept_target_rate`.
+//!
+//! ### Verdicts, and what a skipped check reads as
+//!
+//! - `throughput-ramp`, `transaction-shape`, `fold-in-ratio` and
+//!   `group-contention` judge each probe by `kept_target_rate`
+//!   ([`streaming::rate`]): the pipeline processed rows at the target rate
+//!   (within 2%) *while* load was arriving — a line fitted across the offer
+//!   window (`in_window_applied_rows_per_sec` for the 1-1 chain,
+//!   `in_window_folded_rows_per_sec` for the aggregate) — **and** its backlog
+//!   drained within the grace period (`drained`). `drained` alone is not a
+//!   verdict: a pipeline at half the target still drains a 20s window inside
+//!   a 30s grace (issue #319). The ramp's knee is the highest rate that kept
+//!   its target, and the ramp stops at the first that didn't.
+//! - `hop-ladder`'s T1 flags (`t1_*_pass`, `e2e_max_under_1s`) count rows
+//!   that never reached the terminal hop within the drain grace as misses
+//!   above every bound, rather than judging only the rows that landed.
+//! - A check that didn't run reads as `null`, never as a passing value:
+//!   `fold-in-ratio`'s aggregate oracle is skipped when the target never
+//!   drained (it would hold partial sums), and then both `oracle_ok` and
+//!   `oracle_mismatched_groups` are `null` (issue #335); an unfittable
+//!   in-window rate is `null` and fails `kept_target_rate`.
+//! - The 1-1 chain's oracle (`oracle_ok`) always runs, over the rows that
+//!   landed: it is "correct as far as it got", with `oracle_fully_converged`
+//!   saying whether that was everything.
 //!
 //! All the engine scenarios accept `--application-threads`, `--poll-interval-ms`,
 //! `--maintenance-interval-ms`, `--reconcile-interval-ms` and
@@ -74,8 +98,8 @@
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal
 //! target — the process exits non-zero on an oracle or cross-check failure,
-//! but **not** on a missed latency target or an unsustained rate, which are
-//! measurements rather than errors.
+//! but **not** on a missed latency target or a rate the engine couldn't
+//! keep, which are measurements rather than errors.
 //!
 //! `--release` matters: this pushes 1M rows through a real Postgres
 //! instance and a real CDC pipeline, and the debug-build overhead is large

@@ -265,7 +265,14 @@ pub struct T1Evaluation {
 }
 
 impl T1Evaluation {
-    pub fn evaluate(window: &HistogramSnapshot) -> Self {
+    /// Evaluates T1 over `window`, counting `unlanded` — rows committed in
+    /// the window that still hadn't reached the terminal hop when it closed —
+    /// as observations above every T1 bound. The histogram only sees rows
+    /// that landed, so without them a window that left rows stuck would be
+    /// judged on its fast subset alone and could pass. A row still missing
+    /// after the drain grace is older than that grace, which is longer than
+    /// T1's 1s max.
+    pub fn evaluate(window: &HistogramSnapshot, unlanded: u64) -> Self {
         if window.count == 0 {
             return Self {
                 count: 0,
@@ -276,13 +283,14 @@ impl T1Evaluation {
                 p99_pass: false,
             };
         }
-        let p50_frac = window.fraction(LE_P50);
-        let p99_frac = window.fraction(LE_P99);
+        let total = (window.count + unlanded) as f64;
+        let p50_frac = window.bucket(LE_P50) as f64 / total;
+        let p99_frac = window.bucket(LE_P99) as f64 / total;
         Self {
             count: window.count,
             p50_frac,
             p99_frac,
-            max_ok: window.bucket(LE_MAX) == window.count,
+            max_ok: unlanded == 0 && window.bucket(LE_MAX) == window.count,
             p50_pass: p50_frac >= 0.50,
             p99_pass: p99_frac >= 0.99,
         }
@@ -345,7 +353,7 @@ trellis_end_to_end_latency_seconds_count{transform=\"t\"} 15\n";
 
     #[test]
     fn t1_evaluation_matches_the_issues_boundary_fractions() {
-        let eval = T1Evaluation::evaluate(&e2e(SAMPLE));
+        let eval = T1Evaluation::evaluate(&e2e(SAMPLE), 0);
         assert_eq!(eval.p50_frac, 0.5);
         assert!(eval.p50_pass, "5/10 == 0.50 satisfies the >= 0.50 boundary");
         assert!(
@@ -356,9 +364,30 @@ trellis_end_to_end_latency_seconds_count{transform=\"t\"} 15\n";
         assert!(!eval.all_pass());
     }
 
+    /// A window whose every landed row was fast, but which left rows stuck
+    /// past the drain grace, must not pass T1 on the fast subset alone.
+    #[test]
+    fn rows_that_never_landed_count_against_t1() {
+        let all_fast = "\
+trellis_end_to_end_latency_seconds_bucket{transform=\"t\",le=\"0.25\"} 100\n\
+trellis_end_to_end_latency_seconds_bucket{transform=\"t\",le=\"0.5\"} 100\n\
+trellis_end_to_end_latency_seconds_bucket{transform=\"t\",le=\"1\"} 100\n\
+trellis_end_to_end_latency_seconds_count{transform=\"t\"} 100\n";
+        assert!(T1Evaluation::evaluate(&e2e(all_fast), 0).all_pass());
+
+        let stuck = T1Evaluation::evaluate(&e2e(all_fast), 2);
+        assert!(
+            !stuck.max_ok,
+            "a row still missing after the grace is over 1s"
+        );
+        assert!(!stuck.p99_pass, "100/102 is under the 0.99 boundary");
+        assert!(stuck.p50_pass);
+        assert!(!stuck.all_pass());
+    }
+
     #[test]
     fn zero_observations_never_reports_a_pass() {
-        let eval = T1Evaluation::evaluate(&HistogramSnapshot::default());
+        let eval = T1Evaluation::evaluate(&HistogramSnapshot::default(), 0);
         assert_eq!(eval.count, 0);
         assert!(!eval.all_pass());
     }
