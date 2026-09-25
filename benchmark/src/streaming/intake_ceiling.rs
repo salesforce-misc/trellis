@@ -91,15 +91,21 @@ pub struct IntakeCeilingResult {
     pub target_rows_per_sec: Option<f64>,
     pub rows_per_commit: usize,
     pub offered_duration_secs: f64,
+    /// How long the generator waited, after the offer window closed, for the
+    /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
+    /// `offered_duration_secs` or the achieved rate (issue #541).
+    pub commit_tail_secs: f64,
     pub rows_offered: u64,
     pub offered_achieved_rows_per_sec: f64,
-    /// Rows in the ring at the instant the offer window closed — what intake
-    /// had actually decoded and appended *while* load was arriving.
+    /// Rows in the ring the moment the generator returned (the offer window
+    /// plus its commit tail) — what intake had actually decoded and appended
+    /// *while* load was arriving.
     pub ring_rows_appended_in_window: i64,
-    /// `ring_rows_appended_in_window` over the window: intake's append rate
-    /// under load. When intake was the limiter (it fell behind during the
-    /// window) this **is** the intake ceiling; when it kept up, it equals the
-    /// offered rate and `generator_bound` says so.
+    /// `ring_rows_appended_in_window` over the window plus the commit tail
+    /// (the span it was sampled over): intake's append rate under load. When
+    /// intake was the limiter (it fell behind during the window) this **is**
+    /// the intake ceiling; when it kept up, it equals the offered rate, less
+    /// the tail's share of the span, and `generator_bound` says so.
     ///
     /// Deliberately not `ring_rows_appended` over the window: rows appended
     /// during the grace period, after the generator stopped, would credit a
@@ -135,7 +141,7 @@ impl IntakeCeilingResult {
         format!(
             "{{\"scenario\":\"intake-ceiling\",\"connections\":{},\"target_rows_per_sec\":{},\
              \"rows_per_commit\":{},\
-             \"offered_duration_secs\":{:.3},\"rows_offered\":{},\
+             \"offered_duration_secs\":{:.3},\"commit_tail_secs\":{:.3},\"rows_offered\":{},\
              \"offered_achieved_rows_per_sec\":{:.1},\"ring_rows_appended_in_window\":{},\
              \"append_achieved_rows_per_sec\":{:.1},\"ring_rows_appended\":{},\
              \"append_backlog\":{},\"intake_kept_pace\":{},\"generator_bound\":{},\"wal_bytes_per_source_row\":{:.2}}}",
@@ -146,6 +152,7 @@ impl IntakeCeilingResult {
             },
             self.rows_per_commit,
             self.offered_duration_secs,
+            self.commit_tail_secs,
             self.rows_offered,
             self.offered_achieved_rows_per_sec,
             self.ring_rows_appended_in_window,
@@ -240,7 +247,8 @@ pub async fn run(
         connections: cfg.connections,
         target_rows_per_sec,
         rows_per_commit: cfg.rows_per_commit,
-        offered_duration_secs: load.elapsed.as_secs_f64(),
+        offered_duration_secs: load.window.as_secs_f64(),
+        commit_tail_secs: load.commit_tail().as_secs_f64(),
         rows_offered: load.rows_issued,
         offered_achieved_rows_per_sec: offered_rate,
         ring_rows_appended_in_window: appended_in_window,

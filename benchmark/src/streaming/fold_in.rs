@@ -75,6 +75,10 @@ pub struct FoldInResult {
     /// Generator writer connections.
     pub connections: usize,
     pub offered_duration_secs: f64,
+    /// How long the generator waited, after the offer window closed, for the
+    /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
+    /// `offered_duration_secs` or the achieved rate (issue #541).
+    pub commit_tail_secs: f64,
     pub rows_issued: u64,
     pub achieved_rows_per_sec: f64,
     /// Issue #276's self-check: the generator undershot the target and the
@@ -146,7 +150,7 @@ impl FoldInResult {
         format!(
             "{{\"scenario\":\"{}\",\"fold_in_ratio\":{:.1},\"groups\":{},\
              \"target_rows_per_sec\":{},\"application_threads\":{},\"connections\":{},\
-             \"offered_duration_secs\":{:.3},\
+             \"offered_duration_secs\":{:.3},\"commit_tail_secs\":{:.3},\
              \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
              \"changes_applied\":{},\"drained\":{},\"folded_rows_per_sec\":{},\
              {},\"kept_target_rate\":{},\
@@ -161,6 +165,7 @@ impl FoldInResult {
             self.application_threads,
             self.connections,
             self.offered_duration_secs,
+            self.commit_tail_secs,
             self.rows_issued,
             self.achieved_rows_per_sec,
             self.generator_bound,
@@ -397,7 +402,8 @@ pub async fn run_probe(
         target_rows_per_sec,
         application_threads: tuning.application_threads,
         connections: offer.connections,
-        offered_duration_secs: load.elapsed.as_secs_f64(),
+        offered_duration_secs: load.window.as_secs_f64(),
+        commit_tail_secs: load.commit_tail().as_secs_f64(),
         rows_issued: load.rows_issued,
         achieved_rows_per_sec,
         generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, kept),

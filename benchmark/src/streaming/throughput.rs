@@ -81,6 +81,10 @@ pub struct ThroughputProbe {
     /// Generator writer connections.
     pub connections: usize,
     pub offered_duration_secs: f64,
+    /// How long the generator waited, after the offer window closed, for the
+    /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
+    /// `offered_duration_secs` or the achieved rate (issue #541).
+    pub commit_tail_secs: f64,
     pub rows_issued: u64,
     /// What the generator actually managed — compare against
     /// `target_rows_per_sec` before reading anything else here.
@@ -139,7 +143,7 @@ impl ThroughputProbe {
         format!(
             "{{\"scenario\":\"{}\",\"target_rows_per_sec\":{},\"rows_per_commit\":{},\
              \"commits_per_sec\":{:.2},\"connections\":{},\"offered_duration_secs\":{},\
-             \"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
+             \"commit_tail_secs\":{:.3},\"rows_issued\":{},\"achieved_rows_per_sec\":{:.1},\"generator_bound\":{},\
              \"changes_applied\":{},\
              \"backlog_after_grace\":{},\"drained\":{},\
              {},\"kept_target_rate\":{},\"e2e_count\":{},\
@@ -153,6 +157,7 @@ impl ThroughputProbe {
             self.commits_per_sec,
             self.connections,
             self.offered_duration_secs,
+            self.commit_tail_secs,
             self.rows_issued,
             self.achieved_rows_per_sec,
             self.generator_bound,
@@ -331,7 +336,8 @@ pub async fn run_probe(
         rows_per_commit,
         commits_per_sec,
         connections: offer.connections,
-        offered_duration_secs: offer.duration.as_secs_f64(),
+        offered_duration_secs: load.window.as_secs_f64(),
+        commit_tail_secs: load.commit_tail().as_secs_f64(),
         rows_issued: load.rows_issued,
         achieved_rows_per_sec,
         generator_bound: generator_bound(Some(target_rows_per_sec), achieved_rows_per_sec, kept),

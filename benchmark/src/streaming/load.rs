@@ -99,12 +99,33 @@ impl LoadConfig {
 pub struct LoadSummary {
     pub commits_issued: u64,
     pub rows_issued: u64,
+    /// The offer window: the configured duration. Both generators check the
+    /// deadline before issuing a commit, so every commit counted here was
+    /// issued inside it.
+    pub window: Duration,
+    /// Wall-clock time from the window opening until the last issued commit
+    /// returned: `window` plus the [`commit_tail`](Self::commit_tail).
     pub elapsed: Duration,
 }
 
 impl LoadSummary {
+    /// The rate the generator offered: rows issued over the offer
+    /// [`window`](Self::window).
+    ///
+    /// Not over `elapsed` (issue #541): that includes the commit tail, the
+    /// time the last in-flight commits took to return after the window closed.
+    /// The tail says nothing about what was offered. Counting it made a paced
+    /// run that issued its whole schedule read as an undershoot whenever its
+    /// last commits were slow, and a false [`generator_bound`] with it.
     pub fn achieved_rows_per_sec(&self) -> f64 {
-        self.rows_issued as f64 / self.elapsed.as_secs_f64()
+        self.rows_issued as f64 / self.window.as_secs_f64()
+    }
+
+    /// How long past the window's close the generator waited for commits it
+    /// had issued inside it: `elapsed - window`, reported separately so a
+    /// slow tail stays visible without distorting the offered rate.
+    pub fn commit_tail(&self) -> Duration {
+        self.elapsed.saturating_sub(self.window)
     }
 }
 
@@ -197,6 +218,7 @@ pub async fn run_controlled_load(
     LoadSummary {
         commits_issued: commits,
         rows_issued: commits * cfg.rows_per_commit as u64,
+        window: cfg.duration,
         elapsed: start.elapsed(),
     }
 }
@@ -364,6 +386,7 @@ pub async fn run_parallel_load(
     LoadSummary {
         commits_issued: commits,
         rows_issued: commits * cfg.rows_per_commit as u64,
+        window: cfg.duration,
         elapsed: start.elapsed(),
     }
 }
@@ -400,6 +423,62 @@ mod tests {
         assert!(!generator_bound(None, 548_000.0, false));
     }
 
+    /// A summary of a paced 20k rows/sec run over a 1s window, issuing
+    /// `rows_issued` in 100-row commits and returning `tail` after the window
+    /// closed.
+    fn paced_summary(rows_issued: u64, tail: Duration) -> LoadSummary {
+        LoadSummary {
+            commits_issued: rows_issued / 100,
+            rows_issued,
+            window: Duration::from_secs(1),
+            elapsed: Duration::from_secs(1) + tail,
+        }
+    }
+
+    #[test]
+    fn a_slow_commit_tail_does_not_make_a_full_offer_generator_bound() {
+        // Issue #541's run: every commit due in the window issued, the last
+        // ones slow to return. Its offered rate is its target.
+        let summary = paced_summary(20_000, Duration::from_millis(274));
+        assert_eq!(summary.achieved_rows_per_sec(), 20_000.0);
+        assert_eq!(summary.commit_tail(), Duration::from_millis(274));
+        assert!(!generator_bound(
+            Some(20_000.0),
+            summary.achieved_rows_per_sec(),
+            true
+        ));
+    }
+
+    #[test]
+    fn commits_left_unissued_at_the_deadline_are_an_undershoot() {
+        // A loaded box where the writers were still busy when the window
+        // closed, so commits due in it were never issued (seen on CI). The
+        // generator really did under-offer, whatever the tail.
+        for tail in [Duration::ZERO, Duration::from_millis(300)] {
+            let summary = paced_summary(15_200, tail);
+            assert_eq!(summary.achieved_rows_per_sec(), 15_200.0);
+            assert!(generator_bound(
+                Some(20_000.0),
+                summary.achieved_rows_per_sec(),
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn the_commit_tail_is_what_elapsed_adds_to_the_window() {
+        assert_eq!(
+            paced_summary(20_000, Duration::ZERO).commit_tail(),
+            Duration::ZERO
+        );
+        // Never negative, even if a clock reading lands inside the window.
+        let early = LoadSummary {
+            elapsed: Duration::from_millis(999),
+            ..paced_summary(20_000, Duration::ZERO)
+        };
+        assert_eq!(early.commit_tail(), Duration::ZERO);
+    }
+
     #[test]
     fn commit_ids_are_contiguous_and_disjoint_across_commits() {
         assert_eq!(commit_id_range(1, 0, 1000), (1, 1000));
@@ -418,6 +497,14 @@ mod tests {
         );
         assert_eq!(
             commit_due_offset(2000, 200, 400_000.0),
+            Duration::from_secs(1)
+        );
+        // 20k rows/sec in 100-row commits over 1s: commit 199 is the last one
+        // due before the deadline, so a run that keeps up issues exactly
+        // 200 commits, 20,000 rows.
+        assert!(commit_due_offset(199, 100, 20_000.0) < Duration::from_secs(1));
+        assert_eq!(
+            commit_due_offset(200, 100, 20_000.0),
             Duration::from_secs(1)
         );
     }
@@ -460,9 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn a_paced_parallel_run_offers_its_target_with_gapless_ids() {
-        // 20k rows/sec in 100-row commits from 4 connections for 1s: well
-        // inside one connection's reach, so it must hit the target.
+    fn a_paced_parallel_run_lands_gapless_ids_within_its_schedule() {
+        // 20k rows/sec in 100-row commits from 4 connections for 1s. How many
+        // of the 200 commits due get issued before the deadline depends on how
+        // loaded the box is (issue #541), so this checks only what holds on
+        // any box: every issued row landed, the ids are gapless, and the
+        // schedule is never overrun. The rate and verdict are pure functions
+        // of the summary, tested above.
         let (summary, (landed, min_id, max_id)) = run_against_postgres(ParallelLoad {
             connections: 4,
             rows_per_commit: 100,
@@ -471,14 +562,11 @@ mod tests {
             pace: Pace::RowsPerSec(20_000.0),
         });
         assert_eq!(summary.rows_issued, summary.commits_issued * 100);
+        assert!(summary.commits_issued > 0, "{summary:?}");
+        assert!(summary.rows_issued <= 20_000, "{summary:?}");
+        assert_eq!(summary.window, Duration::from_secs(1));
         assert_eq!(landed as u64, summary.rows_issued);
         assert_eq!((min_id, max_id), (1, summary.rows_issued as i64));
-        // Exactly the commits due inside the window: 20,000 rows.
-        assert_eq!(summary.rows_issued, 20_000);
-        assert!(
-            !generator_bound(Some(20_000.0), summary.achieved_rows_per_sec(), true),
-            "a run that hit its target is not generator-bound: {summary:?}"
-        );
     }
 
     #[test]

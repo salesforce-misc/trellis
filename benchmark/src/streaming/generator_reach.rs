@@ -27,6 +27,10 @@ pub struct GeneratorReachResult {
     pub connections: usize,
     pub rows_per_commit: usize,
     pub offered_duration_secs: f64,
+    /// How long the generator waited, after the offer window closed, for the
+    /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
+    /// `offered_duration_secs` or the achieved rate (issue #541).
+    pub commit_tail_secs: f64,
     pub commits_issued: u64,
     pub rows_issued: u64,
     pub achieved_commits_per_sec: f64,
@@ -37,11 +41,12 @@ impl GeneratorReachResult {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"scenario\":\"generator-reach\",\"connections\":{},\"rows_per_commit\":{},\
-             \"offered_duration_secs\":{:.3},\"commits_issued\":{},\"rows_issued\":{},\
+             \"offered_duration_secs\":{:.3},\"commit_tail_secs\":{:.3},\"commits_issued\":{},\"rows_issued\":{},\
              \"achieved_commits_per_sec\":{:.1},\"achieved_rows_per_sec\":{:.1}}}",
             self.connections,
             self.rows_per_commit,
             self.offered_duration_secs,
+            self.commit_tail_secs,
             self.commits_issued,
             self.rows_issued,
             self.achieved_commits_per_sec,
@@ -92,11 +97,12 @@ pub async fn run(
         "every row the generator reported issuing must have landed"
     );
 
-    let secs = load.elapsed.as_secs_f64();
+    let secs = load.window.as_secs_f64();
     GeneratorReachResult {
         connections,
         rows_per_commit,
         offered_duration_secs: secs,
+        commit_tail_secs: load.commit_tail().as_secs_f64(),
         commits_issued: load.commits_issued,
         rows_issued: load.rows_issued,
         achieved_commits_per_sec: load.commits_issued as f64 / secs,
