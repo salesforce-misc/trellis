@@ -145,23 +145,34 @@ const INTAKE_CONSECUTIVE_FAILURES_METRIC: &str = "trellis_intake_consecutive_fai
 fn handle() -> &'static PrometheusHandle {
     static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
     HANDLE.get_or_init(|| {
-        let builder = PrometheusBuilder::new()
-            .set_buckets(LATENCY_BUCKETS)
-            .expect("LATENCY_BUCKETS is non-empty and every boundary is finite");
-        let recorder = builder.build_recorder();
+        let recorder = described_recorder();
         let handle = recorder.handle();
         // Best-effort install — see the module doc comment. `build_recorder`
         // (rather than `install`/`install_recorder`) is used deliberately:
         // those two are only compiled under the exporter's `http-listener`
         // feature, which this crate does not enable (no bound socket).
         let _ = metrics::set_global_recorder(recorder);
-        describe_metrics();
         handle
     })
 }
 
+/// A recorder with this crate's buckets and every metric's description.
+///
+/// The descriptions go to this recorder directly, not through the macros'
+/// current-recorder lookup: a thread with a local recorder set (a test's
+/// `set_default_local_recorder`) that happens to be first to call
+/// [`handle`] would otherwise take every `# HELP` line with it.
+fn described_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+    let recorder = PrometheusBuilder::new()
+        .set_buckets(LATENCY_BUCKETS)
+        .expect("LATENCY_BUCKETS is non-empty and every boundary is finite")
+        .build_recorder();
+    metrics::with_local_recorder(&recorder, describe_metrics);
+    recorder
+}
+
 /// Registers a `# HELP` description for every metric this module records,
-/// once, right after [`handle`] installs the global recorder. Without this,
+/// once, on the recorder [`described_recorder`] builds. Without this,
 /// `metrics-exporter-prometheus` still renders a `# TYPE` line per series
 /// (inferred from the macro used to record it — `histogram!`/`counter!`/
 /// `gauge!`) but omits `# HELP` entirely, since it has no description to
@@ -441,6 +452,29 @@ mod tests {
         assert!(
             rendered.contains("metrics_facade_test_state"),
             "rendered output missing the state label: {rendered}"
+        );
+    }
+
+    /// A thread with a local recorder set (the intake supervisor tests' own
+    /// registry) can be the first to build the global one. Its descriptions
+    /// must still land on the global recorder: they used to follow the
+    /// local one, and every `# HELP` line was missing from the process's
+    /// scrape (which failed the test below whenever the supervisor test ran
+    /// first).
+    #[test]
+    fn a_local_recorder_does_not_take_the_descriptions() {
+        let local = PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&local);
+
+        let recorder = described_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!(CHANGES_APPLIED_METRIC, "transform" => "t").increment(1);
+        });
+
+        let rendered = recorder.handle().render();
+        assert!(
+            rendered.contains(&format!("# HELP {CHANGES_APPLIED_METRIC} ")),
+            "the description went elsewhere: {rendered}"
         );
     }
 
