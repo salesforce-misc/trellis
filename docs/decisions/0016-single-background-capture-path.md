@@ -347,7 +347,13 @@ maintenance loop now checks every tick for a marker no pass has fenced yet
 (`intake::publication::discharge_wanted`) and runs its reconcile pass at
 once when it finds one. Each fresh marker triggers one early pass: the pass
 fences it, and a marker whose fence doesn't settle in that pass, or whose
-enumeration defers on intake, waits for the regular interval as before.
+enumeration defers on intake, waits for the regular interval as before. A
+pass that runs out a whole catch-up timeout (a long transaction holding a
+fresh fence, or intake behind) suspends early passes until the next regular
+one. Otherwise markers parked one after another behind that transaction
+would each start a pass that waits it out, back to back, and the loop, the
+only sealer, would barely seal. With the suspension, the stall is bounded as
+#431 bounds it: one timeout per `reconcile_interval`.
 
 **A catch-up that keeps failing keeps its definition `catching_up`**, and
 the discharge's backoff and error reporting (#407) apply. `Trellis::status`

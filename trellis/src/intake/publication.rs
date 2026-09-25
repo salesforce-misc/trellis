@@ -392,7 +392,10 @@ pub(crate) async fn park_marker(
 /// most one early pass: the pass that sees it fences it
 /// ([`confirm_fence`]), after which this no longer counts it. A marker whose
 /// fence doesn't settle in that pass, or whose enumeration defers on intake,
-/// waits for the regular interval, as before.
+/// waits for the regular interval, as before. And after a pass that ran out
+/// a whole catch-up timeout, the loop stops asking until its next regular
+/// pass, so fresh markers parked behind a long transaction can't chain
+/// waiting passes back to back (`client::early_pass_allowed`).
 pub(crate) async fn discharge_wanted(client: &impl GenericClient) -> Result<bool, IntakeError> {
     Ok(client
         .query_one(

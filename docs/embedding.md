@@ -83,6 +83,12 @@ the target table quietly return nothing (or stale data, for a transform that
 was already live before the worker process disappeared), with no exception,
 timeout, or log line pointing at the actual cause.
 
+Drain threads alone don't get a transform to `live` either. A build the
+staging worker dispatched before it went away still finishes on the drain
+threads, but only the staging worker runs the catch-up that follows it, so
+the transform stops at `TransformStatus::CatchingUp` until a staging worker
+is back.
+
 This is the single most likely misconfiguration for an embedded deployment —
 easy to hit (a deploy config typo, an autoscaler with a bad minimum, a worker
 dyno nobody remembered to add), and hard to notice until someone asks why a
