@@ -2897,6 +2897,72 @@ mod catch_up_tests {
         );
     }
 
+    /// Issue #518: a definition row whose text doesn't parse fails its
+    /// table's discharge, which records the parse error on the marker and
+    /// backs off (#407), rather than panicking the maintenance loop. Which
+    /// reader of the catalog meets the text first is the discharge's business
+    /// (today its catch-up check does, before the sweep); the sweep's own
+    /// parse is pinned by `resume_orphans`'
+    /// `a_sweep_of_an_unparseable_definition_is_an_error`.
+    #[tokio::test]
+    async fn an_unparseable_definition_fails_the_discharge_and_backs_off() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(&db).await;
+        client
+            .batch_execute(
+                "create table public.t (id bigint primary key); \
+                 insert into public.t values (1); \
+                 create publication test_pub; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.t', 1);",
+            )
+            .await
+            .expect("seed the source table");
+        reconcile_publication(&mut client, "test_pub", &["public.t".to_string()])
+            .await
+            .expect("reconcile parks a marker");
+        client
+            .execute(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.t', 1, 'not a transform', 'catching_up')",
+                &[],
+            )
+            .await
+            .expect("seed an unparseable definition");
+
+        let failures = run_pending_backfills_until(
+            &mut client,
+            "wake",
+            &StagedWatermark::saturated(),
+            Duration::from_secs(600),
+            &|| false,
+        )
+        .await
+        .expect("a failing marker must not fail the pass");
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["public.t"]
+        );
+        let (attempts, last_error, retry_in) = retry_state(&client, "public.t")
+            .await
+            .expect("the failing marker stays");
+        assert_eq!(attempts, 1);
+        let last_error = last_error.expect("the failure's error is recorded");
+        assert!(
+            last_error.contains("failed to parse"),
+            "the recorded error names the cause, got {last_error:?}"
+        );
+        assert!(
+            retry_in.is_some(),
+            "a failed marker has a next-attempt time"
+        );
+    }
+
     /// Issue #407: a park that lands while a discharge of the same table is
     /// failing keeps its fresh state. The failure is recorded against the
     /// generation the pass read, which the park replaced.

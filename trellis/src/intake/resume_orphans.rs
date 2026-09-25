@@ -184,7 +184,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
 use crate::defs::ast::{GroupByKey, KeySpace};
-use crate::defs::catalog::relationship_by_name_in;
+use crate::defs::catalog::{CatalogError, relationship_by_name_in};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::RelationshipCardinality;
 use crate::defs::oracle::{render_to_one_rel_expr_sql, to_one_join_clauses};
@@ -289,8 +289,9 @@ impl Sweep {
             let text: String = row.get(1);
             let target: String = row.get(2);
             let source_table: String = row.get(3);
-            let def = parse(&text)
-                .unwrap_or_else(|e| panic!("persisted definition failed to parse: {e}"));
+            // Issue #518: an error, like every other discharge-time reader
+            // of the catalog, so the marker fails and backs off (#407).
+            let def = parse(&text).map_err(CatalogError::from)?;
             let target_ident = ddl::qualified_target_table_ident(&target);
             // Quoted: `identity_key_columns` resolves its argument with
             // `to_regclass`, which would case-fold a bare mixed-case name.
@@ -510,9 +511,12 @@ async fn aggregate_match(
     let mut rels = BTreeSet::new();
     for key in group_by {
         let name = key.target_column_name();
-        let col = key_cols.iter().find(|c| c.name == name).unwrap_or_else(|| {
-            panic!("aggregate target {target} has no grouping column {name:?} in its key")
-        });
+        let col = key_cols.iter().find(|c| c.name == name).ok_or_else(|| {
+            IntakeError::UnsweepableTarget {
+                target: target.to_string(),
+                reason: format!("its primary key has no grouping column {name:?}"),
+            }
+        })?;
         if let GroupByKey::RelationshipPath { rel, .. } = key {
             rels.insert(rel.as_str());
         }
@@ -533,20 +537,27 @@ async fn aggregate_match(
             .split_once('.')
             .ok_or_else(|| IntakeError::InvalidTableName(source_table.to_string()))?;
         for rel in rels {
+            // The catalog refuses to drop a relationship a definition still
+            // reads, and the validator only admits a to-one path as a GROUP
+            // BY key (a to-many join would fan out and match groups no row
+            // backs), so either of these is a catalog edited by hand: an
+            // error the marker backs off on (issue #518), not a panic.
+            let unsweepable = |reason: String| IntakeError::UnsweepableTarget {
+                target: target.to_string(),
+                reason,
+            };
             let reldef = relationship_by_name_in(txn, from_schema, from_table, rel)
                 .await?
-                // The catalog refuses to drop a relationship a definition
-                // still reads, so this is a broken invariant, not a race.
-                .unwrap_or_else(|| {
-                    panic!("{target}'s GROUP BY reads relationship {rel:?}, which {source_table} doesn't declare")
-                });
-            // The validator only admits a to-one path as a GROUP BY key; a
-            // to-many join would fan out and match groups no row backs.
-            assert_eq!(
-                reldef.cardinality,
-                RelationshipCardinality::ToOne,
-                "{target}'s GROUP BY reads relationship {rel:?}, which is not to-one"
-            );
+                .ok_or_else(|| {
+                    unsweepable(format!(
+                        "its GROUP BY reads relationship {rel:?}, which {source_table} doesn't declare"
+                    ))
+                })?;
+            if reldef.cardinality != RelationshipCardinality::ToOne {
+                return Err(unsweepable(format!(
+                    "its GROUP BY reads relationship {rel:?}, which is not to-one"
+                )));
+            }
             // Joined by its recorded to-side (issue #372), not the bare
             // `to_table` re-resolved through this session's `search_path`.
             joins.push((rel.to_string(), reldef.qualified_to_table(), reldef.def));
@@ -971,6 +982,97 @@ mod db_tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(groups, vec![Some("b".to_string())]);
+    }
+
+    /// Issue #518: a definition row whose text doesn't parse is an error the
+    /// discharge fails its marker on (and backs off, #407), not a panic that
+    /// takes down the maintenance loop.
+    #[tokio::test]
+    async fn a_sweep_of_an_unparseable_definition_is_an_error() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (_pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "insert into source_table_versions (source_table, version) values ('public.t', 1)",
+        )
+        .await
+        .expect("seed the source version");
+        let id: i64 = raw
+            .query_one(
+                "insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.d', 'public.t', 1, 'not a transform', 'catching_up') \
+                 returning id",
+                &[],
+            )
+            .await
+            .expect("seed an unparseable definition")
+            .get(0);
+
+        let txn = raw.transaction().await.expect("begin");
+        let mut sweep = Sweep::default();
+        let err = sweep
+            .add(&txn, &[id], TransformStatus::CatchingUp)
+            .await
+            .expect_err("an unparseable definition fails the sweep");
+        assert!(
+            matches!(&err, IntakeError::Catalog(e) if matches!(**e, CatalogError::Parse(_))),
+            "the parse error is returned, got {err:?}"
+        );
+    }
+
+    /// Issue #518: an aggregate target whose key no longer holds a grouping
+    /// column (its primary key altered by hand) is an error the discharge
+    /// backs off on, not a panic.
+    #[tokio::test]
+    async fn a_sweep_of_an_aggregate_missing_a_grouping_key_column_is_an_error() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, g text, a numeric); \
+             alter table public.orders replica identity full; \
+             insert into public.orders values (1, 'a', 1)",
+        )
+        .await
+        .expect("seed orders");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("g".to_string(), ValueType::Text),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        crate::defs::catalog::install_definition(
+            &pool,
+            "TRANSFORM orders_by_g FROM orders GROUP BY g SELECT sum(a) AS total",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register");
+        crate::intake::publication::settle_builds(&pool).await;
+        let ids = catching_up(&raw).await;
+        raw.batch_execute(
+            "do $$ declare c text; begin \
+               for c in select conname from pg_constraint \
+                        where conrelid = 'public.orders_by_g'::regclass and contype in ('p', 'u') \
+               loop execute format('alter table public.orders_by_g drop constraint %I', c); \
+               end loop; \
+             end $$; \
+             alter table public.orders_by_g add primary key (total)",
+        )
+        .await
+        .expect("rekey the target by hand");
+
+        let txn = raw.transaction().await.expect("begin");
+        let mut sweep = Sweep::default();
+        let err = sweep
+            .add(&txn, &ids, TransformStatus::CatchingUp)
+            .await
+            .expect_err("a target missing its grouping column fails the sweep");
+        assert!(
+            matches!(&err, IntakeError::UnsweepableTarget { target, .. } if target == "public.orders_by_g"),
+            "the mismatch is returned, got {err:?}"
+        );
     }
 }
 

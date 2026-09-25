@@ -116,6 +116,14 @@ pub enum IntakeError {
     /// `Box`ed for the same reason as [`IntakeError::Catalog`]:
     /// `ApplyError` carries an `Intake(IntakeError)` variant.
     Propagation(Box<crate::staging::ApplyError>),
+    /// Issue #518: a discharge's sweep (`super::resume_orphans`) found a
+    /// swept target inconsistent with its definition in the catalog: an
+    /// aggregate target whose key lacks one of its grouping columns (its
+    /// primary key altered by hand, say), or a `GROUP BY` relationship its
+    /// source no longer declares as to-one. Returned rather than panicked, so
+    /// the marker fails and backs off (issue #407) with this on status
+    /// instead of taking down the maintenance loop.
+    UnsweepableTarget { target: String, reason: String },
 }
 
 impl IntakeError {
@@ -149,7 +157,8 @@ impl IntakeError {
             | IntakeError::Io(_)
             | IntakeError::InvalidTableName(_)
             | IntakeError::DottedIdentifierComponent { .. }
-            | IntakeError::InvalidSnapshot(_) => ErrorCode::Internal,
+            | IntakeError::InvalidSnapshot(_)
+            | IntakeError::UnsweepableTarget { .. } => ErrorCode::Internal,
         }
     }
 }
@@ -206,6 +215,9 @@ impl fmt::Display for IntakeError {
             IntakeError::InvalidSnapshot(text) => {
                 write!(f, "could not parse pg_snapshot text {text:?}")
             }
+            IntakeError::UnsweepableTarget { target, reason } => {
+                write!(f, "can't sweep {target}'s unbacked rows: {reason}")
+            }
             IntakeError::MissingProgressRow { slot } => write!(
                 f,
                 "no replication_progress row for slot {slot}; fresh-install slot setup is \
@@ -241,7 +253,8 @@ impl std::error::Error for IntakeError {
             | IntakeError::DottedIdentifierComponent { .. }
             | IntakeError::InvalidSnapshot(_)
             | IntakeError::MissingProgressRow { .. }
-            | IntakeError::OrphanedSlot { .. } => None,
+            | IntakeError::OrphanedSlot { .. }
+            | IntakeError::UnsweepableTarget { .. } => None,
         }
     }
 }
