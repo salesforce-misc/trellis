@@ -3287,6 +3287,19 @@ fn overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
     }
 }
 
+/// Issue #531: whether a to-side `TRUNCATE` at `lsn` is one the
+/// relationship's last projection refresh (stamped at `stamp`) already read,
+/// so clearing the projection for it would drop what the refresh found
+/// written after it. The refresh holds `ACCESS SHARE` on the to-side from its
+/// first read until it commits, so a truncate either committed before that
+/// read (and its commit is at or below the stamp) or waits for the refresh
+/// to commit (and lands above it). Unlike [`overtaken_by_refresh`], a
+/// truncate with no `lsn` is never treated as read: skipping a clear is not
+/// the conservative choice.
+fn truncate_overtaken_by_refresh(lsn: Option<PgLsn>, stamp: Option<PgLsn>) -> bool {
+    matches!((lsn, stamp), (Some(lsn), Some(stamp)) if lsn <= stamp)
+}
+
 /// Issues #507/#531: whether a reverse record carries images its to-side has
 /// since moved past by a write that no later record will bring: the live row
 /// for its new key no longer equals its new image, or a row it deleted (or
@@ -3381,16 +3394,16 @@ async fn superseded_to_side(
     .await
 }
 
-/// Issue #531: each of `records`' relationships' refresh stamp
+/// Issue #531: each of `relationship_ids`' refresh stamp
 /// (`relationship_projections.refreshed_lsn`), keyed by `relationship_id`,
 /// read under a `for share` lock taken in `relationship_id` order. A
-/// relationship never refreshed has no entry. No query at all when `records`
-/// is empty.
+/// relationship never refreshed has no entry. No query at all when
+/// `relationship_ids` is empty.
 async fn relationship_refresh_stamps(
     txn: &Transaction<'_>,
-    records: &[RelationshipReverseRecord],
+    relationship_ids: impl Iterator<Item = i64>,
 ) -> Result<HashMap<i64, PgLsn>, ApplyError> {
-    let mut ids: Vec<i64> = records.iter().map(|r| r.shape.id).collect();
+    let mut ids: Vec<i64> = relationship_ids.collect();
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -4508,6 +4521,29 @@ mod tests {
         assert!(overtaken_by_refresh(None, Some(stamp)));
     }
 
+    /// Issue #531: a to-side truncate's projection clear is skipped only
+    /// when the truncate is at or below the refresh stamp. With no stamp, or
+    /// no `lsn` to compare, the clear runs.
+    #[test]
+    fn only_a_truncate_at_or_below_the_refresh_stamp_skips_its_clear() {
+        let stamp = PgLsn::from(0x2000);
+        assert!(!truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x1000)),
+            None
+        ));
+        assert!(!truncate_overtaken_by_refresh(None, None));
+        assert!(!truncate_overtaken_by_refresh(None, Some(stamp)));
+        assert!(!truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x2001)),
+            Some(stamp)
+        ));
+        assert!(truncate_overtaken_by_refresh(Some(stamp), Some(stamp)));
+        assert!(truncate_overtaken_by_refresh(
+            Some(PgLsn::from(0x1000)),
+            Some(stamp)
+        ));
+    }
+
     /// Issue #125 regression pin, part 1: [`key_array_filter`] renders the
     /// fixed, indexable shape — the bound `$1` array cast to the column's
     /// own type, the column reference itself left uncast — when the
@@ -5085,7 +5121,20 @@ pub struct ApplyPlan {
     /// [`ApplyPlan::aggregate_clears`]. See the `compute` truncate loop's
     /// own comment on why this can't reuse [`ApplyPlan::relationship_reverses`]
     /// (a `TRUNCATE`'s sentinel carries no image to upsert or delete with).
-    relationship_projection_clears: std::collections::HashSet<String>,
+    /// Keyed by `relationship_id`.
+    relationship_projection_clears: std::collections::BTreeMap<i64, RelationshipProjectionClear>,
+}
+
+/// One entry of [`ApplyPlan::relationship_projection_clears`].
+#[derive(Debug, Clone)]
+struct RelationshipProjectionClear {
+    /// The settled projection, qualified.
+    qualified_projection: String,
+    /// The latest truncating commit this batch carries for the to-side
+    /// (the folded truncate's `lsn`). Issue #531: a truncate at or below
+    /// the relationship's refresh stamp is one the refresh already read, so
+    /// the clear is skipped ([`truncate_overtaken_by_refresh`]).
+    lsn: Option<PgLsn>,
 }
 
 /// The image [`compute`] decodes as a change's *old side*: its folded
@@ -5293,8 +5342,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     // projection silently keeps serving every to-side row's last-known
     // value forever after the physical table is emptied — see the
     // `truncated` loop below, where this is populated, for the full story.
-    let mut relationship_projection_clears: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut relationship_projection_clears: std::collections::BTreeMap<
+        i64,
+        RelationshipProjectionClear,
+    > = std::collections::BTreeMap::new();
 
     for (source_key, changes) in by_source {
         tracing::debug!(
@@ -6348,7 +6399,13 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             if rel.cardinality == RelationshipCardinality::ToOne
                 && let Some(projection) = catalog::relationship_projection(pool, rel.id).await?
             {
-                relationship_projection_clears.insert(projection.qualified_table());
+                relationship_projection_clears
+                    .entry(rel.id)
+                    .and_modify(|clear| clear.lsn = clear.lsn.max(change.lsn))
+                    .or_insert(RelationshipProjectionClear {
+                        qualified_projection: projection.qualified_table(),
+                        lsn: change.lsn,
+                    });
             }
             // Issue #267: canonicalized to qualified identity for the same
             // reason [`accumulate_from_side_recomputes`] does it — this shares
@@ -7669,21 +7726,6 @@ pub async fn apply_and_mark_drained_many(
         .await?;
     }
 
-    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
-    // to-one relationship's to-side table empties that relationship's
-    // projection too, as a whole-table delete: every row this projection held
-    // for this relationship just vanished along with the to-side's. No
-    // downstream propagation of its own — the projection is not a target
-    // table, and the from-side recompute this same truncate
-    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
-    // definition; the projection is only ever read by
-    // `build_relationship_context`/the reverse-guard machinery, never a
-    // definition's own downstream consumer.
-    for qualified_projection in &plan.relationship_projection_clears {
-        txn.execute(&format!("delete from {qualified_projection}"), &[])
-            .await?;
-    }
-
     // 3. Ordered pre-lock + upsert/delete, per target table, each under
     // issue #344's per-key ordering lock (taken for every target up front).
     lock_one_to_one_keys(txn, &plan.targets).await?;
@@ -7717,17 +7759,49 @@ pub async fn apply_and_mark_drained_many(
         keys_deleted += deleted;
     }
 
-    // Before 3c, issue #531: the refresh stamp of every relationship this batch
-    // carries a reverse record for, locked `for share` before this
-    // transaction touches any projection row (3c below and 3d), in
-    // `relationship_id` order. A projection refresh locks the same rows `for
-    // update`, in the same order, before it touches a projection row
-    // (`catalog::refresh_relationship_projections_in_txn`), so either it
-    // commits first and a record at or below its stamp reads the stamp here
-    // (and takes the live-row check, `superseded_to_side`), or this
-    // transaction commits first and the refresh reads what it wrote. One
-    // keyed read per batch with reverse records, none without.
-    let refresh_stamps = relationship_refresh_stamps(txn, &plan.relationship_reverses).await?;
+    // Before 2c and 3c, issue #531: the refresh stamp of every relationship
+    // this batch carries a reverse record or a projection clear for, locked
+    // `for share` before this transaction touches any projection row (2c,
+    // 3c and 3d below), in `relationship_id` order. A projection refresh
+    // locks the same rows `for update`, in the same order, before it touches
+    // a projection row (`catalog::refresh_relationship_projections_in_txn`),
+    // so either it commits first and a record at or below its stamp reads
+    // the stamp here (and takes the live-row check, `superseded_to_side`, or
+    // for a truncate skips the clear), or this transaction commits first and
+    // the refresh reads what it wrote. Taken after the target writes (steps
+    // 2 to 3b), the order the discharge takes the same kinds of row in (its
+    // orphan sweep, then the refresh). One keyed read per batch with reverse
+    // records or projection clears, none without.
+    let refresh_stamps = relationship_refresh_stamps(
+        txn,
+        plan.relationship_reverses
+            .iter()
+            .map(|r| r.shape.id)
+            .chain(plan.relationship_projection_clears.keys().copied()),
+    )
+    .await?;
+
+    // 2c. Issue #168: settled parent projection clears — a `TRUNCATE` on a
+    // to-one relationship's to-side empties that relationship's
+    // projection too, as a whole-table delete: every row this projection held
+    // for this relationship just vanished along with the to-side's. No
+    // downstream propagation of its own — the projection is not a target
+    // table, and the from-side recompute this same truncate
+    // stages via `ApplyPlan::reverse_recomputes` is what actually reaches a
+    // definition; the projection is only ever read by
+    // `build_relationship_context`/the reverse-guard machinery, never a
+    // definition's own downstream consumer. Run after the target writes
+    // rather than beside the target clears (step 2) so the stamp lock above
+    // precedes it. Issue #531: a truncate at or below the relationship's
+    // refresh stamp is one the refresh already read, so emptying the
+    // projection would drop the rows the refresh found written after it.
+    for (relationship_id, clear) in &plan.relationship_projection_clears {
+        if truncate_overtaken_by_refresh(clear.lsn, refresh_stamps.get(relationship_id).copied()) {
+            continue;
+        }
+        txn.execute(&format!("delete from {}", clear.qualified_projection), &[])
+            .await?;
+    }
 
     // 3c. Relationship settled-parent projection gen bump (issue #130, epic
     // #127; plan doc §2 guard (b)'s precondition): every to-one relationship

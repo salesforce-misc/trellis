@@ -4819,10 +4819,12 @@ async fn ensure_relationship_projection_in_txn(
 /// projection from the live row when the images no longer hold
 /// (`staging::apply::superseded_to_side`). A record above the stamp is a
 /// change this read may not have seen, so its image is no older than what
-/// this wrote. The stamp rows are locked `for update` before any projection
-/// row, and Phase 3 locks them `for share` before its own projection writes
-/// (step 3c), so a drain either commits before this reads anything or reads
-/// the stamp this commits. A seam row staged after this read can't drain
+/// this wrote. A to-side `TRUNCATE` at or below the stamp is one this read
+/// saw (it holds `ACCESS SHARE` on the to-side until it commits), so Phase 3
+/// skips its projection clear. The stamp rows are locked `for update` before
+/// any projection row, and Phase 3 locks them `for share` before its own
+/// projection writes (steps 2c, 3c and 3d), so a drain either commits before
+/// this reads anything or reads the stamp this commits. A seam row staged after this read can't drain
 /// before the discharge commits: the discharge runs on the only sealer.
 ///
 /// Its projection writes can deadlock with a drain's that holds a

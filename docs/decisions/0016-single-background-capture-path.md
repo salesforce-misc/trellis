@@ -606,8 +606,11 @@ re-derives the from-side rows by the image-less fallback. A record above
 the stamp is a change the refresh may not have read, so its image is no
 older than what the refresh wrote, and it applies unchecked: a relationship
 never refreshed, and every change after a refresh, pays no live-row read.
-The only steady-state cost is one keyed read of the batch's stamps per
-Phase 3 transaction that carries reverse records. That read is `for share`,
+A pending `TRUNCATE` of the to-side at or below the stamp is one the refresh
+already read, so its projection clear is skipped rather than emptying what
+the refresh found written after it. The only steady-state cost is one keyed
+read of the batch's stamps per Phase 3 transaction that carries reverse
+records or a to-side truncate. That read is `for share`,
 taken before the transaction touches any projection row, and the refresh
 locks the same rows `for update` before touching a projection, so a drain
 either commits before the refresh reads anything or reads the stamp the

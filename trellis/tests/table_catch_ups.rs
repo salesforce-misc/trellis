@@ -908,3 +908,143 @@ async fn a_to_side_change_after_the_refresh_applies_its_image_unchecked() {
         Some(Some("ann3".to_string()))
     );
 }
+
+fn customers_truncate(lsn: PgLsn) -> StagedChange {
+    StagedChange::Truncate {
+        src_table: "public.customers".to_string(),
+        lsn: Some(lsn),
+        origin_lsn: None,
+        src_changed: None,
+    }
+}
+
+/// Issue #531's truncate shape: a to-side `TRUNCATE` streamed but not yet
+/// drained when a re-insert is lost is older than what the refresh writes
+/// into the projection. Its clear (issue #168) must not empty the refreshed
+/// projection: the refresh already read the table after the truncate. A
+/// truncate after the refresh still clears it.
+#[tokio::test]
+async fn a_pending_to_side_truncate_does_not_empty_a_refreshed_projection() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+
+    commit_and_stage(&mut client, "truncate public.customers", customers_truncate).await;
+    client
+        .batch_execute("insert into public.customers values (1, 'ann2')")
+        .await
+        .expect("re-insert a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    discharge_markers(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(
+        order_names(&client).await,
+        vec![
+            (10, Some("ann2".to_string())),
+            (11, None),
+            (12, Some("ann2".to_string()))
+        ]
+    );
+
+    commit_and_stage(&mut client, "truncate public.customers", customers_truncate).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(projected_name(&client, 1).await, None);
+    assert_eq!(
+        order_names(&client).await,
+        vec![(10, None), (11, None), (12, None)]
+    );
+}
+
+/// Issue #531 on issue #135's fairness escalation: a deferred rename at the
+/// fairness threshold whose guard still fails escalates instead of deferring
+/// again, and the escalation writes the projection too. It must take the
+/// same live-row check below the refresh stamp as an ordinary apply.
+#[tokio::test]
+async fn an_escalated_older_reverse_does_not_undo_a_projection_refresh() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
+    let relationship_id: i64 = client
+        .query_one(
+            "select id from relationship_definitions where name = 'customer'",
+            &[],
+        )
+        .await
+        .expect("read the relationship id")
+        .get(0);
+
+    commit_and_stage(
+        &mut client,
+        "update public.customers set name = 'ann1' where id = 1",
+        |lsn| StagedChange::RelationshipReverseDeferred {
+            src_table: format!("\u{1f}trellis-rel-reverse-deferred:{relationship_id}"),
+            key: "1".to_string(),
+            old_image: Some(r#"{"id":"1","name":"ann"}"#.to_string()),
+            new_image: Some(r#"{"id":"1","name":"ann1"}"#.to_string()),
+            lsn: Some(lsn),
+            src_changed: None,
+            origin_lsn: None,
+            relationship_id,
+            retry_count: apply::RELATIONSHIP_REVERSE_FAIRNESS_THRESHOLD - 1,
+        },
+    )
+    .await;
+    client
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
+        .await
+        .expect("rename a customer, the CDC lost");
+    trellis
+        .request_backfill("customers")
+        .await
+        .expect("request a re-backfill of the to-side");
+    publication::run_pending_backfills(
+        &mut client,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("run_pending_backfills");
+
+    // A watermark that never advanced fails guard (a), so the deferred
+    // record, at the threshold, escalates.
+    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    seal::seal_phase2(&client, outcome.sealed_seg_seq, WAKE)
+        .await
+        .expect("seal phase 2");
+    let unadvanced = StagedWatermark::new();
+    let mut escalations = 0;
+    while let Some(applied) = apply::drain_once(
+        &db.pool,
+        outcome.sealed_seg_seq,
+        TEST_NAME,
+        1,
+        WAKE,
+        &unadvanced,
+    )
+    .await
+    .expect("drain_once")
+    {
+        escalations += applied.fairness_escalations;
+    }
+    assert_eq!(escalations, 1, "the deferred rename escalated");
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(status_of(&client, "public.order_names").await, "live");
+    assert_eq!(
+        projected_name(&client, 1).await,
+        Some(Some("ann2".to_string()))
+    );
+    assert_eq!(order_names(&client).await, renamed());
+}
