@@ -2199,10 +2199,17 @@ struct TruncateAggregate {
     oracle: &'static str,
 }
 
-/// Every aggregate a [`truncate_scenario`] installs: grouped by one
-/// relationship, by both, by a from-side column paired with one, and by the
-/// other relationship alone, over invertible and `RecomputeOnly` fields.
+/// Every definition a [`truncate_scenario`] installs: aggregates grouped by
+/// one relationship, by both, by a from-side column paired with one, and by
+/// the other relationship alone, over invertible and `RecomputeOnly` fields;
+/// and a 1:1 enrichment reading `buyer`, which the imaged recomputes and the
+/// re-insert's fallback reach too.
 const TRUNCATE_AGGREGATES: &[TruncateAggregate] = &[
+    TruncateAggregate {
+        definition: "TRANSFORM order_buyer FROM orders SELECT buyer.name AS bname, amount AS spent",
+        target: "select id::text, coalesce(bname, '<null>') || '|' || spent::text from order_buyer",
+        oracle: "select o.id::text, coalesce(u.name, '<null>') || '|' || o.amount::text from orders o                  left join users u on u.id = o.user_id",
+    },
     TruncateAggregate {
         definition: "TRANSFORM by_buyer FROM orders GROUP BY buyer.name SELECT SUM(amount) AS v",
         target: "select coalesce(name, '<null>'), v::text from by_buyer",

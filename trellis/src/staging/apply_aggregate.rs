@@ -4936,7 +4936,9 @@ mod tests {
         // Every (rel, column) over names that split, join or look like the
         // encoding itself, empty and multi-byte ones included, in every
         // role: `a_b`/`c` against `a`/`b_c` is the collision #521 found.
-        let names = ["", "a", "b", "c", "a_b", "b_c", "a.b", "b.c", ".", "1:a", "é", "éa"];
+        let names = [
+            "", "a", "b", "c", "a_b", "b_c", "a.b", "b.c", ".", "1:a", "é", "éa",
+        ];
         let mut keys = Vec::new();
         for column in names {
             keys.push(synthetic_relationship_key("reverse", None, column));
