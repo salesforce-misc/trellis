@@ -3397,6 +3397,82 @@ async fn an_insert_and_delete_folded_below_no_horizon_leave_no_group() {
     );
 }
 
+/// The multi-hop form of #486's gap, for an ordinary update chain: row 1
+/// moves `a -> z` at or below a forced recompute of `z` (which counts it),
+/// then `z -> b` above it. Both updates fold into one batch as `a -> b`, so
+/// `z` is never named and keeps the 5 the recompute counted. The same gap
+/// applies to a born-and-died key that passes through a group between its
+/// insert and delete, since `vanished_images` carries only the endpoints.
+/// Fixing it needs every intermediate image a key's rows carried (a hot key
+/// updated N times in a batch would carry N), so it is left for a design
+/// call.
+#[tokio::test]
+#[ignore = "known gap: a fold names only a key's first and last groups, so an \
+            intermediate group a forced recompute counted keeps the key"]
+async fn an_update_chain_through_a_recomputed_group_folded_in_one_batch_leaves_it_correct() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_sku_totals(&db, &mut client, "(1, 'a', 5), (2, 'a', 7), (3, 'b', 2)").await;
+
+    client
+        .batch_execute("update sales set sku = 'z' where id = 1")
+        .await
+        .expect("move row 1 to z");
+    let first_lsn = current_wal_lsn(&client).await;
+    // A forced recompute of z (any producer: a build, a catch-up, a chained
+    // hop) counts row 1 and stamps z's horizon above the first move.
+    stage_sales(&client, "1", "recompute", None, None, None).await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+    trellis::staging::retire_drained_segments(&mut client)
+        .await
+        .expect("retire drained segments");
+    let horizon: PgLsn = client
+        .query_one(
+            "select __trellis_recompute_lsn from sku_totals where sku = 'z'",
+            &[],
+        )
+        .await
+        .expect("read z's horizon")
+        .get::<_, Option<PgLsn>>(0)
+        .expect("the forced recompute stamps z's horizon");
+    assert!(first_lsn <= horizon);
+
+    client
+        .batch_execute("update sales set sku = 'b' where id = 1")
+        .await
+        .expect("move row 1 on to b");
+    let second_lsn = current_wal_lsn(&client).await;
+    assert!(second_lsn > horizon);
+    stage_sales(
+        &client,
+        "1",
+        "update",
+        Some(first_lsn),
+        Some(&sales_image(1, "a", 5)),
+        Some(&sales_image(1, "z", 5)),
+    )
+    .await;
+    stage_sales(
+        &client,
+        "1",
+        "update",
+        Some(second_lsn),
+        Some(&sales_image(1, "z", 5)),
+        Some(&sales_image(1, "b", 5)),
+    )
+    .await;
+    let seg = seal_active_segment(&mut client).await;
+    drain(&db.pool, seg, "worker").await;
+
+    assert_eq!(
+        sku_totals(&client).await,
+        totals(&[("a", "7"), ("b", "7")]),
+        "row 1 only passed through z, so z must be removed"
+    );
+}
+
 /// Issue #486 with no horizon involved: a delta drained while a key's insert
 /// was still in flight (another bucket, or an earlier batch drained later)
 /// probes the group, finds it non-empty only because of that key, and keeps
