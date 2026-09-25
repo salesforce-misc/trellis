@@ -32,7 +32,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
@@ -132,7 +131,7 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
 }
 
 async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen) \

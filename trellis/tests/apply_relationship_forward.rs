@@ -29,7 +29,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
@@ -88,7 +87,7 @@ async fn stage_cdc(
 ) {
     let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(

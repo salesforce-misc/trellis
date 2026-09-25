@@ -39,7 +39,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
@@ -591,7 +590,12 @@ async fn a_cdc_apply_produces_a_jsonb_agg_matching_the_live_elements() {
                      (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                      values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)"
                 ),
-                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+                &[
+                    &src_table,
+                    &key,
+                    &testkit::wal_insert_lsn(client).await,
+                    &new_image,
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("stage {key}: {e}"));

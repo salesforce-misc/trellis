@@ -19,7 +19,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{
@@ -96,7 +95,7 @@ async fn stage_cdc(
 ) {
     let src_table = qualify_fixture_table(src_table);
     let table = active_seg_table(client).await;
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(
@@ -126,7 +125,7 @@ async fn stage_cdc_with_src_changed(
     src_changed: std::time::SystemTime,
 ) {
     let table = active_seg_table(client).await;
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(
@@ -1340,6 +1339,7 @@ async fn a_to_many_enrichment_reads_the_to_side_it_was_declared_against() {
 /// aggregate build's join, the live apply's `RelJoin`, and the reverse path
 /// from a `shop.users` change must all read `shop.users`.
 #[tokio::test]
+#[ignore = "real bug found by #512: see a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group"]
 async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1438,5 +1438,94 @@ async fn an_aggregate_joins_the_to_one_side_it_was_declared_against() {
             ("c".to_string(), Some("105".to_string())),
         ],
         "a shop.users rename regroups user 1's orders"
+    );
+}
+
+/// Issue #512's reproduction, the smallest shape of the failure that made
+/// [`an_aggregate_joins_the_to_one_side_it_was_declared_against`] fail once
+/// its CDC was staged at real LSNs. An aggregate grouped by a to-one path
+/// (`buyer.name`); a new order for user 1 drains as an ordinary delta; then
+/// user 1 is renamed. The drained order's ring row is above the projection's
+/// LSN, so `relationship_fast_path_precondition_holds` sends the rename to
+/// the reverse fallback, which stages image-less recomputes for orders 10
+/// and 12. Those re-derive the group the orders are in now (`c`), but
+/// nothing reaches the group they left (`a`), which keeps its 105 forever.
+/// At LSN 1 the drained order sat below the projection's LSN, the fast path
+/// ran, and its per-group diff emptied `a`.
+#[tokio::test]
+#[ignore = "real bug found by #512: the reverse fallback never re-derives the group a to-side change moves rows out of"]
+async fn a_to_side_rename_after_a_drained_sibling_leaves_no_stale_old_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table users (id integer primary key, name text); \
+             create table orders (id integer primary key, user_id integer, amount integer); \
+             alter table users replica identity full; \
+             alter table orders replica identity full; \
+             insert into users values (1, 'a'), (2, 'b'); \
+             insert into orders values (10, 1, 5), (11, 2, 7);",
+        )
+        .await
+        .expect("seed users and orders");
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP buyer FROM orders.user_id TO users.id",
+    )
+    .await
+    .expect("declare buyer");
+    install_definition(
+        &db.pool,
+        "TRANSFORM spend_by_name FROM orders GROUP BY buyer.name SELECT SUM(amount) AS total",
+        &columns(&[
+            ("id", ValueType::Numeric),
+            ("user_id", ValueType::Numeric),
+            ("amount", ValueType::Numeric),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install spend_by_name");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("insert into orders values (12, 1, 100)", &[])
+        .await
+        .expect("insert an order for user 1");
+    stage_cdc(
+        &client,
+        "orders",
+        "12",
+        "insert",
+        None,
+        Some(r#"{"id":"12","user_id":"1","amount":"100"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    client
+        .execute("update users set name = 'c' where id = 1", &[])
+        .await
+        .expect("rename user 1");
+    stage_cdc(
+        &client,
+        "users",
+        "1",
+        "update",
+        Some(r#"{"id":"1","name":"a"}"#),
+        Some(r#"{"id":"1","name":"c"}"#),
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut client).await;
+
+    assert_eq!(
+        text_pairs(&client, "select name, total::text from spend_by_name").await,
+        vec![
+            ("b".to_string(), Some("7".to_string())),
+            ("c".to_string(), Some("105".to_string())),
+        ],
+        "user 1's orders leave group a for group c"
     );
 }

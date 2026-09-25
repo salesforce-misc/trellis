@@ -31,7 +31,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
@@ -77,7 +76,7 @@ async fn stage_cdc(
                 &format!("{DEFAULT_SCHEMA}.order_lines"),
                 &key,
                 &op,
-                &PgLsn::from(1u64),
+                &testkit::wal_insert_lsn(client).await,
                 &old_image,
                 &new_image,
             ],

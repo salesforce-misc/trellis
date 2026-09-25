@@ -26,7 +26,6 @@ use std::time::SystemTime;
 use pgwire_replication::{Lsn, ReplicationEvent};
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
@@ -217,7 +216,7 @@ async fn insert_cdc_row(
     op: &str,
     new_image: Option<&str>,
 ) {
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(

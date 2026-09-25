@@ -3554,6 +3554,9 @@ mod tests {
         // histograms have something to observe, not just the throughput
         // counter — and so the fold has several rows to collapse.
         let image = r#"{"price":"10.00","tax":"1.50"}"#.to_string();
+        // Issue #512: ordered offsets above the real WAL insert position, as
+        // intake would stage three successive commits.
+        let base = u64::from(testkit::wal_insert_lsn(&client).await);
         for (op, lsn, old_image) in [
             ("insert", 1u64, None),
             ("update", 2, Some(image.clone())),
@@ -3568,7 +3571,7 @@ mod tests {
                         &source,
                         &"1",
                         &op,
-                        &PgLsn::from(lsn),
+                        &PgLsn::from(base + lsn),
                         &old_image,
                         &Some(image.clone()),
                     ],

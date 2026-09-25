@@ -50,7 +50,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
@@ -771,7 +770,7 @@ async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
         &[
             &format!("{DEFAULT_SCHEMA}.orders"),
             &id.to_string(),
-            &PgLsn::from(1u64),
+            &testkit::wal_insert_lsn(raw).await,
             &old_image,
             &new_image,
         ],

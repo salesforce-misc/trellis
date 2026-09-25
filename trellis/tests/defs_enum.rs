@@ -73,7 +73,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
@@ -333,7 +332,12 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
                 "insert into seg_0 \
                  (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                  values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)",
-                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+                &[
+                    &src_table,
+                    &key,
+                    &testkit::wal_insert_lsn(client).await,
+                    &new_image,
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));
@@ -516,7 +520,12 @@ async fn enum_group_by_min_max_matches_a_server_side_recompute() {
                 "insert into seg_0 \
                  (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                  values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)",
-                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+                &[
+                    &src_table,
+                    &key,
+                    &testkit::wal_insert_lsn(client).await,
+                    &new_image,
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));
@@ -650,7 +659,12 @@ async fn alter_type_add_value_is_reflected_on_the_next_recompute_with_nothing_ca
                 "insert into seg_0 \
                  (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                  values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)",
-                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+                &[
+                    &src_table,
+                    &key,
+                    &testkit::wal_insert_lsn(client).await,
+                    &new_image,
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));

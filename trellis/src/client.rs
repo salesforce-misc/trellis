@@ -2200,6 +2200,25 @@ mod intake_supervisor_tests {
         (tracing::subscriber::set_default(subscriber), captured)
     }
 
+    /// A Prometheus recorder for one test's own metrics. Installed with
+    /// [`::metrics::set_default_local_recorder`], it takes this thread's
+    /// recordings in place of the process-global registry, so a test on the
+    /// current-thread runtime asserts on exactly what its own code recorded,
+    /// not on what another test in the same process happened to count.
+    pub(super) fn local_metrics() -> metrics_exporter_prometheus::PrometheusRecorder {
+        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
+    }
+
+    /// The value of the series `series` (name plus labels, exactly as
+    /// rendered) in `rendered`, if it exists.
+    pub(super) fn series_value(rendered: &str, series: &str) -> Option<f64> {
+        let prefix = format!("{series} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse().expect("numeric series value"))
+    }
+
     /// The flake behind `failed_run_is_logged_at_error_and_restarted`: a
     /// thread with no subscriber is first to hit a callsite while this
     /// test's capture is live. The capture must still see this thread's
@@ -2238,6 +2257,8 @@ mod intake_supervisor_tests {
     #[tokio::test(start_paused = true)]
     async fn failed_run_is_logged_at_error_and_restarted() {
         let (_guard, captured) = install_capture();
+        let metrics = local_metrics();
+        let _metrics_guard = ::metrics::set_default_local_recorder(&metrics);
         let attempts = Arc::new(AtomicUsize::new(0));
         let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
         let mut resumed_tx = Some(resumed_tx);
@@ -2285,10 +2306,14 @@ mod intake_supervisor_tests {
             );
         }
 
-        let rendered = crate::metrics::Metrics::new().render_prometheus();
-        assert!(
-            rendered.contains("trellis_intake_restarts_total{outcome=\"error\"}"),
-            "restart counter missing from:\n{rendered}"
+        let rendered = metrics.handle().render();
+        assert_eq!(
+            series_value(
+                &rendered,
+                "trellis_intake_restarts_total{outcome=\"error\"}"
+            ),
+            Some(2.0),
+            "one restart per failed attempt, in this test's own registry:\n{rendered}"
         );
     }
 
@@ -2413,11 +2438,10 @@ mod intake_supervisor_tests {
     /// series exists yet.
     fn consecutive_failures(slot: &str) -> Option<f64> {
         let rendered = crate::metrics::Metrics::new().render_prometheus();
-        let prefix = format!("trellis_intake_consecutive_failures{{slot=\"{slot}\"}} ");
-        rendered
-            .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
-            .map(|value| value.parse().expect("numeric gauge value"))
+        series_value(
+            &rendered,
+            &format!("trellis_intake_consecutive_failures{{slot=\"{slot}\"}}"),
+        )
     }
 
     /// Issue #341: another producer session holding the staging producer
@@ -2429,6 +2453,8 @@ mod intake_supervisor_tests {
     #[tokio::test(start_paused = true)]
     async fn producer_lock_contention_logs_below_error() {
         let (_guard, captured) = install_capture();
+        let metrics = local_metrics();
+        let _metrics_guard = ::metrics::set_default_local_recorder(&metrics);
         let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
         let mut resumed_tx = Some(resumed_tx);
         let mut n = 0;
@@ -2468,13 +2494,20 @@ mod intake_supervisor_tests {
             "{events:?}"
         );
 
-        let rendered = crate::metrics::Metrics::new().render_prometheus();
-        assert!(
-            rendered.contains("trellis_intake_restarts_total{outcome=\"producer_lock_held\"}"),
+        let rendered = metrics.handle().render();
+        assert_eq!(
+            series_value(
+                &rendered,
+                "trellis_intake_restarts_total{outcome=\"producer_lock_held\"}"
+            ),
+            Some(3.0),
             "lock-held restarts must stay countable:\n{rendered}"
         );
         assert_eq!(
-            consecutive_failures("slot_341"),
+            series_value(
+                &rendered,
+                "trellis_intake_consecutive_failures{slot=\"slot_341\"}"
+            ),
             Some(3.0),
             "the lock's holder may be this client's own dead session, so refusals must stay \
              visible to a streak alert"

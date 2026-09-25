@@ -42,7 +42,6 @@
 use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
@@ -183,7 +182,7 @@ async fn converged_fixture(
                 "insert into seg_{active} (src_table, key, op, lsn, new_image, hop_gen) \
                  values ($1, $2, 'insert', $3, $4::text::jsonb, 0)"
             ),
-            &[&src_table, key, &PgLsn::from(1u64), image],
+            &[&src_table, key, &testkit::wal_insert_lsn(&raw).await, image],
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key}: {e}"));

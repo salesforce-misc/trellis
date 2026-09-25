@@ -182,7 +182,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
         ),
         &[
             &format!("{DEFAULT_SCHEMA}.widgets"),
-            &PgLsn::from(1u64),
+            &testkit::wal_insert_lsn(&raw).await,
             &r#"{"id":"1","price":"9"}"#,
         ],
     )

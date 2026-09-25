@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
@@ -114,7 +113,7 @@ async fn insert_cdc_row(
     new_image: Option<&str>,
 ) {
     let src_table = qualify_fixture_table(src_table);
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(

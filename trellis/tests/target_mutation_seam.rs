@@ -408,7 +408,7 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
         &txn,
         &[StagedChange::Truncate {
             src_table: "public.src".to_string(),
-            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            lsn: Some(testkit::wal_insert_lsn(&txn).await),
             origin_lsn: None,
             src_changed: None,
         }],
@@ -474,7 +474,7 @@ async fn a_numeric_grouped_aggregates_truncate_clear_drains_without_halting() {
         &txn,
         &[StagedChange::Truncate {
             src_table: "public.src".to_string(),
-            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            lsn: Some(testkit::wal_insert_lsn(&txn).await),
             origin_lsn: None,
             src_changed: None,
         }],
@@ -604,7 +604,7 @@ async fn a_reverse_relationship_write_to_an_aggregate_target_reaches_a_chained_r
             src_table: "public.posts".to_string(),
             key: "1".to_string(),
             op: trellis::staging::CdcOp::Update,
-            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            lsn: Some(testkit::wal_insert_lsn(&txn).await),
             old_image: Some(r#"{"id":"1","word_count":"100"}"#.to_string()),
             new_image: Some(r#"{"id":"1","word_count":"400"}"#.to_string()),
             origin_lsn: None,

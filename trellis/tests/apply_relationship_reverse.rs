@@ -66,11 +66,24 @@ fn qualify_fixture_table(name: &str) -> String {
     }
 }
 
+/// The LSN a test's hand-staged changes are offsets from (issue #512): the
+/// real WAL insert position, read once the test's setup is done.
+///
+/// The tests here need distinct LSNs in a chosen order (the fold's "latest
+/// wins" rule, the reverse record's `lsn`/`prev_lsn` chain, a child commit
+/// that precedes its parent's), so they stage at `base + N` rather than at
+/// the insert position of the moment. The base still has to be real: every
+/// aggregate group the definition's build wrote carries that build's
+/// recompute horizon, and a change staged below it re-derives its group
+/// instead of applying the reverse path's delta, so the delta arithmetic
+/// these tests are about would never run.
+async fn staging_base(client: &Client) -> u64 {
+    u64::from(testkit::wal_insert_lsn(client).await)
+}
+
 /// Stages one image-bearing (CDC-shaped) change into the active ring
-/// segment, at an explicit `lsn` — unlike most of this crate's other test
-/// files' `stage_cdc` helpers, which pin every row to `lsn = 1`, several
-/// tests here need distinct, ordered LSNs (the fold's "latest wins" rule,
-/// and the reverse record's own `lsn`/`prev_lsn` chain, both key off it).
+/// segment, at an explicit `lsn`, normally [`staging_base`] plus an offset
+/// that orders it among the test's other changes.
 async fn stage_cdc_at_lsn(
     client: &Client,
     src_table: &str,
@@ -419,6 +432,7 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -426,14 +440,14 @@ async fn to_side_update_advances_the_projection_lsn_via_the_delta_path() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "the reverse-delta apply must advance the projection's own lsn chain \
          to the applied record's lsn"
     );
@@ -550,6 +564,7 @@ async fn two_parent_changes_in_one_batch_fold_to_one_record() {
         .expect("update the related post to its final value");
     // Two raw CDC rows for the same key, same batch: 100->400, then
     // 400->500. The pre-existing fold collapses them to old=100, new=500.
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -557,7 +572,7 @@ async fn two_parent_changes_in_one_batch_fold_to_one_record() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     stage_cdc_at_lsn(
@@ -567,14 +582,14 @@ async fn two_parent_changes_in_one_batch_fold_to_one_record() {
         "update",
         Some("{\"id\":1,\"word_count\":400}"),
         Some("{\"id\":1,\"word_count\":500}"),
-        200,
+        base + 200,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
 
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(200)),
+        Some(PgLsn::from(base + 200)),
         "the folded record's lsn must be the latest of the two raw changes"
     );
     let totals = target_totals(&client).await;
@@ -622,6 +637,7 @@ async fn parent_insert_is_picked_up_by_the_reverse_path() {
         .execute("insert into posts (id, word_count) values (999, 999)", &[])
         .await
         .expect("insert the previously-dangling post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -629,7 +645,7 @@ async fn parent_insert_is_picked_up_by_the_reverse_path() {
         "insert",
         None,
         Some("{\"id\":999,\"word_count\":999}"),
-        50,
+        base + 50,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -640,7 +656,7 @@ async fn parent_insert_is_picked_up_by_the_reverse_path() {
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 999).await,
-        Some(PgLsn::from(50))
+        Some(PgLsn::from(base + 50))
     );
     let totals = target_totals(&client).await;
     assert_eq!(
@@ -678,6 +694,7 @@ async fn parent_delete_is_picked_up_by_the_reverse_path() {
         .execute("delete from posts where id = 2", &[])
         .await
         .expect("delete the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -685,7 +702,7 @@ async fn parent_delete_is_picked_up_by_the_reverse_path() {
         "delete",
         Some("{\"id\":2,\"word_count\":250}"),
         None,
-        75,
+        base + 75,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -749,6 +766,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("first update");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -756,7 +774,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg_a = seal_active_segment(&mut client).await;
@@ -779,7 +797,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":400}"),
         Some("{\"id\":1,\"word_count\":500}"),
-        200,
+        base + 200,
     )
     .await;
     let seg_b = seal_active_segment(&mut client).await;
@@ -801,7 +819,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
     txn.commit().await.expect("commit A");
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100))
+        Some(PgLsn::from(base + 100))
     );
 
     // Apply B: its `prev_lsn` (captured before A applied) no longer matches
@@ -823,7 +841,7 @@ async fn a_stale_prev_lsn_is_rejected_and_the_pipeline_still_converges() {
 
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "B's stale prev_lsn must be rejected — the projection stays at A's lsn, \
          not advanced to B's"
     );
@@ -887,6 +905,7 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("first update");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -894,7 +913,7 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg_a = seal_active_segment(&mut client).await;
@@ -914,7 +933,7 @@ async fn a_same_key_guard_rejection_stages_exactly_one_deferred_reverse_row() {
         "update",
         Some("{\"id\":1,\"word_count\":400}"),
         Some("{\"id\":1,\"word_count\":500}"),
-        200,
+        base + 200,
     )
     .await;
     let seg_b = seal_active_segment(&mut client).await;
@@ -1017,6 +1036,7 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -1024,7 +1044,7 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg = seal_active_segment(&mut client).await;
@@ -1083,7 +1103,7 @@ async fn guard_a_watermark_barrier_rejects_and_the_pipeline_still_converges() {
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "the retried delta must eventually advance the projection to the \
          deferred record's own lsn, proving it applied as a real delta on \
          retry rather than merely converging via some other path"
@@ -1129,6 +1149,7 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -1136,7 +1157,7 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg = seal_active_segment(&mut client).await;
@@ -1205,7 +1226,7 @@ async fn guard_b_generation_check_rejects_and_the_pipeline_still_converges() {
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "the retried delta must eventually advance the projection to the \
          deferred record's own lsn"
     );
@@ -1300,6 +1321,7 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
         )
         .await
         .expect("insert article 100 pointing at category 3");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "articles",
@@ -1307,7 +1329,7 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
         "insert",
         None,
         Some("{\"id\":100,\"category_id\":3}"),
-        1,
+        base + 1,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -1330,7 +1352,7 @@ async fn issue_133_a_within_batch_repoint_still_bumps_the_erased_intermediate_pa
         "update",
         Some("{\"id\":3,\"name\":\"C\"}"),
         Some("{\"id\":3,\"name\":\"C-renamed\"}"),
-        100,
+        base + 100,
     )
     .await;
     let seg_r = seal_active_segment(&mut client).await;
@@ -1524,6 +1546,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -1531,7 +1554,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg = seal_active_segment(&mut client).await;
@@ -1553,7 +1576,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
         "insert",
         None,
         Some("{\"id\":20,\"post\":1,\"tag\":\"rust\"}"),
-        50,
+        base + 50,
     )
     .await;
 
@@ -1621,7 +1644,7 @@ async fn guard_c_in_flight_check_rejects_and_the_pipeline_still_converges() {
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "the retried delta must eventually advance the projection to the \
          deferred record's own lsn"
     );
@@ -1660,6 +1683,7 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -1667,7 +1691,7 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg = seal_active_segment(&mut client).await;
@@ -1701,7 +1725,7 @@ async fn all_four_guards_pass_and_the_delta_applies_in_the_ordinary_case() {
 
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "all four guards passed, so the true-delta path must have advanced \
          the projection to this record's own lsn"
     );
@@ -1752,6 +1776,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("first update");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -1759,7 +1784,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg_a = seal_active_segment(&mut client).await;
@@ -1778,7 +1803,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         "update",
         Some("{\"id\":1,\"word_count\":400}"),
         Some("{\"id\":1,\"word_count\":500}"),
-        200,
+        base + 200,
     )
     .await;
     let seg_b = seal_active_segment(&mut client).await;
@@ -1816,7 +1841,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
         "insert",
         None,
         Some("{\"id\":21,\"post\":1,\"tag\":\"rust\"}"),
-        150,
+        base + 150,
     )
     .await;
 
@@ -1862,7 +1887,7 @@ async fn out_of_order_segments_plus_an_in_flight_child_still_converges() {
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(200)),
+        Some(PgLsn::from(base + 200)),
         "the retried delta must eventually advance the projection to B's \
          own lsn"
     );
@@ -1959,6 +1984,7 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
     )
     .await
     .expect("create target table");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "articles",
@@ -1966,7 +1992,7 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
         "insert",
         None,
         Some("{\"id\":1,\"category_id\":10}"),
-        1,
+        base + 1,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -1986,7 +2012,7 @@ async fn a_one_to_one_target_still_converges_via_the_fallback_mechanism() {
         "update",
         Some("{\"id\":10,\"name\":\"Tech\"}"),
         Some("{\"id\":10,\"name\":\"Renamed\"}"),
-        1,
+        base + 1,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;
@@ -2045,6 +2071,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -2052,7 +2079,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
 
@@ -2142,7 +2169,7 @@ async fn deferring_past_the_fairness_threshold_escalates_instead_of_spinning_for
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "escalation must advance the settled parent projection to this transition's \
          own lsn immediately, even though guard (a) — which does not gate the \
          projection write, only the fast-path delta — is still failing"
@@ -2214,6 +2241,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -2221,7 +2249,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
 
@@ -2233,7 +2261,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     let mut next_child_id = 40i32;
     let mut resolved_at_round: Option<i32> = None;
 
-    async fn insert_churn_child(client: &Client, id: i32) {
+    async fn insert_churn_child(client: &Client, base: u64, id: i32) {
         client
             .execute(
                 &format!("insert into post_tags (id, post, tag) values ({id}, 1, 'churn')"),
@@ -2248,7 +2276,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
             "insert",
             None,
             Some(&format!("{{\"id\":{id},\"post\":1,\"tag\":\"churn\"}}")),
-            200 + u64::try_from(id).expect("id is non-negative"),
+            base + 200 + u64::try_from(id).expect("id is non-negative"),
         )
         .await;
     }
@@ -2258,7 +2286,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     // 0`, then panicking below) if the mechanism only happened to work for
     // a lucky handful of rounds rather than actually bounding the wait.
     for round in 1..=(threshold + 3) {
-        insert_churn_child(&client, next_child_id).await;
+        insert_churn_child(&client, base, next_child_id).await;
         next_child_id += 1;
 
         let seg = seal_active_segment(&mut client).await;
@@ -2323,7 +2351,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     );
     assert_eq!(
         projection_lsn(&client, &projection_table, 1).await,
-        Some(PgLsn::from(100)),
+        Some(PgLsn::from(base + 100)),
         "escalation must advance the projection to the parent's true final value, \
          even though it took several rounds of sustained child churn to get there"
     );
@@ -2331,7 +2359,7 @@ async fn a_hot_parent_under_sustained_child_churn_still_resolves_within_the_fair
     // A few more churn rounds *after* resolution — proving the system stays
     // live afterward too, not merely that it eventually gives up once.
     for _ in 0..2 {
-        insert_churn_child(&client, next_child_id).await;
+        insert_churn_child(&client, base, next_child_id).await;
         next_child_id += 1;
     }
 
@@ -2418,6 +2446,7 @@ async fn fairness_escalation_increments_its_own_metric() {
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -2425,7 +2454,7 @@ async fn fairness_escalation_increments_its_own_metric() {
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
 
@@ -2512,6 +2541,7 @@ async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one()
         .execute("update posts set word_count = 400 where id = 1", &[])
         .await
         .expect("update the related post");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "posts",
@@ -2519,7 +2549,7 @@ async fn a_deferred_reverse_lands_in_the_active_segment_never_the_draining_one()
         "update",
         Some("{\"id\":1,\"word_count\":100}"),
         Some("{\"id\":1,\"word_count\":400}"),
-        100,
+        base + 100,
     )
     .await;
     let seg = seal_active_segment(&mut client).await;
@@ -2665,6 +2695,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             .execute("update posts set word_count = 400 where id = 1", &[])
             .await
             .expect("update");
+        let base = staging_base(&client).await;
         stage_cdc_at_lsn(
             &client,
             "posts",
@@ -2672,7 +2703,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "update",
             Some("{\"id\":1,\"word_count\":100}"),
             Some("{\"id\":1,\"word_count\":400}"),
-            100,
+            base + 100,
         )
         .await;
         let seg = seal_active_segment(&mut client).await;
@@ -2723,6 +2754,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             .execute("update posts set word_count = 400 where id = 1", &[])
             .await
             .expect("update");
+        let base = staging_base(&client).await;
         stage_cdc_at_lsn(
             &client,
             "posts",
@@ -2730,7 +2762,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "update",
             Some("{\"id\":1,\"word_count\":100}"),
             Some("{\"id\":1,\"word_count\":400}"),
-            100,
+            base + 100,
         )
         .await;
         let seg = seal_active_segment(&mut client).await;
@@ -2789,6 +2821,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             .execute("update posts set word_count = 400 where id = 1", &[])
             .await
             .expect("update");
+        let base = staging_base(&client).await;
         stage_cdc_at_lsn(
             &client,
             "posts",
@@ -2796,7 +2829,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "update",
             Some("{\"id\":1,\"word_count\":100}"),
             Some("{\"id\":1,\"word_count\":400}"),
-            100,
+            base + 100,
         )
         .await;
         let seg = seal_active_segment(&mut client).await;
@@ -2814,7 +2847,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "insert",
             None,
             Some("{\"id\":30,\"post\":1,\"tag\":\"rust\"}"),
-            50,
+            base + 50,
         )
         .await;
         let plan = claim_fold_compute(&db.pool, seg, "worker_metric_c").await;
@@ -2864,6 +2897,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             .execute("update posts set word_count = 400 where id = 1", &[])
             .await
             .expect("first update");
+        let base = staging_base(&client).await;
         stage_cdc_at_lsn(
             &client,
             "posts",
@@ -2871,7 +2905,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "update",
             Some("{\"id\":1,\"word_count\":100}"),
             Some("{\"id\":1,\"word_count\":400}"),
-            100,
+            base + 100,
         )
         .await;
         let seg_a = seal_active_segment(&mut client).await;
@@ -2888,7 +2922,7 @@ async fn each_guard_increments_its_own_deferral_metric() {
             "update",
             Some("{\"id\":1,\"word_count\":400}"),
             Some("{\"id\":1,\"word_count\":500}"),
-            200,
+            base + 200,
         )
         .await;
         let seg_b = seal_active_segment(&mut client).await;
@@ -3365,6 +3399,7 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
         )
         .await
         .expect("write the to-side");
+    let base = staging_base(&client).await;
     stage_cdc_at_lsn(
         &client,
         "accounts",
@@ -3372,7 +3407,7 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
         "update",
         Some(r#"{"id":1,"code":5,"credit":100}"#),
         Some(r#"{"id":1,"code":null,"credit":100}"#),
-        50,
+        base + 50,
     )
     .await;
     stage_cdc_at_lsn(
@@ -3382,7 +3417,7 @@ async fn a_to_side_change_to_a_null_unique_join_key_drops_its_projection_row() {
         "insert",
         None,
         Some(r#"{"id":3,"code":null,"credit":300}"#),
-        60,
+        base + 60,
     )
     .await;
     drain_to_quiescence(&db.pool, &mut client).await;

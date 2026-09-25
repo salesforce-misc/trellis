@@ -55,7 +55,6 @@ use std::time::Duration;
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{
@@ -131,7 +130,7 @@ async fn insert_cdc_row(
     old_image: Option<&str>,
     new_image: Option<&str>,
 ) {
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(

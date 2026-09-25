@@ -1577,7 +1577,6 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 /// what force a group's value to fall as well as rise.
 #[tokio::test]
 async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
-    use tokio_postgres::types::PgLsn;
     use trellis::defs::{create_aggregate_target_table, create_definition};
     use trellis::staging::{StagedWatermark, apply, seal};
 
@@ -1677,7 +1676,7 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
                     &src_table,
                     &key,
                     &op,
-                    &PgLsn::from(1u64),
+                    &testkit::wal_insert_lsn(client).await,
                     &old_image,
                     &new_image,
                 ],
@@ -1851,7 +1850,6 @@ async fn sum_interval_and_max_date_are_maintained_end_to_end_through_a_drain() {
 /// two `to_jsonb` spellings, which is not something this crate controls.
 #[tokio::test]
 async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two() {
-    use tokio_postgres::types::PgLsn;
     use trellis::defs::{create_aggregate_target_table, create_definition};
     use trellis::staging::{StagedWatermark, apply, seal};
 
@@ -1905,7 +1903,12 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
                      (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                      values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)"
                 ),
-                &[&src_table, &key, &PgLsn::from(1u64), &new_image],
+                &[
+                    &src_table,
+                    &key,
+                    &testkit::wal_insert_lsn(client).await,
+                    &new_image,
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("stage image-bearing {key}: {e}"));

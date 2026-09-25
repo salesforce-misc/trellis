@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
@@ -113,7 +112,7 @@ async fn insert_cdc_row(
     new_image: Option<&str>,
 ) {
     let src_table = qualify_fixture_table(src_table);
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(
@@ -2144,7 +2143,7 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
                 ),
                 &[
                     &id.to_string(),
-                    &PgLsn::from(1u64),
+                    &testkit::wal_insert_lsn(&*client).await,
                     &Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
                 ],
             )

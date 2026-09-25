@@ -98,7 +98,7 @@ async fn insert_cdc_row_with_hop_gen(
     new_image: Option<&str>,
     hop_gen: i32,
 ) {
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(
@@ -200,7 +200,7 @@ async fn insert_poison_held(
                 &key,
                 &seg_seq,
                 &op,
-                &Some(PgLsn::from(1u64)),
+                &Some(testkit::wal_insert_lsn(client).await),
                 &old_image,
                 &new_image,
                 &origin_lsn.map(PgLsn::from),

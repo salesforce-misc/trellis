@@ -7,6 +7,7 @@
 //! - [`crash`] provides the seams durability tests (intake's kill-9 tests,
 //!   the straddler/phase-gap tests) build their actual crash-point scenarios
 //!   on.
+//! - [`lsn`] gives tests a realistic LSN to stage CDC ring rows at.
 //!
 //! This crate is dev-only scaffolding shared across the workspace (any
 //! crate's integration tests can dev-depend on it), not part of the
@@ -17,5 +18,7 @@
 pub mod cluster;
 pub mod crash;
 pub mod fixtures;
+pub mod lsn;
 
 pub use cluster::{StopMode, TestCluster, TestDatabase};
+pub use lsn::wal_insert_lsn;

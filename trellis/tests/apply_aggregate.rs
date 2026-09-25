@@ -78,7 +78,7 @@ async fn insert_cdc_row(
     new_image: Option<&str>,
 ) {
     let src_table = qualify_fixture_table(src_table);
-    let lsn = PgLsn::from(1u64);
+    let lsn = testkit::wal_insert_lsn(client).await;
     client
         .execute(
             &format!(
@@ -573,9 +573,9 @@ async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantin
     // Issue #128's liveness half: `converge::converged_through`'s condition 4
     // deliberately blocks on any live `poison_held` row (by design, for a
     // *genuine* poison case — see that function's own doc comment). With no
-    // NULL-key row ever quarantined in the first place, a token at every
-    // staged change's LSN (this harness's `insert_cdc_row` always stages at
-    // `PgLsn::from(1)`) must converge — the same scenario that used to hang
+    // NULL-key row ever quarantined in the first place, a token the seeded
+    // `replication_progress` row has already confirmed must converge once
+    // every staged change has drained — the same scenario that used to hang
     // the generative suite's `quiesce` past its 30s timeout.
     let converged = converge::converged_through(&client, PgLsn::from(1u64))
         .await
@@ -3105,7 +3105,7 @@ async fn setup_sku_totals(db: &testkit::TestDatabase, client: &mut Client, rows:
             client,
             &key,
             "insert",
-            Some(PgLsn::from(1)),
+            Some(testkit::wal_insert_lsn(&*client).await),
             None,
             Some(&image),
         )

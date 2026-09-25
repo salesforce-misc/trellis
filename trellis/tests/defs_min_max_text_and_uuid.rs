@@ -60,7 +60,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
@@ -98,12 +97,6 @@ async fn active_seg_table(client: &Client) -> String {
     format!("seg_{ring_slot}")
 }
 
-fn next_lsn() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
 async fn stage_image(client: &Client, key: &str, src_table: &str, new_image: &str) {
     let table = active_seg_table(client).await;
     let src_table = format!("{DEFAULT_SCHEMA}.{src_table}");
@@ -114,7 +107,12 @@ async fn stage_image(client: &Client, key: &str, src_table: &str, new_image: &st
                  (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                  values ($1, $2, 'insert', $3, null, $4::text::jsonb, 0)"
             ),
-            &[&src_table, &key, &PgLsn::from(next_lsn()), &new_image],
+            &[
+                &src_table,
+                &key,
+                &testkit::wal_insert_lsn(client).await,
+                &new_image,
+            ],
         )
         .await
         .unwrap_or_else(|e| panic!("stage image-bearing {key} into {table}: {e}"));
@@ -130,7 +128,12 @@ async fn stage_delete(client: &Client, key: &str, src_table: &str, old_image: &s
                  (src_table, key, op, lsn, old_image, new_image, hop_gen) \
                  values ($1, $2, 'delete', $3, $4::text::jsonb, null, 0)"
             ),
-            &[&src_table, &key, &PgLsn::from(next_lsn()), &old_image],
+            &[
+                &src_table,
+                &key,
+                &testkit::wal_insert_lsn(client).await,
+                &old_image,
+            ],
         )
         .await
         .unwrap_or_else(|e| panic!("stage delete {key} into {table}: {e}"));

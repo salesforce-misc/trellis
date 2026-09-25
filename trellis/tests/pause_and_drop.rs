@@ -53,7 +53,6 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // Internals reaches (ADR-0012's `internals` feature, on for this crate's own
@@ -179,7 +178,7 @@ async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
         &[
             &format!("{DEFAULT_SCHEMA}.orders"),
             &id.to_string(),
-            &PgLsn::from(1u64),
+            &testkit::wal_insert_lsn(raw).await,
             &image,
         ],
     )
