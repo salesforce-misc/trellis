@@ -107,10 +107,11 @@ pub struct ClientOptions {
     /// [`intake::publication::run_pending_backfills`] against it — so a
     /// transform registered while the client runs gets published and
     /// backfilled without a restart, and a table whose last reader was
-    /// dropped leaves the publication (issue #427). Coarser than `maintenance_interval` by default: unlike
-    /// seal/reclaim, this does a catalog query and (when a table is newly
-    /// added) an `ALTER PUBLICATION` plus a full backfill enumeration, none
-    /// of which need sub-second freshness.
+    /// dropped leaves the publication (issue #427). Coarser than
+    /// `maintenance_interval` by default: unlike seal/reclaim, this does a
+    /// catalog query and (when a table is newly added) an `ALTER
+    /// PUBLICATION` plus a full backfill enumeration, none of which need
+    /// sub-second freshness.
     pub reconcile_interval: Duration,
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.
@@ -3168,6 +3169,61 @@ mod reconcile_tests {
         assert!(
             is_published(&f.raw).await,
             "`u` still reads `s`, so it stays published"
+        );
+    }
+
+    /// Issue #427: a staging worker may start with nothing registered, so its
+    /// publication starts empty. The pass after the first registration must
+    /// add the table and leave the registration with a capture (a marker, or
+    /// already dispatched by the same pass's discharge), not stranded
+    /// `waiting_to_backfill` with nothing to discharge it.
+    #[tokio::test]
+    async fn a_first_registration_after_an_empty_start_joins_the_publication() {
+        let mut f = fixture(&[]).await;
+        f.raw
+            .batch_execute(&format!(
+                "alter publication {PUBLICATION} drop table public.s"
+            ))
+            .await
+            .expect("start from an empty publication");
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            !is_published(&f.raw).await,
+            "nothing reads `s` yet, so the pass leaves it out"
+        );
+
+        let columns = std::collections::HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        defs::install_definition(
+            &f.pool,
+            "TRANSFORM t FROM s SELECT a + 1 AS f",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register the first reader");
+
+        reconcile_pass(&mut f).await;
+        assert!(
+            is_published(&f.raw).await,
+            "the pass after the first registration publishes its source"
+        );
+        let status: String = f
+            .raw
+            .query_one(
+                "select status from transform_definitions where target_table = 'public.t'",
+                &[],
+            )
+            .await
+            .expect("read status")
+            .get(0);
+        assert!(
+            status != "waiting_to_backfill" || marker_count(&f.raw).await == 1,
+            "the registration is captured: dispatched, or its join marker is still parked \
+             (status {status})"
         );
     }
 }

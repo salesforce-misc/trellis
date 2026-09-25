@@ -586,8 +586,9 @@ impl super::Backend for SubprocessBackend {
     /// in-process simulation: `SIGKILL`s the currently running primary
     /// subprocess (via [`CrashGuard::kill`]), waits for it to actually exit
     /// (recording the exit status — see [`SubprocessBackend::last_kill_status`]),
-    /// then spawns a fresh one against the exact same dsn/slot/publication/
-    /// source-table set `install` originally used. The ring is durable
+    /// then spawns a fresh one against the exact same dsn/slot/publication
+    /// `install` originally used (it reads the tables to publish from the
+    /// catalog, issue #427). The ring is durable
     /// Postgres state untouched by any of this, so the fresh subprocess is
     /// expected to redrive exactly whatever the killed one left mid-flight —
     /// including, if [`SubprocessBackend::arm_pause_before_commit`] paused it

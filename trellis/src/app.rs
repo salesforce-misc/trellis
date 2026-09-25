@@ -122,9 +122,10 @@ use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registr
 pub struct TrellisOptions {
     /// Whether this connection runs the CDC subscriber and ring maintenance
     /// (the staging worker). Exactly one connection in a fleet should set
-    /// this. When set, [`Trellis::connect`] derives the source-table set to
-    /// publish from the catalog, so at least one definition must already be
-    /// registered.
+    /// this. When set, the staging worker publishes whatever tables the
+    /// registered definitions read, straight from the catalog, and picks up
+    /// definitions registered later on its next reconcile pass; none need be
+    /// registered before it starts (issue #427).
     pub staging: bool,
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
@@ -635,8 +636,7 @@ impl Trellis {
             });
         }
 
-        // A failure here is a plain `Db` error. `TrellisError::Publication`
-        // describes a post-DROP reconcile failure and would misreport it.
+        // A failure here is a plain `Db` error.
         crate::intake::publication::park_marker(&**client, &qualified).await?;
         Ok(())
     }
@@ -1590,15 +1590,6 @@ pub enum TrellisError {
     /// reporting a divergence, which is a successful audit) — see
     /// [`SelfCheckError`].
     SelfCheck(SelfCheckError),
-    /// Reconciling the replication publication after a
-    /// `DROP TRANSFORM`/`DROP RELATIONSHIP` ([`Trellis::apply`]) failed
-    /// (issue #142). The definition is already gone when this surfaces — the
-    /// drop and the reconcile are deliberately not one transaction, since
-    /// `alter publication` is its own DDL and the drop must not be held open
-    /// across it — so the recovery is to re-run the reconcile (the running
-    /// client's own periodic `reconcile_source_tables` pass will, unprompted),
-    /// not to re-run the drop.
-    Publication(crate::intake::IntakeError),
 }
 
 impl TrellisError {
@@ -1636,7 +1627,6 @@ impl TrellisError {
             }
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
-            TrellisError::Publication(err) => err.code(),
         }
     }
 }
@@ -1695,11 +1685,6 @@ impl std::fmt::Display for TrellisError {
             ),
             TrellisError::Staging(err) => write!(f, "{err}"),
             TrellisError::SelfCheck(err) => write!(f, "{err}"),
-            TrellisError::Publication(err) => write!(
-                f,
-                "the definition was dropped, but reconciling the replication publication \
-                 afterwards failed: {err}"
-            ),
         }
     }
 }
@@ -1722,7 +1707,6 @@ impl std::error::Error for TrellisError {
             TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => None,
             TrellisError::Staging(err) => Some(err),
             TrellisError::SelfCheck(err) => Some(err),
-            TrellisError::Publication(err) => Some(err),
         }
     }
 }
