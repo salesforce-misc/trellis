@@ -109,6 +109,15 @@ does with them is the row above.
 | **A source lacking the needed `REPLICA IDENTITY`** | **Handled by construction.** The endpoint is never published, so its identity is never read; the seam captures prior images under its own row lock. Pinned: `relationship_target_endpoints.rs`. |
 | **A shared from-table reachable via two relationships** | **Handled.** `group_key` unions every outbound relationship's `from_col`. Pinned: `a_from_side_target_of_two_relationships_unions_both_join_keys` (`endpoint_seam_feed.rs`). |
 
+One write to an endpoint target bypasses the seam: a resumed definition's
+rebuild. Its catch-up (`intake::publication::park_target_catchup_if_read`,
+#507) covers it instead. The discharge refreshes every to-one projection on
+the target from the rebuilt rows (`catalog::refresh_relationship_projections_in_txn`)
+and enumerates the target, so reverse propagation re-derives each consumer.
+Pinned: `a_resumed_targets_rebuild_reaches_a_relationship_consumer` and
+`a_resumed_targets_rebuild_refreshes_a_to_one_projection`
+(`target_mutation_seam.rs`).
+
 ## Known gaps
 
 Four items fell out of filling in this table — the point of the exercise, not

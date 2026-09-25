@@ -49,7 +49,10 @@
 //! `create_relationship` refuses such a target as an endpoint the same way
 //! (#403), and a target whose build finishes with readers already attached (a
 //! resumed upstream) parks a catch-up marker for itself so those readers
-//! re-derive from its rebuilt state (and report `catching_up` until then).
+//! re-derive from its rebuilt state (and report `catching_up` until then):
+//! every reader, including one reading it through a relationship, whose
+//! settled projection that catch-up's discharge also refreshes (#507,
+//! `intake::publication::park_target_catchup_if_read`).
 //! A chunk a worker held across a resume can't write once the rebuild has
 //! made the target applying again: its claim fences every write it makes
 //! (`defs::chunk_queue::ClaimFence`, #434).

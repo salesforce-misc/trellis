@@ -205,34 +205,80 @@ pub(crate) async fn park_registration_markers(
     Ok(())
 }
 
-/// Parks a catch-up marker for `definition_id`'s *target* table when some
-/// applying definition reads it (issue #315), moving each such reader that
-/// is `live` to `catching_up` until the marker is discharged (issue #476).
-/// Called wherever a definition's build finishes after writing its target
-/// outside the target-mutation seam (`staging::target_mutations`): a reader
-/// already attached (only possible for a rebuilt, resumed upstream, since
-/// `defs::catalog` refuses to attach a new one to a target still being
-/// built) re-derives from the rebuilt state once the marker discharges, and
-/// until then it may be missing what the rebuild wrote. A no-op for a target
-/// nothing reads.
+/// Parks a catch-up marker for `definition_id`'s *target* table when
+/// something reads it (issue #315), moving each reader that is `live` to
+/// `catching_up` until the marker is discharged (issue #476). Called wherever
+/// a definition's build finishes after writing its target outside the
+/// target-mutation seam (`staging::target_mutations`): a reader already
+/// attached (only possible for a rebuilt, resumed upstream, since
+/// `defs::catalog` refuses to attach a new one to a target still being built)
+/// re-derives from the rebuilt state once the marker discharges, and until
+/// then it may be missing what the rebuild wrote.
+///
+/// A reader is every applying definition that reads the target, directly as
+/// its source or through a relationship whose to-side it is (issue #507,
+/// [`crate::defs::catalog::applying_readers`]). The discharge reaches a
+/// relationship consumer by reverse propagation: its enumeration stages an
+/// image-less `Recompute` per target key, and apply re-derives every
+/// from-side row joined to one. A target that is a relationship's to-side
+/// gets the marker even with no reader yet, because its discharge also
+/// refreshes the relationship's settled projection
+/// ([`crate::defs::catalog::refresh_relationship_projections_in_txn`]),
+/// which a later consumer would otherwise read stale. A no-op for a target
+/// that is neither read nor a to-side.
 pub(crate) async fn park_target_catchup_if_read(
     client: &impl GenericClient,
     definition_id: i64,
 ) -> Result<(), IntakeError> {
-    let rows = client
-        .query(
-            "select d.target_table, r.id from transform_definitions d \
-             join transform_definitions r on r.source_table = d.target_table \
-             where d.id = $1 and r.status = any($2) \
-             order by r.id",
-            &[&definition_id, &TransformStatus::applying()],
+    let target: String = client
+        .query_one(
+            "select target_table from transform_definitions where id = $1",
+            &[&definition_id],
         )
-        .await?;
-    let Some(target) = rows.first().map(|row| row.get::<_, String>(0)) else {
-        return Ok(());
+        .await?
+        .get(0);
+    let (readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
+    park_catch_up(client, &readers, &tables).await
+}
+
+/// The catch-ups [`park_target_catchup_if_read`] parks for `targets`: every
+/// one of them something reads or that is a relationship's to-side, with the
+/// readers of those, sorted and deduplicated.
+async fn target_catchups(
+    client: &impl GenericClient,
+    targets: &[String],
+) -> Result<(Vec<i64>, Vec<String>), IntakeError> {
+    let mut readers = Vec::new();
+    let mut tables = Vec::new();
+    for target in targets {
+        let read_by = crate::defs::catalog::applying_readers(client, target).await?;
+        if read_by.is_empty() && !is_relationship_to_side(client, target).await? {
+            continue;
+        }
+        readers.extend(read_by);
+        tables.push(target.clone());
+    }
+    readers.sort_unstable();
+    readers.dedup();
+    Ok((readers, tables))
+}
+
+/// Whether `table` is the to-side of some relationship.
+async fn is_relationship_to_side(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<bool, IntakeError> {
+    let Some((schema, name)) = table.split_once('.') else {
+        return Ok(false);
     };
-    let readers: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
-    park_catch_up(client, &readers, &[target]).await
+    Ok(client
+        .query_one(
+            "select exists (select 1 from relationship_definitions \
+             where to_schema = $1 and to_table = $2)",
+            &[&schema, &name],
+        )
+        .await?
+        .get(0))
 }
 
 /// Parks a go-live catch-up marker on each of `tables` for the definitions
@@ -1303,6 +1349,22 @@ async fn discharge_marker(
         fetch_read(&txn, &marker.table, &mut sweep).await?;
     }
     let swept = sweep.finish(&txn).await?;
+    // Issue #507: a target's rebuild wrote it outside the seam, so no seam
+    // row carried its changes into a relationship's settled projection. A
+    // marker on a target is always a catch-up for what such a write left
+    // out, and otherwise the refresh finds nothing to change.
+    if crate::defs::catalog::is_definition_target(&txn, &marker.table).await? {
+        let refreshed =
+            crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
+                .await?;
+        if refreshed > 0 {
+            tracing::info!(
+                table = %marker.table,
+                rows = refreshed,
+                "refreshed relationship projections from a target's catch-up"
+            );
+        }
+    }
     for (id, build) in &builds {
         match build {
             Build::Chunks(ranges) => {
@@ -1456,27 +1518,27 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
              meanwhile; leaving their status as it is"
         );
     }
-    let read_targets = txn
+    let targets: Vec<String> = txn
         .query(
-            "select d.target_table, r.id from transform_definitions d \
-             join transform_definitions r on r.source_table = d.target_table \
-             where d.id = any($1) and r.status = any($2)",
-            &[&flipped, &TransformStatus::applying()],
+            "select target_table from transform_definitions where id = any($1) order by id",
+            &[&flipped],
         )
-        .await?;
-    let chained_sources = txn
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let (readers, mut tables) = target_catchups(txn, &targets).await?;
+    let chained_sources: Vec<String> = txn
         .query(
             "select d.source_table from transform_definitions d \
              where d.id = any($1) and d.status = $2",
             &[&flipped, &TransformStatus::CatchingUp.as_str()],
         )
-        .await?;
-    let tables: Vec<String> = read_targets
-        .iter()
-        .chain(&chained_sources)
+        .await?
+        .into_iter()
         .map(|row| row.get(0))
         .collect();
-    let readers: Vec<i64> = read_targets.iter().map(|row| row.get(1)).collect();
+    tables.extend(chained_sources);
     park_catch_up(txn, &readers, &tables).await
 }
 
@@ -2122,7 +2184,7 @@ mod tests {
                  values ('public.orders', 1), ('public.t', 1); \
                  insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.t', 'public.orders', 1, '', 'live')",
+                 values ('public.t', 'public.orders', 1, 'TRANSFORM t FROM orders SELECT id AS x', 'live')",
             )
             .await
             .expect("seed the upstream definition");
@@ -2130,7 +2192,7 @@ mod tests {
             .query_one(
                 "insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.d', 'public.t', 1, '', 'waiting_to_backfill') returning id",
+                 values ('public.d', 'public.t', 1, 'TRANSFORM d FROM t SELECT id AS x', 'waiting_to_backfill') returning id",
                 &[],
             )
             .await
@@ -2208,7 +2270,7 @@ mod tests {
                 .query_one(
                     "insert into transform_definitions \
                      (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, 'public.orders', 1, '', $2) returning id",
+                     values ($1, 'public.orders', 1, 'TRANSFORM t FROM orders SELECT id AS x', $2) returning id",
                     &[&target, &status],
                 )
                 .await
@@ -3131,7 +3193,7 @@ mod catch_up_tests {
                 .query_one(
                     "insert into transform_definitions \
                      (target_table, source_table, source_version, definition_text, status) \
-                     values ($1, $2, 1, '', $3) returning id",
+                     values ($1, $2, 1, 'TRANSFORM t FROM s SELECT id AS x', $3) returning id",
                     &[&target, &source, &status],
                 )
                 .await
@@ -3266,7 +3328,7 @@ mod catch_up_tests {
                  values ('public.orders', 1), ('public.t', 1); \
                  insert into transform_definitions \
                  (target_table, source_table, source_version, definition_text, status) \
-                 values ('public.t', 'public.orders', 1, '', 'live')",
+                 values ('public.t', 'public.orders', 1, 'TRANSFORM t FROM orders SELECT id AS x', 'live')",
             )
             .await
             .expect("seed the upstream definition and its target");

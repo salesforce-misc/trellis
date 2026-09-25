@@ -92,6 +92,10 @@ pub enum TransformStatus {
     /// TRANSFORM` that added columns, or an upstream rebuild written outside
     /// the target-mutation seam. The discharge that runs its last pending
     /// catch-up flips it to `live`.
+    ///
+    /// Also *reported*, never stored, for a `live` definition reading an
+    /// upstream that isn't `live` (issue #497,
+    /// [`super::catalog::reported_statuses`]).
     CatchingUp,
     Live,
     Quarantined,

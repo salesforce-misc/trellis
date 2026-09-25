@@ -1099,6 +1099,40 @@ pub(crate) async fn catching_up_readers_unlocked(
     Ok(readers)
 }
 
+/// Every applying definition (`live` or `catching_up`) that reads `table`,
+/// directly as its source or through a relationship whose to-side it is
+/// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
+/// outside the target-mutation seam has to catch up (issue #507,
+/// `intake::publication::park_target_catchup_if_read`). A relationship
+/// consumer counts only if one of its fields reads through the relationship,
+/// the same rule the catch-up discharge's go-live check applies
+/// ([`catching_up_readers`]).
+pub(crate) async fn applying_readers(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<i64>, CatalogError> {
+    let rows = client
+        .query(
+            "select id, source_table, definition_text from transform_definitions \
+             where status = any($1) order by id",
+            &[&TransformStatus::applying()],
+        )
+        .await?;
+    let mut readers = Vec::new();
+    for row in rows {
+        let qualified: String = row.get(1);
+        let def = parse(row.get::<_, &str>(2))?;
+        if tables_read_by(client, &def, &qualified)
+            .await?
+            .iter()
+            .any(|t| t == table)
+        {
+            readers.push(row.get::<_, i64>(0));
+        }
+    }
+    Ok(readers)
+}
+
 /// Every table `def`'s direct build reads, fully qualified, sorted and
 /// deduplicated: its source (`qualified_source`, the persisted
 /// `transform_definitions.source_table`) and the to-side table of every
@@ -1106,19 +1140,13 @@ pub(crate) async fn catching_up_readers_unlocked(
 /// ([`RelationshipDefinition::qualified_to_table`], issue #372). A referenced
 /// relationship the source no longer declares contributes nothing.
 async fn tables_read_by(
-    txn: &tokio_postgres::Transaction<'_>,
+    txn: &impl GenericClient,
     def: &TransformDef,
     qualified_source: &str,
 ) -> Result<Vec<String>, CatalogError> {
     let mut tables = vec![qualified_source.to_string()];
     if let Some((schema, table)) = qualified_source.split_once('.') {
-        let mut rels: Vec<String> = super::eval::relationship_references(def)
-            .into_iter()
-            .map(|(rel, _column)| rel)
-            .collect();
-        rels.sort_unstable();
-        rels.dedup();
-        for rel in rels {
+        for rel in referenced_relationships(def) {
             if let Some(reldef) = relationship_by_name_in(txn, schema, table, &rel).await? {
                 tables.push(reldef.qualified_to_table());
             }
@@ -1127,6 +1155,134 @@ async fn tables_read_by(
     tables.sort_unstable();
     tables.dedup();
     Ok(tables)
+}
+
+/// The names of the relationships `def`'s fields read through, sorted and
+/// deduplicated.
+fn referenced_relationships(def: &TransformDef) -> Vec<String> {
+    let mut rels: Vec<String> = super::eval::relationship_references(def)
+        .into_iter()
+        .map(|(rel, _column)| rel)
+        .collect();
+    rels.sort_unstable();
+    rels.dedup();
+    rels
+}
+
+/// Every definition's status as an operator reads it (`Trellis::status`,
+/// `Trellis::definitions`), by id (issue #497, ADR-0016's "What `live`
+/// promises"): its persisted status, except that a `live` definition reading
+/// an upstream that isn't `live` reports [`TransformStatus::CatchingUp`].
+///
+/// An upstream is the definition whose target is a table this one reads:
+/// its source, or the to-side of a relationship one of its fields reads
+/// through ([`tables_read_by`]'s set). While that upstream is paused,
+/// quarantined, rebuilding or catching up, its target doesn't reflect its
+/// own source, so neither does anything derived from it, and a watermark
+/// token wouldn't wait for what's missing. The rule is transitive: an
+/// upstream that only *reports* `catching_up` because of its own upstream
+/// counts as not `live` too.
+///
+/// Derived when read, not stored. A stored transition would have to follow
+/// every status change of every upstream (pause, resume, quarantine, drop,
+/// each go-live) down the chain, under locks, and a reader's own go-live
+/// would have to check its upstreams as well. The derivation needs only the
+/// catalog: one read of the definitions and one of the relationships. The
+/// reported status changes nothing else: the definition keeps applying, as
+/// `catching_up` always does.
+pub(crate) async fn reported_statuses(
+    client: &impl GenericClient,
+) -> Result<HashMap<i64, TransformStatus>, CatalogError> {
+    let relationships: HashMap<(String, String, String), String> = client
+        .query(
+            "select from_schema, from_table, name, to_schema || '.' || to_table \
+             from relationship_definitions",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| ((row.get(0), row.get(1), row.get(2)), row.get(3)))
+        .collect();
+    let rows = client
+        .query(
+            "select id, target_table, source_table, status, definition_text \
+             from transform_definitions order by id",
+            &[],
+        )
+        .await?;
+    let mut nodes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let status_text: String = row.get(3);
+        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+            panic!("transform_definitions.status held unrecognized value '{status_text}'")
+        });
+        let source: String = row.get(2);
+        // Only a `live` definition's reported status can differ from its
+        // persisted one, so only its reads are needed.
+        let mut reads = Vec::new();
+        if status == TransformStatus::Live {
+            reads.push(source.clone());
+            if let Some((schema, table)) = source.split_once('.') {
+                let def = parse(row.get::<_, &str>(4))?;
+                for rel in referenced_relationships(&def) {
+                    let key = (schema.to_string(), table.to_string(), rel);
+                    if let Some(to_table) = relationships.get(&key) {
+                        reads.push(to_table.clone());
+                    }
+                }
+            }
+        }
+        nodes.push(StatusNode {
+            id: row.get(0),
+            target: row.get(1),
+            status,
+            reads,
+        });
+    }
+    Ok(derive_reported_statuses(&nodes))
+}
+
+/// One definition as [`derive_reported_statuses`] sees it.
+struct StatusNode {
+    id: i64,
+    /// Its qualified target table.
+    target: String,
+    /// Its persisted status.
+    status: TransformStatus,
+    /// Every table it reads, qualified (needed only when `status` is `live`).
+    reads: Vec<String>,
+}
+
+/// [`reported_statuses`]' rule over the loaded catalog: starting from every
+/// persisted status, moves a `live` definition to `catching_up` while any
+/// table it reads is the target of a definition not reported `live`, until
+/// nothing moves. Each round only ever moves `live` to `catching_up`, so it
+/// ends within one round per definition, and a cycle (which the catalog
+/// can't hold anyway) can't make it loop.
+fn derive_reported_statuses(nodes: &[StatusNode]) -> HashMap<i64, TransformStatus> {
+    let owner: HashMap<&str, i64> = nodes.iter().map(|n| (n.target.as_str(), n.id)).collect();
+    let mut reported: HashMap<i64, TransformStatus> =
+        nodes.iter().map(|n| (n.id, n.status)).collect();
+    loop {
+        let mut moved = false;
+        for node in nodes {
+            if reported[&node.id] != TransformStatus::Live {
+                continue;
+            }
+            let upstream_not_live = node.reads.iter().any(|table| {
+                owner
+                    .get(table.as_str())
+                    .is_some_and(|up| *up != node.id && reported[up] != TransformStatus::Live)
+            });
+            if upstream_not_live {
+                reported.insert(node.id, TransformStatus::CatchingUp);
+                moved = true;
+            }
+        }
+        if !moved {
+            return reported;
+        }
+    }
 }
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
@@ -1170,7 +1326,7 @@ async fn reject_non_live_upstream(
 }
 
 /// Whether `qualified_table` is some definition's target table.
-async fn is_definition_target(
+pub(crate) async fn is_definition_target(
     client: &impl GenericClient,
     qualified_table: &str,
 ) -> Result<bool, CatalogError> {
@@ -4634,6 +4790,134 @@ async fn ensure_relationship_projection_in_txn(
     Ok(())
 }
 
+/// Re-syncs every settled parent projection whose to-side is
+/// `qualified_to_table` with that table's current rows (issue #507): deletes
+/// each projection row whose to-side row is gone, rewrites the data columns of
+/// each row whose to-side row now differs, and inserts a row for each to-side
+/// key it lacks, seeded as [`ensure_relationship_projection_in_txn`] seeds
+/// one. Returns how many projection rows it changed.
+///
+/// The catch-up discharge runs this for a marker on another definition's
+/// target (`intake::publication::discharge_marker`). Every write to a target
+/// reaches its projection through the target-mutation seam's CDC-shaped rows,
+/// except a rebuild's (a resumed definition's chunks or direct build), which
+/// writes the target directly. Nothing else would ever carry what the rebuild
+/// changed into the projection, and a consumer reading through a to-one
+/// relationship reads the projection, never the target. The same discharge
+/// re-derives those consumers from the refreshed projection (its enumeration
+/// of the target reaches them by reverse propagation).
+///
+/// Neither bookkeeping column moves on a row it rewrites. A seam row for a
+/// write this read already sees can still be pending: it re-applies its own
+/// new image over the row, which this already reflects, and its images, not
+/// the projection, are what its delta is computed from. Its capture of the
+/// row's `__trellis_lsn`, before or after this, still matches, so the order
+/// between it and later seam rows for the key is kept.
+pub(crate) async fn refresh_relationship_projections_in_txn(
+    client: &impl GenericClient,
+    qualified_to_table: &str,
+) -> Result<u64, CatalogError> {
+    let Some((to_schema, to_table)) = qualified_to_table.split_once('.') else {
+        return Ok(0);
+    };
+    // A projection lives in the catalog schema, the same schema as
+    // `relationship_projections` itself (issue #435), which this connection's
+    // search path already resolves.
+    let projections = client
+        .query(
+            "select rp.projection_table, n.nspname::text, rd.to_col \
+             from relationship_projections rp \
+             join relationship_definitions rd on rd.id = rp.relationship_id \
+             join pg_class c on c.oid = 'relationship_projections'::regclass \
+             join pg_namespace n on n.oid = c.relnamespace \
+             where rd.to_schema = $1 and rd.to_table = $2 \
+             order by rp.relationship_id",
+            &[&to_schema, &to_table],
+        )
+        .await?;
+    let quoted_to_table = ddl::qualified_source_table(qualified_to_table);
+    let mut changed = 0;
+    for row in projections {
+        let projection_table: String = row.get(0);
+        let catalog_schema: String = row.get(1);
+        let to_col: String = row.get(2);
+        let qualified_projection =
+            ddl::qualified_relationship_projection_table(&catalog_schema, &projection_table);
+        let key = quote_ident(&to_col);
+        let bookkeeping = [
+            to_col.as_str(),
+            ddl::PROJECTION_GEN_COLUMN,
+            ddl::PROJECTION_LSN_COLUMN,
+        ];
+        let data_columns: Vec<String> = client
+            .query(
+                "select column_name::text from information_schema.columns \
+                 where table_schema = $1 and table_name = $2 order by ordinal_position",
+                &[&catalog_schema, &projection_table],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .filter(|c| !bookkeeping.contains(&c.as_str()))
+            .collect();
+        let data: Vec<String> = data_columns.iter().map(|c| quote_ident(c)).collect();
+
+        changed += client
+            .execute(
+                &format!(
+                    "delete from {qualified_projection} p where not exists ( \
+                         select 1 from {quoted_to_table} t where t.{key} = p.{key})"
+                ),
+                &[],
+            )
+            .await?;
+        if !data.is_empty() {
+            let sets: Vec<String> = data.iter().map(|c| format!("{c} = t.{c}")).collect();
+            let differs: Vec<String> = data
+                .iter()
+                .map(|c| format!("p.{c} is distinct from t.{c}"))
+                .collect();
+            changed += client
+                .execute(
+                    &format!(
+                        "update {qualified_projection} p set {sets} \
+                         from {quoted_to_table} t \
+                         where t.{key} = p.{key} and ({differs})",
+                        sets = sets.join(", "),
+                        differs = differs.join(" or "),
+                    ),
+                    &[],
+                )
+                .await?;
+        }
+        let mut insert_cols = vec![
+            key.clone(),
+            quote_ident(ddl::PROJECTION_GEN_COLUMN),
+            quote_ident(ddl::PROJECTION_LSN_COLUMN),
+        ];
+        let mut select_cols = vec![format!("t.{key}"), "0".to_string(), "seed.lsn".to_string()];
+        for c in &data {
+            insert_cols.push(c.clone());
+            select_cols.push(format!("t.{c}"));
+        }
+        changed += client
+            .execute(
+                &format!(
+                    "with seed as (select pg_current_wal_lsn() as lsn) \
+                     insert into {qualified_projection} ({insert_cols}) \
+                     select {select_cols} from {quoted_to_table} t, seed \
+                     where t.{key} is not null and not exists ( \
+                         select 1 from {qualified_projection} p where p.{key} = t.{key})",
+                    insert_cols = insert_cols.join(", "),
+                    select_cols = select_cols.join(", "),
+                ),
+                &[],
+            )
+            .await?;
+    }
+    Ok(changed)
+}
+
 /// The [`create_definition_inner`] half of issue #129's projection-widening:
 /// for every to-one relationship `def`'s fields read through
 /// ([`super::eval::relationship_references`], grouped by relationship name),
@@ -6069,5 +6353,89 @@ mod value_type_codec_tests {
     #[test]
     fn an_unrecognized_token_does_not_decode() {
         assert_eq!(decode_value_type("frobnicate"), None);
+    }
+}
+
+#[cfg(test)]
+mod reported_status_tests {
+    use super::{StatusNode, TransformStatus, derive_reported_statuses};
+
+    fn node(id: i64, target: &str, status: TransformStatus, reads: &[&str]) -> StatusNode {
+        StatusNode {
+            id,
+            target: target.to_string(),
+            status,
+            reads: reads.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_reader_of_a_non_live_upstream_reports_catching_up() {
+        use TransformStatus::*;
+        for upstream in [
+            Paused,
+            Quarantined,
+            WaitingToBackfill,
+            Backfilling,
+            CatchingUp,
+        ] {
+            let reported = derive_reported_statuses(&[
+                node(1, "public.u", upstream, &["public.s"]),
+                node(2, "public.d", Live, &["public.u"]),
+            ]);
+            assert_eq!(reported[&1], upstream, "the upstream reports what it is");
+            assert_eq!(
+                reported[&2], CatchingUp,
+                "a reader of a {upstream:?} upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_of_a_live_upstream_stays_live() {
+        use TransformStatus::*;
+        let reported = derive_reported_statuses(&[
+            node(1, "public.u", Live, &["public.s"]),
+            node(2, "public.d", Live, &["public.u", "public.other"]),
+        ]);
+        assert_eq!(reported[&2], Live);
+    }
+
+    #[test]
+    fn a_relationship_to_side_is_an_upstream_too() {
+        use TransformStatus::*;
+        // `public.r` reads its own source and, through a relationship, the
+        // target `public.u`.
+        let reported = derive_reported_statuses(&[
+            node(1, "public.u", Paused, &["public.s"]),
+            node(2, "public.r", Live, &["public.reports", "public.u"]),
+        ]);
+        assert_eq!(reported[&2], CatchingUp);
+    }
+
+    #[test]
+    fn the_rule_is_transitive_down_a_chain() {
+        use TransformStatus::*;
+        // Listed downstream-first so a single pass can't get it right.
+        let reported = derive_reported_statuses(&[
+            node(3, "public.c", Live, &["public.b"]),
+            node(2, "public.b", Live, &["public.a"]),
+            node(1, "public.a", CatchingUp, &["public.s"]),
+        ]);
+        assert_eq!(reported[&1], CatchingUp);
+        assert_eq!(reported[&2], CatchingUp);
+        assert_eq!(reported[&3], CatchingUp);
+    }
+
+    #[test]
+    fn only_a_live_status_is_ever_changed() {
+        use TransformStatus::*;
+        let reported = derive_reported_statuses(&[
+            node(1, "public.u", Paused, &["public.s"]),
+            node(2, "public.d", Paused, &["public.u"]),
+            node(3, "public.e", Backfilling, &["public.u"]),
+        ]);
+        assert_eq!(reported[&2], Paused);
+        assert_eq!(reported[&3], Backfilling);
     }
 }

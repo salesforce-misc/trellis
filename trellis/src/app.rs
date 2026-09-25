@@ -488,30 +488,40 @@ impl Trellis {
         })
     }
 
-    /// Every registered transform definition, oldest first.
+    /// Every registered transform definition, oldest first. Each status is
+    /// the one [`Trellis::status`] reports: a `live` definition reading an
+    /// upstream that isn't `live` shows [`TransformStatus::CatchingUp`]
+    /// (issue #497).
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
-        let client = self.pool.get().await?;
-        let rows = client
+        let mut client = self.pool.get().await?;
+        // One repeatable-read transaction, so the reported statuses are
+        // derived from the same catalog state the rows come from.
+        let txn = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await?;
+        let rows = txn
             .query(
-                "select id, target_table, source_table, source_version, status, created_at \
+                "select id, target_table, source_table, source_version, created_at \
                  from transform_definitions order by id",
                 &[],
             )
             .await?;
+        let reported = crate::defs::catalog::reported_statuses(&*txn).await?;
+        txn.commit().await?;
         Ok(rows
             .into_iter()
             .map(|row| {
-                let status_text: String = row.get(4);
-                let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
-                });
+                let id: i64 = row.get(0);
                 DefinitionSummary {
-                    id: row.get(0),
+                    id,
                     target_table: row.get(1),
                     source_table: row.get(2),
                     source_version: row.get(3),
-                    status,
-                    created_at: row.get(5),
+                    status: reported[&id],
+                    created_at: row.get(4),
                 }
             })
             .collect())
@@ -531,7 +541,11 @@ impl Trellis {
     /// catch-up hasn't run yet reports [`TransformStatus::CatchingUp`]
     /// instead, as does a `live` one given a catch-up of its own (an
     /// `ALTER TRANSFORM` that added columns, a resumed column): it is applying
-    /// changes, but its target may still be missing some (issue #476).
+    /// changes, but its target may still be missing some (issue #476). So does
+    /// a `live` one reading an upstream (another definition's target, as its
+    /// source or through a relationship) that isn't `live` itself: paused,
+    /// quarantined, rebuilding or catching up, down the whole chain (issue
+    /// #497). That one is derived from the upstream's status when read.
     ///
     /// Also reports why a definition isn't getting there, when the cause is a
     /// failing backfill of its source table
@@ -542,7 +556,7 @@ impl Trellis {
         &self,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         // Issue #73: `transform_definitions.target_table` is persisted
         // fully-qualified, but every caller here only ever has the bare name
         // their `TRANSFORM <name> FROM ...` text declared — even once issue
@@ -552,9 +566,16 @@ impl Trellis {
         // API's callers never have anything but the bare name to poll with —
         // match against `target_table`'s bare table-name suffix rather than
         // the qualified column directly.
-        let row = client
+        let txn = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await?;
+        let row = txn
             .query_opt(
-                "select d.status, pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at \
+                "select d.status, pb.table_name, pb.attempts, pb.last_error, pb.next_attempt_at, \
+                        d.id \
                  from transform_definitions d \
                  left join pending_backfill pb \
                    on pb.table_name = d.source_table and pb.last_error is not null \
@@ -562,11 +583,16 @@ impl Trellis {
                 &[&target_table],
             )
             .await?;
-        Ok(row.map(|row| {
+        let mut status = None;
+        if let Some(row) = &row {
             let status_text: String = row.get(0);
-            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+            let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                 panic!("transform_definitions.status held unrecognized value '{status_text}'")
             });
+            status = Some(reported_status(&*txn, row.get(5), stored).await?);
+        }
+        txn.commit().await?;
+        Ok(row.zip(status).map(|(row, status)| {
             let backfill_failure =
                 row.get::<_, Option<String>>(1)
                     .map(|source_table| BackfillFailure {
@@ -755,16 +781,18 @@ impl Trellis {
                 // same reasoning).
                 let row = client
                     .query_opt(
-                        "select status from transform_definitions \
+                        "select status, id from transform_definitions \
                          where split_part(target_table, '.', 2) = $1",
                         &[t],
                     )
                     .await?
                     .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
                 let status_text: String = row.get(0);
-                let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
+                let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                     panic!("transform_definitions.status held unrecognized value '{status_text}'")
                 });
+                // The status `Trellis::status` reports (issue #497).
+                let status = reported_status(&**client, row.get(1), stored).await?;
                 Ok(QuarantineEntry {
                     target,
                     state: QuarantineState::from(status),
@@ -1253,6 +1281,24 @@ impl Trellis {
         }
         Ok(columns)
     }
+}
+
+/// The status an operator reads for definition `id`, persisted as `stored`
+/// (issue #497, `defs::catalog::reported_statuses`). Only a `live` one can
+/// differ, so any other skips the catalog read.
+async fn reported_status(
+    client: &impl tokio_postgres::GenericClient,
+    id: i64,
+    stored: TransformStatus,
+) -> Result<TransformStatus, TrellisError> {
+    if stored != TransformStatus::Live {
+        return Ok(stored);
+    }
+    Ok(crate::defs::catalog::reported_statuses(client)
+        .await?
+        .get(&id)
+        .copied()
+        .unwrap_or(stored))
 }
 
 /// One registered transform definition's status, as [`Trellis::status`]

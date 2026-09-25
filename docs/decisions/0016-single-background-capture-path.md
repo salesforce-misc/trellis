@@ -402,8 +402,9 @@ the whole time.
 
 Some catch-ups are parked on a definition that is already `live`: a column
 resume (`staging::quarantine::resume_column`), an `ALTER TRANSFORM` that
-added columns, and an upstream rebuild that wrote a reader's source outside
-the seam (`park_target_catchup_if_read`). Each leaves the target missing
+added columns, and an upstream rebuild that wrote a reader's source, or a
+table it reads through a relationship, outside the seam
+(`park_target_catchup_if_read`, #507). Each leaves the target missing
 something until the catch-up runs.
 
 **Decision:** such a park moves the definition from `live` to `catching_up`
@@ -421,7 +422,9 @@ stops. Considered and rejected:
 - **Deriving the state from pending markers when status is read.** A marker
   is per table, not per definition: a new registration's join marker on a
   shared source would report every `live` definition on it as catching up,
-  though none of them is missing anything.
+  though none of them is missing anything. (Deriving it from *upstream
+  status*, below, is a different rule: a definition's status is per
+  definition.)
 
 **Locks.** A park locks the definition rows before it parks the markers, and
 the discharge locks the `catching_up` definitions it may flip before it
@@ -449,6 +452,69 @@ the discharge's backoff and error reporting (#407) apply. `Trellis::status`
 shows the error when the failing marker is on the definition's source; a
 failing marker on a relationship to-side is only in the staging worker's
 log.
+
+#### A rebuilt target's readers
+
+*Decided 2026-09-24, implemented by #507.* A resumed definition's rebuild
+writes its target outside the target-mutation seam, so nothing it writes
+reaches the target's readers or a relationship's settled projection. When the
+build finishes, `park_target_catchup_if_read` parks a catch-up on the target
+for **every** applying definition that reads it, directly as its source or
+through a relationship whose to-side it is, and parks it even with no reader
+when the target is a relationship's to-side. The discharge of that marker:
+
+- **Re-derives relationship consumers by reverse propagation.** Its
+  enumeration stages an image-less `Recompute` per target key, and apply's
+  reverse path turns each into a `Recompute` of every from-side row joined to
+  it, as it does for any image-less change to a to-side. That covers every
+  joined row, changed by the rebuild or not, as the catch-up does for a
+  direct reader: the discharge can't tell which keys the rebuild changed.
+- **Refreshes a to-one relationship's settled projection** from the target,
+  in the discharge's own transaction (`refresh_relationship_projections_in_txn`):
+  it deletes, rewrites or inserts each projection row that differs. A 1-1
+  consumer reads the projection, never the target, so the re-derive above
+  would otherwise reproduce the stale value. The refresh runs for every
+  marker on a target; one the seam kept in step has nothing to change.
+
+Considered and rejected: routing rebuild writes through the seam (every
+rebuild would pay full per-row reverse propagation), and rebuilding every
+consumer from its own source when the target goes live (a full rebuild per
+consumer on every upstream resume).
+
+#### A reader whose upstream isn't `live`
+
+*Decided 2026-09-24, implemented by #497.* A definition reads an
+**upstream** when another definition's target is its source, or the to-side
+of a relationship one of its fields reads through. While that upstream is
+paused, quarantined, rebuilding (`waiting_to_backfill`, `backfilling`) or
+`catching_up`, its target doesn't reflect its own source, so neither does
+the reader, and a token taken after a commit to the upstream's source
+wouldn't wait for what's missing. So a `live` reader of an upstream that
+isn't `live` reports `catching_up`. The rule is transitive: an upstream that
+only reports `catching_up` because of its own upstream counts too. The reader
+keeps applying, and `reject_non_live_upstream` stays what it was, a guard on
+registration.
+
+**Decision: derived when status is read, not stored.**
+`defs::catalog::reported_statuses` computes it from the catalog alone (one
+read of the definitions, one of the relationships) for `Trellis::status`,
+`Trellis::definitions` and `Trellis::quarantine_status`. The persisted status
+never changes for it. Considered and rejected:
+
+- **A stored transition.** Every status change of every upstream (pause,
+  resume, quarantine, drop, each go-live) would have to walk its readers down
+  the chain and move them, under the same locks the catch-up parks take, and
+  a reader's own go-live (`go_live_caught_up`) would have to check its
+  upstreams before flipping. Missing any one of those transitions leaves a
+  reader stuck `catching_up` or wrongly `live`. The derivation has no such
+  transitions to miss, and it's cheap: status is an operator read, and the
+  catalog is small.
+
+A rebuilt upstream still parks a catch-up for its readers
+(`park_target_catchup_if_read`), because what the rebuild wrote outside the
+seam never reached them. That one is stored, like every catch-up, and the
+reader reports `live` only once both hold: its upstream is `live` and its own
+catch-up has run.
 
 ## Why
 

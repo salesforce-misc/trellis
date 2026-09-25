@@ -17,8 +17,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
-    CatalogError, Statement, alter_transform, create_definition, create_relationship,
-    install_definition, parse_statement, publication_tables,
+    CatalogError, Statement, TransformStatus, alter_transform, create_definition,
+    create_relationship, install_definition, parse_statement, publication_tables,
 };
 use trellis::intake::publication;
 use trellis::integer::IntWidth;
@@ -104,6 +104,81 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
         .into_iter()
         .map(|row| (row.get(0), row.get(1)))
         .collect()
+}
+
+/// Stages one CDC change as intake would, at the current WAL insert
+/// position: a real commit LSN, above every horizon the test set up before
+/// it (issue #512), rather than a fake one below them all. `group_key` is
+/// what intake stamps on a relationship from-side's change: the `from_col`
+/// values its images carry.
+async fn stage_cdc(
+    raw: &mut Client,
+    src_table: &str,
+    key: &str,
+    op: trellis::staging::CdcOp,
+    old_image: Option<&str>,
+    new_image: Option<&str>,
+    group_key: Option<Vec<String>>,
+) {
+    let lsn: tokio_postgres::types::PgLsn = raw
+        .query_one("select pg_current_wal_insert_lsn()", &[])
+        .await
+        .expect("read the WAL insert position")
+        .get(0);
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: src_table.to_string(),
+            key: key.to_string(),
+            op,
+            lsn: Some(lsn),
+            old_image: old_image.map(str::to_string),
+            new_image: new_image.map(str::to_string),
+            origin_lsn: Some(lsn),
+            src_changed: None,
+            hop_gen: 0,
+            group_key,
+        }],
+    )
+    .await
+    .expect("stage the change");
+    txn.commit().await.expect("commit");
+}
+
+/// [`stage_cdc`] for one `public.orders` update.
+async fn stage_order_update(raw: &mut Client, key: &str, old_image: &str, new_image: &str) {
+    stage_cdc(
+        raw,
+        "public.orders",
+        key,
+        trellis::staging::CdcOp::Update,
+        Some(old_image),
+        Some(new_image),
+        None,
+    )
+    .await;
+}
+
+/// `target`'s status as `Trellis::status` reports it.
+async fn reported(trellis: &trellis::Trellis, target: &str) -> TransformStatus {
+    trellis
+        .status(target)
+        .await
+        .expect("read the status")
+        .unwrap_or_else(|| panic!("{target} is defined"))
+        .status
+}
+
+/// `target`'s persisted status.
+async fn stored(raw: &Client, target: &str) -> String {
+    raw.query_one(
+        "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read the persisted status")
+    .get(0)
 }
 
 async fn setup() -> (TestCluster, TestDatabase, Client) {
@@ -767,16 +842,15 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
     assert_eq!(wrong, 0, "d follows every resumed row");
 }
 
-/// A resumed definition's rebuild writes its target outside the seam, and
-/// the target's readers have to hear of what it changed. A relationship
-/// declared on the target while it was `live` survives a pause, and a
-/// consumer reading through it doesn't read the target's table as its
-/// source, so the rebuild's go-live catch-up for readers
-/// (`park_target_catchup_if_read`) doesn't cover it. A source change made
-/// during the pause reaches the target through the rebuild, but never the
-/// consumer.
+/// Issue #507: a resumed definition's rebuild writes its target outside the
+/// seam, and the target's readers have to hear of what it changed. A
+/// relationship declared on the target while it was `live` survives a
+/// pause, and a consumer reading through it doesn't read the target's table
+/// as its source. The rebuild's catch-up (`park_target_catchup_if_read`)
+/// covers it all the same, and its discharge refreshes the to-one
+/// relationship's projection the consumer reads. The consumer reports
+/// `catching_up` while the target is paused (#497).
 #[tokio::test]
-#[ignore = "#507: a resumed target's rebuild never reaches a relationship consumer"]
 async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(
@@ -832,31 +906,29 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
         .apply("PAUSE TRANSFORM order_doubles")
         .await
         .expect("pause the target");
+    assert_eq!(
+        reported(&trellis, "report_view").await,
+        TransformStatus::CatchingUp,
+        "#497: a consumer reading a paused target through a relationship isn't live"
+    );
+    assert_eq!(
+        stored(&raw, "report_view").await,
+        "live",
+        "it keeps applying"
+    );
 
     // A source change while the target is paused, staged as intake would. Its
     // apply skips the frozen target, and the rebuild picks it up.
     raw.execute("update public.orders set a = 100 where id = 1", &[])
         .await
         .expect("update the source");
-    let txn = raw.transaction().await.expect("begin");
-    append(
-        &txn,
-        &[StagedChange::Cdc {
-            src_table: "public.orders".to_string(),
-            key: "1".to_string(),
-            op: trellis::staging::CdcOp::Update,
-            lsn: Some(testkit::wal_insert_lsn(&txn).await),
-            old_image: Some(r#"{"id":"1","a":"1"}"#.to_string()),
-            new_image: Some(r#"{"id":"1","a":"100"}"#.to_string()),
-            origin_lsn: None,
-            src_changed: None,
-            hop_gen: 0,
-            group_key: None,
-        }],
+    stage_order_update(
+        &mut raw,
+        "1",
+        r#"{"id":"1","a":"1"}"#,
+        r#"{"id":"1","a":"100"}"#,
     )
-    .await
-    .expect("stage the source update");
-    txn.commit().await.expect("commit");
+    .await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     trellis
@@ -894,4 +966,330 @@ async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
         BTreeMap::from([("1".to_string(), "200".to_string())]),
         "the rebuild's change to the target must reach the relationship consumer"
     );
+    assert_eq!(
+        reported(&trellis, "report_view").await,
+        TransformStatus::Live,
+        "live again once its upstream is and its catch-up has run"
+    );
+}
+
+/// Issue #507's to-one half: a consumer reading through a to-one
+/// relationship reads the relationship's settled projection, never the
+/// target, and a rebuild writes the target outside the seam that keeps the
+/// projection in step. The rebuild's catch-up refreshes it: an updated row,
+/// a row the rebuild added, and one it dropped all reach the projection, and
+/// a from-side row inserted afterwards resolves through the refreshed
+/// projection rather than the pre-pause one.
+#[tokio::test]
+async fn a_resumed_targets_rebuild_refreshes_a_to_one_projection() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a numeric); \
+         alter table public.orders replica identity full; \
+         insert into public.orders values (1, 1), (2, 2); \
+         create table public.order_doubles (id integer primary key, x numeric); \
+         create table public.reports (id integer primary key, oid integer); \
+         alter table public.reports replica identity full; \
+         insert into public.reports values (1, 1), (2, 2); \
+         create table public.report_view (id integer primary key, x numeric)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
+        &numeric_columns(&["id", "a"]),
+    )
+    .await
+    .expect("define order_doubles");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a to-one relationship on the live target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
+        &numeric_columns(&["id", "oid"]),
+    )
+    .await
+    .expect("define a consumer through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let projection_rows =
+        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
+    assert_eq!(
+        rows(&raw, &projection_rows).await,
+        BTreeMap::from([
+            ("1".to_string(), "2".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "precondition: the projection carries the target's column"
+    );
+
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause the target");
+
+    // While the target is paused: one order changes, one goes, one arrives.
+    raw.batch_execute(
+        "update public.orders set a = 100 where id = 1; \
+         delete from public.orders where id = 2; \
+         insert into public.orders values (3, 3)",
+    )
+    .await
+    .expect("change the source");
+    use trellis::staging::CdcOp;
+    stage_order_update(
+        &mut raw,
+        "1",
+        r#"{"id":"1","a":"1"}"#,
+        r#"{"id":"1","a":"100"}"#,
+    )
+    .await;
+    stage_cdc(
+        &mut raw,
+        "public.orders",
+        "2",
+        CdcOp::Delete,
+        Some(r#"{"id":"2","a":"2"}"#),
+        None,
+        None,
+    )
+    .await;
+    stage_cdc(
+        &mut raw,
+        "public.orders",
+        "3",
+        CdcOp::Insert,
+        None,
+        Some(r#"{"id":"3","a":"3"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    trellis
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume the target");
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    assert_eq!(
+        rows(&raw, &projection_rows).await,
+        BTreeMap::from([
+            ("1".to_string(), "200".to_string()),
+            ("3".to_string(), "6".to_string()),
+        ]),
+        "the projection follows the rebuilt target"
+    );
+
+    // New from-side rows resolve through the projection.
+    raw.batch_execute("insert into public.reports values (3, 3), (4, 1)")
+        .await
+        .expect("insert reports");
+    for (id, oid) in [("3", "3"), ("4", "1")] {
+        stage_cdc(
+            &mut raw,
+            "public.reports",
+            id,
+            CdcOp::Insert,
+            None,
+            Some(&format!(r#"{{"id":"{id}","oid":"{oid}"}}"#)),
+            Some(vec![oid.to_string()]),
+        )
+        .await;
+    }
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, coalesce(x::text, 'null') from public.report_view"
+        )
+        .await,
+        BTreeMap::from([
+            ("1".to_string(), "200".to_string()),
+            ("2".to_string(), "null".to_string()),
+            ("3".to_string(), "6".to_string()),
+            ("4".to_string(), "200".to_string()),
+        ]),
+        "every consumer row reads the rebuilt target"
+    );
+}
+
+/// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
+async fn chained_pair(db: &TestDatabase, raw: &mut Client) {
+    raw.batch_execute(
+        "create table public.src (id integer primary key, v numeric); \
+         insert into public.src values (1, 1), (2, 2); \
+         create table public.t (id integer primary key, doubled numeric); \
+         create table public.d (id integer primary key, doubled numeric)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.t FROM public.src SELECT v + v AS doubled",
+        &numeric_columns(&["id", "v"]),
+    )
+    .await
+    .expect("define t");
+    drain_to_quiescence(&db.pool, raw).await;
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.d FROM public.t SELECT doubled AS doubled",
+        &numeric_columns(&["id", "doubled"]),
+    )
+    .await
+    .expect("define d");
+    drain_to_quiescence(&db.pool, raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, raw).await;
+    assert_eq!(stored(raw, "t").await, "live", "precondition");
+    assert_eq!(stored(raw, "d").await, "live", "precondition");
+}
+
+/// Issue #497: a definition whose source is another definition's target
+/// reports `catching_up` while that upstream is paused and while it
+/// rebuilds after the resume, applying throughout, and reports `live` again
+/// once the upstream is `live` and its own catch-up has run.
+#[tokio::test]
+async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live() {
+    let (_cluster, db, mut raw) = setup().await;
+    chained_pair(&db, &mut raw).await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
+
+    trellis
+        .apply("PAUSE TRANSFORM t")
+        .await
+        .expect("pause the upstream");
+    assert_eq!(reported(&trellis, "t").await, TransformStatus::Paused);
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+    let listed: Vec<(String, TransformStatus)> = trellis
+        .definitions()
+        .await
+        .expect("list definitions")
+        .into_iter()
+        .map(|d| (d.target_table, d.status))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("public.t".to_string(), TransformStatus::Paused),
+            ("public.d".to_string(), TransformStatus::CatchingUp),
+        ],
+        "definitions() reports what status() does"
+    );
+
+    raw.execute("update public.src set v = 100 where id = 1", &[])
+        .await
+        .expect("update the source");
+    stage_cdc(
+        &mut raw,
+        "public.src",
+        "1",
+        trellis::staging::CdcOp::Update,
+        Some(r#"{"id":"1","v":"1"}"#),
+        Some(r#"{"id":"1","v":"100"}"#),
+        None,
+    )
+    .await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .expect("resume the upstream");
+    assert_eq!(
+        reported(&trellis, "t").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+
+    // The rebuild finishes: both are catching up, `t` on its own go-live
+    // catch-up and `d` on the one the rebuild parked for its readers.
+    publication::settle_builds(&db.pool).await;
+    assert_eq!(stored(&raw, "t").await, "catching_up");
+    assert_eq!(stored(&raw, "d").await, "catching_up");
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+
+    publication::discharge_registrations(&db.pool)
+        .await
+        .expect("discharge the catch-ups");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
+    assert_eq!(
+        rows(&raw, "select id::text, doubled::text from public.d").await,
+        BTreeMap::from([
+            ("1".to_string(), "200".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "d follows the rebuilt upstream"
+    );
+}
+
+/// Issue #497: a `live` reader of an upstream that is catching up (here on a
+/// resumed column's catch-up) reports `catching_up` though nothing was parked
+/// for the reader itself, and `live` once the upstream's catch-up discharges.
+#[tokio::test]
+async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
+    let (_cluster, db, mut raw) = setup().await;
+    chained_pair(&db, &mut raw).await;
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+
+    raw.batch_execute(
+        "insert into column_status (transform_table, column_name, last_error, local_fuse) \
+         values ('t', 'doubled', 'synthetic pause', true)",
+    )
+    .await
+    .expect("pause t.doubled");
+    quarantine::resume_column(&db.pool, "t", "doubled")
+        .await
+        .expect("resume t.doubled");
+    assert_eq!(stored(&raw, "t").await, "catching_up");
+    assert_eq!(stored(&raw, "d").await, "live", "nothing was parked for d");
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+
+    publication::run_pending_backfills(
+        &mut raw,
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("discharge t's catch-up");
+    assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);
+    assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
 }
