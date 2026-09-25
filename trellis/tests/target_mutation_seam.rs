@@ -766,3 +766,132 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
         .get(0);
     assert_eq!(wrong, 0, "d follows every resumed row");
 }
+
+/// A resumed definition's rebuild writes its target outside the seam, and
+/// the target's readers have to hear of what it changed. A relationship
+/// declared on the target while it was `live` survives a pause, and a
+/// consumer reading through it doesn't read the target's table as its
+/// source, so the rebuild's go-live catch-up for readers
+/// (`park_target_catchup_if_read`) doesn't cover it. A source change made
+/// during the pause reaches the target through the rebuild, but never the
+/// consumer.
+#[tokio::test]
+#[ignore = "known gap found reviewing #434: a resumed target's rebuild never reaches a relationship consumer"]
+async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a numeric); \
+         alter table public.orders replica identity full; \
+         insert into public.orders values (1, 1), (2, 2); \
+         create table public.order_doubles (id integer primary key, x numeric); \
+         create table public.reports (id integer primary key, oid integer); \
+         alter table public.reports replica identity full; \
+         insert into public.reports values (1, 1); \
+         create table public.report_view (id integer primary key, x numeric)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
+        &numeric_columns(&["id", "a"]),
+    )
+    .await
+    .expect("define order_doubles");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a relationship on the live target");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.report_view FROM public.reports SELECT rollup.x AS x",
+        &numeric_columns(&["id", "oid"]),
+    )
+    .await
+    .expect("define a consumer through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select id::text, x::text from public.report_view").await,
+        BTreeMap::from([("1".to_string(), "2".to_string())]),
+        "precondition: the consumer reads the target through the relationship"
+    );
+
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause the target");
+
+    // A source change while the target is paused, staged as intake would. Its
+    // apply skips the frozen target, and the rebuild picks it up.
+    raw.execute("update public.orders set a = 100 where id = 1", &[])
+        .await
+        .expect("update the source");
+    let txn = raw.transaction().await.expect("begin");
+    append(
+        &txn,
+        &[StagedChange::Cdc {
+            src_table: "public.orders".to_string(),
+            key: "1".to_string(),
+            op: trellis::staging::CdcOp::Update,
+            lsn: Some(tokio_postgres::types::PgLsn::from(1)),
+            old_image: Some(r#"{"id":"1","a":"1"}"#.to_string()),
+            new_image: Some(r#"{"id":"1","a":"100"}"#.to_string()),
+            origin_lsn: None,
+            src_changed: None,
+            hop_gen: 0,
+            group_key: None,
+        }],
+    )
+    .await
+    .expect("stage the source update");
+    txn.commit().await.expect("commit");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    trellis
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume the target");
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+
+    let status: String = raw
+        .query_one(
+            "select status from transform_definitions where target_table = 'public.order_doubles'",
+            &[],
+        )
+        .await
+        .expect("read status")
+        .get(0);
+    assert_eq!(status, "live", "precondition: the rebuild went live");
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, x::text from public.order_doubles order by id"
+        )
+        .await,
+        BTreeMap::from([
+            ("1".to_string(), "200".to_string()),
+            ("2".to_string(), "4".to_string()),
+        ]),
+        "precondition: the rebuild read the change"
+    );
+    assert_eq!(
+        rows(&raw, "select id::text, x::text from public.report_view").await,
+        BTreeMap::from([("1".to_string(), "200".to_string())]),
+        "the rebuild's change to the target must reach the relationship consumer"
+    );
+}

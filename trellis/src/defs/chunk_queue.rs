@@ -1754,4 +1754,78 @@ mod tests {
             "a write after the resume is fenced out"
         );
     }
+
+    /// Issue #434: a write that reaches its fence while a resume holds the
+    /// chunk's row waits for the resume to commit, and then sees it. The
+    /// staleness check is a statement of its own for exactly this: in the
+    /// locking statement, the lock wait would re-check only the chunk row,
+    /// against a definition row read before the resume committed.
+    ///
+    /// The real resume is held after it has locked the chunk (at its marker
+    /// park, behind a table lock the test holds), so the fence arrives while
+    /// the chunk's row is locked, not before or after.
+    #[tokio::test]
+    async fn a_fence_that_waited_out_a_resume_sees_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        pause_transform(&pool, "order_doubles")
+            .await
+            .expect("pause");
+
+        let mut blocker = pool.get().await.expect("blocker connection");
+        let blocking = blocker.transaction().await.expect("begin");
+        blocking
+            .batch_execute("lock table pending_backfill in exclusive mode")
+            .await
+            .expect("hold the resume at its marker park");
+        let resuming = tokio::spawn({
+            let pool = pool.clone();
+            async move { resume_transform(&pool, "order_doubles").await }
+        });
+        let wait_for_lock_waiters = async |n: i64| {
+            for _ in 0..500 {
+                let waiting: i64 = raw
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where datname = current_database() and wait_event_type = 'Lock'",
+                        &[],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting == n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("never saw {n} lock waiters");
+        };
+        wait_for_lock_waiters(1).await;
+        let fenced = tokio::spawn({
+            let pool = pool.clone();
+            let chunk_id = held[0].id;
+            async move {
+                let mut client = pool.get().await.expect("connection");
+                let txn = client.transaction().await.expect("begin");
+                let fence = ClaimFence {
+                    chunk_id,
+                    claimed_by: WORKER,
+                };
+                fence.hold(&*txn).await.expect("hold")
+            }
+        });
+        wait_for_lock_waiters(2).await;
+
+        blocking.commit().await.expect("release the resume");
+        resuming.await.expect("join").expect("resume");
+        assert!(
+            !fenced.await.expect("join"),
+            "a fence that waited for the resume's lock sees the resume"
+        );
+    }
 }

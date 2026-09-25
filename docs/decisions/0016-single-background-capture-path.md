@@ -209,6 +209,12 @@ The cost is that a resume waits for the definition's in-flight chunk writes:
 one chunk's statement, or one statement of a direct build. `for key share`
 doesn't block the heartbeat's refresh of `claimed_at`. The stale-claim sweep
 skips a chunk whose write is in flight, as it already skipped any locked row.
+Those waits are bounded by the write only while its worker keeps running. A
+worker that stalls inside a fenced transaction (a frozen process, or a network
+partition the server hasn't noticed yet) holds the chunk's lock until its
+session ends, and no timeout bounds that: the resume waits, and the sweep
+can't reclaim the chunk. An unfenced write committed on its own, so the same
+stall used to hold nothing.
 
 The fence replaced repairing a late write after the fact. #360 had the discard
 park a catch-up on the chunk's source. That catch-up repaired the target
