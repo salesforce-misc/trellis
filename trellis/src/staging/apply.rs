@@ -1352,6 +1352,10 @@ pub(crate) struct ReverseRelationshipShape {
     /// relationship changes in the same batch. Empty whenever
     /// `group_by_columns` is.
     group_by_siblings: Vec<GroupBySibling>,
+    /// Set when the relationship's to-side is one of this instance's own
+    /// targets, fed to this reverse path by the target-mutation seam (issue
+    /// #507, [`to_side_superseded`]).
+    seam_fed_to_side: Option<SeamFedToSide>,
 }
 
 /// One other to-one relationship a [`ReverseRelationshipShape`]'s fallback
@@ -1367,6 +1371,17 @@ struct GroupBySibling {
     to_col_pg_type: Option<String>,
     /// The to-side columns some aggregate groups by.
     columns: Vec<String>,
+}
+
+/// A relationship to-side that is one of this instance's own targets (issue
+/// #507): what Phase 3 needs to read its live row by key.
+#[derive(Debug)]
+struct SeamFedToSide {
+    /// The to-side table, quoted and qualified for direct interpolation.
+    table: String,
+    /// `to_col`'s type ([`key_column_pg_type`]), so the lookup by key can
+    /// use the to-side's own unique index on it.
+    key_pg_type: Option<String>,
 }
 
 /// One aggregate target's issue #131 fast-path shape: everything needed to
@@ -1856,6 +1871,19 @@ async fn build_reverse_relationship_shape(
 
     let (group_by_columns, group_by_siblings) =
         group_by_relationships(pool, rel, &qualified_from_table, &defs).await?;
+    let qualified_to_table = rel.qualified_to_table();
+    let to_side_is_target = {
+        let client = pool.get().await?;
+        catalog::is_definition_target(&**client, &qualified_to_table).await?
+    };
+    let seam_fed_to_side = if to_side_is_target {
+        let table = ddl::qualified_source_table(&qualified_to_table);
+        let key_pg_type = key_column_pg_type(pool, &table, &rel.def.to_col).await?;
+        Some(SeamFedToSide { table, key_pg_type })
+    } else {
+        None
+    };
+
     Ok(ReverseRelationshipShape {
         id: rel.id,
         name: rel.def.name.clone(),
@@ -1870,6 +1898,7 @@ async fn build_reverse_relationship_shape(
         needs_recompute_fallback,
         group_by_columns,
         group_by_siblings,
+        seam_fed_to_side,
     })
 }
 
@@ -3119,6 +3148,169 @@ async fn apply_projection_advance(
         update_sets = update_sets.join(", "),
     );
     txn.execute(&sql, &[&new_image, &lsn]).await?;
+    Ok(())
+}
+
+/// Issue #507: whether a reverse record on a seam-fed to-side (one of this
+/// instance's own targets) carries images its to-side has since moved past
+/// by a write that no later seam row will bring: the live row for its new
+/// key no longer equals its new image, or a row it deleted (or moved off
+/// `old_key`) is back.
+///
+/// A source to-side is fed by CDC, which carries every write, so its last
+/// image for a key is always the key's latest state and the projection
+/// follows its images. A target to-side is fed by the target-mutation seam,
+/// which a resumed definition's rebuild bypasses. That rebuild's changes
+/// reach the projection through its go-live catch-up instead
+/// (`catalog::refresh_relationship_projections_in_txn`), and a seam row
+/// staged before the rebuild but drained after that refresh would put the
+/// pre-rebuild image back, with nothing after it to correct it. So a record
+/// whose images the live row contradicts writes the projection from the live
+/// row ([`apply_projection_from_live`]) and re-derives its from-side rows
+/// with the image-less fallback, never a delta from images that no longer
+/// hold. A record that merely lags a newer seam write to the same key (both
+/// rows pending in different segments) lands here too. That is correct as
+/// well, since the newer row finds the projection already at its image, but
+/// it costs an aggregate consumer the delta fast path for that record. Only
+/// a to-side that is one of this instance's targets pays the extra keyed
+/// read.
+async fn to_side_superseded(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    to_side: &SeamFedToSide,
+    to_side_columns: &[String],
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    new_image: Option<&str>,
+) -> Result<bool, ApplyError> {
+    let key_ident = quote_ident(&shape.to_col);
+    let filter = match &to_side.key_pg_type {
+        Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
+        None => format!("t.{key_ident}::text = $1"),
+    };
+    let doc = row_as_text_jsonb_sql("t", to_side_columns);
+    let sql = format!(
+        "select ({doc}) is not distinct from $2::text::jsonb from {} t where {filter}",
+        to_side.table
+    );
+    // The live row for `key` equals `image`, or is absent when `image` is.
+    let holds = async |key: &str, image: Option<&str>| -> Result<bool, ApplyError> {
+        let row = txn.query_opt(&sql, &[&key, &image]).await?;
+        Ok(match row {
+            Some(row) => image.is_some() && row.get::<_, bool>(0),
+            None => image.is_none(),
+        })
+    };
+    if let Some(key) = new_key.as_deref()
+        && !holds(key, new_image).await?
+    {
+        return Ok(true);
+    }
+    if let Some(key) = old_key.as_deref()
+        && new_key.as_deref() != Some(key)
+        && !holds(key, None).await?
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `record`'s seam-fed to-side when [`to_side_superseded`] finds its images
+/// stale, else `None` (always `None` for a to-side that isn't a target).
+async fn superseded_to_side<'r>(
+    txn: &Transaction<'_>,
+    row_columns_cache: &mut HashMap<String, Vec<String>>,
+    record: &'r RelationshipReverseRecord,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+) -> Result<Option<&'r SeamFedToSide>, ApplyError> {
+    let Some(to_side) = &record.shape.seam_fed_to_side else {
+        return Ok(None);
+    };
+    let columns = cached_row_columns(txn, row_columns_cache, &to_side.table)
+        .await?
+        .to_vec();
+    let stale = to_side_superseded(
+        txn,
+        &record.shape,
+        to_side,
+        &columns,
+        old_key,
+        new_key,
+        record.new_image.as_deref(),
+    )
+    .await?;
+    Ok(stale.then_some(to_side))
+}
+
+/// [`apply_projection_advance`] for a record [`to_side_superseded`] found
+/// stale: writes the projection row of each of `old_key`/`new_key` from the
+/// live to-side row instead of the record's image, deleting it where the
+/// to-side has no row. Moves [`ddl::PROJECTION_LSN_COLUMN`] to `lsn` exactly
+/// as the image advance would, and never touches
+/// [`ddl::PROJECTION_GEN_COLUMN`].
+async fn apply_projection_from_live(
+    txn: &Transaction<'_>,
+    shape: &ReverseRelationshipShape,
+    to_side: &SeamFedToSide,
+    old_key: &Option<String>,
+    new_key: &Option<String>,
+    lsn: Option<PgLsn>,
+) -> Result<(), ApplyError> {
+    if shape.qualified_projection.is_empty() {
+        return Ok(());
+    }
+    let key_ident = quote_ident(&shape.to_col);
+    let filter = match &to_side.key_pg_type {
+        Some(ty) => format!("t.{key_ident} = $1::text::{ty}"),
+        None => format!("t.{key_ident}::text = $1"),
+    };
+    let data_columns = projection_data_columns(
+        txn,
+        &shape.projection_schema,
+        &shape.projection_table_bare,
+        &shape.to_col,
+    )
+    .await?;
+    let gen_ident = quote_ident(ddl::PROJECTION_GEN_COLUMN);
+    let lsn_ident = quote_ident(ddl::PROJECTION_LSN_COLUMN);
+    let mut insert_cols = vec![key_ident.clone()];
+    let mut select_exprs = vec![format!("t.{key_ident}")];
+    let mut update_sets = Vec::new();
+    for col in &data_columns {
+        let ident = quote_ident(col);
+        insert_cols.push(ident.clone());
+        select_exprs.push(format!("t.{ident}"));
+        update_sets.push(format!("{ident} = excluded.{ident}"));
+    }
+    insert_cols.push(gen_ident);
+    select_exprs.push("0".to_string());
+    insert_cols.push(lsn_ident.clone());
+    select_exprs.push("$2::pg_lsn".to_string());
+    update_sets.push(format!("{lsn_ident} = excluded.{lsn_ident}"));
+    let delete = format!(
+        "delete from {proj} p where p.{key_ident}::text = $1 \
+         and not exists (select 1 from {to_table} t where {filter})",
+        proj = shape.qualified_projection,
+        to_table = to_side.table,
+    );
+    let upsert = format!(
+        "insert into {proj} ({insert_cols}) \
+         select {select_exprs} from {to_table} t where {filter} \
+         on conflict ({key_ident}) do update set {update_sets}",
+        proj = shape.qualified_projection,
+        to_table = to_side.table,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        update_sets = update_sets.join(", "),
+    );
+    let mut keys: Vec<&str> = old_key.iter().chain(new_key).map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        txn.execute(&delete, &[&key]).await?;
+        txn.execute(&upsert, &[&key, &lsn]).await?;
+    }
     Ok(())
 }
 
@@ -7434,15 +7626,27 @@ pub async fn apply_and_mark_drained_many(
                     &row_columns,
                 )
                 .await?;
-                apply_projection_advance(
-                    txn,
-                    shape,
-                    &old_key,
-                    &new_key,
-                    record.new_image.as_deref(),
-                    record.lsn,
-                )
-                .await?;
+                match superseded_to_side(txn, &mut row_columns_cache, record, &old_key, &new_key)
+                    .await?
+                {
+                    Some(to_side) => {
+                        apply_projection_from_live(
+                            txn, shape, to_side, &old_key, &new_key, record.lsn,
+                        )
+                        .await?
+                    }
+                    None => {
+                        apply_projection_advance(
+                            txn,
+                            shape,
+                            &old_key,
+                            &new_key,
+                            record.new_image.as_deref(),
+                            record.lsn,
+                        )
+                        .await?
+                    }
+                }
                 continue;
             }
 
@@ -7547,7 +7751,13 @@ pub async fn apply_and_mark_drained_many(
         {
             fast_path_keys.push(k);
         }
-        let fast_path_safe = record.retry_count == 0
+        // Issue #507: a record whose images a seam-fed to-side has moved
+        // past (see `to_side_superseded`) takes the fallback, and the
+        // projection follows the live row.
+        let superseded =
+            superseded_to_side(txn, &mut row_columns_cache, record, &old_key, &new_key).await?;
+        let fast_path_safe = superseded.is_none()
+            && record.retry_count == 0
             && relationship_fast_path_precondition_holds(
                 txn,
                 &shape.from_table,
@@ -7766,15 +7976,23 @@ pub async fn apply_and_mark_drained_many(
         // step 3c's forward `__trellis_gen` bump above (never touched
         // here; see `apply_projection_advance`'s doc comment for the
         // distinction).
-        apply_projection_advance(
-            txn,
-            shape,
-            &old_key,
-            &new_key,
-            record.new_image.as_deref(),
-            record.lsn,
-        )
-        .await?;
+        match superseded {
+            Some(to_side) => {
+                apply_projection_from_live(txn, shape, to_side, &old_key, &new_key, record.lsn)
+                    .await?
+            }
+            None => {
+                apply_projection_advance(
+                    txn,
+                    shape,
+                    &old_key,
+                    &new_key,
+                    record.new_image.as_deref(),
+                    record.lsn,
+                )
+                .await?
+            }
+        }
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging

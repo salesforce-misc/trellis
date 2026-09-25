@@ -30,7 +30,7 @@ async fn migrate_up_is_idempotent() {
         first_run,
         vec![
             1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
-            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48
+            27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46, 47, 48, 49
         ],
         // Issue #73 added V22 (drops `column_status`'s now-unenforceable
         // `target_table` foreign key). Its reviewer follow-up added V23
@@ -106,8 +106,9 @@ async fn migrate_up_is_idempotent() {
         // fences the marker). Issue #372 added V46 (`relationship_definitions
         // .to_schema`, the to-side's resolved schema). Issue #476 added V47
         // (the `catching_up` transform status). Issues #468/#485 added V48
-        // (drops V18's `backfill_coverage`).
-        "expected exactly V1 through V7, V9 through V24, V26 through V40, and V42 through V48 to be applied"
+        // (drops V18's `backfill_coverage`). Issue #507 added V49
+        // (`pending_backfill.refresh_projections`).
+        "expected exactly V1 through V7, V9 through V24, V26 through V40, and V42 through V49 to be applied"
     );
 
     // Running again should be a no-op: same ledger, no error.

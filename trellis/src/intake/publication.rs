@@ -223,9 +223,10 @@ pub(crate) async fn park_registration_markers(
 /// from-side row joined to one. A target that is a relationship's to-side
 /// gets the marker even with no reader yet, because its discharge also
 /// refreshes the relationship's settled projection
-/// ([`crate::defs::catalog::refresh_relationship_projections_in_txn`]),
-/// which a later consumer would otherwise read stale. A no-op for a target
-/// that is neither read nor a to-side.
+/// ([`crate::defs::catalog::refresh_relationship_projections_in_txn`], asked
+/// for by [`request_projection_refresh`]), which a later consumer would
+/// otherwise read stale. A no-op for a target that is neither read nor a
+/// to-side.
 pub(crate) async fn park_target_catchup_if_read(
     client: &impl GenericClient,
     definition_id: i64,
@@ -238,7 +239,29 @@ pub(crate) async fn park_target_catchup_if_read(
         .await?
         .get(0);
     let (readers, tables) = target_catchups(client, std::slice::from_ref(&target)).await?;
-    park_catch_up(client, &readers, &tables).await
+    park_catch_up(client, &readers, &tables).await?;
+    request_projection_refresh(client, &tables).await
+}
+
+/// Asks the discharge of each of `tables`' markers, just parked by this
+/// transaction, to refresh the relationship projections on it
+/// (`pending_backfill.refresh_projections`, issue #507): each is a target a
+/// rebuild rewrote outside the seam. The markers are already locked by the
+/// park, so this takes no new lock.
+async fn request_projection_refresh(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<(), IntakeError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    client
+        .execute(
+            "update pending_backfill set refresh_projections = true where table_name = any($1)",
+            &[&tables],
+        )
+        .await?;
+    Ok(())
 }
 
 /// The catch-ups [`park_target_catchup_if_read`] parks for `targets`: every
@@ -554,6 +577,9 @@ struct PendingBackfill {
     /// Whether the backoff after the last failure has run out
     /// (`next_attempt_at`, read against the database's clock).
     due: bool,
+    /// Whether the discharge refreshes the relationship projections on
+    /// `table` ([`request_projection_refresh`], issue #507).
+    refresh_projections: bool,
 }
 
 /// Reads every marker, in the order they were parked (issue #457): a pass
@@ -565,7 +591,7 @@ async fn fetch_pending_backfills(
     let rows = client
         .query(
             "select table_name, fence_xid::text::bigint, generation, attempts, \
-                    coalesce(next_attempt_at <= now(), true) \
+                    coalesce(next_attempt_at <= now(), true), refresh_projections \
              from pending_backfill order by generation",
             &[],
         )
@@ -578,6 +604,7 @@ async fn fetch_pending_backfills(
             generation: r.get(2),
             attempts: r.get(3),
             due: r.get(4),
+            refresh_projections: r.get(5),
         })
         .collect())
 }
@@ -1350,10 +1377,13 @@ async fn discharge_marker(
     }
     let swept = sweep.finish(&txn).await?;
     // Issue #507: a target's rebuild wrote it outside the seam, so no seam
-    // row carried its changes into a relationship's settled projection. A
-    // marker on a target is always a catch-up for what such a write left
-    // out, and otherwise the refresh finds nothing to change.
-    if crate::defs::catalog::is_definition_target(&txn, &marker.table).await? {
+    // row carried its changes into a relationship's settled projection. Only
+    // the catch-up parked for such a rewrite asks for the refresh: it diffs
+    // the whole target, and every other write reaches the projection
+    // through the seam.
+    if marker.refresh_projections
+        && crate::defs::catalog::is_definition_target(&txn, &marker.table).await?
+    {
         let refreshed =
             crate::defs::catalog::refresh_relationship_projections_in_txn(&txn, &marker.table)
                 .await?;
@@ -1527,7 +1557,7 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    let (readers, mut tables) = target_catchups(txn, &targets).await?;
+    let (readers, rewritten) = target_catchups(txn, &targets).await?;
     let chained_sources: Vec<String> = txn
         .query(
             "select d.source_table from transform_definitions d \
@@ -1538,8 +1568,10 @@ async fn go_live(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), IntakeError> 
         .into_iter()
         .map(|row| row.get(0))
         .collect();
+    let mut tables = rewritten.clone();
     tables.extend(chained_sources);
-    park_catch_up(txn, &readers, &tables).await
+    park_catch_up(txn, &readers, &tables).await?;
+    request_projection_refresh(txn, &rewritten).await
 }
 
 /// Flips each of `candidates` (every `catching_up` definition that reads

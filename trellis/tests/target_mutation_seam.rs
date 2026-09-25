@@ -1293,3 +1293,353 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_catches_up() {
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);
     assert_eq!(reported(&trellis, "d").await, TransformStatus::Live);
 }
+
+/// Seals the active segment and drains every sealed one, once: the seam
+/// rows the drain itself stages stay in the new active segment.
+async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
+    let watermark = StagedWatermark::saturated();
+    trellis::staging::seal_if_active_nonempty(client, WAKE)
+        .await
+        .expect("seal");
+    while let Some(seg) = apply::next_claimable_segment(&*client)
+        .await
+        .expect("next claimable segment")
+    {
+        apply::drain_once(pool, seg, "seam_test", 1, WAKE, &watermark)
+            .await
+            .expect("drain_once");
+    }
+    retire_drained_segments(client)
+        .await
+        .expect("retire drained segments");
+}
+
+/// The consumer [`stale_seam_rows_drain_after_a_rebuilds_refresh`] puts on
+/// the relationship.
+enum Consumer {
+    /// `report_view`, one row per report: the image-less recompute path.
+    OneToOne,
+    /// `report_totals`, a `SUM` over it: the reverse-delta fast path.
+    Aggregate,
+}
+
+/// Issue #507: seam rows for a target staged before its pause (an update and
+/// a delete) are still undrained when the rebuild's go-live catch-up
+/// refreshes the relationship's projection, and drain after it. Their images
+/// predate the rebuild, so neither may put its value back: the projection
+/// and the consumer end at the rebuilt target.
+///
+/// With `stale_last`, the stale rows drain only after everything the
+/// catch-up staged has (its enumeration, and the recomputes that fans out
+/// to), as they can when a drain worker finishes a later segment first or
+/// the rows were deferred and re-staged: they land on a consumer already
+/// re-derived from the refreshed projection. The test stages them again at
+/// their original write token once the rest is quiescent.
+async fn stale_seam_rows_drain_after_a_rebuilds_refresh(consumer: Consumer, stale_last: bool) {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a numeric); \
+         alter table public.orders replica identity full; \
+         insert into public.orders values (1, 1), (2, 2); \
+         create table public.order_doubles (id integer primary key, x numeric); \
+         create table public.reports (id integer primary key, oid integer, grp integer); \
+         alter table public.reports replica identity full; \
+         insert into public.reports values (1, 1, 1), (2, 2, 1)",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
+        &numeric_columns(&["id", "a"]),
+    )
+    .await
+    .expect("define order_doubles");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a to-one relationship on the live target");
+    let (text, consumer_rows) = match consumer {
+        Consumer::OneToOne => (
+            "TRANSFORM report_view FROM reports SELECT rollup.x AS x",
+            "select id::text, coalesce(x::text, 'null') from public.report_view",
+        ),
+        Consumer::Aggregate => (
+            "TRANSFORM report_totals FROM reports GROUP BY grp SELECT SUM(rollup.x) AS total",
+            "select grp::text, total::text from public.report_totals",
+        ),
+    };
+    install_definition(
+        &db.pool,
+        text,
+        &numeric_columns(&["id", "oid", "grp"]),
+        "public",
+    )
+    .await
+    .expect("define a consumer through the relationship");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    let projection_rows =
+        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
+    let expected_consumer = |one: &str, two: &str, total: &str| match consumer {
+        Consumer::OneToOne => BTreeMap::from([
+            ("1".to_string(), one.to_string()),
+            ("2".to_string(), two.to_string()),
+        ]),
+        Consumer::Aggregate => BTreeMap::from([("1".to_string(), total.to_string())]),
+    };
+    assert_eq!(
+        rows(&raw, consumer_rows).await,
+        expected_consumer("2", "4", "6"),
+        "precondition: the consumer reads the target through the relationship"
+    );
+
+    // Two live writes to the target, whose seam rows then sit in a sealed
+    // segment nothing drains until the end.
+    raw.batch_execute(
+        "update public.orders set a = 5 where id = 1; delete from public.orders where id = 2",
+    )
+    .await
+    .expect("change the source");
+    use trellis::staging::CdcOp;
+    stage_order_update(
+        &mut raw,
+        "1",
+        r#"{"id":"1","a":"1"}"#,
+        r#"{"id":"1","a":"5"}"#,
+    )
+    .await;
+    stage_cdc(
+        &mut raw,
+        "public.orders",
+        "2",
+        CdcOp::Delete,
+        Some(r#"{"id":"2","a":"2"}"#),
+        None,
+        None,
+    )
+    .await;
+    seal_and_drain_once(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, "select id::text, x::text from public.order_doubles").await,
+        BTreeMap::from([("1".to_string(), "10".to_string())]),
+        "precondition: the target took both writes"
+    );
+    // What the seam staged for the two writes, to replay for `stale_last`.
+    let stale_rows: Vec<StagedChange> = if stale_last {
+        let slot: i16 = raw
+            .query_one("select ring_slot from segment_pointer", &[])
+            .await
+            .expect("read segment_pointer")
+            .get(0);
+        let rows = raw
+            .query(
+                &format!(
+                    "select key, op::text, lsn, old_image::text, new_image::text from seg_{slot} \
+                     where src_table = 'public.order_doubles' order by key"
+                ),
+                &[],
+            )
+            .await
+            .expect("read the seam rows");
+        assert_eq!(rows.len(), 2, "precondition: one seam row per write");
+        rows.into_iter()
+            .map(|row| StagedChange::Cdc {
+                src_table: "public.order_doubles".to_string(),
+                key: row.get(0),
+                op: match row.get::<_, String>(1).as_str() {
+                    "update" => CdcOp::Update,
+                    "delete" => CdcOp::Delete,
+                    other => panic!("unexpected seam op {other}"),
+                },
+                lsn: row.get(2),
+                old_image: row.get(3),
+                new_image: row.get(4),
+                origin_lsn: None,
+                src_changed: None,
+                hop_gen: 0,
+                group_key: None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if stale_last {
+        drain_to_quiescence(&db.pool, &mut raw).await;
+    } else {
+        trellis::staging::seal_if_active_nonempty(&mut raw, WAKE)
+            .await
+            .expect("seal the seam rows, undrained");
+    }
+
+    // Paused, the source moves on; the rebuild writes the target outside the
+    // seam, and its catch-up refreshes the projection.
+    let trellis = trellis::Trellis::connect(
+        trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis");
+    trellis
+        .apply("PAUSE TRANSFORM order_doubles")
+        .await
+        .expect("pause the target");
+    raw.batch_execute(
+        "update public.orders set a = 7 where id = 1; insert into public.orders values (2, 8)",
+    )
+    .await
+    .expect("change the source while paused");
+    trellis
+        .apply("RESUME TRANSFORM order_doubles")
+        .await
+        .expect("resume the target");
+    publication::settle_registrations(&db.pool).await;
+    let rebuilt = BTreeMap::from([
+        ("1".to_string(), "14".to_string()),
+        ("2".to_string(), "16".to_string()),
+    ]);
+    assert_eq!(
+        rows(&raw, "select id::text, x::text from public.order_doubles").await,
+        rebuilt,
+        "precondition: the rebuild read the paused changes"
+    );
+    assert_eq!(
+        rows(&raw, &projection_rows).await,
+        rebuilt,
+        "precondition: the catch-up refreshed the projection"
+    );
+
+    // The pre-pause seam rows drain now, after the refresh.
+    if stale_last {
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        publication::settle_registrations(&db.pool).await;
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        assert_eq!(
+            rows(&raw, consumer_rows).await,
+            expected_consumer("14", "16", "30"),
+            "precondition: the consumer was re-derived from the refreshed projection"
+        );
+        let txn = raw.transaction().await.expect("begin");
+        append(&txn, &stale_rows)
+            .await
+            .expect("stage the stale seam rows again");
+        txn.commit().await.expect("commit");
+    }
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, &projection_rows).await,
+        rebuilt,
+        "a seam row older than the rebuild must not put its image back"
+    );
+    assert_eq!(
+        rows(&raw, consumer_rows).await,
+        expected_consumer("14", "16", "30"),
+        "the consumer follows the rebuilt target"
+    );
+}
+
+#[tokio::test]
+async fn stale_seam_rows_after_a_rebuilds_refresh_leave_a_to_one_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, false).await;
+}
+
+#[tokio::test]
+async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, false).await;
+}
+
+#[tokio::test]
+async fn stale_seam_rows_drained_last_leave_a_to_one_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::OneToOne, true).await;
+}
+
+#[tokio::test]
+async fn stale_seam_rows_drained_last_leave_an_aggregate_consumer_correct() {
+    stale_seam_rows_drain_after_a_rebuilds_refresh(Consumer::Aggregate, true).await;
+}
+
+/// Issue #507: the projection refresh diffs the whole target, so only a
+/// catch-up parked for a rewrite outside the seam asks for it
+/// (`pending_backfill.refresh_projections`). Any other marker on the target
+/// leaves the projection alone: here one the refresh would visibly repair.
+#[tokio::test]
+async fn only_a_rewrites_catch_up_refreshes_the_projection() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, a numeric); \
+         insert into public.orders values (1, 1); \
+         create table public.order_doubles (id integer primary key, x numeric); \
+         create table public.reports (id integer primary key, oid integer); \
+         alter table public.reports replica identity full",
+    )
+    .await
+    .expect("create tables");
+    create_definition(
+        &db.pool,
+        "TRANSFORM public.order_doubles FROM public.orders SELECT a + a AS x",
+        &numeric_columns(&["id", "a"]),
+    )
+    .await
+    .expect("define order_doubles");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    publication::settle_registrations(&db.pool).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP rollup FROM reports.oid TO order_doubles.id",
+    )
+    .await
+    .expect("a to-one relationship on the live target");
+    let projection: String = raw
+        .query_one("select projection_table from relationship_projections", &[])
+        .await
+        .expect("the relationship's projection")
+        .get(0);
+    raw.batch_execute(&format!(
+        "alter table {DEFAULT_SCHEMA}.\"{projection}\" add column x numeric; \
+         update {DEFAULT_SCHEMA}.\"{projection}\" set x = 999"
+    ))
+    .await
+    .expect("put a value in the projection only a refresh would repair");
+    let projection_rows =
+        format!("select id::text, x::text from {DEFAULT_SCHEMA}.\"{projection}\" order by id");
+
+    for (refresh, expected) in [(false, "999"), (true, "2")] {
+        raw.execute(
+            "insert into pending_backfill (table_name, refresh_projections) \
+             values ('public.order_doubles', $1)",
+            &[&refresh],
+        )
+        .await
+        .expect("park a marker on the target");
+        publication::run_pending_backfills(
+            &mut raw,
+            WAKE,
+            &StagedWatermark::saturated(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("discharge it");
+        assert_eq!(
+            rows(&raw, "select count(*)::text, '' from pending_backfill").await,
+            BTreeMap::from([("0".to_string(), String::new())]),
+            "precondition: the marker discharged"
+        );
+        assert_eq!(
+            rows(&raw, &projection_rows).await,
+            BTreeMap::from([("1".to_string(), expected.to_string())]),
+            "refresh_projections = {refresh}"
+        );
+    }
+}

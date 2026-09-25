@@ -114,8 +114,13 @@ rebuild. Its catch-up (`intake::publication::park_target_catchup_if_read`,
 #507) covers it instead. The discharge refreshes every to-one projection on
 the target from the rebuilt rows (`catalog::refresh_relationship_projections_in_txn`)
 and enumerates the target, so reverse propagation re-derives each consumer.
-Pinned: `a_resumed_targets_rebuild_reaches_a_relationship_consumer` and
-`a_resumed_targets_rebuild_refreshes_a_to_one_projection`
+A seam row staged before the rebuild and drained after the refresh carries a
+pre-rebuild image, so apply checks a target to-side's reverse records against
+the live row and follows the live row when they disagree
+(`apply::to_side_superseded`).
+Pinned: `a_resumed_targets_rebuild_reaches_a_relationship_consumer`,
+`a_resumed_targets_rebuild_refreshes_a_to_one_projection`, the four
+`stale_seam_rows_*` tests and `only_a_rewrites_catch_up_refreshes_the_projection`
 (`target_mutation_seam.rs`).
 
 ## Known gaps

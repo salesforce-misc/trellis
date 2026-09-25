@@ -473,8 +473,17 @@ when the target is a relationship's to-side. The discharge of that marker:
   in the discharge's own transaction (`refresh_relationship_projections_in_txn`):
   it deletes, rewrites or inserts each projection row that differs. A 1-1
   consumer reads the projection, never the target, so the re-derive above
-  would otherwise reproduce the stale value. The refresh runs for every
-  marker on a target; one the seam kept in step has nothing to change.
+  would otherwise reproduce the stale value. It diffs the whole target (about
+  0.7 s for a 1M-row target, on the sealer), so only a marker parked for such
+  a rewrite asks for it (`pending_backfill.refresh_projections`); every other
+  write reaches the projection through the seam.
+- **Keeps older seam rows from undoing the refresh.** A seam row staged before
+  the rebuild can still be pending when the refresh runs, and its image
+  predates what the rebuild wrote. For a to-side that is one of this
+  instance's targets, apply compares each reverse record's images with the
+  live row; when they disagree it writes the projection from the live row and
+  re-derives the from-side rows by the image-less fallback rather than a
+  delta (`staging::apply::to_side_superseded`).
 
 Considered and rejected: routing rebuild writes through the seam (every
 rebuild would pay full per-row reverse propagation), and rebuilding every

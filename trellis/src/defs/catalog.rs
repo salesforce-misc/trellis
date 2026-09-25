@@ -4797,8 +4797,11 @@ async fn ensure_relationship_projection_in_txn(
 /// key it lacks, seeded as [`ensure_relationship_projection_in_txn`] seeds
 /// one. Returns how many projection rows it changed.
 ///
-/// The catch-up discharge runs this for a marker on another definition's
-/// target (`intake::publication::discharge_marker`). Every write to a target
+/// The catch-up discharge runs this for a marker parked because a rebuild
+/// rewrote a definition's target (`pending_backfill.refresh_projections`,
+/// `intake::publication::discharge_marker`). It diffs the whole target, about
+/// 0.7 s for a 1M-row target whose projection is already current, so no
+/// other marker asks for it. Every write to a target
 /// reaches its projection through the target-mutation seam's CDC-shaped rows,
 /// except a rebuild's (a resumed definition's chunks or direct build), which
 /// writes the target directly. Nothing else would ever carry what the rebuild
@@ -4807,12 +4810,26 @@ async fn ensure_relationship_projection_in_txn(
 /// re-derives those consumers from the refreshed projection (its enumeration
 /// of the target reaches them by reverse propagation).
 ///
-/// Neither bookkeeping column moves on a row it rewrites. A seam row for a
-/// write this read already sees can still be pending: it re-applies its own
-/// new image over the row, which this already reflects, and its images, not
-/// the projection, are what its delta is computed from. Its capture of the
-/// row's `__trellis_lsn`, before or after this, still matches, so the order
-/// between it and later seam rows for the key is kept.
+/// Neither bookkeeping column moves on a row it rewrites. A seam row staged
+/// before this read can still be pending, and its capture of the row's
+/// `__trellis_lsn`, before or after this, still matches. If its image is the
+/// row's latest it re-applies what this already wrote. If the rebuild
+/// superseded it, putting that image back would be wrong with nothing after
+/// it to correct it, so Phase 3 checks a seam-fed to-side's images against
+/// the live row and writes the projection from the live row instead
+/// (`staging::apply::to_side_superseded`). A seam row staged after this read
+/// can't drain before the discharge commits: the discharge runs on the only
+/// sealer.
+///
+/// Its projection writes can deadlock with a drain's, which locks projection
+/// rows in key order (step 3c's `__trellis_gen` bump) or one record at a
+/// time (step 3d), while this locks them in scan order, and with a drain that
+/// holds a projection row while it writes an aggregate consumer's target row
+/// the same discharge's orphan sweep deleted. Postgres aborts one side, the
+/// same bounded case as the sweep's own (`intake::resume_orphans`): an
+/// aborted apply is a transient error with no quarantine charge, and an
+/// aborted discharge rolls back whole and retries after the marker's
+/// backoff.
 pub(crate) async fn refresh_relationship_projections_in_txn(
     client: &impl GenericClient,
     qualified_to_table: &str,
