@@ -603,9 +603,15 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
             return;
         }
         for chunk in &claimed {
-            chunk_queue::run_claimed_chunk(pool, chunk, CLAIMED_BY, Duration::from_secs(5))
-                .await
-                .expect("run_claimed_chunk");
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run_claimed_chunk");
             chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
                 .await
                 .expect("finish_chunk");

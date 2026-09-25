@@ -776,9 +776,15 @@ async fn a_failed_catchup_park_does_not_leave_the_definition_live() {
             .expect("claim the job")
     };
     assert_eq!(job.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &job[0], WORKER, Duration::from_secs(5))
-        .await
-        .expect("run the build");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &job[0],
+        WORKER,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run the build");
     let outcome = chunk_queue::finish_chunk(&db.pool, &job[0], WORKER).await;
     assert!(outcome.is_err(), "the injected park failure surfaces");
 
@@ -886,7 +892,14 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
     let pool = db.pool.clone();
     let job = superseded[0].clone();
     let old_build = tokio::spawn(async move {
-        chunk_queue::run_claimed_chunk(&pool, &job, OLD_WORKER, Duration::from_secs(5)).await
+        chunk_queue::run_claimed_chunk(
+            &pool,
+            &job,
+            OLD_WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
     });
     wait_for_build_held(&client).await;
 

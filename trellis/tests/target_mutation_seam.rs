@@ -776,7 +776,7 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
 /// during the pause reaches the target through the rebuild, but never the
 /// consumer.
 #[tokio::test]
-#[ignore = "known gap found reviewing #434: a resumed target's rebuild never reaches a relationship consumer"]
+#[ignore = "#507: a resumed target's rebuild never reaches a relationship consumer"]
 async fn a_resumed_targets_rebuild_reaches_a_relationship_consumer() {
     let (_cluster, db, mut raw) = setup().await;
     raw.batch_execute(

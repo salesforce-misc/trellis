@@ -1572,7 +1572,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // getting stuck behind the segment path's own early `continue`s
         // below.
         let backfill_progress =
-            drain_backfill_chunks(&pool, &claimed_by, chunk_heartbeat_interval).await;
+            drain_backfill_chunks(&pool, &claimed_by, chunk_heartbeat_interval, reclaim_ttl).await;
 
         // `register_drainer` doubles as the liveness refresh
         // `count_live_drainers` reads below (see its own doc comment), so it
@@ -1758,6 +1758,7 @@ async fn drain_backfill_chunks(
     pool: &Pool,
     claimed_by: &str,
     heartbeat_interval: Duration,
+    reclaim_ttl: Duration,
 ) -> bool {
     let claimed = match pool.get().await {
         Ok(client) => chunk_queue::claim_chunks(&**client, claimed_by, 1).await,
@@ -1767,7 +1768,9 @@ async fn drain_backfill_chunks(
         return false;
     };
 
-    match chunk_queue::run_claimed_chunk(pool, &chunk, claimed_by, heartbeat_interval).await {
+    match chunk_queue::run_claimed_chunk(pool, &chunk, claimed_by, heartbeat_interval, reclaim_ttl)
+        .await
+    {
         Ok(()) => {
             let _ = chunk_queue::finish_chunk(pool, &chunk, claimed_by).await;
         }
@@ -2847,7 +2850,13 @@ mod backfill_chunk_claim_tests {
 
         let worker_pool = pool.clone();
         let worker = tokio::spawn(async move {
-            drain_backfill_chunks(&worker_pool, "gated-worker", Duration::from_secs(5)).await
+            drain_backfill_chunks(
+                &worker_pool,
+                "gated-worker",
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
         });
 
         // Wait for the chunk write to park on the gate: an event, not a
@@ -2913,9 +2922,23 @@ mod backfill_chunk_claim_tests {
             "one call finishes exactly the chunk it claimed"
         );
 
-        assert!(drain_backfill_chunks(&pool, "gated-worker", Duration::from_secs(5)).await);
         assert!(
-            !drain_backfill_chunks(&pool, "gated-worker", Duration::from_secs(5)).await,
+            drain_backfill_chunks(
+                &pool,
+                "gated-worker",
+                Duration::from_secs(5),
+                Duration::from_secs(60)
+            )
+            .await
+        );
+        assert!(
+            !drain_backfill_chunks(
+                &pool,
+                "gated-worker",
+                Duration::from_secs(5),
+                Duration::from_secs(60)
+            )
+            .await,
             "nothing is left to claim"
         );
         let status: String = raw

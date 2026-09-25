@@ -399,9 +399,15 @@ async fn a_one_to_one_row_deleted_during_the_build_is_gone_at_live() {
         .await
         .expect("claim");
     assert_eq!(chunks.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &chunks[0], "probe", Duration::from_secs(5))
-        .await
-        .expect("run chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &chunks[0],
+        "probe",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run chunk");
 
     let image = row_4("a");
     commit_and_stage(

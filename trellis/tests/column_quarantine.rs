@@ -1090,9 +1090,15 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
     assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
 
     // The first worker writes the chunk and dies before finishing it.
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker-1", Duration::from_secs(5))
-        .await
-        .expect("run_claimed_chunk (initial build)");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "worker-1",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run_claimed_chunk (initial build)");
 
     let initial = client
         .query_one("select x::text, y::text from t where id = 1", &[])
@@ -1132,9 +1138,15 @@ async fn a_reexecuted_backfill_chunk_leaves_a_paused_column_untouched() {
         .await
         .expect("claim_chunks after the reclaim");
     assert_eq!(reclaimed.len(), 1, "the reclaimed chunk is claimable again");
-    chunk_queue::run_claimed_chunk(&db.pool, &reclaimed[0], "worker-2", Duration::from_secs(5))
-        .await
-        .expect("run_claimed_chunk (re-executed after the reclaim)");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &reclaimed[0],
+        "worker-2",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run_claimed_chunk (re-executed after the reclaim)");
 
     let after = client
         .query_one("select x::text, y::text from t where id = 1", &[])

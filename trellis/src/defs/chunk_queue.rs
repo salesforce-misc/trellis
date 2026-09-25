@@ -341,21 +341,45 @@ const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
 /// write, while the stale-claim sweep's `for update skip locked` passes the
 /// chunk over.
 ///
+/// Both of those waits last only as long as the write, provided its worker
+/// keeps running. A worker that stalls inside the transaction (a frozen
+/// process, or a network partition the server hasn't noticed) would hold the
+/// lock until its session ended, which nothing else bounds. So [`hold`] sets
+/// the transaction's `idle_in_transaction_session_timeout` to the fleet's
+/// reclaim TTL first: the server ends a session left idle mid-transaction
+/// that long, releasing its locks, at the point the stale-claim sweep would
+/// have given up on the claim anyway.
+///
 /// [`hold`]: ClaimFence::hold
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ClaimFence<'a> {
     chunk_id: i64,
     claimed_by: &'a str,
+    /// The fleet's reclaim TTL: how long the fenced transaction may sit idle
+    /// before the server ends its session.
+    idle_timeout: Duration,
 }
 
 impl ClaimFence<'_> {
     /// Locks the claim for the rest of `txn` and returns whether it still
     /// holds: the chunk is undone, still claimed by this worker, and not
     /// [`STALE`]. The caller writes nothing in `txn` when it doesn't.
+    ///
+    /// Sets `txn`'s `idle_in_transaction_session_timeout` to the reclaim
+    /// TTL before it takes the lock. `set local` is enough: the server arms
+    /// that timer each time the session goes idle inside a transaction, from
+    /// the setting's value at that moment.
     pub(crate) async fn hold(
         &self,
         txn: &impl GenericClient,
     ) -> Result<bool, tokio_postgres::Error> {
+        // Zero would disable the timeout, and the setting is an `int` of
+        // milliseconds.
+        let idle_ms = self.idle_timeout.as_millis().clamp(1, i32::MAX as u128);
+        txn.batch_execute(&format!(
+            "set local idle_in_transaction_session_timeout = {idle_ms}"
+        ))
+        .await?;
         let claimed = txn
             .query_opt(
                 "select 1 from backfill_chunks \
@@ -699,6 +723,9 @@ async fn discard_resumed_chunks(
 /// [`crate::client::Client`] pass its `ClientOptions::heartbeat`'s own
 /// interval, matching the same margin the ring's own
 /// [`crate::staging::HeartbeatDaemon`] keeps against `reclaim_ttl` there.
+/// `reclaim_ttl` is that fleet TTL: a worker that stalls inside one of the
+/// chunk's fenced write transactions loses its session after that long idle
+/// ([`ClaimFence`]).
 ///
 /// The target schema comes from the definition's own persisted, qualified
 /// `target_table` identity, never from the running worker's configuration
@@ -718,6 +745,7 @@ pub async fn run_claimed_chunk(
     chunk: &ClaimedChunk,
     claimed_by: &str,
     heartbeat_interval: Duration,
+    reclaim_ttl: Duration,
 ) -> Result<(), ChunkQueueError> {
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
         .await?
@@ -741,6 +769,7 @@ pub async fn run_claimed_chunk(
     let fence = ClaimFence {
         chunk_id: chunk.id,
         claimed_by,
+        idle_timeout: reclaim_ttl,
     };
     let ran = match &chunk.work {
         ChunkWork::Range { lo, hi } => backfill::execute_one_to_one_chunk(
@@ -1321,9 +1350,15 @@ mod tests {
             "the discard parks nothing"
         );
 
-        run_claimed_chunk(&pool, &rebuild[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run rebuild chunk");
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
@@ -1348,9 +1383,15 @@ mod tests {
             .expect("claim rebuild");
         assert_eq!(rebuild.len(), 1);
 
-        run_claimed_chunk(&pool, &rebuild[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run rebuild chunk");
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
         finish_chunk(&pool, &rebuild[0], WORKER)
             .await
             .expect("finish rebuild chunk");
@@ -1448,9 +1489,15 @@ mod tests {
 
         let job = claim_chunks(&raw, WORKER, 10).await.expect("claim again");
         assert_eq!(job.len(), 1);
-        run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("run the job");
+        run_claimed_chunk(
+            &pool,
+            &job[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run the job");
         finish_chunk(&pool, &job[0], WORKER)
             .await
             .expect("finish the job");
@@ -1505,9 +1552,15 @@ mod tests {
         dispatch_job(&pool, id, 2).await;
 
         let job = claim_chunks(&raw, WORKER, 10).await.expect("claim");
-        let error = run_claimed_chunk(&pool, &job[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect_err("the build has no target to write");
+        let error = run_claimed_chunk(
+            &pool,
+            &job[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect_err("the build has no target to write");
         let given_up = fail_chunk(&pool, &job[0], WORKER, &error.to_string())
             .await
             .expect("fail the job");
@@ -1587,9 +1640,15 @@ mod tests {
             .await
             .expect("claim rebuild");
         assert_eq!(rebuild.len(), 1);
-        run_claimed_chunk(&pool, &rebuild[0], "rebuild-worker", Duration::from_secs(5))
-            .await
-            .expect("run rebuild chunk");
+        run_claimed_chunk(
+            &pool,
+            &rebuild[0],
+            "rebuild-worker",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run rebuild chunk");
         finish_chunk(&pool, &rebuild[0], "rebuild-worker")
             .await
             .expect("finish rebuild chunk");
@@ -1617,9 +1676,15 @@ mod tests {
             .await
             .expect("update the source");
 
-        run_claimed_chunk(&pool, &held, WORKER, Duration::from_secs(5))
-            .await
-            .expect("run the held chunk");
+        run_claimed_chunk(
+            &pool,
+            &held,
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("run the held chunk");
         finish_chunk(&pool, &held, WORKER)
             .await
             .expect("finish the held chunk");
@@ -1658,9 +1723,15 @@ mod tests {
         pause_transform(&pool, "rollup").await.expect("pause");
         resume_transform(&pool, "rollup").await.expect("resume");
 
-        run_claimed_chunk(&pool, &held[0], WORKER, Duration::from_secs(5))
-            .await
-            .expect("a superseded job is not a failure");
+        run_claimed_chunk(
+            &pool,
+            &held[0],
+            WORKER,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a superseded job is not a failure");
         let rows: i64 = raw
             .query_one("select count(*) from public.rollup", &[])
             .await
@@ -1695,9 +1766,15 @@ mod tests {
         let reclaimed = claim_chunks(&raw, WORKER, 1).await.expect("reclaim claim");
         assert_eq!(reclaimed.len(), 1);
 
-        run_claimed_chunk(&pool, &stalled[0], "stalled-worker", Duration::from_secs(5))
-            .await
-            .expect("a superseded chunk is not a failure");
+        run_claimed_chunk(
+            &pool,
+            &stalled[0],
+            "stalled-worker",
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a superseded chunk is not a failure");
         let rows: i64 = raw
             .query_one("select count(*) from public.order_doubles", &[])
             .await
@@ -1726,6 +1803,7 @@ mod tests {
         let fence = ClaimFence {
             chunk_id: held[0].id,
             claimed_by: WORKER,
+            idle_timeout: Duration::from_secs(60),
         };
 
         let impatient = Pool::new(
@@ -1815,6 +1893,7 @@ mod tests {
                 let fence = ClaimFence {
                     chunk_id,
                     claimed_by: WORKER,
+                    idle_timeout: Duration::from_secs(60),
                 };
                 fence.hold(&*txn).await.expect("hold")
             }
@@ -1826,6 +1905,85 @@ mod tests {
         assert!(
             !fenced.await.expect("join"),
             "a fence that waited for the resume's lock sees the resume"
+        );
+    }
+
+    /// A worker that stalls inside a fenced write transaction loses its
+    /// session once it has sat idle for the reclaim TTL, so its lock can't
+    /// keep a resume waiting or the chunk from being reclaimed past the point
+    /// the stale-claim sweep would have given up on it anyway. The stalled
+    /// worker is a transaction that holds the fence and then does nothing,
+    /// under a 200 ms TTL.
+    #[tokio::test]
+    async fn a_fenced_transaction_left_idle_past_the_reclaim_ttl_loses_its_lock() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, mut raw) = connect(&db).await;
+        let (id, def) = seed_waiting(&raw, "orders", "order_doubles", 3).await;
+        dispatch(&pool, id, &def, "public.orders").await;
+        let held = claim_chunks(&raw, WORKER, 1).await.expect("claim");
+        assert_eq!(held.len(), 1);
+        let fence = ClaimFence {
+            chunk_id: held[0].id,
+            claimed_by: WORKER,
+            idle_timeout: Duration::from_millis(200),
+        };
+
+        let (_, mut stalled) = connect(&db).await;
+        let stalled_pid: i32 = stalled
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("read the stalled session's pid")
+            .get(0);
+        let writing = stalled.transaction().await.expect("begin");
+        assert!(fence.hold(&writing).await.expect("hold"), "the claim holds");
+        assert_eq!(
+            reclaim_stale_chunks(&mut raw, Duration::ZERO)
+                .await
+                .expect("reclaim"),
+            0,
+            "the sweep passes over a chunk whose write holds its fence"
+        );
+
+        // Waits for the server to end the idle session, not for a duration.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive: bool = raw
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity where pid = $1)",
+                    &[&stalled_pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle fenced transaction was never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            reclaim_stale_chunks(&mut raw, Duration::ZERO)
+                .await
+                .expect("reclaim"),
+            1,
+            "with the session gone, the claim is reclaimed"
+        );
+        assert_eq!(
+            claim_chunks(&raw, "next-worker", 1)
+                .await
+                .expect("claim again")
+                .len(),
+            1,
+            "and the chunk can be claimed again"
+        );
+        assert!(
+            writing.commit().await.is_err(),
+            "the stalled worker's transaction is gone with its session"
         );
     }
 }

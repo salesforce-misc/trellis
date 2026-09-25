@@ -209,12 +209,17 @@ The cost is that a resume waits for the definition's in-flight chunk writes:
 one chunk's statement, or one statement of a direct build. `for key share`
 doesn't block the heartbeat's refresh of `claimed_at`. The stale-claim sweep
 skips a chunk whose write is in flight, as it already skipped any locked row.
-Those waits are bounded by the write only while its worker keeps running. A
-worker that stalls inside a fenced transaction (a frozen process, or a network
-partition the server hasn't noticed yet) holds the chunk's lock until its
-session ends, and no timeout bounds that: the resume waits, and the sweep
-can't reclaim the chunk. An unfenced write committed on its own, so the same
-stall used to hold nothing.
+A worker that stalls inside a fenced transaction (a frozen process, or a
+network partition the server hasn't noticed yet) would hold the chunk's lock
+until its session ended. An unfenced write committed on its own, so the same
+stall used to hold nothing. So the fenced transaction sets its
+`idle_in_transaction_session_timeout` to the fleet's reclaim TTL
+(`ClientOptions::reclaim_ttl`). The server ends a session left idle in the
+transaction that long, which releases its locks when the sweep would have
+given up on the claim anyway. The resume's wait is then bounded by the TTL,
+or by a write statement that is still running. The resume takes no
+`lock_timeout` of its own: it can't know the fleet's TTL, and the idle
+timeout already bounds the wait.
 
 The fence replaced repairing a late write after the fact. #360 had the discard
 park a catch-up on the chunk's source. That catch-up repaired the target

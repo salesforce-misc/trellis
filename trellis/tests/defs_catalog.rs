@@ -35,6 +35,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
                 chunk,
                 "defs_catalog_test",
                 std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(60),
             )
             .await
             .expect("run_claimed_chunk");

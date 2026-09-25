@@ -217,6 +217,7 @@ async fn a_chunk_abandoned_by_its_claimant_is_reclaimed_and_completed_by_another
         &re_claimed[0],
         "fresh-worker",
         Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .await
     .expect("run_claimed_chunk");
@@ -290,9 +291,15 @@ async fn a_chunk_of_an_explicitly_schema_qualified_target_is_written_into_that_s
         .await
         .expect("claim_chunks");
     assert_eq!(claimed.len(), 1, "one chunk covers this small source table");
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker", Duration::from_secs(5))
-        .await
-        .expect("run_claimed_chunk must write into the definition's own declared schema");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "worker",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run_claimed_chunk must write into the definition's own declared schema");
     chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker")
         .await
         .expect("finish_chunk");
@@ -401,6 +408,7 @@ async fn a_composite_key_chunk_abandoned_by_its_claimant_is_reclaimed_and_comple
         &re_claimed[0],
         "fresh-worker",
         Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .await
     .expect("run_claimed_chunk");
@@ -510,8 +518,14 @@ async fn a_chunk_write_slower_than_the_reclaim_ttl_is_not_falsely_reclaimed() {
     let pool = db.pool.clone();
     let chunk_for_task = chunk.clone();
     let run_task = tokio::spawn(async move {
-        chunk_queue::run_claimed_chunk(&pool, &chunk_for_task, "slow-worker", heartbeat_interval)
-            .await
+        chunk_queue::run_claimed_chunk(
+            &pool,
+            &chunk_for_task,
+            "slow-worker",
+            heartbeat_interval,
+            ttl,
+        )
+        .await
     });
 
     // While the chunk write is (slowly) in flight, repeatedly sweep for
@@ -617,6 +631,7 @@ async fn a_stale_claimants_late_finish_after_reclaim_is_a_no_op() {
         &re_claimed[0],
         "fresh-worker",
         Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .await
     .expect("run_claimed_chunk");
@@ -683,9 +698,15 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim A's chunk");
     assert_eq!(claimed_a.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed_a[0], "worker-a", Duration::from_secs(5))
-        .await
-        .expect("run A's chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed_a[0],
+        "worker-a",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run A's chunk");
     chunk_queue::finish_chunk(&db.pool, &claimed_a[0], "worker-a")
         .await
         .expect("finish A's chunk");
@@ -725,9 +746,15 @@ async fn a_delta_is_excluded_from_a_backfilling_definition_and_discharged_once_i
         .await
         .expect("claim B's chunk");
     assert_eq!(claimed_b.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed_b[0], "worker-b", Duration::from_secs(5))
-        .await
-        .expect("run B's chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed_b[0],
+        "worker-b",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run B's chunk");
     // Deliberately not finished yet.
 
     let pre_delta_y: i64 = client
@@ -933,9 +960,15 @@ async fn alter_transform_add_parks_a_catch_up_that_repairs_a_row_changed_mid_bac
         .await
         .expect("claim the chunk");
     assert_eq!(claimed.len(), 1);
-    chunk_queue::run_claimed_chunk(&db.pool, &claimed[0], "worker", Duration::from_secs(5))
-        .await
-        .expect("run the chunk");
+    chunk_queue::run_claimed_chunk(
+        &db.pool,
+        &claimed[0],
+        "worker",
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("run the chunk");
     chunk_queue::finish_chunk(&db.pool, &claimed[0], "worker")
         .await
         .expect("finish the chunk");
