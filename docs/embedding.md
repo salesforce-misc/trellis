@@ -147,16 +147,13 @@ about an individual transform's own progress.
 ### Wiring it into a host health check
 
 The bindings are in progress (epic #140): the Elixir binding in
-`clients/elixir` covers `connect`, `migrate`, `define`, `status` and
-`shutdown` so far (issue #146), and the Ruby binding doesn't exist yet. Each
-is a thin Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
-decision 1. Until they grow the health checks, the pattern below is written
-against the Rust API directly, sized for
-what a binding's eventual `Trellis.has_live_drain_workers?` /
-`Trellis.has_live_staging_worker?` (Elixir and Ruby alike) calls are
-expected to wrap one-to-one
-— see ADR-0010 decision 4 for why a plain boolean needs no flattening to
-cross that boundary.
+`clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146 and
+#147), and the Ruby binding doesn't exist yet. Each is a thin
+Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
+decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
+and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`
+(or the boolean itself from the bang variant). A plain boolean needs no
+flattening to cross the boundary (ADR-0010 decision 4).
 
 **Phoenix**, wired as a `Plug` health-check endpoint polled by the
 platform's liveness probe:
@@ -166,13 +163,15 @@ defmodule MyAppWeb.HealthController do
   use MyAppWeb, :controller
 
   def workers(conn, _params) do
-    # `MyApp.Trellis` is the supervised `ResourceArc` handle ADR-0010
-    # decision 3 describes — one per node, held in the supervision tree.
+    # `MyApp.Trellis.handle/0` returns the node's one handle, the one
+    # ADR-0010 decision 3 describes, held in the supervision tree.
+    trellis = MyApp.Trellis.handle()
+
     cond do
-      not MyApp.Trellis.has_live_drain_workers?() ->
+      not Trellis.has_live_drain_workers!(trellis) ->
         send_resp(conn, 503, "no live drain workers in this fleet")
 
-      not MyApp.Trellis.has_live_staging_worker?() ->
+      not Trellis.has_live_staging_worker!(trellis) ->
         send_resp(conn, 503, "no live staging worker in this fleet")
 
       true ->

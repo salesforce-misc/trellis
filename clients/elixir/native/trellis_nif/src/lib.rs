@@ -13,9 +13,10 @@
 //!   to an atom from a closed set, with a fallback for a code it doesn't know.
 //! - **Only plain data crosses** (decision 4). The flattening itself is
 //!   `trellis-embed`'s; this crate only turns its plain values into terms.
-//!   Status words become atoms here, but only ever words from
-//!   [`trellis_embed::transform_status_names`], which [`load`] allocates up
-//!   front, never a string read from the database.
+//!   Words become atoms here (statuses, quarantine states, relationship
+//!   cardinalities, `apply` outcome kinds), but only ever words from the
+//!   closed sets `trellis-embed` lists, which [`load`] allocates up front,
+//!   never a string read from the database.
 //!
 //! The handle is a [`ResourceArc`] over [`Handle`]. Dropping the last
 //! reference (the BEAM garbage-collecting it) drops the [`BlockingTrellis`],
@@ -25,12 +26,16 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, TrellisOptions};
 use trellis_embed::{
-    ERROR_CODES, PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainError,
-    require_transform_statement, transform_status_names,
+    ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainError, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
+    PlainRelationshipSummary, PlainSamplePage, decode_cursor, decode_watermark, encode_watermark,
+    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -155,15 +160,197 @@ impl From<PlainBackfillFailure> for BackfillFailureTerm {
     }
 }
 
-/// `word`'s atom. `word` is always a [`trellis::TransformStatus::as_str`]
-/// word, so this only ever looks up an atom [`load`] already allocated.
-fn status_atom(env: Env, word: &'static str) -> NifReply<Atom> {
+/// `word`'s atom. `word` is always one of the `'static` words in
+/// [`atom_words`], never text read from the database, so this only ever
+/// looks up an atom [`load`] already allocated.
+fn word_atom(env: Env, word: &'static str) -> NifReply<Atom> {
     Atom::from_str(env, word).map_err(|_| {
         error(
             ErrorCode::Internal,
-            format!("could not encode the status word {word:?} as an atom"),
+            format!("could not encode the word {word:?} as an atom"),
         )
     })
+}
+
+fn word_atoms(env: Env, words: Vec<&'static str>) -> NifReply<Vec<Atom>> {
+    words.into_iter().map(|word| word_atom(env, word)).collect()
+}
+
+/// Every word this NIF turns into an atom: the closed sets [`load`]
+/// allocates.
+fn atom_words() -> impl Iterator<Item = &'static str> {
+    transform_status_names()
+        .into_iter()
+        .chain(quarantine_state_names())
+        .chain(relationship_cardinality_names())
+        .chain(PlainApplied::KINDS)
+}
+
+impl DefinitionTerm {
+    fn new(env: Env, definition: PlainDefinition) -> NifReply<Self> {
+        Ok(DefinitionTerm {
+            id: definition.id,
+            target_table: definition.target_table,
+            source_table: definition.source_table,
+            source_version: definition.source_version,
+            status: word_atom(env, definition.status)?,
+            source_columns: definition.source_columns.into_iter().collect(),
+        })
+    }
+}
+
+/// A registered definition, as `definitions/1` lists it.
+#[derive(NifMap)]
+struct DefinitionSummaryTerm {
+    id: i64,
+    target_table: String,
+    source_table: String,
+    source_version: i64,
+    status: Atom,
+    created_at_micros: i64,
+}
+
+/// A relationship `apply/2` registered.
+#[derive(NifMap)]
+struct RelationshipTerm {
+    id: i64,
+    name: String,
+    from_schema: String,
+    from_table: String,
+    from_col: String,
+    to_schema: String,
+    to_table: String,
+    to_col: String,
+    cardinality: Atom,
+    warnings: Vec<String>,
+}
+
+/// A registered relationship, as `relationships/1` lists it.
+#[derive(NifMap)]
+struct RelationshipSummaryTerm {
+    id: i64,
+    name: String,
+    from_schema: String,
+    from_table: String,
+    from_col: String,
+    to_schema: String,
+    to_table: String,
+    to_col: String,
+    cardinality: Atom,
+    created_at_micros: i64,
+}
+
+/// What `apply/2` did. `kind` is one of [`PlainApplied::KINDS`]; each
+/// other field is set only for the kinds that carry it (`definition` for
+/// `transform_defined` and `altered`, `relationship` for
+/// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
+/// and `altered` for `altered`), and is `nil` otherwise. `Trellis.Applied`
+/// turns this into the tagged value `apply/2` returns.
+#[derive(NifMap)]
+struct AppliedTerm {
+    kind: Atom,
+    definition: Option<DefinitionTerm>,
+    relationship: Option<RelationshipTerm>,
+    columns: Option<Vec<String>>,
+    added: Option<Vec<String>>,
+    dropped: Option<Vec<String>>,
+    altered: Option<Vec<String>>,
+}
+
+/// One entry of `quarantined/1`, or `quarantine_status/2`'s one entry.
+#[derive(NifMap)]
+struct QuarantineEntryTerm {
+    target: String,
+    state: Atom,
+    paused_at_micros: Option<i64>,
+    last_error: Option<String>,
+}
+
+/// One poisoned key, as `poisoned_since/2` lists it.
+#[derive(NifMap)]
+struct PoisonEntryTerm {
+    src_table: String,
+    key: String,
+    last_error: String,
+    poisoned_at_micros: i64,
+}
+
+#[derive(NifMap)]
+struct PoisonSampleTerm {
+    src_table: String,
+    key: String,
+    error_message: String,
+}
+
+/// One page of `sample_quarantined/3`.
+#[derive(NifMap)]
+struct SamplePageTerm {
+    samples: Vec<PoisonSampleTerm>,
+    next_cursor: Option<String>,
+}
+
+impl RelationshipTerm {
+    fn new(env: Env, relationship: PlainRelationship) -> NifReply<Self> {
+        Ok(RelationshipTerm {
+            id: relationship.id,
+            name: relationship.name,
+            from_schema: relationship.from_schema,
+            from_table: relationship.from_table,
+            from_col: relationship.from_col,
+            to_schema: relationship.to_schema,
+            to_table: relationship.to_table,
+            to_col: relationship.to_col,
+            cardinality: word_atom(env, relationship.cardinality)?,
+            warnings: relationship.warnings,
+        })
+    }
+}
+
+impl AppliedTerm {
+    fn new(env: Env, applied: PlainApplied) -> NifReply<Self> {
+        let mut term = AppliedTerm {
+            kind: word_atom(env, applied.kind())?,
+            definition: None,
+            relationship: None,
+            columns: None,
+            added: None,
+            dropped: None,
+            altered: None,
+        };
+        match applied {
+            PlainApplied::TransformDefined(definition) => {
+                term.definition = Some(DefinitionTerm::new(env, definition)?);
+            }
+            PlainApplied::RelationshipDefined(relationship) => {
+                term.relationship = Some(RelationshipTerm::new(env, relationship)?);
+            }
+            PlainApplied::Resumed { columns } => term.columns = Some(columns),
+            PlainApplied::Altered {
+                definition,
+                added,
+                dropped,
+                altered,
+            } => {
+                term.definition = Some(DefinitionTerm::new(env, definition)?);
+                term.added = Some(added);
+                term.dropped = Some(dropped);
+                term.altered = Some(altered);
+            }
+            PlainApplied::Paused | PlainApplied::Dropped | PlainApplied::Unknown => {}
+        }
+        Ok(term)
+    }
+}
+
+impl QuarantineEntryTerm {
+    fn new(env: Env, entry: PlainQuarantineEntry) -> NifReply<Self> {
+        Ok(QuarantineEntryTerm {
+            target: entry.target,
+            state: word_atom(env, entry.state)?,
+            paused_at_micros: entry.paused_at_micros,
+            last_error: entry.last_error,
+        })
+    }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -197,8 +384,8 @@ fn migrate(handle: ResourceArc<Handle>) -> NifReply<Atom> {
 /// `BlockingTrellis::apply` takes every statement form, so `text` is checked
 /// first with `trellis::statement_kind`: any other form (`DROP`, `PAUSE`,
 /// ...) is a `validation` error and is never applied, and text that doesn't
-/// parse is the `parse` error `apply` would return. The other forms get their
-/// own functions in the binding's full surface (#147).
+/// parse is the `parse` error `apply` would return. Every form, this one
+/// included, goes through `apply/2`.
 #[rustler::nif(schedule = "DirtyIo")]
 fn define(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<DefinitionTerm> {
     require_transform_statement(&text).map_err(plain)?;
@@ -211,15 +398,168 @@ fn define(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<Defin
             "define/2 applied a statement that registered no transform",
         )
     })?;
-    let definition = PlainDefinition::from(&definition);
-    Ok(DefinitionTerm {
-        id: definition.id,
-        target_table: definition.target_table,
-        source_table: definition.source_table,
-        source_version: definition.source_version,
-        status: status_atom(env, definition.status)?,
-        source_columns: definition.source_columns.into_iter().collect(),
+    DefinitionTerm::new(env, PlainDefinition::from(&definition))
+}
+
+/// Runs one statement of Trellis's grammar, whatever its form, and reports
+/// what it did.
+#[rustler::nif(schedule = "DirtyIo")]
+fn apply(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<AppliedTerm> {
+    let applied = handle.with(|trellis| trellis.apply(&text))?;
+    AppliedTerm::new(env, PlainApplied::from(&applied))
+}
+
+/// Every registered transform definition, oldest first.
+#[rustler::nif(schedule = "DirtyIo")]
+fn definitions(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<DefinitionSummaryTerm>> {
+    handle
+        .with(BlockingTrellis::definitions)?
+        .iter()
+        .map(|summary| {
+            let summary = PlainDefinitionSummary::from(summary);
+            Ok(DefinitionSummaryTerm {
+                id: summary.id,
+                target_table: summary.target_table,
+                source_table: summary.source_table,
+                source_version: summary.source_version,
+                status: word_atom(env, summary.status)?,
+                created_at_micros: summary.created_at_micros,
+            })
+        })
+        .collect()
+}
+
+/// Every registered relationship, oldest first.
+#[rustler::nif(schedule = "DirtyIo")]
+fn relationships(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<RelationshipSummaryTerm>> {
+    handle
+        .with(BlockingTrellis::relationships)?
+        .iter()
+        .map(|summary| {
+            let summary = PlainRelationshipSummary::try_from(summary).map_err(plain)?;
+            Ok(RelationshipSummaryTerm {
+                id: summary.id,
+                name: summary.name,
+                from_schema: summary.from_schema,
+                from_table: summary.from_table,
+                from_col: summary.from_col,
+                to_schema: summary.to_schema,
+                to_table: summary.to_table,
+                to_col: summary.to_col,
+                cardinality: word_atom(env, summary.cardinality)?,
+                created_at_micros: summary.created_at_micros,
+            })
+        })
+        .collect()
+}
+
+/// Parks a go-live catch-up re-read of `source_table` for the staging worker.
+#[rustler::nif(schedule = "DirtyIo")]
+fn request_backfill(handle: ResourceArc<Handle>, source_table: String) -> NifReply<Atom> {
+    handle.with(|trellis| trellis.request_backfill(&source_table))?;
+    Ok(rustler::types::atom::ok())
+}
+
+/// Every key poisoned after `watermark_micros` (epoch microseconds), oldest
+/// first.
+#[rustler::nif(schedule = "DirtyIo")]
+fn poisoned_since(
+    handle: ResourceArc<Handle>,
+    watermark_micros: i64,
+) -> NifReply<Vec<PoisonEntryTerm>> {
+    let watermark = system_time_from_epoch_micros(watermark_micros).map_err(plain)?;
+    Ok(handle
+        .with(|trellis| trellis.poisoned_since(watermark))?
+        .iter()
+        .map(|entry| {
+            let entry = PlainPoisonEntry::from(entry);
+            PoisonEntryTerm {
+                src_table: entry.src_table,
+                key: entry.key,
+                last_error: entry.last_error,
+                poisoned_at_micros: entry.poisoned_at_micros,
+            }
+        })
+        .collect())
+}
+
+/// Every quarantined transform and paused column.
+#[rustler::nif(schedule = "DirtyIo")]
+fn quarantined(env: Env, handle: ResourceArc<Handle>) -> NifReply<Vec<QuarantineEntryTerm>> {
+    handle
+        .with(BlockingTrellis::quarantined)?
+        .iter()
+        .map(|entry| QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(entry)))
+        .collect()
+}
+
+/// One target's state, by its `transform` or `transform.column` address.
+#[rustler::nif(schedule = "DirtyIo")]
+fn quarantine_status(
+    env: Env,
+    handle: ResourceArc<Handle>,
+    target: String,
+) -> NifReply<QuarantineEntryTerm> {
+    let entry = handle.with(|trellis| trellis.quarantine_status(&target))?;
+    QuarantineEntryTerm::new(env, PlainQuarantineEntry::from(&entry))
+}
+
+/// Up to `limit` of `target`'s quarantined rows, after the opaque `cursor`
+/// (`nil` for the first page).
+#[rustler::nif(schedule = "DirtyIo")]
+fn sample_quarantined(
+    handle: ResourceArc<Handle>,
+    target: String,
+    cursor: Option<String>,
+    limit: i64,
+) -> NifReply<SamplePageTerm> {
+    let after = decode_cursor(cursor.as_deref()).map_err(plain)?;
+    let samples = handle.with(|trellis| trellis.sample_quarantined(&target, after, limit))?;
+    let page = PlainSamplePage::new(&samples, cursor.as_deref());
+    Ok(SamplePageTerm {
+        samples: page
+            .samples
+            .into_iter()
+            .map(|sample| PoisonSampleTerm {
+                src_table: sample.src_table,
+                key: sample.key,
+                error_message: sample.error_message,
+            })
+            .collect(),
+        next_cursor: page.next_cursor,
     })
+}
+
+/// Whether any drain worker in the fleet is alive.
+#[rustler::nif(schedule = "DirtyIo")]
+fn has_live_drain_workers(handle: ResourceArc<Handle>) -> NifReply<bool> {
+    handle.with(BlockingTrellis::has_live_drain_workers)
+}
+
+/// Whether this instance's staging worker is alive anywhere in the fleet.
+#[rustler::nif(schedule = "DirtyIo")]
+fn has_live_staging_worker(handle: ResourceArc<Handle>) -> NifReply<bool> {
+    handle.with(BlockingTrellis::has_live_staging_worker)
+}
+
+/// A read-your-writes token, as an opaque string.
+#[rustler::nif(schedule = "DirtyIo")]
+fn watermark_token(handle: ResourceArc<Handle>) -> NifReply<String> {
+    handle
+        .with(BlockingTrellis::watermark_token)
+        .map(encode_watermark)
+}
+
+/// Waits up to `timeout_ms` for every change committed at or before `token`
+/// to reach its targets.
+///
+/// Holds a dirty IO scheduler for as long as it waits, and the handle runs
+/// one call at a time, so every other call on it queues behind this one.
+#[rustler::nif(schedule = "DirtyIo")]
+fn await_converged(handle: ResourceArc<Handle>, token: String, timeout_ms: u64) -> NifReply<Atom> {
+    let token = decode_watermark(&token).map_err(plain)?;
+    handle.with(|trellis| trellis.await_converged(token, Duration::from_millis(timeout_ms)))?;
+    Ok(rustler::types::atom::ok())
 }
 
 /// `target_table`'s status, or `nil` when no definition writes it.
@@ -234,7 +574,7 @@ fn status(
     };
     let status = PlainDefinitionStatus::from(&status);
     Ok(Some(StatusTerm {
-        status: status_atom(env, status.status)?,
+        status: word_atom(env, status.status)?,
         backfill_failure: status.backfill_failure.map(BackfillFailureTerm::from),
     }))
 }
@@ -261,18 +601,41 @@ fn error_codes() -> NifReply<Vec<&'static str>> {
 /// Every status atom `define/2` and `status/2` can return.
 #[rustler::nif(schedule = "DirtyIo")]
 fn status_names(env: Env) -> NifReply<Vec<Atom>> {
-    transform_status_names()
-        .into_iter()
-        .map(|name| status_atom(env, name))
-        .collect()
+    word_atoms(env, transform_status_names())
 }
 
-/// Allocates the status atoms up front, from the closed set `trellis`
-/// defines, so encoding a status never creates an atom.
+/// Every state atom `quarantined/1` and `quarantine_status/2` can return.
+#[rustler::nif(schedule = "DirtyIo", name = "quarantine_state_names")]
+fn quarantine_state_names_nif(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, quarantine_state_names())
+}
+
+/// Every cardinality atom a relationship can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn cardinality_names(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, relationship_cardinality_names())
+}
+
+/// Every outcome kind `apply/2`'s result can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn applied_kinds(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, PlainApplied::KINDS.to_vec())
+}
+
+/// Every statement kind `trellis`'s grammar has, for the Elixir test
+/// asserting `apply/2`'s round trip covers each one.
+#[rustler::nif(schedule = "DirtyIo")]
+fn statement_kinds() -> NifReply<Vec<&'static str>> {
+    Ok(trellis::StatementKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect())
+}
+
+/// Allocates every atom this NIF encodes up front, from the closed sets
+/// `trellis-embed` lists, so encoding a result never creates an atom.
 fn load(env: Env, _info: Term) -> bool {
-    transform_status_names()
-        .into_iter()
-        .all(|name| Atom::from_str(env, name).is_ok())
+    atom_words().all(|word| Atom::from_str(env, word).is_ok())
 }
 
 rustler::init!("Elixir.Trellis.Native", load = load);

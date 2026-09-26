@@ -4,9 +4,22 @@ defmodule Trellis do
   tables from the BEAM, through the `trellis` Rust crate itself
   (`docs/decisions/0010-embeddable-clients.md`).
 
-  This is the vertical slice: `connect/1`, `migrate/1`, `define/2`,
-  `status/2` and `shutdown/1`, enough to take a transform from nothing to
-  `:live`.
+  The surface mirrors the Rust crate's `BlockingTrellis`:
+
+  - **Lifecycle:** `connect/1`, `migrate/1`, `shutdown/1`.
+  - **Every statement form:** `apply/2` runs one statement of Trellis's
+    grammar (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`,
+    `RESUME TRANSFORM`, `DROP TRANSFORM`, `DROP RELATIONSHIP`,
+    `ALTER TRANSFORM`) and reports what it did as a `t:Trellis.Applied.t/0`.
+    `define/2` is the one guarded convenience: an `apply/2` that refuses
+    anything but a `TRANSFORM` statement before applying it.
+  - **Reads:** `status/2`, `definitions/1`, `relationships/1`.
+  - **Quarantine:** `quarantined/1`, `quarantine_status/2`,
+    `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
+    statements: `apply(trellis, "RESUME TRANSFORM order_totals.total")`.
+  - **Operations:** `request_backfill/2`, `has_live_drain_workers/1`,
+    `has_live_staging_worker/1`, and the read-your-writes pair
+    `watermark_token/1` and `await_converged/3`.
 
       # A deploy's migration step: the defaults run nothing in the background.
       {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
@@ -25,6 +38,17 @@ defmodule Trellis do
   return `{:ok, value}` (or `:ok`) and `{:error, %Trellis.Error{}}`; the bang
   variants return the value or raise the `Trellis.Error`.
 
+  ## Conventions
+
+  - Times are `DateTime`s in UTC, at microsecond precision.
+  - A quarantine target is an address string: a transform's bare target
+    table name (`"order_totals"`) or `"transform.column"`
+    (`"order_totals.total"`), exactly as `quarantined/1` reports it.
+  - `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are
+    opaque: pass back what the previous call returned.
+  - Every atom in a result comes from a closed set allocated when the NIF
+    loads; none is ever built from a string the database returned.
+
   ## One handle per OS process
 
   A handle owns a connection pool and a small Rust runtime, and optionally
@@ -33,7 +57,21 @@ defmodule Trellis do
   or, as a backstop, when it is garbage collected.
   """
 
-  alias Trellis.{Definition, Error, Native, Status}
+  # `apply/2` is this module's own; `Kernel.apply/2` is never called here.
+  import Kernel, except: [apply: 2]
+
+  alias Trellis.{
+    Applied,
+    Definition,
+    DefinitionSummary,
+    Error,
+    Native,
+    PoisonEntry,
+    QuarantineEntry,
+    RelationshipSummary,
+    SamplePage,
+    Status
+  }
 
   @enforce_keys [:ref]
   defstruct [:ref]
@@ -69,6 +107,12 @@ defmodule Trellis do
           | {:staging, boolean()}
           | {:drain_threads, non_neg_integer()}
           | {:worker_threads, pos_integer()}
+
+  # The largest `limit` and `timeout_ms` the engine takes (an `i64` and a
+  # `u64` millisecond count); anything larger is refused as `:validation`
+  # rather than failing to decode in the NIF.
+  @max_limit 9_223_372_036_854_775_807
+  @max_timeout_ms 18_446_744_073_709_551_615
 
   @defaults %{
     schema: "trellis",
@@ -119,6 +163,7 @@ defmodule Trellis do
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
   `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
   anything is applied, and a statement that doesn't parse is a `:parse` error.
+  `apply/2` takes every form.
 
   Trellis runs this on its own connections, not in the caller's transaction:
   if an enclosing Ecto migration rolls back, the definition stays.
@@ -150,6 +195,216 @@ defmodule Trellis do
   @doc "Like `status/2`, but raises `Trellis.Error`."
   @spec status!(t(), String.t()) :: Status.t() | nil
   def status!(trellis, target_table), do: bang(status(trellis, target_table))
+
+  @doc """
+  Runs one statement of Trellis's grammar, whatever its form, and reports
+  what it did (see `t:Trellis.Applied.t/0`).
+
+      {:ok, {:transform_defined, definition}} =
+        Trellis.apply(trellis, "TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+
+      {:ok, {:resumed, ["order_totals.total"]}} =
+        Trellis.apply(trellis, "RESUME TRANSFORM order_totals.total")
+
+  A statement that doesn't parse is a `:parse` error, and nothing is applied.
+  Like `define/2`, this runs on Trellis's own connections, not in the
+  caller's transaction.
+
+  `{:ok, :unknown}` is a success like any other `{:ok, _}`: the statement
+  took effect, and only its outcome is newer than this binding can describe.
+  Don't retry it; read the result back with `status/2`, `definitions/1` or
+  `relationships/1` if you need it.
+  """
+  @spec apply(t(), String.t()) :: {:ok, Applied.t()} | {:error, Error.t()}
+  def apply(%__MODULE__{ref: ref}, text) when is_binary(text) do
+    with {:ok, applied} <- native(Native.apply(ref, text)) do
+      {:ok, Applied.from_native(applied)}
+    end
+  end
+
+  @doc "Like `apply/2`, but raises `Trellis.Error`."
+  @spec apply!(t(), String.t()) :: Applied.t()
+  def apply!(trellis, text), do: bang(__MODULE__.apply(trellis, text))
+
+  @doc "Every registered transform definition, oldest first."
+  @spec definitions(t()) :: {:ok, [DefinitionSummary.t()]} | {:error, Error.t()}
+  def definitions(%__MODULE__{ref: ref}) do
+    list(Native.definitions(ref), &DefinitionSummary.from_native/1)
+  end
+
+  @doc "Like `definitions/1`, but raises `Trellis.Error`."
+  @spec definitions!(t()) :: [DefinitionSummary.t()]
+  def definitions!(trellis), do: bang(definitions(trellis))
+
+  @doc "Every registered relationship, oldest first."
+  @spec relationships(t()) :: {:ok, [RelationshipSummary.t()]} | {:error, Error.t()}
+  def relationships(%__MODULE__{ref: ref}) do
+    list(Native.relationships(ref), &RelationshipSummary.from_native/1)
+  end
+
+  @doc "Like `relationships/1`, but raises `Trellis.Error`."
+  @spec relationships!(t()) :: [RelationshipSummary.t()]
+  def relationships!(trellis), do: bang(relationships(trellis))
+
+  @doc """
+  Asks the staging worker to re-read `source_table` (a bare table name,
+  resolved like one in a statement) for every definition that reads it, and
+  returns once that re-read is queued.
+
+  Each `:live` reader reports `:catching_up` until the re-read has
+  re-derived every row the table still has and deleted any target row it no
+  longer backs. A newly defined transform doesn't need this: its backfill is
+  queued for it. Only a table Trellis already captures can be re-read; any
+  other is refused.
+  """
+  @spec request_backfill(t(), String.t()) :: :ok | {:error, Error.t()}
+  def request_backfill(%__MODULE__{ref: ref}, source_table) when is_binary(source_table) do
+    unit(Native.request_backfill(ref, source_table))
+  end
+
+  @doc "Like `request_backfill/2`, but raises `Trellis.Error`."
+  @spec request_backfill!(t(), String.t()) :: :ok
+  def request_backfill!(trellis, source_table), do: bang(request_backfill(trellis, source_table))
+
+  @doc """
+  Every source row the apply path poisoned (gave up on) after `since`,
+  oldest first. Poll it with the last entry's `poisoned_at` so a
+  whole-table failure doesn't sit unnoticed.
+  """
+  @spec poisoned_since(t(), DateTime.t()) :: {:ok, [PoisonEntry.t()]} | {:error, Error.t()}
+  def poisoned_since(%__MODULE__{ref: ref}, %DateTime{} = since) do
+    list(Native.poisoned_since(ref, Trellis.Time.to_micros(since)), &PoisonEntry.from_native/1)
+  end
+
+  @doc "Like `poisoned_since/2`, but raises `Trellis.Error`."
+  @spec poisoned_since!(t(), DateTime.t()) :: [PoisonEntry.t()]
+  def poisoned_since!(trellis, since), do: bang(poisoned_since(trellis, since))
+
+  @doc """
+  Every quarantined transform and paused column, across every transform.
+  Cheap enough for a dashboard or health check to poll.
+  """
+  @spec quarantined(t()) :: {:ok, [QuarantineEntry.t()]} | {:error, Error.t()}
+  def quarantined(%__MODULE__{ref: ref}) do
+    list(Native.quarantined(ref), &QuarantineEntry.from_native/1)
+  end
+
+  @doc "Like `quarantined/1`, but raises `Trellis.Error`."
+  @spec quarantined!(t()) :: [QuarantineEntry.t()]
+  def quarantined!(trellis), do: bang(quarantined(trellis))
+
+  @doc """
+  The state of one target: a transform (`"order_totals"`) or one of its
+  columns (`"order_totals.total"`). A column that isn't paused is `:live`.
+  """
+  @spec quarantine_status(t(), String.t()) :: {:ok, QuarantineEntry.t()} | {:error, Error.t()}
+  def quarantine_status(%__MODULE__{ref: ref}, target) when is_binary(target) do
+    with {:ok, entry} <- native(Native.quarantine_status(ref, target)) do
+      {:ok, QuarantineEntry.from_native(entry)}
+    end
+  end
+
+  @doc "Like `quarantine_status/2`, but raises `Trellis.Error`."
+  @spec quarantine_status!(t(), String.t()) :: QuarantineEntry.t()
+  def quarantine_status!(trellis, target), do: bang(quarantine_status(trellis, target))
+
+  @typedoc """
+  Options for `sample_quarantined/3`:
+
+  - `:limit`: the most rows to return. Default `100`.
+  - `:after`: the `next_cursor` of the previous page. Default `nil`, the
+    first page.
+  """
+  @type sample_option :: {:limit, pos_integer()} | {:after, SamplePage.cursor() | nil}
+
+  @doc """
+  One page of the rows quarantined under `target`, to diagnose a
+  quarantine's cause: for a column (`"order_totals.total"`), the rows that
+  failed evaluating it; for a whole transform (`"order_totals"`), the keys
+  poisoned from its source table.
+
+      {:ok, page} = Trellis.sample_quarantined(trellis, "order_totals.total", limit: 50)
+      {:ok, next} = Trellis.sample_quarantined(trellis, "order_totals.total", limit: 50, after: page.next_cursor)
+  """
+  @spec sample_quarantined(t(), String.t(), [sample_option()]) ::
+          {:ok, SamplePage.t()} | {:error, Error.t()}
+  def sample_quarantined(%__MODULE__{ref: ref}, target, options \\ [])
+      when is_binary(target) and is_list(options) do
+    with {:ok, limit, cursor} <- sample_options(options),
+         {:ok, page} <- native(Native.sample_quarantined(ref, target, cursor, limit)) do
+      {:ok, SamplePage.from_native(page)}
+    end
+  end
+
+  @doc "Like `sample_quarantined/3`, but raises `Trellis.Error`."
+  @spec sample_quarantined!(t(), String.t(), [sample_option()]) :: SamplePage.t()
+  def sample_quarantined!(trellis, target, options \\ []),
+    do: bang(sample_quarantined(trellis, target, options))
+
+  @doc """
+  Whether at least one drain worker is alive anywhere in the fleet. With
+  none, nothing reaches a target table: poll this from a health check.
+  """
+  @spec has_live_drain_workers(t()) :: {:ok, boolean()} | {:error, Error.t()}
+  def has_live_drain_workers(%__MODULE__{ref: ref}),
+    do: native(Native.has_live_drain_workers(ref))
+
+  @doc "Like `has_live_drain_workers/1`, but raises `Trellis.Error`."
+  @spec has_live_drain_workers!(t()) :: boolean()
+  def has_live_drain_workers!(trellis), do: bang(has_live_drain_workers(trellis))
+
+  @doc """
+  Whether the staging worker (change capture) is alive anywhere in the
+  fleet. The other half of the health check.
+  """
+  @spec has_live_staging_worker(t()) :: {:ok, boolean()} | {:error, Error.t()}
+  def has_live_staging_worker(%__MODULE__{ref: ref}),
+    do: native(Native.has_live_staging_worker(ref))
+
+  @doc "Like `has_live_staging_worker/1`, but raises `Trellis.Error`."
+  @spec has_live_staging_worker!(t()) :: boolean()
+  def has_live_staging_worker!(trellis), do: bang(has_live_staging_worker(trellis))
+
+  @typedoc "An opaque `watermark_token/1` token."
+  @opaque watermark :: String.t()
+
+  @doc """
+  A read-your-writes token covering every write committed before this call.
+  Take it after a source-table write commits, then pass it to
+  `await_converged/3` to wait for that write to reach its targets.
+  """
+  @spec watermark_token(t()) :: {:ok, watermark()} | {:error, Error.t()}
+  def watermark_token(%__MODULE__{ref: ref}), do: native(Native.watermark_token(ref))
+
+  @doc "Like `watermark_token/1`, but raises `Trellis.Error`."
+  @spec watermark_token!(t()) :: watermark()
+  def watermark_token!(trellis), do: bang(watermark_token(trellis))
+
+  @doc """
+  Waits until every change committed at or before `token` has reached its
+  target tables, or `timeout_ms` passes (a `:timeout` error; retry it).
+
+  It waits for captured changes only: a transform that isn't `:live` yet
+  may still be missing rows when this returns (see `status/2`).
+
+  The handle runs one call at a time, so every other call on it, from any
+  process, waits behind this one for up to `timeout_ms`. Size it
+  accordingly.
+  """
+  @spec await_converged(t(), watermark(), non_neg_integer()) :: :ok | {:error, Error.t()}
+  def await_converged(%__MODULE__{ref: ref}, token, timeout_ms)
+      when is_binary(token) and is_integer(timeout_ms) do
+    if timeout_ms in 0..@max_timeout_ms do
+      unit(Native.await_converged(ref, token, timeout_ms))
+    else
+      invalid(":timeout_ms must be a non-negative integer, got: #{inspect(timeout_ms)}")
+    end
+  end
+
+  @doc "Like `await_converged/3`, but raises `Trellis.Error`."
+  @spec await_converged!(t(), watermark(), non_neg_integer()) :: :ok
+  def await_converged!(trellis, token, timeout_ms),
+    do: bang(await_converged(trellis, token, timeout_ms))
 
   @doc """
   Stops the handle's background work and waits for its threads to exit. Any
@@ -211,7 +466,35 @@ defmodule Trellis do
     end
   end
 
+  defp sample_options(options) do
+    case Keyword.split(options, [:limit, :after]) do
+      {_, [_ | _] = unknown} ->
+        invalid("unknown options #{inspect(Keyword.keys(unknown))}; known: [:limit, :after]")
+
+      {known, []} ->
+        limit = Keyword.get(known, :limit, 100)
+        cursor = Keyword.get(known, :after)
+
+        cond do
+          not (is_integer(limit) and limit in 1..@max_limit) ->
+            invalid(":limit must be a positive integer, got: #{inspect(limit)}")
+
+          not (is_nil(cursor) or is_binary(cursor)) ->
+            invalid(":after must be a cursor from a previous page, got: #{inspect(cursor)}")
+
+          true ->
+            {:ok, limit, cursor}
+        end
+    end
+  end
+
   defp invalid(message), do: {:error, Error.validation(message)}
+
+  defp list(reply, from_native) do
+    with {:ok, items} <- native(reply) do
+      {:ok, Enum.map(items, from_native)}
+    end
+  end
 
   defp native({:ok, value}), do: {:ok, value}
   defp native({:error, error}), do: {:error, Error.from_native(error)}
