@@ -184,6 +184,9 @@ pub use staging::self_check::SelfCheckError;
 pub use defs::{
     Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
+// `watermark_token`/`await_converged`'s token, so an embedder names it
+// without its own (version-locked) `tokio-postgres` dependency.
+pub use tokio_postgres::types::PgLsn;
 
 // --- Tier 2: statement classification -------------------------------------
 // Pure on the text, so an embedder can refuse the wrong statement form before

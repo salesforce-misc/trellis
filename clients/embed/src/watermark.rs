@@ -6,8 +6,7 @@
 //! (`pg_current_wal_lsn()`'s), which makes it readable in a log line. Hosts
 //! must still treat it as opaque; only this module reads it.
 
-use tokio_postgres::types::PgLsn;
-use trellis::ErrorCode;
+use trellis::{ErrorCode, PgLsn};
 
 use crate::PlainError;
 
