@@ -1703,13 +1703,37 @@ mod tests {
             (1..MAX_LIVE_CLUSTERS).map(|_| CLUSTERS.acquire()).collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let restorer = std::thread::spawn(move || {
             let _ = tx.send(TestCluster::from_backup(&backup));
         });
         let restored = rx
             .recv_timeout(Duration::from_secs(120))
             .expect("from_backup blocked on the full cluster pool");
         assert_ne!(restored.root(), source.root());
+
+        // Issue #576: the orphan reaper counts a live owner that isn't its
+        // postmaster's parent as gone, and stops the server. That is only
+        // safe while every postmaster is a direct child of the process named
+        // in its directory, however it was started and whichever thread
+        // started it. `source` was respawned by `cold_backup` (the `restart`
+        // path); `restored` was started on a thread that has since exited.
+        // The pid comes from the pidfile, as the reaper reads it, not from
+        // the spawned `Child`, which a wrapper around `postgres` would be.
+        restorer.join().expect("join the restoring thread");
+        for (what, cluster) in [("restarted", &source), ("restored", &restored)] {
+            let postmaster: i32 = fs::read_to_string(cluster.data_dir.join("postmaster.pid"))
+                .expect("read postmaster.pid")
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse().ok())
+                .expect("postmaster pid on the pidfile's first line");
+            let ppid = ps_field(postmaster, "ppid");
+            assert_eq!(
+                ppid.as_deref(),
+                Some(std::process::id().to_string().as_str()),
+                "the {what} postmaster must be a direct child of the test process"
+            );
+        }
     }
 
     /// Issue #569: a wait on a pool where nothing is ever released panics,
