@@ -19,7 +19,7 @@
 //! session-scoped advisory lock. The singleton lock must be pinned to one
 //! connection for its whole lifetime, so this opens one directly.
 
-use tokio_postgres::{Client, GenericClient, NoTls, Transaction};
+use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::error::StagingError;
 
@@ -124,18 +124,19 @@ impl ProducerSession {
     /// else does), and enforces both guards in order: `synchronous_commit`
     /// first, so a session that fails the durability check never briefly
     /// holds the singleton lock, then the lock itself.
+    ///
+    /// TCP keepalives are on at both ends before the lock is taken (issue
+    /// #364), so a partitioned producer's lock frees in about 25s rather
+    /// than the ~2h the kernel defaults allow. See
+    /// `crate::pool::TCP_KEEPALIVE_IDLE` for the numbers.
     pub async fn connect(dsn: &str, schema: &str) -> Result<Self, StagingError> {
-        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
+        let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
         let handle = tokio::spawn(async move {
             let _ = connection.await;
         });
 
         client
-            .batch_execute(&format!(
-                "set search_path to {}, public; {}",
-                crate::pool::quote_ident(schema),
-                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
-            ))
+            .batch_execute(&crate::pool::dedicated_session_setup(schema))
             .await?;
 
         require_synchronous_commit_on(&client).await?;

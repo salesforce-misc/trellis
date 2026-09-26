@@ -19,8 +19,11 @@
 //! for the staging ring to make its durability guarantees.
 //! Beyond `search_path`, the hook also pins the output GUCs that make a
 //! value's text rendering depend on the value alone rather than on the
-//! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]); nothing else
-//! is enforced here yet.
+//! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), and turns on
+//! TCP keepalives at both ends so a partitioned connection's locks don't
+//! outlive it by hours (see [`tcp_keepalive_gucs`], issue #364). The
+//! dedicated, non-pooled connections get the same through
+//! [`connect_dedicated`] and [`dedicated_session_setup`].
 
 use crate::config::Config;
 use crate::error::Error;
@@ -28,6 +31,7 @@ use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
 use std::str::FromStr;
+use std::time::Duration;
 use tokio_postgres::NoTls;
 
 /// A pooled connection, handed out by [`Pool::get`].
@@ -75,8 +79,9 @@ impl Pool {
     /// [`crate::config::DEFAULT_POOL_WAIT_TIMEOUT`] for the sizing/timeout
     /// reasoning.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let pg_config = tokio_postgres::Config::from_str(config.dsn())
+        let mut pg_config = tokio_postgres::Config::from_str(config.dsn())
             .map_err(|err| Error::Config(format!("invalid database connection string: {err}")))?;
+        with_client_keepalives(&mut pg_config);
 
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -358,9 +363,9 @@ pub(crate) fn deterministic_text_output_options() -> String {
 /// (so unqualified reads/writes against a transform target table resolve
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
-/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]. Beyond
-/// those, this is the seam intake will use to enforce
-/// `synchronous_commit = on`.
+/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] and the
+/// server-side TCP keepalives ([`tcp_keepalive_gucs`]). Beyond those, this
+/// is the seam intake will use to enforce `synchronous_commit = on`.
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -368,11 +373,140 @@ async fn session_bootstrap(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(&format!(
-            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}",
+            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}",
             quote_ident(schema),
-            quote_ident(target_schema)
+            quote_ident(target_schema),
+            tcp_keepalive_gucs()
         ))
         .await
+}
+
+// ---------------------------------------------------------------------
+// Dead-peer detection: TCP keepalives on both ends (issue #364)
+// ---------------------------------------------------------------------
+
+/// How long a connection sits with no traffic before the first keepalive
+/// probe goes out. Applied on both ends; see [`tcp_keepalive_gucs`] for the
+/// server's half and [`with_client_keepalives`] for the client's.
+///
+/// # Why every Trellis connection gets these, and why these numbers
+///
+/// Postgres frees a session's locks only when the backend learns its
+/// client is gone. A process that exits closes its socket and the server
+/// notices at once. A network partition closes nothing: the backend sits
+/// idle on a socket whose peer can no longer answer until the kernel gives
+/// up on it, which with Linux defaults (`tcp_keepalive_time` 7200s, then 9
+/// probes 75s apart) is about 2h11m. The replication slot doesn't have
+/// this problem, because `wal_sender_timeout` (60s by default) ends the
+/// walsender on its own clock.
+///
+/// The producer session is where this hurt (issue #364): its backend holds
+/// the instance's producer-singleton advisory lock
+/// ([`crate::staging::session::producer_singleton_lock_key`]), so a
+/// partitioned producer kept every restart refused with
+/// `ProducerAlreadyRunning` for the whole two hours, staging nothing. But
+/// any connection partitioned mid-transaction pins its row and advisory
+/// locks the same way, so the pool and every dedicated connection get the
+/// same settings.
+///
+/// Idle 10s, then up to 3 probes 5s apart, is a dead peer declared about
+/// 25s after it last answered ([`TCP_USER_TIMEOUT`] matches that). That's
+/// inside `wal_sender_timeout`'s default 60s, so after a partition the
+/// producer lock is free before the slot is, and a restarting intake waits
+/// on the slot rather than on the lock. The cost is one probe per idle
+/// connection per 10s, and a connection is only given up on after it has
+/// missed three probes in a row.
+///
+/// Not configurable. These settings override any `keepalives*` or
+/// `tcp_user_timeout` in the DSN, and any server, database or role default
+/// for the `tcp_*` GUCs.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+
+/// The gap between keepalive probes once [`TCP_KEEPALIVE_IDLE`] has passed.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Unanswered probes before the connection is declared dead.
+const TCP_KEEPALIVE_COUNT: u32 = 3;
+
+/// How long data sent on the connection may go unacknowledged before the
+/// kernel drops it: [`TCP_KEEPALIVE_IDLE`] + [`TCP_KEEPALIVE_COUNT`] ×
+/// [`TCP_KEEPALIVE_INTERVAL`], the same 25s.
+///
+/// The keepalives alone don't cover a busy connection. Linux sends no
+/// keepalive probe while the socket has unacknowledged data in flight, so a
+/// partition that lands just after the server sent a reply (on a producer
+/// streaming changes, the likely case) is left to the retransmission
+/// timeout instead, about 15 minutes under the default `tcp_retries2`.
+/// `TCP_USER_TIMEOUT` bounds that case too, and when it's set Linux also
+/// uses it in place of the probe count to decide when keepalives have
+/// failed, which is why it matches the keepalive total.
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The `set` statements that make the **server** probe this connection's
+/// client and drop it once the client stops answering. This is the half
+/// that frees a partitioned session's locks. They're user-settable GUCs, so
+/// no privilege is needed.
+///
+/// Postgres ignores them on a unix-socket connection, which has no network
+/// to partition, and reads them back as `0` there. On a server without
+/// `TCP_USER_TIMEOUT`/`TCP_KEEPCNT` support it logs that it can't set that
+/// one, and the statement still succeeds.
+pub(crate) fn tcp_keepalive_gucs() -> String {
+    format!(
+        "set tcp_keepalives_idle to {}; set tcp_keepalives_interval to {}; \
+         set tcp_keepalives_count to {TCP_KEEPALIVE_COUNT}; set tcp_user_timeout to {}",
+        TCP_KEEPALIVE_IDLE.as_secs(),
+        TCP_KEEPALIVE_INTERVAL.as_secs(),
+        TCP_USER_TIMEOUT.as_millis()
+    )
+}
+
+/// The **client's** half of [`tcp_keepalive_gucs`]: `tokio_postgres`'s own
+/// keepalives, which default to 2h idle with OS-default probing.
+///
+/// Freeing the server's locks doesn't need this, but noticing the partition
+/// does. A client waiting on a reply from a partitioned server sees nothing
+/// arrive and, without its own probes, keeps waiting for the same two
+/// hours. On the producer that's intake stuck mid-append instead of
+/// failing, so the supervisor never restarts it. With these, the wait
+/// fails after about 25s and the restart path takes over.
+pub(crate) fn with_client_keepalives(config: &mut tokio_postgres::Config) {
+    config
+        .keepalives(true)
+        .keepalives_idle(TCP_KEEPALIVE_IDLE)
+        .keepalives_interval(TCP_KEEPALIVE_INTERVAL)
+        .keepalives_retries(TCP_KEEPALIVE_COUNT)
+        .tcp_user_timeout(TCP_USER_TIMEOUT);
+}
+
+/// Opens a standalone (non-pooled) connection to `dsn` with the client-side
+/// keepalives set. The caller spawns or polls the returned connection
+/// future, then runs [`dedicated_session_setup`] (or its own superset of
+/// it) before using the client.
+pub(crate) async fn connect_dedicated(
+    dsn: &str,
+) -> Result<
+    (
+        tokio_postgres::Client,
+        tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
+    ),
+    tokio_postgres::Error,
+> {
+    let mut config = tokio_postgres::Config::from_str(dsn)?;
+    with_client_keepalives(&mut config);
+    config.connect(NoTls).await
+}
+
+/// The session setup a dedicated connection runs straight after
+/// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
+/// pooled one: `search_path` pinned to `schema` then `public`,
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], and [`tcp_keepalive_gucs`].
+pub(crate) fn dedicated_session_setup(schema: &str) -> String {
+    format!(
+        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}",
+        quote_ident(schema),
+        tcp_keepalive_gucs()
+    )
 }
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text.
@@ -411,6 +545,31 @@ mod tests {
     fn quote_ident_escapes_embedded_quotes() {
         assert_eq!(quote_ident("trellis"), "\"trellis\"");
         assert_eq!(quote_ident("weird\"schema"), "\"weird\"\"schema\"");
+    }
+
+    /// Issue #364: the client probes on the same schedule the server does.
+    /// The server half is checked against a live TCP session in
+    /// `tests/tcp_keepalives.rs`; `tokio_postgres` exposes no way to read
+    /// the client's socket options back, so this checks the config instead.
+    #[test]
+    fn client_keepalives_match_the_server_schedule() {
+        let mut config = tokio_postgres::Config::from_str("host=127.0.0.1 keepalives_idle=7200")
+            .expect("parse dsn");
+        with_client_keepalives(&mut config);
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), TCP_KEEPALIVE_IDLE);
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(TCP_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(TCP_KEEPALIVE_COUNT));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&TCP_USER_TIMEOUT));
+        // The user timeout replaces the probe count on Linux once set, so
+        // it has to equal the probing budget or it changes the schedule.
+        assert_eq!(
+            TCP_USER_TIMEOUT,
+            TCP_KEEPALIVE_IDLE + TCP_KEEPALIVE_INTERVAL * TCP_KEEPALIVE_COUNT
+        );
     }
 
     #[test]

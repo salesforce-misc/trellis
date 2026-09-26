@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::MissedTickBehavior;
-use tokio_postgres::{Client, GenericClient, NoTls};
+use tokio_postgres::{Client, GenericClient};
 
 use super::error::StagingError;
 
@@ -375,16 +375,12 @@ impl Drop for HeartbeatDaemon {
 }
 
 async fn open_daemon_connection(dsn: &str, schema: &str) -> Result<Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
+    let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
     client
-        .batch_execute(&format!(
-            "set search_path to {}, public; {}",
-            crate::pool::quote_ident(schema),
-            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
-        ))
+        .batch_execute(&crate::pool::dedicated_session_setup(schema))
         .await?;
     Ok(client)
 }

@@ -45,7 +45,6 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tokio_postgres::NoTls;
 use tokio_postgres::config::Host;
 
 use crate::config::Config;
@@ -771,9 +770,9 @@ impl RestartBackoff {
 /// fails outright if the lock is held, so a refusal here always follows this
 /// client's own intake stopping. The usual holder is then this client's own
 /// previous producer session, which the server hasn't yet noticed is gone.
-/// After a network partition, that can last until the server's TCP
-/// keepalive gives up on it (hours, with OS defaults), and all staging is
-/// down meanwhile. A second `staging_worker` client that took the lock over
+/// After a network partition, that lasts until the server's TCP keepalive
+/// gives up on it, about 25s (issue #364; `crate::pool::TCP_KEEPALIVE_IDLE`
+/// has the numbers), and all staging is down meanwhile. A second `staging_worker` client that took the lock over
 /// is the other possibility; it reads `0` while this one climbs, so a fleet
 /// that deliberately runs one aggregates with `min by (slot)`.
 async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
@@ -1424,16 +1423,12 @@ async fn connect_plain(
     dsn: &str,
     schema: &str,
 ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await?;
+    let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
     client
-        .batch_execute(&format!(
-            "set search_path to {}, public; {}",
-            quote_ident(schema),
-            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
-        ))
+        .batch_execute(&crate::pool::dedicated_session_setup(schema))
         .await?;
     Ok(client)
 }
@@ -1926,7 +1921,7 @@ async fn open_wake_session(
     channel: String,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<impl std::future::Future<Output = ()>, tokio_postgres::Error> {
-    let (client, mut connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let (client, mut connection) = crate::pool::connect_dedicated(&dsn).await?;
     let driver = tokio::spawn(async move {
         loop {
             match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
@@ -1941,9 +1936,8 @@ async fn open_wake_session(
 
     if let Err(err) = client
         .batch_execute(&format!(
-            "set search_path to {}, public; {}; listen {}",
-            quote_ident(&schema),
-            crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS,
+            "{}; listen {}",
+            crate::pool::dedicated_session_setup(&schema),
             quote_ident(&channel)
         ))
         .await
@@ -2843,7 +2837,7 @@ mod backfill_chunk_claim_tests {
         let pool_config =
             crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
         let pool = Pool::new(&pool_config).expect("build a same-crate pool");
-        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
         tokio::spawn(async move {

@@ -1,9 +1,10 @@
 //! An ephemeral, disposable Postgres instance for integration tests, plus
 //! per-scenario database isolation on top of one running instance.
 //!
-//! [`TestCluster`] owns one `postgres` server process listening only on a
-//! unix socket in a throwaway temp directory; both are cleaned up when it's
-//! dropped. It's started with `wal_level=logical` (and matching
+//! [`TestCluster`] owns one `postgres` server process listening on a unix
+//! socket in a throwaway temp directory (and on loopback TCP only when
+//! started with [`TestCluster::start_with_tcp`]); both are cleaned up when
+//! it's dropped. It's started with `wal_level=logical` (and matching
 //! `max_replication_slots`/`max_wal_senders`) so intake's replication-slot
 //! machinery can be exercised against it.
 //! [`TestCluster::create_isolated_database`] then hands out a fresh,
@@ -84,13 +85,17 @@ impl Drop for ClusterPermit {
     }
 }
 
-/// One ephemeral Postgres server, reachable only over a unix socket,
+/// One ephemeral Postgres server, reachable over a unix socket (and, when
+/// started with [`TestCluster::start_with_tcp`], over loopback TCP too),
 /// configured for logical replication.
 pub struct TestCluster {
     root: PathBuf,
     data_dir: PathBuf,
     socket_dir: PathBuf,
     port: u16,
+    /// Whether the server also listens on `127.0.0.1:port`. See
+    /// [`TestCluster::start_with_tcp`].
+    tcp: bool,
     // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
     // through a shared reference: the generative suite keeps its cluster in
     // a `thread_local` and only ever hands out `&TestCluster`.
@@ -107,6 +112,24 @@ impl TestCluster {
     /// this is test-only scaffolding, not a place to build resilient error
     /// handling.
     pub fn start() -> Self {
+        Self::start_listening(false)
+    }
+
+    /// [`TestCluster::start`], plus a loopback TCP listener on a free port
+    /// that [`TestCluster::tcp_database_dsn`] reaches. For the few tests that
+    /// need a TCP session rather than a unix-socket one: Postgres ignores
+    /// the `tcp_keepalives_*`/`tcp_user_timeout` settings on a unix socket
+    /// and always reads them back as `0` there (issue #364).
+    ///
+    /// The port comes from binding `127.0.0.1:0` and letting it go just
+    /// before the server starts, so another process could in principle take
+    /// it in between. The server then fails to start and this panics, like
+    /// any other setup failure here.
+    pub fn start_with_tcp() -> Self {
+        Self::start_listening(true)
+    }
+
+    fn start_listening(tcp: bool) -> Self {
         // Reclaim segments/dirs leaked by prior runs that were killed before
         // `Drop` could stop their server. Once per process is enough: our own
         // live clusters are protected by the liveness check, and `Drop` frees
@@ -123,7 +146,10 @@ impl TestCluster {
         let socket_dir = root.join("sock");
         fs::create_dir_all(&socket_dir).expect("create socket dir");
 
-        let port: u16 = 5432;
+        // Unix-socket-only clusters all share 5432: the port only names the
+        // socket file, which lives in each cluster's own directory. A TCP
+        // listener needs a port nobody else holds.
+        let port: u16 = if tcp { free_loopback_port() } else { 5432 };
 
         // `initdb`'s bootstrap backend transiently allocates a SysV segment,
         // so on a machine whose small system-wide table (macOS `shmmni`
@@ -148,13 +174,14 @@ impl TestCluster {
         );
 
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, &log_path);
+        let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path);
 
         let cluster = Self {
             root,
             data_dir,
             socket_dir,
             port,
+            tcp,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -264,13 +291,14 @@ impl TestCluster {
 
         let port: u16 = 5432;
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, &log_path);
+        let server = spawn_server(&data_dir, &socket_dir, port, false, &log_path);
 
         let cluster = Self {
             root,
             data_dir,
             socket_dir,
             port,
+            tcp: false,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -288,6 +316,20 @@ impl TestCluster {
             self.socket_dir.display(),
             self.port,
             name
+        )
+    }
+
+    /// [`TestCluster::database_dsn`], but over loopback TCP rather than the
+    /// unix socket. Panics unless this cluster was started with
+    /// [`TestCluster::start_with_tcp`].
+    pub fn tcp_database_dsn(&self, name: &str) -> String {
+        assert!(
+            self.tcp,
+            "tcp_database_dsn needs a cluster started with TestCluster::start_with_tcp"
+        );
+        format!(
+            "host=127.0.0.1 port={} user=postgres dbname={}",
+            self.port, name
         )
     }
 
@@ -311,7 +353,13 @@ impl TestCluster {
         let _ = server.wait();
         while_down();
         let log_path = self.root.join("postgres.log");
-        *server = spawn_server(&self.data_dir, &self.socket_dir, self.port, &log_path);
+        *server = spawn_server(
+            &self.data_dir,
+            &self.socket_dir,
+            self.port,
+            self.tcp,
+            &log_path,
+        );
         drop(server);
         self.wait_ready(&log_path);
     }
@@ -584,7 +632,22 @@ impl StopMode {
 
 /// Starts `postgres` on `data_dir`, appending its output to `log_path` (so a
 /// [`TestCluster::restart`] keeps the log from before the restart).
-fn spawn_server(data_dir: &Path, socket_dir: &Path, port: u16, log_path: &Path) -> Child {
+/// A loopback TCP port that was free a moment ago. See
+/// [`TestCluster::start_with_tcp`] for the race this leaves open.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("find a free loopback port")
+        .port()
+}
+
+fn spawn_server(
+    data_dir: &Path,
+    socket_dir: &Path,
+    port: u16,
+    tcp: bool,
+    log_path: &Path,
+) -> Child {
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -594,7 +657,8 @@ fn spawn_server(data_dir: &Path, socket_dir: &Path, port: u16, log_path: &Path) 
         .arg("-D")
         .arg(data_dir)
         .arg("-h")
-        .arg("") // no TCP listener; unix socket only
+        // Unix socket only unless the cluster asked for loopback TCP.
+        .arg(if tcp { "127.0.0.1" } else { "" })
         .arg("-k")
         .arg(socket_dir)
         .arg("-p")
