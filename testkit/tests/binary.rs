@@ -18,11 +18,15 @@ struct Spawned {
 
 impl Spawned {
     fn start(args: &[&str]) -> Self {
+        Self::start_with_stderr(args, Stdio::inherit())
+    }
+
+    fn start_with_stderr(args: &[&str], stderr: Stdio) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_trellis-testkit"))
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .expect("spawn trellis-testkit");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -174,5 +178,20 @@ async fn sigterm_tears_the_cluster_down_with_a_client_still_connected() {
     assert!(status.success(), "kill -TERM failed");
 
     // stdin is still open here, so it was the signal that did it.
+    assert_torn_down(&mut spawned, &data_dir, pid);
+}
+
+#[test]
+fn a_host_that_captured_stderr_and_died_still_gets_a_clean_exit() {
+    // A host that spawned with stderr on a pipe too (Ruby's `Open3.popen3`,
+    // say) and then died: every pipe it held closes at once. Writing the
+    // teardown note into the dead stderr must not panic the binary.
+    let mut spawned = Spawned::start_with_stderr(&[], Stdio::piped());
+    let data_dir = spawned.data_dir();
+    let pid = spawned.postmaster_pid();
+
+    drop(spawned.child.stderr.take());
+    drop(spawned.stdin.take());
+
     assert_torn_down(&mut spawned, &data_dir, pid);
 }

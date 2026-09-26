@@ -35,8 +35,14 @@
 //!
 //! A host that can't keep a pipe on stdin (a CI step that backgrounds this
 //! with `&`, where stdin is `/dev/null`) passes `--ignore-stdin` and relies
-//! on a signal alone. If this process is itself SIGKILLed, nothing can tear
-//! down; the next [`TestCluster`] started on the machine reaps what it left.
+//! on a signal alone.
+//!
+//! Don't SIGKILL this process: nothing can tear down then. The `postgres`
+//! server outlives it (reparented to init) and keeps running, and testkit's
+//! orphan reaper deliberately never touches a directory whose postmaster is
+//! alive, so a later [`TestCluster`] won't clean it up either. Stop such a
+//! leftover with `pg_ctl stop -D <data_dir>` (`data_dir` is in the JSON).
+//! Closing stdin or sending SIGTERM is always enough.
 //!
 //! ```text
 //! trellis-testkit [--dbname NAME] [--ignore-stdin]
@@ -57,6 +63,9 @@
 //! # ... at exit:
 //! testkit.close # closes its stdin, then waits for teardown
 //! ```
+//!
+//! A forked child inherits the write end of that pipe, so EOF only arrives
+//! once every process holding it has exited or closed it.
 //!
 //! Elixir, with Postgrex (a port's stdin closes when its owner exits):
 //!
@@ -80,7 +89,8 @@ Starts a throwaway Postgres with the engine test suite's settings, creates
 one empty database, prints a JSON line with its connection details on
 stdout, and tears everything down on SIGTERM/SIGINT/SIGHUP or stdin EOF.
 
-  --dbname NAME    name of the database to create (default: trellis_test)
+  --dbname NAME    name of the database to create: ASCII letters, digits
+                   and underscores, at most 63 (default: trellis_test)
   --ignore-stdin   don't treat stdin EOF as the signal to tear down";
 
 struct Args {
@@ -100,6 +110,7 @@ impl Args {
                     parsed.dbname = args
                         .next()
                         .ok_or_else(|| "--dbname needs a value".to_string())?;
+                    check_dbname(&parsed.dbname)?;
                 }
                 "--ignore-stdin" => parsed.watch_stdin = false,
                 other => return Err(format!("unrecognized argument `{other}`")),
@@ -107,6 +118,31 @@ impl Args {
         }
         Ok(parsed)
     }
+}
+
+/// Restricts `--dbname` to names that need no quoting. The printed `dsn` is
+/// an unquoted libpq keyword/value string, so a space or a quote would make
+/// it unparseable, and `createdb` would read a leading `-` as an option.
+fn check_dbname(name: &str) -> Result<(), String> {
+    let plain = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    // 63 bytes is Postgres's identifier limit (NAMEDATALEN - 1); a longer
+    // name would be silently truncated to something the JSON doesn't say.
+    if name.is_empty() || name.len() > 63 || !plain {
+        return Err(format!(
+            "--dbname `{name}` must be 1 to 63 ASCII letters, digits or underscores"
+        ));
+    }
+    Ok(())
+}
+
+/// A line on stderr that can't fail. Once a cluster exists, `eprintln!`
+/// would panic if stderr is a pipe whose reader has gone (a host that
+/// captured stderr and then died), and a second panic in teardown would
+/// abort before the server is stopped.
+fn note(message: std::fmt::Arguments) {
+    let _ = writeln!(std::io::stderr(), "trellis-testkit: {message}");
 }
 
 fn main() -> ExitCode {
@@ -154,7 +190,9 @@ async fn run(args: Args) -> ExitCode {
     let mut stdout = std::io::stdout().lock();
     if let Err(error) = writeln!(stdout, "{info}").and_then(|()| stdout.flush()) {
         // Nobody is reading: whoever spawned us is gone.
-        eprintln!("trellis-testkit: could not write connection info ({error}); tearing down");
+        note(format_args!(
+            "could not write connection info ({error}); tearing down"
+        ));
         drop(cluster);
         return ExitCode::FAILURE;
     }
@@ -171,7 +209,7 @@ async fn run(args: Args) -> ExitCode {
             }
         } => "stdin closed",
     };
-    eprintln!("trellis-testkit: {reason}; tearing down");
+    note(format_args!("{reason}; tearing down"));
     // The handlers stay installed through teardown, so a second signal
     // (an impatient runner, a double Ctrl-C) can't cut it short.
     drop(cluster);
@@ -217,5 +255,17 @@ mod tests {
     fn rejects_a_missing_value_and_unknown_flags() {
         assert!(parse(&["--dbname"]).is_err());
         assert!(parse(&["--tcp"]).is_err());
+    }
+
+    #[test]
+    fn rejects_a_dbname_the_dsn_or_createdb_would_misread() {
+        // Each of these would print a `dsn` libpq can't parse back to the
+        // same database, or reach `createdb` as an option.
+        for name in ["has space", "a'b", "a\"b", "--ignore-stdin", "-V", ""] {
+            assert!(parse(&["--dbname", name]).is_err(), "accepted {name:?}");
+        }
+        assert!(parse(&["--dbname", &"a".repeat(64)]).is_err());
+        assert!(parse(&["--dbname", &"a".repeat(63)]).is_ok());
+        assert!(parse(&["--dbname", "App_Test_2"]).is_ok());
     }
 }
