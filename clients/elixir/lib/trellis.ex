@@ -382,8 +382,7 @@ defmodule Trellis do
 
   @doc """
   Waits until every change committed at or before `token` has reached its
-  target tables, or `timeout_ms` passes (an `:internal` error naming the
-  timeout).
+  target tables, or `timeout_ms` passes (a `:timeout` error; retry it).
 
   It waits for captured changes only: a transform that isn't `:live` yet
   may still be missing rows when this returns (see `status/2`).
