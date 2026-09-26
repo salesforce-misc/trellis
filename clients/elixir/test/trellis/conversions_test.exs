@@ -11,7 +11,8 @@ defmodule Trellis.ConversionsTest do
     QuarantineEntry,
     Relationship,
     RelationshipSummary,
-    SamplePage
+    SamplePage,
+    SelfCheckReport
   }
 
   @micros 1_727_222_400_654_321
@@ -45,6 +46,51 @@ defmodule Trellis.ConversionsTest do
                 :altered,
                 :unknown
               ]}
+
+    assert Trellis.Native.self_check_outcomes() ==
+             {:ok, [:converged, :not_caught_up, :diverged]}
+
+    assert Trellis.Native.divergence_kinds() ==
+             {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column]}
+  end
+
+  test "a self-check report's divergences become structs" do
+    report =
+      SelfCheckReport.from_native(%{
+        target: "order_totals",
+        checked_through: "1/16B3748",
+        rows_compared: 2,
+        next_after: "2",
+        outcome: :diverged,
+        divergences: [
+          %{kind: :cell, key: "1", column: "total", persisted: "9999", recomputed: nil},
+          %{kind: :extra_column, key: nil, column: "legacy", persisted: nil, recomputed: nil}
+        ]
+      })
+
+    assert report == %SelfCheckReport{
+             target: "order_totals",
+             checked_through: "1/16B3748",
+             rows_compared: 2,
+             next_after: "2",
+             outcome: :diverged,
+             divergences: [
+               %Trellis.Divergence{
+                 kind: :cell,
+                 key: "1",
+                 column: "total",
+                 persisted: "9999",
+                 recomputed: nil
+               },
+               %Trellis.Divergence{
+                 kind: :extra_column,
+                 key: nil,
+                 column: "legacy",
+                 persisted: nil,
+                 recomputed: nil
+               }
+             ]
+           }
   end
 
   defp native_definition do

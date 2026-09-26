@@ -21,6 +21,8 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146 and
   `poisoned_since/2`: the quarantine reads. Resuming is a statement.
 - `request_backfill/2`, `has_live_drain_workers/1`,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
+- `self_check/3`: audit one page of a target against a fresh recompute from
+  its source, reporting any divergence.
 
 ```elixir
 # A deploy's migration step: the defaults run nothing in the background.
@@ -60,8 +62,9 @@ and some connection must run drain threads, or no definition ever reaches
 - Times are `DateTime`s. They cross the NIF as epoch microseconds.
 - A quarantine target is an address string, `"transform"` or
   `"transform.column"`, exactly as `quarantined/1` reports it.
-- `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are opaque:
-  pass back what the previous call returned.
+- `sample_quarantined/3`'s and `self_check/3`'s cursors and
+  `watermark_token/1`'s token are opaque: pass back what the previous call
+  returned.
 - Every call runs on a dirty IO scheduler.
 
 ## Layout

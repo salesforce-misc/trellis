@@ -31,6 +31,10 @@ defmodule Trellis.Native do
   def has_live_staging_worker(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def watermark_token(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def await_converged(_handle, _token, _timeout_ms), do: :erlang.nif_error(:nif_not_loaded)
+
+  def self_check(_handle, _target_table, _after, _limit, _mode, _timeout_ms),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def shutdown(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def error_codes, do: :erlang.nif_error(:nif_not_loaded)
   def status_names, do: :erlang.nif_error(:nif_not_loaded)
@@ -38,4 +42,6 @@ defmodule Trellis.Native do
   def cardinality_names, do: :erlang.nif_error(:nif_not_loaded)
   def applied_kinds, do: :erlang.nif_error(:nif_not_loaded)
   def statement_kinds, do: :erlang.nif_error(:nif_not_loaded)
+  def self_check_outcomes, do: :erlang.nif_error(:nif_not_loaded)
+  def divergence_kinds, do: :erlang.nif_error(:nif_not_loaded)
 end

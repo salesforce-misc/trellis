@@ -30,6 +30,7 @@ use crate::app::{
     RelationshipSummary, Trellis, TrellisError, TrellisOptions,
 };
 use crate::config::Config;
+use crate::staging::{SelfCheckMode, SelfCheckReport, SelfCheckScope};
 
 /// One [`BlockingTrellis`] method call, carried over a channel to the
 /// dedicated background thread that owns the real, async [`Trellis`] (see
@@ -65,6 +66,13 @@ enum Job {
     HasLiveStagingWorker(oneshot::Sender<Result<bool, TrellisError>>),
     WatermarkToken(oneshot::Sender<Result<PgLsn, TrellisError>>),
     AwaitConverged(PgLsn, Duration, oneshot::Sender<Result<(), TrellisError>>),
+    SelfCheck(
+        String,
+        SelfCheckScope,
+        SelfCheckMode,
+        Duration,
+        oneshot::Sender<Result<SelfCheckReport, TrellisError>>,
+    ),
     Shutdown(oneshot::Sender<Result<(), TrellisError>>),
 }
 
@@ -86,8 +94,21 @@ enum Job {
 /// [`TrellisError::CalledFromAsyncContext`] rather than blocking, since
 /// blocking such a thread would deadlock/panic inside `tokio` itself. Use
 /// the async [`Trellis`] directly in that context instead.
+///
+/// Every public [`Trellis`] method has a twin here except one, left
+/// async-only on purpose: [`Trellis::pool`]. The pool hands out async
+/// connections, which a caller with no `tokio` runtime of its own (the whole
+/// audience of this type) can't drive, and which were never meant to cross
+/// an FFI boundary. A caller that needs its own queries against the target
+/// tables opens its own connection. The `tests` module below checks that
+/// no other method is missing.
 pub struct BlockingTrellis {
     job_tx: mpsc::UnboundedSender<Job>,
+    /// A copy of the configuration the background thread's [`Trellis`]
+    /// connected with, so [`BlockingTrellis::config`] can hand out a
+    /// reference without a round trip. [`Config`] is immutable once built, so
+    /// the copy can't drift from the original.
+    config: Config,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -103,6 +124,7 @@ impl BlockingTrellis {
     pub fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), TrellisError>>();
+        let kept_config = config.clone();
 
         let thread = std::thread::Builder::new()
             .name("trellis-blocking".to_string())
@@ -121,6 +143,7 @@ impl BlockingTrellis {
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(BlockingTrellis {
                 job_tx,
+                config: kept_config,
                 thread: Some(thread),
             }),
             Ok(Err(err)) => {
@@ -135,6 +158,14 @@ impl BlockingTrellis {
                 Err(TrellisError::BlockingThreadExitedBeforeReady)
             }
         }
+    }
+
+    /// The resolved configuration (schema names, DSN) this instance connected
+    /// with. See [`Trellis::config`]. Like [`BlockingTrellis::metrics`], this
+    /// doesn't round-trip through the background thread: the handle keeps its
+    /// own copy of the (immutable) [`Config`] it was connected with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Applies Trellis's schema migrations. See [`Trellis::migrate`].
@@ -257,6 +288,26 @@ impl BlockingTrellis {
     /// on a shared handle, not just this one. Size it accordingly.
     pub fn await_converged(&self, token: PgLsn, timeout: Duration) -> Result<(), TrellisError> {
         self.submit(|reply| Job::AwaitConverged(token, timeout, reply))
+    }
+
+    /// Audits one page of `target_table` against an independent recompute of
+    /// its definition from the source. See [`Trellis::self_check`] for what
+    /// `scope`, `mode` and `timeout` mean and what the report holds.
+    ///
+    /// Like [`BlockingTrellis::await_converged`], this can hold the
+    /// background thread for up to `timeout` per convergence await it makes
+    /// (one under [`SelfCheckMode::Strict`], up to two under
+    /// [`SelfCheckMode::Standard`]), plus the comparison itself, so every
+    /// other call on a shared handle queues behind it for that long.
+    pub fn self_check(
+        &self,
+        target_table: &str,
+        scope: SelfCheckScope,
+        mode: SelfCheckMode,
+        timeout: Duration,
+    ) -> Result<SelfCheckReport, TrellisError> {
+        let target_table = target_table.to_string();
+        self.submit(|reply| Job::SelfCheck(target_table, scope, mode, timeout, reply))
     }
 
     /// Stops any background work this connection started and waits for the
@@ -399,6 +450,9 @@ async fn run(
             Job::AwaitConverged(token, timeout, reply) => {
                 let _ = reply.send(trellis.await_converged(token, timeout).await);
             }
+            Job::SelfCheck(table, scope, mode, timeout, reply) => {
+                let _ = reply.send(trellis.self_check(&table, scope, mode, timeout).await);
+            }
             Job::Shutdown(reply) => {
                 let _ = reply.send(trellis.shutdown().await);
                 return;
@@ -463,5 +517,70 @@ mod tests {
             err.to_string().contains("worker_threads"),
             "error should name the offending option, got: {err}"
         );
+    }
+}
+
+/// Issue #587: a public [`Trellis`] method with no [`BlockingTrellis`] twin
+/// is unreachable from every binding, and nothing else notices the gap. This
+/// reads both `impl` blocks' source and fails naming any method missing from
+/// the blocking side, so adding one to `Trellis` without bridging it (or
+/// listing it in `ASYNC_ONLY` with a reason on [`BlockingTrellis`]'s doc)
+/// breaks the build's tests rather than a binding author's afternoon.
+///
+/// It reads source text rather than a hand-kept list of both method sets, so
+/// the only thing maintained by hand is the deliberate exception. It relies
+/// on `rustfmt`'s layout (`impl Trellis {` at column 0, closed by a bare `}`,
+/// methods indented four spaces), which `verify`'s fmt check guarantees.
+#[cfg(test)]
+mod surface_tests {
+    /// Public `Trellis` methods deliberately left async-only; see
+    /// [`super::BlockingTrellis`]'s doc comment for why.
+    const ASYNC_ONLY: &[&str] = &["pool"];
+
+    /// The names of the `pub` methods in `source`'s `impl <type_name> {`
+    /// block.
+    fn public_methods(source: &str, type_name: &str) -> Vec<String> {
+        let header = format!("impl {type_name} {{");
+        let mut lines = source.lines().skip_while(|line| *line != header);
+        assert!(
+            lines.next().is_some(),
+            "no `{header}` block found; has it moved?"
+        );
+        lines
+            .take_while(|line| *line != "}")
+            .filter_map(|line| {
+                let rest = line
+                    .strip_prefix("    pub async fn ")
+                    .or_else(|| line.strip_prefix("    pub fn "))?;
+                let end = rest.find(['(', '<'])?;
+                Some(rest[..end].to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_public_trellis_method_has_a_blocking_twin() {
+        let trellis = public_methods(include_str!("app.rs"), "Trellis");
+        let blocking = public_methods(include_str!("blocking.rs"), "BlockingTrellis");
+        // Guards the parser itself: an empty set would pass vacuously.
+        assert!(trellis.contains(&"self_check".to_string()), "{trellis:?}");
+        assert!(blocking.contains(&"self_check".to_string()), "{blocking:?}");
+
+        let missing: Vec<&String> = trellis
+            .iter()
+            .filter(|name| !ASYNC_ONLY.contains(&name.as_str()) && !blocking.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "public Trellis methods with no BlockingTrellis twin: {missing:?}. Bridge each in \
+             blocking.rs, or add it to ASYNC_ONLY and say why on BlockingTrellis's doc comment"
+        );
+
+        for name in ASYNC_ONLY {
+            assert!(
+                trellis.iter().any(|method| method == name),
+                "ASYNC_ONLY lists `{name}`, which is no longer a public Trellis method"
+            );
+        }
     }
 }

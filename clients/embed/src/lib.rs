@@ -27,6 +27,8 @@
 //! | [`trellis::PoisonEntry`] | fields + poison time | [`PlainPoisonEntry`] |
 //! | a page of [`trellis::PoisonSample`] | the rows + the next page's cursor | [`PlainSamplePage`] |
 //! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
+//! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word | [`PlainSelfCheckReport`] |
+//! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
 //!
 //! One piece of shared logic isn't flattening: [`require_transform_statement`]
 //! is the check a binding's `define` makes before calling `apply`, so that a
@@ -40,6 +42,7 @@ mod definition;
 mod error;
 mod quarantine;
 mod relationship;
+mod self_check;
 mod statement;
 mod status;
 mod time;
@@ -57,6 +60,10 @@ pub use quarantine::{
 };
 pub use relationship::{
     PlainRelationship, PlainRelationshipSummary, relationship_cardinality_names,
+};
+pub use self_check::{
+    DIVERGENCE_KINDS, PlainDivergence, PlainSelfCheckReport, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    self_check_mode,
 };
 pub use statement::require_transform_statement;
 pub use status::{

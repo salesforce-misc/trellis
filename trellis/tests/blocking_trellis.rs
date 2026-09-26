@@ -15,9 +15,14 @@
 //! No `.await` appears anywhere in the `BlockingTrellis`-driving portion of
 //! any test below.
 
+use std::time::Duration;
 use testkit::TestCluster;
 use trellis::config::DEFAULT_TARGET_SCHEMA;
-use trellis::{BlockingTrellis, Config, TransformStatus, TrellisError, TrellisOptions};
+
+use trellis::{
+    BlockingTrellis, Config, SelfCheckError, SelfCheckMode, SelfCheckScope, TransformStatus,
+    TrellisError, TrellisOptions,
+};
 
 /// (a) + (c): a full lifecycle — connect, migrate, define, definitions(), a
 /// status check, and shutdown — driven entirely through `BlockingTrellis`
@@ -45,8 +50,9 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     drop(setup_runtime);
 
     let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let trellis =
-        BlockingTrellis::connect(config, TrellisOptions::default()).expect("connect (sync)");
+    let trellis = BlockingTrellis::connect(config.clone(), TrellisOptions::default())
+        .expect("connect (sync)");
+    assert_eq!(trellis.config().dsn(), config.dsn());
 
     trellis.migrate().expect("migrate (sync)");
 
@@ -71,6 +77,27 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     assert!(
         status.is_some(),
         "a just-registered definition must report some status"
+    );
+
+    // Issue #587: `self_check` reaches the engine through the blocking
+    // facade too. An unregistered target fails before any convergence wait,
+    // so this proves the bridge without needing a staging worker.
+    let result = trellis.self_check(
+        "no_such_target",
+        SelfCheckScope {
+            after: None,
+            limit: 10,
+        },
+        SelfCheckMode::Strict,
+        Duration::from_secs(1),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TrellisError::SelfCheck(SelfCheckError::TargetNotFound(ref target)))
+                if target == "no_such_target"
+        ),
+        "expected TargetNotFound, got {result:?}"
     );
 
     trellis.shutdown().expect("shutdown (sync)");

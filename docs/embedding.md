@@ -147,8 +147,8 @@ about an individual transform's own progress.
 ### Wiring it into a host health check
 
 The bindings are in progress (epic #140): the Elixir binding in
-`clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146 and
-#147), and the Ruby binding doesn't exist yet. Each is a thin
+`clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146,
+#147 and #587), and the Ruby binding doesn't exist yet. Each is a thin
 Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
 decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
 and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`

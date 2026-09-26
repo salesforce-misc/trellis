@@ -14,7 +14,8 @@
 //! - **Only plain data crosses** (decision 4). The flattening itself is
 //!   `trellis-embed`'s; this crate only turns its plain values into terms.
 //!   Words become atoms here (statuses, quarantine states, relationship
-//!   cardinalities, `apply` outcome kinds), but only ever words from the
+//!   cardinalities, `apply` outcome kinds, `self_check` outcomes and
+//!   divergence kinds), but only ever words from the
 //!   closed sets `trellis-embed` lists, which [`load`] allocates up front,
 //!   never a string read from the database.
 //!
@@ -29,13 +30,14 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
-use trellis::{BlockingTrellis, Config, ErrorCode, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions};
 use trellis_embed::{
-    ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainError, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
-    PlainRelationshipSummary, PlainSamplePage, decode_cursor, decode_watermark, encode_watermark,
+    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainDefinition,
+    PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry,
+    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
+    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark, encode_watermark,
     quarantine_state_names, relationship_cardinality_names, require_transform_statement,
-    system_time_from_epoch_micros, transform_status_names,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -184,6 +186,8 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(quarantine_state_names())
         .chain(relationship_cardinality_names())
         .chain(PlainApplied::KINDS)
+        .chain(SELF_CHECK_OUTCOMES)
+        .chain(DIVERGENCE_KINDS)
 }
 
 impl DefinitionTerm {
@@ -287,6 +291,58 @@ struct PoisonSampleTerm {
 struct SamplePageTerm {
     samples: Vec<PoisonSampleTerm>,
     next_cursor: Option<String>,
+}
+
+/// What `self_check/3` found. `outcome` is one of
+/// [`SELF_CHECK_OUTCOMES`]; `divergences` is empty unless it is `diverged`.
+#[derive(NifMap)]
+struct SelfCheckReportTerm {
+    target: String,
+    checked_through: String,
+    rows_compared: i64,
+    next_after: Option<String>,
+    outcome: Atom,
+    divergences: Vec<DivergenceTerm>,
+}
+
+/// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
+/// [`PlainDivergence`] for which other fields each kind sets.
+#[derive(NifMap)]
+struct DivergenceTerm {
+    kind: Atom,
+    key: Option<String>,
+    column: Option<String>,
+    persisted: Option<String>,
+    recomputed: Option<String>,
+}
+
+impl SelfCheckReportTerm {
+    fn new(env: Env, report: PlainSelfCheckReport) -> NifReply<Self> {
+        Ok(SelfCheckReportTerm {
+            target: report.target,
+            checked_through: report.checked_through,
+            rows_compared: report.rows_compared,
+            next_after: report.next_after,
+            outcome: word_atom(env, report.outcome)?,
+            divergences: report
+                .divergences
+                .into_iter()
+                .map(|divergence| DivergenceTerm::new(env, divergence))
+                .collect::<NifReply<_>>()?,
+        })
+    }
+}
+
+impl DivergenceTerm {
+    fn new(env: Env, divergence: PlainDivergence) -> NifReply<Self> {
+        Ok(DivergenceTerm {
+            kind: word_atom(env, divergence.kind)?,
+            key: divergence.key,
+            column: divergence.column,
+            persisted: divergence.persisted,
+            recomputed: divergence.recomputed,
+        })
+    }
 }
 
 impl RelationshipTerm {
@@ -562,6 +618,35 @@ fn await_converged(handle: ResourceArc<Handle>, token: String, timeout_ms: u64) 
     Ok(rustler::types::atom::ok())
 }
 
+/// Audits up to `limit` of `target_table`'s keys after `after` (`nil` for the
+/// first page) against a fresh recompute from the source, in `mode`
+/// (`"standard"` or `"strict"`), waiting up to `timeout_ms` per convergence
+/// await.
+///
+/// Like `await_converged`, it holds a dirty IO scheduler, and the handle, for
+/// as long as it waits.
+#[rustler::nif(schedule = "DirtyIo")]
+fn self_check(
+    env: Env,
+    handle: ResourceArc<Handle>,
+    target_table: String,
+    after: Option<String>,
+    limit: i64,
+    mode: String,
+    timeout_ms: u64,
+) -> NifReply<SelfCheckReportTerm> {
+    let mode = self_check_mode(&mode).map_err(plain)?;
+    let report = handle.with(|trellis| {
+        trellis.self_check(
+            &target_table,
+            SelfCheckScope { after, limit },
+            mode,
+            Duration::from_millis(timeout_ms),
+        )
+    })?;
+    SelfCheckReportTerm::new(env, PlainSelfCheckReport::from(&report))
+}
+
 /// `target_table`'s status, or `nil` when no definition writes it.
 #[rustler::nif(schedule = "DirtyIo")]
 fn status(
@@ -620,6 +705,18 @@ fn cardinality_names(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn applied_kinds(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, PlainApplied::KINDS.to_vec())
+}
+
+/// Every outcome atom `self_check/3`'s report can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn self_check_outcomes(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, SELF_CHECK_OUTCOMES.to_vec())
+}
+
+/// Every divergence kind atom `self_check/3`'s report can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn divergence_kinds(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, DIVERGENCE_KINDS.to_vec())
 }
 
 /// Every statement kind `trellis`'s grammar has, for the Elixir test

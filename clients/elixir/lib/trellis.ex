@@ -18,8 +18,9 @@ defmodule Trellis do
     `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
     statements: `apply(trellis, "RESUME TRANSFORM order_totals.total")`.
   - **Operations:** `request_backfill/2`, `has_live_drain_workers/1`,
-    `has_live_staging_worker/1`, and the read-your-writes pair
-    `watermark_token/1` and `await_converged/3`.
+    `has_live_staging_worker/1`, the read-your-writes pair
+    `watermark_token/1` and `await_converged/3`, and the audit
+    `self_check/3`.
 
       # A deploy's migration step: the defaults run nothing in the background.
       {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
@@ -44,8 +45,9 @@ defmodule Trellis do
   - A quarantine target is an address string: a transform's bare target
     table name (`"order_totals"`) or `"transform.column"`
     (`"order_totals.total"`), exactly as `quarantined/1` reports it.
-  - `sample_quarantined/3`'s cursor and `watermark_token/1`'s token are
-    opaque: pass back what the previous call returned.
+  - `sample_quarantined/3`'s and `self_check/3`'s cursors and
+    `watermark_token/1`'s token are opaque: pass back what the previous call
+    returned.
   - Every atom in a result comes from a closed set allocated when the NIF
     loads; none is ever built from a string the database returned.
 
@@ -70,6 +72,7 @@ defmodule Trellis do
     QuarantineEntry,
     RelationshipSummary,
     SamplePage,
+    SelfCheckReport,
     Status
   }
 
@@ -406,6 +409,67 @@ defmodule Trellis do
   def await_converged!(trellis, token, timeout_ms),
     do: bang(await_converged(trellis, token, timeout_ms))
 
+  @typedoc """
+  Options for `self_check/3`:
+
+  - `:limit` (required): the most keys to audit in this call.
+  - `:timeout_ms` (required): how long to wait for the target to catch up,
+    per wait. A `:standard` check waits up to twice, a `:strict` one once.
+  - `:after`: the `next_after` of the previous report. Default `nil`, the
+    first page.
+  - `:mode`: `:standard` (default) re-checks anything that differs after a
+    fresh wait, so a change still in flight isn't reported; it is safe while
+    the source is being written. `:strict` skips the re-check, and is only
+    sound once writes to the audited tables have stopped.
+  """
+  @type self_check_option ::
+          {:limit, pos_integer()}
+          | {:timeout_ms, non_neg_integer()}
+          | {:after, SelfCheckReport.cursor() | nil}
+          | {:mode, :standard | :strict}
+
+  @doc """
+  Audits one page of `target_table` against a fresh recompute of its
+  definition from the source tables, and reports what differs. See
+  `t:self_check_option/0` and `Trellis.SelfCheckReport`.
+
+  Only a one-row-per-source-key transform can be audited; an aggregate
+  target is a `:validation` error, and an unknown one `:not_found`. A
+  column that is paused is left out of the comparison.
+
+  To sweep a whole target, chain calls through `next_after`:
+
+      {:ok, report} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000)
+      {:ok, next} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000, after: report.next_after)
+
+  Like `await_converged/3`, it holds the handle while it waits, so every
+  other call on it waits behind this one.
+  """
+  @spec self_check(t(), String.t(), [self_check_option()]) ::
+          {:ok, SelfCheckReport.t()} | {:error, Error.t()}
+  def self_check(%__MODULE__{ref: ref}, target_table, options)
+      when is_binary(target_table) and is_list(options) do
+    with {:ok, opts} <- self_check_options(options),
+         {:ok, report} <-
+           native(
+             Native.self_check(
+               ref,
+               target_table,
+               opts.after,
+               opts.limit,
+               Atom.to_string(opts.mode),
+               opts.timeout_ms
+             )
+           ) do
+      {:ok, SelfCheckReport.from_native(report)}
+    end
+  end
+
+  @doc "Like `self_check/3`, but raises `Trellis.Error`."
+  @spec self_check!(t(), String.t(), [self_check_option()]) :: SelfCheckReport.t()
+  def self_check!(trellis, target_table, options),
+    do: bang(self_check(trellis, target_table, options))
+
   @doc """
   Stops the handle's background work and waits for its threads to exit. Any
   later call on the handle returns a `:validation` error; shutting down again
@@ -484,6 +548,41 @@ defmodule Trellis do
 
           true ->
             {:ok, limit, cursor}
+        end
+    end
+  end
+
+  @self_check_keys [:limit, :timeout_ms, :after, :mode]
+
+  defp self_check_options(options) do
+    case Keyword.split(options, @self_check_keys) do
+      {_, [_ | _] = unknown} ->
+        invalid(
+          "unknown options #{inspect(Keyword.keys(unknown))}; known: #{inspect(@self_check_keys)}"
+        )
+
+      {known, []} ->
+        opts = Map.merge(%{after: nil, mode: :standard}, Map.new(known))
+        limit = Map.get(opts, :limit)
+        timeout_ms = Map.get(opts, :timeout_ms)
+
+        cond do
+          not (is_integer(limit) and limit in 1..@max_limit) ->
+            invalid(":limit is required and must be a positive integer, got: #{inspect(limit)}")
+
+          not (is_integer(timeout_ms) and timeout_ms in 0..@max_timeout_ms) ->
+            invalid(
+              ":timeout_ms is required and must be a non-negative integer, got: #{inspect(timeout_ms)}"
+            )
+
+          not (is_nil(opts.after) or is_binary(opts.after)) ->
+            invalid(":after must be a cursor from a previous report, got: #{inspect(opts.after)}")
+
+          opts.mode not in [:standard, :strict] ->
+            invalid(":mode must be :standard or :strict, got: #{inspect(opts.mode)}")
+
+          true ->
+            {:ok, opts}
         end
     end
   end
