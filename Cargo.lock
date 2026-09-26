@@ -2041,6 +2041,7 @@ dependencies = [
 name = "trellis-embed"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "trellis",
 ]
 

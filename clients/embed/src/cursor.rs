@@ -112,6 +112,31 @@ mod tests {
         assert_eq!(next_cursor(&[]), None);
     }
 
+    proptest::proptest! {
+        /// Any two strings, whatever bytes they hold, come back unchanged.
+        #[test]
+        fn any_pair_round_trips(src_table in ".*", key in ".*") {
+            let cursor = encode_cursor(&src_table, &key);
+            proptest::prop_assert_eq!(
+                decode_cursor(Some(&cursor)).unwrap(),
+                Some((src_table, key)),
+            );
+        }
+
+        /// Any string decodes without panicking, to either a validation error
+        /// or exactly the pair whose cursor it is.
+        #[test]
+        fn any_string_decodes_canonically_or_is_rejected(cursor in "[0-9]{0,3}:?.*|.*") {
+            match decode_cursor(Some(&cursor)) {
+                Ok(Some((src_table, key))) => {
+                    proptest::prop_assert_eq!(encode_cursor(&src_table, &key), cursor);
+                }
+                Ok(None) => proptest::prop_assert!(false, "Some decoded to None"),
+                Err(err) => proptest::prop_assert_eq!(err.code, "validation"),
+            }
+        }
+    }
+
     #[test]
     fn a_malformed_cursor_is_a_validation_error() {
         for cursor in [

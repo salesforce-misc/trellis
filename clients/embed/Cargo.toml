@@ -19,3 +19,6 @@ trellis = { path = "../../trellis" }
 # this never reaches the `cli` binary — see `trellis/Cargo.toml`'s
 # `test-util` comment for the check.
 trellis = { path = "../../trellis", features = ["test-util"] }
+# The cursor's round-trip and never-panics properties. Pure string work, so
+# they run in the default suite (not `#[ignore]`d like `generative`'s).
+proptest = "1.11"

@@ -6,7 +6,12 @@
 use trellis::QuarantineTarget;
 
 /// `target`'s address: `transform` for a whole transform, `transform.column`
-/// for one column. [`QuarantineTarget::parse`] reads it back.
+/// for one column.
+///
+/// [`QuarantineTarget::parse`] reads back the address of every target
+/// `trellis` reports, whose names are grammar identifiers and so hold no dot.
+/// A hand-built target with a dot in its transform name does not round-trip
+/// (see `parse`'s doc), and nothing here pretends otherwise.
 pub fn quarantine_address(target: &QuarantineTarget) -> String {
     target.to_string()
 }
@@ -27,6 +32,8 @@ mod tests {
         assert_eq!(quarantine_address(&target), "order_totals.total");
     }
 
+    /// The targets `trellis` reports have identifier names, and those
+    /// round-trip.
     #[test]
     fn addresses_round_trip_through_parse() {
         for target in [

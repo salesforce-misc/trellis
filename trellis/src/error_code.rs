@@ -63,10 +63,9 @@ impl ErrorCode {
     /// explicit code mapping against, since `#[non_exhaustive]` stops any
     /// crate but this one from matching the enum exhaustively.
     ///
-    /// Adding a variant means adding it here as well as to [`Self::as_str`]
-    /// (which the compiler already stops you on);
-    /// `every_variant_is_listed_in_all` below is the reminder. The bindings'
-    /// own test then fails until they map the new code deliberately.
+    /// Adding a variant fails `every_variant_is_listed_in_all` below until it
+    /// is added here as well (`assert_all_is_every_variant` in this module), and the
+    /// bindings' own test then fails until they map the new code deliberately.
     pub const ALL: [ErrorCode; 6] = [
         ErrorCode::Parse,
         ErrorCode::Validation,
@@ -95,6 +94,42 @@ impl fmt::Display for ErrorCode {
         f.write_str(self.as_str())
     }
 }
+
+/// Test-only: asserts that `$ty::ALL` holds exactly the variants named, and
+/// that the names are every variant of `$ty`.
+///
+/// An exhaustive `match` over `ALL` alone is only a reminder: naming a new
+/// variant in the `match` satisfies the compiler while `ALL` still lacks it.
+/// Here one list of names feeds both the `match` (which stops compiling until
+/// a new variant is named) and the membership check against `ALL` (which
+/// then fails until `ALL` has it too).
+#[cfg(test)]
+macro_rules! assert_all_is_every_variant {
+    ($ty:ident: $($variant:ident),+ $(,)?) => {{
+        fn exhaustive(value: $ty) {
+            match value {
+                $($ty::$variant => {})+
+            }
+        }
+        let named = [$($ty::$variant),+];
+        for value in named {
+            exhaustive(value);
+            assert!(
+                $ty::ALL.contains(&value),
+                "{value:?} is missing from {}::ALL",
+                stringify!($ty),
+            );
+        }
+        assert_eq!(
+            $ty::ALL.len(),
+            named.len(),
+            "{}::ALL lists a variant twice",
+            stringify!($ty),
+        );
+    }};
+}
+#[cfg(test)]
+pub(crate) use assert_all_is_every_variant;
 
 /// Classifies a raw `tokio_postgres::Error` the way every error variant in
 /// this crate that wraps one directly (typically named `Db` or `Connect`)
@@ -152,22 +187,19 @@ mod tests {
 
     use super::*;
 
-    /// The compile-time half of [`ErrorCode::ALL`]'s contract: a new variant
-    /// fails to compile here until it gets an arm, which is the prompt to add
-    /// it to `ALL` too. The runtime half checks `ALL` has no duplicates and
-    /// that every listed code has its own `as_str` form.
+    /// [`ErrorCode::ALL`] is exactly the enum's variants, so a new code can't
+    /// skip the bindings' mapping test by being left out of `ALL`. Every
+    /// listed code also has its own `as_str` form.
     #[test]
     fn every_variant_is_listed_in_all() {
-        for code in ErrorCode::ALL {
-            match code {
-                ErrorCode::Parse
-                | ErrorCode::Validation
-                | ErrorCode::Connectivity
-                | ErrorCode::Conflict
-                | ErrorCode::NotFound
-                | ErrorCode::Internal => {}
-            }
-        }
+        assert_all_is_every_variant!(
+            ErrorCode: Parse,
+            Validation,
+            Connectivity,
+            Conflict,
+            NotFound,
+            Internal,
+        );
         let names: std::collections::HashSet<&str> =
             ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
         assert_eq!(names.len(), ErrorCode::ALL.len());
