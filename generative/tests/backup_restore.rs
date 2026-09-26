@@ -17,12 +17,10 @@
 //! backup and restored cluster are deleted before the case returns, so a
 //! deep run holds at most two extra copies of the cluster at a time.
 //!
-//! Every run here also takes [`RESTORE_GATE`], one at a time. A restore
-//! starts a second cluster while the first is still up, and testkit caps a
-//! process at four live clusters, so four runs each holding one cluster
-//! and waiting for another would wait forever. That is exactly what
-//! `-- --include-ignored` did before the gate: the three pins and the
-//! property, all blocked in `TestCluster::from_backup`.
+//! A restore starts a second cluster while the run still holds its first.
+//! testkit draws restored clusters from their own permit pool (issue #569),
+//! so these runs can go in parallel without four of them each holding one
+//! cluster and waiting forever for another.
 
 use generative::backend::ManualBackend;
 use generative::generate::{
@@ -33,21 +31,8 @@ use generative::model::{BackupKind, Op, Program, RestorePlan};
 use generative::run::{RunError, run_convergence_with_restore};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use testkit::TestCluster;
 use trellis::{Config, Pool};
-
-/// Serializes this file's runs; see the module doc comment. A pin takes it
-/// before starting its own cluster, so a pin waiting here holds none, and
-/// the most live at once is the property's per-thread cluster plus one run's
-/// two.
-static RESTORE_GATE: Mutex<()> = Mutex::new(());
-
-/// Takes [`RESTORE_GATE`]. A run that failed while holding it poisons it,
-/// which says nothing about the next one, so poisoning is ignored.
-fn restore_gate() -> MutexGuard<'static, ()> {
-    RESTORE_GATE.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -117,7 +102,6 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_a_cold_copy_restore_converges_without_a_pause((program, plan) in program_with_restore_plan()) {
         HARNESS.with(|h| {
-            let _gate = restore_gate();
             h.runtime
                 .block_on(run(&h.cluster, &program, &plan))
                 .map_err(TestCaseError::fail)
@@ -190,9 +174,8 @@ fn cold_copy_at(backup_op: usize) -> RestorePlan {
 }
 
 /// Runs [`one_to_one_and_aggregate_program`] backed up at `backup_op` on a
-/// cluster of its own, under [`RESTORE_GATE`].
+/// cluster of its own.
 fn pin(backup_op: usize) {
-    let _gate = restore_gate();
     let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let cluster = TestCluster::start();
     runtime

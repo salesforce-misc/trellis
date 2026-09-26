@@ -33,7 +33,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Condvar, Mutex, Once};
+use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 use trellis::{Config, Pool, migrate};
 
@@ -51,37 +51,127 @@ fn unique_suffix() -> String {
 /// `postgres` holds one SysV shared-memory segment as a startup interlock,
 /// and macOS's `kern.sysv.shmseg` defaults to 8; without a cap, libtest
 /// fanning tests across many cores starts enough clusters at once to exhaust
-/// the segment table and fail `initdb`. 4 stays well under the limit with
-/// headroom for a dropping cluster whose segment isn't freed until its
-/// `pg_ctl stop` returns.
+/// the segment table and fail `initdb`.
+///
+/// Clusters come from two pools, so the most live at once is
+/// `MAX_LIVE_CLUSTERS + MAX_RESTORED_CLUSTERS` (6), still under the limit.
+/// [`TestCluster::start`] takes from [`CLUSTERS`];
+/// [`TestCluster::from_backup`] takes from [`RESTORED_CLUSTERS`]. A restore
+/// is the one place a test starts a second cluster while it still holds its
+/// first, and with a single pool, `MAX_LIVE_CLUSTERS` tests each holding
+/// one and waiting in `from_backup` for another would wait forever (issue
+/// #569). With two, a restore only ever waits on other restores, which
+/// wait on nothing unless they restore again, so one level of nesting
+/// can't deadlock.
 const MAX_LIVE_CLUSTERS: usize = 4;
-static LIVE_CLUSTERS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+/// Cap on clusters started by [`TestCluster::from_backup`]; see
+/// [`MAX_LIVE_CLUSTERS`].
+const MAX_RESTORED_CLUSTERS: usize = 2;
+
+/// How long a wait for a permit may go without *any* permit in its pool
+/// being released before it panics. The deadline resets on every release,
+/// so a long queue behind busy tests never trips it; only a pool where
+/// nothing moves at all does, which is a deadlock rather than contention:
+/// e.g. tests that each hold a restored cluster and restore again. Generous,
+/// because a long-running property can legitimately hold a cluster for many
+/// minutes.
+const PERMIT_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static CLUSTERS: PermitPool = PermitPool::new("cluster", MAX_LIVE_CLUSTERS, PERMIT_STALL_TIMEOUT);
+static RESTORED_CLUSTERS: PermitPool = PermitPool::new(
+    "restored-cluster",
+    MAX_RESTORED_CLUSTERS,
+    PERMIT_STALL_TIMEOUT,
+);
+
+/// A counting semaphore over live clusters. See [`MAX_LIVE_CLUSTERS`].
+struct PermitPool {
+    name: &'static str,
+    max: usize,
+    stall_timeout: Duration,
+    state: Mutex<PoolState>,
+    released: Condvar,
+}
+
+struct PoolState {
+    live: usize,
+    /// Bumped on every release, so a waiter can tell a pool that is moving
+    /// from one that is stuck.
+    releases: u64,
+}
+
+impl PermitPool {
+    const fn new(name: &'static str, max: usize, stall_timeout: Duration) -> Self {
+        Self {
+            name,
+            max,
+            stall_timeout,
+            state: Mutex::new(PoolState {
+                live: 0,
+                releases: 0,
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    // A panic elsewhere while the lock is held says nothing about the count,
+    // so poisoning is ignored rather than cascading into every later test.
+    fn lock(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for a free permit. Panics if the pool is full and no permit is
+    /// released for [`PermitPool::stall_timeout`], rather than hanging the
+    /// test binary with no error.
+    fn acquire(&'static self) -> ClusterPermit {
+        let mut state = self.lock();
+        let mut seen = state.releases;
+        let mut deadline = Instant::now() + self.stall_timeout;
+        while state.live >= self.max {
+            if state.releases != seen {
+                seen = state.releases;
+                deadline = Instant::now() + self.stall_timeout;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let held = state.live;
+                // Unlock before panicking so the pool stays usable.
+                drop(state);
+                panic!(
+                    "{} permit exhausted: {held} of {} held and none released in {:?}; \
+                     is a test holding a cluster while it waits for another (nested from_backup)?",
+                    self.name, self.max, self.stall_timeout
+                );
+            }
+            state = self
+                .released
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.live += 1;
+        ClusterPermit { pool: self }
+    }
+}
 
 /// RAII permit for one live cluster. Acquired before `initdb` and released
 /// only when dropped — which, for a permit held in [`TestCluster`], happens
 /// after the server has been stopped and its segment freed. Held as a local
 /// first in `start()` so a panic during setup releases it rather than
 /// deadlocking later tests.
-struct ClusterPermit;
-
-impl ClusterPermit {
-    fn acquire() -> Self {
-        let (lock, cvar) = &LIVE_CLUSTERS;
-        let mut live = lock.lock().expect("cluster permit lock");
-        while *live >= MAX_LIVE_CLUSTERS {
-            live = cvar.wait(live).expect("cluster permit wait");
-        }
-        *live += 1;
-        ClusterPermit
-    }
+struct ClusterPermit {
+    pool: &'static PermitPool,
 }
 
 impl Drop for ClusterPermit {
     fn drop(&mut self) {
-        let (lock, cvar) = &LIVE_CLUSTERS;
-        let mut live = lock.lock().expect("cluster permit lock");
-        *live -= 1;
-        cvar.notify_one();
+        let mut state = self.pool.lock();
+        state.live -= 1;
+        state.releases += 1;
+        drop(state);
+        // Every waiter, not one: each tracks releases to tell a busy pool
+        // from a stuck one, so one left asleep would miss the progress.
+        self.pool.released.notify_all();
     }
 }
 
@@ -139,7 +229,7 @@ impl TestCluster {
 
         // Gate concurrent clusters before any `initdb`; a local so setup
         // panics release it, then moved into the returned cluster.
-        let permit = ClusterPermit::acquire();
+        let permit = CLUSTERS.acquire();
 
         let root = std::env::temp_dir().join(format!("trellis-testkit-{}", unique_suffix()));
         let data_dir = root.join("data");
@@ -281,9 +371,18 @@ impl TestCluster {
     ///
     /// `backup` is copied, not consumed, so it can be restored from more
     /// than once. Torn down on drop like any other [`TestCluster`].
+    ///
+    /// Safe to call while holding the cluster the backup came from: restored
+    /// clusters have their own, smaller cap (see `MAX_LIVE_CLUSTERS`), so a
+    /// restore never waits on a regular cluster being dropped. Restoring
+    /// again while holding a *restored* cluster isn't covered by that; if
+    /// that exhausts the restored pool, this panics after a long stall
+    /// rather than hanging.
     pub fn from_backup(backup: &ClusterBackup) -> Self {
         reap_orphans_once();
-        let permit = ClusterPermit::acquire();
+        // From its own pool: the caller usually still holds the cluster the
+        // backup came from. See `MAX_LIVE_CLUSTERS`.
+        let permit = RESTORED_CLUSTERS.acquire();
 
         let root = std::env::temp_dir().join(format!("trellis-testkit-{}", unique_suffix()));
         let data_dir = root.join("data");
@@ -1193,5 +1292,63 @@ mod tests {
             "directories without the trellis-testkit- prefix must be left alone"
         );
         let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// Issue #569: a restore started while every regular cluster permit is
+    /// held, the caller's own among them, comes up instead of waiting for a
+    /// permit no one will release. Before #569, `from_backup` drew from the
+    /// same pool and blocked here forever; the restore runs on its own
+    /// thread so that regression fails this test instead of hanging it.
+    #[test]
+    fn a_restore_comes_up_while_every_cluster_permit_is_held() {
+        let source = TestCluster::start();
+        let backup = source.cold_backup();
+        // `source` holds one; take the rest. Nothing else in this binary
+        // starts a cluster, so these never wait.
+        let _rest: Vec<ClusterPermit> =
+            (1..MAX_LIVE_CLUSTERS).map(|_| CLUSTERS.acquire()).collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(TestCluster::from_backup(&backup));
+        });
+        let restored = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("from_backup blocked on the full cluster pool");
+        assert_ne!(restored.root(), source.root());
+    }
+
+    /// Issue #569: a wait on a pool where nothing is ever released panics,
+    /// with a message naming the likely cause, instead of hanging.
+    #[test]
+    #[should_panic(
+        expected = "test-cluster permit exhausted: 1 of 1 held and none released in 100ms; \
+                    is a test holding a cluster while it waits for another (nested from_backup)?"
+    )]
+    fn a_permit_wait_that_never_moves_panics_instead_of_hanging() {
+        static POOL: PermitPool = PermitPool::new("test-cluster", 1, Duration::from_millis(100));
+        let _held = POOL.acquire();
+        let _never = POOL.acquire();
+    }
+
+    /// A wait behind a busy pool isn't a stall: every release restarts the
+    /// deadline, so a waiter still gets its permit after waiting far longer
+    /// than the stall timeout in total, as long as releases keep coming.
+    /// The releases are counted without freeing a slot, so the only way
+    /// the waiter survives to take the final, real one is the reset.
+    #[test]
+    fn releases_keep_a_long_permit_wait_from_counting_as_a_stall() {
+        static POOL: PermitPool = PermitPool::new("busy", 1, Duration::from_millis(300));
+        let held = POOL.acquire();
+        let waiter = std::thread::spawn(|| drop(POOL.acquire()));
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(100));
+            POOL.lock().releases += 1;
+            POOL.released.notify_all();
+        }
+        drop(held);
+        waiter
+            .join()
+            .expect("the waiter panicked as stalled despite ongoing releases");
     }
 }
