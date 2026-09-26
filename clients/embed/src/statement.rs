@@ -21,13 +21,13 @@ use crate::PlainError;
 /// that doesn't parse is the `parse` error `apply` would have returned.
 pub fn require_transform_statement(text: &str) -> Result<(), PlainError> {
     match trellis::statement_kind(text)? {
-        StatementKind::Transform => Ok(()),
+        StatementKind::DefineTransform => Ok(()),
         other => Err(PlainError::new(
             ErrorCode::Validation,
             format!(
                 "define takes only a TRANSFORM statement, and this is a {} statement, so \
                  nothing was applied",
-                other.as_str().to_ascii_uppercase()
+                other.keywords()
             ),
         )),
     }
@@ -54,11 +54,14 @@ mod tests {
                 "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
                 "RELATIONSHIP",
             ),
-            ("PAUSE TRANSFORM widget_prices", "PAUSE"),
-            ("RESUME TRANSFORM widget_prices", "RESUME"),
-            ("  drop TRANSFORM widget_prices", "DROP"),
-            ("DROP RELATIONSHIP widgets.owner", "DROP"),
-            ("ALTER TRANSFORM widget_prices DROP doubled", "ALTER"),
+            ("PAUSE TRANSFORM widget_prices", "PAUSE TRANSFORM"),
+            ("RESUME TRANSFORM widget_prices", "RESUME TRANSFORM"),
+            ("  drop TRANSFORM widget_prices", "DROP TRANSFORM"),
+            ("DROP RELATIONSHIP widgets.owner", "DROP RELATIONSHIP"),
+            (
+                "ALTER TRANSFORM widget_prices DROP doubled",
+                "ALTER TRANSFORM",
+            ),
         ] {
             let err = require_transform_statement(text).unwrap_err();
             assert_eq!(err.code, "validation", "{text:?}");

@@ -169,12 +169,12 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// [`crate::Trellis::apply`] would carry out, and a statement `apply` would
 /// refuse as malformed is the same [`ParseError`] here, whatever keyword it
 /// leads with (`TRANSFORM oops` is an error, not a
-/// [`StatementKind::Transform`]).
+/// [`StatementKind::DefineTransform`]).
 ///
 /// It is pure on the text: nothing is read from or written to the database.
 /// That is what lets an embedding binding (issue #580) refuse the wrong form
 /// before it applies anything — a `define` that only defines transforms
-/// checks for [`StatementKind::Transform`] and then calls `apply` with the
+/// checks for [`StatementKind::DefineTransform`] and then calls `apply` with the
 /// same text, and nothing can happen between the two to change the answer.
 pub fn statement_kind(input: &str) -> Result<StatementKind, ParseError> {
     parse_statement(input).map(|statement| statement.kind())

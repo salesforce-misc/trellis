@@ -84,7 +84,8 @@ defmodule TrellisTest do
     for statement <- [
           "PAUSE TRANSFORM gadget_prices",
           "  drop transform gadget_prices",
-          "RELATIONSHIP owner FROM gadgets.id TO gadgets.id"
+          "RELATIONSHIP owner FROM gadgets.id TO gadgets.id",
+          "DROP RELATIONSHIP gadgets.owner"
         ] do
       assert {:error, %Error{code: :validation, message: message}} =
                Trellis.define(trellis, statement)
@@ -104,6 +105,10 @@ defmodule TrellisTest do
 
     assert {:error, %Error{code: :parse}} = Trellis.define(trellis, "TRANSFORM oops")
     assert_raise Error, fn -> Trellis.define!(trellis, "TRANSFORM oops") end
+
+    # A malformed statement of another form is the same :parse error, not a
+    # :validation refusal naming a form it never managed to be.
+    assert {:error, %Error{code: :parse}} = Trellis.define(trellis, "DROP gadget_prices")
   end
 
   test "a table no transform writes has no status" do

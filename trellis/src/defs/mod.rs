@@ -1257,41 +1257,54 @@ mod statement_grammar_tests {
     // --- statement_kind (issue #580) -------------------------------------
 
     /// One well-formed statement of every form, with the kind it must
-    /// classify as. Both `DROP` subjects and every `ALTER` clause are here,
-    /// since each is its own path through the parser.
-    const EVERY_FORM: [(&str, StatementKind); 11] = [
+    /// classify as. Both `DROP` subjects (schema-qualified or not) and every
+    /// `ALTER` clause are here, since each is its own path through the parser.
+    const EVERY_FORM: [(&str, StatementKind); 12] = [
         (
             "TRANSFORM widget_prices FROM widgets SELECT price AS price",
-            StatementKind::Transform,
+            StatementKind::DefineTransform,
         ),
         (
             "TRANSFORM widget_totals FROM widgets GROUP BY owner_id \
              SELECT owner_id AS owner_id, SUM(price) AS total",
-            StatementKind::Transform,
+            StatementKind::DefineTransform,
         ),
         (
             "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
-            StatementKind::Relationship,
+            StatementKind::DefineRelationship,
         ),
-        ("PAUSE TRANSFORM widget_prices", StatementKind::Pause),
-        ("PAUSE TRANSFORM widget_prices.price", StatementKind::Pause),
+        (
+            "PAUSE TRANSFORM widget_prices",
+            StatementKind::PauseTransform,
+        ),
+        (
+            "PAUSE TRANSFORM widget_prices.price",
+            StatementKind::PauseTransform,
+        ),
         (
             "RESUME TRANSFORM widget_prices.price",
-            StatementKind::Resume,
+            StatementKind::ResumeTransform,
         ),
-        ("DROP TRANSFORM widget_prices", StatementKind::Drop),
-        ("DROP RELATIONSHIP widgets.owner", StatementKind::Drop),
+        ("DROP TRANSFORM widget_prices", StatementKind::DropTransform),
+        (
+            "DROP RELATIONSHIP widgets.owner",
+            StatementKind::DropRelationship,
+        ),
+        (
+            "DROP RELATIONSHIP shop.widgets.owner",
+            StatementKind::DropRelationship,
+        ),
         (
             "ALTER TRANSFORM widget_prices ADD price + price AS doubled",
-            StatementKind::Alter,
+            StatementKind::AlterTransform,
         ),
         (
             "ALTER TRANSFORM widget_prices DROP doubled",
-            StatementKind::Alter,
+            StatementKind::AlterTransform,
         ),
         (
             "ALTER TRANSFORM widget_prices ALTER doubled AS price + price + price",
-            StatementKind::Alter,
+            StatementKind::AlterTransform,
         ),
     ];
 
@@ -1300,6 +1313,11 @@ mod statement_grammar_tests {
         for (text, kind) in EVERY_FORM {
             assert_eq!(statement_kind(text).unwrap(), kind, "{text:?}");
             assert_eq!(parse_statement(text).unwrap().kind(), kind, "{text:?}");
+            assert!(
+                text.starts_with(&format!("{} ", kind.keywords())),
+                "{text:?} doesn't open with {:?}",
+                kind.keywords()
+            );
         }
         let covered: std::collections::HashSet<StatementKind> =
             EVERY_FORM.iter().map(|&(_, kind)| kind).collect();
@@ -1386,18 +1404,24 @@ mod statement_grammar_tests {
     #[test]
     fn every_statement_kind_is_listed_in_all() {
         crate::error_code::assert_all_is_every_variant!(
-            StatementKind: Transform,
-            Relationship,
-            Pause,
-            Resume,
-            Drop,
-            Alter,
+            StatementKind: DefineTransform,
+            DefineRelationship,
+            PauseTransform,
+            ResumeTransform,
+            DropTransform,
+            DropRelationship,
+            AlterTransform,
         );
         let names: std::collections::HashSet<&str> = StatementKind::ALL
             .iter()
             .map(|kind| kind.as_str())
             .collect();
         assert_eq!(names.len(), StatementKind::ALL.len());
+        let keywords: std::collections::HashSet<&str> = StatementKind::ALL
+            .iter()
+            .map(|kind| kind.keywords())
+            .collect();
+        assert_eq!(keywords.len(), StatementKind::ALL.len());
         for kind in StatementKind::ALL {
             assert_eq!(kind.to_string(), kind.as_str());
         }
