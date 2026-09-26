@@ -1113,6 +1113,8 @@ impl Trellis {
     /// [`TrellisError::Staging`]`(`[`StagingError::ConvergenceTimeout`]`)`
     /// on timeout — a named, matchable condition rather than a generic
     /// failure, whose [`TrellisError::code`] is [`ErrorCode::Timeout`].
+    /// `timeout` holds even while a poll is blocked, on a lock say: the
+    /// server abandons the poll at the deadline (issue #596).
     ///
     /// `token` is `pg_current_wal_lsn()`, which normally sits *ahead* of the
     /// caller's own commit: any unrelated WAL (another backend, a write to an
@@ -1141,7 +1143,7 @@ impl Trellis {
         timeout: Duration,
     ) -> Result<(), TrellisError> {
         let client = self.pool.get().await?;
-        Ok(converge::await_converged(&**client, token, timeout).await?)
+        Ok(converge::await_converged(&client, token, timeout).await?)
     }
 
     /// Audits one target's persisted rows against an independently-rendered

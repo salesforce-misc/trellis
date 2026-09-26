@@ -468,3 +468,135 @@ async fn await_converged_times_out_with_a_named_error() {
         other => panic!("expected ConvergenceTimeout, got {other:?}"),
     }
 }
+
+/// Takes `ACCESS EXCLUSIVE` on `poison_held` (which every convergence poll
+/// reads, condition 4) in an open transaction on `holder`, so a poll on
+/// another session blocks on the lock until `holder` rolls back.
+async fn lock_poison_held(holder: &Client) {
+    holder
+        .batch_execute("begin; lock table poison_held in access exclusive mode")
+        .await
+        .expect("lock poison_held");
+}
+
+/// Backends queued behind the `poison_held` lock right now.
+async fn poison_held_waiters(observer: &Client) -> i64 {
+    observer
+        .query_one(
+            "select count(*) from pg_locks \
+             where relation = 'poison_held'::regclass and not granted",
+            &[],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// Issue #596: `await_converged`'s deadline must hold while a poll is
+/// blocked. Before the fix it checked the deadline only between polls, so a
+/// poll queued behind a lock waited out any timeout (here: until the lock is
+/// released, which this test only does after the call returns).
+///
+/// Three things are pinned: the wait ends in exactly
+/// [`StagingError::ConvergenceTimeout`] (`self_check` reads only that
+/// variant as "not caught up", #592) and does so promptly; the server-side
+/// query is gone once it returns (no backend still queued on the lock); and
+/// the same connection serves a later wait normally.
+#[tokio::test]
+async fn await_converged_times_out_while_a_poll_blocks_on_a_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    // Nothing pending, progress past the token: the only thing standing
+    // between this token and `converged` is the lock.
+    seed_progress(&client, "slot1", 1000).await;
+    let token = PgLsn::from(50);
+
+    lock_poison_held(&holder).await;
+
+    let timeout = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        converge::await_converged(&client, token, timeout),
+    )
+    .await
+    .expect("await_converged hung past its own 200ms deadline on a blocked poll");
+    let elapsed = started.elapsed();
+
+    match result {
+        Err(StagingError::ConvergenceTimeout {
+            token: got_token,
+            waited,
+        }) => {
+            assert_eq!(got_token, token);
+            assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
+        }
+        other => panic!("expected ConvergenceTimeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a 200ms wait took {elapsed:?} to give up on a blocked poll"
+    );
+
+    // Still holding the lock: had the poll only been abandoned client-side,
+    // its query would still be queued on it.
+    assert_eq!(
+        poison_held_waiters(&holder).await,
+        0,
+        "the timed-out poll's query must not keep running on the server"
+    );
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release lock");
+    converge::await_converged(&client, token, Duration::from_secs(5))
+        .await
+        .expect("the connection must serve a later wait once the lock is released");
+}
+
+/// Issue #596's other half: a `statement_timeout` the session set itself,
+/// shorter than the wait's budget, fires well before the wait's deadline.
+/// That's the caller's own setting cancelling a query, not the wait running
+/// out of time, so it must surface as the database error it is rather than
+/// as [`StagingError::ConvergenceTimeout`].
+#[tokio::test]
+async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    seed_progress(&client, "slot1", 1000).await;
+    let token = PgLsn::from(50);
+    client
+        .batch_execute("set statement_timeout = '100ms'")
+        .await
+        .expect("set statement_timeout");
+
+    lock_poison_held(&holder).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        converge::await_converged(&client, token, Duration::from_secs(60)),
+    )
+    .await
+    .expect("the session's own 100ms statement_timeout must end the wait");
+
+    match result {
+        Err(StagingError::Db(err)) => assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::QUERY_CANCELED),
+            "expected the session's statement_timeout, got {err}"
+        ),
+        other => panic!("expected the session's statement_timeout as a Db error, got {other:?}"),
+    }
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release lock");
+}

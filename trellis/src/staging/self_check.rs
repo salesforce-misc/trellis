@@ -543,7 +543,7 @@ async fn await_then_compare(
     let token = {
         let client = pool.get().await?;
         let token = converge::watermark_token(&**client).await?;
-        if !caught_up(converge::await_converged(&**client, token, timeout).await)? {
+        if !caught_up(converge::await_converged(&client, token, timeout).await)? {
             return Ok(AwaitOutcome::NotCaughtUp { attempted: token });
         }
         token

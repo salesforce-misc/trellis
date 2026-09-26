@@ -290,6 +290,68 @@ async fn await_converged_times_out_with_a_named_staging_error() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// Issue #596, through the pool: a poll blocked on a lock ends in
+/// [`StagingError::ConvergenceTimeout`] (code [`ErrorCode::Timeout`]) at the
+/// deadline, and the pooled connection it ran on comes back usable. The pool
+/// has one connection, so the follow-up wait (and `watermark_token` before
+/// it) must reuse the very connection the timed-out poll ran on.
+#[tokio::test]
+async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let config = Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_pool_max_size(1)
+        .expect("pool size");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let token = trellis.watermark_token().await.expect("watermark_token");
+    let raw = connect_raw(db.dsn()).await;
+    // Converged but for the lock: progress at the token, nothing pending.
+    seed_progress(&raw, "slot1", token).await;
+    raw.batch_execute("begin; lock table poison_held in access exclusive mode")
+        .await
+        .expect("lock poison_held");
+
+    let timeout = Duration::from_millis(200);
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        trellis.await_converged(token, timeout),
+    )
+    .await
+    .expect("await_converged hung past its own deadline on a blocked poll");
+    let elapsed = started.elapsed();
+    match result {
+        Err(err @ TrellisError::Staging(StagingError::ConvergenceTimeout { .. })) => {
+            assert_eq!(err.code(), ErrorCode::Timeout);
+        }
+        other => panic!("expected TrellisError::Staging(ConvergenceTimeout), got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a 200ms wait took {elapsed:?} to give up on a blocked poll"
+    );
+
+    raw.batch_execute("rollback").await.expect("release lock");
+    let token = trellis.watermark_token().await.expect("watermark_token");
+    raw.execute(
+        "update replication_progress set confirmed_lsn = $1",
+        &[&token],
+    )
+    .await
+    .expect("advance progress");
+    trellis
+        .await_converged(token, Duration::from_secs(5))
+        .await
+        .expect("the pooled connection must serve a later wait");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// `BlockingTrellis::watermark_token`/`BlockingTrellis::await_converged` must
 /// work from a plain, non-async `#[test]` with no surrounding `tokio`
 /// runtime on the calling thread — `trellis/tests/blocking_trellis.rs`'s own

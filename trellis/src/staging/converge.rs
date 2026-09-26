@@ -37,8 +37,9 @@
 
 use std::time::{Duration, Instant};
 
-use tokio_postgres::GenericClient;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
+use tokio_postgres::{Client, GenericClient, SimpleQueryMessage, SimpleQueryRow};
 
 use super::append::{RING_SIZE, ring_table_name};
 use super::error::StagingError;
@@ -115,10 +116,23 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// of a write made outside a drain. A missing origin can only make a wait
 /// longer, never let it return early; before #469 every row was missing one,
 /// so a busy stream gated every token on work committed after it.
+///
+/// The engine itself only polls through [`await_converged`], which inlines
+/// [`converged_sql`] into its bounded poll; this typed, unbounded form is
+/// for tests and harnesses that re-check once.
+#[cfg(any(test, feature = "test-util", feature = "internals"))]
 pub async fn converged_through(
     client: &impl GenericClient,
     token: PgLsn,
 ) -> Result<bool, StagingError> {
+    let row = client.query_one(&converged_sql("$1"), &[&token]).await?;
+    Ok(row.get(0))
+}
+
+/// [`converged_through`]'s query, one boolean column, with the token spelled
+/// as the SQL expression `token`: `$1` for the typed query above, or an
+/// inlined `pg_lsn` literal for [`await_converged`]'s simple-protocol poll.
+fn converged_sql(token: &str) -> String {
     // `origin_lsn` is nullable — a row of unknown origin (a backfill
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
     // "unknown" to "conservatively old" — a NULL must gate exactly like the
@@ -146,15 +160,17 @@ pub async fn converged_through(
         format!(
             "((select ring_slot from segment_pointer) = {slot} \
               and coalesce( \
-                  (select min(origin_lsn) from {table}) <= $1 \
+                  (select min(origin_lsn) from {table}) <= {token} \
                   or exists (select 1 from {table} where origin_lsn is null), \
                   false \
               ))"
         )
     });
 
-    let condition4 = "select 1 from poison_held \
-                       where origin_lsn is null or origin_lsn <= $1";
+    let condition4 = format!(
+        "select 1 from poison_held \
+         where origin_lsn is null or origin_lsn <= {token}"
+    );
 
     // Invariant this leans on: a physical `seg_N` only holds rows while it has
     // a `segments` row (the `exists (... segments ...)` term). A slot's rows
@@ -189,7 +205,7 @@ pub async fn converged_through(
         format!(
             "select 1 from {table} r \
              where (select ring_slot from segment_pointer) <> {slot} \
-               and (r.origin_lsn is null or r.origin_lsn <= $1) \
+               and (r.origin_lsn is null or r.origin_lsn <= {token}) \
                and exists ( \
                    select 1 from segments s \
                    where s.ring_slot = {slot} \
@@ -201,16 +217,13 @@ pub async fn converged_through(
         )
     });
 
-    let sql = format!(
+    format!(
         "select \
-             coalesce((select min(confirmed_lsn) from replication_progress) >= $1, false) \
+             coalesce((select min(confirmed_lsn) from replication_progress) >= {token}, false) \
              and not ({condition2}) \
              and not exists ({condition3}) \
              and not exists ({condition4})"
-    );
-
-    let row = client.query_one(&sql, &[&token]).await?;
-    Ok(row.get(0))
+    )
 }
 
 /// "Is anything pending at all?" — the cheap gate the doc's "Ask for the
@@ -319,13 +332,21 @@ pub(crate) async fn request_intake_confirm(
 /// keepalive (issue #452). A wait that is already satisfied, or blocked only
 /// on draining, writes nothing.
 ///
+/// `timeout` bounds the whole call, including a poll that blocks (on a lock,
+/// say) rather than returning (issue #596): each poll runs under a
+/// server-side `statement_timeout` of the remaining budget; see
+/// [`poll_within_deadline`].
+///
 /// The engine's own workers do the actual draining; this only waits for
 /// them. On timeout, returns [`StagingError::ConvergenceTimeout`] — a named
 /// variant, not a generic "values not stabilizing" message (see the error
 /// variant's own doc comment for why that framing is actively misleading
 /// here).
+///
+/// Takes a plain [`Client`], not a transaction: each poll is its own
+/// implicit transaction, and the timeout it sets must not outlive it.
 pub async fn await_converged(
-    client: &impl GenericClient,
+    client: &Client,
     token: PgLsn,
     timeout: Duration,
 ) -> Result<(), StagingError> {
@@ -333,33 +354,140 @@ pub async fn await_converged(
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
 
     let started = Instant::now();
+    let wait = Deadline {
+        token,
+        started,
+        timeout,
+    };
+    // `PgLsn`'s `Display` is Postgres's own `X/Y` hex form: nothing to escape.
+    let token_literal = format!("'{token}'::pg_lsn");
+    let converged = converged_sql(&token_literal);
+    let request_confirm = format!(
+        "select pg_logical_emit_message(false, '{CONVERGE_MESSAGE_PREFIX}', '') \
+         where coalesce((select min(confirmed_lsn) from replication_progress) \
+                        < {token_literal}, false)"
+    );
     let mut backoff = INITIAL_BACKOFF;
     let mut requested = false;
     loop {
-        if converged_through(client, token).await? {
+        let rows = poll_within_deadline(client, &wait, &converged).await?;
+        // Anything but a `true` reads as "not yet": fails closed, never early.
+        if rows.last().and_then(|row| row.get(0)) == Some("t") {
             return Ok(());
         }
         if !requested {
             requested = true;
-            let behind: bool = client
-                .query_one(
-                    "select coalesce((select min(confirmed_lsn) from replication_progress) < $1, \
-                     false)",
-                    &[&token],
-                )
-                .await?
-                .get(0);
-            if behind {
-                request_intake_confirm(client).await?;
-            }
+            poll_within_deadline(client, &wait, &request_confirm).await?;
         }
         let waited = started.elapsed();
         if waited >= timeout {
-            return Err(StagingError::ConvergenceTimeout { token, waited });
+            return Err(wait.expired());
         }
         tokio::time::sleep(backoff.min(timeout - waited)).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+}
+
+/// One [`await_converged`] call's deadline, and the error it expires into.
+struct Deadline {
+    token: PgLsn,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl Deadline {
+    fn remaining(&self) -> Duration {
+        self.timeout.saturating_sub(self.started.elapsed())
+    }
+
+    fn passed(&self) -> bool {
+        self.started.elapsed() >= self.timeout
+    }
+
+    fn expired(&self) -> StagingError {
+        StagingError::ConvergenceTimeout {
+            token: self.token,
+            waited: self.started.elapsed(),
+        }
+    }
+}
+
+/// How far past the server's own `statement_timeout` [`poll_within_deadline`]
+/// waits for the server to report it before giving up client-side. Only a
+/// connection that has stopped delivering anything at all (a network stall)
+/// ever reaches it.
+const SERVER_REPORT_GRACE: Duration = Duration::from_secs(1);
+
+/// Runs `statement` (one SQL statement, no parameters) under `wait`'s
+/// remaining budget, returning its rows (issue #596).
+///
+/// The budget is enforced by the server, not by dropping the future: the
+/// statement runs in the same simple-protocol message as a
+/// `set_config('statement_timeout', …, true)` (`SET LOCAL`), which makes the
+/// two one implicit transaction. Postgres starts a fresh statement timer
+/// per statement of such a message, so the timer covers the whole of
+/// `statement`, lock waits included, and the setting ends with the message.
+/// When it fires the server has already abandoned the query and rolled the
+/// implicit transaction back: the connection is idle and clean, so a pooled
+/// one goes back to the pool as-is. Dropping a `tokio-postgres` future
+/// instead would leave the query running server-side, and cancelling it
+/// with a cancel token races the connection's next query.
+///
+/// A session `statement_timeout` shorter than the budget is kept, not
+/// raised. A `57014` (`query_canceled`) that arrives once the deadline has
+/// passed is the budget firing and becomes
+/// [`StagingError::ConvergenceTimeout`]; the server's timer ran at least the
+/// (rounded-up) remaining budget from after it was computed, so it can't
+/// arrive earlier. One that arrives before the deadline is someone else's (the
+/// session's own shorter `statement_timeout`, a `pg_cancel_backend`) and
+/// stays a [`StagingError::Db`], like any other failure. The poll sets no
+/// `lock_timeout`, so a `55P03` is always the session's own.
+///
+/// [`SERVER_REPORT_GRACE`] past the budget, the poll gives up client-side
+/// too, as a backstop for a connection that has stopped responding. That
+/// abandoned request is still bounded server-side by the budget.
+async fn poll_within_deadline(
+    client: &Client,
+    wait: &Deadline,
+    statement: &str,
+) -> Result<Vec<SimpleQueryRow>, StagingError> {
+    let remaining = wait.remaining();
+    // Round up so the server can't fire before the deadline, and never 0,
+    // which would disable the timeout. The GUC's ceiling is `i32::MAX` ms.
+    let budget_ms = remaining
+        .as_micros()
+        .div_ceil(1000)
+        .clamp(1, i32::MAX as u128);
+    let message = format!(
+        "select set_config('statement_timeout', \
+             case when setting::bigint between 1 and {budget_ms} then setting \
+                  else '{budget_ms}' end, \
+             true) \
+         from pg_settings where name = 'statement_timeout'; \
+         {statement}"
+    );
+    let messages = match tokio::time::timeout(
+        remaining.saturating_add(SERVER_REPORT_GRACE),
+        client.simple_query(&message),
+    )
+    .await
+    {
+        Ok(Ok(messages)) => messages,
+        Ok(Err(err)) if err.code() == Some(&SqlState::QUERY_CANCELED) && wait.passed() => {
+            return Err(wait.expired());
+        }
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => return Err(wait.expired()),
+    };
+    // The first row is `set_config`'s; the caller's statement's rows follow.
+    Ok(messages
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .skip(1)
+        .collect())
 }
 
 // --- Boundary marker: the loose observability view lives on the other side ---
