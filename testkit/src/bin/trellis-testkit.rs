@@ -38,10 +38,9 @@
 //! on a signal alone.
 //!
 //! Don't SIGKILL this process: nothing can tear down then. The `postgres`
-//! server outlives it (reparented to init) and keeps running, and testkit's
-//! orphan reaper deliberately never touches a directory whose postmaster is
-//! alive, so a later [`TestCluster`] won't clean it up either. Stop such a
-//! leftover with `pg_ctl stop -D <data_dir>` (`data_dir` is in the JSON).
+//! server outlives it and keeps running until the next [`TestCluster`] on the
+//! box (same `TMPDIR`) starts, whose orphan reaper stops it. Stop it sooner
+//! with `pg_ctl stop -D <data_dir>` (`data_dir` is in the JSON).
 //! Closing stdin or sending SIGTERM is always enough.
 //!
 //! ```text
