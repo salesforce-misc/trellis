@@ -196,6 +196,24 @@ impl TestCluster {
         &self.root
     }
 
+    /// The cluster's data directory (inside [`TestCluster::root`]).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The directory holding the cluster's unix socket; libpq and most
+    /// Postgres clients take it as the `host`.
+    pub fn socket_dir(&self) -> &Path {
+        &self.socket_dir
+    }
+
+    /// The port the server listens on. With no TCP listener it only names
+    /// the socket file (`.s.PGSQL.<port>`) inside
+    /// [`TestCluster::socket_dir`].
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// The OS process id of the `postgres` server. Exposed mainly so tests
     /// of the harness itself can assert the process has exited after
     /// teardown.
@@ -316,13 +334,12 @@ impl TestCluster {
         self.wait_ready(&log_path);
     }
 
-    /// Creates a fresh, uniquely-named, otherwise-empty database on this
-    /// instance with its own connection pool. No migrations are applied —
-    /// useful for tests that exercise [`trellis::migrate`] itself. Most
-    /// callers want [`TestCluster::create_isolated_database`] instead.
-    pub async fn create_empty_database(&self) -> TestDatabase {
-        let name = format!("trellis_test_{}", unique_suffix());
-
+    /// Creates an empty database called `name` on this instance and returns
+    /// its connection string (see [`TestCluster::database_dsn`]). Unlike
+    /// [`TestCluster::create_empty_database`] there is no handle: the
+    /// database lives until the cluster is torn down. That suits the
+    /// `trellis-testkit` binary, whose database goes with its cluster.
+    pub fn create_database(&self, name: &str) -> String {
         run_to_completion(
             Command::new("createdb")
                 .arg("-h")
@@ -331,11 +348,19 @@ impl TestCluster {
                 .arg(self.port.to_string())
                 .arg("-U")
                 .arg("postgres")
-                .arg(&name),
+                .arg(name),
             "createdb",
         );
+        self.database_dsn(name)
+    }
 
-        let dsn = self.database_dsn(&name);
+    /// Creates a fresh, uniquely-named, otherwise-empty database on this
+    /// instance with its own connection pool. No migrations are applied —
+    /// useful for tests that exercise [`trellis::migrate`] itself. Most
+    /// callers want [`TestCluster::create_isolated_database`] instead.
+    pub async fn create_empty_database(&self) -> TestDatabase {
+        let name = format!("trellis_test_{}", unique_suffix());
+        let dsn = self.create_database(&name);
 
         let config = Config::from_dsn(dsn.clone()).expect("valid schema");
         let pool = Pool::new(&config).expect("build pool for isolated database");

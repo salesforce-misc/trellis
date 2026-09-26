@@ -32,7 +32,7 @@ This repo is home to a few key components:
 * `docs` outlines the key ideas and decisions this project has taken
 * `benchmark` is a harness for measuring throughput, latency and other key-metrics
 * `generative` is a generative test suite that is used to validate correctness under various scenarios and loads
-* `testkit` is a reusable, test-only harness that spins up a throwaway, logical-replication-enabled PostgreSQL instance and hands out isolated, migrated databases per test scenario. It is never shipped in a user's binary — other crates pull it in as a dev-dependency and exercise it through `cargo test`.
+* `testkit` is a reusable, test-only harness that spins up a throwaway, logical-replication-enabled PostgreSQL instance and hands out isolated, migrated databases per test scenario. It is never shipped in a user's binary — other crates pull it in as a dev-dependency and exercise it through `cargo test`. Its `trellis-testkit` binary provisions the same kind of cluster for test suites written in other languages; see `cargo run -p testkit --bin trellis-testkit -- --help`.
 
 ## Up & Running
 

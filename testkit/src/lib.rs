@@ -9,6 +9,11 @@
 //!   on.
 //! - [`lsn`] gives tests a realistic LSN to stage CDC ring rows at.
 //!
+//! The crate also builds a `trellis-testkit` binary (`src/bin/`) that holds
+//! one [`TestCluster`] for a test suite written in another language (the
+//! Elixir and Ruby bindings): it prints the connection details as a JSON
+//! line and tears the cluster down on a signal or when its stdin closes.
+//!
 //! This crate is dev-only scaffolding shared across the workspace (any
 //! crate's integration tests can dev-depend on it), not part of the
 //! engine's runtime behavior. Setup failures panic rather than returning
