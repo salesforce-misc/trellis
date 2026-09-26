@@ -600,3 +600,53 @@ async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
         .await
         .expect("release lock");
 }
+
+/// Review of issue #596: a spent budget still gets one real check. Before
+/// #596 a zero `timeout` meant "check once", and callers lean on that:
+/// generative's `quiesce` passes whatever is left of its own budget
+/// (`saturating_sub`), possibly nothing, and expects the wait to confirm an
+/// already-converged ring rather than fail on it. With the server timeout
+/// set to the bare remaining budget, that check got a 1ms `statement_timeout`
+/// and could never finish.
+#[tokio::test]
+async fn await_converged_with_a_spent_budget_still_checks_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    seed_progress(&client, "slot1", 1000).await;
+    let token = PgLsn::from(50);
+    for _ in 0..20 {
+        converge::await_converged(&client, token, Duration::ZERO)
+            .await
+            .expect("a converged token must pass its one check on a zero budget");
+    }
+}
+
+/// The same floor, made deterministic: the one check on a zero budget is
+/// held up briefly behind a lock (as a poll is behind a segment retire's
+/// `TRUNCATE`) and must still complete rather than time out at once.
+#[tokio::test]
+async fn await_converged_with_a_spent_budget_rides_out_a_brief_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    seed_progress(&client, "slot1", 1000).await;
+    let token = PgLsn::from(50);
+
+    lock_poison_held(&holder).await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        holder
+            .batch_execute("rollback")
+            .await
+            .expect("release lock");
+    });
+
+    converge::await_converged(&client, token, Duration::ZERO)
+        .await
+        .expect("a check held up by a brief lock must still complete on a zero budget");
+    release.await.expect("release task");
+}

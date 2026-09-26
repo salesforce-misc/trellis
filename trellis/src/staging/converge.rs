@@ -334,8 +334,10 @@ pub(crate) async fn request_intake_confirm(
 ///
 /// `timeout` bounds the whole call, including a poll that blocks (on a lock,
 /// say) rather than returning (issue #596): each poll runs under a
-/// server-side `statement_timeout` of the remaining budget; see
-/// [`poll_within_deadline`].
+/// server-side `statement_timeout` of the remaining budget, but never less
+/// than [`MIN_POLL_BUDGET`]; see [`poll_within_deadline`]. So a call always
+/// makes at least one real check, even with a zero or spent `timeout`, and
+/// a blocked poll overruns the deadline by at most that floor.
 ///
 /// The engine's own workers do the actual draining; this only waits for
 /// them. On timeout, returns [`StagingError::ConvergenceTimeout`] — a named
@@ -412,6 +414,16 @@ impl Deadline {
     }
 }
 
+/// The least server time any one poll gets, however little of the budget is
+/// left. Before issue #596 every poll ran to completion, so a zero `timeout`
+/// meant "check once", and the poll the backoff times to land on the deadline
+/// was a real check. Callers lean on that: generative's `quiesce` passes
+/// what's left of its own budget, possibly nothing. A healthy poll takes a
+/// few milliseconds; the floor leaves room for that and for a brief lock
+/// wait (a segment retire's `TRUNCATE`, say), and bounds how far a poll
+/// blocked for longer can run past the deadline.
+const MIN_POLL_BUDGET: Duration = Duration::from_millis(250);
+
 /// How far past the server's own `statement_timeout` [`poll_within_deadline`]
 /// waits for the server to report it before giving up client-side. Only a
 /// connection that has stopped delivering anything at all (a network stall)
@@ -419,7 +431,8 @@ impl Deadline {
 const SERVER_REPORT_GRACE: Duration = Duration::from_secs(1);
 
 /// Runs `statement` (one SQL statement, no parameters) under `wait`'s
-/// remaining budget, returning its rows (issue #596).
+/// remaining budget, or [`MIN_POLL_BUDGET`] if that's longer, returning its
+/// rows (issue #596).
 ///
 /// The budget is enforced by the server, not by dropping the future: the
 /// statement runs in the same simple-protocol message as a
@@ -437,13 +450,13 @@ const SERVER_REPORT_GRACE: Duration = Duration::from_secs(1);
 /// raised. A `57014` (`query_canceled`) that arrives once the deadline has
 /// passed is the budget firing and becomes
 /// [`StagingError::ConvergenceTimeout`]; the server's timer ran at least the
-/// (rounded-up) remaining budget from after it was computed, so it can't
-/// arrive earlier. One that arrives before the deadline is someone else's (the
+/// (rounded-up, floored) budget, which is at least the remaining budget, from
+/// after it was computed, so it can't arrive earlier. One that arrives before the deadline is someone else's (the
 /// session's own shorter `statement_timeout`, a `pg_cancel_backend`) and
 /// stays a [`StagingError::Db`], like any other failure. The poll sets no
 /// `lock_timeout`, so a `55P03` is always the session's own.
 ///
-/// [`SERVER_REPORT_GRACE`] past the budget, the poll gives up client-side
+/// [`SERVER_REPORT_GRACE`] past its budget, the poll gives up client-side
 /// too, as a backstop for a connection that has stopped responding. That
 /// abandoned request is still bounded server-side by the budget.
 async fn poll_within_deadline(
@@ -451,13 +464,11 @@ async fn poll_within_deadline(
     wait: &Deadline,
     statement: &str,
 ) -> Result<Vec<SimpleQueryRow>, StagingError> {
-    let remaining = wait.remaining();
-    // Round up so the server can't fire before the deadline, and never 0,
-    // which would disable the timeout. The GUC's ceiling is `i32::MAX` ms.
-    let budget_ms = remaining
-        .as_micros()
-        .div_ceil(1000)
-        .clamp(1, i32::MAX as u128);
+    let budget = wait.remaining().max(MIN_POLL_BUDGET);
+    // Round up so the server can't fire before the deadline (and the floor
+    // keeps it off 0, which would disable the timeout). The GUC's ceiling is
+    // `i32::MAX` ms.
+    let budget_ms = budget.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128);
     let message = format!(
         "select set_config('statement_timeout', \
              case when setting::bigint between 1 and {budget_ms} then setting \
@@ -467,7 +478,7 @@ async fn poll_within_deadline(
          {statement}"
     );
     let messages = match tokio::time::timeout(
-        remaining.saturating_add(SERVER_REPORT_GRACE),
+        budget.saturating_add(SERVER_REPORT_GRACE),
         client.simple_query(&message),
     )
     .await
