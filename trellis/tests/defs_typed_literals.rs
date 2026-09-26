@@ -80,8 +80,8 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// `SELECT id AS id, DATE '...' AS d, TIMESTAMP '...' AS ts, BYTEA '...' AS b`,
-/// using the `<type> '<text>'` spelling.
+/// The select list `DATE '...' AS d, TIMESTAMP '...' AS ts, BYTEA '...' AS b,
+/// ...`, one field per case, using the `<type> '<text>'` spelling.
 fn select_list_typed_literal_spelling() -> String {
     let mut parts = Vec::new();
     for (name, keyword, text, _) in CASES {
