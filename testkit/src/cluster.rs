@@ -27,9 +27,12 @@
 //! can trap SIGKILL, teardown can't be the only defense: [`TestCluster::start`]
 //! first runs a self-healing reaper ([`reap_orphans_in`]) that sweeps orphaned
 //! `trellis-testkit-*` dirs from dead prior runs, freeing each one's leaked
-//! segment before allocating a new one.
+//! segment before allocating a new one. A killed run's postmaster doesn't die
+//! with it either; it's reparented and keeps running, so the reaper also stops
+//! a postmaster whose owning test process is gone (#576).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -876,8 +879,9 @@ fn reap_orphans_once() {
 /// Sweeps `trellis-testkit-*` directories left in `tmp` by dead prior runs,
 /// freeing each one's leaked SysV shared-memory segment (via its
 /// `postmaster.pid`) and removing the directory. A dir whose recorded
-/// postmaster is still alive belongs to a running test process and is left
-/// untouched no matter what; one whose postmaster is dead (or has no
+/// postmaster is still alive is left untouched unless
+/// [`stop_orphaned_postmaster`] confirms the test process that started it is
+/// gone and stops the server first (#576); one whose postmaster is dead (or has no
 /// `postmaster.pid` at all) is only a genuine orphan if its *owning* process
 /// (see [`owning_pid`]) is also confirmed dead — a live owner can be
 /// mid-`initdb`/mid-startup (no pidfile yet) or, per #206, mid-teardown of a
@@ -901,17 +905,25 @@ fn reap_orphans_in(tmp: &Path) {
         let data_dir = dir.join("data");
         match fs::read_to_string(data_dir.join("postmaster.pid")) {
             // First line of `postmaster.pid` is the postmaster PID. If it's
-            // still alive this cluster is in use by a running test process
-            // (possibly a parallel test binary) — leave it entirely alone,
-            // regardless of the owning process (below): never reap a
-            // directory backing a postgres that's actually running.
+            // still alive, the cluster is either in use by a running test
+            // process (possibly a parallel test binary) or orphaned by one
+            // that was killed without running `Drop` (#576). Only
+            // `stop_orphaned_postmaster` may tell those apart; unless it
+            // stops the server, the directory is left entirely alone.
             Ok(contents) => {
-                let postgres_alive = contents
+                let postmaster = contents
                     .lines()
                     .next()
                     .and_then(|line| line.trim().parse::<i32>().ok())
-                    .is_some_and(process_alive);
-                if postgres_alive {
+                    .filter(|&pid| process_alive(pid));
+                if let Some(postmaster) = postmaster {
+                    if stop_orphaned_postmaster(&name, &data_dir, postmaster) {
+                        // A clean stop already freed the segment and deleted
+                        // the pidfile, making this a no-op; after the SIGKILL
+                        // fallback it frees what the server couldn't.
+                        reap_shmem_segment(&data_dir);
+                        let _ = fs::remove_dir_all(&dir);
+                    }
                     continue;
                 }
                 // Postgres itself is confirmed dead, but a dead postmaster
@@ -962,16 +974,128 @@ fn reap_orphans_in(tmp: &Path) {
 }
 
 /// Extracts the owning process's PID from a `trellis-testkit-<pid>-<counter>`
-/// directory name, as produced by [`unique_suffix`]. Returns `None` if the
-/// name doesn't have that shape (e.g. it's not one this build of testkit
-/// created).
+/// directory name, as produced by [`unique_suffix`]. Returns `None` unless
+/// the name has exactly that shape, both parts all digits (e.g. it's not one
+/// this build of testkit created), or the PID can't be a test process's.
 fn owning_pid(dir_name: &str) -> Option<i32> {
-    dir_name
-        .strip_prefix("trellis-testkit-")?
-        .split('-')
-        .next()?
-        .parse::<i32>()
-        .ok()
+    let (pid, counter) = dir_name.strip_prefix("trellis-testkit-")?.split_once('-')?;
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(pid) || !all_digits(counter) {
+        return None;
+    }
+    pid.parse::<i32>().ok().filter(|&pid| pid > 1)
+}
+
+/// Stops `postmaster`, a live process named by the `postmaster.pid` in
+/// `data_dir`, if the test process that started it is gone (#576). Returns
+/// whether the server is now stopped; on `false` the caller must leave the
+/// directory alone.
+///
+/// A test binary killed without unwinding (SIGKILL, `timeout`, an OOM kill, a
+/// CI cancel) runs no `Drop`, so its postmaster is reparented and runs on
+/// forever, holding a whole cluster's memory and disk. Everything here errs
+/// towards leaving a server running, because stopping one a live test is
+/// using fails that test. It stops the server only when all of these hold:
+///
+/// - `dir_name` is exactly `trellis-testkit-<owner>-<n>` ([`owning_pid`]).
+///   Clusters anyone else runs on the box live elsewhere or under other
+///   names, and nothing about them is even looked at.
+/// - The owner is gone: `kill -0` finds no such process, or the process
+///   holding that PID now isn't the postmaster's parent. testkit starts every
+///   postmaster as a direct child of the owner ([`spawn_server`]), so a live
+///   owner is always its parent, and a killed owner's postmaster is
+///   reparented to init or a subreaper. So a PID the kernel reused for an
+///   unrelated process can't pass for the owner, and no clock comparison is
+///   needed. If `ps` can't report the parent, the owner counts as alive.
+/// - `ps` shows `postmaster` running `postgres` on this `data_dir`, so a
+///   stale pidfile whose PID was reused is never signalled.
+///
+/// It stops the server with `pg_ctl stop -m immediate`, as `Drop` does
+/// (the data is about to be deleted, so a shutdown checkpoint buys nothing),
+/// falling back to SIGKILL.
+fn stop_orphaned_postmaster(dir_name: &str, data_dir: &Path, postmaster: i32) -> bool {
+    let Some(owner) = owning_pid(dir_name) else {
+        return false;
+    };
+    if postmaster <= 1 {
+        return false;
+    }
+    let owner_gone = !process_alive(owner)
+        || ps_field(postmaster, "ppid")
+            .and_then(|ppid| ppid.parse::<i32>().ok())
+            .is_some_and(|ppid| ppid != owner);
+    if !owner_gone || !serves_data_dir(postmaster, data_dir) {
+        return false;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "testkit: stopping orphaned postgres (pid {postmaster}) in {}; the test process \
+         that started it (pid {owner}) is gone",
+        data_dir.display()
+    );
+    let stopped = Command::new("pg_ctl")
+        .arg("stop")
+        .arg("-D")
+        .arg(data_dir)
+        .arg("-m")
+        .arg("immediate")
+        .arg("-w")
+        .arg("-t")
+        .arg("10")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if stopped {
+        return true;
+    }
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(postmaster.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(postmaster) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// Whether `pid` is a `postgres` started on `data_dir`. A postmaster keeps
+/// its original command line (`postgres -D <data_dir> ...`), unlike its
+/// children, which retitle themselves.
+fn serves_data_dir(pid: i32, data_dir: &Path) -> bool {
+    let Some(command) = ps_field(pid, "command") else {
+        return false;
+    };
+    let mut args = command.split_whitespace();
+    let is_postgres = args
+        .next()
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|program| program == "postgres");
+    let data_dir = data_dir.to_string_lossy();
+    is_postgres && args.any(|arg| arg == data_dir)
+}
+
+/// One `ps` column for `pid`, trimmed, or `None` if `ps` fails or has no
+/// such process. `-ww` keeps a long command line from being cut to the
+/// terminal width.
+fn ps_field(pid: i32, field: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .arg("-ww")
+        .arg("-o")
+        .arg(format!("{field}="))
+        .arg("-p")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !value.is_empty()).then_some(value)
 }
 
 /// Whether `path`'s last modification was more than `age` ago. Conservative on
@@ -1328,6 +1452,225 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    /// A PID that belonged to a real process and is now free: a child that
+    /// has exited and been waited on.
+    fn dead_pid() -> i32 {
+        let mut child = Command::new("true").spawn().expect("spawn `true`");
+        child.wait().expect("wait for `true`");
+        child.id() as i32
+    }
+
+    /// A real `postgres`, a child of this test process, in a directory named
+    /// the way `unique_suffix` names one owned by `owner`, alone in its own
+    /// sandbox. Stopped, and the sandbox removed, on drop, so a failing
+    /// assertion can't leak either.
+    ///
+    /// The socket goes in a short directory of its own, not in the cluster
+    /// dir: nested two levels deep under a long `TMPDIR` (`verify` points it
+    /// into `target/`), the socket path would pass the ~107-byte limit on
+    /// unix socket paths, and postgres wouldn't start. The reaper never
+    /// looks at the socket dir.
+    struct RealPostmaster {
+        sandbox: PathBuf,
+        socket_dir: PathBuf,
+        dir: PathBuf,
+        data_dir: PathBuf,
+        server: Child,
+    }
+
+    impl RealPostmaster {
+        fn start(tag: &str, owner: i32) -> Self {
+            let sandbox = fresh_sandbox(tag);
+            let dir = sandbox.join(format!("trellis-testkit-{owner}-0"));
+            let data_dir = dir.join("data");
+            let socket_dir = std::env::temp_dir().join(format!("trs-{}", unique_suffix()));
+            fs::create_dir_all(&socket_dir).expect("create socket dir");
+            run_with_retries(
+                || {
+                    let _ = fs::remove_dir_all(&data_dir);
+                    let mut cmd = Command::new("initdb");
+                    cmd.arg("-D")
+                        .arg(&data_dir)
+                        .arg("-U")
+                        .arg("postgres")
+                        .arg("--auth=trust")
+                        .arg("--no-sync");
+                    cmd
+                },
+                "initdb",
+            );
+            let server = spawn_server(
+                &data_dir,
+                &socket_dir,
+                5432,
+                false,
+                &dir.join("postgres.log"),
+            );
+            let postmaster = Self {
+                sandbox,
+                socket_dir,
+                dir,
+                data_dir,
+                server,
+            };
+            // The reaper only sees a postmaster once its pidfile names it.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !fs::read_to_string(postmaster.data_dir.join("postmaster.pid"))
+                .is_ok_and(|pidfile| pidfile.lines().any(|line| line.trim() == "ready"))
+            {
+                assert!(Instant::now() < deadline, "postgres did not start");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            postmaster
+        }
+
+        /// Waits (bounded) for the server to exit, returning whether it did.
+        fn exited_within(&mut self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if self.server.try_wait().expect("poll postgres").is_some() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for RealPostmaster {
+        fn drop(&mut self) {
+            if self.server.try_wait().ok().flatten().is_none() {
+                let _ = Command::new("pg_ctl")
+                    .args(["stop", "-m", "immediate", "-w", "-D"])
+                    .arg(&self.data_dir)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = self.server.kill();
+                let _ = self.server.wait();
+            }
+            let _ = fs::remove_dir_all(&self.sandbox);
+            let _ = fs::remove_dir_all(&self.socket_dir);
+        }
+    }
+
+    /// Issue #576: a test binary killed without unwinding leaves its
+    /// postmaster running. The reaper stops it once the owner in the
+    /// directory name is dead, and removes the directory.
+    #[test]
+    fn stops_a_live_postmaster_whose_owner_is_dead() {
+        let mut postmaster = RealPostmaster::start("live-orphan", dead_pid());
+
+        reap_orphans_in(&postmaster.sandbox);
+
+        assert!(
+            postmaster.exited_within(Duration::from_secs(10)),
+            "the orphaned postmaster should have been stopped"
+        );
+        assert!(
+            !postmaster.dir.exists(),
+            "the orphaned cluster's directory should have been removed"
+        );
+    }
+
+    /// Issue #576: a running cluster whose owner is alive (here, this very
+    /// test process, the postmaster's parent) is never touched.
+    #[test]
+    fn leaves_a_live_postmaster_whose_owner_is_alive() {
+        let mut postmaster = RealPostmaster::start("live-owned", std::process::id() as i32);
+
+        reap_orphans_in(&postmaster.sandbox);
+
+        assert!(
+            postmaster
+                .server
+                .try_wait()
+                .expect("poll postgres")
+                .is_none(),
+            "a postmaster whose owner is alive must keep running"
+        );
+        assert!(
+            postmaster.data_dir.join("postmaster.pid").exists(),
+            "a live owner's cluster directory must be left alone"
+        );
+    }
+
+    /// Issue #576: if the owner's PID has been reused, the process now
+    /// holding it is alive but isn't the postmaster's parent. That still
+    /// counts as the owner being gone.
+    #[test]
+    fn stops_a_live_postmaster_whose_owner_pid_was_reused() {
+        // Alive, but not the postmaster's parent: this test process is.
+        let mut reused = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in process");
+        let mut postmaster = RealPostmaster::start("live-reused", reused.id() as i32);
+
+        reap_orphans_in(&postmaster.sandbox);
+
+        assert!(
+            postmaster.exited_within(Duration::from_secs(10)),
+            "a postmaster whose owner PID now belongs to an unrelated process should be stopped"
+        );
+        assert!(!postmaster.dir.exists());
+        assert!(
+            reused.try_wait().expect("poll stand-in").is_none(),
+            "the process holding the reused PID must not be signalled"
+        );
+        let _ = reused.kill();
+        let _ = reused.wait();
+    }
+
+    /// Issue #576: a pidfile whose PID now belongs to something other than
+    /// this cluster's postgres is never signalled, even with the owner dead.
+    #[test]
+    fn never_signals_a_live_pid_that_is_not_the_clusters_postgres() {
+        let sandbox = fresh_sandbox("live-not-postgres");
+        let mut other = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in process");
+        let dir = write_fake_cluster(
+            &sandbox,
+            &format!("{}-0", dead_pid()),
+            Some(other.id() as i32),
+        );
+
+        reap_orphans_in(&sandbox);
+
+        assert!(
+            other.try_wait().expect("poll stand-in").is_none(),
+            "a live process that isn't this cluster's postgres must not be signalled"
+        );
+        assert!(dir.exists(), "its directory must be left alone");
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn owning_pid_accepts_only_the_exact_unique_suffix_shape() {
+        assert_eq!(owning_pid("trellis-testkit-1234-0"), Some(1234));
+        assert_eq!(owning_pid("trellis-testkit-1234-17"), Some(1234));
+        for name in [
+            "trellis-testkit-1234",
+            "trellis-testkit-1234-",
+            "trellis-testkit-1234-0-backup",
+            "trellis-testkit-1234-x",
+            "trellis-testkit--1234-0",
+            "trellis-testkit-+1234-0",
+            "trellis-testkit-1-0",
+            "trellis-testkit-0-0",
+            "trellis-testkit-dead",
+            "cluster-1234-0",
+        ] {
+            assert_eq!(owning_pid(name), None, "{name}");
+        }
     }
 
     #[test]
