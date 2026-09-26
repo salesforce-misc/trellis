@@ -1,0 +1,21 @@
+[package]
+name = "trellis-embed"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# The shared, host-agnostic half of the Elixir and Ruby bindings
+# (docs/decisions/0010-embeddable-clients.md): the flattening from the
+# `trellis` crate's public types to plain data, written once. It holds no
+# Rustler or Magnus types and exports no C ABI — each binding crate depends on
+# this and on `trellis` directly (ADR-0010 decision 1).
+[dependencies]
+trellis = { path = "../../trellis" }
+
+[dev-dependencies]
+# `test-util` opens `trellis::dev`, whose `defs::parse` is the only way to
+# build the `TransformDef` a `Definition` literal needs in a unit test. A
+# dev-dependency's features stay out of every non-test build (resolver 2), so
+# this never reaches the `cli` binary — see `trellis/Cargo.toml`'s
+# `test-util` comment for the check.
+trellis = { path = "../../trellis", features = ["test-util"] }

@@ -58,6 +58,24 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every variant, once — the list an embedding binding
+    /// (`docs/decisions/0010-embeddable-clients.md`, decision 4) checks its own
+    /// explicit code mapping against, since `#[non_exhaustive]` stops any
+    /// crate but this one from matching the enum exhaustively.
+    ///
+    /// Adding a variant means adding it here as well as to [`Self::as_str`]
+    /// (which the compiler already stops you on);
+    /// `every_variant_is_listed_in_all` below is the reminder. The bindings'
+    /// own test then fails until they map the new code deliberately.
+    pub const ALL: [ErrorCode; 6] = [
+        ErrorCode::Parse,
+        ErrorCode::Validation,
+        ErrorCode::Connectivity,
+        ErrorCode::Conflict,
+        ErrorCode::NotFound,
+        ErrorCode::Internal,
+    ];
+
     /// A stable, lowercase `snake_case` name for this category — the form a
     /// host language across a future FFI boundary would key off of.
     pub fn as_str(self) -> &'static str {
@@ -133,6 +151,27 @@ mod tests {
     use tokio_postgres::error::SqlState;
 
     use super::*;
+
+    /// The compile-time half of [`ErrorCode::ALL`]'s contract: a new variant
+    /// fails to compile here until it gets an arm, which is the prompt to add
+    /// it to `ALL` too. The runtime half checks `ALL` has no duplicates and
+    /// that every listed code has its own `as_str` form.
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        for code in ErrorCode::ALL {
+            match code {
+                ErrorCode::Parse
+                | ErrorCode::Validation
+                | ErrorCode::Connectivity
+                | ErrorCode::Conflict
+                | ErrorCode::NotFound
+                | ErrorCode::Internal => {}
+            }
+        }
+        let names: std::collections::HashSet<&str> =
+            ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
+        assert_eq!(names.len(), ErrorCode::ALL.len());
+    }
 
     /// Issue #340: the server reporting a dead or unavailable connection is
     /// connectivity, whichever connection it happened to (a producer

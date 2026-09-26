@@ -1567,6 +1567,38 @@ pub enum QuarantineState {
     Paused,
 }
 
+impl QuarantineState {
+    /// Every variant, once — the closed set an embedding binding allocates
+    /// its host-side names (Elixir atoms, Ruby symbols) from at load time
+    /// (`docs/decisions/0010-embeddable-clients.md`, decision 4), so it never
+    /// has to hard-code the set itself. Adding a variant means adding it here
+    /// as well as to [`Self::as_str`]; `every_variant_is_listed_in_all` below
+    /// is the reminder.
+    pub const ALL: [QuarantineState; 6] = [
+        QuarantineState::Live,
+        QuarantineState::WaitingToBackfill,
+        QuarantineState::Backfilling,
+        QuarantineState::CatchingUp,
+        QuarantineState::Quarantined,
+        QuarantineState::Paused,
+    ];
+
+    /// A stable, lowercase `snake_case` name for this state — the form that
+    /// crosses an FFI boundary. Each state [`TransformStatus`] mirrors uses
+    /// that status's own [`TransformStatus::as_str`] word, so a host sees one
+    /// name for one state whichever read reported it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuarantineState::Live => "live",
+            QuarantineState::WaitingToBackfill => "waiting_to_backfill",
+            QuarantineState::Backfilling => "backfilling",
+            QuarantineState::CatchingUp => "catching_up",
+            QuarantineState::Quarantined => "quarantined",
+            QuarantineState::Paused => "paused",
+        }
+    }
+}
+
 impl From<TransformStatus> for QuarantineState {
     fn from(status: TransformStatus) -> Self {
         match status {
@@ -1843,6 +1875,38 @@ impl From<StagingError> for TrellisError {
 impl From<SelfCheckError> for TrellisError {
     fn from(err: SelfCheckError) -> Self {
         TrellisError::SelfCheck(err)
+    }
+}
+
+#[cfg(test)]
+mod quarantine_state_tests {
+    use super::*;
+
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        for state in QuarantineState::ALL {
+            match state {
+                QuarantineState::Live
+                | QuarantineState::WaitingToBackfill
+                | QuarantineState::Backfilling
+                | QuarantineState::CatchingUp
+                | QuarantineState::Quarantined
+                | QuarantineState::Paused => {}
+            }
+        }
+        let names: std::collections::HashSet<&str> =
+            QuarantineState::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names.len(), QuarantineState::ALL.len());
+    }
+
+    /// A state that mirrors a [`TransformStatus`] is named exactly as that
+    /// status is, so a host binding sees one word per state across
+    /// [`Trellis::status`] and [`Trellis::quarantine_status`].
+    #[test]
+    fn mirrored_states_share_the_status_word() {
+        for status in TransformStatus::ALL {
+            assert_eq!(QuarantineState::from(status).as_str(), status.as_str());
+        }
     }
 }
 
