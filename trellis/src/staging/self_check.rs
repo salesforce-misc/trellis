@@ -37,7 +37,8 @@
 //! target legitimately lags its source by CDC apply latency. [`self_check`]
 //! takes a watermark token, awaits convergence through it (bounded by a
 //! timeout — on timeout it reports [`SelfCheckOutcome::NotCaughtUp`], never a
-//! divergence), then reads the target and runs the recompute inside a single
+//! divergence; any other failure of the wait is an `Err`, see [`caught_up`]),
+//! then reads the target and runs the recompute inside a single
 //! `REPEATABLE READ` transaction ([`compare_once`]).
 //!
 //! Under [`SelfCheckMode::Standard`], a divergence is only reported as real
@@ -542,10 +543,7 @@ async fn await_then_compare(
     let token = {
         let client = pool.get().await?;
         let token = converge::watermark_token(&**client).await?;
-        if converge::await_converged(&**client, token, timeout)
-            .await
-            .is_err()
-        {
+        if !caught_up(converge::await_converged(&**client, token, timeout).await)? {
             return Ok(AwaitOutcome::NotCaughtUp { attempted: token });
         }
         token
@@ -553,6 +551,21 @@ async fn await_then_compare(
 
     let pass = compare_once(pool, def, pk, scope, paused, token).await?;
     Ok(AwaitOutcome::CaughtUp(pass))
+}
+
+/// Reads [`converge::await_converged`]'s result: `Ok(true)` if the target
+/// caught up, `Ok(false)` only if the wait ran out of time
+/// ([`StagingError::ConvergenceTimeout`]), which is the one failure that
+/// means "not caught up yet" (issue #592). Any other error means the wait
+/// itself couldn't run, say a lost connection or a failed query, so it
+/// propagates. Reporting it as [`SelfCheckOutcome::NotCaughtUp`] would tell a
+/// caller polling `self_check` to keep waiting on an audit that can't run.
+fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
+    match waited {
+        Ok(()) => Ok(true),
+        Err(StagingError::ConvergenceTimeout { .. }) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// The bounded, single-transaction comparison itself (ADR-0013: "reads the
@@ -1095,5 +1108,35 @@ mod tests {
     fn reproduced_keeps_a_stable_divergence_rather_than_erasing_it() {
         let both = vec![cell("1", "9999", "11")];
         assert_eq!(reproduced(&both, both.clone()), both);
+    }
+
+    /// Only the wait running out of time reads as "not caught up yet": a
+    /// genuine timeout still yields `Ok(false)`, so `self_check` reports
+    /// [`SelfCheckOutcome::NotCaughtUp`].
+    #[test]
+    fn caught_up_reads_a_convergence_timeout_as_not_caught_up() {
+        let timeout = StagingError::ConvergenceTimeout {
+            token: PgLsn::from(42),
+            waited: Duration::from_millis(150),
+        };
+        assert!(!caught_up(Err(timeout)).expect("a timeout is not an error"));
+        assert!(caught_up(Ok(())).expect("a converged wait is not an error"));
+    }
+
+    /// Issue #592: any other wait failure means the audit couldn't run, so it
+    /// must come back as `Err`, with the wrapped error's own code, never as a
+    /// benign "not caught up".
+    #[test]
+    fn caught_up_propagates_every_other_wait_failure() {
+        let err = caught_up(Err(StagingError::InvalidRingSlot(99)))
+            .expect_err("a non-timeout wait failure must propagate");
+        assert!(
+            matches!(
+                err,
+                SelfCheckError::Staging(StagingError::InvalidRingSlot(99))
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(err.code(), ErrorCode::Internal);
     }
 }

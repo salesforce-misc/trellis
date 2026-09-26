@@ -477,6 +477,102 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
     running.shutdown().await.expect("shutdown running");
 }
 
+/// Issue #592: a database failure during `self_check`'s convergence wait
+/// must come back as `Err`, not as the benign
+/// [`SelfCheckOutcome::NotCaughtUp`]. Otherwise a caller polling `self_check`
+/// keeps seeing "not caught up" while the audit can't run at all.
+///
+/// Deterministic, with no race against the timeout: a raw session holds an
+/// `ACCESS EXCLUSIVE` lock on `poison_held`, which the wait's
+/// `converged_through` query reads, so that query blocks on the lock however
+/// long the timeout is. None of `self_check`'s earlier reads touch
+/// `poison_held`. The test finds the blocked backend in `pg_locks`, terminates
+/// it, and only then releases the lock.
+#[tokio::test]
+async fn self_check_reports_a_connection_lost_during_its_convergence_wait_as_an_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = converged_fixture(
+        &db,
+        "create table widgets (id integer primary key, price integer)",
+        "widgets",
+        "TRANSFORM widget_prices FROM widgets SELECT price AS price",
+        &[("1", r#"{"id": "1", "price": "9"}"#)],
+    )
+    .await;
+
+    raw.batch_execute("begin; lock table poison_held in access exclusive mode")
+        .await
+        .expect("lock poison_held");
+
+    let audit = tokio::spawn(async move {
+        let result = trellis
+            .self_check(
+                "widget_prices",
+                SelfCheckScope {
+                    after: None,
+                    limit: 100,
+                },
+                SelfCheckMode::Strict,
+                GENEROUS_TIMEOUT,
+            )
+            .await;
+        (trellis, result)
+    });
+
+    // Wait for the convergence query to queue behind the lock. This loop
+    // only paces the lookup: the query stays blocked until the terminate
+    // below, so how long this takes doesn't change the outcome.
+    let mut blocked = None;
+    for _ in 0..600 {
+        let pids: Vec<i32> = raw
+            .query(
+                "select pid from pg_locks \
+                 where relation = 'poison_held'::regclass and not granted",
+                &[],
+            )
+            .await
+            .expect("read pg_locks")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !pids.is_empty() {
+            assert_eq!(pids.len(), 1, "only self_check's wait reads poison_held");
+            blocked = Some(pids[0]);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let pid = blocked.expect("self_check's convergence wait never blocked on poison_held");
+
+    let terminated: bool = raw
+        .query_one("select pg_terminate_backend($1)", &[&pid])
+        .await
+        .expect("terminate the waiting backend")
+        .get(0);
+    assert!(terminated, "pg_terminate_backend({pid}) failed");
+    raw.batch_execute("rollback")
+        .await
+        .expect("release the lock");
+
+    let (trellis, result) = audit.await.expect("self_check task");
+    let err = match result {
+        Ok(report) => panic!(
+            "a connection lost during the convergence wait must be an error, not a report; \
+             got {:?}",
+            report.outcome
+        ),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.code(),
+        trellis::ErrorCode::Connectivity,
+        "a terminated backend is a connectivity failure, got {err}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// A currently-paused column's deliberately-stale persisted value must be
 /// excluded from the comparison entirely (ADR-0013: "auditing it would
 /// report a false divergence on exactly the targets an operator is most
