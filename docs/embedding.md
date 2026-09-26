@@ -143,10 +143,12 @@ about an individual transform's own progress.
 
 ### Wiring it into a host health check
 
-Neither the Ruby nor the Elixir binding exists yet (epic #140 — the
-`Client::start`/`Trellis` shape above is the whole surface today; a binding
-is a thin Rustler/Magnus wrapper over it, per ADR-0010 decision 1). Until
-then, the pattern below is written against the Rust API directly, sized for
+The bindings are in progress (epic #140): the Elixir binding in
+`clients/elixir` covers `connect`, `migrate`, `define`, `status` and
+`shutdown` so far (issue #146), and the Ruby binding doesn't exist yet. Each
+is a thin Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
+decision 1. Until they grow the health checks, the pattern below is written
+against the Rust API directly, sized for
 what a binding's eventual `Trellis.has_live_drain_workers?` /
 `Trellis.has_live_staging_worker?` (Elixir and Ruby alike) calls are
 expected to wrap one-to-one

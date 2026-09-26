@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["trellis", "benchmark", "cli", "clients/embed", "generative", "testkit"]
+members = [
+    "trellis",
+    "benchmark",
+    "cli",
+    "clients/embed",
+    "clients/elixir/native/trellis_nif",
+    "generative",
+    "testkit",
+]
 
 [workspace.package]
 edition = "2024"

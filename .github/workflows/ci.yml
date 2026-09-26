@@ -122,3 +122,80 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  elixir:
+    # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
+    # workspace member, so the `ci` job already formats, lints and builds it
+    # (Rustler needs no Erlang install to compile); this job loads it into a
+    # BEAM and runs the ExUnit suite against a `trellis-testkit` cluster.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Restore Cargo dependency cache
+        # The `ci` job's entry, restore-only: that job is the one that saves.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
+
+      - name: Install PostgreSQL server binaries
+        # trellis-testkit shells out to initdb/postgres/pg_ctl/createdb, the
+        # same as the `ci` job's tests; see that job's step.
+        run: |
+          set -euo pipefail
+          pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
+          if [ -z "$pg_bin" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql
+            pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin | sort -V | tail -n1)"
+          fi
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Install Erlang/OTP and Elixir
+        # The versions clients/elixir/.tool-versions pins, from Hex's builds.
+        run: .github/scripts/setup-beam.sh clients/elixir/.tool-versions "$RUNNER_TEMP/beam"
+
+      - name: Build trellis-testkit onto PATH
+        # The suite's setup (test/support/test_cluster.ex) spawns it from PATH.
+        run: |
+          cargo build -p testkit --bin trellis-testkit
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/debug/trellis-testkit "$RUNNER_TEMP/bin/"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Mix dependencies
+        working-directory: clients/elixir
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Check Elixir formatting
+        working-directory: clients/elixir
+        run: mix format --check-formatted
+
+      - name: Test
+        # `mix compile` builds the NIF through Cargo (debug, into the
+        # workspace's target/, reusing the restored dependencies).
+        working-directory: clients/elixir
+        env:
+          MIX_ENV: test
+        run: |
+          mix compile --warnings-as-errors
+          mix test

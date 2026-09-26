@@ -1,0 +1,24 @@
+[package]
+name = "trellis_nif"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# The Elixir binding's NIF (docs/decisions/0010-embeddable-clients.md): a thin
+# Rustler wrapper over `trellis::BlockingTrellis`. Plain-data flattening and
+# error mapping live in `trellis-embed`, shared with the Ruby binding; this
+# crate only turns those plain values into Erlang terms.
+[lib]
+crate-type = ["cdylib"]
+# No Rust tests live here: the conversions are `trellis-embed`'s and tested
+# there, and everything else needs a BEAM, so it is tested by `mix test`.
+# Building a NIF needs no Erlang install (Rustler resolves the `enif_*` API
+# when the BEAM loads the library), so this crate stays in `cargo build
+# --workspace` on a box without one.
+test = false
+doctest = false
+
+[dependencies]
+trellis = { path = "../../../../trellis" }
+trellis-embed = { path = "../../../embed" }
+rustler = "0.38"
