@@ -41,7 +41,8 @@ pub enum ErrorCode {
     /// support.
     Validation,
     /// Reaching or using Postgres failed at the connection/transport/pool
-    /// layer, or applying migrations failed.
+    /// layer, including a pool checkout that waited out
+    /// `pool_wait_timeout` for a free connection.
     Connectivity,
     /// The operation collides with existing state: a name already declared,
     /// a uniqueness violation, a singleton lock already held, an instance
@@ -50,12 +51,15 @@ pub enum ErrorCode {
     /// Something the caller (or a persisted record) named — a table, a
     /// slot, a row — does not exist.
     NotFound,
-    /// A bounded wait ran out before the condition it waits for held: the
-    /// caller's own deadline expired, not a fault. Expected and retryable:
-    /// retry with the same or a wider budget, or look at why the engine is
-    /// behind. Today that's [`crate::Trellis::await_converged`] exhausting
-    /// its `timeout`. Kept apart from `Internal` so a host can tell it from
-    /// a bug (issue #586).
+    /// A wait bounded by a timeout the caller passed to the call ran out
+    /// before the condition it waits for held: the caller's own deadline
+    /// expired, not a fault. Expected and retryable: retry with the same or a
+    /// wider budget, or look at why the engine is behind. Today that's
+    /// [`crate::Trellis::await_converged`] exhausting its `timeout`. Kept
+    /// apart from `Internal` so a host can tell it from a bug (issue #586).
+    /// Not every timeout is this: a pool checkout timing out is
+    /// `Connectivity`, and a Postgres statement or lock timeout is
+    /// classified by its SQLSTATE like any other server error.
     Timeout,
     /// Anything else: engine-internal failures, "should not happen"
     /// invariants, IO failures, and Postgres errors with no more specific
