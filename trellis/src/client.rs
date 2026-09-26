@@ -772,9 +772,10 @@ impl RestartBackoff {
 /// previous producer session, which the server hasn't yet noticed is gone.
 /// After a network partition, that lasts until the server's TCP keepalive
 /// gives up on it, about 25s (issue #364; `crate::pool::TCP_KEEPALIVE_IDLE`
-/// has the numbers), and all staging is down meanwhile. A second `staging_worker` client that took the lock over
-/// is the other possibility; it reads `0` while this one climbs, so a fleet
-/// that deliberately runs one aggregates with `min by (slot)`.
+/// has the numbers), and all staging is down meanwhile. A second
+/// `staging_worker` client that took the lock over is the other
+/// possibility; it reads `0` while this one climbs, so a fleet that
+/// deliberately runs one aggregates with `min by (slot)`.
 async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
 where
     A: FnMut() -> Fut,

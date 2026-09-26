@@ -146,11 +146,6 @@ impl TestCluster {
         let socket_dir = root.join("sock");
         fs::create_dir_all(&socket_dir).expect("create socket dir");
 
-        // Unix-socket-only clusters all share 5432: the port only names the
-        // socket file, which lives in each cluster's own directory. A TCP
-        // listener needs a port nobody else holds.
-        let port: u16 = if tcp { free_loopback_port() } else { 5432 };
-
         // `initdb`'s bootstrap backend transiently allocates a SysV segment,
         // so on a machine whose small system-wide table (macOS `shmmni`
         // defaults to 32) is under pressure from other Postgres instances it
@@ -172,6 +167,13 @@ impl TestCluster {
             },
             "initdb",
         );
+
+        // Unix-socket-only clusters all share 5432: the port only names the
+        // socket file, which lives in each cluster's own directory. A TCP
+        // listener needs a port nobody else holds, picked only now, after
+        // `initdb`, so the window in which another process could take it is
+        // milliseconds rather than seconds.
+        let port: u16 = if tcp { free_loopback_port() } else { 5432 };
 
         let log_path = root.join("postgres.log");
         let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path);
@@ -630,8 +632,6 @@ impl StopMode {
     }
 }
 
-/// Starts `postgres` on `data_dir`, appending its output to `log_path` (so a
-/// [`TestCluster::restart`] keeps the log from before the restart).
 /// A loopback TCP port that was free a moment ago. See
 /// [`TestCluster::start_with_tcp`] for the race this leaves open.
 fn free_loopback_port() -> u16 {
@@ -641,6 +641,9 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
+/// Starts `postgres` on `data_dir`, appending its output to `log_path` (so a
+/// [`TestCluster::restart`] keeps the log from before the restart). It
+/// listens on loopback TCP as well as the unix socket only when `tcp` is set.
 fn spawn_server(
     data_dir: &Path,
     socket_dir: &Path,
