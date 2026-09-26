@@ -195,15 +195,16 @@ fn migrate(handle: ResourceArc<Handle>) -> NifReply<Atom> {
 /// Registers the `TRANSFORM` statement `text`.
 ///
 /// `BlockingTrellis::apply` takes every statement form, so `text` is checked
-/// first: any other form (`DROP`, `PAUSE`, ...) is a `validation` error and
-/// is never applied. The other forms get their own functions in the
-/// binding's full surface (#147).
+/// first with `trellis::statement_kind`: any other form (`DROP`, `PAUSE`,
+/// ...) is a `validation` error and is never applied, and text that doesn't
+/// parse is the `parse` error `apply` would return. The other forms get their
+/// own functions in the binding's full surface (#147).
 #[rustler::nif(schedule = "DirtyIo")]
 fn define(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<DefinitionTerm> {
     require_transform_statement(&text).map_err(plain)?;
     let applied = handle.with(|trellis| trellis.apply(&text))?;
-    // Unreachable while the check above mirrors `apply`'s dispatch; kept so a
-    // drift between the two is an error rather than a panic.
+    // Unreachable: the check above is `apply`'s own parser. Kept as defence,
+    // so a mistake there is an error rather than a panic.
     let definition = applied.into_transform().ok_or_else(|| {
         error(
             ErrorCode::Internal,

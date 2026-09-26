@@ -23,7 +23,9 @@
 //!
 //! One piece of shared logic isn't flattening: [`require_transform_statement`]
 //! is the check a binding's `define` makes before calling `apply`, so that a
-//! `DROP` or `PAUSE` handed to `define` is refused rather than carried out.
+//! `DROP` or `PAUSE` handed to `define` is refused rather than carried out. It
+//! asks [`trellis::statement_kind`], so the form is `apply`'s own parser's
+//! answer, and only the refusal's wording lives here.
 
 mod cursor;
 mod definition;

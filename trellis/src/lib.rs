@@ -27,6 +27,9 @@
 //!   every error type in this crate can report via a `code()` method,
 //!   independent of its own (freely growing) internal variants — see
 //!   `docs/decisions/0008-public-api-design.md`, decision 3.
+//! - [`statement_kind`] names which form a statement is ([`StatementKind`])
+//!   without applying it, using `apply`'s own parser — the check a binding
+//!   makes before handing a statement to `apply` (issue #580).
 //! - [`metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
 //!   in-process registry (issue #51, epic #49) and its Prometheus text
 //!   exposition (issue #53, [`app::Trellis::metrics`]) — see
@@ -181,6 +184,12 @@ pub use staging::self_check::SelfCheckError;
 pub use defs::{
     Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
+
+// --- Tier 2: statement classification -------------------------------------
+// Pure on the text, so an embedder can refuse the wrong statement form before
+// handing it to `apply` (issue #580). It is `apply`'s own parser, not a copy
+// of its dispatch rule.
+pub use defs::{StatementKind, statement_kind};
 
 /// Placeholder entry point exercising the async plumbing the engine will
 /// build on. Returns the crate version so callers have something to check.

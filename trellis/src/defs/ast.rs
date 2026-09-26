@@ -136,6 +136,87 @@ pub enum Statement {
     AlterTransform(AlterTransform),
 }
 
+impl Statement {
+    /// Which form this statement is — the same decision
+    /// [`crate::Trellis::apply`] dispatches on, with the parsed payload
+    /// dropped.
+    pub fn kind(&self) -> StatementKind {
+        match self {
+            Statement::DefineTransform(_) => StatementKind::Transform,
+            Statement::DefineRelationship(_) => StatementKind::Relationship,
+            Statement::Pause(_) => StatementKind::Pause,
+            Statement::Resume(_) => StatementKind::Resume,
+            Statement::Drop(_) => StatementKind::Drop,
+            Statement::AlterTransform(_) => StatementKind::Alter,
+        }
+    }
+}
+
+/// Which form a statement of Trellis's grammar is, without what it says —
+/// what [`crate::statement_kind`] returns (issue #580).
+///
+/// One variant per form [`crate::Trellis::apply`] carries out, each named for
+/// the keyword that leads it, since that keyword alone is what the parser
+/// picks the form by. `DROP TRANSFORM` and `DROP RELATIONSHIP` are one
+/// [`StatementKind::Drop`], as they are one [`crate::Applied::Dropped`].
+///
+/// `#[non_exhaustive]` for the reason [`crate::Applied`] is: the grammar
+/// grows a form at a time (`AMEND` is next once it has its own ADR), and a
+/// binding matching on this must already handle a kind it doesn't know.
+/// [`StatementKind::ALL`] is the list a binding checks its own mapping
+/// against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StatementKind {
+    /// `TRANSFORM <target> FROM <source> ...` — defines a transform.
+    Transform,
+    /// `RELATIONSHIP <name> FROM <table>.<col> TO <table>.<col>` — defines a
+    /// relationship.
+    Relationship,
+    /// `PAUSE TRANSFORM <target>[.<column>]`.
+    Pause,
+    /// `RESUME TRANSFORM <target>[.<column>]`.
+    Resume,
+    /// `DROP TRANSFORM <target>` or `DROP RELATIONSHIP [<schema>.]<table>.<name>`.
+    Drop,
+    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]`.
+    Alter,
+}
+
+impl StatementKind {
+    /// Every variant, once — the list a binding checks its own mapping
+    /// against, since `#[non_exhaustive]` stops any crate but this one from
+    /// matching the enum exhaustively. `every_statement_kind_is_listed_in_all`
+    /// fails until a new variant is added here.
+    pub const ALL: [StatementKind; 6] = [
+        StatementKind::Transform,
+        StatementKind::Relationship,
+        StatementKind::Pause,
+        StatementKind::Resume,
+        StatementKind::Drop,
+        StatementKind::Alter,
+    ];
+
+    /// A stable, lowercase name for this kind: its leading keyword,
+    /// lowercased — the form a host language keys off of.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatementKind::Transform => "transform",
+            StatementKind::Relationship => "relationship",
+            StatementKind::Pause => "pause",
+            StatementKind::Resume => "resume",
+            StatementKind::Drop => "drop",
+            StatementKind::Alter => "alter",
+        }
+    }
+}
+
+impl fmt::Display for StatementKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a [`Statement::Pause`]/[`Statement::Resume`] addresses: a registered
 /// transform, whole (`column: None`) or one of its calculated fields.
 ///

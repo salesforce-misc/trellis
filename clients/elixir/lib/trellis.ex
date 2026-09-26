@@ -118,7 +118,7 @@ defmodule Trellis do
 
   Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
   `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
-  anything is applied.
+  anything is applied, and a statement that doesn't parse is a `:parse` error.
 
   Trellis runs this on its own connections, not in the caller's transaction:
   if an enclosing Ecto migration rolls back, the definition stays.

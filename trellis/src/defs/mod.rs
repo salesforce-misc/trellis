@@ -50,7 +50,7 @@ pub mod validate;
 // doors onto it. Names the engine does not use are split out below and
 // compiled only behind those gates, which is what keeps a plain
 // `cargo build` free of `unused_imports` rather than an `allow`.
-pub use ast::{AlterTransform, DefinitionRef, Statement, TransformRef, ValueType};
+pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{
     CatalogError, alter_transform, create_relationship, install_definition, publication_tables,
 };
@@ -58,7 +58,7 @@ pub use error::ParseError;
 pub use model::{
     Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
 };
-pub use parser::{parse, parse_statement};
+pub use parser::{parse, parse_statement, statement_kind};
 pub use pg_type::PgType;
 pub use validate::validate;
 
@@ -1252,5 +1252,154 @@ mod statement_grammar_tests {
     #[test]
     fn amend_is_not_part_of_this_grammar_yet() {
         assert!(parse_statement("AMEND TRANSFORM order_totals").is_err());
+    }
+
+    // --- statement_kind (issue #580) -------------------------------------
+
+    /// One well-formed statement of every form, with the kind it must
+    /// classify as. Both `DROP` subjects and every `ALTER` clause are here,
+    /// since each is its own path through the parser.
+    const EVERY_FORM: [(&str, StatementKind); 11] = [
+        (
+            "TRANSFORM widget_prices FROM widgets SELECT price AS price",
+            StatementKind::Transform,
+        ),
+        (
+            "TRANSFORM widget_totals FROM widgets GROUP BY owner_id \
+             SELECT owner_id AS owner_id, SUM(price) AS total",
+            StatementKind::Transform,
+        ),
+        (
+            "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
+            StatementKind::Relationship,
+        ),
+        ("PAUSE TRANSFORM widget_prices", StatementKind::Pause),
+        ("PAUSE TRANSFORM widget_prices.price", StatementKind::Pause),
+        (
+            "RESUME TRANSFORM widget_prices.price",
+            StatementKind::Resume,
+        ),
+        ("DROP TRANSFORM widget_prices", StatementKind::Drop),
+        ("DROP RELATIONSHIP widgets.owner", StatementKind::Drop),
+        (
+            "ALTER TRANSFORM widget_prices ADD price + price AS doubled",
+            StatementKind::Alter,
+        ),
+        (
+            "ALTER TRANSFORM widget_prices DROP doubled",
+            StatementKind::Alter,
+        ),
+        (
+            "ALTER TRANSFORM widget_prices ALTER doubled AS price + price + price",
+            StatementKind::Alter,
+        ),
+    ];
+
+    #[test]
+    fn statement_kind_names_every_form() {
+        for (text, kind) in EVERY_FORM {
+            assert_eq!(statement_kind(text).unwrap(), kind, "{text:?}");
+            assert_eq!(parse_statement(text).unwrap().kind(), kind, "{text:?}");
+        }
+        let covered: std::collections::HashSet<StatementKind> =
+            EVERY_FORM.iter().map(|&(_, kind)| kind).collect();
+        assert_eq!(
+            covered.len(),
+            StatementKind::ALL.len(),
+            "EVERY_FORM must hold a statement of every kind"
+        );
+    }
+
+    /// The leading keyword is matched case-insensitively behind any
+    /// whitespace the lexer skips, non-ASCII spaces included, and trailing
+    /// whitespace changes nothing.
+    #[test]
+    fn statement_kind_ignores_case_and_surrounding_whitespace() {
+        for (text, kind) in EVERY_FORM {
+            let alternating: String = text
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect();
+            for body in [text.to_string(), text.to_ascii_lowercase(), alternating] {
+                for space in ["", " ", "\n\t  ", "\r\n", "\u{00a0}", "\u{2003}\u{3000}"] {
+                    let variant = format!("{space}{body}{space}");
+                    assert_eq!(statement_kind(&variant).unwrap(), kind, "{variant:?}");
+                }
+            }
+        }
+    }
+
+    /// A statement that leads with a real keyword but doesn't parse is a
+    /// parse error, not that keyword's kind: `apply` would refuse it just
+    /// the same, so a binding checking the kind must not let it through as
+    /// a well-formed statement of some form.
+    #[test]
+    fn a_malformed_statement_of_each_kind_is_a_parse_error() {
+        for text in [
+            "TRANSFORM oops",
+            "TRANSFORM t FROM widgets SELECT price AS price garbage",
+            "RELATIONSHIP owner FROM widgets.owner_id",
+            "PAUSE widget_prices",
+            "PAUSE RELATIONSHIP widgets.owner",
+            "RESUME TRANSFORM",
+            "DROP TRANSFORM widget_prices.price",
+            "DROP RELATIONSHIP owner",
+            "ALTER TRANSFORM widget_prices",
+            "ALTER TRANSFORM widget_prices PAUSE",
+        ] {
+            let err = statement_kind(text).unwrap_err();
+            assert_eq!(err, parse_statement(text).unwrap_err(), "{text:?}");
+            assert_eq!(err.code(), crate::ErrorCode::Parse, "{text:?}");
+        }
+    }
+
+    /// Text that leads with no statement keyword at all — nothing, an
+    /// unknown verb, or a keyword with more identifier characters glued on —
+    /// is a parse error too.
+    #[test]
+    fn text_with_no_statement_keyword_is_a_parse_error() {
+        for text in [
+            "",
+            "   ",
+            "\u{3000}",
+            "AMEND TRANSFORM widget_prices",
+            "DELETE TRANSFORM widget_prices",
+            "TRANSFORMS t FROM widgets SELECT price AS price",
+            "TRANSFORM_x t FROM widgets SELECT price AS price",
+            "_TRANSFORM t FROM widgets SELECT price AS price",
+            "SELECT 1",
+            "'TRANSFORM'",
+        ] {
+            assert!(statement_kind(text).is_err(), "{text:?}");
+        }
+    }
+
+    /// [`StatementKind::ALL`] is exactly the enum's variants, and every
+    /// variant has its own name.
+    #[test]
+    fn every_statement_kind_is_listed_in_all() {
+        crate::error_code::assert_all_is_every_variant!(
+            StatementKind: Transform,
+            Relationship,
+            Pause,
+            Resume,
+            Drop,
+            Alter,
+        );
+        let names: std::collections::HashSet<&str> = StatementKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect();
+        assert_eq!(names.len(), StatementKind::ALL.len());
+        for kind in StatementKind::ALL {
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
     }
 }

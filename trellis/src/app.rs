@@ -243,6 +243,11 @@ impl Trellis {
     /// `resume_column`/`drop_transform`/`drop_relationship` methods this
     /// replaces are gone rather than kept alongside it.
     ///
+    /// A caller that accepts only some forms (a binding's `define` takes only
+    /// `TRANSFORM`) asks [`crate::statement_kind`] first: it parses the text
+    /// the same way, applies nothing, and so can refuse the wrong form before
+    /// anything happens.
+    ///
     /// The statements it accepts (see [`defs::parse_statement`] for the full
     /// grammar, and `docs/transforms.md` for the semantics):
     ///

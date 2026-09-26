@@ -57,11 +57,6 @@ pub mod defs {
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
 
-    /// Every statement form's parser, so `trellis-embed`'s `define` guard is
-    /// checked against the dispatch `Trellis::apply` actually uses rather
-    /// than a second copy of it.
-    pub use crate::defs::parse_statement;
-
     pub use crate::defs::{
         CatalogError, DdlError, PgType, TransformStatus, ValueType, backfill_definition,
         create_aggregate_target_table, create_definition_without_backfill, create_relationship,
