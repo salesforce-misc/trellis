@@ -20,10 +20,25 @@ defmodule Trellis.TestCluster do
   """
   def info, do: Agent.get(__MODULE__, & &1.info)
 
-  @doc "A Postgrex connection to the cluster's database, linked to the caller."
-  def postgrex! do
-    info = info()
+  @doc "A Postgrex connection to the shared cluster's database, linked to the caller."
+  def postgrex!, do: postgrex!(info())
 
+  @doc """
+  Starts a second, private cluster for one test and returns its details
+  (the shape `info/0` returns). It is torn down when the calling test
+  process exits.
+
+  For a test whose leftovers would disturb the shared cluster. A separate
+  database isn't enough for one that runs the staging worker: Trellis's
+  replication slot name is fixed, and slots are cluster-wide.
+  """
+  def private! do
+    {:ok, agent} = Agent.start_link(&open/0)
+    Agent.get(agent, & &1.info)
+  end
+
+  @doc "A Postgrex connection to the cluster `info` describes, linked to the caller."
+  def postgrex!(info) do
     {:ok, pg} =
       Postgrex.start_link(
         socket_dir: info["host"],

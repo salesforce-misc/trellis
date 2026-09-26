@@ -52,7 +52,7 @@ defmodule Trellis.BackfillFailure do
       source_table: failure.source_table,
       attempts: failure.attempts,
       last_error: failure.last_error,
-      next_attempt_at: DateTime.from_unix!(micros, :microsecond)
+      next_attempt_at: Trellis.Time.from_micros(micros)
     }
   end
 end

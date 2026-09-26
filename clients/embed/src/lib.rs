@@ -20,6 +20,13 @@
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
 //! | [`trellis::QuarantineTarget`] | `transform` / `transform.column` | [`quarantine_address`] |
 //! | `sample_quarantined`'s `(src_table, key)` cursor | an opaque string | [`next_cursor`] / [`decode_cursor`] |
+//! | [`trellis::Applied`] | its kind + that kind's plain fields, or `unknown` | [`PlainApplied`] |
+//! | [`trellis::RelationshipDefinition`] | fields + cardinality word + warning messages | [`PlainRelationship`] |
+//! | [`trellis::RelationshipSummary`] | fields + cardinality word + creation time | [`PlainRelationshipSummary`] |
+//! | [`trellis::QuarantineEntry`] | address + state word + pause time/error | [`PlainQuarantineEntry`] |
+//! | [`trellis::PoisonEntry`] | fields + poison time | [`PlainPoisonEntry`] |
+//! | a page of [`trellis::PoisonSample`] | the rows + the next page's cursor | [`PlainSamplePage`] |
+//! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
 //!
 //! One piece of shared logic isn't flattening: [`require_transform_statement`]
 //! is the check a binding's `define` makes before calling `apply`, so that a
@@ -27,22 +34,33 @@
 //! asks [`trellis::statement_kind`], so the form is `apply`'s own parser's
 //! answer, and only the refusal's wording lives here.
 
+mod applied;
 mod cursor;
 mod definition;
 mod error;
 mod quarantine;
+mod relationship;
 mod statement;
 mod status;
 mod time;
+mod watermark;
+
+pub use applied::PlainApplied;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
     PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
-pub use quarantine::quarantine_address;
+pub use quarantine::{
+    PlainPoisonEntry, PlainPoisonSample, PlainQuarantineEntry, PlainSamplePage, quarantine_address,
+};
+pub use relationship::{
+    PlainRelationship, PlainRelationshipSummary, relationship_cardinality_names,
+};
 pub use statement::require_transform_statement;
 pub use status::{
     quarantine_state, quarantine_state_names, transform_status, transform_status_names,
 };
 pub use time::{epoch_micros, system_time_from_epoch_micros};
+pub use watermark::{decode_watermark, encode_watermark};

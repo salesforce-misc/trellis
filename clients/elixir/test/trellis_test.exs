@@ -3,9 +3,9 @@ defmodule TrellisTest do
   # slot, so these don't run concurrently.
   use ExUnit.Case, async: false
 
-  alias Trellis.{Definition, Error, Status, TestCluster}
+  import Trellis.Eventually
 
-  @converge_ms 30_000
+  alias Trellis.{Definition, Error, Status, TestCluster}
 
   setup_all do
     # Migrating is what a deploy's migration step does, on a handle that
@@ -131,24 +131,5 @@ defmodule TrellisTest do
 
   defp rows(pg) do
     Postgrex.query!(pg, "select id, price from widget_prices order by id", []).rows
-  end
-
-  # Polls `check` until it returns `{:done, result}`, or fails the test
-  # naming what it waited for and the last `{:waiting, seen}` value.
-  defp eventually(what, check, deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + @converge_ms
-
-    case check.() do
-      {:done, result} ->
-        result
-
-      {:waiting, seen} ->
-        if System.monotonic_time(:millisecond) > deadline do
-          flunk("waited #{@converge_ms}ms for #{what}; last saw #{inspect(seen)}")
-        else
-          Process.sleep(50)
-          eventually(what, check, deadline)
-        end
-    end
   end
 end

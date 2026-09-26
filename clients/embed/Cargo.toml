@@ -11,6 +11,10 @@ publish = false
 # this and on `trellis` directly (ADR-0010 decision 1).
 [dependencies]
 trellis = { path = "../../trellis" }
+# Only for `PgLsn`, the type `watermark_token`/`await_converged` traffic in,
+# which `trellis` doesn't re-export. The same version `trellis` depends on, so
+# it resolves to the one crate and the one type.
+tokio-postgres = "0.7.13"
 
 [dev-dependencies]
 # `test-util` opens `trellis::dev`, whose `defs::parse` is the only way to
