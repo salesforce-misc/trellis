@@ -20,11 +20,16 @@
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
 //! | [`trellis::QuarantineTarget`] | `transform` / `transform.column` | [`quarantine_address`] |
 //! | `sample_quarantined`'s `(src_table, key)` cursor | an opaque string | [`next_cursor`] / [`decode_cursor`] |
+//!
+//! One piece of shared logic isn't flattening: [`require_transform_statement`]
+//! is the check a binding's `define` makes before calling `apply`, so that a
+//! `DROP` or `PAUSE` handed to `define` is refused rather than carried out.
 
 mod cursor;
 mod definition;
 mod error;
 mod quarantine;
+mod statement;
 mod status;
 mod time;
 
@@ -34,6 +39,7 @@ pub use definition::{
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use quarantine::quarantine_address;
+pub use statement::require_transform_statement;
 pub use status::{
     quarantine_state, quarantine_state_names, transform_status, transform_status_names,
 };

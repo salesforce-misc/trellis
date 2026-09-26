@@ -8,8 +8,14 @@ defmodule Trellis do
   `status/2` and `shutdown/1`, enough to take a transform from nothing to
   `:live`.
 
+      # A deploy's migration step: the defaults run nothing in the background.
+      {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
+      :ok = Trellis.migrate(migrator)
+      :ok = Trellis.shutdown(migrator)
+
+      # The app, once migrated. The staging worker reads the catalog as it
+      # starts, so a `staging: true` handle can't connect before `migrate/1`.
       {:ok, trellis} = Trellis.connect(url: "postgres://localhost/app", staging: true, drain_threads: 2)
-      :ok = Trellis.migrate(trellis)
       {:ok, definition} = Trellis.define(trellis, "TRANSFORM widget_prices FROM widgets SELECT price AS price")
       {:ok, %Trellis.Status{status: :live}} = Trellis.status(trellis, "widget_prices")
       :ok = Trellis.shutdown(trellis)
@@ -91,6 +97,11 @@ defmodule Trellis do
   @doc """
   Creates or upgrades Trellis's own tables in the configured schema. Safe to
   run on every boot.
+
+  Run it on a handle with the default options, before connecting one that
+  runs background work: the staging worker reads Trellis's tables as it
+  starts, so a `staging: true` connect to an unmigrated schema fails with a
+  `:not_found` error.
   """
   @spec migrate(t()) :: :ok | {:error, Error.t()}
   def migrate(%__MODULE__{ref: ref}), do: unit(Native.migrate(ref))
@@ -105,9 +116,9 @@ defmodule Trellis do
   Returns once the definition is registered and its backfill queued, with the
   definition at `:waiting_to_backfill`; poll `status/2` for `:live`.
 
-  Only `TRANSFORM` statements belong here. Any other statement form is still
-  applied (there's no way to tell the forms apart before applying one), and
-  then reported as a `:validation` error.
+  Only `TRANSFORM` statements belong here. Any other statement form (`DROP`,
+  `PAUSE`, `RELATIONSHIP`, ...) is refused with a `:validation` error before
+  anything is applied.
 
   Trellis runs this on its own connections, not in the caller's transaction:
   if an enclosing Ecto migration rolls back, the definition stays.

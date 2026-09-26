@@ -30,7 +30,7 @@ use rustler::{Atom, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, TrellisOptions};
 use trellis_embed::{
     ERROR_CODES, PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainError,
-    transform_status_names,
+    require_transform_statement, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -61,8 +61,11 @@ struct ConnectOptions {
 /// One connected Trellis instance, owned by the BEAM as a resource.
 ///
 /// The lock is read for every call and written only by `shutdown`, which
-/// takes the [`BlockingTrellis`] out; calls from several BEAM processes run
-/// concurrently, and a call after shutdown gets an error, not a hang.
+/// takes the [`BlockingTrellis`] out, so a call after shutdown gets an error,
+/// not a hang. Calls from several BEAM processes don't wait on each other for
+/// the lock, but the [`BlockingTrellis`] runs them one at a time on its own
+/// thread, so each waiting call holds a dirty IO scheduler until its turn.
+/// `shutdown` waits for calls already in flight before it takes the instance.
 struct Handle {
     trellis: RwLock<Option<BlockingTrellis>>,
     /// The OS process that connected. The BEAM never forks, so this can't
@@ -191,19 +194,20 @@ fn migrate(handle: ResourceArc<Handle>) -> NifReply<Atom> {
 
 /// Registers the `TRANSFORM` statement `text`.
 ///
-/// `BlockingTrellis::apply` takes every statement form, and nothing public
-/// says which form `text` is before it is applied, so a different form still
-/// takes effect and is then reported as a `validation` error that says so.
-/// The other forms get their own functions in the binding's full surface
-/// (#147).
+/// `BlockingTrellis::apply` takes every statement form, so `text` is checked
+/// first: any other form (`DROP`, `PAUSE`, ...) is a `validation` error and
+/// is never applied. The other forms get their own functions in the
+/// binding's full surface (#147).
 #[rustler::nif(schedule = "DirtyIo")]
 fn define(env: Env, handle: ResourceArc<Handle>, text: String) -> NifReply<DefinitionTerm> {
+    require_transform_statement(&text).map_err(plain)?;
     let applied = handle.with(|trellis| trellis.apply(&text))?;
+    // Unreachable while the check above mirrors `apply`'s dispatch; kept so a
+    // drift between the two is an error rather than a panic.
     let definition = applied.into_transform().ok_or_else(|| {
         error(
-            ErrorCode::Validation,
-            "define/2 takes a TRANSFORM statement; this statement is another form, and it was \
-             applied but registered no transform",
+            ErrorCode::Internal,
+            "define/2 applied a statement that registered no transform",
         )
     })?;
     let definition = PlainDefinition::from(&definition);

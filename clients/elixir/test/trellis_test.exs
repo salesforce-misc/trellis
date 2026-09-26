@@ -45,10 +45,10 @@ defmodule TrellisTest do
     assert definition.source_columns == %{"id" => "integer", "price" => "integer"}
 
     assert %Status{status: :live, backfill_failure: nil} =
-             eventually(fn ->
+             eventually("widget_prices to reach :live", fn ->
                case Trellis.status!(trellis, "widget_prices") do
-                 %Status{status: :live} = status -> status
-                 _ -> nil
+                 %Status{status: :live} = status -> {:done, status}
+                 status -> {:waiting, status}
                end
              end)
 
@@ -56,9 +56,46 @@ defmodule TrellisTest do
     assert rows(pg) == [[1, 5]]
 
     Postgrex.query!(pg, "insert into widgets (id, price) values (2, 7)", [])
-    assert eventually(fn -> if rows(pg) == [[1, 5], [2, 7]], do: true end)
+
+    eventually("the new source row to reach widget_prices", fn ->
+      case rows(pg) do
+        [[1, 5], [2, 7]] -> {:done, :ok}
+        rows -> {:waiting, rows}
+      end
+    end)
 
     assert :ok = Trellis.shutdown(trellis)
+  end
+
+  # `define/2` is `apply` underneath, which carries out every statement form,
+  # so it must refuse the others before applying them, not after. The handle
+  # runs nothing in the background, so the definition stays put at
+  # :waiting_to_backfill unless one of these statements reaches the engine.
+  test "define/2 refuses any other statement form without applying it" do
+    pg = TestCluster.postgrex!()
+    Postgrex.query!(pg, "create table gadgets (id integer primary key, price integer)", [])
+
+    trellis = Trellis.connect!(url: TestCluster.info()["dsn"])
+    on_exit(fn -> Trellis.shutdown(trellis) end)
+
+    assert {:ok, %Definition{status: :waiting_to_backfill}} =
+             Trellis.define(trellis, "TRANSFORM gadget_prices FROM gadgets SELECT price AS price")
+
+    for statement <- [
+          "PAUSE TRANSFORM gadget_prices",
+          "  drop transform gadget_prices",
+          "RELATIONSHIP owner FROM gadgets.id TO gadgets.id"
+        ] do
+      assert {:error, %Error{code: :validation, message: message}} =
+               Trellis.define(trellis, statement)
+
+      assert message =~ "nothing was applied"
+      assert_raise Error, fn -> Trellis.define!(trellis, statement) end
+
+      assert {:ok, %Status{status: :waiting_to_backfill}} =
+               Trellis.status(trellis, "gadget_prices"),
+             "#{inspect(statement)} took effect"
+    end
   end
 
   test "a statement that doesn't parse is a :parse error" do
@@ -91,20 +128,22 @@ defmodule TrellisTest do
     Postgrex.query!(pg, "select id, price from widget_prices order by id", []).rows
   end
 
-  # Polls `check` until it returns something truthy, or fails the test.
-  defp eventually(check, deadline \\ nil) do
+  # Polls `check` until it returns `{:done, result}`, or fails the test
+  # naming what it waited for and the last `{:waiting, seen}` value.
+  defp eventually(what, check, deadline \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + @converge_ms
 
-    cond do
-      result = check.() ->
+    case check.() do
+      {:done, result} ->
         result
 
-      System.monotonic_time(:millisecond) > deadline ->
-        flunk("did not converge within #{@converge_ms}ms")
-
-      true ->
-        Process.sleep(50)
-        eventually(check, deadline)
+      {:waiting, seen} ->
+        if System.monotonic_time(:millisecond) > deadline do
+          flunk("waited #{@converge_ms}ms for #{what}; last saw #{inspect(seen)}")
+        else
+          Process.sleep(50)
+          eventually(what, check, deadline)
+        end
     end
   end
 end

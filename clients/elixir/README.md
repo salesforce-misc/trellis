@@ -10,8 +10,14 @@ This is the vertical slice (issue #146): `connect/1`, `migrate/1`,
 `define/2`, `status/2` and `shutdown/1`, each with a bang variant.
 
 ```elixir
+# A deploy's migration step: the defaults run nothing in the background.
+{:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
+:ok = Trellis.migrate(migrator)
+:ok = Trellis.shutdown(migrator)
+
+# The app, once migrated. The staging worker reads the catalog as it starts,
+# so a `staging: true` handle can't connect before `migrate/1` has run.
 {:ok, trellis} = Trellis.connect(url: "postgres://localhost/app", staging: true, drain_threads: 2)
-:ok = Trellis.migrate(trellis)
 {:ok, _definition} = Trellis.define(trellis, "TRANSFORM widget_prices FROM widgets SELECT price AS price")
 {:ok, %Trellis.Status{status: :live}} = Trellis.status(trellis, "widget_prices")
 :ok = Trellis.shutdown(trellis)
