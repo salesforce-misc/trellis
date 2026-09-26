@@ -8,10 +8,12 @@
 //! own: [`Definition`] (what `apply` returns for a `TRANSFORM` statement) has
 //! the source columns but no creation time, and [`DefinitionSummary`] (what
 //! `definitions()` lists) has the creation time but no source columns.
+//! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
+//! backfill failure's retry time in epoch microseconds.
 
 use std::collections::BTreeMap;
 
-use trellis::{Definition, DefinitionSummary};
+use trellis::{BackfillFailure, Definition, DefinitionStatus, DefinitionSummary};
 
 use crate::{epoch_micros, transform_status};
 
@@ -73,6 +75,53 @@ impl From<&DefinitionSummary> for PlainDefinitionSummary {
             source_version: summary.source_version,
             status: transform_status(summary.status),
             created_at_micros: epoch_micros(summary.created_at),
+        }
+    }
+}
+
+/// A [`DefinitionStatus`] flattened to plain data: what a host polls until a
+/// definition reaches `live`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainDefinitionStatus {
+    /// The status's `as_str()` word; see [`crate::transform_status`].
+    pub status: &'static str,
+    /// Set while the definition's source table's backfill keeps failing to
+    /// discharge; see [`DefinitionStatus::backfill_failure`].
+    pub backfill_failure: Option<PlainBackfillFailure>,
+}
+
+/// A [`BackfillFailure`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainBackfillFailure {
+    /// The fully-qualified `schema.table` the backfill marker is parked on.
+    pub source_table: String,
+    /// How many discharges have failed since the marker was parked.
+    pub attempts: u32,
+    /// The latest failure's error message.
+    pub last_error: String,
+    /// The earliest next discharge attempt, as [`crate::epoch_micros`].
+    pub next_attempt_at_micros: i64,
+}
+
+impl From<&DefinitionStatus> for PlainDefinitionStatus {
+    fn from(status: &DefinitionStatus) -> Self {
+        PlainDefinitionStatus {
+            status: transform_status(status.status),
+            backfill_failure: status
+                .backfill_failure
+                .as_ref()
+                .map(PlainBackfillFailure::from),
+        }
+    }
+}
+
+impl From<&BackfillFailure> for PlainBackfillFailure {
+    fn from(failure: &BackfillFailure) -> Self {
+        PlainBackfillFailure {
+            source_table: failure.source_table.clone(),
+            attempts: failure.attempts,
+            last_error: failure.last_error.clone(),
+            next_attempt_at_micros: epoch_micros(failure.next_attempt_at),
         }
     }
 }
@@ -152,6 +201,48 @@ mod tests {
                 source_version: 3,
                 status: "live",
                 created_at_micros: 1_727_222_400_123_456,
+            }
+        );
+    }
+
+    #[test]
+    fn a_healthy_status_crosses_as_its_word_with_no_failure() {
+        let status = DefinitionStatus {
+            status: TransformStatus::Live,
+            backfill_failure: None,
+        };
+
+        assert_eq!(
+            PlainDefinitionStatus::from(&status),
+            PlainDefinitionStatus {
+                status: "live",
+                backfill_failure: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_backfill_failure_crosses_with_its_retry_time_in_microseconds() {
+        let status = DefinitionStatus {
+            status: TransformStatus::WaitingToBackfill,
+            backfill_failure: Some(BackfillFailure {
+                source_table: "public.orders".to_string(),
+                attempts: 4,
+                last_error: "permission denied for table orders".to_string(),
+                next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
+            }),
+        };
+
+        assert_eq!(
+            PlainDefinitionStatus::from(&status),
+            PlainDefinitionStatus {
+                status: "waiting_to_backfill",
+                backfill_failure: Some(PlainBackfillFailure {
+                    source_table: "public.orders".to_string(),
+                    attempts: 4,
+                    last_error: "permission denied for table orders".to_string(),
+                    next_attempt_at_micros: 1_727_222_400_654_321,
+                }),
             }
         );
     }

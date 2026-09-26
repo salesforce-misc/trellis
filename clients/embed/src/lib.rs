@@ -15,6 +15,7 @@
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::Definition`] | summary fields + column name → type name | [`PlainDefinition`] |
 //! | [`trellis::DefinitionSummary`] | summary fields | [`PlainDefinitionSummary`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure | [`PlainDefinitionStatus`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
 //! | [`trellis::QuarantineTarget`] | `transform` / `transform.column` | [`quarantine_address`] |
@@ -28,7 +29,9 @@ mod status;
 mod time;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
-pub use definition::{PlainDefinition, PlainDefinitionSummary};
+pub use definition::{
+    PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
+};
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use quarantine::quarantine_address;
 pub use status::{
