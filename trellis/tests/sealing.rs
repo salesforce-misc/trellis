@@ -12,9 +12,9 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{StagingError, TRUNCATE_SENTINEL_KEY, seal};
+use trellis::staging::{StagedChange, StagingError, TRUNCATE_SENTINEL_KEY, seal};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), for tests that
 /// need a plain `tokio_postgres::Client`/`Transaction` — the type
@@ -368,6 +368,253 @@ async fn the_high_xid_writer_is_claimed_exactly_once_via_the_xmax_fix() {
         .expect("seal phase 2 (segment 2)");
 
     assert_claimed_exactly_once(&sealer, &[1, 2], "xmax-case").await;
+}
+
+/// A `Recompute` for `key`, the plainest [`trellis::staging::StagedChange`]:
+/// the tests below append through the real `trellis::staging::append`, so
+/// they exercise the writer's own pointer read rather than naming a slot.
+fn recompute(key: &str) -> StagedChange {
+    StagedChange::Recompute {
+        src_table: "orders".to_string(),
+        key: key.to_string(),
+        hop_gen: 0,
+        group_key: None,
+        src_changed: None,
+        prior_image: None,
+        origin_lsn: None,
+    }
+}
+
+async fn seal_both_phases(sealer: &mut Client) -> i64 {
+    let outcome = seal::seal_phase1(sealer).await.expect("seal phase 1");
+    seal::seal_phase2(sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// Issue #595: a writer at a snapshot isolation level takes its snapshot
+/// with a first `SELECT`, two seals flip the pointer past it, and only then
+/// does it append. Read from `segment_pointer`, the active slot comes out of
+/// its snapshot — segment 1's slot, two flips stale — and the row lands in
+/// `seg_0` with an xid above both `xmax(S_1)` and `xmax(S_2)`: batch 1 can't
+/// see it, batch 2's predecessor half reads `seg_1` not `seg_0`, and no
+/// later batch reads `seg_0` at all. The writer must read the slot from the
+/// snapshot-independent mirror instead, so it lands in the live slot.
+async fn a_snapshot_isolation_writer_is_claimed_exactly_once(level: IsolationLevel) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer
+        .build_transaction()
+        .isolation_level(level)
+        .start()
+        .await
+        .expect("begin writer");
+    // The first statement fixes the transaction's snapshot: slot 0 active.
+    let seen: i16 = writer_txn
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("take the writer's snapshot")
+        .get(0);
+    assert_eq!(seen, 0);
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 1);
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+
+    trellis::staging::append(&writer_txn, &[recompute("snapshot-writer")])
+        .await
+        .expect("append from the snapshot-isolation writer");
+    writer_txn.commit().await.expect("commit writer");
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 3);
+
+    assert_claimed_exactly_once(&sealer, &[1, 2, 3], "snapshot-writer").await;
+}
+
+#[tokio::test]
+async fn a_repeatable_read_writer_that_took_its_snapshot_before_a_seal_is_claimed_exactly_once() {
+    a_snapshot_isolation_writer_is_claimed_exactly_once(IsolationLevel::RepeatableRead).await;
+}
+
+#[tokio::test]
+async fn a_serializable_writer_that_took_its_snapshot_before_a_seal_is_claimed_exactly_once() {
+    a_snapshot_isolation_writer_is_claimed_exactly_once(IsolationLevel::Serializable).await;
+}
+
+/// Which ring table (`seg_0`..`seg_3`) holds the one row keyed `key`.
+async fn ring_table_of(client: &Client, key: &str) -> String {
+    client
+        .query_one(
+            "select tableoid::regclass::text from (
+                 select tableoid, key from seg_0
+                 union all select tableoid, key from seg_1
+                 union all select tableoid, key from seg_2
+                 union all select tableoid, key from seg_3
+             ) rows where key = $1",
+            &[&key],
+        )
+        .await
+        .expect("locate row's ring table")
+        .get(0)
+}
+
+/// Appends `key` through the real `trellis::staging::append` in its own
+/// committed transaction.
+async fn append_committed(client: &mut Client, key: &str) {
+    let txn = client.transaction().await.expect("begin append");
+    trellis::staging::append(&txn, &[recompute(key)])
+        .await
+        .expect("append");
+    txn.commit().await.expect("commit append");
+}
+
+/// Issue #595's crash case: the sealer dies after phase 1's flip commits and
+/// before phase 2 moves the mirror, so writers keep resolving the sealed
+/// slot. Recovery's reconstruction runs through `seal_phase2`, which sets
+/// the mirror before its xid bump, so a writer still open in the sealed slot
+/// has an xid below `xmax(S_1)`: in `S_1`'s in-progress list, holding the
+/// gate, and claimed by batch 2. Writers after recovery land in the live
+/// slot.
+#[tokio::test]
+async fn a_crash_between_the_flip_and_the_mirror_set_is_recovered_and_the_writer_is_claimed_exactly_once()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    // Phase 1 only: the pointer names slot 1, the mirror still slot 0.
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    assert_eq!(outcome.sealed_seg_seq, 1);
+    assert_eq!(active_pointer(&sealer).await, (2, 1));
+
+    // A writer appends through the real pointer read and stays open across
+    // the recovery: it lands in the sealed slot.
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    trellis::staging::append(&writer_txn, &[recompute("crash-window")])
+        .await
+        .expect("append into the crash window");
+    let landed: String = writer_txn
+        .query_one(
+            "select tableoid::regclass::text from seg_0 where key = 'crash-window'",
+            &[],
+        )
+        .await
+        .expect("the crash-window row is in seg_0")
+        .get(0);
+    assert_eq!(landed, "seg_0");
+
+    // Same age-gate wait as `age_gated_recovery_unwedges_a_crashed_seal_...`.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let tight = seal::SealConfig {
+        age_gate: Duration::from_millis(5),
+    };
+    let recovered = seal::recover_stuck_seals(&sealer, &tight, "wake")
+        .await
+        .expect("recover_stuck_seals");
+    assert_eq!(recovered, vec![outcome.sealed_seg_seq]);
+
+    // Recovery moved the mirror: new writers target the live slot.
+    append_committed(&mut sealer, "after-recovery").await;
+    assert_eq!(ring_table_of(&sealer, "after-recovery").await, "seg_1");
+
+    // The crash-window writer is in S_1's in-progress list, so it holds the
+    // gate until it settles.
+    match seal::seal_phase1(&mut sealer).await {
+        Err(StagingError::SealGateBlocked) => {}
+        other => {
+            panic!("expected the seal gate to block on the crash-window writer, got {other:?}")
+        }
+    }
+    writer_txn.commit().await.expect("commit writer");
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "crash-window").await;
+    assert_claimed_exactly_once(&sealer, &[1, 2], "after-recovery").await;
+}
+
+/// The guard on phase 2's mirror set: a phase 2 that stalls past the
+/// recovery age gate runs after recovery published `S_1` and after segment 2
+/// sealed and moved the mirror to slot 2. Setting the mirror back to slot 1
+/// would send writers into a sealed slot with xids above `xmax(S_2)`, which
+/// is issue #595's loss again. The stalled call must leave the mirror alone.
+#[tokio::test]
+async fn a_phase_two_that_stalls_past_recovery_does_not_move_the_mirror_backwards() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let tight = seal::SealConfig {
+        age_gate: Duration::from_millis(5),
+    };
+    let recovered = seal::recover_stuck_seals(&sealer, &tight, "wake")
+        .await
+        .expect("recover_stuck_seals");
+    assert_eq!(recovered, vec![outcome.sealed_seg_seq]);
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+
+    // Segment 1's original phase 2 finally runs.
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("stalled phase 2");
+
+    append_committed(&mut sealer, "after-stalled-phase-2").await;
+    assert_eq!(
+        ring_table_of(&sealer, "after-stalled-phase-2").await,
+        "seg_2"
+    );
+}
+
+/// The other half of the mirror argument: "a writer that read the old slot
+/// did so before the mirror set, hence has an xid below the bump" needs the
+/// writer's xid to exist when it reads. `active_ring_slot` assigns it in the
+/// same statement. A writer that resolves slot 0, then sees segment 1 seal
+/// around it before its insert, must be in `S_1`'s in-progress list and
+/// hold the gate; without the xid it would be absent from `S_1` altogether,
+/// segment 2 could seal past it, and its row would land in `seg_0` behind
+/// both fences.
+#[tokio::test]
+async fn a_writer_that_resolved_its_slot_before_a_seal_holds_the_seal_gate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    let slot = trellis::staging::active_ring_slot(&writer_txn)
+        .await
+        .expect("resolve the active slot");
+    assert_eq!(slot, 0);
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 1);
+
+    match seal::seal_phase1(&mut sealer).await {
+        Err(StagingError::SealGateBlocked) => {}
+        other => panic!(
+            "expected the seal gate to block on a writer that resolved slot 0 before the seal, \
+             got {other:?}"
+        ),
+    }
+
+    writer_txn
+        .execute(
+            &format!(
+                "insert into seg_{slot} (src_table, key, op, hop_gen) \
+                 values ('orders', 'resolved-early', 'recompute', 0)"
+            ),
+            &[],
+        )
+        .await
+        .expect("insert into the resolved slot");
+    writer_txn.commit().await.expect("commit writer");
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "resolved-early").await;
 }
 
 #[tokio::test]

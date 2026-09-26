@@ -55,8 +55,10 @@ tuples, no free space to reserve. Consequence, per
 **autoANALYZE**, so these tables have no planner statistics unless you write them.
 
 **The pointer** is a single pinned row (`id bool PRIMARY KEY DEFAULT true CHECK
-(id)`) naming which ring slot is `active`. Writers **read it inside their writing
-transaction and do not lock it** — see below.
+(id)`) naming which ring slot is `active`. Writers don't read the row itself:
+they read **its mirror**, a sequence (`ring_slot_mirror`) the seal sets to the
+same slot. They read it inside their writing transaction and do not lock it —
+see below.
 
 **The registry** holds one row per live batch: state, fence, bucket split,
 timestamps. `seg_seq` is monotonic and **never reused**; the physical `ring_slot`
@@ -126,6 +128,19 @@ resolves the pointer inside its writing transaction — tying its `row_txid` to 
 value it read — then writes into that slot. If a seal flipped in between, the row
 lands in what is now the sealed *predecessor* slot: a **straddler**, and picking
 it up exactly once is what [03](03-sealing-and-the-fence.md) exists to do.
+
+The fence accounts for a read that is stale by **one seal, and only one**, and
+only if two things hold. The writer must already have its xid when it reads, and
+the read must return the latest value the seal has set. A plain `SELECT` from
+the pointer row fails the second test at `REPEATABLE READ` and `SERIALIZABLE`,
+where it answers from the transaction's snapshot. A writer whose snapshot is two
+seals old lands two slots behind with an xid above both fences, and no batch
+ever reads it. So writers read the mirror instead, with
+`pg_sequence_last_value('ring_slot_mirror')`. Sequence reads are not
+transactional, so they return the latest value at every isolation level. The
+same statement assigns the writer's xid first (`pg_current_xact_id()`). None of
+Trellis's own writers runs at a snapshot level, but a capture trigger runs in
+the application's transaction, at whatever level the application chose.
 
 The central trade: *pay for stale reads once, in a read-time fence, instead of
 paying for coordination on every append.*

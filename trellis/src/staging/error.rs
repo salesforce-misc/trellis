@@ -18,9 +18,10 @@ use crate::error_code::{self, ErrorCode};
 /// hold before it may append.
 #[derive(Debug)]
 pub enum StagingError {
-    /// `segment_pointer` named a `ring_slot` outside `0..RING_SIZE`. Should
-    /// never happen — only this module writes that column — but resolving it
-    /// into a table name is checked and typed rather than assumed.
+    /// `segment_pointer` or its `ring_slot_mirror` sequence named a
+    /// `ring_slot` outside `0..RING_SIZE` (`-1`: the mirror read NULL).
+    /// Should never happen — only this module writes either — but resolving
+    /// it into a table name is checked and typed rather than assumed.
     InvalidRingSlot(i16),
     /// A [`super::session::ProducerSession`] was refused because the
     /// connection's effective `synchronous_commit` was `off`. A correctness

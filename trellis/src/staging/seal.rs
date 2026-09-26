@@ -58,6 +58,13 @@ pub struct SealOutcome {
 
 /// Fetches the currently active segment's `(seg_seq, ring_slot)` from the
 /// pointer — a plain read, no lock (see `trellis::staging::append`).
+///
+/// This reads the `segment_pointer` table, not the `ring_slot_mirror`
+/// sequence ring writers read ([`append::active_ring_slot`]), on purpose:
+/// the seal's own statements run at `READ COMMITTED`, and the table is the
+/// registry's authority for `active_seq`. The two disagree between phase 1's
+/// commit and phase 2's mirror set, which the fence argument in
+/// [`seal_phase2`] depends on.
 async fn active_pointer(client: &impl GenericClient) -> Result<(i64, i16), StagingError> {
     let row = client
         .query_one("select active_seq, ring_slot from segment_pointer", &[])
@@ -226,14 +233,45 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// Phase 2 of the two-phase seal, and also crash recovery's reconstruction
 /// step (docs/staging-and-claiming/03-sealing-and-the-fence.md — recovery
 /// "reconstructs `S_k` at the flip boundary from `seal_step1`" by simply
-/// running this now, long after the flip committed): the `xmax`-trap fix
-/// (`SELECT pg_current_xact_id()`, in **autocommit**, immediately before the
-/// snapshot) followed by capturing and publishing `fence_snapshot`.
+/// running this now, long after the flip committed): the ring-slot mirror
+/// set, then the `xmax`-trap fix (`SELECT pg_current_xact_id()`, in
+/// **autocommit**, immediately before the snapshot), then capturing and
+/// publishing `fence_snapshot`.
+///
+/// **The mirror set comes first** (issue #595). Ring writers resolve their
+/// slot from `ring_slot_mirror` ([`append::active_ring_slot`]), not from
+/// `segment_pointer`, so they keep targeting the sealed slot until this
+/// statement moves the mirror to the slot phase 1 activated. The fence
+/// argument, restated for the mirror: a writer takes its xid before it reads
+/// the mirror, so every writer that read the old slot did so before this
+/// set, hence before the bump below assigned its xid, hence with an xid
+/// below `xmax(S_k)`. It is either visible in `S_k` (batch *k* claims it) or
+/// in `S_k`'s in-progress list (the seal gate blocks `S_{k+1}` until it
+/// settles, and batch *k+1*'s predecessor half claims it). No writer holding
+/// an old-slot read has an xid at or above `xmax(S_k)`.
+///
+/// The same placement covers crash recovery: a sealer that died between
+/// phase 1's commit and this set leaves the mirror on the sealed slot, and
+/// writers keep landing there until recovery runs this function — every one
+/// of them still before the recovery's own bump.
+///
+/// The set is guarded to the pointer still naming this seal's successor
+/// (`active_seq = seg_seq + 1`), with the pointer row locked for the length
+/// of the statement. A normal phase 2 always matches: the successor can't
+/// seal until this fence is published. The guard is for a phase 2 that
+/// stalls past the recovery age gate: recovery publishes `S_k`, the
+/// successor seals and moves the mirror on, and the stalled call must not
+/// then drag the mirror back to a slot that is already sealed. The row lock
+/// orders the check against the successor's flip; a successor flip that
+/// commits first makes the re-checked row fail the guard, so nothing is set.
+/// A raced call that does match (a recoverer and a normal completion) sets
+/// the same value twice, which is harmless.
 ///
 /// Takes `&Client`, never a `Transaction`, so the xmax fix can't
 /// accidentally run inside an open transaction — there, the `SELECT`
 /// wouldn't commit and `latestCompletedXid` wouldn't move, silently
-/// reintroducing the trap.
+/// reintroducing the trap. The mirror set must also commit before the bump,
+/// which only autocommit guarantees.
 ///
 /// The write is scoped `state = 'sealed' and fence_snapshot is null`, so a
 /// raced call (a concurrent recoverer, or a normal completion that beat it)
@@ -269,6 +307,17 @@ pub async fn seal_phase2(
     seg_seq: i64,
     wake_channel: &str,
 ) -> Result<(), StagingError> {
+    client
+        .execute(
+            "with successor as materialized ( \
+                 select ring_slot from segment_pointer \
+                 where active_seq = $1::bigint + 1 \
+                 for update \
+             ) \
+             select setval('ring_slot_mirror', ring_slot, true) from successor",
+            &[&seg_seq],
+        )
+        .await?;
     client.query_one("select pg_current_xact_id()", &[]).await?;
     let fence: String = client
         .query_one("select pg_current_snapshot()::text", &[])

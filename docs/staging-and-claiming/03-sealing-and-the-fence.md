@@ -96,13 +96,54 @@ version.
 6. flip the pointer — last;
 7. `COMMIT`.
 
-**Phase 2** (a *separate* transaction, after the flip has committed and is
-visible): capture and record `seal_snapshot = S_k`.
+**Phase 2** (separate autocommit statements, after the flip has committed and is
+visible):
+1. set the pointer's mirror to the new slot (below);
+2. bump the xid horizon (the `xmax` trap, below);
+3. capture and record `seal_snapshot = S_k`.
 
 **`seal_snapshot` must never be taken inside the flip transaction.** Taken after
 the flip commits, no writer holding an old-pointer read can have an xid at or
 above `xmax(S_k)` — which is what makes the fence sound. Taken inside, it can,
 and the fence silently admits or drops rows depending on timing.
+
+### The pointer writers read is a mirror
+
+"No writer holding an old-pointer read has an xid at or above `xmax(S_k)`" makes
+two assumptions about the writer. Its xid exists when it reads the pointer, and
+the read returns the latest committed flip. At `READ COMMITTED` a plain
+`SELECT` from `segment_pointer` meets the second. At `REPEATABLE READ` or
+`SERIALIZABLE` it does not: the read answers from the transaction's snapshot,
+which a first statement can have fixed any number of seals ago. Such a writer
+lands in `slot_k` with `row_txid >= xmax(S_k)`. Batch *k* can't see it, the gate
+for *k+1* doesn't wait for it, batch *k+1* misses it if `S_{k+1}` is captured
+while it is still open, and no later batch reads `slot_k`. One seal between the
+transaction's first statement and its first write is enough.
+
+So writers never read the table. They read `ring_slot_mirror`, a sequence
+holding the same slot, with `pg_sequence_last_value()`. Sequence reads are not
+transactional, so the value is the latest one at every isolation level. The
+same statement assigns the writer's xid first. Phase 2 sets the mirror
+**after phase 1 commits and before the xid bump**, which restates the argument
+for the mirror:
+
+> A writer that read the old slot did so before the set, hence before the
+> bump's xid was assigned, hence with an xid below `xmax(S_k)`. It is visible in
+> `S_k` (batch *k* claims it) or in its in-progress list (the gate blocks
+> `S_{k+1}` until it settles; batch *k+1* claims it).
+
+Between phase 1's commit and the set, writers keep landing in the sealed slot.
+That is the phase gap with the pointer's side of it moved, and the argument
+covers it. `segment_pointer` stays the registry's authority: the seal's own
+reads, `Raced`, and convergence read the table, since they run at
+`READ COMMITTED`.
+
+The set is guarded to the pointer still naming this seal's successor, with the
+pointer row locked for the statement. A normal phase 2 always matches, because
+the successor cannot seal before this fence is published. The guard is for a
+phase 2 that stalls past the recovery age gate (below): recovery publishes
+`S_k`, the successor seals and moves the mirror on, and the stalled call must not
+drag the mirror back to a slot that is already sealed.
 
 ### The `xmax` trap
 
@@ -210,7 +251,7 @@ accumulates larger batches. Batch size adapts to load without a knob.
 | Crash point | Left behind | Recovery |
 |---|---|---|
 | producer mid-append | nothing (rolls back with its transaction) | — |
-| **sealer between phase 1 and phase 2** | `state = 'sealed'`, `seal_step1` set, `seal_snapshot` NULL. The batch is unclaimable (a claim needs a snapshot) **and** its successor cannot seal (the gate blocks on the absent snapshot). **The ring wedges.** | a recovery pass reconstructs `S_k` at the flip boundary from `seal_step1`. It is **age-gated** (10 s) so it can never stomp a healthy in-flight seal's sub-millisecond phase gap, and the write is scoped to the still-incomplete state, so a concurrent recoverer or a normal completion matches zero rows |
+| **sealer between phase 1 and phase 2**, including before the mirror set | `state = 'sealed'`, `seal_step1` set, `seal_snapshot` NULL, and possibly the mirror still naming the sealed slot, so writers keep landing there. The batch is unclaimable (a claim needs a snapshot) **and** its successor cannot seal (the gate blocks on the absent snapshot). **The ring wedges.** | a recovery pass runs phase 2 again: it sets the mirror, bumps, and reconstructs `S_k`. Every writer that landed in the sealed slot took its xid before recovery's bump, so the mirror argument holds unchanged. It is **age-gated** (10 s) so it can never stomp a healthy in-flight seal's sub-millisecond phase gap, and the write is scoped to the still-incomplete state, so a concurrent recoverer or a normal completion matches zero rows |
 | sealer after phase 2 | complete seal | — |
 
 Without the age gate, recovery races every normal seal — back to two
@@ -232,10 +273,15 @@ instead of a data-loss event.
   both-slots read has no meaning; Trellis relies on `txid_snapshot`.
 - **The two-phase split is not optional.** Capturing the boundary snapshot inside
   the transaction that moves the boundary is the `xmax` trap.
+- **A snapshot-independent pointer read, after the writer's xid exists.** A
+  writer at `REPEATABLE READ` or `SERIALIZABLE` reads a table from its
+  snapshot, so it can be told a slot several seals old. Writers read the
+  pointer from a sequence, whose reads are not transactional, and the seal
+  sets that mirror before its xid bump.
 - **The crash window is designed for, not discovered.** Phase 1 without phase 2
   wedges the ring on purpose, so the age-gated recovery pass is written alongside
   the seal.
 - **The boundary is tested directly.** Named tests for the straddler, the
-  phase-gap writer, and the `xmax` case — those three writers are the entire risk
-  surface, and none appears unless a test deliberately holds a transaction open
-  across a seal.
+  phase-gap writer, the `xmax` case, and the snapshot-isolation writer — those
+  four writers are the entire risk surface, and none appears unless a test
+  deliberately holds a transaction open across a seal.

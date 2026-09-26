@@ -204,12 +204,17 @@ async fn stage_transaction_failure_rolls_back_and_leaves_the_watermark_untouched
     seed_progress(&client, "slot1", 100).await;
 
     let txn = client.transaction().await.expect("begin");
-    // Force the stage to fail: corrupt `segment_pointer` to name an
-    // out-of-range ring slot in this transaction, so `append::append`'s slot
-    // resolution errors out. The corruption dies with the rollback.
-    txn.execute("update segment_pointer set ring_slot = 9", &[])
-        .await
-        .expect("corrupt the pointer for this transaction only");
+    // Force the stage to fail: a constraint on the active ring table that
+    // rejects every new row, added in this transaction, so
+    // `append::append`'s insert errors out. The constraint dies with the
+    // rollback. (Not a corrupt `segment_pointer`: writers resolve their slot
+    // from the non-transactional `ring_slot_mirror` sequence, issue #595.)
+    txn.execute(
+        "alter table seg_0 add constraint reject_every_row check (false) not valid",
+        &[],
+    )
+    .await
+    .expect("reject inserts into seg_0 for this transaction only");
 
     let result = intake::stage_and_advance(
         &txn,
@@ -219,7 +224,7 @@ async fn stage_transaction_failure_rolls_back_and_leaves_the_watermark_untouched
         PgLsn::from(200),
     )
     .await;
-    assert!(result.is_err(), "an invalid ring slot must fail the stage");
+    assert!(result.is_err(), "a rejected append must fail the stage");
     txn.rollback().await.expect("rollback");
 
     assert_eq!(seg_0_count(&client).await, 0, "nothing should be staged");
@@ -228,14 +233,17 @@ async fn stage_transaction_failure_rolls_back_and_leaves_the_watermark_untouched
         Some(100),
         "a failed stage transaction must leave the watermark untouched"
     );
-    let ring_slot: i16 = client
-        .query_one("select ring_slot from segment_pointer", &[])
+    let constraints: i64 = client
+        .query_one(
+            "select count(*) from pg_constraint where conname = 'reject_every_row'",
+            &[],
+        )
         .await
-        .expect("query pointer")
+        .expect("query constraints")
         .get(0);
     assert_eq!(
-        ring_slot, 0,
-        "the corruption must not have survived the rollback"
+        constraints, 0,
+        "the constraint must not have survived the rollback"
     );
 }
 

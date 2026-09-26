@@ -112,7 +112,7 @@ pub use seal::{seal_phase1, seal_phase2};
 // Reached only by this crate's own `tests/*.rs`, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
-pub use append::{RING_SIZE, TRUNCATE_SENTINEL_KEY, ring_slot_is_free};
+pub use append::{RING_SIZE, TRUNCATE_SENTINEL_KEY, active_ring_slot, ring_slot_is_free};
 #[cfg(any(test, feature = "internals"))]
 pub use apply::next_claimable_segment;
 #[cfg(any(test, feature = "internals"))]

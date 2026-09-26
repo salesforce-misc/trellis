@@ -101,6 +101,7 @@ high-volume ones be append-only and vacuum-free.
 |---|---|---|
 | ring tables `seg_0 … seg_{N-1}` | **append + `TRUNCATE` only** | the staged changes themselves |
 | `segment_pointer` | one row, updated per seal | names the active ring slot |
+| `ring_slot_mirror` (sequence) | `setval` once per seal | the pointer's slot, as writers read it, at any isolation level |
 | `segments` (registry) | one row per live batch, updated | state machine, fence, bucket mask |
 | `seg_claims` | one row per in-flight bucket | the claim; its primary key *is* the exclusion |
 | `drainers` | one row per live worker | share denominator for fair fan-out |

@@ -136,6 +136,12 @@ pub async fn converged_through(
     // condition 2 is the separate, unrelated fix for the *empty*-table case:
     // `min()` over zero rows is NULL too, and that must mean "nothing to
     // gate on", not "unknown, so block everything".
+    // Conditions 2 and 3 read `segment_pointer`, not the `ring_slot_mirror`
+    // sequence ring writers resolve their slot from (issue #595). Between a
+    // seal's phase 1 commit and its phase 2 mirror set, writers still land in
+    // the slot the table already calls sealed; condition 3 gates those rows
+    // like any other row in a sealed slot, so the table read is the right one
+    // here. Don't switch this to the mirror.
     let condition2 = per_ring_table(" or ", |slot, table| {
         format!(
             "((select ring_slot from segment_pointer) = {slot} \
@@ -152,10 +158,13 @@ pub async fn converged_through(
 
     // Invariant this leans on: a physical `seg_N` only holds rows while it has
     // a `segments` row (the `exists (... segments ...)` term). A slot's rows
-    // are appended only while it is the *active* slot, which always carries a
-    // registry row, and retirement (`retire::retire_drained_segments`) always
-    // deletes the `segments` row and truncates the table atomically, in one
-    // transaction — so a populated slot with no registry row is unreachable.
+    // are appended only by writers that resolved it from `ring_slot_mirror`,
+    // which names a slot with a registry row. Such a writer took its xid
+    // before the read (`append::active_ring_slot`), so it holds the
+    // successor's seal gate and retirement waits for it to settle. Retirement
+    // (`retire::retire_drained_segments`) always deletes the `segments` row
+    // and truncates the table atomically, in one transaction — so a populated
+    // slot with no registry row is unreachable.
     // If that ever changed, such orphaned rows would silently *not* gate (the
     // `exists` is false) — a false `converged`.
     //

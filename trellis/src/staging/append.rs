@@ -408,6 +408,54 @@ pub(crate) fn ring_table_name(ring_slot: i16) -> Result<&'static str, StagingErr
     }
 }
 
+/// Resolves the ring slot a writer appends into (issue #595;
+/// docs/staging-and-claiming/03-sealing-and-the-fence.md, "The two-phase
+/// seal"). Every ring writer resolves its slot here, never from
+/// `segment_pointer`. Two things make the read safe for the fence, and both
+/// are in this one statement:
+///
+/// - **It reads the mirror, not the table.** `ring_slot_mirror` is a
+///   sequence, and `pg_sequence_last_value` is not transactional: it returns
+///   the latest value at every isolation level. `select ring_slot from
+///   segment_pointer` does not — at `REPEATABLE READ` or `SERIALIZABLE` it
+///   answers from the transaction's snapshot, which can be any number of
+///   flips old, and a row written to a slot that stale lands above its
+///   batch's fence where no batch ever claims it.
+/// - **The writer's xid is assigned before the read.** The fence argument is
+///   "every writer that read the old slot has an xid below `xmax(S_k)`": the
+///   read precedes phase 2's mirror set, which precedes its xid bump. That
+///   only bounds the writer's xid if the xid already exists when it reads;
+///   a writer that read first and took its xid at the `INSERT` could take it
+///   after the bump, sit above `xmax(S_k)`, and slip past the seal gate.
+///   Assigning it here costs nothing: the `INSERT` that follows would assign
+///   it anyway, and `pg_current_xact_id()` returns the existing xid if the
+///   transaction already has one. `CASE` evaluates its condition before its
+///   result, so the order holds within one round trip.
+///
+/// The read takes no lock: locking would serialize every append against
+/// every seal. A read of a slot the seal has just flipped away from is
+/// expected and is exactly what the fence accounts for.
+///
+/// `segment_pointer` stays the registry's authority for `active_seq` and for
+/// Trellis's own `READ COMMITTED` readers (the seal's `active_pointer` and
+/// `Raced` check, convergence's conditions 2 and 3). Between phase 1's commit
+/// and phase 2's mirror set the two disagree by one slot; that gap is part of
+/// the argument above, so don't "unify" the two reads.
+pub async fn active_ring_slot(client: &impl GenericClient) -> Result<i16, StagingError> {
+    let ring_slot: Option<i16> = client
+        .query_one(
+            "select case when pg_current_xact_id() is not null \
+                 then pg_sequence_last_value('ring_slot_mirror')::smallint end",
+            &[],
+        )
+        .await?
+        .get(0);
+    // `V53__ring_slot_mirror.sql` initialises the sequence with
+    // `is_called = true`, so `pg_sequence_last_value` is never NULL; a NULL
+    // here means that invariant broke, not "slot 0".
+    ring_slot.ok_or(StagingError::InvalidRingSlot(-1))
+}
+
 /// Appends `changes` into the active ring segment as a single blind
 /// multi-row `INSERT` — no `ON CONFLICT`, no merge, one row per change.
 /// `row_txid`, `appended_at`, and `route` come from the tables' own
@@ -419,18 +467,14 @@ pub(crate) fn ring_table_name(ring_slot: i16) -> Result<&'static str, StagingErr
 /// something else (stage 01's watermark advance) rather than have a
 /// transaction opened and committed underneath them.
 ///
-/// The pointer is read with a plain `SELECT`, no `FOR UPDATE`/`FOR SHARE`:
-/// locking it would serialize every append against every seal. A stale read
-/// is expected and is what the fence (stage 03) accounts for.
+/// The active slot comes from [`active_ring_slot`] — the unlocked,
+/// snapshot-independent mirror read the fence (stage 03) accounts for.
 pub async fn append(txn: &Transaction<'_>, changes: &[StagedChange]) -> Result<(), StagingError> {
     if changes.is_empty() {
         return Ok(());
     }
 
-    let ring_slot: i16 = txn
-        .query_one("select ring_slot from segment_pointer", &[])
-        .await?
-        .get(0);
+    let ring_slot = active_ring_slot(txn).await?;
     let table = ring_table_name(ring_slot)?;
 
     const COLUMNS: &str = "src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, \

@@ -1,0 +1,22 @@
+-- Issue #595: a snapshot-independent copy of `segment_pointer.ring_slot`
+-- for ring *writers* to read (docs/staging-and-claiming/02-the-staging-ring.md,
+-- "Why the pointer is read but not locked", and
+-- 03-sealing-and-the-fence.md, "The two-phase seal").
+--
+-- A writer at REPEATABLE READ or SERIALIZABLE reads `segment_pointer` from
+-- its transaction snapshot, which can be one or more flips old; its row then
+-- lands in a sealed slot with an xid above that slot's fence and no batch
+-- ever claims it. Sequence reads are never transactional, so
+-- `pg_sequence_last_value('ring_slot_mirror')` returns the latest value at
+-- every isolation level. `setval` is non-transactional too: only the seal's
+-- phase 2 (`staging::seal::seal_phase2`) writes it, in autocommit, after
+-- phase 1's flip has committed.
+--
+-- `segment_pointer` stays the registry's authority (`active_seq`, the seal's
+-- own reads, convergence); this only mirrors which slot writers target.
+-- `minvalue 0` so slot 0 is representable, `maxvalue 3` because the ring has
+-- four slots (`seg_0`..`seg_3`, `staging::append::RING_SIZE`); the
+-- `setval(..., true)` below makes `pg_sequence_last_value` non-NULL from the
+-- start.
+create sequence ring_slot_mirror as smallint minvalue 0 maxvalue 3 no cycle;
+select setval('ring_slot_mirror', (select ring_slot from segment_pointer), true);
