@@ -125,14 +125,9 @@ impl PermitPool {
     /// test binary with no error.
     fn acquire(&'static self) -> ClusterPermit {
         let mut state = self.lock();
-        let mut seen = state.releases;
-        let mut deadline = Instant::now() + self.stall_timeout;
+        let mut stall = StallClock::start(self.stall_timeout, state.releases, Instant::now());
         while state.live >= self.max {
-            if state.releases != seen {
-                seen = state.releases;
-                deadline = Instant::now() + self.stall_timeout;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = stall.remaining(state.releases, Instant::now());
             if remaining.is_zero() {
                 let held = state.live;
                 // Unlock before panicking so the pool stays usable.
@@ -154,6 +149,37 @@ impl PermitPool {
     }
 }
 
+/// When a permit wait counts as stalled: `timeout` after the last release
+/// it saw, or after it started if it has seen none. Takes the time as an
+/// argument so the reset can be tested without sleeping.
+struct StallClock {
+    timeout: Duration,
+    seen: u64,
+    deadline: Instant,
+}
+
+impl StallClock {
+    fn start(timeout: Duration, releases: u64, now: Instant) -> Self {
+        Self {
+            timeout,
+            seen: releases,
+            deadline: now + timeout,
+        }
+    }
+
+    /// How much longer the wait may go, given the pool's release count at
+    /// `now`. A release since the last call restarts the clock; zero means
+    /// stalled. Checked on every wakeup, a timed-out one included, so a
+    /// waiter that no release woke still sees the count move.
+    fn remaining(&mut self, releases: u64, now: Instant) -> Duration {
+        if releases != self.seen {
+            self.seen = releases;
+            self.deadline = now + self.timeout;
+        }
+        self.deadline.saturating_duration_since(now)
+    }
+}
+
 /// RAII permit for one live cluster. Acquired before `initdb` and released
 /// only when dropped — which, for a permit held in [`TestCluster`], happens
 /// after the server has been stopped and its segment freed. Held as a local
@@ -169,9 +195,9 @@ impl Drop for ClusterPermit {
         state.live -= 1;
         state.releases += 1;
         drop(state);
-        // Every waiter, not one: each tracks releases to tell a busy pool
-        // from a stuck one, so one left asleep would miss the progress.
-        self.pool.released.notify_all();
+        // One waiter is enough: the others see `releases` move when their
+        // own stall deadline wakes them (see `StallClock::remaining`).
+        self.pool.released.notify_one();
     }
 }
 
@@ -1332,23 +1358,24 @@ mod tests {
     }
 
     /// A wait behind a busy pool isn't a stall: every release restarts the
-    /// deadline, so a waiter still gets its permit after waiting far longer
-    /// than the stall timeout in total, as long as releases keep coming.
-    /// The releases are counted without freeing a slot, so the only way
-    /// the waiter survives to take the final, real one is the reset.
+    /// clock, so a wait can run far past the stall timeout in total as long
+    /// as releases keep coming, and only a full timeout with none stalls it.
     #[test]
     fn releases_keep_a_long_permit_wait_from_counting_as_a_stall() {
-        static POOL: PermitPool = PermitPool::new("busy", 1, Duration::from_millis(300));
-        let held = POOL.acquire();
-        let waiter = std::thread::spawn(|| drop(POOL.acquire()));
-        for _ in 0..10 {
-            std::thread::sleep(Duration::from_millis(100));
-            POOL.lock().releases += 1;
-            POOL.released.notify_all();
-        }
-        drop(held);
-        waiter
-            .join()
-            .expect("the waiter panicked as stalled despite ongoing releases");
+        let minute = Duration::from_secs(60);
+        let start = Instant::now();
+        let at = |minutes: u32| start + minute * minutes;
+        let mut stall = StallClock::start(minute * 30, 0, start);
+
+        assert_eq!(stall.remaining(0, at(29)), minute);
+        // A release (seen whenever the waiter next wakes) restarts it...
+        assert_eq!(stall.remaining(1, at(29)), minute * 30);
+        // ...so 50 minutes in, past the first deadline, the wait goes on,
+        assert_eq!(stall.remaining(1, at(50)), minute * 9);
+        assert_eq!(stall.remaining(3, at(58)), minute * 30);
+        // until a full timeout passes with no release.
+        assert_eq!(stall.remaining(3, at(87)), minute);
+        assert!(stall.remaining(3, at(88)).is_zero());
+        assert!(stall.remaining(3, at(120)).is_zero());
     }
 }
