@@ -64,12 +64,15 @@ defmodule Trellis.SelfCheckTest do
     assert :ok = Trellis.await_converged(trellis, checked_through, @timeout_ms)
 
     # One key a page: sweeping through `next_after` visits each key once
-    # and ends on a `nil` cursor.
-    [first | _] = pages = sweep(trellis, "audited_widget_totals", 1)
-    assert %SelfCheckReport{rows_compared: 1, next_after: cursor} = first
-    assert is_binary(cursor)
+    # and ends on a `nil` cursor. A page that fills its limit exactly still
+    # hands back a cursor (the engine can't know no key follows), so the
+    # sweep ends on an empty third page.
+    pages = sweep(trellis, "audited_widget_totals", 1)
+
+    assert Enum.map(pages, &{&1.rows_compared, is_binary(&1.next_after)}) ==
+             [{1, true}, {1, true}, {0, false}]
+
     assert Enum.all?(pages, &(&1.outcome == :converged))
-    assert pages |> Enum.map(& &1.rows_compared) |> Enum.sum() == 2
 
     # The engine wrote 11 (10 + 1); this test overwrites it.
     Postgrex.query!(pg, "update audited_widget_totals set total = 9999 where id = '1'", [])

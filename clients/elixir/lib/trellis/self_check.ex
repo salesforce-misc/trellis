@@ -13,6 +13,8 @@ defmodule Trellis.SelfCheckReport do
     didn't catch up.
   - `next_after` is the cursor to pass as the next call's `:after` to audit
     the following page. `nil` means this page reached the end of the target.
+    A page that fills `:limit` exactly still returns a cursor, so a sweep
+    can end on a page that compares nothing.
   - `checked_through` is the watermark the outcome holds through, a token
     `Trellis.await_converged/3` takes.
   """

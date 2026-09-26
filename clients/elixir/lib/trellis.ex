@@ -442,8 +442,13 @@ defmodule Trellis do
       {:ok, report} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000)
       {:ok, next} = Trellis.self_check(trellis, "order_totals", limit: 1_000, timeout_ms: 30_000, after: report.next_after)
 
-  Like `await_converged/3`, it holds the handle while it waits, so every
-  other call on it waits behind this one.
+  The handle runs one call at a time, and this one can hold it for up to
+  `:timeout_ms` per wait (twice under `:standard`) plus the comparison of
+  up to `:limit` keys. Every other call on the handle, from any process,
+  waits behind it, each parking one of the BEAM's dirty IO schedulers while
+  it does. To sweep a large target alongside live traffic, give the audit a
+  handle of its own, connected with the defaults so it runs no background
+  work.
   """
   @spec self_check(t(), String.t(), [self_check_option()]) ::
           {:ok, SelfCheckReport.t()} | {:error, Error.t()}
