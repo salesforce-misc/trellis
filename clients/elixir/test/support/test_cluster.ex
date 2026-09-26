@@ -25,15 +25,20 @@ defmodule Trellis.TestCluster do
 
   @doc """
   Starts a second, private cluster for one test and returns its details
-  (the shape `info/0` returns). It is torn down when the calling test
-  process exits.
+  (the shape `info/0` returns). It is torn down in an `on_exit` callback
+  registered here, so any `on_exit` the test registers afterwards (shutting
+  down a handle connected to it, say) runs first, on every path. If the VM
+  itself dies, the port closing tears it down just the same.
 
   For a test whose leftovers would disturb the shared cluster. A separate
   database isn't enough for one that runs the staging worker: Trellis's
-  replication slot name is fixed, and slots are cluster-wide.
+  replication slot name is fixed, and slots are cluster-wide (#588).
   """
   def private! do
-    {:ok, agent} = Agent.start_link(&open/0)
+    # Not linked: the test process exits before its `on_exit` callbacks run,
+    # and a link would take the cluster down ahead of them.
+    {:ok, agent} = Agent.start(&open/0)
+    ExUnit.Callbacks.on_exit(fn -> Agent.stop(agent) end)
     Agent.get(agent, & &1.info)
   end
 

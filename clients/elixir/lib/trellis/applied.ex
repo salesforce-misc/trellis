@@ -19,7 +19,8 @@ defmodule Trellis.Applied do
     names, altered: names}}`: an `ALTER TRANSFORM` statement edited its
     subject. The lists name only the fields this call actually changed.
   - `:unknown`: the statement was applied, but its outcome is newer than
-    this version of the binding, which has no shape for it.
+    this version of the binding, which has no shape for it. It is still a
+    success: don't retry the statement, which would apply it twice.
   """
 
   @type alteration :: %{

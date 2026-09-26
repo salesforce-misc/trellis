@@ -209,6 +209,11 @@ defmodule Trellis do
   A statement that doesn't parse is a `:parse` error, and nothing is applied.
   Like `define/2`, this runs on Trellis's own connections, not in the
   caller's transaction.
+
+  `{:ok, :unknown}` is a success like any other `{:ok, _}`: the statement
+  took effect, and only its outcome is newer than this binding can describe.
+  Don't retry it; read the result back with `status/2`, `definitions/1` or
+  `relationships/1` if you need it.
   """
   @spec apply(t(), String.t()) :: {:ok, Applied.t()} | {:error, Error.t()}
   def apply(%__MODULE__{ref: ref}, text) when is_binary(text) do

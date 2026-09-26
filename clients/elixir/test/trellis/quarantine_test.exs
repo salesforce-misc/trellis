@@ -67,8 +67,8 @@ defmodule Trellis.QuarantineTest do
     # The pause is visible while the batch that tripped it can still be in
     # flight, and a resume that lands before that batch settles sees it
     # retried against its original row images, which pauses the column
-    # again. Wait for everything written so far to drain first, the way an
-    # operator resuming a column has to today.
+    # again (#585). Wait for everything written so far to drain first, the
+    # way an operator resuming a column has to until that's fixed.
     assert :ok = Trellis.await_converged(trellis, Trellis.watermark_token!(trellis), 30_000)
 
     # The flat list carries the same entry, by the same address.
@@ -123,8 +123,8 @@ defmodule Trellis.QuarantineTest do
   # which `poisoned_since/2` reports and the transform's own address samples.
   #
   # No public call releases a poisoned key, and a held one stops
-  # `await_converged/3` converging past it, so this runs on a cluster of its
-  # own rather than wedging the shared one.
+  # `await_converged/3` converging past it (#588), so this runs on a cluster
+  # of its own rather than wedging the shared one.
   test "a poisoned key is reported by poisoned_since and sampled under its transform" do
     cluster = TestCluster.private!()
     dsn = cluster["dsn"]
@@ -135,6 +135,8 @@ defmodule Trellis.QuarantineTest do
     :ok = Trellis.migrate!(migrator)
     :ok = Trellis.shutdown!(migrator)
 
+    # Registered after `private!/0`'s teardown, so it runs first: on_exit
+    # callbacks run last-in, first-out.
     trellis = Trellis.connect!(url: dsn, staging: true, drain_threads: 1)
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
@@ -175,9 +177,6 @@ defmodule Trellis.QuarantineTest do
              Trellis.quarantine_status!(trellis, "gizmo_prices")
 
     assert Postgrex.query!(pg, "select id, price from gizmo_prices", []).rows == [[1, 5]]
-
-    # Before the private cluster goes down with this process.
-    :ok = Trellis.shutdown!(trellis)
   end
 
   test "sample_quarantined refuses a malformed cursor or limit before calling the engine" do
