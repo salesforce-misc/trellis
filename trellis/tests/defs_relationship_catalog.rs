@@ -2157,3 +2157,92 @@ async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
         .expect("read query");
     assert!(missing.is_none());
 }
+
+/// Issue #429 review: every check runs before any catalog write, and the
+/// transaction rolls back on a rejection, so a refused relationship leaves no
+/// `schema_nodes`, `schema_edges`, `relationship_definitions` or
+/// `relationship_projections` rows behind. Rejected here by the to-one
+/// replica-identity check, which used to run after the node writes. The same
+/// pair then succeeds once fixed, so the empty counts aren't vacuous.
+#[tokio::test]
+async fn a_rejected_relationship_leaves_no_catalog_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_plain_column(&db.pool, "orders", "cust").await;
+    create_table_with_pk(&db.pool, "customers", "id").await;
+    let client = db.pool.get().await.expect("get connection");
+    let counts = async || -> Vec<i64> {
+        let mut out = Vec::new();
+        for table in [
+            "schema_nodes",
+            "schema_edges",
+            "relationship_definitions",
+            "relationship_projections",
+        ] {
+            let row = client
+                .query_one(&format!("select count(*) from {table}"), &[])
+                .await
+                .expect("count catalog rows");
+            out.push(row.get(0));
+        }
+        out
+    };
+    let text = "RELATIONSHIP customer FROM orders.cust TO customers.id";
+
+    let err = create_relationship(&db.pool, text).await.unwrap_err();
+    assert!(
+        matches!(err, CatalogError::ReplicaIdentityRequired(_)),
+        "{err:?}"
+    );
+    assert_eq!(counts().await, vec![0, 0, 0, 0], "a rejection left rows");
+
+    set_replica_identity_full(&db.pool, "orders").await;
+    create_relationship(&db.pool, text)
+        .await
+        .expect("accepted once orders is REPLICA IDENTITY FULL");
+    let after = counts().await;
+    assert!(
+        after[0] == 2 && after[1] == 1 && after[2] == 1,
+        "an accepted relationship writes two nodes, one edge and one row: {after:?}"
+    );
+}
+
+/// Issue #429 review: intake's keying check passes a table on `REPLICA
+/// IDENTITY USING INDEX` without finding the index, and one whose index was
+/// dropped (Postgres then treats it as `NOTHING`) has no key at all. The key
+/// lookup is what notices, and the rejection names the endpoint's side as a
+/// keying failure rather than a target-table DDL error.
+#[tokio::test]
+async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unkeyed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id integer not null, cust integer); \
+             create unique index orders_id on orders (id); \
+             alter table orders replica identity using index orders_id; \
+             drop index orders_id; \
+             create table customers (id integer primary key); \
+             alter table customers replica identity full",
+        )
+        .await
+        .expect("create tables");
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.id",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CatalogError::RelationshipEndpointNotChangeKeyed {
+                side: RelationshipSide::From,
+                endpoint,
+            } if endpoint == "trellis.orders"
+        ),
+        "{err:?}"
+    );
+}

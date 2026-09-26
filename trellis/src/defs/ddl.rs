@@ -284,8 +284,9 @@ impl fmt::Display for DdlError {
                 "source table '{source_table}' has primary key {column} ({pg_type}), a type \
                  whose equality isn't text-stable, so the apply/backfill paths (which \
                  compare primary keys as text) would silently diverge from the Postgres \
-                 oracle's typed equality; supported primary key types are integer, bigint, \
-                 smallint, uuid, text, and character varying"
+                 oracle's typed equality; supported primary key types are {} and enum types \
+                 (see docs/type-support.md)",
+                super::catalog::supported_join_key_types()
             ),
             DdlError::InvalidDefinition(err) => {
                 write!(f, "cannot generate target-table DDL: {err}")
@@ -1916,6 +1917,27 @@ mod tests {
             predicate: Predicate::True,
             explicit_source_schema: None,
             explicit_target_schema: None,
+        }
+    }
+
+    /// The unsupported-key message lists the allowlist the gate actually
+    /// uses, not a hand-kept copy: it had drifted to the pre-#111 six types,
+    /// missing `oid` and the temporal families.
+    #[test]
+    fn unsupported_primary_key_message_lists_the_live_allowlist() {
+        let message = DdlError::UnsupportedPrimaryKeyType {
+            source_table: "public.orders".to_string(),
+            column: "id".to_string(),
+            pg_type: "numeric".to_string(),
+        }
+        .to_string();
+        let allowlist = super::super::catalog::supported_join_key_types();
+        assert!(message.contains(&allowlist), "{message}");
+        for type_name in ["oid", "date", "bytea", "enum types"] {
+            assert!(
+                message.contains(type_name),
+                "{type_name:?} missing: {message}"
+            );
         }
     }
 
