@@ -754,6 +754,29 @@ pub async fn install_definition(
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
 
+    // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
+    // side is trusted outright rather than resolved — checked here, before
+    // any DDL work runs, so a bogus explicit spelling fails fast with a
+    // friendly `ValidationError` instead of surfacing as a confusing DDL
+    // failure partway through this function, or as issue #566's key read
+    // below reporting the missing table as one with no primary key.
+    // `create_definition_inner` (below) repeats both checks inside its own
+    // transaction; that repeat is the *authoritative* one — it's the only
+    // check the test-fixture entry points ([`create_definition`]/
+    // [`create_definition_without_backfill`], which never call this
+    // function) ever run. This one is a pure fail-fast nicety for the far
+    // more common `install_definition` path, redundant-but-harmless on the
+    // path that also reaches `create_definition_inner`.
+    if let Some(schema) = &def.explicit_source_schema
+        && !confirm_qualified_table_exists(pool, schema, &def.source).await?
+    {
+        return Err(ValidationError::QualifiedSourceTableNotFound {
+            schema: schema.clone(),
+            table: def.source.clone(),
+        }
+        .into());
+    }
+
     // Validate *before* any DDL is generated or executed, for every key-space
     // (issue #94). DDL generation type-infers each target column from the same
     // expressions the validator checks, so an invalid definition reaching DDL
@@ -781,28 +804,6 @@ pub async fn install_definition(
     }
     let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
     validate(&def, source_columns, &relationships)?;
-
-    // Issue #76 / ADR-0007 grammar clause 4: an explicit schema on either
-    // side is trusted outright rather than resolved — checked here, before
-    // any DDL work runs, so a bogus explicit spelling fails fast with a
-    // friendly `ValidationError` instead of surfacing as a confusing DDL
-    // failure partway through this function.
-    // `create_definition_inner` (below) repeats both checks inside its own
-    // transaction; that repeat is the *authoritative* one — it's the only
-    // check the test-fixture entry points ([`create_definition`]/
-    // [`create_definition_without_backfill`], which never call this
-    // function) ever run. This one is a pure fail-fast nicety for the far
-    // more common `install_definition` path, redundant-but-harmless on the
-    // path that also reaches `create_definition_inner`.
-    if let Some(schema) = &def.explicit_source_schema
-        && !confirm_qualified_table_exists(pool, schema, &def.source).await?
-    {
-        return Err(ValidationError::QualifiedSourceTableNotFound {
-            schema: schema.clone(),
-            table: def.source.clone(),
-        }
-        .into());
-    }
 
     // An explicit `TRANSFORM <schema>.<target>` spelling overrides
     // `target_schema` (`Config::target_schema`, or this function's own
@@ -3432,6 +3433,28 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
 }
 
+/// Refuses a 1-1 field named after one of `qualified_source`'s primary key
+/// columns (issue #566) — see [`reject_primary_key_named_fields`]. Every key
+/// column is a source column, so the key is only introspected when some field
+/// shares a name with one of `source_columns`: a definition with none costs
+/// no query.
+async fn reject_fields_named_after_primary_key(
+    pool: &Pool,
+    qualified_source: &str,
+    fields: &[FieldDef],
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), CatalogError> {
+    if !fields.iter().any(|f| source_columns.contains_key(&f.name)) {
+        return Ok(());
+    }
+    let pk = ddl::source_primary_key(pool, qualified_source)
+        .await
+        .map_err(CatalogError::Ddl)?;
+    let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+    reject_primary_key_named_fields(fields, &pk_names)?;
+    Ok(())
+}
+
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
 /// from (issue #76, ADR-0007 grammar clause 4) — computed once, early in
 /// that function, exactly like `target_schema`/[`effective_target_schema`]
@@ -3475,28 +3498,6 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// [`resolve_graph_identity`] itself, the same pooled two-step resolution
 /// `staging::apply::compute`'s `qualified_schema_node_key` already reuses,
 /// rather than re-implementing the fallback a third time.
-/// Refuses a 1-1 field named after one of `qualified_source`'s primary key
-/// columns (issue #566) — see [`reject_primary_key_named_fields`]. Every key
-/// column is a source column, so the key is only introspected when some field
-/// shares a name with one of `source_columns`: a definition with none costs
-/// no query.
-async fn reject_fields_named_after_primary_key(
-    pool: &Pool,
-    qualified_source: &str,
-    fields: &[FieldDef],
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<(), CatalogError> {
-    if !fields.iter().any(|f| source_columns.contains_key(&f.name)) {
-        return Ok(());
-    }
-    let pk = ddl::source_primary_key(pool, qualified_source)
-        .await
-        .map_err(CatalogError::Ddl)?;
-    let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
-    reject_primary_key_named_fields(fields, &pk_names)?;
-    Ok(())
-}
-
 async fn resolve_source_for_install(
     pool: &Pool,
     def: &TransformDef,

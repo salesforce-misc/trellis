@@ -2295,3 +2295,37 @@ async fn alter_transform_add_of_a_field_named_after_a_primary_key_column_is_reje
         );
     }
 }
+
+/// Issue #566's key read runs before `validate` for a 1-1 definition with a
+/// field named like a source column (`a AS a`). With an explicit `FROM
+/// <schema>.<table>` naming a table that doesn't exist, that read would find
+/// no key and report `NoPrimaryKey`. The explicit-schema existence check runs
+/// first, so the missing table is reported as missing.
+#[tokio::test]
+async fn an_explicit_source_without_its_table_is_reported_missing_before_the_key_is_read() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute("create schema custom; create table s (id bigint primary key, a numeric)")
+        .await
+        .expect("seed a same-named table outside the named schema");
+
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM t FROM custom.s SELECT a AS a",
+        &numeric(&["id", "a"]),
+        "public",
+    )
+    .await
+    .expect_err("custom.s doesn't exist");
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(
+                trellis::defs::ValidationError::QualifiedSourceTableNotFound { schema, table }
+            ) if schema == "custom" && table == "s"
+        ),
+        "{err:?}"
+    );
+}
