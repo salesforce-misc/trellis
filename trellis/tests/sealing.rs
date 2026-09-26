@@ -617,6 +617,105 @@ async fn a_writer_that_resolved_its_slot_before_a_seal_holds_the_seal_gate() {
     assert_claimed_exactly_once(&sealer, &[1, 2], "resolved-early").await;
 }
 
+/// The order inside phase 2 is the whole mirror argument: set the mirror,
+/// *then* bump the xid horizon, *then* capture `S_k`. A writer can read the
+/// sealed slot from the mirror right up to the set. Its xid is below
+/// `xmax(S_k)` only if the bump and the capture come after that. So this test
+/// stops phase 2 at its mirror set by holding the pointer row the set's guard
+/// locks, starts a writer while phase 2 waits there, and then lets phase 2
+/// finish. The writer read the sealed slot, so it must hold the successor's
+/// seal gate and be claimed exactly once. If the set moved after the capture,
+/// `S_1` would already be taken while phase 2 waited, the writer's xid would
+/// be above `xmax(S_1)`, the gate would let segment 2 seal past it, and its
+/// row would sit in `seg_0` behind both fences.
+#[tokio::test]
+async fn a_writer_that_reads_the_mirror_while_phase_two_waits_to_set_it_holds_the_seal_gate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+    let monitor = connect_raw(db.dsn()).await;
+
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    assert_eq!(outcome.sealed_seg_seq, 1);
+
+    // Hold the pointer row so phase 2 stops at the mirror set's `for update`.
+    let mut blocker = connect_raw(db.dsn()).await;
+    let blocker_txn = blocker.transaction().await.expect("begin blocker");
+    blocker_txn
+        .query_one("select 1 from segment_pointer for update", &[])
+        .await
+        .expect("lock the pointer row");
+
+    let sealer_pid: i32 = sealer
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("sealer pid")
+        .get(0);
+    let phase2 = tokio::spawn(async move {
+        seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        sealer
+    });
+    // Wait until phase 2 is actually parked on the row lock. Otherwise the
+    // writer below could run before phase 2 started at all, and the test would
+    // pass whatever order phase 2's statements came in.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: bool = monitor
+            .query_one(
+                "select exists (select 1 from pg_locks where pid = $1 and not granted)",
+                &[&sealer_pid],
+            )
+            .await
+            .expect("poll pg_locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "phase 2 never waited on the pointer row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The mirror still names the sealed slot: the writer lands there and stays
+    // open across the rest of phase 2.
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    trellis::staging::append(&writer_txn, &[recompute("mid-phase-two")])
+        .await
+        .expect("append while phase 2 waits");
+    let landed: i64 = writer_txn
+        .query_one(
+            "select count(*) from seg_0 where key = 'mid-phase-two'",
+            &[],
+        )
+        .await
+        .expect("find the writer's row")
+        .get(0);
+    assert_eq!(landed, 1, "the writer should have resolved the sealed slot");
+
+    blocker_txn
+        .rollback()
+        .await
+        .expect("release the pointer row");
+    let mut sealer = phase2.await.expect("phase 2 task");
+
+    match seal::seal_phase1(&mut sealer).await {
+        Err(StagingError::SealGateBlocked) => {}
+        other => panic!(
+            "expected the seal gate to block on a writer that read the mirror before phase 2 \
+             set it, got {other:?}"
+        ),
+    }
+    writer_txn.commit().await.expect("commit writer");
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+    assert_claimed_exactly_once(&sealer, &[1, 2], "mid-phase-two").await;
+}
+
 #[tokio::test]
 async fn seal_gate_blocks_until_the_straddler_settles() {
     let cluster = TestCluster::start();
