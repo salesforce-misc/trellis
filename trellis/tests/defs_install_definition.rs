@@ -2160,3 +2160,138 @@ async fn a_cycle_closing_registration_reports_the_cycle_not_the_existing_target(
         "only s -> b is registered"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #566: a field named after a 1-1 source's primary key column.
+// ---------------------------------------------------------------------
+
+async fn table_exists(client: &Client, qualified: &str) -> bool {
+    client
+        .query_one("select to_regclass($1) is not null", &[&qualified])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The target already carries the source's key column, so a field of the same
+/// name, even the passthrough `id AS id`, would declare it twice. It used to
+/// fail install with a raw `42701 column "id" specified more than once`. Now it
+/// is refused with a clear error before any DDL, and the refusal names the key
+/// even for a non-passthrough (which `validate` alone would report as
+/// `CalculatedFieldShadowsSourceColumn`, advising a bare passthrough instead).
+#[tokio::test]
+async fn install_definition_rejects_a_field_named_after_a_primary_key_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute("create table s (id bigint primary key, a numeric)")
+        .await
+        .expect("seed source");
+
+    for text in [
+        "TRANSFORM t FROM s SELECT id AS id, a AS a",
+        "TRANSFORM t FROM s SELECT a AS id",
+    ] {
+        let err = install_definition(&db.pool, text, &numeric(&["id", "a"]), "public")
+            .await
+            .expect_err("a field named after the key column is refused");
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(
+                    trellis::defs::ValidationError::FieldNamedAfterPrimaryKey { field }
+                ) if field == "id"
+            ),
+            "{text}: {err:?}"
+        );
+        assert!(
+            !table_exists(&client, "public.t").await,
+            "{text}: no target table is left behind"
+        );
+    }
+}
+
+/// A key column selected under another name is an ordinary column that
+/// copies the key; nothing collides, and it installs and builds as one.
+#[tokio::test]
+async fn install_definition_accepts_a_primary_key_column_under_another_name() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 20) g",
+        )
+        .await
+        .expect("seed source");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT id AS order_id, a AS a",
+        &numeric(&["id", "a"]),
+        "public",
+    )
+    .await
+    .expect("a renamed primary key column installs");
+    trellis::intake::publication::settle_builds(&db.pool).await;
+    let mismatches: i64 = client
+        .query_one(
+            "select count(*) from s full join t on t.id = s.id \
+             where t.id is null or s.id is null or t.order_id is distinct from s.id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(mismatches, 0);
+}
+
+/// `ALTER TRANSFORM ... ADD id AS id` gets the same clear refusal as a first
+/// `TRANSFORM`, rather than the raw 42701 its rewrite's insert used to hit.
+#[tokio::test]
+async fn alter_transform_add_of_a_field_named_after_a_primary_key_column_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, a numeric); \
+             insert into s (id, a) select g, g from generate_series(1, 20) g",
+        )
+        .await
+        .expect("seed source");
+    install_definition(
+        &db.pool,
+        "TRANSFORM t FROM s SELECT a AS a",
+        &numeric(&["id", "a"]),
+        "public",
+    )
+    .await
+    .expect("install");
+    drain_backfill_chunks(&db.pool).await;
+
+    for text in [
+        "ALTER TRANSFORM t ADD id AS id",
+        "ALTER TRANSFORM t ADD a + 1 AS id",
+    ] {
+        let trellis::defs::Statement::AlterTransform(alter) =
+            trellis::defs::parse_statement(text).expect("parse")
+        else {
+            panic!("an ALTER TRANSFORM statement");
+        };
+        let err = trellis::defs::alter_transform(&db.pool, &alter)
+            .await
+            .expect_err("adding a field named after the key column is refused");
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(
+                    trellis::defs::ValidationError::FieldNamedAfterPrimaryKey { field }
+                ) if field == "id"
+            ),
+            "{text}: {err:?}"
+        );
+    }
+}

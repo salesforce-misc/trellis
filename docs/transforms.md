@@ -52,6 +52,11 @@ Insertion/deletion maps 1-1. Always a single source table: deriving a target
 from a key-to-key join of two tables is a cross-join, not 1-1, even when the
 join is one-to-one in practice.
 
+The target always carries the source's primary key columns, so don't select
+them under their own names: a field named after a key column (`id AS id`, or any
+expression `AS id`) is rejected, because the column is already there. A key
+column under a different name (`id AS order_id`) is an ordinary column.
+
 ### Aggregate (`GROUP BY`)
 
 Each distinct combination of grouping values produces one target row, matching
@@ -70,6 +75,11 @@ aliased yet, so two keys that share a column name (`GROUP BY buyer.name,
 seller.name`, or `name` alongside `buyer.name`) are rejected. To group by both,
 group over a 1-1 transform that selects them under distinct names
 (`buyer.name AS buyer_name`).
+
+An aggregate target also has hidden columns of Trellis's own, such as the
+running sum behind an `AVG`. Their names start with `__`, so that prefix is
+reserved: a field name, or a `GROUP BY` column, that starts with `__` is
+rejected.
 
 ```
 TRANSFORM order_totals FROM order_line_items GROUP BY order_id

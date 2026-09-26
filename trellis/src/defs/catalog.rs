@@ -118,7 +118,7 @@ use super::parser::{parse, parse_relationship};
 use super::pg_type::PgType;
 use super::validate::{
     RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
-    infer_field_types, validate,
+    infer_field_types, reject_primary_key_named_fields, validate,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -762,6 +762,23 @@ pub async fn install_definition(
     // behind for a definition that is then rejected. `create_definition`/
     // `create_definition_without_backfill` validate again below; that repeat is
     // cheap and keeps those entry points safe when called directly.
+    //
+    // Issue #566: a 1-1 field named after a source primary key column is
+    // refused ahead of `validate`, so it gets that error rather than
+    // `CalculatedFieldShadowsSourceColumn`'s "make it a bare passthrough".
+    // The same gate as the helper's own, checked first so that a definition
+    // with no field named like a source column doesn't resolve its source
+    // here at all.
+    if let KeySpace::OneToOne = def.key_space
+        && def
+            .fields
+            .iter()
+            .any(|f| source_columns.contains_key(&f.name))
+    {
+        let qualified_source = resolve_source_for_install(pool, &def).await?;
+        reject_fields_named_after_primary_key(pool, &qualified_source, &def.fields, source_columns)
+            .await?;
+    }
     let relationships = resolve_relationships_for_new_definition(pool, &def).await?;
     validate(&def, source_columns, &relationships)?;
 
@@ -1537,6 +1554,16 @@ pub async fn alter_transform(
             alter.target
         )));
     }
+
+    // Issue #566: an added field can't take a key column's name, exactly as
+    // at install. Ahead of `validate` for the same reason as there.
+    reject_fields_named_after_primary_key(
+        pool,
+        &current.source_table,
+        &real_adds,
+        &current.source_columns,
+    )
+    .await?;
 
     // Reuse the exact validator (and, inside it, the exact column-cycle
     // detector) a first `define` runs — see this function's own doc comment
@@ -3448,6 +3475,28 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// [`resolve_graph_identity`] itself, the same pooled two-step resolution
 /// `staging::apply::compute`'s `qualified_schema_node_key` already reuses,
 /// rather than re-implementing the fallback a third time.
+/// Refuses a 1-1 field named after one of `qualified_source`'s primary key
+/// columns (issue #566) — see [`reject_primary_key_named_fields`]. Every key
+/// column is a source column, so the key is only introspected when some field
+/// shares a name with one of `source_columns`: a definition with none costs
+/// no query.
+async fn reject_fields_named_after_primary_key(
+    pool: &Pool,
+    qualified_source: &str,
+    fields: &[FieldDef],
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), CatalogError> {
+    if !fields.iter().any(|f| source_columns.contains_key(&f.name)) {
+        return Ok(());
+    }
+    let pk = ddl::source_primary_key(pool, qualified_source)
+        .await
+        .map_err(CatalogError::Ddl)?;
+    let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+    reject_primary_key_named_fields(fields, &pk_names)?;
+    Ok(())
+}
+
 async fn resolve_source_for_install(
     pool: &Pool,
     def: &TransformDef,

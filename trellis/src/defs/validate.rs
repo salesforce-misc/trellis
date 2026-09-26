@@ -17,7 +17,7 @@ use std::fmt;
 
 use regex::Regex;
 
-use super::ast::{Expr, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
+use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
 use super::model::RelationshipCardinality;
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
@@ -46,6 +46,25 @@ pub struct ResolvedRelationship {
 pub enum ValidationError {
     /// Two calculated fields on the same target share a name.
     DuplicateFieldName { name: String },
+    /// A field's name starts with [`RESERVED_COLUMN_PREFIX`], which is kept
+    /// for the hidden columns Trellis adds to a target
+    /// ([`super::ddl::RECOMPUTE_LSN_COLUMN`], an `AVG`'s `__{field}_sum`, a
+    /// `SUM`'s `__{field}_count`). Without the reservation such a name could
+    /// equal one of them, and install failed with a raw Postgres
+    /// duplicate-column error (issue #566).
+    ReservedFieldName { field: String },
+    /// A `GROUP BY` key's target column name starts with
+    /// [`RESERVED_COLUMN_PREFIX`] (see [`ValidationError::ReservedFieldName`]).
+    /// `key` is the key as written, `column` the target column it would
+    /// become.
+    ReservedGroupByColumnName { key: String, column: String },
+    /// A 1-1 field is named after one of the source's primary key columns
+    /// (issue #566), whether it passes that column through (`id AS id`) or
+    /// computes something else under its name. The target already carries
+    /// every key column as its own key, so the field would declare the column
+    /// a second time. Raised by [`reject_primary_key_named_fields`], which the
+    /// catalog runs once it knows the source's key.
+    FieldNamedAfterPrimaryKey { field: String },
     /// A field's expression references a name that is neither a known
     /// source column nor another calculated field on the same target.
     UnresolvedColumn { field: String, column: String },
@@ -443,6 +462,26 @@ impl fmt::Display for ValidationError {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
             }
+            ValidationError::ReservedFieldName { field } => write!(
+                f,
+                "field name '{field}' starts with '__', which Trellis reserves for the hidden \
+                 columns it keeps on a target table (such as an AVG's running sum); choose a \
+                 name that doesn't start with '__'"
+            ),
+            ValidationError::ReservedGroupByColumnName { key, column } => write!(
+                f,
+                "GROUP BY key '{key}' would become target column '{column}', but Trellis \
+                 reserves names starting with '__' for the hidden columns it keeps on a target \
+                 table. GROUP BY keys can't be aliased yet, so group over a 1-1 transform that \
+                 selects the column under a name that doesn't start with '__'"
+            ),
+            ValidationError::FieldNamedAfterPrimaryKey { field } => write!(
+                f,
+                "field '{field}' has the name of a primary key column of the source table, \
+                 which the target already carries as its own key. Drop the field (the key \
+                 column is in the target without it), or give it a name that isn't a key \
+                 column's (e.g. `{field} AS source_{field}`)"
+            ),
             ValidationError::UnresolvedColumn { field, column } => write!(
                 f,
                 "calculated field '{field}' references '{column}', which is neither a \
@@ -750,6 +789,19 @@ pub fn validate(
         });
     }
 
+    // Issue #566: checked ahead of every per-key-space rule, so a reserved
+    // name is reported as such rather than as whatever shape error its
+    // expression also happens to have.
+    if let Some(field) = def
+        .fields
+        .iter()
+        .find(|f| f.name.starts_with(RESERVED_COLUMN_PREFIX))
+    {
+        return Err(ValidationError::ReservedFieldName {
+            field: field.name.clone(),
+        });
+    }
+
     // Exhaustive matches: these are the "re-verify at this layer" guard for
     // #22's already-enforced 1-1/TRUE-only constructs (see module docs).
     // `Aggregate` has real runtime checks (below), since — unlike the other
@@ -825,6 +877,14 @@ pub fn validate(
                     return Err(ValidationError::GroupByKeysShareTargetColumn {
                         first: group_by_key_as_written(earlier),
                         second: group_by_key_as_written(key),
+                        column: key.target_column_name().to_string(),
+                    });
+                }
+                // Issue #566: a key's column sits beside the target's hidden
+                // `__`-prefixed columns, so it may not use their prefix.
+                if key.target_column_name().starts_with(RESERVED_COLUMN_PREFIX) {
+                    return Err(ValidationError::ReservedGroupByColumnName {
+                        key: group_by_key_as_written(key),
                         column: key.target_column_name().to_string(),
                     });
                 }
@@ -926,6 +986,39 @@ pub fn validate(
     infer_field_types(def, source_columns, relationships)?;
 
     Ok(())
+}
+
+/// The name prefix reserved for the hidden columns Trellis keeps on a target
+/// table (issue #566). A user field or `GROUP BY` column may not start with it.
+pub const RESERVED_COLUMN_PREFIX: &str = "__";
+
+/// Rejects any of a 1-1 definition's `fields` named after one of the
+/// source's `primary_key` columns (issue #566). The target already carries
+/// every key column as its own key, so such a field would be declared a second
+/// time, and install used to fail with a raw Postgres duplicate-column error.
+/// `id AS id` is refused too, not quietly treated as the key column: the
+/// field adds nothing, and refusing it keeps the stored definition exactly
+/// what was written. A key column under another name (`id AS order_id`) is an
+/// ordinary column and passes.
+///
+/// [`validate`] can't run this itself, since it doesn't know the source's
+/// key; the catalog calls it at install and for an `ALTER TRANSFORM`'s added
+/// fields, before [`validate`], so this error wins over
+/// [`ValidationError::CalculatedFieldShadowsSourceColumn`], whose advice (use
+/// a bare passthrough) would be wrong for a key column.
+pub fn reject_primary_key_named_fields(
+    fields: &[FieldDef],
+    primary_key: &[&str],
+) -> Result<(), ValidationError> {
+    match fields
+        .iter()
+        .find(|f| primary_key.contains(&f.name.as_str()))
+    {
+        Some(field) => Err(ValidationError::FieldNamedAfterPrimaryKey {
+            field: field.name.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// A `GROUP BY` key spelled the way the definition wrote it: `column` or
@@ -2013,7 +2106,7 @@ fn visit<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::ast::{FieldDef, Operator};
+    use crate::defs::ast::Operator;
     use crate::defs::pg_type::PgType;
     use crate::float::FloatWidth;
 
@@ -3619,5 +3712,130 @@ mod tests {
             }
             other => panic!("expected InvalidRegexPattern, got {other:?}"),
         }
+    }
+
+    fn parsed(text: &str) -> TransformDef {
+        crate::defs::parser::parse(text).expect("parse")
+    }
+
+    #[test]
+    fn a_field_named_like_an_aggregate_targets_hidden_columns_is_rejected() {
+        // Issue #566: each of these named one of the hidden columns the
+        // aggregate target DDL adds (`__{field}_count`, `__{field}_sum`,
+        // `RECOMPUTE_LSN_COLUMN`), so validation passed and install then
+        // failed with a raw `42701 column specified more than once`.
+        let source_columns = numeric_columns(&["g", "x"]);
+        for (text, field) in [
+            (
+                "TRANSFORM t FROM s GROUP BY g SELECT SUM(x) AS total, COUNT(*) AS __total_count",
+                "__total_count",
+            ),
+            (
+                "TRANSFORM t FROM s GROUP BY g SELECT AVG(x) AS a, COUNT(*) AS __a_sum",
+                "__a_sum",
+            ),
+            (
+                "TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS __trellis_recompute_lsn",
+                "__trellis_recompute_lsn",
+            ),
+        ] {
+            let err = validate(&parsed(text), &source_columns, &HashMap::new()).unwrap_err();
+            assert_eq!(
+                err,
+                ValidationError::ReservedFieldName {
+                    field: field.to_string()
+                },
+                "{text}"
+            );
+            assert!(err.to_string().contains("reserves"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_double_underscore_field_name_is_reserved_on_a_one_to_one_transform_too() {
+        // The prefix is reserved uniformly rather than only where a hidden
+        // column exists today, so the rule is one a user can learn once.
+        let err = validate(
+            &parsed("TRANSFORM t FROM s SELECT x AS __x"),
+            &numeric_columns(&["x"]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::ReservedFieldName {
+                field: "__x".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_leading_underscore_field_name_is_still_allowed() {
+        assert_eq!(
+            validate(
+                &parsed("TRANSFORM t FROM s GROUP BY g SELECT SUM(x) AS _total"),
+                &numeric_columns(&["g", "x"]),
+                &HashMap::new(),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_group_by_key_whose_target_column_is_reserved_is_rejected() {
+        // `GROUP BY __a_sum ... AVG(x) AS a` would declare `__a_sum` twice:
+        // once as the key's column, once as `a`'s hidden running sum.
+        let err = validate(
+            &parsed("TRANSFORM t FROM s GROUP BY __a_sum SELECT AVG(x) AS a"),
+            &numeric_columns(&["__a_sum", "x"]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::ReservedGroupByColumnName {
+                key: "__a_sum".to_string(),
+                column: "__a_sum".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_field_named_after_a_primary_key_column_is_rejected() {
+        // Issue #566: the target already carries the key column, so a field of
+        // the same name, a bare passthrough or not, would declare it twice.
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, amount AS amount",
+            "TRANSFORM t FROM s SELECT amount AS amount, amount AS id",
+            "TRANSFORM t FROM s SELECT id + 1 AS id",
+        ] {
+            let err = reject_primary_key_named_fields(&parsed(text).fields, &["id"]).unwrap_err();
+            assert_eq!(
+                err,
+                ValidationError::FieldNamedAfterPrimaryKey {
+                    field: "id".to_string()
+                },
+                "{text}"
+            );
+            assert!(err.to_string().contains("already carries"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_field_named_after_any_column_of_a_composite_key_is_rejected() {
+        let d = parsed("TRANSFORM t FROM s SELECT x AS x, b AS b");
+        assert_eq!(
+            reject_primary_key_named_fields(&d.fields, &["a", "b"]),
+            Err(ValidationError::FieldNamedAfterPrimaryKey {
+                field: "b".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_primary_key_column_under_another_name_is_allowed() {
+        // `id AS order_id` is an ordinary column that happens to copy the key.
+        let d = parsed("TRANSFORM t FROM s SELECT id AS order_id, amount AS amount");
+        assert_eq!(reject_primary_key_named_fields(&d.fields, &["id"]), Ok(()));
     }
 }
