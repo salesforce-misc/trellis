@@ -919,9 +919,11 @@ async fn take_fuse_gate(txn: &Transaction<'_>, src_table: &str) -> Result<(), Ap
 /// taken while `txn` is open) is skipped entirely — the same fast path every
 /// eviction below threshold took before #160.
 ///
-/// Idempotent: a definition already [`TransformStatus::Quarantined`] is left
-/// alone (no redundant write, no repeated log line) on every later eviction
-/// that keeps `src_table` above threshold.
+/// Idempotent, and never relabels a freeze: a definition already frozen
+/// ([`TransformStatus::Quarantined`] or [`TransformStatus::Paused`]) is left
+/// alone (no write, no log line) on every later eviction that keeps
+/// `src_table` above threshold, including when the freeze landed after this
+/// call read its candidates (issue #338, see [`quarantine_if_crossed`]).
 ///
 /// `pub` rather than module-private only so the issue-#159 regression test
 /// (`tests/quarantine.rs`) can drive two genuinely overlapping eviction
@@ -993,42 +995,73 @@ pub async fn trip_transform_fuse_if_crossed(
              source; nothing quarantined"
         );
     }
-    for def in definitions {
-        if def.status == TransformStatus::Quarantined {
-            continue;
-        }
-        // `fuse_rearmed_at` is read inside `txn` (from the definition's own
-        // committed row, by id) rather than carried on `Definition`: it is
-        // pure fuse bookkeeping with no other reader, so widening the
-        // catalog's public model — and every construction site of it — for
-        // one call site isn't worth it.
-        let poisoned_count: i64 = txn
-            .query_one(
-                "select count(*) from poison \
-                 where src_table = $1 \
-                   and poisoned_at > coalesce( \
-                         (select fuse_rearmed_at from transform_definitions where id = $2), \
-                         '-infinity'::timestamptz)",
-                &[&src_table, &def.id],
-            )
-            .await?
-            .get(0);
-        if poisoned_count < DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64 {
-            continue;
-        }
-        tracing::warn!(
-            transform = %def.def.target,
-            src_table = %src_table,
-            poisoned_count,
-            "whole-transform fuse tripped; quarantining"
-        );
-        txn.execute(
-            "update transform_definitions set status = $1 where id = $2",
-            &[&TransformStatus::Quarantined.as_str(), &def.id],
-        )
-        .await?;
+    for def in &definitions {
+        quarantine_if_crossed(txn, src_table, def).await?;
     }
     Ok(())
+}
+
+/// One candidate's half of [`trip_transform_fuse_if_crossed`]: quarantines
+/// `def` if its windowed `poison` count for `src_table` has crossed
+/// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]. Returns whether it did.
+///
+/// `def` comes from the caller's unlocked candidate read
+/// ([`catalog::transforms_for_source`], on a pool connection), so by the time
+/// this runs the row may have moved on: an operator may have paused it, or
+/// paused and resumed it (issue #338). The read only nominates candidates.
+/// The verdict is one conditional `UPDATE` that re-checks, against the row as
+/// it is when the write happens, both that the definition is still in a
+/// state the fuse may freeze (an applying one, the same set the candidate read
+/// filtered on) and that its count crosses the threshold under its current
+/// `fuse_rearmed_at` window. Under READ COMMITTED a row changed by a
+/// transaction that commits while this `UPDATE` waits on it is re-evaluated
+/// against the committed version, so a pause that lands mid-statement is seen
+/// too. A paused definition therefore stays `paused`, the way
+/// [`crate::defs::lifecycle::pause_transform`] leaves a quarantined one
+/// `quarantined`: both triggers are the same freeze, and the label records
+/// which one fired first.
+///
+/// `fuse_rearmed_at` is read from the definition's row rather than carried
+/// on `Definition`: it is pure fuse bookkeeping with no other reader, so
+/// widening the catalog's public model (and every construction site of it)
+/// for one call site isn't worth it. The row lock this takes is the same one
+/// the unconditional write it replaced took, and only when the definition
+/// actually trips.
+async fn quarantine_if_crossed(
+    txn: &Transaction<'_>,
+    src_table: &str,
+    def: &Definition,
+) -> Result<bool, ApplyError> {
+    const WINDOWED_COUNT: &str = "(select count(*) from poison p \
+         where p.src_table = $3 \
+           and p.poisoned_at > coalesce(t.fuse_rearmed_at, '-infinity'::timestamptz))";
+    let tripped = txn
+        .query_opt(
+            &format!(
+                "update transform_definitions t set status = $1 \
+                 where t.id = $2 and t.status = any($4) and {WINDOWED_COUNT} >= $5 \
+                 returning {WINDOWED_COUNT}"
+            ),
+            &[
+                &TransformStatus::Quarantined.as_str(),
+                &def.id,
+                &src_table,
+                &TransformStatus::applying(),
+                &(DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64),
+            ],
+        )
+        .await?;
+    let Some(row) = tripped else {
+        return Ok(false);
+    };
+    let poisoned_count: i64 = row.get(0);
+    tracing::warn!(
+        transform = %def.def.target,
+        src_table = %src_table,
+        poisoned_count,
+        "whole-transform fuse tripped; quarantining"
+    );
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------
@@ -2487,5 +2520,235 @@ mod unit_tests {
                  got:\n{old_plan}"
             );
         }
+    }
+
+    /// A raw connection onto `db` with `search_path` on trellis's schema.
+    async fn connect_raw(db: &testkit::TestDatabase) -> tokio_postgres::Client {
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "set search_path to {}, public",
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("set search_path");
+        raw
+    }
+
+    /// A same-crate pool plus a raw connection onto `db`, with a live
+    /// `order_totals` definition over `public.orders` and a threshold's worth
+    /// of committed `poison` rows against that source: every precondition the
+    /// whole-transform fuse needs to trip. Returns the pool, the raw client
+    /// and the qualified source.
+    async fn fuse_ready(db: &testkit::TestDatabase) -> (Pool, tokio_postgres::Client, String) {
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let raw = connect_raw(db).await;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, price numeric, tax numeric)",
+        )
+        .await
+        .expect("seed source table");
+        let columns: HashMap<String, ValueType> = ["id", "price", "tax"]
+            .iter()
+            .map(|name| (name.to_string(), ValueType::Numeric))
+            .collect();
+        catalog::create_definition(
+            &pool,
+            "TRANSFORM order_totals FROM public.orders SELECT price + tax AS total",
+            &columns,
+        )
+        .await
+        .expect("create definition");
+        let src_table = "public.orders".to_string();
+        for i in 0..DEFAULT_TRANSFORM_DEATH_THRESHOLD {
+            raw.execute(
+                "insert into poison (src_table, key, last_error) values ($1, $2, 'test')",
+                &[&src_table, &format!("k{i}")],
+            )
+            .await
+            .expect("insert poison marker");
+        }
+        (pool, raw, src_table)
+    }
+
+    async fn status_of(raw: &tokio_postgres::Client) -> String {
+        raw.query_one(
+            "select status from transform_definitions \
+             where target_table like '%.order_totals'",
+            &[],
+        )
+        .await
+        .expect("read status")
+        .get(0)
+    }
+
+    /// Runs the fuse's per-definition write for `def` (a candidate from an
+    /// earlier, unlocked read) in its own transaction, as the eviction
+    /// transaction would, and returns whether it quarantined.
+    async fn trip_candidate(pool: &Pool, src_table: &str, def: &Definition) -> bool {
+        let mut client = pool.get().await.expect("pool connection");
+        let txn = client.transaction().await.expect("begin");
+        let tripped = quarantine_if_crossed(&txn, src_table, def)
+            .await
+            .expect("fuse write");
+        txn.commit().await.expect("commit");
+        tripped
+    }
+
+    /// Issue #338: the fuse reads its candidates without a lock, then writes.
+    /// An operator PAUSE that commits between the two stands; the fuse must
+    /// not relabel the freeze as its own. The interleaving is the fuse's two
+    /// halves called in order around the pause, not a race.
+    #[tokio::test]
+    async fn a_pause_between_the_fuse_read_and_write_stays_paused() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, src_table) = fuse_ready(&db).await;
+
+        let candidates = catalog::transforms_for_source(&pool, &src_table)
+            .await
+            .expect("candidate read");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the live definition is a fuse candidate"
+        );
+
+        crate::defs::lifecycle::pause_transform(&pool, "order_totals")
+            .await
+            .expect("pause");
+
+        assert!(
+            !trip_candidate(&pool, &src_table, &candidates[0]).await,
+            "the fuse must not claim a definition an operator froze after its read"
+        );
+        assert_eq!(status_of(&raw).await, "paused");
+    }
+
+    /// Issue #338, the pause committing *while* the fuse's write waits on it:
+    /// the pause's transaction holds the definition's row (as
+    /// `pause_transform` does between its `for update` read and its commit)
+    /// when the fuse's `UPDATE` reaches it. The fuse's write must re-check the
+    /// row the pause committed, not the version its statement started from.
+    ///
+    /// The ordering is observed, not timed: the pause commits only once the
+    /// fuse's transaction is parked on a lock. The wait for that is bounded;
+    /// if it expires the pause commits anyway and the first test above's
+    /// ordering is what gets exercised, which must also hold.
+    #[tokio::test]
+    async fn a_pause_committing_while_the_fuse_write_waits_stays_paused() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, src_table) = fuse_ready(&db).await;
+
+        let candidates = catalog::transforms_for_source(&pool, &src_table)
+            .await
+            .expect("candidate read");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the live definition is a fuse candidate"
+        );
+
+        let mut operator = connect_raw(&db).await;
+        let pause = operator.transaction().await.expect("begin pause");
+        pause
+            .execute(
+                "update transform_definitions set status = 'paused' \
+                 where target_table like '%.order_totals'",
+                &[],
+            )
+            .await
+            .expect("pause, uncommitted");
+
+        let fuse = trip_candidate(&pool, &src_table, &candidates[0]);
+        let commit_pause = async {
+            for _ in 0..200 {
+                let waiting: i64 = raw
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where wait_event_type = 'Lock' and datname = current_database()",
+                        &[],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            pause.commit().await.expect("commit pause");
+        };
+        let (tripped, ()) = tokio::join!(fuse, commit_pause);
+
+        assert!(
+            !tripped,
+            "the fuse must not claim a definition paused while its write waited"
+        );
+        assert_eq!(status_of(&raw).await, "paused");
+    }
+
+    /// Issue #338's wider window: a pause *and* resume both landing between
+    /// the fuse's read and its write. The resume re-armed the fuse and handed
+    /// the definition back for a fresh build, so the stale read's verdict no
+    /// longer applies to it. Two things in the write stop it, and either alone
+    /// would: the definition is no longer applying, and its re-armed window
+    /// counts none of the pre-resume `poison` rows. (The pre-#338 code passed
+    /// this too, through its separate windowed count; the pin is against a
+    /// fix that re-checks the status but trusts a count taken earlier.)
+    #[tokio::test]
+    async fn a_pause_and_resume_between_the_fuse_read_and_write_is_not_quarantined() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, src_table) = fuse_ready(&db).await;
+
+        let candidates = catalog::transforms_for_source(&pool, &src_table)
+            .await
+            .expect("candidate read");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the live definition is a fuse candidate"
+        );
+
+        crate::defs::lifecycle::pause_transform(&pool, "order_totals")
+            .await
+            .expect("pause");
+        resume_transform(&pool, "order_totals")
+            .await
+            .expect("resume");
+
+        assert!(
+            !trip_candidate(&pool, &src_table, &candidates[0]).await,
+            "the fuse must not quarantine a definition resumed after its read"
+        );
+        assert_eq!(status_of(&raw).await, "waiting_to_backfill");
+    }
+
+    /// The positive control for the two tests above: with nothing landing in
+    /// the window, the same two halves quarantine.
+    #[tokio::test]
+    async fn an_undisturbed_fuse_read_and_write_quarantines() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, src_table) = fuse_ready(&db).await;
+
+        let candidates = catalog::transforms_for_source(&pool, &src_table)
+            .await
+            .expect("candidate read");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the live definition is a fuse candidate"
+        );
+
+        assert!(trip_candidate(&pool, &src_table, &candidates[0]).await);
+        assert_eq!(status_of(&raw).await, "quarantined");
     }
 }
