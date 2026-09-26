@@ -2636,10 +2636,12 @@ mod unit_tests {
     /// when the fuse's `UPDATE` reaches it. The fuse's write must re-check the
     /// row the pause committed, not the version its statement started from.
     ///
-    /// The ordering is observed, not timed: the pause commits only once the
-    /// fuse's transaction is parked on a lock. The wait for that is bounded;
-    /// if it expires the pause commits anyway and the first test above's
-    /// ordering is what gets exercised, which must also hold.
+    /// The ordering is observed, not timed: the pause commits only once
+    /// Postgres reports the fuse's session blocked by the pause's. That block
+    /// is certain (the fuse's snapshot still sees the row `live`, so its
+    /// `UPDATE` has to lock it), so the test asserts it rather than falling
+    /// back to the first test's ordering; the bound only stops a regression
+    /// from hanging the suite.
     #[tokio::test]
     async fn a_pause_committing_while_the_fuse_write_waits_stays_paused() {
         let cluster = testkit::TestCluster::start();
@@ -2656,6 +2658,11 @@ mod unit_tests {
         );
 
         let mut operator = connect_raw(&db).await;
+        let pause_pid: i32 = operator
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("read the pause's backend pid")
+            .get(0);
         let pause = operator.transaction().await.expect("begin pause");
         pause
             .execute(
@@ -2668,21 +2675,28 @@ mod unit_tests {
 
         let fuse = trip_candidate(&pool, &src_table, &candidates[0]);
         let commit_pause = async {
-            for _ in 0..200 {
+            let mut blocked = false;
+            for _ in 0..3000 {
                 let waiting: i64 = raw
                     .query_one(
                         "select count(*) from pg_stat_activity \
-                         where wait_event_type = 'Lock' and datname = current_database()",
-                        &[],
+                         where $1 = any(pg_blocking_pids(pid))",
+                        &[&pause_pid],
                     )
                     .await
                     .expect("read pg_stat_activity")
                     .get(0);
                 if waiting > 0 {
+                    blocked = true;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
+            assert!(
+                blocked,
+                "the fuse's write never blocked on the uncommitted pause, so this \
+                 test would not exercise the mid-statement re-check"
+            );
             pause.commit().await.expect("commit pause");
         };
         let (tripped, ()) = tokio::join!(fuse, commit_pause);
