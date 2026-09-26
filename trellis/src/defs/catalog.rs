@@ -2933,12 +2933,13 @@ async fn validate_relationship_endpoint(
                 pg_type,
             });
         }
-        // `reject_unkeyed_relationship_endpoint` above passes a table on
-        // `REPLICA IDENTITY USING INDEX` without looking for the index, and
-        // one whose index was since dropped (which Postgres then treats as
-        // `NOTHING`) has no key at all. It is the same keying failure, so it
-        // gets that error rather than `CatalogError::Ddl`, whose message is
-        // about creating a target table.
+        // Not reachable while `reject_unkeyed_relationship_endpoint` above
+        // holds: it passes only a table with a primary key or a live
+        // replica-identity index (which qualifies as an identity index), or
+        // one of this instance's targets, which always carry a key. Should
+        // that drift, it is the same keying failure, so it gets that error
+        // rather than `CatalogError::Ddl`, whose message is about creating a
+        // target table.
         Err(DdlError::NoPrimaryKey { .. }) => {
             return Err(CatalogError::RelationshipEndpointNotChangeKeyed {
                 side,

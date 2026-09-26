@@ -274,9 +274,13 @@ fn extract_key(
 ///   IDENTITY USING INDEX`.
 ///
 /// Anything else has no key: `DEFAULT` without a primary key, `FULL` without
-/// one (issue #315's aggregate-target case), and `NOTHING`. Such a table is
-/// worse than undecodable once published: Postgres refuses its updates and
-/// deletes outright when it has no replica identity at all. Issue #376 checks
+/// one (issue #315's aggregate-target case), `NOTHING`, and `USING INDEX`
+/// whose index has since been dropped, which Postgres then treats as
+/// `NOTHING` while `relreplident` still reads `'i'` (issue #429's review:
+/// pgoutput flags no key column, so intake stops on the first change). Such
+/// a table is worse than undecodable once published: Postgres refuses its
+/// updates and deletes outright when it has no replica identity at all.
+/// Issue #376 checks
 /// this before accepting a definition whose source isn't one of the
 /// instance's own targets (`defs::catalog::reject_unkeyed_source`); `false`
 /// for a table that doesn't exist.
@@ -292,7 +296,8 @@ pub(crate) async fn change_keyed(
     );
     let keyed: Option<bool> = client
         .query_opt(
-            "select c.relreplident = 'i' \
+            "select (c.relreplident = 'i' and exists ( \
+                       select 1 from pg_index i where i.indrelid = c.oid and i.indisreplident)) \
                  or (c.relreplident in ('d', 'f') and exists ( \
                        select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary)) \
              from pg_class c where c.oid = pg_catalog.to_regclass($1)",

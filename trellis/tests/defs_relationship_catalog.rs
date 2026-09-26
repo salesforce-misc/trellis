@@ -2207,11 +2207,14 @@ async fn a_rejected_relationship_leaves_no_catalog_rows() {
     );
 }
 
-/// Issue #429 review: intake's keying check passes a table on `REPLICA
-/// IDENTITY USING INDEX` without finding the index, and one whose index was
-/// dropped (Postgres then treats it as `NOTHING`) has no key at all. The key
-/// lookup is what notices, and the rejection names the endpoint's side as a
-/// keying failure rather than a target-table DDL error.
+/// Issue #429 review: a table left on `REPLICA IDENTITY USING INDEX` after
+/// its index was dropped is one Postgres treats as `NOTHING`: pgoutput flags
+/// no key column, so intake stops on its first change (`MissingKeyValue`),
+/// and Postgres refuses its updates and deletes once it is published.
+/// `relreplident` still reads `'i'`, which intake's keying check used to take
+/// on trust. Rejected as unkeyed on its side, whether or not the table also
+/// has a primary key (with none, the key lookup used to be what noticed, as
+/// a target-table DDL error).
 #[tokio::test]
 async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unkeyed() {
     let cluster = TestCluster::start();
@@ -2223,26 +2226,47 @@ async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unk
              create unique index orders_id on orders (id); \
              alter table orders replica identity using index orders_id; \
              drop index orders_id; \
-             create table customers (id integer primary key); \
-             alter table customers replica identity full",
+             create table customers (id integer primary key, code integer not null); \
+             create unique index customers_code on customers (code); \
+             alter table customers replica identity using index customers_code; \
+             drop index customers_code; \
+             create table regions (id integer primary key); \
+             alter table regions replica identity full; \
+             create table visits (id integer primary key, customer integer); \
+             alter table visits replica identity full",
         )
         .await
         .expect("create tables");
 
-    let err = create_relationship(
-        &db.pool,
-        "RELATIONSHIP customer FROM orders.cust TO customers.id",
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            CatalogError::RelationshipEndpointNotChangeKeyed {
-                side: RelationshipSide::From,
-                endpoint,
-            } if endpoint == "trellis.orders"
+    for (text, side, endpoint) in [
+        (
+            "RELATIONSHIP region FROM orders.cust TO regions.id",
+            RelationshipSide::From,
+            "trellis.orders",
         ),
-        "{err:?}"
-    );
+        // To-many, so nothing else asks the from-side for a replica
+        // identity: before the review fix this one was accepted.
+        (
+            "RELATIONSHIP visits FROM customers.id TO visits.customer",
+            RelationshipSide::From,
+            "trellis.customers",
+        ),
+        (
+            "RELATIONSHIP customer FROM regions.id TO customers.id",
+            RelationshipSide::To,
+            "trellis.customers",
+        ),
+    ] {
+        let err = create_relationship(&db.pool, text).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                CatalogError::RelationshipEndpointNotChangeKeyed {
+                    side: got_side,
+                    endpoint: got,
+                } if *got_side == side && got == endpoint
+            ),
+            "{text}: {err:?}"
+        );
+    }
 }
