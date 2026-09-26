@@ -178,7 +178,9 @@ pub use staging::self_check::SelfCheckError;
 // --- Tier 2: the types tier-1/tier-2 signatures traffic in ----------------
 // Compiler-forced: a `pub fn` on the facade that returns or accepts one of
 // these would otherwise expose an unnameable type.
-pub use defs::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
+pub use defs::{
+    Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
+};
 
 /// Placeholder entry point exercising the async plumbing the engine will
 /// build on. Returns the crate version so callers have something to check.

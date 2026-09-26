@@ -80,6 +80,42 @@ Two structural facts shape several cells:
   (`defs_install_definition.rs`). Backfill's fast path is real only for a
   to-many aggregate over a to-one's own field, not for a bare to-one value.
 
+## Endpoint requirements
+
+A relationship `CREATE RELATIONSHIP` accepts must never halt the instance later
+over something that was knowable when it was declared (issue #429). So every
+requirement the paths above place on a relationship's two endpoint tables and
+its join columns is checked at create time, in one place:
+`defs::catalog::validate_relationship`, which runs before any catalog write.
+Each check calls the same function, or reads the same allowlist, as the path
+that would otherwise fail, so the create-time gate and the runtime can't drift
+apart. Each rejection names the side (from or to), the table and, where there
+is one, the column.
+
+| Requirement | Applies to | Why (the path that needs it) | Check |
+|---|---|---|---|
+| Both join columns exist | from, to | Every path reads them. | `column_type_in_txn` |
+| The join columns' types are comparable | the pair | ADR-0006's "type-check the join". | `assert_comparable_types` |
+| Each join column's type is on the join-key allowlist | from, to | The engine matches join keys as text; see [type-support.md](type-support.md)'s join-key role. | `assert_join_key_type_supported` |
+| Intake can key the endpoint's changes | from, to; not this instance's own targets | An endpoint the instance doesn't own is published, and intake keys each change by its primary key or replica-identity index (#375). | `reject_unkeyed_relationship_endpoint` → `intake::change_keyed` |
+| The endpoint's key (its primary key, or the unique index standing in for one) has only types on the key allowlist | from, to; own targets included | Apply keys every change the relationship propagates by it: the to-side's own staged changes (`apply::compute`'s per-source lookup and its `TRUNCATE` loop), and the from-side rows a to-side change re-derives (`accumulate_from_side_recomputes`, `build_reverse_relationship_shape`, the `TRUNCATE` loop's from-side walk). That lookup rejects an unsupported type, and the rejection halts the instance (#429). An aggregate target's key is its `GROUP BY` columns, so owning the endpoint doesn't exempt it. | `ddl::source_primary_key_in_txn`, the runtime's own lookup |
+| An endpoint that is one of this instance's targets is `live` | from, to | The seam is such an endpoint's only change feed, and a build's writes land outside it (#403). | `reject_non_live_upstream` |
+| The name is unique on the qualified from-table | from | A relationship's identity is `(from_schema, from_table, name)` (#288). | inline query |
+| The new edge closes no table cycle | the pair | Propagation must terminate. | `reject_if_table_cycle` |
+| A to-many to-side carries `to_col` in its pre-images (`REPLICA IDENTITY FULL`, or a replica-identity index covering `to_col`) | to; not own targets | The reverse recompute reads `to_col` from delete and re-parent pre-images (#41). | `assert_replica_identity_supports_to_many` |
+| A to-one relationship's endpoints are `REPLICA IDENTITY FULL` | from, to; not own targets | The settled parent projection needs the to-side's whole prior image, and a from-side FK re-point needs one at all (#129, #158). | `assert_replica_identity_supports_projection` → `check_source_guarantees` |
+
+A join column with no usable index on the from-side draws a warning
+(`RelationshipWarning::MissingFkIndex`), not a rejection. Columns a transform
+reads *through* a relationship (`rel.column`) are checked when that transform
+is defined, not here.
+
+Out of scope: the source schema changing after the relationship is created,
+such as a key's type changing or its primary key being dropped. The source
+schema belongs to the user
+([ADR-0005](decisions/0005-source-schema-is-user-owned.md)), and such drift
+can still halt the instance at apply time.
+
 ## The obligation table
 
 Legend: a function + test means **handled and pinned**. **N/A** means this path

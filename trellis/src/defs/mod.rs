@@ -55,7 +55,9 @@ pub use catalog::{
     CatalogError, alter_transform, create_relationship, install_definition, publication_tables,
 };
 pub use error::ParseError;
-pub use model::{Definition, RelationshipCardinality, RelationshipDefinition, TransformStatus};
+pub use model::{
+    Definition, RelationshipCardinality, RelationshipDefinition, RelationshipSide, TransformStatus,
+};
 pub use parser::{parse, parse_statement};
 pub use pg_type::PgType;
 pub use validate::validate;

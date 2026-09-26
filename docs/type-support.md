@@ -60,7 +60,13 @@ climb it left-to-right:
    (`is_text_stable_join_key_type`) — an unsafe single-column PK
    (`numeric`/`timestamptz`/`interval`, which `::text`-matching
    would silently mismatch) is rejected at define time with
-   `DdlError::UnsupportedPrimaryKeyType` (#107). The typed key index
+   `DdlError::UnsupportedPrimaryKeyType` (#107). The role covers every table
+   whose rows Trellis keys, not just a transform's source: both endpoints of a
+   relationship are held to it too, since apply keys every change the
+   relationship propagates by the endpoint's own key. `CREATE RELATIONSHIP`
+   rejects an endpoint with a key column off the allowlist
+   (`CatalogError::RelationshipEndpointUnsupportedKey`, #429), including an
+   aggregate target whose `GROUP BY` key is. The typed key index
    (below) later unlocks those: it compares
    *decoded values*, so a rendering that is ambiguous (`'1 day'` vs
    `'24 hours'`) or merely inconsistent between two renderers stops

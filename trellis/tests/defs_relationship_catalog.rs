@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use testkit::TestCluster;
 use trellis::defs::{
-    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition,
+    CatalogError, EdgeKind, RelationshipCardinality, RelationshipDefinition, RelationshipSide,
     RelationshipTypeMismatch, RelationshipWarning, ValidationError, ValueType, create_definition,
     create_relationship, create_target_table, edges_from, install_definition, parse,
     relationship_by_name, relationship_projection, relationships_to_table, source_primary_key,
@@ -578,8 +578,10 @@ async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
     assert!(
         matches!(
             &err,
-            CatalogError::RelationshipEndpointNotChangeKeyed { endpoint }
-                if endpoint == "trellis.products"
+            CatalogError::RelationshipEndpointNotChangeKeyed {
+                side: RelationshipSide::To,
+                endpoint,
+            } if endpoint == "trellis.products"
         ),
         "{err:?}"
     );
@@ -1952,4 +1954,206 @@ async fn a_relationship_resolves_endpoints_in_a_mixed_case_schema() {
         has_total,
         "the projection was widened with Custom.Totals.total"
     );
+}
+
+/// Issue #429: asserts `create_relationship` refused `text` on `side` because
+/// `endpoint`'s key column `column` is `pg_type`, and stored nothing.
+async fn assert_endpoint_key_rejected(
+    pool: &trellis::pool::Pool,
+    text: &str,
+    from_table: &str,
+    side: RelationshipSide,
+    endpoint: &str,
+    column: &str,
+    pg_type: &str,
+) {
+    let err = create_relationship(pool, text).await.unwrap_err();
+    match &err {
+        CatalogError::RelationshipEndpointUnsupportedKey {
+            side: got_side,
+            endpoint: got_endpoint,
+            column: got_column,
+            pg_type: got_type,
+            ..
+        } => {
+            assert_eq!(*got_side, side, "{err}");
+            assert_eq!(got_endpoint, endpoint, "{err}");
+            assert_eq!(got_column, column, "{err}");
+            assert_eq!(got_type, pg_type, "{err}");
+        }
+        other => panic!("expected RelationshipEndpointUnsupportedKey, got {other:?}"),
+    }
+    let message = err.to_string();
+    for needle in [
+        side.as_str(),
+        endpoint,
+        column,
+        pg_type,
+        "docs/type-support.md",
+    ] {
+        assert!(
+            message.contains(needle),
+            "{needle:?} missing from: {message}"
+        );
+    }
+    let name = text.split_whitespace().nth(1).expect("relationship name");
+    let stored = relationship_by_name(pool, SCHEMA, from_table, name)
+        .await
+        .expect("read query");
+    assert!(stored.is_none(), "a rejected relationship left a row");
+}
+
+/// Issue #429's from-side reproduction: `orders`' own primary key is
+/// `numeric`, which the from-side reverse recompute
+/// (`staging::apply::accumulate_from_side_recomputes`) keys every matched
+/// `orders` row by. The relationship used to be accepted, and the first
+/// change to `customers` then halted the instance.
+#[tokio::test]
+async fn a_from_side_with_an_unsupported_primary_key_type_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id numeric primary key, cust integer); \
+             alter table orders replica identity full; \
+             create table customers (id integer primary key, name text); \
+             alter table customers replica identity full",
+        )
+        .await
+        .expect("create tables");
+
+    assert_endpoint_key_rejected(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.id",
+        "orders",
+        RelationshipSide::From,
+        "trellis.orders",
+        "id",
+        "numeric",
+    )
+    .await;
+}
+
+/// Issue #429's to-side reproduction: `customers` joins on its unique `code`
+/// column, so the join key is fine, but its own primary key is `numeric`, and
+/// every staged `customers` change is keyed by it (`staging::apply::compute`'s
+/// per-source key lookup).
+#[tokio::test]
+async fn a_to_side_with_an_unsupported_primary_key_type_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, cust integer); \
+             alter table orders replica identity full; \
+             create table customers (id numeric primary key, code integer unique not null, \
+                                     name text); \
+             alter table customers replica identity full",
+        )
+        .await
+        .expect("create tables");
+
+    assert_endpoint_key_rejected(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.code",
+        "orders",
+        RelationshipSide::To,
+        "trellis.customers",
+        "id",
+        "numeric",
+    )
+    .await;
+}
+
+/// Issue #429: every column of a composite key is gated, not just the first.
+#[tokio::test]
+async fn a_composite_key_with_one_unsupported_column_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table orders (id integer primary key, cust integer); \
+             alter table orders replica identity full; \
+             create table customers (region integer, seq interval, code integer unique not null, \
+                                     primary key (region, seq)); \
+             alter table customers replica identity full",
+        )
+        .await
+        .expect("create tables");
+
+    assert_endpoint_key_rejected(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.code",
+        "orders",
+        RelationshipSide::To,
+        "trellis.customers",
+        "seq",
+        "interval",
+    )
+    .await;
+}
+
+/// Issue #429: the key-type gate accepts every key the runtime accepts. Both
+/// endpoints here have keys on the allowlist other than `integer` (a composite
+/// `uuid`/`text` from-side, an enum to-side), joined through non-key columns.
+#[tokio::test]
+async fn endpoints_with_supported_non_integer_primary_keys_are_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create type tier as enum ('gold', 'silver'); \
+             create table orders (tenant uuid, ref text, cust integer, primary key (tenant, ref)); \
+             alter table orders replica identity full; \
+             create table customers (id tier primary key, code integer unique not null); \
+             alter table customers replica identity full",
+        )
+        .await
+        .expect("create tables");
+
+    let created = create_relationship(
+        &db.pool,
+        "RELATIONSHIP customer FROM orders.cust TO customers.code",
+    )
+    .await
+    .expect("allowlisted endpoint keys are accepted");
+    assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
+}
+
+/// Issue #429: the join-key allowlist holds on the to-side on its own, when
+/// the from-side's type is fine and the two are comparable.
+/// `a_character_n_join_key_is_rejected` fails on the from-side first.
+#[tokio::test]
+async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_table_with_typed_column(&db.pool, "order_line_items", "product_id", "text").await;
+    create_table_with_typed_column(&db.pool, "products", "code", "character(8)").await;
+
+    let err = create_relationship(
+        &db.pool,
+        "RELATIONSHIP product FROM order_line_items.product_id TO products.code",
+    )
+    .await
+    .unwrap_err();
+
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            table,
+            column,
+            ..
+        }) => {
+            assert_eq!(table, "products");
+            assert_eq!(column, "code");
+        }
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
 }

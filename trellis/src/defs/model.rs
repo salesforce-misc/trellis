@@ -324,6 +324,31 @@ impl RelationshipCardinality {
     }
 }
 
+/// Which endpoint of a relationship a create-time rejection is about
+/// (issue #429): the `FROM` table, which holds the join column, or the `TO`
+/// table that column points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationshipSide {
+    From,
+    To,
+}
+
+impl RelationshipSide {
+    /// `"from-side"` or `"to-side"`, the wording rejection messages use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationshipSide::From => "from-side",
+            RelationshipSide::To => "to-side",
+        }
+    }
+}
+
+impl std::fmt::Display for RelationshipSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Which role [`super::catalog::resolve_node`] is being asked to establish
 /// for a table: a **source** table is one Trellis reads over logical
 /// replication and never issues DDL against (ADR-0005); a **target** table

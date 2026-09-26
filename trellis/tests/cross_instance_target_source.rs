@@ -22,7 +22,8 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{
-    CatalogError, ValueType, create_relationship, install_definition, publication_tables,
+    CatalogError, RelationshipSide, ValueType, create_relationship, install_definition,
+    publication_tables,
 };
 use trellis::intake::publication::reconcile_publication;
 use trellis::integer::IntWidth;
@@ -321,22 +322,29 @@ async fn a_relationship_endpoint_intake_cant_key_is_rejected() {
     .await
     .expect("instance A installs a 1-1");
 
-    for (text, endpoint) in [
+    for (text, side, endpoint) in [
         (
             "RELATIONSHIP visits FROM stores.region TO region_visits.region",
+            RelationshipSide::To,
             "public.region_visits",
         ),
         (
             "RELATIONSHIP store FROM region_visits.region TO stores.region",
+            RelationshipSide::From,
             "public.region_visits",
         ),
         (
             "RELATIONSHIP named FROM stores.region TO keyless.region",
+            RelationshipSide::To,
             "public.keyless",
         ),
     ] {
         match create_relationship(&pool_b, text).await {
-            Err(CatalogError::RelationshipEndpointNotChangeKeyed { endpoint: got }) => {
+            Err(CatalogError::RelationshipEndpointNotChangeKeyed {
+                side: got_side,
+                endpoint: got,
+            }) => {
+                assert_eq!(got_side, side, "{text}");
                 assert_eq!(got, endpoint, "{text}");
             }
             other => {

@@ -17,7 +17,9 @@ use std::collections::HashMap;
 
 use tokio_postgres::Client;
 use trellis::defs::ast::ValueType;
-use trellis::defs::{CatalogError, create_relationship, install_definition, publication_tables};
+use trellis::defs::{
+    CatalogError, RelationshipSide, create_relationship, install_definition, publication_tables,
+};
 use trellis::integer::IntWidth;
 
 #[path = "support/pgoutput_intake.rs"]
@@ -247,11 +249,83 @@ async fn a_target_still_backfilling_is_refused_as_an_endpoint() {
         .await
         .expect("dispatch h1's chunks");
 
-    match create_relationship(&db.pool, "RELATIONSHIP rollup FROM reports.oid TO h1.id").await {
-        Err(CatalogError::TransformNotLive { transform, status }) => {
-            assert_eq!(transform, "h1");
-            assert_eq!(status.as_str(), "backfilling");
+    // Both sides (issue #429): the rule is about the endpoint, not its role.
+    for text in [
+        "RELATIONSHIP rollup FROM reports.oid TO h1.id",
+        "RELATIONSHIP report FROM h1.id TO reports.id",
+    ] {
+        match create_relationship(&db.pool, text).await {
+            Err(CatalogError::TransformNotLive { transform, status }) => {
+                assert_eq!(transform, "h1", "{text}");
+                assert_eq!(status.as_str(), "backfilling", "{text}");
+            }
+            other => panic!("expected TransformNotLive for {text}, got {other:?}"),
         }
-        other => panic!("expected TransformNotLive, got {other:?}"),
+    }
+}
+
+/// Issue #429: an own target is exempt from the intake-keying and
+/// replica-identity checks, but not from the key-type check. An aggregate
+/// target's key is its `GROUP BY` columns, and apply keys the endpoint's
+/// changes by it through the same type-gated lookup as any other endpoint's,
+/// so a `numeric` grouping column would halt the instance on the first
+/// change the relationship propagates. Rejected on either side, even though
+/// the join key itself is an integer.
+#[tokio::test]
+async fn an_aggregate_target_keyed_on_an_unsupported_type_is_refused_as_an_endpoint() {
+    let (_cluster, db, raw) = pgoutput_intake::database().await;
+    raw.batch_execute(
+        "create table public.sales (id integer primary key, region integer, tier numeric, \
+                                    amount integer); \
+         alter table public.sales replica identity full; \
+         create table public.stores (id integer primary key, region integer); \
+         alter table public.stores replica identity full; \
+         create table public.regions (id integer primary key, name text); \
+         alter table public.regions replica identity full",
+    )
+    .await
+    .expect("create sources");
+    install_definition(
+        &db.pool,
+        "TRANSFORM tier_totals FROM sales GROUP BY region, tier SELECT SUM(amount) AS total",
+        &HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("region".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("tier".to_string(), ValueType::Numeric),
+            ("amount".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]),
+        "public",
+    )
+    .await
+    .expect("install the aggregate");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+
+    for (text, side) in [
+        (
+            "RELATIONSHIP home FROM tier_totals.region TO regions.id",
+            RelationshipSide::From,
+        ),
+        (
+            "RELATIONSHIP totals FROM stores.region TO tier_totals.region",
+            RelationshipSide::To,
+        ),
+    ] {
+        match create_relationship(&db.pool, text).await {
+            Err(CatalogError::RelationshipEndpointUnsupportedKey {
+                side: got_side,
+                endpoint,
+                column,
+                pg_type,
+                ..
+            }) => {
+                assert_eq!(got_side, side, "{text}");
+                assert_eq!(endpoint, "public.tier_totals", "{text}");
+                assert_eq!(column, "tier", "{text}");
+                assert_eq!(pg_type, "numeric", "{text}");
+            }
+            other => {
+                panic!("expected RelationshipEndpointUnsupportedKey for {text}, got {other:?}")
+            }
+        }
     }
 }
