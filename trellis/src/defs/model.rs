@@ -412,40 +412,34 @@ mod tests {
     use super::TransformStatus;
 
     /// [`TransformStatus::ALL`] is hand-maintained, so this is the guard that
-    /// makes forgetting it loud: the `match` has no wildcard, so adding a
-    /// variant fails to compile here until it is named, and the length
-    /// assertion fails if `ALL` grows without this test being revisited.
-    ///
-    /// The pair is a forcing function, not a proof: naming a new variant in
-    /// the `match` arm alone satisfies the compiler, so a variant can still be
-    /// left out of `ALL`. That residual is deliberately fail-*closed* —
-    /// [`TransformStatus::dispatchable`] is an allowlist built from `ALL`, so
-    /// a variant missing from `ALL` is simply never handed work, which is the
-    /// safe direction. `dispatchable_is_every_unfrozen_status` below pins the
-    /// resulting word list, so the omission surfaces there rather than
-    /// silently re-opening a gate.
+    /// makes forgetting it loud: the macro's `match` has no wildcard, so
+    /// adding a variant fails to compile here until it is named, and every
+    /// named variant must then be in `ALL` exactly once. That matters twice
+    /// over: [`TransformStatus::dispatchable`] is an allowlist built from
+    /// `ALL`, and the host bindings allocate their status atoms/symbols from
+    /// it at load time (ADR-0010 decision 4), so a status missing from `ALL`
+    /// would reach a host as a name outside that closed set. Each listed
+    /// variant also round-trips through its own persisted word.
     #[test]
     fn every_variant_is_listed_in_all() {
+        crate::error_code::assert_all_is_every_variant!(
+            TransformStatus: WaitingToBackfill,
+            Backfilling,
+            CatchingUp,
+            Live,
+            Quarantined,
+            Paused,
+        );
         for status in TransformStatus::ALL {
-            match status {
-                TransformStatus::WaitingToBackfill
-                | TransformStatus::Backfilling
-                | TransformStatus::CatchingUp
-                | TransformStatus::Live
-                | TransformStatus::Quarantined
-                | TransformStatus::Paused => {}
-            }
             assert_eq!(
                 TransformStatus::from_persisted(status.as_str()),
                 Some(status),
                 "every listed variant round-trips through its persisted word"
             );
         }
-        assert_eq!(
-            TransformStatus::ALL.len(),
-            6,
-            "bump this alongside `ALL` when a status is added"
-        );
+        let names: std::collections::HashSet<&str> =
+            TransformStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names.len(), TransformStatus::ALL.len());
     }
 
     /// The chunk queue's allowlist is exactly "not frozen" — asserted against
