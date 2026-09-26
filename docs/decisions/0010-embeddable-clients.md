@@ -23,7 +23,7 @@ made for this boundary:
 * [`BlockingTrellis`](../../trellis/src/blocking.rs) — synchronous facade over
   async `Trellis`, owning a dedicated thread with its own Tokio runtime.
 * [`ErrorCode`](../../trellis/src/error_code.rs) — a `#[non_exhaustive]`,
-  six-variant taxonomy with a stable `as_str()`, reported by every error that
+  small taxonomy with a stable `as_str()`, reported by every error that
   can reach a caller.
 * The transform status lifecycle (#55): `define()` returns once the definition
   is registered and its backfill queued; completion is polled via `status()`.

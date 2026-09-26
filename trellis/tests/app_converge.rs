@@ -30,7 +30,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{
     StagedWatermark, StagingError, apply, has_pending, retire_drained_segments, seal,
 };
-use trellis::{BlockingTrellis, Config, Trellis, TrellisError, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `trellis/tests/converge.rs`/`client_e2e.rs`'s own helper of the same name.
@@ -267,12 +267,17 @@ async fn await_converged_times_out_with_a_named_staging_error() {
     let elapsed = started.elapsed();
 
     match result {
-        Err(TrellisError::Staging(StagingError::ConvergenceTimeout {
-            token: got_token,
-            waited,
-        })) => {
+        Err(
+            err @ TrellisError::Staging(StagingError::ConvergenceTimeout {
+                token: got_token,
+                waited,
+            }),
+        ) => {
             assert_eq!(got_token, token);
             assert!(waited >= timeout);
+            // Issue #586: an expired deadline is its own retryable code, not
+            // `internal` (which a host reads as "a Trellis bug").
+            assert_eq!(err.code(), ErrorCode::Timeout);
         }
         other => panic!("expected TrellisError::Staging(ConvergenceTimeout), got {other:?}"),
     }
@@ -327,10 +332,13 @@ fn blocking_trellis_watermark_token_and_await_converged_round_trip() {
     let timeout = Duration::from_millis(80);
     let result = trellis.await_converged(token, timeout);
     match result {
-        Err(TrellisError::Staging(StagingError::ConvergenceTimeout {
-            token: got_token, ..
-        })) => {
+        Err(
+            err @ TrellisError::Staging(StagingError::ConvergenceTimeout {
+                token: got_token, ..
+            }),
+        ) => {
             assert_eq!(got_token, token);
+            assert_eq!(err.code(), ErrorCode::Timeout);
         }
         other => panic!("expected TrellisError::Staging(ConvergenceTimeout), got {other:?}"),
     }

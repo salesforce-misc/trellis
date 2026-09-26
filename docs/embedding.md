@@ -51,6 +51,9 @@ the backfill's staged rows drain. That pair is the
 contract: `live` means the transform is in its steady state, so a token awaited
 after it covers every commit at or before the token
 ([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
+If the token hasn't converged when the timeout you passed runs out,
+`await_converged` fails with error code `timeout`, not `internal`: the target
+is behind, not broken, so retry or allow longer.
 A transform whose build has finished but whose catch-up hasn't run yet reports
 `catching_up`: it is already applying changes, but its target may still be
 missing some. A `live` transform that gets a catch-up of its own (an

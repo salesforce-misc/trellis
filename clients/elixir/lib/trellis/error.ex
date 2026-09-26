@@ -19,11 +19,21 @@ defmodule Trellis.Error do
     dropped.
   - `:conflict`: clashes with something that already exists.
   - `:not_found`: names something that doesn't exist.
+  - `:timeout`: a bounded wait ran out before its condition held (for
+    example, the target hadn't caught up within the timeout you gave).
+    Expected, not a bug: retry, or allow longer.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """
   @type code ::
-          :parse | :validation | :connectivity | :conflict | :not_found | :internal | :unknown
+          :parse
+          | :validation
+          | :connectivity
+          | :conflict
+          | :not_found
+          | :timeout
+          | :internal
+          | :unknown
 
   @type t :: %__MODULE__{code: code(), message: String.t()}
 
@@ -38,6 +48,7 @@ defmodule Trellis.Error do
     "connectivity" => :connectivity,
     "conflict" => :conflict,
     "not_found" => :not_found,
+    "timeout" => :timeout,
     "internal" => :internal
   }
 

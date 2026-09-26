@@ -68,12 +68,15 @@ impl StagingError {
     /// This error's stable, coarse [`ErrorCode`] category (`docs/decisions/0008-public-api-design.md`,
     /// decision 3). [`StagingError::ProducerAlreadyRunning`] is the one
     /// variant that's a genuine collision with existing state (a singleton
-    /// lock already held) -> [`ErrorCode::Conflict`]; everything else here
-    /// is either an internal ring-mechanics condition (a race lost, a full
-    /// slot, a blocked seal gate, an unfenced segment, a convergence
-    /// timeout, an invalid slot index) that a caller can't act on any
-    /// differently than "internal failure, maybe retry", or a Postgres
-    /// error classified generically.
+    /// lock already held) -> [`ErrorCode::Conflict`], and
+    /// [`StagingError::ConvergenceTimeout`] is the caller's own deadline
+    /// expiring -> [`ErrorCode::Timeout`], an expected, retryable outcome a
+    /// host must be able to tell apart from a bug (issue #586). Everything
+    /// else here is either an internal ring-mechanics condition (a race
+    /// lost, a full slot, a blocked seal gate, an unfenced segment, an
+    /// invalid slot index) that a caller can't act on any differently than
+    /// "internal failure, maybe retry", or a Postgres error classified
+    /// generically.
     pub fn code(&self) -> ErrorCode {
         match self {
             StagingError::ProducerAlreadyRunning => ErrorCode::Conflict,
@@ -85,8 +88,8 @@ impl StagingError {
             | StagingError::RingFull { .. }
             | StagingError::SealGateBlocked
             | StagingError::Raced
-            | StagingError::UnfencedSealedSegment { .. }
-            | StagingError::ConvergenceTimeout { .. } => ErrorCode::Internal,
+            | StagingError::UnfencedSealedSegment { .. } => ErrorCode::Internal,
+            StagingError::ConvergenceTimeout { .. } => ErrorCode::Timeout,
             StagingError::Db(err) => error_code::classify_pg_error(err),
         }
     }

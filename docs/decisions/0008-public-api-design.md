@@ -95,7 +95,10 @@ a giant `match` over every internal variant).
 
 **Settled:** `ErrorCode` (`trellis/src/error_code.rs`) is a small,
 `#[non_exhaustive]` enum of coarse categories an FFI caller would branch on
-(`Parse`, `Validation`, `Connectivity`, `Conflict`, `NotFound`, `Internal`).
+(`Parse`, `Validation`, `Connectivity`, `Conflict`, `NotFound`, `Timeout`,
+`Internal`). `Timeout` came later (#586): `await_converged` running out of
+time is an expected, retryable outcome, and reporting it as `Internal` left a
+host unable to tell it from a bug.
 Every caller-facing error type (`TrellisError`, `ClientError`, `CatalogError`,
 `ApplyError`, ...) gained a `code()` method, with SQLSTATE-based
 `classify_pg_error` for raw Postgres errors. `source()`/chaining stays

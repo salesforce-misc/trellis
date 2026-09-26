@@ -1107,7 +1107,7 @@ impl Trellis {
     /// "reflected" means). Errors with
     /// [`TrellisError::Staging`]`(`[`StagingError::ConvergenceTimeout`]`)`
     /// on timeout — a named, matchable condition rather than a generic
-    /// failure.
+    /// failure, whose [`TrellisError::code`] is [`ErrorCode::Timeout`].
     ///
     /// `token` is `pg_current_wal_lsn()`, which normally sits *ahead* of the
     /// caller's own commit: any unrelated WAL (another backend, a write to an
@@ -2007,13 +2007,16 @@ mod error_code_tests {
     /// [`Trellis::await_converged`] actually surfaces, so its category is
     /// pinned separately from the delegation test above — an embedder
     /// branching on [`TrellisError::code`] shouldn't see it drift silently.
+    /// It is [`ErrorCode::Timeout`], not [`ErrorCode::Internal`]: the
+    /// caller's deadline expiring is expected and retryable, and a host maps
+    /// `internal` to "a Trellis bug" (issue #586).
     #[test]
-    fn a_convergence_timeout_surfaces_as_internal_through_the_facade() {
+    fn a_convergence_timeout_surfaces_as_timeout_through_the_facade() {
         let err = TrellisError::Staging(StagingError::ConvergenceTimeout {
             token: PgLsn::from(0),
             waited: Duration::from_secs(1),
         });
 
-        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(err.code(), ErrorCode::Timeout);
     }
 }
