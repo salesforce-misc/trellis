@@ -69,6 +69,13 @@ async fn connect_raw(dsn: &str) -> Client {
 /// actually spent. It is a ceiling, not a wait.
 const GENEROUS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The convergence deadline for the #592 test that blocks the wait on a
+/// lock and terminates it. Never spent: the test terminates the wait within
+/// its 30s lookup bound. It only has to outlast that bound, so the wait is
+/// still running when the terminate lands once #596 enforces the deadline
+/// mid-poll.
+const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Seals the active segment and drains it through the engine's own apply
 /// path, repeating until nothing is pending — the hand-driven stand-in for a
 /// running `Client`'s drain workers that `defs_backfill_chunk_queue.rs`
@@ -482,12 +489,20 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
 /// [`SelfCheckOutcome::NotCaughtUp`]. Otherwise a caller polling `self_check`
 /// keeps seeing "not caught up" while the audit can't run at all.
 ///
-/// Deterministic, with no race against the timeout: a raw session holds an
-/// `ACCESS EXCLUSIVE` lock on `poison_held`, which the wait's
-/// `converged_through` query reads, so that query blocks on the lock however
-/// long the timeout is. None of `self_check`'s earlier reads touch
-/// `poison_held`. The test finds the blocked backend in `pg_locks`, terminates
+/// A raw session holds an `ACCESS EXCLUSIVE` lock on `poison_held`, which
+/// the wait's `converged_through` query reads, so that query blocks on the
+/// lock. None of `self_check`'s earlier reads touch `poison_held`, and nothing
+/// else in this fixture reads it (the drain only writes it when it parks a
+/// poisoned key). The test finds the blocked backend in `pg_locks`, terminates
 /// it, and only then releases the lock.
+///
+/// Today `await_converged` checks its deadline only between polls, so the
+/// blocked query waits out any timeout. Issue #596 will bound each poll by
+/// the remaining deadline, and then a blocked wait ends in
+/// `ConvergenceTimeout`, which this test would read as `NotCaughtUp`. So the
+/// wait's deadline, [`LOCKED_WAIT_TIMEOUT`], is far longer than the lookup
+/// loop's own 30s bound: the terminate always lands well inside it, with or
+/// without #596.
 #[tokio::test]
 async fn self_check_reports_a_connection_lost_during_its_convergence_wait_as_an_error() {
     let cluster = TestCluster::start();
@@ -514,7 +529,7 @@ async fn self_check_reports_a_connection_lost_during_its_convergence_wait_as_an_
                     limit: 100,
                 },
                 SelfCheckMode::Strict,
-                GENEROUS_TIMEOUT,
+                LOCKED_WAIT_TIMEOUT,
             )
             .await;
         (trellis, result)
