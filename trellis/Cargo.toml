@@ -57,6 +57,12 @@ regex = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
 
+# Issue #600: `pthread_atfork`, so a forked child rebuilds this crate's
+# process-global state instead of inheriting locks a parent thread held (see
+# `src/fork_local.rs`). Already in the tree through `tokio`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Issue #56/ADR-0009 decision 1's optional OTLP export layer. Off by default
 # — `cargo build -p trellis` (no flags) compiles none of the four
@@ -150,3 +156,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 # `client::wait_for_wake`'s poll floor and the wake listener's reopen backoff,
 # so they assert exact virtual durations instead of racing a real clock.
 tokio = { version = "1", features = ["test-util"] }
+
+# Issue #600: forks the test process, so it runs as its own `main` rather
+# than inside libtest's multithreaded harness. See the file's doc comment.
+[[test]]
+name = "fork_child_globals"
+harness = false
