@@ -273,7 +273,8 @@ a row committed during that wait would be neither read nor streamed (#393).
 ### What it asks of a deployment
 
 - **No transform is `live` when `apply` returns.** Poll `Trellis::status` until
-  it is, then take `Trellis::watermark_token` and `await_converged` on it.
+  it is ([embedding — Poll to `live`](embedding.md#poll-to-live-dont-wait)),
+  then take `Trellis::watermark_token` and `await_converged` on it.
   `await_converged` checks the ring and intake's progress, never a
   definition's status, so on its own it doesn't wait for a build that hasn't
   started. After `live` it covers everything: `live` waits for a chunked or
@@ -282,7 +283,8 @@ a row committed during that wait would be neither read nor streamed (#393).
   ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
   live without its maintenance loop. Chunked and direct builds also need drain threads
-  ([embedding](embedding.md#the-silent-stall-hazard-issue-144)).
+  ([embedding — Who runs what](embedding.md#who-runs-what),
+  [the silent-stall hazard](embedding.md#the-silent-stall-hazard-issue-144)).
 - **Only the staging worker needs publication and replication privileges.** A
   process that only registers transforms needs catalog access and the right to
   create target tables, and so does one that drops them: a `DROP` only removes

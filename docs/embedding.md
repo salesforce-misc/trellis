@@ -21,6 +21,46 @@ same database:
   (`drain_threads: N`) that actually apply staged changes into target
   tables.
 
+### Who runs what
+
+Every process connects with the same two options, spelled the same way in
+all three APIs: Rust's `TrellisOptions { staging, drain_threads, .. }`,
+Elixir's `Trellis.connect(url: ..., staging: ..., drain_threads: ...)` and
+Ruby's `Trellis.connect(url: ..., staging: ..., drain_threads: ...)`. Both
+default to off (`false`, `0`), so a handle connected with the defaults runs
+nothing in the background.
+
+| Process | `staging` | `drain_threads` |
+|---|---|---|
+| Migration run (`rails db:migrate`, `mix ecto.migrate`, a release task) | `false` | `0` |
+| Web process, console, background job | `false` | `0` |
+| The dedicated Trellis worker, exactly one per fleet | `true` | `N` (at least 1) |
+| Extra drain capacity, if the worker's threads can't keep up | `false` | `N` |
+
+Four rules sit behind that table:
+
+* **Exactly one process sets `staging: true`.** The staging worker holds a
+  lock for as long as it runs, and a second `staging: true` connect fails
+  with a `conflict` error while the first is alive. In a rolling deploy,
+  stop the old worker before the new one connects, or retry the new one's
+  connect until the old one has gone.
+* **At least one process runs drain threads.** Drain threads take their work
+  from a queue in the database, so any number of processes can run them;
+  the dedicated worker's own are usually enough.
+* **`migrate` runs before the worker connects.** The staging worker reads
+  Trellis's own tables as it starts, so a `staging: true` connect to a
+  schema `migrate` hasn't created yet fails with a `not_found` error.
+* **Nothing errors when a rule is broken.** With no staging worker, every
+  new transform stays `waiting_to_backfill`. With a staging worker but no
+  drain threads, it gets to `backfilling` and stays there. Either way every
+  `define` and `status` call succeeds and the targets stay empty. That's
+  [the silent-stall hazard](#the-silent-stall-hazard-issue-144) below,
+  and the health checks that catch it.
+
+A third option, `worker_threads`, is unrelated to either: it sizes the
+runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
+2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
+
 ```rust
 // A web process: define transforms, never drains anything.
 let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
@@ -46,19 +86,7 @@ parent column the projection doesn't carry yet adds it there, so the process
 that applies it must own the projection too
 ([data-flow — What it asks of a deployment](data-flow.md#what-it-asks-of-a-deployment)).
 Code that needs the target populated polls `status()` until the transform is
-`live`, then calls `await_converged` with a fresh `watermark_token()` to let
-the backfill's staged rows drain. That pair is the
-contract: `live` means the transform is in its steady state, so a token awaited
-after it covers every commit at or before the token
-([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
-If the token hasn't converged when the timeout you passed runs out,
-`await_converged` fails with error code `timeout`, not `internal`: the target
-is behind, not broken, so retry or allow longer.
-A transform whose build has finished but whose catch-up hasn't run yet reports
-`catching_up`: it is already applying changes, but its target may still be
-missing some. A `live` transform that gets a catch-up of its own (an
-`ALTER TRANSFORM` that adds columns, a column resumed from quarantine) reports
-`catching_up` again until that has run.
+`live` ([Poll to `live`, don't wait](#poll-to-live-dont-wait)).
 
 Dropping a transform is the same: `DROP` removes catalog rows and nothing else,
 and the worker takes the source out of the publication on its next reconcile
@@ -80,7 +108,8 @@ let worker = Trellis::connect(
 This shape has one sharp edge: **if the dedicated worker process is never
 deployed, or gets scaled to zero, nothing errors.** Every `apply()` call
 still succeeds, every transform still gets registered — it just sits in
-`TransformStatus::WaitingToBackfill` forever, because nothing in the fleet
+`TransformStatus::WaitingToBackfill` forever (or `Backfilling`, when the
+staging worker runs but no drain threads do), because nothing in the fleet
 runs the staging worker that captures its source's rows, or the drain
 workers (`drain_threads > 0`) that build and maintain its target. Read paths against
 the target table quietly return nothing (or stale data, for a transform that
@@ -209,3 +238,301 @@ Either way, the shape is the same: poll on a timer (not once at boot — a
 worker process can be scaled to zero well after a healthy start), and treat
 `false` as "every transform in this fleet may be silently stuck," not as a
 transient blip to retry past.
+
+## Migrations and transactions
+
+**Trellis never joins your migration's transaction.** `migrate`, `define` and
+`apply` each run on the handle's own pooled connections, and each commits
+before it returns. None of them takes a connection or a transaction from the
+host, and neither binding has a migration helper that changes that. Rails and
+Ecto both wrap each migration in a transaction by default, so a define made
+inside one behaves in three ways you might not expect:
+
+* **A rollback doesn't undo it.** If the migration fails after `define`
+  returned, the host's changes roll back, but the definition and its target
+  table stay. Running the migration again then fails on `define` with a
+  `conflict` error, because the target table already exists. A define isn't
+  idempotent, even for the identical statement.
+* **It can't see the migration's own uncommitted work.** A source table
+  created earlier in the same transaction isn't visible to Trellis's
+  connection, so `define` fails with `not_found`. A column added earlier
+  isn't visible either, so a field that reads it fails with a `validation`
+  error.
+* **It can hang on the migration's locks.** If Trellis needs a lock the
+  migration's transaction already holds (dropping a target table the
+  migration has read from, say), it waits for that transaction to end, and
+  the transaction is waiting for Trellis. Postgres sees an idle transaction
+  and a waiting one, not a deadlock, so nothing breaks the wait.
+
+So keep Trellis out of the host's transaction, in this order:
+
+1. The host migrations that create or change source tables run and commit.
+2. `migrate` creates or upgrades Trellis's own tables. It's idempotent, so
+   running it on every deploy is fine.
+3. The transforms are defined, outside any host transaction, skipping any
+   that already exist.
+4. The dedicated worker starts or restarts. It doesn't need the definitions
+   to exist first; it picks each one up on its next pass.
+
+Step 3 can be a deploy step of its own, run after migrations, or a
+migration of its own with the host's transaction turned off
+(`disable_ddl_transaction!` in Rails, `@disable_ddl_transaction true` in
+Ecto). Either way, give it nothing else to do. Since a define isn't
+idempotent, check `status` first: it returns nothing for a target no
+transform writes.
+
+```rust
+if trellis.status("order_totals").await?.is_none() {
+    trellis
+        .apply("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+        .await?;
+}
+```
+
+In an Elixir release, as a task run after `Ecto.Migrator`:
+
+```elixir
+defmodule MyApp.Release do
+  def define_transforms do
+    {:ok, _} = Application.ensure_all_started(:trellis)
+    # The defaults: nothing runs in the background.
+    trellis = Trellis.connect!(url: System.fetch_env!("DATABASE_URL"))
+    :ok = Trellis.migrate!(trellis)
+
+    if Trellis.status!(trellis, "order_totals") == nil do
+      Trellis.define!(trellis, "TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+    end
+
+    :ok = Trellis.shutdown!(trellis)
+  end
+end
+```
+
+In Rails, as a migration of its own, after the one that creates `orders`:
+
+```ruby
+class DefineOrderTotals < ActiveRecord::Migration[7.2]
+  # Trellis commits on its own connection. A transaction here would protect
+  # nothing, and could only make a rollback look like it undid the define.
+  disable_ddl_transaction!
+
+  def up
+    # Assumes an initializer connected this process's handle with the
+    # defaults (staging: false, drain_threads: 0), and that `Trellis.migrate`
+    # has run.
+    return if Trellis.status("order_totals")
+
+    Trellis.define("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+  end
+
+  def down
+    raise ActiveRecord::IrreversibleMigration
+  end
+end
+```
+
+The `status` guard checks the target's name, not its definition. A changed
+statement for a target that already exists is an `ALTER TRANSFORM`
+([Changing a definition](transforms.md#changing-a-definition)), not a second
+define. To remove a transform deliberately, apply `PAUSE TRANSFORM
+order_totals` and then `DROP TRANSFORM order_totals`: `DROP` refuses a
+transform that isn't paused, and takes the target table's data with it. In
+Ruby, those statements need `Trellis.apply`, which comes with the binding's
+full surface (#152).
+
+## Poll to `live`, don't wait
+
+`define` (and `apply` with a `TRANSFORM`) returns once the definition is
+registered, with its target table created and empty, and its status
+`waiting_to_backfill`. The build runs in the background on the dedicated
+worker, and takes as long as the source's size calls for
+([ADR-0008 decision 1](decisions/0008-public-api-design.md#1-synchronous-calls-at-the-ffi-boundary)).
+Nothing waits for it for you: code that needs the target populated polls
+`status` until it reads `live`.
+
+`status` returns the transform's status word (Rust's `TransformStatus`,
+Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
+
+| Status | What it means | What your poll does |
+|---|---|---|
+| `waiting_to_backfill` | Defined; the source's existing rows haven't been read yet. | Keep polling. |
+| `backfilling` | The target is being built. | Keep polling. |
+| `catching_up` | Built and maintained, but may still be missing changes made while it was building. | Keep polling. |
+| `live` | The steady state. | Done. |
+| `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
+| `paused` | Frozen by a `PAUSE TRANSFORM` (or by Trellis, after the replication slot was lost). | Stop and report it. |
+
+The lifecycle behind these words is in
+[transforms — Status](transforms.md#status) and
+[observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+Three things a poll needs to handle:
+
+* **`waiting_to_backfill` has no deadline of its own.** A long-running
+  transaction anywhere in the cluster holds every backfill back until it ends
+  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
+  and Trellis reports nothing but the status meanwhile. So poll with a
+  deadline of your own, and from somewhere that can wait (a deploy check, a
+  background job), not a web request.
+* **A failing build doesn't fail the poll.** It stays `waiting_to_backfill`
+  and is retried forever, with the error on the status's
+  `backfill_failure` (the source table, attempt count, last error and next
+  attempt time) ([a backfill that keeps
+  failing](observability.md#a-backfill-that-keeps-failing)). Log that
+  error; it's usually the whole answer.
+* **`quarantined` can come before `live`.** The fuse can trip once apply
+  maintains a transform, which starts at `catching_up`, so a transform can
+  go from `catching_up` to `quarantined` without ever reporting `live`. Its
+  target holds what the build wrote, and it won't move again on its own:
+  `quarantined` and `sample_quarantined` show which rows failed and why, and
+  `RESUME TRANSFORM <target>` rebuilds it from `waiting_to_backfill` once the
+  data is fixed. A single calculated column can be quarantined too, while
+  the transform stays `live`; `status` doesn't show that, `quarantined`
+  does.
+
+```rust
+use std::time::Duration;
+use trellis::TransformStatus;
+
+let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+loop {
+    let Some(status) = trellis.status("order_totals").await? else {
+        panic!("no transform writes order_totals");
+    };
+    match status.status {
+        TransformStatus::Live => break,
+        TransformStatus::Quarantined | TransformStatus::Paused => {
+            panic!("order_totals is {:?}: it won't go live until it's resumed", status.status);
+        }
+        _ => {}
+    }
+    if let Some(failure) = &status.backfill_failure {
+        eprintln!("backfill of {} is failing: {}", failure.source_table, failure.last_error);
+    }
+    if tokio::time::Instant::now() > deadline {
+        panic!("order_totals is still {:?}", status.status);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+```
+
+```elixir
+defmodule MyApp.TrellisReady do
+  require Logger
+
+  def await_live(trellis, target, timeout_ms \\ 600_000) do
+    poll_live(trellis, target, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp poll_live(trellis, target, deadline) do
+    case Trellis.status!(trellis, target) do
+      nil ->
+        {:error, :not_defined}
+
+      %Trellis.Status{status: :live} ->
+        :ok
+
+      %Trellis.Status{status: frozen} when frozen in [:quarantined, :paused] ->
+        {:error, frozen}
+
+      %Trellis.Status{status: status, backfill_failure: failure} ->
+        if failure do
+          Logger.warning("backfill of #{failure.source_table} failing: #{failure.last_error}")
+        end
+
+        if System.monotonic_time(:millisecond) > deadline do
+          {:error, {:still, status}}
+        else
+          Process.sleep(1_000)
+          poll_live(trellis, target, deadline)
+        end
+    end
+  end
+end
+```
+
+```ruby
+def await_live(target, timeout: 600)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+  loop do
+    status = Trellis.status(target) or raise "no transform writes #{target}"
+    case status.status
+    when :live then return
+    when :quarantined, :paused
+      raise "#{target} is #{status.status}: it won't go live until it's resumed"
+    end
+    if (failure = status.backfill_failure)
+      Rails.logger.warn("backfill of #{failure.source_table} failing: #{failure.last_error}")
+    end
+    if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      raise "#{target} is still #{status.status}"
+    end
+    sleep 1
+  end
+end
+```
+
+### Reading your own writes
+
+`live` is where the read-your-writes contract starts. Once a transform
+reports `live`, write to its source, let the commit return, take a
+`watermark_token`, and pass it to `await_converged`: when that returns, the
+target reflects the write
+([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
+The same pair, taken right after the poll above reads `live`, waits out the
+last of the build's own changes.
+
+```rust
+let token = trellis.watermark_token().await?;
+trellis.await_converged(token, Duration::from_secs(30)).await?;
+```
+
+```elixir
+token = Trellis.watermark_token!(trellis)
+:ok = Trellis.await_converged!(trellis, token, 30_000)
+```
+
+`await_converged` waits for captured changes only; it doesn't read status. A
+transform that isn't `live` yet, `catching_up` included, can still be missing
+rows after it returns, which is why the poll comes first. When the timeout
+runs out first, it fails with a `timeout` error, not `internal`: the target is
+behind, not broken, so retry or allow longer. A binding handle runs one call
+at a time, so every other call on it waits behind an `await_converged` for up
+to its timeout; keep the timeout short on a handle that also serves requests.
+Ruby gets `watermark_token` and `await_converged` with its full surface (#152).
+
+## What the engine maintains today
+
+The grammar's full design is broader than what the engine does today, and
+what it doesn't do is refused when you define it, not accepted and left
+unmaintained. Today a transform:
+
+* Reads one source table, which needs a primary key
+  ([transforms — Source tables](transforms.md#source-tables)), or another
+  transform's target once that transform is `live`.
+* Is either 1-1 (one target row per source row) or a `GROUP BY` aggregate
+  ([transforms — Granularity](transforms.md#granularity)).
+* Computes its fields from the source row, from other fields, and from
+  related tables through a declared `RELATIONSHIP`: a to-one path directly,
+  a to-many path inside an aggregate
+  ([transforms — Relationships](transforms.md#relationships)).
+
+Refused at define time today:
+
+* **`JOIN`.** The cross-join granularity that
+  [transforms](transforms.md#cross-join) describes isn't in the grammar
+  yet; a `JOIN` clause is a `parse` error.
+* **`WHERE` with anything but `TRUE`.** The partial-data predicate
+  [transforms](transforms.md#partial-data) describes isn't in the grammar
+  yet either; any other predicate is a `parse` error.
+* **A type in a role it can't play.** Whether a column's type can be a key,
+  a computed input or an aggregate's argument is in the
+  [type-support matrix](type-support.md). A column of a type Trellis can't
+  place at all (an array, a range, a composite) can't be referenced.
+
+`self_check` audits 1-1 targets only, and the column-level fuse only ever
+freezes a column of a 1-1 transform.
+
+How aggregates and relationship-enriched transforms are built and kept up
+to date is under active redesign (#558), so this guide doesn't describe it.
+Depend on what you can observe: the status lifecycle, and the `live` plus
+`await_converged` contract above.

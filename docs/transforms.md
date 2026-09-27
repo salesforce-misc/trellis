@@ -255,7 +255,7 @@ Every defined transform carries an observable **status**:
   quarantined column is resumed.
 * **`live`** — the steady state: once a transform reports `live`, awaiting a
   watermark token taken after a commit guarantees its target reflects that
-  commit ([embedding](embedding.md)).
+  commit ([embedding — Reading your own writes](embedding.md#reading-your-own-writes)).
 * **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
   resuming re-runs the backfill, returning it to `waiting_to_backfill`.
 * **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the
@@ -270,7 +270,9 @@ Every defined transform carries an observable **status**:
   ([intake failure modes](staging-and-claiming/01-intake-and-lsn-confirmation.md#failure-modes)).
 
 An application can list defined transforms and read each one's status — enough to
-tell a newly-defined transform is still populating, without a metrics pipeline.
+tell a newly-defined transform is still populating, without a metrics pipeline
+([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)
+has the polling pattern).
 
 A transform can sit in `waiting_to_backfill` while a long-lived cluster
 transaction holds the backfill's fence open — a safe wait, explained with its
