@@ -41,7 +41,6 @@
 //! by construction rather than by convention.
 
 use std::fmt;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -997,11 +996,7 @@ fn build_intake_config(
     config: &Config,
     options: &ClientOptions,
 ) -> Result<IntakeConfig, ClientError> {
-    let pg_config = tokio_postgres::Config::from_str(dsn).map_err(|err| {
-        ClientError::Config(crate::error::Error::Config(format!(
-            "invalid database connection string: {err}"
-        )))
-    })?;
+    let pg_config = crate::config::parse_dsn(dsn).map_err(ClientError::Config)?;
 
     let host = match pg_config.get_hosts().first() {
         Some(Host::Tcp(host)) => host.clone(),
@@ -1423,7 +1418,7 @@ async fn reconcile_source_tables(
 async fn connect_plain(
     dsn: &str,
     schema: &str,
-) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+) -> Result<tokio_postgres::Client, crate::error::Error> {
     let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
     tokio::spawn(async move {
         let _ = connection.await;
@@ -1921,7 +1916,7 @@ async fn open_wake_session(
     schema: String,
     channel: String,
     tx: tokio::sync::mpsc::UnboundedSender<()>,
-) -> Result<impl std::future::Future<Output = ()>, tokio_postgres::Error> {
+) -> Result<impl std::future::Future<Output = ()>, crate::error::Error> {
     let (client, mut connection) = crate::pool::connect_dedicated(&dsn).await?;
     let driver = tokio::spawn(async move {
         loop {
@@ -1944,7 +1939,7 @@ async fn open_wake_session(
         .await
     {
         driver.abort();
-        return Err(err);
+        return Err(err.into());
     }
 
     Ok(async move {
@@ -2746,6 +2741,20 @@ mod error_code_tests {
 
         assert_eq!(wrapped.code(), expected);
         assert_eq!(wrapped.code(), ErrorCode::Conflict);
+    }
+
+    /// Issue #608: intake's replication settings come from its own parse of
+    /// the DSN, whose failure must not echo part of the password.
+    #[test]
+    fn intake_config_dsn_error_carries_no_password_fragment() {
+        for dsn in crate::config::malformed_dsn_fixtures::DSNS {
+            let config = Config::from_dsn(dsn).expect("schema is valid; only the DSN is bogus");
+            let err = build_intake_config(dsn, &config, &ClientOptions::default())
+                .map(|_| ())
+                .expect_err("the DSN doesn't parse");
+            assert_eq!(err.code(), ErrorCode::Validation, "{err:?}");
+            crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
+        }
     }
 }
 

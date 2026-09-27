@@ -374,7 +374,7 @@ impl Drop for HeartbeatDaemon {
     }
 }
 
-async fn open_daemon_connection(dsn: &str, schema: &str) -> Result<Client, tokio_postgres::Error> {
+async fn open_daemon_connection(dsn: &str, schema: &str) -> Result<Client, crate::error::Error> {
     let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
     tokio::spawn(async move {
         let _ = connection.await;

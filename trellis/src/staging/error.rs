@@ -61,6 +61,10 @@ pub enum StagingError {
     /// this is — it just means the token hasn't cleared yet, and the caller
     /// should widen its budget or investigate the drain, not the schema.
     ConvergenceTimeout { token: PgLsn, waited: Duration },
+    /// A [`super::session::ProducerSession`]'s DSN didn't parse. Carries
+    /// the [`crate::error::Error::Config`] from [`crate::config::parse_dsn`],
+    /// whose fixed message quotes none of the DSN (issue #608).
+    Config(crate::error::Error),
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
 }
@@ -91,6 +95,7 @@ impl StagingError {
             | StagingError::Raced
             | StagingError::UnfencedSealedSegment { .. } => ErrorCode::Internal,
             StagingError::ConvergenceTimeout { .. } => ErrorCode::Timeout,
+            StagingError::Config(err) => err.code(),
             StagingError::Db(err) => error_code::classify_pg_error(err),
         }
     }
@@ -134,6 +139,7 @@ impl fmt::Display for StagingError {
                 f,
                 "convergence through {token} was not reached after waiting {waited:?}"
             ),
+            StagingError::Config(err) => write!(f, "{err}"),
             StagingError::Db(err) => {
                 write!(f, "staging ring database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -145,6 +151,7 @@ impl fmt::Display for StagingError {
 impl std::error::Error for StagingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            StagingError::Config(err) => Some(err),
             StagingError::Db(err) => Some(err),
             _ => None,
         }
@@ -154,5 +161,17 @@ impl std::error::Error for StagingError {
 impl From<tokio_postgres::Error> for StagingError {
     fn from(err: tokio_postgres::Error) -> Self {
         StagingError::Db(err)
+    }
+}
+
+/// For [`crate::pool::connect_dedicated`]'s error: a connection failure
+/// stays [`StagingError::Db`], anything else (a DSN that doesn't parse) is
+/// [`StagingError::Config`].
+impl From<crate::error::Error> for StagingError {
+    fn from(err: crate::error::Error) -> Self {
+        match err {
+            crate::error::Error::Connect(err) => StagingError::Db(err),
+            other => StagingError::Config(other),
+        }
     }
 }

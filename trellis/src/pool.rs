@@ -30,7 +30,6 @@ use crate::error::Error;
 use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
-use std::str::FromStr;
 use std::time::Duration;
 use tokio_postgres::NoTls;
 
@@ -79,8 +78,7 @@ impl Pool {
     /// [`crate::config::DEFAULT_POOL_WAIT_TIMEOUT`] for the sizing/timeout
     /// reasoning.
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let mut pg_config = tokio_postgres::Config::from_str(config.dsn())
-            .map_err(|err| Error::Config(format!("invalid database connection string: {err}")))?;
+        let mut pg_config = crate::config::parse_dsn(config.dsn())?;
         with_client_keepalives(&mut pg_config, DeadPeerDetection::KeepalivesOnly);
 
         let manager_config = ManagerConfig {
@@ -579,6 +577,10 @@ pub(crate) fn with_client_keepalives(
 /// keepalives and user timeout set. The caller spawns or polls the returned
 /// connection future, then runs [`dedicated_session_setup`] (or its own
 /// superset of it) before using the client.
+///
+/// A DSN that doesn't parse is an [`Error::Config`] from
+/// [`crate::config::parse_dsn`], never a `tokio_postgres::Error`, whose
+/// `Debug` can quote part of the password (issue #608).
 pub(crate) async fn connect_dedicated(
     dsn: &str,
 ) -> Result<
@@ -586,11 +588,11 @@ pub(crate) async fn connect_dedicated(
         tokio_postgres::Client,
         tokio_postgres::Connection<tokio_postgres::Socket, tokio_postgres::tls::NoTlsStream>,
     ),
-    tokio_postgres::Error,
+    Error,
 > {
-    let mut config = tokio_postgres::Config::from_str(dsn)?;
+    let mut config = crate::config::parse_dsn(dsn)?;
     with_client_keepalives(&mut config, DeadPeerDetection::KeepalivesAndUserTimeout);
-    config.connect(NoTls).await
+    Ok(config.connect(NoTls).await?)
 }
 
 /// The session setup a dedicated connection runs straight after
@@ -637,6 +639,7 @@ pub(crate) fn quote_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn quote_ident_escapes_embedded_quotes() {
@@ -770,6 +773,31 @@ mod tests {
         match Pool::new(&config) {
             Err(Error::Config(_)) => {}
             other => panic!("expected a typed config error, got {other:?}"),
+        }
+    }
+
+    /// Issue #608: a DSN that doesn't parse gets a fixed message, not
+    /// tokio_postgres's error, which can name part of the password.
+    #[test]
+    fn unparsable_dsn_error_carries_no_password_fragment() {
+        for dsn in crate::config::malformed_dsn_fixtures::DSNS {
+            let config = Config::from_dsn(dsn).expect("schema is valid; only the DSN is bogus");
+            let err = Pool::new(&config).expect_err("the DSN doesn't parse");
+            assert!(matches!(err, Error::Config(_)), "{err:?}");
+            crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
+        }
+    }
+
+    /// Issue #608: the dedicated connections (producer session, maintenance
+    /// loop, wake listener, liveness daemon) parse the DSN themselves.
+    #[tokio::test]
+    async fn dedicated_connection_dsn_error_carries_no_password_fragment() {
+        for dsn in crate::config::malformed_dsn_fixtures::DSNS {
+            let err = connect_dedicated(dsn)
+                .await
+                .map(|_| ())
+                .expect_err("the DSN doesn't parse");
+            crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
         }
     }
 

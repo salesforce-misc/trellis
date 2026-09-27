@@ -331,6 +331,34 @@ impl fmt::Debug for RedactedDsn<'_> {
     }
 }
 
+/// Parses `dsn` with [`tokio_postgres::Config`]'s parser. Every place
+/// Trellis parses a DSN goes through this.
+///
+/// On failure it reports a fixed message and drops tokio_postgres's error
+/// (issue #608). That error's `Debug` and `source()` name the offending
+/// option, so a password holding an unquoted space
+/// (`password=hunter2 xyzzy=1`) or a URL query value holding an unencoded
+/// `&` would print its tail as an "unknown option". Nothing in a DSN that
+/// fails to parse can be trusted not to be password material, which is the
+/// same reason [`RedactedDsn`] prints one as `<redacted>`. The message names
+/// the form the DSN looked like and what usually breaks it, without quoting
+/// any of it.
+pub(crate) fn parse_dsn(dsn: &str) -> Result<tokio_postgres::Config, Error> {
+    dsn.parse().map_err(|_| {
+        let hint = if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+            "a postgres:// URL; percent-encode reserved characters (such as @ : / ? # & and \
+             spaces) in the user, password and query values"
+        } else {
+            "a key=value connection string; single-quote any value that contains spaces, and \
+             escape a quote or backslash inside it with a backslash"
+        };
+        Error::Config(format!(
+            "the database connection string does not parse as {hint} (the parser's detail is \
+             withheld because it can quote part of a password)"
+        ))
+    })
+}
+
 impl fmt::Display for Config {
     /// A short, human-readable summary of the resolved instance identity —
     /// the schema this instance operates in, and the schema its transform
@@ -430,6 +458,38 @@ fn pool_wait_timeout_from_env() -> Result<Duration, Error> {
     }
 }
 
+/// Test fixtures for issue #608: DSNs that fail to parse and carry a
+/// password whose tail tokio_postgres's parse error would name.
+#[cfg(test)]
+pub(crate) mod malformed_dsn_fixtures {
+    /// `password=hunter2 xyzzy=1` meant a password of `hunter2 xyzzy=1`, but
+    /// unquoted it parses as `password=hunter2` plus an unknown option
+    /// `xyzzy`, which tokio_postgres's error names. The URL form does the
+    /// same through a query parameter holding an unencoded `&`.
+    pub(crate) const DSNS: [&str; 2] = [
+        "host=db.example.com password=hunter2 xyzzy=1",
+        "postgresql://db.example.com/app?password=hunter2&xyzzy=1",
+    ];
+
+    const FRAGMENTS: [&str; 2] = ["hunter2", "xyzzy"];
+
+    /// Asserts that neither `err` nor anything on its `source()` chain puts
+    /// a fragment of the password in its `Display` or `Debug`.
+    pub(crate) fn assert_no_password_fragment(dsn: &str, err: &(dyn std::error::Error + 'static)) {
+        let mut next = Some(err);
+        while let Some(err) = next {
+            let printed = format!("{err} / {err:?}");
+            for fragment in FRAGMENTS {
+                assert!(
+                    !printed.contains(fragment),
+                    "the error for {dsn:?} leaks {fragment:?}: {printed}"
+                );
+            }
+            next = err.source();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +565,18 @@ mod tests {
             parsed.get_hosts(),
             [tokio_postgres::config::Host::Tcp("db.example.com".into())]
         );
+    }
+
+    /// Issue #608: the fixed parse-failure message still says which form
+    /// the DSN looked like, so there's something to act on.
+    #[test]
+    fn unparsable_dsn_message_names_its_form() {
+        let [key_value, url] = malformed_dsn_fixtures::DSNS;
+        let message = parse_dsn(key_value).unwrap_err().to_string();
+        assert!(message.contains("key=value"), "{message}");
+        let message = parse_dsn(url).unwrap_err().to_string();
+        assert!(message.contains("postgres:// URL"), "{message}");
+        assert!(parse_dsn("host=db.example.com user=alice").is_ok());
     }
 
     #[test]

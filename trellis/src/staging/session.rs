@@ -336,6 +336,19 @@ mod lock_probe_tests {
 mod tests {
     use super::producer_singleton_lock_key;
 
+    /// Issue #608: `ProducerSession::connect` is public and parses its own
+    /// DSN, so its parse failure must not echo part of the password either.
+    #[tokio::test]
+    async fn unparsable_dsn_error_carries_no_password_fragment() {
+        for dsn in crate::config::malformed_dsn_fixtures::DSNS {
+            let err = super::ProducerSession::connect(dsn, "trellis")
+                .await
+                .expect_err("the DSN doesn't parse");
+            assert_eq!(err.code(), crate::ErrorCode::Validation, "{err:?}");
+            crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
+        }
+    }
+
     /// Issue #234: the whole point of the derivation — two instances in the
     /// same database must not contend for each other's singleton. Pure
     /// arithmetic, no database needed; the end-to-end proof that two
