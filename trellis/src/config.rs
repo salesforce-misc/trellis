@@ -89,7 +89,12 @@ pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// schema names via [`validate_schema_name`], so there is no way to hold a
 /// `Config` whose schema hasn't been checked — see [`Config::with_schema`]
 /// and [`Config::with_target_schema`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand rather than derived so a `{:?}` (a `tracing`
+/// field, a panic message, an embedder's log line) can't print the DSN's
+/// password (issue #591). It shows a password-free DSN as written and
+/// replaces any other with `<redacted>`.
+#[derive(Clone)]
 pub struct Config {
     /// A Postgres connection string, in either URL (`postgresql://...`) or
     /// libpq keyword/value (`host=... user=...`) form.
@@ -250,6 +255,50 @@ impl Config {
         match std::env::var("PGPASSWORD") {
             Ok(password) => format!("postgresql://{user}:{password}@{host}:{port}/{dbname}"),
             Err(_) => format!("postgresql://{user}@{host}:{port}/{dbname}"),
+        }
+    }
+}
+
+impl fmt::Debug for Config {
+    /// Destructures `self` so a new field can't be added without deciding
+    /// here whether it's safe to print.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            dsn,
+            schema,
+            target_schema,
+            pool_max_size,
+            pool_wait_timeout,
+        } = self;
+        f.debug_struct("Config")
+            .field("dsn", &RedactedDsn(dsn))
+            .field("schema", schema)
+            .field("target_schema", target_schema)
+            .field("pool_max_size", pool_max_size)
+            .field("pool_wait_timeout", pool_wait_timeout)
+            .finish()
+    }
+}
+
+/// `Debug`s a DSN without its password (issue #591).
+///
+/// Rather than masking the password in place, which would mean
+/// re-implementing the connection-string grammar and getting every quoting
+/// and escaping rule right, this asks [`tokio_postgres::Config`]'s own
+/// parser (the one [`crate::Pool`] connects with) whether the DSN carries a
+/// password at all. A DSN that parses and carries none prints as written,
+/// so the host, port, user and database stay visible for debugging. Any
+/// other DSN prints as `<redacted>`. That includes one that fails to parse,
+/// since there's no telling where its password would be. It also covers a
+/// URL whose password holds an unencoded `@`, which the parser splits at
+/// the first `@`, so part of the password would land in the host.
+pub(crate) struct RedactedDsn<'a>(pub(crate) &'a str);
+
+impl fmt::Debug for RedactedDsn<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.parse::<tokio_postgres::Config>() {
+            Ok(parsed) if parsed.get_password().is_none() => fmt::Debug::fmt(self.0, f),
+            _ => f.write_str("<redacted>"),
         }
     }
 }
@@ -474,5 +523,51 @@ mod tests {
             .unwrap()
             .with_pool_wait_timeout(Duration::from_millis(250));
         assert_eq!(config.pool_wait_timeout(), Duration::from_millis(250));
+    }
+
+    /// Issue #591: neither `{:?}` nor `{}` on a [`Config`] may print the
+    /// DSN's password, whichever form carries it.
+    #[test]
+    fn config_debug_and_display_never_print_the_password() {
+        for dsn in [
+            "postgresql://alice:s3cret@db.example.com:5432/app",
+            "postgres://alice:s3cret@db.example.com/app?sslmode=disable",
+            "postgresql://alice@db.example.com/app?password=s3cret&sslmode=disable",
+            // An unencoded `@` in the password: the parser splits at the
+            // first `@`, so the tail would otherwise surface as the host.
+            "postgresql://alice:s3cret@s3cret@db.example.com/app",
+            "host=db.example.com user=alice password=s3cret dbname=app",
+            "host=db.example.com user=alice password = 's3cret with spaces' dbname=app",
+            // Unparseable (an unknown keyword): redacted whole.
+            "host=db.example.com sslpassword=s3cret",
+            "host=db.example.com password='s3cret",
+        ] {
+            let config = Config::with_schema(dsn, "app_trellis").unwrap();
+            let debug = format!("{config:?}");
+            let pretty = format!("{config:#?}");
+            let display = format!("{config}");
+            for printed in [&debug, &pretty, &display] {
+                assert!(!printed.contains("s3cret"), "{dsn:?} leaked: {printed}");
+            }
+            assert!(debug.contains("dsn: <redacted>"), "{debug}");
+            // The rest of the configuration stays visible.
+            assert!(debug.contains(r#"schema: "app_trellis""#), "{debug}");
+            assert!(debug.contains("pool_max_size"), "{debug}");
+        }
+    }
+
+    /// A DSN with no password has nothing to hide, so `{:?}` prints it as
+    /// written, keeping the host, port, user and database visible.
+    #[test]
+    fn config_debug_prints_a_password_free_dsn_as_written() {
+        for dsn in [
+            "postgresql://alice@db.example.com:5432/app",
+            "postgresql:///app?host=/tmp/sockets",
+            "host=/tmp/sockets port=5433 user=postgres dbname=app",
+        ] {
+            let config = Config::from_dsn(dsn).unwrap();
+            let debug = format!("{config:?}");
+            assert!(debug.contains(&format!("dsn: {dsn:?}")), "{debug}");
+        }
     }
 }

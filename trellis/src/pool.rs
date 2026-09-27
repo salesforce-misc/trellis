@@ -772,4 +772,18 @@ mod tests {
             other => panic!("expected a typed config error, got {other:?}"),
         }
     }
+
+    /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through
+    /// `deadpool_postgres::Manager`'s `tokio_postgres::Config`, whose own
+    /// `Debug` masks the password. This pins that, so a dependency bump
+    /// that changes it fails here rather than in someone's logs.
+    #[test]
+    fn pool_debug_never_prints_the_password() {
+        let config = Config::from_dsn("postgresql://alice:s3cret@db.example.com/app")
+            .expect("schema is valid");
+        let pool = Pool::new(&config).expect("the DSN parses; no I/O happens here");
+        let printed = format!("{pool:?}");
+        assert!(!printed.contains("s3cret"), "leaked: {printed}");
+        assert!(printed.contains("db.example.com"), "{printed}");
+    }
 }

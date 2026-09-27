@@ -43,6 +43,7 @@ use tokio_postgres::types::PgLsn;
 
 use pgoutput::{ColumnValue, Message, Relation, RelationCache};
 
+use crate::config::RedactedDsn;
 use crate::defs::catalog;
 use crate::pool::Pool;
 #[cfg(any(test, feature = "internals"))]
@@ -512,7 +513,10 @@ pub(crate) fn stamp_commit_metadata(
 /// Connection parameters for [`Intake::connect`]: the replication transport
 /// (`pgwire_replication`) plus the DSN [`ProducerSession`] opens its own
 /// dedicated connection to for the linchpin transaction.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand so neither `password` nor the password inside
+/// `dsn` is ever printed (issue #591).
+#[derive(Clone)]
 pub struct IntakeConfig {
     /// The DSN for the linchpin/staging connection, opened via
     /// [`ProducerSession`] (which enforces `synchronous_commit = on` and
@@ -580,6 +584,55 @@ impl Default for GroupCommitConfig {
             max_rows: 1000,
             max_delay: Duration::from_millis(5),
         }
+    }
+}
+
+impl std::fmt::Debug for IntakeConfig {
+    /// Destructures `self` so a new field can't be added without deciding
+    /// here whether it's safe to print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            dsn,
+            schema,
+            host,
+            port,
+            user,
+            password,
+            database,
+            slot,
+            publication,
+            wake_channel,
+            spill_threshold,
+            hard_cap,
+            group_commit,
+        } = self;
+        /// Stands in for a non-empty password.
+        struct Redacted;
+        impl std::fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("<redacted>")
+            }
+        }
+        let password: &dyn std::fmt::Debug = if password.is_empty() {
+            password
+        } else {
+            &Redacted
+        };
+        f.debug_struct("IntakeConfig")
+            .field("dsn", &RedactedDsn(dsn))
+            .field("schema", schema)
+            .field("host", host)
+            .field("port", port)
+            .field("user", user)
+            .field("password", password)
+            .field("database", database)
+            .field("slot", slot)
+            .field("publication", publication)
+            .field("wake_channel", wake_channel)
+            .field("spill_threshold", spill_threshold)
+            .field("hard_cap", hard_cap)
+            .field("group_commit", group_commit)
+            .finish()
     }
 }
 
@@ -1458,6 +1511,32 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// Issue #591: `{:?}` on an [`IntakeConfig`] prints neither its
+    /// `password` nor the password inside its `dsn`.
+    #[test]
+    fn intake_config_debug_never_prints_the_password() {
+        let config = IntakeConfig {
+            dsn: "postgresql://alice:s3cret@db.example.com/app".to_string(),
+            schema: "trellis".to_string(),
+            host: "db.example.com".to_string(),
+            port: 5432,
+            user: "alice".to_string(),
+            password: "s3cret".to_string(),
+            database: "app".to_string(),
+            slot: "trellis_slot".to_string(),
+            publication: "trellis_pub".to_string(),
+            wake_channel: "trellis_wake".to_string(),
+            spill_threshold: 1,
+            hard_cap: 2,
+            group_commit: None,
+        };
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!printed.contains("s3cret"), "leaked: {printed}");
+            assert!(printed.contains("db.example.com"), "{printed}");
+        }
+        assert!(format!("{config:?}").contains("password: <redacted>"));
     }
 
     #[test]
