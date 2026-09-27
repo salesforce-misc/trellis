@@ -77,6 +77,10 @@ module Trellis
   # Call Trellis.connect in the forked process (Puma's on_worker_boot,
   # Passenger's starting_worker_process). A ValidationError, like any other
   # call on a handle that can't serve it.
+  #
+  # Also Trellis.connect's error in a process forked while its parent had a
+  # handle running, which may have inherited a lock that handle's threads
+  # held (issue #600): shut down before forking (Puma's before_fork).
   class ForkedHandleError < ValidationError
   end
 

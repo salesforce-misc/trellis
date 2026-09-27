@@ -30,10 +30,12 @@ require_relative "trellis/trellis_ruby"
 # interrupt abandons the wait, not the work: the call itself still finishes
 # in the background.
 #
-# A handle doesn't survive `fork`. Connect after forking (Puma's
-# on_worker_boot, Passenger's starting_worker_process); a forked child's
-# calls on a handle it inherited raise Trellis::ForkedHandleError, except
-# Trellis.shutdown, which leaves the parent's handle alone and does nothing.
+# A handle doesn't survive `fork`. Shut down before forking (Puma's
+# before_fork) and connect after (on_worker_boot, Passenger's
+# starting_worker_process). A forked child's calls on a handle it inherited
+# raise Trellis::ForkedHandleError, except Trellis.shutdown, which leaves the
+# parent's handle alone and does nothing. So does Trellis.connect in a child
+# forked while its parent's handle was running (issue #600).
 module Trellis
   @handle = nil
   @lock = Mutex.new
@@ -41,8 +43,10 @@ module Trellis
 
   class << self
     # Connects this process's handle. Raises ValidationError if this process
-    # is already connected: shut that handle down first. A handle inherited
-    # through `fork` is set aside, never touched, and replaced.
+    # is already connected: shut that handle down first. Raises
+    # ForkedHandleError in a process forked while its parent had a handle
+    # running (connected, connecting, or not yet fully shut down): it may
+    # have inherited a lock one of that handle's threads held (issue #600).
     #
     # - url: where the database is, as a libpq connection string
     #   ("host=... dbname=...") or URL. Nothing is read from the environment.

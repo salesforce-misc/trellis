@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "rbconfig"
+require "socket"
 require "test_helper"
 
 # ADR-0010 decision 3: a handle does not survive fork. Rust threads don't
@@ -61,11 +62,12 @@ class ForkTest < Minitest::Test
     out_r&.close
   end
 
-  # The whole life of a forking server's worker, in a script of its own so
-  # both processes exit normally, running their at_exit hooks and freeing
-  # their handles: the child finds the inherited handle refused, connects
-  # its own, uses it, and exits; the parent's handle is unaffected.
-  def test_a_forked_child_connects_its_own_handle_and_both_exit_cleanly
+  # The whole life of a forking server's workers, in a script of its own so
+  # every process exits normally, running its at_exit hooks and freeing its
+  # handles. A child forked while the parent's handle runs can't use it or
+  # connect its own (issue #600); a worker forked after the parent shut down
+  # connects its own, uses it, and exits; the parent connects again.
+  def test_a_child_connects_only_if_its_parent_shut_down_before_forking
     script = File.expand_path("support/fork_worker.rb", __dir__)
     lib = File.expand_path("../lib", __dir__)
     out_r, out_w = IO.pipe
@@ -78,12 +80,78 @@ class ForkTest < Minitest::Test
     assert status.success?, output
     assert_equal <<~OUT, output
       child: Trellis::ForkedHandleError
+      child: connect Trellis::ForkedHandleError, forked while running: true
       child: connected? false
-      child: own handle status nil
-      child: connected? true
       child exit: 0
+      worker: own handle status nil
+      worker: connected? true
+      worker exit: 0
       parent: status nil
     OUT
+  ensure
+    out_r&.close
+  end
+
+  # Issue #600: an engine still connecting on another thread has threads,
+  # and may hold a process-wide lock, before `Trellis` holds any handle. A
+  # child forked then can't connect; one forked once that connect has
+  # finished (here, failed) can.
+  #
+  # The connect is held mid-way by a server that accepts its connection and
+  # never answers, so the fork is certain to land while its threads run.
+  def test_a_child_forked_while_another_thread_connects_can_t_connect
+    server = TCPServer.new("127.0.0.1", 0)
+    url = "host=127.0.0.1 port=#{server.addr[1]} dbname=trellis user=trellis"
+    connecting = Thread.new do
+      Thread.current.report_on_exception = false
+      Trellis.connect(url: url, staging: true)
+    end
+    assert server.wait_readable(30), "the connect never reached the server"
+    peer = server.accept
+    refute Trellis.connected?
+
+    parent = Process.pid
+    child, output = fork_to_connect
+    assert_equal "Trellis::ForkedHandleError: this process (#{child}) was forked from process " \
+                 "#{parent} while that process had a Trellis engine running, so it may have " \
+                 "inherited a lock one of the engine's threads held, which nothing in this " \
+                 "process can release: it can't connect. Call Trellis.shutdown before forking " \
+                 "(Puma's before_fork), and Trellis.connect after (on_worker_boot)\n", output
+
+    # The server hangs up, so the connect fails, and its threads are gone.
+    peer.close
+    assert_raises(Trellis::ConnectivityError) do
+      connecting.join(30) or flunk "the connect didn't fail once the server hung up"
+    end
+    _, output = fork_to_connect
+    assert_equal "connected\n", output
+  ensure
+    peer&.close
+    server&.close
+  end
+
+  private
+
+  # Forks a child that connects (running nothing in the background) and
+  # reports how that went. Returns the child's pid and its report.
+  def fork_to_connect
+    out_r, out_w = IO.pipe
+    child = fork do
+      out_r.close
+      begin
+        Trellis.connect(url: TestCluster.dsn)
+        out_w.puts "connected"
+        Trellis.shutdown
+      rescue StandardError => e
+        out_w.puts "#{e.class}: #{e.message}"
+      end
+    ensure
+      out_w.close
+      exit!(0)
+    end
+    out_w.close
+    assert wait_for_child(child, seconds: 30).success?
+    [child, out_r.read]
   ensure
     out_r&.close
   end

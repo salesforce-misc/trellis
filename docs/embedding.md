@@ -75,6 +75,30 @@ let worker = Trellis::connect(
 .await?;
 ```
 
+## Forking (issue #600)
+
+Preforking servers (Puma, Unicorn, Passenger, Resque) fork after boot. The
+engine is not safe to fork while it runs: `fork()` copies memory but only
+the calling thread, so a lock one of the engine's threads held at that
+instant (its enum type-name interner, its metrics registry, or one inside
+`tracing`, `quanta` or Rust's stdio) is copied held, and nothing in the
+child will ever release it. A child that then connects an engine of its own
+can wait on that lock forever. The contract, as for most native libraries
+with threads of their own (`librdkafka`, gRPC's core): **no engine may be
+running in a process at the moment it forks** if the child is going to
+connect. Shut every
+handle down first (`Trellis::shutdown` joins every thread the engine
+started) and connect in the child after the fork. A child that execs
+straight away (`posix_spawn`, Ruby's `system`) is unaffected.
+
+The crate doesn't try to make an engine safe to inherit mid-flight: it can't
+reach the locks inside its dependencies. The host language's binding owns
+the fork boundary instead. The Ruby binding enforces the contract: every
+call on an inherited handle raises `Trellis::ForkedHandleError`, and so does
+`Trellis.connect` in a child forked while its parent had a handle running,
+rather than risk the hang (`clients/ruby/README.md`). The BEAM never forks,
+so the Elixir binding has nothing to enforce.
+
 ## The silent-stall hazard (issue #144)
 
 This shape has one sharp edge: **if the dedicated worker process is never

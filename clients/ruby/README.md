@@ -66,10 +66,14 @@ definition ever reaches `:live`.
 - **A handle doesn't survive `fork`.** Connect after forking: Puma's
   `on_worker_boot`, Passenger's `starting_worker_process`. A forked child's
   calls on a handle it inherited raise `Trellis::ForkedHandleError` rather
-  than hang, and `connect` in the child replaces it. `Trellis.shutdown` in a
-  child that hasn't connected does nothing. If the parent connects too (to
-  migrate, say), shut it down before forking: a child forked while the
-  parent's handle is busy can inherit a lock one of its threads held.
+  than hang. `Trellis.shutdown` in a child that hasn't connected does
+  nothing. If the parent connects too (to migrate, say), shut it down before
+  forking. A child forked while the parent's handle was running (connected,
+  connecting on another thread, or not yet fully shut down) may have
+  inherited a lock one of that handle's threads held, which nothing in the
+  child can release, so its `connect` raises `Trellis::ForkedHandleError`
+  too, rather than risk hanging on it (issue #600). Forks whose children
+  never connect, and `system`/`spawn`, are unaffected.
 
   ```ruby
   # config/puma.rb

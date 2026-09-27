@@ -17,6 +17,11 @@
 //!   inherits has nothing left to answer it. Every call checks the pid first
 //!   and raises `Trellis::ForkedHandleError`, and a forked copy is never
 //!   dropped either (see [`Handle`]'s `Drop`).
+//! - **A process forked while its parent had an engine running can't
+//!   connect one of its own** (issue #600): it may have inherited a lock one
+//!   of the parent's engine threads held, which nothing in it can release.
+//!   [`connect`] raises `Trellis::ForkedHandleError` instead of risking the
+//!   hang. See the [`engine`] module.
 //! - **Only plain data crosses** (decision 4). The flattening is
 //!   `trellis-embed`'s; this crate turns its plain values into hashes, and
 //!   `lib/trellis.rb` turns those into `Data` objects. Status words become
@@ -31,10 +36,13 @@
 
 #![cfg(feature = "ruby")]
 
+mod engine;
+
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 
+use engine::{Engine, ForkedWhileRunning};
 use magnus::prelude::*;
 use magnus::{
     Error, Exception, ExceptionClass, RArray, RClass, RHash, RModule, Ruby, StaticSymbol, function,
@@ -54,7 +62,7 @@ type Reply<T> = Result<T, PlainError>;
 /// after shutdown gets an error rather than a hang. The lock is read for
 /// every call and written only by `shutdown`, and only ever taken on a
 /// helper thread, never on a Ruby thread holding the GVL.
-type Shared = Arc<RwLock<Option<BlockingTrellis>>>;
+type Shared = Arc<RwLock<Option<Engine>>>;
 
 /// One connected Trellis instance, owned by Ruby as `Trellis::Native::Handle`
 /// and held by the `Trellis` module's singleton.
@@ -71,12 +79,12 @@ struct Handle {
 
 impl Drop for Handle {
     /// A handle garbage-collected in a forked child is leaked, not dropped.
-    /// Dropping a [`BlockingTrellis`] closes its job channel and detaches its
-    /// thread, and in a child neither that thread nor the runtime serving
-    /// the channel exists: the handle is a copy of the parent's state, and
-    /// the only safe thing to do with it is leave it alone. In the owning
-    /// process the drop is the ordinary backstop: it tells the background
-    /// thread to wind down, without blocking the GC that ran it.
+    /// Dropping an [`Engine`] shuts it down, and in a child neither its
+    /// threads nor the runtime serving its job channel exist: the handle is a
+    /// copy of the parent's state, and the only safe thing to do with it is
+    /// leave it alone. In the owning process the drop is the ordinary
+    /// backstop: the engine shuts down on a thread of its own, without
+    /// blocking the GC that ran it.
     fn drop(&mut self) {
         if std::process::id() != self.owner_pid {
             std::mem::forget(Arc::clone(&self.trellis));
@@ -114,9 +122,8 @@ impl Handle {
         if pid == self.owner_pid {
             return Ok(());
         }
-        let class: ExceptionClass = trellis_module(ruby)?.const_get("ForkedHandleError")?;
-        Err(Error::new(
-            class,
+        Err(forked_handle_error(
+            ruby,
             format!(
                 "this Trellis handle was connected by process {}, and this is process {pid}: \
                  a handle does not survive fork, so call Trellis.connect in this process \
@@ -189,6 +196,9 @@ impl Handle {
 
 /// Connects a new instance. Every option is required here: the defaults are
 /// `lib/trellis.rb`'s to document, and nothing falls back to the environment.
+///
+/// Raises `Trellis::ForkedHandleError`, before starting anything, in a
+/// process forked while its parent had an engine running (issue #600).
 fn connect(
     ruby: &Ruby,
     url: String,
@@ -198,6 +208,7 @@ fn connect(
     drain_threads: usize,
     worker_threads: usize,
 ) -> Result<Handle, Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
     let trellis = blocking(ruby, move || {
         let config = Config::with_schema(url, schema)?.with_target_schema(target_schema)?;
         let options = TrellisOptions {
@@ -205,12 +216,37 @@ fn connect(
             drain_threads,
             worker_threads: Some(worker_threads),
         };
-        BlockingTrellis::connect(config, options).map_err(PlainError::from)
+        // Can't fail after `check` passed (a process's answer never
+        // changes), but if it did, it's still an error rather than a hang.
+        Engine::connect(config, options)
+            .map_err(|err| PlainError::new(ErrorCode::Validation, forked_while_running(&err)))?
+            .map_err(PlainError::from)
     })?;
     Ok(Handle {
         trellis: Arc::new(RwLock::new(Some(trellis))),
         owner_pid: std::process::id(),
     })
+}
+
+/// `Trellis::ForkedHandleError` with `message`.
+fn forked_handle_error(ruby: &Ruby, message: String) -> Error {
+    match trellis_module(ruby)
+        .and_then(|module| module.const_get::<_, ExceptionClass>("ForkedHandleError"))
+    {
+        Ok(class) => Error::new(class, message),
+        Err(err) => err,
+    }
+}
+
+fn forked_while_running(err: &ForkedWhileRunning) -> String {
+    format!(
+        "this process ({}) was forked from process {} while that process had a Trellis engine \
+         running, so it may have inherited a lock one of the engine's threads held, which \
+         nothing in this process can release: it can't connect. Call Trellis.shutdown before \
+         forking (Puma's before_fork), and Trellis.connect after (on_worker_boot)",
+        std::process::id(),
+        err.parent
+    )
 }
 
 fn poisoned() -> PlainError {
