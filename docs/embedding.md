@@ -200,14 +200,15 @@ about an individual transform's own progress.
 ### Wiring it into a host health check
 
 The bindings are in progress (epic #140): the Elixir binding in
-`clients/elixir` wraps the whole `BlockingTrellis` surface (issues #146,
-#147 and #587), and the Ruby binding in `clients/ruby` is so far a vertical
-slice (#151: connect, migrate, define, status, shutdown), without these
-checks. Each is a thin
+`clients/elixir` and `clients/ruby` each wrap the whole `BlockingTrellis`
+surface (issues #146, #147, #587, #151 and #152). Each is a thin
 Rustler/Magnus wrapper over the `Trellis` shape above, per ADR-0010
 decision 1. In Elixir the two checks are `Trellis.has_live_drain_workers/1`
 and `Trellis.has_live_staging_worker/1`, each returning `{:ok, boolean}`
-(or the boolean itself from the bang variant). A plain boolean needs no
+(or the boolean itself from the bang variant); in Ruby they are the
+predicates `Trellis.has_live_drain_workers?` and
+`Trellis.has_live_staging_worker?`, on the process's one handle, raising a
+`Trellis::Error` if the database can't answer. A plain boolean needs no
 flattening to cross the boundary (ADR-0010 decision 4).
 
 **Phoenix**, wired as a `Plug` health-check endpoint polled by the
@@ -239,8 +240,7 @@ end
 **Rails**, as a scheduled check (e.g. a recurring Sidekiq job or a
 `rails-healthcheck`-style route) rather than on every request — this check
 is a fleet-wide question, not something that needs to be re-answered on
-every web request. The Ruby binding doesn't have these two methods yet: they
-come with its full surface (#152), and this is the shape they will take:
+every web request:
 
 ```ruby
 class TrellisWorkerHealthCheck

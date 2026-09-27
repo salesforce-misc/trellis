@@ -24,9 +24,11 @@
 //!   hang. See the [`engine`] module.
 //! - **Only plain data crosses** (decision 4). The flattening is
 //!   `trellis-embed`'s; this crate turns its plain values into hashes, and
-//!   `lib/trellis.rb` turns those into `Data` objects. Status words become
-//!   symbols, but only words from the closed set `trellis-embed` lists, which
-//!   [`init`] interns up front, never a string read from the database.
+//!   `lib/trellis.rb` turns those into `Data` objects. Words become symbols
+//!   (statuses, quarantine states, relationship cardinalities, `apply`
+//!   outcome kinds, `self_check` outcomes and divergence kinds), but only
+//!   words from the closed sets `trellis-embed` lists, which [`init`] interns
+//!   up front, never a string read from the database.
 //! - **Errors cross as `(code, message)`.** Ruby's `Trellis::Error.from_native`
 //!   picks the exception class for the code, so the code-to-class map lives in
 //!   one place, `lib/trellis/error.rb`.
@@ -41,17 +43,23 @@ mod engine;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::Duration;
 
 use engine::{Engine, ForkedWhileRunning};
 use magnus::prelude::*;
 use magnus::{
-    Error, Exception, ExceptionClass, RArray, RClass, RHash, RModule, Ruby, StaticSymbol, function,
-    method,
+    Error, Exception, ExceptionClass, IntoValue, RArray, RClass, RHash, RModule, Ruby,
+    StaticSymbol, Value, function, method,
 };
-use trellis::{BlockingTrellis, Config, ErrorCode, TrellisError, TrellisOptions};
+use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisError, TrellisOptions};
 use trellis_embed::{
-    ERROR_CODES, PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainError,
-    require_transform_statement, transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainConfig,
+    PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
+    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark,
+    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -177,6 +185,199 @@ impl Handle {
                 .map(|status| PlainDefinitionStatus::from(&status)))
         })?;
         status.map(|status| status_hash(ruby, status)).transpose()
+    }
+
+    /// Runs one statement of Trellis's grammar, whatever its form, and
+    /// reports what it did as `{kind:, definition:, relationship:, columns:,
+    /// added:, dropped:, altered:}`: `kind` is one of [`PlainApplied::KINDS`],
+    /// and each other field is set only for the kinds that carry it (see
+    /// [`applied_hash`]).
+    fn apply(ruby: &Ruby, rb_self: &Self, text: String) -> Result<RHash, Error> {
+        let applied = rb_self.call(ruby, move |trellis| {
+            Ok(PlainApplied::from(&trellis.apply(&text)?))
+        })?;
+        applied_hash(ruby, applied)
+    }
+
+    /// Every registered transform definition, oldest first.
+    fn definitions(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
+        let summaries = rb_self.call(ruby, |trellis| {
+            Ok(trellis
+                .definitions()?
+                .iter()
+                .map(PlainDefinitionSummary::from)
+                .collect::<Vec<_>>())
+        })?;
+        array(ruby, summaries, definition_summary_hash)
+    }
+
+    /// Every registered relationship, oldest first.
+    fn relationships(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
+        let summaries = rb_self
+            .call(ruby, BlockingTrellis::relationships)?
+            .iter()
+            .map(|summary| {
+                PlainRelationshipSummary::try_from(summary).map_err(|err| raise(ruby, err))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        array(ruby, summaries, relationship_summary_hash)
+    }
+
+    /// Parks a go-live catch-up re-read of `source_table` for the staging
+    /// worker.
+    fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
+        rb_self.call(ruby, move |trellis| trellis.request_backfill(&source_table))
+    }
+
+    /// Every key poisoned after `watermark_micros` (epoch microseconds),
+    /// oldest first.
+    fn poisoned_since(ruby: &Ruby, rb_self: &Self, watermark_micros: i64) -> Result<RArray, Error> {
+        rb_self.check_pid(ruby)?;
+        let watermark =
+            system_time_from_epoch_micros(watermark_micros).map_err(|err| raise(ruby, err))?;
+        let entries = rb_self.call(ruby, move |trellis| {
+            Ok(trellis
+                .poisoned_since(watermark)?
+                .iter()
+                .map(PlainPoisonEntry::from)
+                .collect::<Vec<_>>())
+        })?;
+        array(ruby, entries, poison_entry_hash)
+    }
+
+    /// Every quarantined transform and paused column.
+    fn quarantined(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
+        let entries = rb_self.call(ruby, |trellis| {
+            Ok(trellis
+                .quarantined()?
+                .iter()
+                .map(PlainQuarantineEntry::from)
+                .collect::<Vec<_>>())
+        })?;
+        array(ruby, entries, quarantine_entry_hash)
+    }
+
+    /// One target's state, by its `transform` or `transform.column` address.
+    fn quarantine_status(ruby: &Ruby, rb_self: &Self, target: String) -> Result<RHash, Error> {
+        let entry = rb_self.call(ruby, move |trellis| {
+            Ok(PlainQuarantineEntry::from(
+                &trellis.quarantine_status(&target)?,
+            ))
+        })?;
+        quarantine_entry_hash(ruby, entry)
+    }
+
+    /// Up to `limit` of `target`'s quarantined rows, after the opaque
+    /// `cursor` (`nil` for the first page).
+    fn sample_quarantined(
+        ruby: &Ruby,
+        rb_self: &Self,
+        target: String,
+        cursor: Option<String>,
+        limit: i64,
+    ) -> Result<RHash, Error> {
+        rb_self.check_pid(ruby)?;
+        let after = decode_cursor(cursor.as_deref()).map_err(|err| raise(ruby, err))?;
+        let page = rb_self.call(ruby, move |trellis| {
+            let samples = trellis.sample_quarantined(&target, after, limit)?;
+            Ok(PlainSamplePage::new(&samples, cursor.as_deref()))
+        })?;
+        let samples = array(ruby, page.samples, |ruby, sample| {
+            record(
+                ruby,
+                [
+                    ("src_table", ruby.into_value(sample.src_table)),
+                    ("key", ruby.into_value(sample.key)),
+                    ("error_message", ruby.into_value(sample.error_message)),
+                ],
+            )
+        })?;
+        record(
+            ruby,
+            [
+                ("samples", samples.as_value()),
+                ("next_cursor", ruby.into_value(page.next_cursor)),
+            ],
+        )
+    }
+
+    /// Whether any drain worker in the fleet is alive.
+    fn has_live_drain_workers(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
+        rb_self.call(ruby, BlockingTrellis::has_live_drain_workers)
+    }
+
+    /// Whether this instance's staging worker is alive anywhere in the fleet.
+    fn has_live_staging_worker(ruby: &Ruby, rb_self: &Self) -> Result<bool, Error> {
+        rb_self.call(ruby, BlockingTrellis::has_live_staging_worker)
+    }
+
+    /// A read-your-writes token, as an opaque string.
+    fn watermark_token(ruby: &Ruby, rb_self: &Self) -> Result<String, Error> {
+        rb_self.call(ruby, |trellis| {
+            trellis.watermark_token().map(encode_watermark)
+        })
+    }
+
+    /// Waits up to `timeout_ms` for every change committed at or before
+    /// `token` to reach its targets. The handle runs one call at a time, so
+    /// every other call on it queues behind this one.
+    fn await_converged(
+        ruby: &Ruby,
+        rb_self: &Self,
+        token: String,
+        timeout_ms: u64,
+    ) -> Result<(), Error> {
+        rb_self.check_pid(ruby)?;
+        let token = decode_watermark(&token).map_err(|err| raise(ruby, err))?;
+        rb_self.call(ruby, move |trellis| {
+            trellis.await_converged(token, Duration::from_millis(timeout_ms))
+        })
+    }
+
+    /// Audits up to `limit` of `target_table`'s keys after `after` (`nil`
+    /// for the first page) against a fresh recompute from the source, in
+    /// `mode` (`"standard"` or `"strict"`), waiting up to `timeout_ms` per
+    /// convergence await. Like `await_converged`, it holds the handle for as
+    /// long as it waits.
+    fn self_check(
+        ruby: &Ruby,
+        rb_self: &Self,
+        target_table: String,
+        after: Option<String>,
+        limit: i64,
+        mode: String,
+        timeout_ms: u64,
+    ) -> Result<RHash, Error> {
+        rb_self.check_pid(ruby)?;
+        let mode = self_check_mode(&mode).map_err(|err| raise(ruby, err))?;
+        let report = rb_self.call(ruby, move |trellis| {
+            let report = trellis.self_check(
+                &target_table,
+                SelfCheckScope { after, limit },
+                mode,
+                Duration::from_millis(timeout_ms),
+            )?;
+            Ok(PlainSelfCheckReport::from(&report))
+        })?;
+        self_check_hash(ruby, report)
+    }
+
+    /// The configuration the handle connected with.
+    fn config(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
+        let config = rb_self.call(ruby, |trellis| Ok(PlainConfig::from(trellis.config())))?;
+        record(
+            ruby,
+            [
+                ("url", ruby.into_value(config.url)),
+                ("schema", ruby.into_value(config.schema)),
+                ("target_schema", ruby.into_value(config.target_schema)),
+                ("pool_max_size", ruby.into_value(config.pool_max_size)),
+                (
+                    "pool_wait_timeout_ms",
+                    ruby.into_value(config.pool_wait_timeout_ms),
+                ),
+            ],
+        )
     }
 
     /// Stops the instance's background work and joins its runtime thread.
@@ -425,10 +626,49 @@ fn raise(ruby: &Ruby, err: PlainError) -> Error {
 }
 
 /// `word`'s symbol. `word` is always one of the `'static` words
-/// [`transform_status_names`] lists, all interned by [`init`], never text
-/// read from the database.
+/// [`symbol_words`] lists, all interned by [`init`], never text read from
+/// the database.
 fn word_symbol(ruby: &Ruby, word: &'static str) -> StaticSymbol {
     ruby.sym_new(word)
+}
+
+fn word_symbols(ruby: &Ruby, words: impl IntoIterator<Item = &'static str>) -> RArray {
+    ruby.ary_from_iter(words.into_iter().map(|word| word_symbol(ruby, word)))
+}
+
+/// Every word this extension turns into a symbol: the closed sets [`init`]
+/// interns.
+fn symbol_words() -> impl Iterator<Item = &'static str> {
+    transform_status_names()
+        .into_iter()
+        .chain(quarantine_state_names())
+        .chain(relationship_cardinality_names())
+        .chain(PlainApplied::KINDS)
+        .chain(SELF_CHECK_OUTCOMES)
+        .chain(DIVERGENCE_KINDS)
+}
+
+/// A hash from symbol keys to `fields`' values: the shape every record
+/// crosses as, for `lib/trellis.rb` to turn into its `Data` value.
+fn record<const N: usize>(ruby: &Ruby, fields: [(&str, Value); N]) -> Result<RHash, Error> {
+    let hash = ruby.hash_new();
+    for (name, value) in fields {
+        hash.aset(ruby.sym_new(name), value)?;
+    }
+    Ok(hash)
+}
+
+/// `items`, each turned into a Ruby value by `convert`.
+fn array<T, V: IntoValue>(
+    ruby: &Ruby,
+    items: Vec<T>,
+    convert: impl Fn(&Ruby, T) -> Result<V, Error>,
+) -> Result<RArray, Error> {
+    let array = ruby.ary_new_capa(items.len());
+    for item in items {
+        array.push(convert(ruby, item)?)?;
+    }
+    Ok(array)
 }
 
 fn definition_hash(ruby: &Ruby, definition: PlainDefinition) -> Result<RHash, Error> {
@@ -436,14 +676,34 @@ fn definition_hash(ruby: &Ruby, definition: PlainDefinition) -> Result<RHash, Er
     for (name, type_name) in definition.source_columns {
         columns.aset(name, type_name)?;
     }
-    let hash = ruby.hash_new();
-    hash.aset(ruby.sym_new("id"), definition.id)?;
-    hash.aset(ruby.sym_new("target_table"), definition.target_table)?;
-    hash.aset(ruby.sym_new("source_table"), definition.source_table)?;
-    hash.aset(ruby.sym_new("source_version"), definition.source_version)?;
-    hash.aset(ruby.sym_new("status"), word_symbol(ruby, definition.status))?;
-    hash.aset(ruby.sym_new("source_columns"), columns)?;
-    Ok(hash)
+    record(
+        ruby,
+        [
+            ("id", ruby.into_value(definition.id)),
+            ("target_table", ruby.into_value(definition.target_table)),
+            ("source_table", ruby.into_value(definition.source_table)),
+            ("source_version", ruby.into_value(definition.source_version)),
+            ("status", word_symbol(ruby, definition.status).as_value()),
+            ("source_columns", columns.as_value()),
+        ],
+    )
+}
+
+fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("id", ruby.into_value(summary.id)),
+            ("target_table", ruby.into_value(summary.target_table)),
+            ("source_table", ruby.into_value(summary.source_table)),
+            ("source_version", ruby.into_value(summary.source_version)),
+            ("status", word_symbol(ruby, summary.status).as_value()),
+            (
+                "created_at_micros",
+                ruby.into_value(summary.created_at_micros),
+            ),
+        ],
+    )
 }
 
 fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Error> {
@@ -451,22 +711,181 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .backfill_failure
         .map(|failure| backfill_failure_hash(ruby, failure))
         .transpose()?;
-    let hash = ruby.hash_new();
-    hash.aset(ruby.sym_new("status"), word_symbol(ruby, status.status))?;
-    hash.aset(ruby.sym_new("backfill_failure"), failure)?;
-    Ok(hash)
+    record(
+        ruby,
+        [
+            ("status", word_symbol(ruby, status.status).as_value()),
+            ("backfill_failure", ruby.into_value(failure)),
+        ],
+    )
 }
 
 fn backfill_failure_hash(ruby: &Ruby, failure: PlainBackfillFailure) -> Result<RHash, Error> {
-    let hash = ruby.hash_new();
-    hash.aset(ruby.sym_new("source_table"), failure.source_table)?;
-    hash.aset(ruby.sym_new("attempts"), failure.attempts)?;
-    hash.aset(ruby.sym_new("last_error"), failure.last_error)?;
-    hash.aset(
-        ruby.sym_new("next_attempt_at_micros"),
-        failure.next_attempt_at_micros,
-    )?;
-    Ok(hash)
+    record(
+        ruby,
+        [
+            ("source_table", ruby.into_value(failure.source_table)),
+            ("attempts", ruby.into_value(failure.attempts)),
+            ("last_error", ruby.into_value(failure.last_error)),
+            (
+                "next_attempt_at_micros",
+                ruby.into_value(failure.next_attempt_at_micros),
+            ),
+        ],
+    )
+}
+
+fn relationship_hash(ruby: &Ruby, relationship: PlainRelationship) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("id", ruby.into_value(relationship.id)),
+            ("name", ruby.into_value(relationship.name)),
+            ("from_schema", ruby.into_value(relationship.from_schema)),
+            ("from_table", ruby.into_value(relationship.from_table)),
+            ("from_col", ruby.into_value(relationship.from_col)),
+            ("to_schema", ruby.into_value(relationship.to_schema)),
+            ("to_table", ruby.into_value(relationship.to_table)),
+            ("to_col", ruby.into_value(relationship.to_col)),
+            (
+                "cardinality",
+                word_symbol(ruby, relationship.cardinality).as_value(),
+            ),
+            ("warnings", ruby.into_value(relationship.warnings)),
+        ],
+    )
+}
+
+fn relationship_summary_hash(
+    ruby: &Ruby,
+    summary: PlainRelationshipSummary,
+) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("id", ruby.into_value(summary.id)),
+            ("name", ruby.into_value(summary.name)),
+            ("from_schema", ruby.into_value(summary.from_schema)),
+            ("from_table", ruby.into_value(summary.from_table)),
+            ("from_col", ruby.into_value(summary.from_col)),
+            ("to_schema", ruby.into_value(summary.to_schema)),
+            ("to_table", ruby.into_value(summary.to_table)),
+            ("to_col", ruby.into_value(summary.to_col)),
+            (
+                "cardinality",
+                word_symbol(ruby, summary.cardinality).as_value(),
+            ),
+            (
+                "created_at_micros",
+                ruby.into_value(summary.created_at_micros),
+            ),
+        ],
+    )
+}
+
+/// What `apply` did. `kind` is one of [`PlainApplied::KINDS`]; each other
+/// field is set only for the kinds that carry it (`definition` for
+/// `transform_defined` and `altered`, `relationship` for
+/// `relationship_defined`, `columns` for `resumed`, and `added`, `dropped`
+/// and `altered` for `altered`), and is `nil` otherwise: the same flat shape
+/// the Elixir NIF hands `Trellis.Applied`.
+fn applied_hash(ruby: &Ruby, applied: PlainApplied) -> Result<RHash, Error> {
+    let kind = word_symbol(ruby, applied.kind()).as_value();
+    let nil = ruby.qnil().as_value();
+    let (mut definition, mut relationship, mut columns) = (nil, nil, nil);
+    let (mut added, mut dropped, mut altered) = (nil, nil, nil);
+    match applied {
+        PlainApplied::TransformDefined(plain) => {
+            definition = definition_hash(ruby, plain)?.as_value();
+        }
+        PlainApplied::RelationshipDefined(plain) => {
+            relationship = relationship_hash(ruby, plain)?.as_value();
+        }
+        PlainApplied::Resumed { columns: resumed } => columns = ruby.into_value(resumed),
+        PlainApplied::Altered {
+            definition: plain,
+            added: plain_added,
+            dropped: plain_dropped,
+            altered: plain_altered,
+        } => {
+            definition = definition_hash(ruby, plain)?.as_value();
+            added = ruby.into_value(plain_added);
+            dropped = ruby.into_value(plain_dropped);
+            altered = ruby.into_value(plain_altered);
+        }
+        PlainApplied::Paused | PlainApplied::Dropped | PlainApplied::Unknown => {}
+    }
+    record(
+        ruby,
+        [
+            ("kind", kind),
+            ("definition", definition),
+            ("relationship", relationship),
+            ("columns", columns),
+            ("added", added),
+            ("dropped", dropped),
+            ("altered", altered),
+        ],
+    )
+}
+
+fn quarantine_entry_hash(ruby: &Ruby, entry: PlainQuarantineEntry) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("target", ruby.into_value(entry.target)),
+            ("state", word_symbol(ruby, entry.state).as_value()),
+            ("paused_at_micros", ruby.into_value(entry.paused_at_micros)),
+            ("last_error", ruby.into_value(entry.last_error)),
+        ],
+    )
+}
+
+fn poison_entry_hash(ruby: &Ruby, entry: PlainPoisonEntry) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("src_table", ruby.into_value(entry.src_table)),
+            ("key", ruby.into_value(entry.key)),
+            ("last_error", ruby.into_value(entry.last_error)),
+            (
+                "poisoned_at_micros",
+                ruby.into_value(entry.poisoned_at_micros),
+            ),
+        ],
+    )
+}
+
+/// What `self_check` found. `outcome` is one of [`SELF_CHECK_OUTCOMES`];
+/// `divergences` is empty unless it is `diverged`.
+fn self_check_hash(ruby: &Ruby, report: PlainSelfCheckReport) -> Result<RHash, Error> {
+    let divergences = array(ruby, report.divergences, divergence_hash)?;
+    record(
+        ruby,
+        [
+            ("target", ruby.into_value(report.target)),
+            ("checked_through", ruby.into_value(report.checked_through)),
+            ("rows_compared", ruby.into_value(report.rows_compared)),
+            ("next_after", ruby.into_value(report.next_after)),
+            ("outcome", word_symbol(ruby, report.outcome).as_value()),
+            ("divergences", divergences.as_value()),
+        ],
+    )
+}
+
+/// One divergence. `kind` is one of [`DIVERGENCE_KINDS`]; see
+/// [`PlainDivergence`] for which other fields each kind sets.
+fn divergence_hash(ruby: &Ruby, divergence: PlainDivergence) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("kind", word_symbol(ruby, divergence.kind).as_value()),
+            ("key", ruby.into_value(divergence.key)),
+            ("column", ruby.into_value(divergence.column)),
+            ("persisted", ruby.into_value(divergence.persisted)),
+            ("recomputed", ruby.into_value(divergence.recomputed)),
+        ],
+    )
 }
 
 /// Every error code `trellis-embed` maps explicitly, for the test asserting
@@ -475,31 +894,89 @@ fn error_codes() -> Vec<&'static str> {
     ERROR_CODES.to_vec()
 }
 
-/// Every status symbol `define` and `status` can return.
+/// Every status symbol `define`, `status` and `definitions` can return.
 fn status_names(ruby: &Ruby) -> RArray {
-    ruby.ary_from_iter(
-        transform_status_names()
-            .into_iter()
-            .map(|word| word_symbol(ruby, word)),
-    )
+    word_symbols(ruby, transform_status_names())
+}
+
+/// Every state symbol `quarantined` and `quarantine_status` can return.
+fn quarantine_states(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, quarantine_state_names())
+}
+
+/// Every cardinality symbol a relationship can carry.
+fn cardinality_names(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, relationship_cardinality_names())
+}
+
+/// Every outcome kind `apply`'s result can carry.
+fn applied_kinds(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, PlainApplied::KINDS)
+}
+
+/// Every outcome symbol `self_check`'s report can carry.
+fn self_check_outcomes(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, SELF_CHECK_OUTCOMES)
+}
+
+/// Every divergence kind symbol `self_check`'s report can carry.
+fn divergence_kinds(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, DIVERGENCE_KINDS)
+}
+
+/// Every statement kind `trellis`'s grammar has, for the test asserting
+/// `apply`'s round trip covers each one.
+fn statement_kinds() -> Vec<&'static str> {
+    trellis::StatementKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect()
 }
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
-    // Interns every status symbol up front, from the closed set, so
-    // encoding a result never creates one.
-    status_names(ruby);
+    // Interns every symbol a result can carry up front, from the closed
+    // sets, so encoding a result never creates one.
+    for word in symbol_words() {
+        word_symbol(ruby, word);
+    }
 
     let native = ruby.define_module("Trellis")?.define_module("Native")?;
     native.define_module_function("connect", function!(connect, 6))?;
     native.define_module_function("error_codes", function!(error_codes, 0))?;
     native.define_module_function("status_names", function!(status_names, 0))?;
+    native.define_module_function("quarantine_states", function!(quarantine_states, 0))?;
+    native.define_module_function("cardinality_names", function!(cardinality_names, 0))?;
+    native.define_module_function("applied_kinds", function!(applied_kinds, 0))?;
+    native.define_module_function("self_check_outcomes", function!(self_check_outcomes, 0))?;
+    native.define_module_function("divergence_kinds", function!(divergence_kinds, 0))?;
+    native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;
     handle.define_method("owner_pid", method!(Handle::owner_pid, 0))?;
     handle.define_method("migrate", method!(Handle::migrate, 0))?;
     handle.define_method("define", method!(Handle::define, 1))?;
+    handle.define_method("apply", method!(Handle::apply, 1))?;
     handle.define_method("status", method!(Handle::status, 1))?;
+    handle.define_method("definitions", method!(Handle::definitions, 0))?;
+    handle.define_method("relationships", method!(Handle::relationships, 0))?;
+    handle.define_method("request_backfill", method!(Handle::request_backfill, 1))?;
+    handle.define_method("poisoned_since", method!(Handle::poisoned_since, 1))?;
+    handle.define_method("quarantined", method!(Handle::quarantined, 0))?;
+    handle.define_method("quarantine_status", method!(Handle::quarantine_status, 1))?;
+    handle.define_method("sample_quarantined", method!(Handle::sample_quarantined, 3))?;
+    handle.define_method(
+        "has_live_drain_workers",
+        method!(Handle::has_live_drain_workers, 0),
+    )?;
+    handle.define_method(
+        "has_live_staging_worker",
+        method!(Handle::has_live_staging_worker, 0),
+    )?;
+    handle.define_method("watermark_token", method!(Handle::watermark_token, 0))?;
+    handle.define_method("await_converged", method!(Handle::await_converged, 2))?;
+    handle.define_method("self_check", method!(Handle::self_check, 5))?;
+    handle.define_method("config", method!(Handle::config, 0))?;
     handle.define_method("shutdown", method!(Handle::shutdown, 0))?;
     Ok(())
 }

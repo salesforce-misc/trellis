@@ -37,6 +37,7 @@ defmodule Trellis.Native do
   def self_check(_handle, _target_table, _after, _limit, _mode, _timeout_ms),
     do: :erlang.nif_error(:nif_not_loaded)
 
+  def config(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def shutdown(_handle), do: :erlang.nif_error(:nif_not_loaded)
   def error_codes, do: :erlang.nif_error(:nif_not_loaded)
   def status_names, do: :erlang.nif_error(:nif_not_loaded)

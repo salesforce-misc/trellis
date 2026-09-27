@@ -10,8 +10,9 @@ class TrellisTest < Minitest::Test
   #
   # Something has to run the staging worker and drain threads or the
   # definition never leaves :waiting_to_backfill. Here that's the test's own
-  # handle: this process is the whole fleet. It's the only test that runs
-  # the staging worker, whose replication slot is cluster-wide (#588).
+  # handle: this process is the whole fleet. The staging worker's
+  # replication slot is cluster-wide (#588), so tests that run it take turns:
+  # Minitest runs them one at a time, and teardown shuts each one down.
   def test_a_defined_transform_goes_live_and_keeps_its_target_converged
     pg = TestCluster.pg
     pg.exec("create table widgets (id integer primary key, price integer)")
@@ -26,19 +27,15 @@ class TrellisTest < Minitest::Test
     assert_equal :waiting_to_backfill, definition.status
     assert_equal({ "id" => "integer", "price" => "integer" }, definition.source_columns)
 
-    status = eventually("widget_prices to reach :live") do
-      status = Trellis.status("widget_prices")
-      status if status&.status == :live
-    end
+    status = await_status("widget_prices")
     assert_equal Trellis::Status.new(status: :live, backfill_failure: nil), status
 
     # The backfill carried the existing row across.
     assert_equal [[1, 5]], rows(pg)
 
     pg.exec("insert into widgets (id, price) values (2, 7)")
-    eventually("the new source row to reach widget_prices") do
-      rows(pg) == [[1, 5], [2, 7]]
-    end
+    eventually_value("the new source row to reach widget_prices",
+                     ->(rows) { rows == [[1, 5], [2, 7]] }) { rows(pg) }
 
     assert_nil Trellis.shutdown
     refute Trellis.connected?
@@ -80,6 +77,17 @@ class TrellisTest < Minitest::Test
     # A malformed statement of another form is the same parse error, not a
     # validation refusal naming a form it never managed to be.
     assert_raises(Trellis::ParseError) { Trellis.define("DROP gadget_prices") }
+  end
+
+  def test_config_reads_back_the_options_the_handle_connected_with
+    Trellis.connect(url: TestCluster.dsn, target_schema: "reporting")
+    config = Trellis.config
+    assert_instance_of Trellis::Config, config
+    assert_equal TestCluster.dsn, config.url
+    assert_equal "trellis", config.schema
+    assert_equal "reporting", config.target_schema
+    assert_operator config.pool_max_size, :>=, 1
+    assert_operator config.pool_wait_timeout_ms, :>=, 1
   end
 
   def test_a_table_no_transform_writes_has_no_status

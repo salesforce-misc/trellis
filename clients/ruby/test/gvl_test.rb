@@ -13,32 +13,22 @@ class GvlTest < Minitest::Test
 
   CATALOG = "trellis.transform_definitions"
 
+  # Every call goes through the same GVL-releasing wait in the extension;
+  # this checks it for a call from the slice and one from the full surface.
   def test_a_blocking_call_lets_other_threads_run
     Trellis.connect(url: TestCluster.dsn)
-    holder, release = hold_lock(CATALOG, seconds: 1.0)
-
-    ticks = 0
-    ticker = Thread.new do
-      loop do
-        ticks += 1
-        sleep 0.01
+    {
+      "status" => -> { assert_nil Trellis.status("no_such_target") },
+      "definitions" => -> { assert_kind_of Array, Trellis.definitions }
+    }.each do |name, call|
+      holder, release = hold_lock(CATALOG, seconds: 1.0)
+      begin
+        assert_lets_other_threads_run(name, call)
+      ensure
+        release.close
+        wait_for_child(holder, seconds: 30)
       end
     end
-    started = monotonic
-    assert_nil Trellis.status("no_such_target")
-    elapsed = monotonic - started
-    ticker.kill.join
-
-    assert_operator elapsed, :>=, 0.5, "the call wasn't slow: it didn't wait for the lock"
-    # A call holding the GVL starves the ticker for its whole duration: it
-    # ticks 0 times (checked by making the extension wait with the GVL held).
-    # ~100 ticks fit in a second when the call releases it; 3 leaves a slow
-    # CI runner plenty of room while still telling the two apart.
-    assert_operator ticks, :>=, 3,
-                    "the ticker ran only #{ticks} times in #{elapsed.round(2)}s: the call held the GVL"
-  ensure
-    release&.close
-    wait_for_child(holder, seconds: 30) if holder
   end
 
   def test_thread_kill_and_thread_raise_interrupt_a_blocked_call
@@ -109,6 +99,28 @@ class GvlTest < Minitest::Test
   end
 
   private
+
+  def assert_lets_other_threads_run(name, call)
+    ticks = 0
+    ticker = Thread.new do
+      loop do
+        ticks += 1
+        sleep 0.01
+      end
+    end
+    started = monotonic
+    call.call
+    elapsed = monotonic - started
+    ticker.kill.join
+
+    assert_operator elapsed, :>=, 0.5, "#{name} wasn't slow: it didn't wait for the lock"
+    # A call holding the GVL starves the ticker for its whole duration: it
+    # ticks 0 times (checked by making the extension wait with the GVL held).
+    # ~100 ticks fit in a second when the call releases it; 3 leaves a slow
+    # CI runner plenty of room while still telling the two apart.
+    assert_operator ticks, :>=, 3,
+                    "the ticker ran only #{ticks} times in #{elapsed.round(2)}s: #{name} held the GVL"
+  end
 
   def assert_blocked(thread)
     sleep 0.3

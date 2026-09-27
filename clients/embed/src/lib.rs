@@ -29,6 +29,7 @@
 //! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
 //! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
+//! | [`trellis::Config`] | its fields, the DSN as `url`, the pool timeout in milliseconds | [`PlainConfig`] |
 //!
 //! | a `tracing` event | level word + target + message | [`PlainLogRecord`] |
 //!
@@ -44,6 +45,7 @@
 //! a thread its host VM owns (`src/log.rs` explains why it pulls).
 
 mod applied;
+mod config;
 mod cursor;
 mod definition;
 mod error;
@@ -57,6 +59,7 @@ mod time;
 mod watermark;
 
 pub use applied::PlainApplied;
+pub use config::PlainConfig;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{

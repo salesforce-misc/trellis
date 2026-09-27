@@ -6,10 +6,10 @@ and run streaming transforms without deploying a separate service. The design
 is [ADR-0010](../../docs/decisions/0010-embeddable-clients.md); the work is
 epic #140.
 
-The surface mirrors the Rust crate's `BlockingTrellis` (issues #146 and
-#147). Every function has a bang variant.
+The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
+#587 and #152). Every function has a bang variant.
 
-- `connect/1`, `migrate/1`, `shutdown/1`: the handle's lifecycle.
+- `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
   `RELATIONSHIP`, `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
   `DROP RELATIONSHIP`, `ALTER TRANSFORM`), returning what it did as a tagged

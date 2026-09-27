@@ -45,12 +45,13 @@ use std::time::Duration;
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure, PlainDefinition,
-    PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry,
-    PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
-    PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark, encode_watermark,
-    quarantine_state_names, relationship_cardinality_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure, PlainConfig,
+    PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
+    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark,
+    encode_watermark, quarantine_state_names, relationship_cardinality_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -661,6 +662,29 @@ fn self_check(
         )
     })?;
     SelfCheckReportTerm::new(env, PlainSelfCheckReport::from(&report))
+}
+
+/// The configuration a handle connected with, as `config/1` returns it.
+#[derive(NifMap)]
+struct ConfigTerm {
+    url: String,
+    schema: String,
+    target_schema: String,
+    pool_max_size: u64,
+    pool_wait_timeout_ms: u64,
+}
+
+/// The configuration the handle connected with.
+#[rustler::nif(schedule = "DirtyIo")]
+fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
+    let config = handle.with(|trellis| Ok(PlainConfig::from(trellis.config())))?;
+    Ok(ConfigTerm {
+        url: config.url,
+        schema: config.schema,
+        target_schema: config.target_schema,
+        pool_max_size: config.pool_max_size,
+        pool_wait_timeout_ms: config.pool_wait_timeout_ms,
+    })
 }
 
 /// `target_table`'s status, or `nil` when no definition writes it.

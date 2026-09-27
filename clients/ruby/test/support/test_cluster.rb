@@ -21,17 +21,25 @@ module TestCluster
     # way a deploy's migration step would: on a handle that runs nothing in
     # the background.
     def start
-      @testkit = IO.popen([executable], "r+")
-      unless @testkit.wait_readable(120)
-        raise "trellis-testkit reported no cluster within 120s"
-      end
-
-      line = @testkit.gets or raise "trellis-testkit exited before reporting a cluster"
-      @info = JSON.parse(line)
+      @testkit, @info = open
 
       Trellis.connect(url: dsn)
       Trellis.migrate
       Trellis.shutdown
+    end
+
+    # Starts a second, private cluster for one test, yields its details (the
+    # shape #info returns), and tears it down when the block returns, however
+    # it returns. Shut down any handle connected to it inside the block.
+    #
+    # For a test whose leftovers would disturb the shared cluster. A separate
+    # database isn't enough for one that runs the staging worker: Trellis's
+    # replication slot name is fixed, and slots are cluster-wide (#588).
+    def private_cluster
+      testkit, info = open
+      yield info
+    ensure
+      testkit&.close
     end
 
     # Closes testkit's stdin and waits for it to tear the cluster down.
@@ -43,12 +51,26 @@ module TestCluster
       info.fetch("dsn")
     end
 
-    # A new `pg` connection to the cluster's database. Close it when done.
-    def pg
-      PG.connect(dsn)
+    # A new `pg` connection to the database `info` describes (the shared
+    # cluster's by default). Close it when done.
+    def pg(info = self.info)
+      PG.connect(info.fetch("dsn"))
     end
 
     private
+
+    # Spawns testkit and waits for the cluster it reports: its stdin pipe and
+    # the cluster's details.
+    def open
+      testkit = IO.popen([executable], "r+")
+      unless testkit.wait_readable(120)
+        testkit.close
+        raise "trellis-testkit reported no cluster within 120s"
+      end
+
+      line = testkit.gets or raise "trellis-testkit exited before reporting a cluster"
+      [testkit, JSON.parse(line)]
+    end
 
     # CI puts trellis-testkit on PATH; locally, the workspace's debug build.
     def executable

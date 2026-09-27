@@ -60,8 +60,8 @@ module Trellis
     CODE = :internal
   end
 
-  # A bounded wait ran out of time. Mapped ahead of the engine: #586 gives
-  # Trellis this code, and until it lands nothing raises it.
+  # A bounded wait ran out of time, such as Trellis.await_converged's
+  # timeout_ms. The wait is over, not the work: retry it.
   class TimeoutError < Error
     CODE = :timeout
   end

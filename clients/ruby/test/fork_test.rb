@@ -10,6 +10,24 @@ require "test_helper"
 class ForkTest < Minitest::Test
   include TrellisTestCase
 
+  # Every other call on the handle, each with arguments it would accept.
+  FULL_SURFACE = {
+    "apply" => -> { Trellis.apply("PAUSE TRANSFORM t") },
+    "config" => -> { Trellis.config },
+    "definitions" => -> { Trellis.definitions },
+    "relationships" => -> { Trellis.relationships },
+    "request_backfill" => -> { Trellis.request_backfill("t") },
+    "poisoned_since" => -> { Trellis.poisoned_since(Time.now) },
+    "quarantined" => -> { Trellis.quarantined },
+    "quarantine_status" => -> { Trellis.quarantine_status("t.c") },
+    "sample_quarantined" => -> { Trellis.sample_quarantined("t.c") },
+    "has_live_drain_workers?" => -> { Trellis.has_live_drain_workers? },
+    "has_live_staging_worker?" => -> { Trellis.has_live_staging_worker? },
+    "watermark_token" => -> { Trellis.watermark_token },
+    "await_converged" => -> { Trellis.await_converged("0/0", timeout_ms: 1_000) },
+    "self_check" => -> { Trellis.self_check("t", limit: 1, timeout_ms: 1_000) }
+  }.freeze
+
   def test_a_forked_child_s_calls_raise_rather_than_hang
     Trellis.connect(url: TestCluster.dsn)
     parent = Process.pid
@@ -21,6 +39,7 @@ class ForkTest < Minitest::Test
         "status" => -> { Trellis.status("no_such_target") },
         "migrate" => -> { Trellis.migrate },
         "define" => -> { Trellis.define("TRANSFORM t FROM no_such_source SELECT a AS a") },
+        **FULL_SURFACE,
         # Not connected in this process, so shutdown does nothing, and leaves
         # the inherited handle in place for the calls after it to refuse.
         "shutdown" => -> { Trellis.shutdown },
@@ -44,7 +63,7 @@ class ForkTest < Minitest::Test
     assert status.success?, output
 
     lines = output.lines(chomp: true)
-    ["status", "migrate", "define", "status after shutdown"].each do |name|
+    ["status", "migrate", "define", *FULL_SURFACE.keys, "status after shutdown"].each do |name|
       assert_includes lines,
                       "#{name}: Trellis::ForkedHandleError: this Trellis handle was connected by " \
                       "process #{parent}, and this is process #{child}: a handle does not survive " \

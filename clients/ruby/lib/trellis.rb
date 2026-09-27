@@ -15,6 +15,22 @@ require_relative "trellis/trellis_ruby"
 # every other method uses it, and Trellis.shutdown closes it (an at_exit hook
 # is the backstop).
 #
+# The surface mirrors the Rust crate's BlockingTrellis:
+#
+# - Lifecycle: connect, connected?, migrate, config, shutdown.
+# - Every statement form: apply runs one statement of Trellis's grammar
+#   (TRANSFORM, RELATIONSHIP, PAUSE TRANSFORM, RESUME TRANSFORM, DROP
+#   TRANSFORM, DROP RELATIONSHIP, ALTER TRANSFORM) and reports what it did
+#   as an Applied. define is the one guarded convenience: an apply that
+#   refuses anything but a TRANSFORM statement before applying it.
+# - Reads: status, definitions, relationships.
+# - Quarantine: quarantined, quarantine_status, sample_quarantined,
+#   poisoned_since. Pausing and resuming are statements:
+#   Trellis.apply("RESUME TRANSFORM order_totals.total").
+# - Operations: request_backfill, has_live_drain_workers?,
+#   has_live_staging_worker?, the read-your-writes pair watermark_token and
+#   await_converged, and the audit self_check.
+#
 #   # A deploy's migration step: the defaults run nothing in the background.
 #   Trellis.connect(url: "host=localhost dbname=app")
 #   Trellis.migrate
@@ -28,7 +44,14 @@ require_relative "trellis/trellis_ruby"
 # Every call blocks on the database with the GVL released, so other threads
 # run meanwhile, and Thread#kill, Thread#raise and Ctrl-C interrupt it. An
 # interrupt abandons the wait, not the work: the call itself still finishes
-# in the background.
+# in the background. Every failure raises a Trellis::Error subclass.
+#
+# Conventions: times are Times in UTC, at microsecond precision; a
+# quarantine target is an address string, a transform's bare target table
+# name ("order_totals") or "transform.column" ("order_totals.total"); the
+# cursors sample_quarantined and self_check return, and watermark_token's
+# token, are opaque strings to pass back unchanged; and every symbol in a
+# result comes from a closed set, never from a string the database returned.
 #
 # A handle doesn't survive `fork`. Shut down before forking (Puma's
 # before_fork) and connect after (on_worker_boot, Passenger's
@@ -37,6 +60,13 @@ require_relative "trellis/trellis_ruby"
 # parent's handle alone and does nothing. So does Trellis.connect in a child
 # forked while its parent's handle was running (issue #600).
 module Trellis
+  # The largest `limit:` and `timeout_ms:` the engine takes (an i64 and a
+  # u64 millisecond count); anything larger is refused as a ValidationError
+  # rather than failing to convert in the extension.
+  MAX_LIMIT = (2**63) - 1
+  MAX_TIMEOUT_MS = (2**64) - 1
+  SELF_CHECK_MODES = %i[standard strict].freeze
+
   @handle = nil
   @lock = Mutex.new
   @at_exit_installed = false
@@ -107,24 +137,200 @@ module Trellis
       nil
     end
 
-    # Registers a transform from a `TRANSFORM` statement and returns its
-    # Definition. Its backfill runs in the background: poll #status for :live.
+    # The Config this process's handle connected with.
+    def config
+      Config.new(**handle.config)
+    end
+
+    # Registers a transform from a `TRANSFORM` statement, creates its target
+    # table, and returns its Definition, at :waiting_to_backfill. Its
+    # backfill runs in the background: poll #status for :live.
     #
     # Only a `TRANSFORM` statement: any other form (DROP, PAUSE, ...) raises
-    # ValidationError without being applied.
+    # ValidationError without being applied, and a statement that doesn't
+    # parse raises ParseError. #apply takes every form.
+    #
+    # Trellis runs this on its own connections, not in the caller's
+    # transaction: if an enclosing migration rolls back, the definition stays.
     def define(statement)
-      raise ValidationError, "the statement must be a String" unless statement.is_a?(String)
-
+      string!("the statement", statement)
       Definition.new(**handle.define(statement))
+    end
+
+    # Runs one statement of Trellis's grammar, whatever its form, and returns
+    # an Applied saying what it did.
+    #
+    #   Trellis.apply("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+    #   # => #<data Trellis::Applied kind=:transform_defined, definition=#<data Trellis::Definition ...>, ...>
+    #   Trellis.apply("RESUME TRANSFORM order_totals.total").columns
+    #   # => ["order_totals.total"]
+    #
+    # A statement that doesn't parse raises ParseError, and nothing is
+    # applied. Like #define, this runs on Trellis's own connections, not in
+    # the caller's transaction.
+    #
+    # An Applied of kind :unknown is a success like any other: the statement
+    # took effect, and only its outcome is newer than this binding can
+    # describe. Don't retry it; read the result back with #status,
+    # #definitions or #relationships if you need it.
+    def apply(statement)
+      string!("the statement", statement)
+      Applied.from_native(handle.apply(statement))
     end
 
     # The Status of the definition writing target_table (a bare table name,
     # or "schema.table"), or nil when none does.
     def status(target_table)
-      raise ValidationError, "the target table must be a String" unless target_table.is_a?(String)
-
+      string!("the target table", target_table)
       hash = handle.status(target_table)
       hash && Status.from_native(hash)
+    end
+
+    # Every registered transform definition, oldest first, as
+    # DefinitionSummary values.
+    def definitions
+      handle.definitions.map { |hash| DefinitionSummary.from_native(hash) }
+    end
+
+    # Every registered relationship, oldest first, as RelationshipSummary
+    # values.
+    def relationships
+      handle.relationships.map { |hash| RelationshipSummary.from_native(hash) }
+    end
+
+    # Asks the staging worker to re-read source_table (a bare table name,
+    # resolved like one in a statement) for every definition that reads it,
+    # and returns once that re-read is queued.
+    #
+    # Each :live reader reports :catching_up until the re-read has re-derived
+    # every row the table still has and deleted any target row it no longer
+    # backs. A newly defined transform doesn't need this: its backfill is
+    # queued for it. Only a table Trellis already captures can be re-read;
+    # any other raises NotFoundError.
+    def request_backfill(source_table)
+      string!("the source table", source_table)
+      handle.request_backfill(source_table)
+      nil
+    end
+
+    # Every source row the apply path poisoned (gave up on) after `since` (a
+    # Time), oldest first, as PoisonEntry values. Poll it with the last
+    # entry's poisoned_at so a whole-table failure doesn't sit unnoticed.
+    def poisoned_since(since)
+      raise ValidationError, "since must be a Time, got: #{since.inspect}" unless since.is_a?(::Time)
+
+      micros = EpochMicros.from_time(since) or
+        raise ValidationError, "since is out of range: #{since.inspect}"
+      handle.poisoned_since(micros).map { |hash| PoisonEntry.from_native(hash) }
+    end
+
+    # Every quarantined transform and paused column, across every transform,
+    # as QuarantineEntry values. Cheap enough for a dashboard or health
+    # check to poll.
+    def quarantined
+      handle.quarantined.map { |hash| QuarantineEntry.from_native(hash) }
+    end
+
+    # The QuarantineEntry of one target: a transform ("order_totals") or one
+    # of its columns ("order_totals.total"). A column that isn't paused is
+    # :live.
+    def quarantine_status(target)
+      string!("the target", target)
+      QuarantineEntry.from_native(handle.quarantine_status(target))
+    end
+
+    # One SamplePage of the rows quarantined under target, to diagnose a
+    # quarantine's cause: for a column ("order_totals.total"), the rows that
+    # failed evaluating it; for a whole transform ("order_totals"), the keys
+    # poisoned from its source table.
+    #
+    # - limit: the most rows to return.
+    # - after: the previous page's next_cursor; nil for the first page.
+    #
+    #   page = Trellis.sample_quarantined("order_totals.total", limit: 50)
+    #   page = Trellis.sample_quarantined("order_totals.total", limit: 50, after: page.next_cursor)
+    def sample_quarantined(target, limit: 100, after: nil)
+      string!("the target", target)
+      limit!(limit)
+      cursor!(after, "a cursor from a previous page")
+      SamplePage.from_native(handle.sample_quarantined(target, after, limit))
+    end
+
+    # Whether at least one drain worker is alive anywhere in the fleet. With
+    # none, nothing reaches a target table: poll this from a health check.
+    def has_live_drain_workers?
+      handle.has_live_drain_workers
+    end
+
+    # Whether the staging worker (change capture) is alive anywhere in the
+    # fleet. The other half of the health check.
+    def has_live_staging_worker?
+      handle.has_live_staging_worker
+    end
+
+    # A read-your-writes token (an opaque String) covering every write
+    # committed before this call. Take it after a source-table write commits,
+    # then pass it to #await_converged to wait for that write to reach its
+    # targets.
+    def watermark_token
+      handle.watermark_token
+    end
+
+    # Waits until every change committed at or before `token` has reached its
+    # target tables, or timeout_ms passes (a TimeoutError; retry it). Returns
+    # nil.
+    #
+    # It waits for captured changes only: a transform that isn't :live yet
+    # may still be missing rows when this returns (see #status).
+    #
+    # The handle runs one call at a time, so every other call on it, from
+    # any thread, waits behind this one for up to timeout_ms. Size it
+    # accordingly.
+    def await_converged(token, timeout_ms:)
+      string!("the token", token)
+      timeout_ms!(timeout_ms)
+      handle.await_converged(token, timeout_ms)
+      nil
+    end
+
+    # Audits one page of target_table against a fresh recompute of its
+    # definition from the source tables, and returns a SelfCheckReport of
+    # what differs.
+    #
+    # - limit: the most keys to audit in this call.
+    # - timeout_ms: how long to wait for the target to catch up, per wait. A
+    #   :standard check waits up to twice, a :strict one once.
+    # - after: the previous report's next_after; nil for the first page.
+    # - mode: :standard re-checks anything that differs after a fresh wait,
+    #   so a change still in flight isn't reported; it is safe while the
+    #   source is being written. :strict skips the re-check, and is only
+    #   sound once writes to the audited tables have stopped.
+    #
+    # Only a one-row-per-source-key transform can be audited: an aggregate
+    # target raises ValidationError, and an unknown one NotFoundError. A
+    # column that is paused is left out of the comparison. To sweep a whole
+    # target, chain calls through next_after:
+    #
+    #   report = Trellis.self_check("order_totals", limit: 1_000, timeout_ms: 30_000)
+    #   report = Trellis.self_check("order_totals", limit: 1_000, timeout_ms: 30_000,
+    #                               after: report.next_after)
+    #
+    # The handle runs one call at a time, and this one can hold it for up to
+    # timeout_ms per wait plus the comparison of up to `limit` keys. To sweep
+    # a large target alongside live traffic, run the audit in a process of
+    # its own, connected with the defaults so it runs no background work.
+    def self_check(target_table, limit:, timeout_ms:, after: nil, mode: :standard)
+      string!("the target table", target_table)
+      limit!(limit)
+      timeout_ms!(timeout_ms)
+      cursor!(after, "a cursor from a previous report")
+      unless SELF_CHECK_MODES.include?(mode)
+        raise ValidationError, "mode must be :standard or :strict, got: #{mode.inspect}"
+      end
+
+      SelfCheckReport.from_native(
+        handle.self_check(target_table, after, limit, mode.to_s, timeout_ms)
+      )
     end
 
     # Stops this process's handle: its background work, its connections and
@@ -160,6 +366,28 @@ module Trellis
       return if value.is_a?(String)
 
       raise ValidationError, "#{name} must be a String, got: #{value.inspect}"
+    end
+
+    def string!(what, value)
+      raise ValidationError, "#{what} must be a String, got: #{value.inspect}" unless value.is_a?(String)
+    end
+
+    def limit!(limit)
+      return if limit.is_a?(Integer) && limit.between?(1, MAX_LIMIT)
+
+      raise ValidationError, "limit must be a positive Integer, got: #{limit.inspect}"
+    end
+
+    def timeout_ms!(timeout_ms)
+      return if timeout_ms.is_a?(Integer) && timeout_ms.between?(0, MAX_TIMEOUT_MS)
+
+      raise ValidationError, "timeout_ms must be a non-negative Integer, got: #{timeout_ms.inspect}"
+    end
+
+    def cursor!(cursor, what)
+      return if cursor.nil? || cursor.is_a?(String)
+
+      raise ValidationError, "after must be #{what}, got: #{cursor.inspect}"
     end
 
     def install_at_exit

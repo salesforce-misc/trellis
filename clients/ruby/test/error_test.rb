@@ -20,6 +20,11 @@ class ErrorTest < Minitest::Test
     end
   end
 
+  # And the other way: the map names no code the engine has dropped.
+  def test_the_mapping_names_exactly_the_engines_codes
+    assert_equal Trellis::Native.error_codes.sort, Trellis::Error::BY_CODE.keys.sort
+  end
+
   def test_a_code_this_binding_does_not_know_becomes_an_unknown_error_naming_it
     error = Trellis::Error.from_native("brand_new_code", "something broke")
     assert_instance_of Trellis::UnknownError, error

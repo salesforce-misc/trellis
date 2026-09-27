@@ -121,6 +121,24 @@ defmodule TrellisTest do
     assert {:error, %Error{code: :parse}} = Trellis.define(trellis, "DROP gadget_prices")
   end
 
+  test "config/1 reads back the options the handle connected with" do
+    dsn = TestCluster.info()["dsn"]
+    trellis = Trellis.connect!(url: dsn, target_schema: "reporting")
+    on_exit(fn -> Trellis.shutdown(trellis) end)
+
+    assert {:ok,
+            %Trellis.Config{
+              url: ^dsn,
+              schema: "trellis",
+              target_schema: "reporting",
+              pool_max_size: pool_max_size,
+              pool_wait_timeout_ms: pool_wait_timeout_ms
+            }} = Trellis.config(trellis)
+
+    assert pool_max_size >= 1
+    assert pool_wait_timeout_ms >= 1
+  end
+
   test "a table no transform writes has no status" do
     trellis = Trellis.connect!(url: TestCluster.info()["dsn"])
     on_exit(fn -> Trellis.shutdown(trellis) end)

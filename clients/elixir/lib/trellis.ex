@@ -6,7 +6,7 @@ defmodule Trellis do
 
   The surface mirrors the Rust crate's `BlockingTrellis`:
 
-  - **Lifecycle:** `connect/1`, `migrate/1`, `shutdown/1`.
+  - **Lifecycle:** `connect/1`, `migrate/1`, `config/1`, `shutdown/1`.
   - **Every statement form:** `apply/2` runs one statement of Trellis's
     grammar (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`,
     `RESUME TRANSFORM`, `DROP TRANSFORM`, `DROP RELATIONSHIP`,
@@ -67,6 +67,7 @@ defmodule Trellis do
 
   alias Trellis.{
     Applied,
+    Config,
     Definition,
     DefinitionSummary,
     Error,
@@ -159,6 +160,18 @@ defmodule Trellis do
   @doc "Like `migrate/1`, but raises `Trellis.Error`."
   @spec migrate!(t()) :: :ok
   def migrate!(trellis), do: bang(migrate(trellis))
+
+  @doc "The configuration `trellis` connected with. See `Trellis.Config`."
+  @spec config(t()) :: {:ok, Config.t()} | {:error, Error.t()}
+  def config(%__MODULE__{ref: ref}) do
+    with {:ok, config} <- native(Native.config(ref)) do
+      {:ok, Config.from_native(config)}
+    end
+  end
+
+  @doc "Like `config/1`, but raises `Trellis.Error`."
+  @spec config!(t()) :: Config.t()
+  def config!(trellis), do: bang(config(trellis))
 
   @doc """
   Registers a `TRANSFORM` statement and creates its target table.
