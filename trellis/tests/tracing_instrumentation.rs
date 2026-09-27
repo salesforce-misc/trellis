@@ -462,23 +462,12 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
     );
 }
 
-/// Issue #56's quarantine event: isolating and evicting a poisoned key
-/// (`quarantine::evict_key`, called from `isolate_and_evict`) emits a
-/// `WARN` event naming the key — mirroring
-/// `tests/quarantine.rs`'s `zero_threshold_disables_eviction_even_past_the_default_threshold`'s
-/// convention of calling `isolate_and_evict` directly with a hand-built
-/// `FoldedChange`, here with `threshold: 1` so the single failing key
-/// evicts on its first attempt.
-#[tokio::test]
-async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
-    let (_guard, captured) = install_capture();
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
+/// Creates `orders (id, price, tax)` with one healthy row (id 1) and a
+/// one-to-one `target` transform computing `price + tax`, for the quarantine
+/// tests below to feed a malformed image for key 1 into.
+async fn seed_orders_totals(db: &testkit::TestDatabase, client: &Client, target: &str) {
     let def = TransformDef {
-        target: "spans_evict_totals".to_string(),
+        target: target.to_string(),
         source: "orders".to_string(),
         key_space: KeySpace::OneToOne,
         fields: vec![FieldDef {
@@ -500,7 +489,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     let source_columns = numeric_columns(&["id", "price", "tax"]);
     create_definition(
         &db.pool,
-        "TRANSFORM spans_evict_totals FROM orders SELECT price + tax AS total",
+        &format!("TRANSFORM {target} FROM orders SELECT price + tax AS total"),
         &source_columns,
     )
     .await
@@ -518,6 +507,23 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         )
         .await
         .expect("seed source row");
+}
+
+/// Issue #56's quarantine event: isolating and evicting a poisoned key
+/// (`quarantine::evict_key`, called from `isolate_and_evict`) emits a
+/// `WARN` event naming the key — mirroring
+/// `tests/quarantine.rs`'s `zero_threshold_disables_eviction_even_past_the_default_threshold`'s
+/// convention of calling `isolate_and_evict` directly with a hand-built
+/// `FoldedChange`, here with `threshold: 1` so the single failing key
+/// evicts on its first attempt.
+#[tokio::test]
+async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
+    let (_guard, captured) = install_capture();
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_orders_totals(&db, &client, "spans_evict_totals").await;
 
     let folded = vec![FoldedChange {
         src_table: "orders".to_string(),
@@ -576,6 +582,74 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         Some(canonical.as_str())
     );
     assert_eq!(evicted.fields.get("key").map(String::as_str), Some("1"));
+}
+
+/// Issue #614: when isolation pins a failure on a key that is still below the
+/// death threshold, `classify_and_retry` must say so at `WARN`, naming the key
+/// and its death count, not log the same "isolation reproduced nothing" line a
+/// batch with no attributable key gets. One `drain_once` call over a batch
+/// whose only key is malformed charges it one death (of the default 5) and
+/// surfaces the failure, so there is nothing to poll for.
+#[tokio::test]
+async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
+    let (_guard, captured) = install_capture();
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_orders_totals(&db, &client, "spans_charge_totals").await;
+    insert_cdc_row(
+        &client,
+        "seg_0",
+        "orders",
+        "1",
+        "insert",
+        Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
+    )
+    .await;
+    let seg_seq = seal_active_segment(&mut client).await;
+
+    let result = apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "span_test_worker",
+        1,
+        "trellis_span_test",
+        &StagedWatermark::saturated(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a below-threshold charge surfaces the original failure, got {result:?}"
+    );
+
+    let events = captured.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.message().contains("isolation reproduced nothing")),
+        "isolation did pin key 1, so it must not be reported as reproducing nothing: \
+         {events:#?}"
+    );
+    let charged = events
+        .iter()
+        .find(|e| {
+            e.level == tracing::Level::WARN
+                && e.message().contains("still below the death threshold")
+        })
+        .unwrap_or_else(|| panic!("expected a WARN event naming the charged key: {events:#?}"));
+    let expected = format!("{DEFAULT_SCHEMA}.orders key=1 (1/5 deaths)");
+    assert_eq!(
+        charged.fields.get("charged").map(String::as_str),
+        Some(expected.as_str())
+    );
+    assert!(
+        charged
+            .fields
+            .get("error")
+            .is_some_and(|e| e.contains("not-a-number")),
+        "the original failure rides along on the same line: {charged:#?}"
+    );
 }
 
 /// Issue #56's backfill status transition events (#55's lifecycle):

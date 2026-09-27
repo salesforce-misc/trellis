@@ -9452,10 +9452,14 @@ async fn classify_and_retry(
                     Ok(Some(retry_folded))
                 }
                 // Warn, not debug: the operator should see which key is
-                // heading for eviction. Bounded, not spam — the key is
-                // charged once per drain cycle, so this repeats at most
-                // `threshold - 1` times per key before `evict_key`'s own warn
-                // replaces it (or a clean drain clears the count).
+                // heading for eviction, and nothing else logs this surfaced
+                // failure (the worker loop just releases and backs off).
+                // Bounded, not spam: every key this line names was just
+                // charged, so it names a key at most `threshold - 1` times
+                // before `evict_key`'s own warn replaces it. A clean drain
+                // that applies the key clears its count, so a key that only
+                // fails intermittently can start over, but then each line
+                // still stands for a real failed drain.
                 quarantine::IsolationOutcome::ChargedBelowThreshold { charged } => {
                     tracing::warn!(
                         seg_seq,
