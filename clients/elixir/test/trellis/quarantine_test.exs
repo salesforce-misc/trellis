@@ -172,11 +172,19 @@ defmodule Trellis.QuarantineTest do
              Trellis.sample_quarantined!(trellis, "gizmo_prices")
 
     # One poisoned key is below the whole-transform fuse: the transform stays
-    # live, and the good row went through.
+    # live, and the good row goes through.
     assert %QuarantineEntry{target: "gizmo_prices", state: :live} =
              Trellis.quarantine_status!(trellis, "gizmo_prices")
 
-    assert Postgrex.query!(pg, "select id, price from gizmo_prices", []).rows == [[1, 5]]
+    # The eviction commits on its own, and only then does the drain retry the
+    # batch without key 2, so the good row can land a moment after the poison
+    # entry is visible.
+    eventually("gizmo_prices to hold the good row", fn ->
+      case Postgrex.query!(pg, "select id, price from gizmo_prices", []).rows do
+        [[1, 5]] = rows -> {:done, rows}
+        rows -> {:waiting, rows}
+      end
+    end)
   end
 
   test "sample_quarantined refuses a malformed cursor or limit before calling the engine" do

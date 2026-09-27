@@ -139,9 +139,15 @@ class QuarantineTest < Minitest::Test
         assert_equal [["public.gizmos", "2"]], page.samples.map { |s| [s.src_table, s.key] }
 
         # One poisoned key is below the whole-transform fuse: the transform
-        # stays live, and the good row went through.
+        # stays live, and the good row goes through.
         assert_equal :live, Trellis.quarantine_status("gizmo_prices").state
-        assert_equal [%w[1 5]], pg.exec("select id, price from gizmo_prices").values
+
+        # The eviction commits on its own, and only then does the drain retry
+        # the batch without key 2, so the good row can land a moment after
+        # the poison entry is visible.
+        eventually_value("gizmo_prices to hold the good row", ->(rows) { rows == [%w[1 5]] }) do
+          pg.exec("select id, price from gizmo_prices").values
+        end
       ensure
         # Before the private cluster goes away under it.
         Trellis.shutdown
