@@ -21,6 +21,9 @@ defmodule Trellis do
     `has_live_staging_worker/1`, the read-your-writes pair
     `watermark_token/1` and `await_converged/3`, and the audit
     `self_check/3`.
+  - **Observability:** `Trellis.Metrics.render_prometheus/0` for a scrape
+    route the host serves, and `Trellis.LogBridge`, which forwards the
+    engine's log lines to `Logger` from the moment `:trellis` starts.
 
       # A deploy's migration step: the defaults run nothing in the background.
       {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")
@@ -34,8 +37,8 @@ defmodule Trellis do
       {:ok, %Trellis.Status{status: :live}} = Trellis.status(trellis, "widget_prices")
       :ok = Trellis.shutdown(trellis)
 
-  Every function blocks the calling process on a database round trip, on a
-  dirty IO scheduler, so no normal scheduler is held up. Non-bang functions
+  Every function here blocks the calling process on a database round trip,
+  on a dirty IO scheduler, so no normal scheduler is held up. Non-bang functions
   return `{:ok, value}` (or `:ok`) and `{:error, %Trellis.Error{}}`; the bang
   variants return the value or raise the `Trellis.Error`.
 

@@ -1,8 +1,10 @@
 defmodule Trellis.Native do
   @moduledoc false
-  # The NIF boundary (native/trellis_nif). Every function here runs on a
-  # dirty IO scheduler and returns `{:ok, value}` or `{:error, {code, message}}`
-  # with `code` a binary; `Trellis` turns the error into a `Trellis.Error`.
+  # The NIF boundary (native/trellis_nif). Every function here returns
+  # `{:ok, value}` or `{:error, {code, message}}` with `code` a binary;
+  # `Trellis` turns the error into a `Trellis.Error`. Every one that can wait
+  # runs on a dirty IO scheduler; the NIF crate's module docs list the two
+  # that don't, and why.
 
   use Rustler,
     otp_app: :trellis,
@@ -44,4 +46,8 @@ defmodule Trellis.Native do
   def statement_kinds, do: :erlang.nif_error(:nif_not_loaded)
   def self_check_outcomes, do: :erlang.nif_error(:nif_not_loaded)
   def divergence_kinds, do: :erlang.nif_error(:nif_not_loaded)
+  def log_levels, do: :erlang.nif_error(:nif_not_loaded)
+  def render_prometheus, do: :erlang.nif_error(:nif_not_loaded)
+  def install_log_bridge(_level), do: :erlang.nif_error(:nif_not_loaded)
+  def take_log_records(_max), do: :erlang.nif_error(:nif_not_loaded)
 end

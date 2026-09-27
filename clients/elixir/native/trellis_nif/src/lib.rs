@@ -7,7 +7,20 @@
 //!
 //! - **Every NIF runs on a dirty IO scheduler** (ADR-0010 decision 3), the
 //!   constant lookups included, so there is no rule to remember about which
-//!   ones are "cheap".
+//!   ones are "cheap". Two exceptions, neither of which touches a handle or
+//!   the database (issue #149):
+//!   - `render_prometheus` runs on a **dirty CPU** scheduler. It never waits
+//!     on IO, which is why ADR-0010 singles it out, but its cost isn't
+//!     bounded either: it formats every series in the process-wide registry
+//!     and folds in every histogram sample recorded since the last render.
+//!     On a dirty CPU scheduler that can't stall a normal scheduler, and it
+//!     doesn't queue behind dirty IO schedulers held by `await_converged`.
+//!     A scrape every few seconds makes the dirty hop's cost irrelevant.
+//!   - `take_log_records` runs on a **normal** scheduler. It never waits (an
+//!     empty queue is an empty list) and copies at most `max` records, which
+//!     `Trellis.LogBridge` keeps small. It runs every 100 ms; on a dirty IO
+//!     scheduler it would stall, and the queue fill and drop lines, whenever
+//!     every one of them was held by a long `await_converged`.
 //! - **Every NIF returns `{:ok, value}` or `{:error, {code, message}}`**, where
 //!   `code` is [`trellis_embed::PlainError::code`] as a binary. Elixir maps it
 //!   to an atom from a closed set, with a fallback for a code it doesn't know.
@@ -15,7 +28,7 @@
 //!   `trellis-embed`'s; this crate only turns its plain values into terms.
 //!   Words become atoms here (statuses, quarantine states, relationship
 //!   cardinalities, `apply` outcome kinds, `self_check` outcomes and
-//!   divergence kinds), but only ever words from the
+//!   divergence kinds, log levels), but only ever words from the
 //!   closed sets `trellis-embed` lists, which [`load`] allocates up front,
 //!   never a string read from the database.
 //!
@@ -32,7 +45,7 @@ use std::time::Duration;
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainDefinition,
+    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure, PlainDefinition,
     PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry,
     PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary, PlainSamplePage,
     PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark, encode_watermark,
@@ -188,6 +201,7 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(PlainApplied::KINDS)
         .chain(SELF_CHECK_OUTCOMES)
         .chain(DIVERGENCE_KINDS)
+        .chain(LOG_LEVELS)
 }
 
 impl DefinitionTerm {
@@ -719,6 +733,12 @@ fn divergence_kinds(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, DIVERGENCE_KINDS.to_vec())
 }
 
+/// Every level atom `take_log_records/1` can return.
+#[rustler::nif(schedule = "DirtyIo")]
+fn log_levels(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, LOG_LEVELS.to_vec())
+}
+
 /// Every statement kind `trellis`'s grammar has, for the Elixir test
 /// asserting `apply/2`'s round trip covers each one.
 #[rustler::nif(schedule = "DirtyIo")]
@@ -727,6 +747,45 @@ fn statement_kinds() -> NifReply<Vec<&'static str>> {
         .iter()
         .map(|kind| kind.as_str())
         .collect())
+}
+
+/// The process-wide metrics registry in Prometheus text exposition format:
+/// `trellis::Metrics::render_prometheus`, the registry every handle in this
+/// OS process records into. On a dirty CPU scheduler: see the module docs.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn render_prometheus() -> NifReply<String> {
+    Ok(trellis::Metrics::new().render_prometheus())
+}
+
+/// Installs `trellis-embed`'s log bridge as this OS process's global
+/// `tracing` subscriber, if no call has yet, and sets the most verbose level
+/// it forwards (one of `trellis_embed::LOG_LEVEL_FILTERS`). A `conflict`
+/// error means another subscriber was installed first.
+#[rustler::nif(schedule = "DirtyIo")]
+fn install_log_bridge(level: String) -> NifReply<Atom> {
+    let bridge = trellis_embed::install_log_bridge().map_err(plain)?;
+    bridge.set_max_level(&level).map_err(plain)?;
+    Ok(rustler::types::atom::ok())
+}
+
+/// One log record, as `{level, target, message}`.
+type LogRecordTerm = (Atom, String, String);
+
+/// Up to `max` queued log records as `{level, target, message}`, oldest
+/// first, and how many were dropped since the last call. Empty when the
+/// bridge isn't installed. On a normal scheduler: see the module docs.
+#[rustler::nif]
+fn take_log_records(env: Env, max: usize) -> NifReply<(Vec<LogRecordTerm>, u64)> {
+    let Some(bridge) = trellis_embed::installed_log_bridge() else {
+        return Ok((Vec::new(), 0));
+    };
+    let batch = bridge.take(max);
+    let records = batch
+        .records
+        .into_iter()
+        .map(|record| Ok((word_atom(env, record.level)?, record.target, record.message)))
+        .collect::<NifReply<_>>()?;
+    Ok((records, batch.dropped))
 }
 
 /// Allocates every atom this NIF encodes up front, from the closed sets

@@ -64,6 +64,16 @@ defmodule TrellisTest do
       end
     end)
 
+    # The apply shows up in the process-wide registry. The drain records it
+    # just after its transaction commits, so the row can be visible first.
+    eventually("widget_prices' applied changes to reach the metrics", fn ->
+      metrics = Trellis.Metrics.render_prometheus()
+
+      if metrics =~ ~r/^trellis_changes_applied_total\{transform="[^"]*widget_prices"\} \d+$/m,
+        do: {:done, :ok},
+        else: {:waiting, metrics}
+    end)
+
     assert :ok = Trellis.shutdown(trellis)
   end
 

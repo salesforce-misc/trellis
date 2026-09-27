@@ -88,8 +88,11 @@ workers — none of it per-call.
 round trip — far past what either host VM tolerates on a scheduler thread.
 
 * **Elixir:** every NIF runs on a dirty IO scheduler, no exceptions for
-  calls that look cheap (`status/2` is still a query). The lone exception is
-  reading the metrics registry, an in-process read with no round trip.
+  calls that look cheap (`status/2` is still a query). The exceptions are
+  the two in-process reads with no round trip (#149): rendering the metrics
+  registry runs on a dirty *CPU* scheduler, because its cost grows with the
+  registry, and draining the log bridge's bounded queue, which never waits,
+  runs on a normal one.
 * **Ruby:** every call releases the GVL and supplies an unblocking function so
   `Thread#kill` and Ctrl-C are not swallowed — which requires an interruptible
   reply wait rather than a bare blocking receive.

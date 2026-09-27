@@ -11,6 +11,10 @@ publish = false
 # this and on `trellis` directly (ADR-0010 decision 1).
 [dependencies]
 trellis = { path = "../../trellis" }
+# `log`'s bridge from the engine's `tracing` events to the host's logger: the
+# same facade `trellis` emits through, and nothing more (no
+# `tracing-subscriber`; the bridge's subscriber is a queue push).
+tracing = "0.1"
 
 [dev-dependencies]
 # `test-util` opens `trellis::dev`, whose `defs::parse` is the only way to

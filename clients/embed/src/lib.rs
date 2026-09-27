@@ -30,16 +30,24 @@
 //! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
 //!
+//! | a `tracing` event | level word + target + message | [`PlainLogRecord`] |
+//!
 //! One piece of shared logic isn't flattening: [`require_transform_statement`]
 //! is the check a binding's `define` makes before calling `apply`, so that a
 //! `DROP` or `PAUSE` handed to `define` is refused rather than carried out. It
 //! asks [`trellis::statement_kind`], so the form is `apply`'s own parser's
 //! answer, and only the refusal's wording lives here.
+//!
+//! The other is [`install_log_bridge`], the `tracing` subscriber a binding
+//! installs on the host's behalf so the engine's log lines reach the host's
+//! logger. It only queues [`PlainLogRecord`]s; each binding drains them from
+//! a thread its host VM owns (`src/log.rs` explains why it pulls).
 
 mod applied;
 mod cursor;
 mod definition;
 mod error;
+mod log;
 mod quarantine;
 mod relationship;
 mod self_check;
@@ -55,6 +63,10 @@ pub use definition::{
     PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
+pub use log::{
+    LOG_LEVEL_FILTERS, LOG_LEVELS, LOG_QUEUE_CAPACITY, LogBatch, LogBridge, PlainLogRecord,
+    install_log_bridge, installed_log_bridge,
+};
 pub use quarantine::{
     PlainPoisonEntry, PlainPoisonSample, PlainQuarantineEntry, PlainSamplePage, quarantine_address,
 };

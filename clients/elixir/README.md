@@ -23,6 +23,16 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146 and
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3`: audit one page of a target against a fresh recompute from
   its source, reporting any divergence.
+- `Trellis.Metrics.render_prometheus/0`: the process-wide metrics registry
+  as Prometheus text, for a `/metrics` route the host already serves (the
+  binding opens no port). It needs no handle.
+- `Trellis.LogBridge`: started with the `:trellis` application, it forwards
+  the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
+  as `:target` metadata). Set `config :trellis, log_level: :info` to choose
+  the most verbose level forwarded (default: `Logger.level()` at start), or
+  `config :trellis, log_bridge: false` to install your own `tracing`
+  subscriber instead. A line can be dropped if the bridge falls behind, and
+  a warning says how many; logging never blocks or crashes the engine.
 
 ```elixir
 # A deploy's migration step: the defaults run nothing in the background.
@@ -65,7 +75,8 @@ and some connection must run drain threads, or no definition ever reaches
 - `sample_quarantined/3`'s and `self_check/3`'s cursors and
   `watermark_token/1`'s token are opaque: pass back what the previous call
   returned.
-- Every call runs on a dirty IO scheduler.
+- Every call that takes a handle runs on a dirty IO scheduler.
+  `Trellis.Metrics.render_prometheus/0` runs on a dirty CPU scheduler.
 
 ## Layout
 
