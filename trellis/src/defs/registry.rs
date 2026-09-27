@@ -249,13 +249,17 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
 ];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
-/// may call in a calculated field (issue #11's groundwork), plus `COUNT`
-/// (issue #75). `SUM`/`MIN`/`MAX`/`AVG` are numeric-only and unary; `COUNT`
-/// is arity-0 (`COUNT(*)` — row-counting, not `COUNT(<column>)`), which
-/// [`super::parser`] special-cases: it accepts the literal `*` in place of an
-/// argument list and hands this spec's empty `arg_types` an empty `args`
-/// vec, rather than teaching this table's shape a non-expression argument
-/// syntax.
+/// may call in a calculated field. This table is the list of supported names;
+/// each entry's `arg_types` is only a representative declaration. Which
+/// argument types an aggregate actually accepts, and what it returns for
+/// each, is [`aggregate_result_type`]'s job (for example `MIN`/`MAX` also
+/// take text, temporal, `inet` and enum arguments, and `SUM` takes
+/// `interval`).
+///
+/// `COUNT` is the one entry whose arity isn't read from here. Its
+/// `arg_types` is empty, and [`super::parser`] special-cases both forms:
+/// `COUNT(*)` counts rows (issue #75) and `COUNT(<expr>)` counts non-null
+/// values of any argument type (issue #120).
 pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
     FunctionSpec {
         name: "SUM",
