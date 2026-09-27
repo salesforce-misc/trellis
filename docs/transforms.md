@@ -43,7 +43,9 @@ for the cross-instance rules.
 ## Granularity
 
 Granularity determines the target's primary-key space — what a single target row
-represents relative to its source row(s). Trellis supports three.
+represents relative to its source row(s). The design has three: 1-1 and
+aggregate are accepted today, and cross-join isn't yet (a `JOIN` clause is a
+parse error).
 
 ### 1-1
 
@@ -65,9 +67,11 @@ of grouping columns; many source rows can map to one target row, and adding,
 removing, or changing a source row can insert, delete, or update a target row.
 
 Grouping-key columns may be referenced directly; any other source column must be
-wrapped in exactly one of `SUM`, `AVG`, `MIN`, or `MAX` (numeric-only). `COUNT(*)`
-counts rows in the group (#75); `COUNT(<column>)` is not yet implemented (see
-ADR-0004).
+wrapped in exactly one aggregate: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`,
+`BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` or `JSONB_AGG`. `COUNT(*)` counts
+rows in the group (#75), and `COUNT(<expr>)` counts the rows where `<expr>`
+isn't null (#120). Which column types each aggregate accepts is in the
+[type-support matrix](type-support.md).
 
 A grouping key can also be a to-one relationship path (`GROUP BY post.author`).
 Each key becomes a target column named after its bare column, and keys can't be
@@ -108,6 +112,9 @@ an aggregate with tens of thousands of groups written concurrently, benchmark
 it first (`benchmark group-contention --groups <n>`).
 
 ### Cross-join
+
+**Not yet supported:** a `JOIN` clause is refused with a parse error. This
+section describes the design.
 
 The primary-key space is the join of two source tables, mirroring the rows a
 `JOIN` returns. Each unique pairing of source primary keys that satisfies the
@@ -196,6 +203,9 @@ that would introduce a cycle, directly or transitively, is invalid and rejected
 before it runs, keeping evaluation order well-defined.
 
 ## Partial data
+
+**Not yet supported:** the grammar accepts only `WHERE TRUE`, and any other
+predicate is a parse error. This section describes the design.
 
 Any target table, regardless of granularity, may be defined over a *subset* of
 its source rows via a row-level predicate. Like a partial index, materializing

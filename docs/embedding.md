@@ -246,7 +246,7 @@ transient blip to retry past.
 before it returns. None of them takes a connection or a transaction from the
 host, and neither binding has a migration helper that changes that. Rails and
 Ecto both wrap each migration in a transaction by default, so a define made
-inside one behaves in three ways you might not expect:
+inside one behaves in four ways you might not expect:
 
 * **A rollback doesn't undo it.** If the migration fails after `define`
   returned, the host's changes roll back, but the definition and its target
@@ -258,11 +258,20 @@ inside one behaves in three ways you might not expect:
   connection, so `define` fails with `not_found`. A column added earlier
   isn't visible either, so a field that reads it fails with a `validation`
   error.
-* **It can hang on the migration's locks.** If Trellis needs a lock the
-  migration's transaction already holds (dropping a target table the
-  migration has read from, say), it waits for that transaction to end, and
-  the transaction is waiting for Trellis. Postgres sees an idle transaction
-  and a waiting one, not a deadlock, so nothing breaks the wait.
+* **It can't go live until the migration commits.** A backfill waits out
+  every transaction that had written anything when it was queued
+  ([the `xmin` caveat](observability.md#backfill-status-and-the-xmin-caveat)),
+  and that includes a migration that changed a table before its define. So
+  a migration that polls for `live` inside its own transaction can wait on
+  itself until its deadline.
+* **Some statements can hang on the migration's locks.** A define doesn't
+  lock the source table, so a migration that altered it doesn't block one.
+  But a define whose target name matches a table the migration created and
+  hasn't committed waits for the migration to end, and so does a `DROP
+  TRANSFORM` of a target the migration has read or written. The migration is
+  waiting for Trellis meanwhile, and Postgres sees an idle transaction and a
+  waiting one, not a deadlock, so nothing breaks the wait. Trellis sets no
+  `lock_timeout` of its own.
 
 So keep Trellis out of the host's transaction, in this order:
 
@@ -373,12 +382,16 @@ Three things a poll needs to handle:
   and Trellis reports nothing but the status meanwhile. So poll with a
   deadline of your own, and from somewhere that can wait (a deploy check, a
   background job), not a web request.
-* **A failing build doesn't fail the poll.** It stays `waiting_to_backfill`
-  and is retried forever, with the error on the status's
-  `backfill_failure` (the source table, attempt count, last error and next
-  attempt time) ([a backfill that keeps
+* **A failing build doesn't fail the poll.** When the backfill can't start,
+  or an aggregate's or relationship-enriched transform's build fails, it
+  goes back to `waiting_to_backfill` and is retried forever, with the error
+  on the status's `backfill_failure` (the source table, attempt count, last
+  error and next attempt time) ([a backfill that keeps
   failing](observability.md#a-backfill-that-keeps-failing)). Log that
-  error; it's usually the whole answer.
+  error; it's usually the whole answer. A plain 1-1 build is split into
+  chunks, and a chunk that fails (a field that overflows its type on some
+  row, say) is retried as it stands: the transform stays `backfilling`,
+  `backfill_failure` stays empty, and only your deadline notices.
 * **`quarantined` can come before `live`.** The fuse can trip once apply
   maintains a transform, which starts at `catching_up`, so a transform can
   go from `catching_up` to `quarantined` without ever reporting `live`. Its
