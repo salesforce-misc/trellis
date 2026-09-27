@@ -1,16 +1,18 @@
 //! [`Config`] crosses as its fields, with the pool's wait timeout as whole
 //! milliseconds, the unit every duration a binding takes or returns uses.
 //!
-//! The DSN is named `url` here, after the connect option both bindings take
-//! it as, so a host's config value reads back the options it connected with.
+//! Every field but the DSN. The DSN can carry a password, and a host-language
+//! config value gets printed whole far too easily: Elixir's `inspect` in a
+//! Logger line or crash report, Ruby's `p`, a `to_h` serialized to JSON. A
+//! redacting `inspect` would cover only some of those paths, and the host
+//! already has the connection string it passed to connect. `Config`'s own
+//! `Display` leaves the DSN out for the same reason.
 
 use trellis::Config;
 
 /// A [`Config`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainConfig {
-    /// The Postgres connection string, exactly as the host passed it.
-    pub url: String,
     /// The schema Trellis keeps its own tables in.
     pub schema: String,
     /// The schema a bare target table name is created in.
@@ -25,7 +27,6 @@ pub struct PlainConfig {
 impl From<&Config> for PlainConfig {
     fn from(config: &Config) -> Self {
         PlainConfig {
-            url: config.dsn().to_string(),
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
             pool_max_size: u64::try_from(config.pool_max_size()).unwrap_or(u64::MAX),
@@ -43,7 +44,7 @@ mod tests {
 
     #[test]
     fn a_config_flattens_to_its_fields() {
-        let config = Config::with_schema("host=/tmp dbname=app", "trellis_app")
+        let config = Config::with_schema("host=/tmp dbname=app password=s3cret", "trellis_app")
             .unwrap()
             .with_target_schema("reporting")
             .unwrap()
@@ -53,7 +54,6 @@ mod tests {
         assert_eq!(
             PlainConfig::from(&config),
             PlainConfig {
-                url: "host=/tmp dbname=app".to_string(),
                 schema: "trellis_app".to_string(),
                 target_schema: "reporting".to_string(),
                 pool_max_size: 7,
@@ -61,6 +61,15 @@ mod tests {
                 pool_wait_timeout_ms: 2_500,
             }
         );
+    }
+
+    #[test]
+    fn the_dsn_and_its_password_never_cross() {
+        let config =
+            Config::with_schema("postgresql://alice:s3cret@db.example.com/app", "trellis").unwrap();
+        let plain = format!("{:?}", PlainConfig::from(&config));
+        assert!(!plain.contains("s3cret"), "{plain}");
+        assert!(!plain.contains("db.example.com"), "{plain}");
     }
 
     #[test]

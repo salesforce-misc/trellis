@@ -667,7 +667,6 @@ fn self_check(
 /// The configuration a handle connected with, as `config/1` returns it.
 #[derive(NifMap)]
 struct ConfigTerm {
-    url: String,
     schema: String,
     target_schema: String,
     pool_max_size: u64,
@@ -679,7 +678,6 @@ struct ConfigTerm {
 fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
     let config = handle.with(|trellis| Ok(PlainConfig::from(trellis.config())))?;
     Ok(ConfigTerm {
-        url: config.url,
         schema: config.schema,
         target_schema: config.target_schema,
         pool_max_size: config.pool_max_size,

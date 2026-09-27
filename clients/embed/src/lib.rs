@@ -29,7 +29,7 @@
 //! | `watermark_token`'s `PgLsn` | an opaque string | [`encode_watermark`] / [`decode_watermark`] |
 //! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
-//! | [`trellis::Config`] | its fields, the DSN as `url`, the pool timeout in milliseconds | [`PlainConfig`] |
+//! | [`trellis::Config`] | its fields but the DSN (which can carry a password), the pool timeout in milliseconds | [`PlainConfig`] |
 //!
 //! | a `tracing` event | level word + target + message | [`PlainLogRecord`] |
 //!

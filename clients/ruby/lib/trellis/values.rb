@@ -219,10 +219,11 @@ module Trellis
   Divergence = Data.define(:kind, :key, :column, :persisted, :recomputed)
 
   # The configuration this process's handle connected with, as Trellis.config
-  # returns it: connect's url, schema and target_schema, and the connection
-  # pool's size cap and how long a call waits for a free connection.
+  # returns it: connect's schema and target_schema, and the connection pool's
+  # size cap and how long a call waits for a free connection.
   #
-  # url is the connection string exactly as it was passed to connect,
-  # password and all: don't log it.
-  Config = Data.define(:url, :schema, :target_schema, :pool_max_size, :pool_wait_timeout_ms)
+  # Not the url: a connection string can carry a password, and a Config is
+  # the kind of value that ends up in a log line whole. The caller already
+  # has the url it connected with.
+  Config = Data.define(:schema, :target_schema, :pool_max_size, :pool_wait_timeout_ms)
 end

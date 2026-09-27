@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "pp"
 require "test_helper"
 
 class TrellisTest < Minitest::Test
@@ -79,15 +80,23 @@ class TrellisTest < Minitest::Test
     assert_raises(Trellis::ParseError) { Trellis.define("DROP gadget_prices") }
   end
 
-  def test_config_reads_back_the_options_the_handle_connected_with
-    Trellis.connect(url: TestCluster.dsn, target_schema: "reporting")
+  def test_config_reads_back_the_options_the_handle_connected_with_but_never_the_url
+    # The test cluster trusts every local connection, so the password is
+    # accepted and ignored: it's here to be looked for in the output.
+    password = "s3cret-hunter2"
+    Trellis.connect(url: "#{TestCluster.dsn} password=#{password}", target_schema: "reporting")
     config = Trellis.config
     assert_instance_of Trellis::Config, config
-    assert_equal TestCluster.dsn, config.url
     assert_equal "trellis", config.schema
     assert_equal "reporting", config.target_schema
     assert_operator config.pool_max_size, :>=, 1
     assert_operator config.pool_wait_timeout_ms, :>=, 1
+
+    # A config is the kind of value that gets logged whole.
+    refute_includes config.to_h.keys, :url
+    [config.inspect, config.to_s, config.to_h.to_s, config.pretty_inspect].each do |printed|
+      refute_includes printed, password
+    end
   end
 
   def test_a_table_no_transform_writes_has_no_status

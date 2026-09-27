@@ -121,22 +121,30 @@ defmodule TrellisTest do
     assert {:error, %Error{code: :parse}} = Trellis.define(trellis, "DROP gadget_prices")
   end
 
-  test "config/1 reads back the options the handle connected with" do
-    dsn = TestCluster.info()["dsn"]
-    trellis = Trellis.connect!(url: dsn, target_schema: "reporting")
+  test "config/1 reads back the options the handle connected with, but never the url" do
+    # The test cluster trusts every local connection, so the password is
+    # accepted and ignored: it's here to be looked for in the output.
+    password = "s3cret-hunter2"
+    url = TestCluster.info()["dsn"] <> " password=" <> password
+    trellis = Trellis.connect!(url: url, target_schema: "reporting")
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
     assert {:ok,
             %Trellis.Config{
-              url: ^dsn,
               schema: "trellis",
               target_schema: "reporting",
               pool_max_size: pool_max_size,
               pool_wait_timeout_ms: pool_wait_timeout_ms
-            }} = Trellis.config(trellis)
+            } = config} = Trellis.config(trellis)
 
     assert pool_max_size >= 1
     assert pool_wait_timeout_ms >= 1
+
+    # A config is the kind of value that gets logged whole.
+    refute Map.has_key?(config, :url)
+    refute inspect(config) =~ password
+    refute inspect(Map.from_struct(config)) =~ password
+    refute inspect(trellis) =~ password
   end
 
   test "a table no transform writes has no status" do

@@ -362,13 +362,13 @@ impl Handle {
         self_check_hash(ruby, report)
     }
 
-    /// The configuration the handle connected with.
+    /// The configuration the handle connected with, all but the connection
+    /// string (see [`PlainConfig`]).
     fn config(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
         let config = rb_self.call(ruby, |trellis| Ok(PlainConfig::from(trellis.config())))?;
         record(
             ruby,
             [
-                ("url", ruby.into_value(config.url)),
                 ("schema", ruby.into_value(config.schema)),
                 ("target_schema", ruby.into_value(config.target_schema)),
                 ("pool_max_size", ruby.into_value(config.pool_max_size)),

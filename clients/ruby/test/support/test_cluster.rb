@@ -63,13 +63,14 @@ module TestCluster
     # the cluster's details.
     def open
       testkit = IO.popen([executable], "r+")
-      unless testkit.wait_readable(120)
-        testkit.close
-        raise "trellis-testkit reported no cluster within 120s"
-      end
+      raise "trellis-testkit reported no cluster within 120s" unless testkit.wait_readable(120)
 
       line = testkit.gets or raise "trellis-testkit exited before reporting a cluster"
       [testkit, JSON.parse(line)]
+    rescue StandardError
+      # Closing its stdin tells testkit to tear down whatever it started.
+      testkit&.close
+      raise
     end
 
     # CI puts trellis-testkit on PATH; locally, the workspace's debug build.

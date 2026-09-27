@@ -370,8 +370,7 @@ statement for a target that already exists is an `ALTER TRANSFORM`
 define. To remove a transform deliberately, apply `PAUSE TRANSFORM
 order_totals` and then `DROP TRANSFORM order_totals`: `DROP` refuses a
 transform that isn't paused, and takes the target table's data with it. In
-Ruby, those statements need `Trellis.apply`, which comes with the binding's
-full surface (#152).
+Ruby, run those statements with `Trellis.apply`.
 
 ## Poll to `live`, don't wait
 
@@ -528,6 +527,11 @@ token = Trellis.watermark_token!(trellis)
 :ok = Trellis.await_converged!(trellis, token, 30_000)
 ```
 
+```ruby
+token = Trellis.watermark_token
+Trellis.await_converged(token, timeout_ms: 30_000)
+```
+
 `await_converged` waits for captured changes only; it doesn't read status. A
 transform that isn't `live` yet, `catching_up` included, can still be missing
 rows after it returns, which is why the poll comes first. When the timeout
@@ -535,7 +539,6 @@ runs out first, it fails with a `timeout` error, not `internal`: the target is
 behind, not broken, so retry or allow longer. A binding handle runs one call
 at a time, so every other call on it waits behind an `await_converged` for up
 to its timeout; keep the timeout short on a handle that also serves requests.
-Ruby gets `watermark_token` and `await_converged` with its full surface (#152).
 
 ## What the engine maintains today
 
