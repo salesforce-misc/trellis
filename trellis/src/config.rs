@@ -251,12 +251,40 @@ impl Config {
         let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".to_string());
         let user = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string());
         let dbname = std::env::var("PGDATABASE").unwrap_or_else(|_| user.clone());
-
-        match std::env::var("PGPASSWORD") {
-            Ok(password) => format!("postgresql://{user}:{password}@{host}:{port}/{dbname}"),
-            Err(_) => format!("postgresql://{user}@{host}:{port}/{dbname}"),
-        }
+        let password = std::env::var("PGPASSWORD").ok();
+        keyword_value_dsn(&host, &port, &user, password.as_deref(), &dbname)
     }
+}
+
+/// Assembles a keyword/value DSN from the `PG*` environment values.
+///
+/// Every value is single-quoted with `\` and `'` backslash-escaped, so it
+/// reaches the connection exactly as given. A URL would need each part
+/// percent-encoded instead: interpolated raw, a `PGPASSWORD` holding `@`
+/// moved the rest of the password into the host, and a `PGHOST` socket
+/// directory (`/var/run/postgresql`) became part of the database name.
+fn keyword_value_dsn(
+    host: &str,
+    port: &str,
+    user: &str,
+    password: Option<&str>,
+    dbname: &str,
+) -> String {
+    fn quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
+    }
+    let mut dsn = format!(
+        "host={} port={} user={} dbname={}",
+        quoted(host),
+        quoted(port),
+        quoted(user),
+        quoted(dbname),
+    );
+    if let Some(password) = password {
+        dsn.push_str(" password=");
+        dsn.push_str(&quoted(password));
+    }
+    dsn
 }
 
 impl fmt::Debug for Config {
@@ -439,6 +467,44 @@ mod tests {
             .with_target_schema("")
             .unwrap_err();
         assert!(matches!(err, Error::Config(_)));
+    }
+
+    /// The `PG*` values reach the connection exactly as given, whatever
+    /// characters they hold: a `PGPASSWORD` with `@`, `:`, `/`, quotes or
+    /// backslashes, and a `PGHOST` socket directory.
+    // `Host::Unix` only exists on unix.
+    #[cfg(unix)]
+    #[test]
+    fn env_dsn_carries_pg_values_through_verbatim() {
+        let password = r#"p@ss:w/rd?#&'q'\ x"#;
+        let dsn = keyword_value_dsn(
+            "/var/run/postgresql",
+            "5433",
+            "o'brien@corp",
+            Some(password),
+            "my db",
+        );
+        let parsed: tokio_postgres::Config = dsn.parse().expect("the assembled DSN parses");
+        assert_eq!(parsed.get_password(), Some(password.as_bytes()));
+        assert_eq!(parsed.get_user(), Some("o'brien@corp"));
+        assert_eq!(parsed.get_dbname(), Some("my db"));
+        assert_eq!(parsed.get_ports(), [5433]);
+        assert_eq!(
+            parsed.get_hosts(),
+            [tokio_postgres::config::Host::Unix(
+                "/var/run/postgresql".into()
+            )]
+        );
+
+        let parsed: tokio_postgres::Config =
+            keyword_value_dsn("db.example.com", "5432", "alice", None, "app")
+                .parse()
+                .expect("the assembled DSN parses");
+        assert_eq!(parsed.get_password(), None);
+        assert_eq!(
+            parsed.get_hosts(),
+            [tokio_postgres::config::Host::Tcp("db.example.com".into())]
+        );
     }
 
     #[test]
