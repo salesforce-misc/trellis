@@ -34,6 +34,12 @@ the ~1-CPU WAL-decoding ceiling below.
 
 ## Ingestion via logical replication
 
+> **Superseded design (2026-09-27).** This section describes the code on
+> `main`: capture by logical replication, the backfill discharge, markers and
+> the go-live re-read. [ADR-0002](decisions/0002-async-data-flow.md) replaces
+> them with trigger capture and a build that applies from its first chunk. The
+> text is rewritten as that lands (#556).
+
 Trellis subscribes to the source tables through a Postgres **logical replication
 slot**, which delivers a committed, LSN-ordered stream of row-level changes
 (insert / update / delete) for the tables feeding any transform. How a decoded
@@ -59,6 +65,12 @@ transform starts reading it are captured separately, by the path below.
 
 ## Capturing a table's existing rows
 
+> **Superseded design (2026-09-27).** This section describes the code on
+> `main`: capture by logical replication, the backfill discharge, markers and
+> the go-live re-read. [ADR-0002](decisions/0002-async-data-flow.md) replaces
+> them with trigger capture and a build that applies from its first chunk. The
+> text is rewritten as that lands (#556).
+
 A new transform's target has to reflect every row its source already holds,
 not only the changes that arrive after it's defined. Replication doesn't carry
 those rows, so Trellis reads them from the table: the **capture**. The capture
@@ -67,7 +79,7 @@ by the capture or delivered by the stream afterward, and a commit that both see
 is counted once.
 
 There is one capture path, and every definition's initial build goes through
-it ([ADR-0016](decisions/0016-single-background-capture-path.md)). Resumes,
+it ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)). Resumes,
 explicit `request_backfill` calls and go-live catch-ups use it too. Two
 rebuilds of some columns of a `live` transform don't yet: a column resume and an
 `ALTER TRANSFORM` that adds columns read those columns' values in-call, then
@@ -104,7 +116,7 @@ drain threads.
      `ALTER`'s own transaction falls short of a writer that starts between that
      snapshot and the commit. The discharge's fence postdates the commit, so it
      waits out that writer too
-     ([ADR-0016](decisions/0016-single-background-capture-path.md#the-join-fence),
+     ([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes),
      #431).
    - If the source needs no publication change, the staging worker's next
      reconcile pass parks the marker on it (`park_registration_markers`, in the
@@ -138,8 +150,8 @@ drain threads.
    | Build | Used for | How it runs |
    |---|---|---|
    | Ring enumeration | any shape; the fallback for a shape the direct build can't render | one cursor inside the discharge transaction appends an image-less `Recompute` per source row, which drain workers fold like any batch |
-   | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0007](decisions/0007-direct-set-based-backfill.md#backgrounding-and-resumability)) |
-   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0016](decisions/0016-single-background-capture-path.md#the-direct-build-job)) |
+   | Plain 1-1 chunks | plain (no relationship) 1-1 definitions | the discharge cuts the source's key range into `backfill_chunks`, and drain threads claim and execute them ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
+   | Direct set-based build | aggregates and relationship-enriched 1-1 definitions | the discharge enqueues one job (a `backfill_chunks` row with no bounds), and a drain thread runs ADR-0007's whole `INSERT … SELECT` build ([ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) |
 
    The discharge checks against the catalog that the direct build can render
    a definition before it dispatches one; a shape it can't
@@ -153,7 +165,7 @@ drain threads.
    job loses its claim to the reclaim sweep, and another reruns it. A chunk or
    job that a worker still holds when its definition is paused and resumed is
    superseded, and its writes are fenced so that none lands after the resume
-   (#434, [ADR-0016](decisions/0016-single-background-capture-path.md#a-chunk-held-across-a-resume)).
+   (#434, [ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)).
    A direct build that fails goes back to `waiting_to_backfill` behind a
    marker that carries the error and a backoff, the same retry state a failed
    discharge gets (#407), so `Trellis::status` reports it.
@@ -170,7 +182,7 @@ drain threads.
    token awaited after it covers every commit at or before the token. A ring
    enumeration's rows are still undrained when it flips, but they carry no
    `origin_lsn`, so they gate every token
-   ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
+   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 
 ### Why the path is gap-free
 
@@ -255,12 +267,12 @@ a go-live catch-up for the table's applying readers. They report
 `catching_up` until the discharge has re-read the table and swept their
 targets for rows the source no longer backs, which a re-read alone can't
 reach
-([ADR-0016](decisions/0016-single-background-capture-path.md#a-fresh-install)).
+([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)).
 An explicit `Trellis::request_backfill`, and a table rejoining the
 publication after an operator dropped it, park the same catch-ups for the
 same reason, and a re-read table that is a relationship's to-side also has
 its settled projections refreshed
-([ADR-0016](decisions/0016-single-background-capture-path.md#a-re-read-tables-readers)).
+([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)).
 A slot lost under the same name is recovered differently
 (`intake::slot_loss`): the slot is recreated without a read, every transform
 it fed is paused, and each one's resume parks its own marker.
@@ -280,7 +292,7 @@ a row committed during that wait would be neither read nor streamed (#393).
   started. After `live` it covers everything: `live` waits for a chunked or
   direct build's go-live catch-up (the definition reports `catching_up` until
   then), and a ring enumeration's staged rows gate every token
-  ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
+  ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 - **A staging worker must be running.** Nothing joins, waits, captures or goes
   live without its maintenance loop. Chunked and direct builds also need drain threads
   ([embedding — Who runs what](embedding.md#who-runs-what),

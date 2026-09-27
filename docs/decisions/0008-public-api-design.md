@@ -37,13 +37,13 @@ never backfill. `define()` blocks just long enough to create the target table,
 capture the coverage fence, and persist the definition / enumerate its backfill
 work — then returns before a single target row is built.
 
-> [ADR-0016](0016-single-background-capture-path.md) narrows this further:
-> `define()` creates the target table and persists the definition as
-> `waiting_to_backfill`, and nothing else. It captures no fence and enumerates
-> nothing. The backfill discharge does both in the background.
+> [ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)
+> narrows this further: `define()` creates the target table, its ledger tables
+> and its chunk plan, persists the definition, and nothing else. It captures
+> no fence and reads no source row. Drain workers build in the background.
 
 The reason is scale: even the chunked direct-build path
-([ADR-0007](0007-direct-set-based-backfill.md)) takes real wall-clock time on a
+([ADR-0002](0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)) takes real wall-clock time on a
 billion-row table, and blocking that long means an interrupted process loses
 all progress. Backfill is therefore always background and resumable: the chunked
 writes are a durable, claimable work queue that running `application_threads`

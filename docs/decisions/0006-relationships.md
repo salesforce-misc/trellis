@@ -167,38 +167,25 @@ directions:
   in dependency order: to-one looks up the single related row by join key;
   to-many aggregates the related rows.
 * **Reverse (a *related* row changes).** From the dependency graph, Trellis
-  finds which relationships target the changed table and re-derives the
-  referencing rows whose join key matches the changed row's key — read from the
-  changed row's replica image. Both cardinalities therefore constrain replica
-  identity, enforced at define time:
+  finds which relationships target the changed table and updates the
+  referencing rows' targets through the parent's applied value, which each
+  target owns ([ADR-0002](0002-async-data-flow.md#relationships-are-factored)):
+  a to-side change touches the parent row and its groups, never the children,
+  for fields linear in the to-side value; other fields re-derive each child
+  through the target's join-key index. No replica identity is required on
+  either side, because the target's ledger holds the join key and group each
+  child was last counted under and the parent's applied values.
 
-  * **To-many**'s join key is a *non-PK* to-side column, omitted from the
-    default (PK) replica identity's delete/re-parent pre-images. Requires
-    `REPLICA IDENTITY FULL`, or a replica-identity index covering the join
-    column.
-  * **To-one**'s join key is the to-side PK, which the default identity carries
-    — but the key alone is not enough. Every to-one relationship gets an
-    unconditional settled parent projection, whose reverse-applied advance needs
-    the to-side row's *entire* old image to detect an update, delete, or re-key.
-    So the to-side requires `REPLICA IDENTITY FULL`.
-  * **To-one** additionally requires `REPLICA IDENTITY FULL` on its **from-side**
-    (child) table. The from-side join column is an ordinary non-key column (the
-    FK), so under the default identity an `UPDATE` that re-points the FK without
-    touching the PK ships *no* pre-image — nothing to recover the prior parent
-    from. The to-side gate cannot catch this: a from-side re-point never touches
-    the to-side row.
+  Finding a parent's children is an index lookup on the target's own ledger
+  (its join-key column), which Trellis creates and owns. No index on the
+  source tables is needed for it, consistent with
+  [ADR-0005](0005-source-schema-is-user-owned.md).
 
-  This reuses the existing "recompute" staging path, not a bespoke persisted
-  reverse index. Finding the affected referencing rows is a lookup on the
-  from-side join column — **correct without an index**; an index only makes it
-  fast. Per [ADR-0005](0005-source-schema-is-user-owned.md), Trellis does not
-  create it; it detects a usable one and, if absent, emits a performance warning
-  naming the exact `CREATE INDEX`.
-
-This is the case [ADR-0002](0002-async-data-flow.md) flagged: cross-relationship
-formulas are unsound under naive synchronous triggers. The async
-staging/apply/fence design makes them sound; reverse propagation is one more
-producer feeding that machinery, not a new ordering regime.
+This is the case [ADR-0002](0002-async-data-flow.md) flags: cross-relationship
+formulas are unsound under synchronous derivation. Asynchronous derivation
+under the ledger's read-after-lock and visibility-checked application makes
+them sound; reverse propagation is one more producer feeding that machinery,
+not a new ordering regime.
 
 ## Redefinition
 

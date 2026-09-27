@@ -211,7 +211,7 @@ quarantine are two arcs of one lifecycle:
   awaited with `Trellis::await_converged` guarantees the target reflects that
   commit. A ring enumeration's rows may still be draining when it flips, but
   they gate every token, so the await covers them
-  ([ADR-0016](decisions/0016-single-background-capture-path.md#what-live-promises)).
+  ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 * **`quarantined`** — the fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, re-runs the backfill, and **re-arms**
@@ -227,7 +227,7 @@ fence`, `trellis/src/intake/publication.rs`). Because `xmin` is
 **cluster-global**, any unrelated long-running transaction *anywhere in the
 cluster* pins it and holds every waiting backfill in `waiting_to_backfill`
 until that transaction ends. Since every new transform goes through this wait
-([ADR-0016](decisions/0016-single-background-capture-path.md)), a long
+([ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)), a long
 transaction delays every registration from going live, not only the ones on a
 newly published table.
 
@@ -246,7 +246,7 @@ queries, `pg_dump`, or workload on another database sharing the cluster.
 A backfill can also fail outright, for example when a plain 1-1 transform's
 source has lost its primary key. That is a fault, so unlike the fence wait it
 is surfaced (issue #407,
-[ADR-0016](decisions/0016-single-background-capture-path.md#consequences)):
+[ADR-0002](decisions/0002-async-data-flow.md#what-the-implementation-removes)):
 
 * **It doesn't hold up other tables.** The staging worker logs the failure as a
   warning and moves on to the next table's backfill in the same pass.

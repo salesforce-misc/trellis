@@ -513,7 +513,7 @@ end
 reports `live`, write to its source, let the commit return, take a
 `watermark_token`, and pass it to `await_converged`: when that returns, the
 target reflects the write
-([ADR-0016 — What `live` promises](decisions/0016-single-background-capture-path.md#what-live-promises)).
+([ADR-0002 — What `live` promises](decisions/0002-async-data-flow.md#what-live-promises)).
 The same pair, taken right after the poll above reads `live`, waits out the
 last of the build's own changes.
 

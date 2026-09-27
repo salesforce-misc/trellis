@@ -9,6 +9,12 @@ the staging area, and only then telling the upstream cursor it may move.
 that is durably staged.* A crash at any instant either loses nothing or replays
 work that was never staged — there is no third outcome.
 
+> **Superseded design (2026-09-27).** This section describes the code on
+> `main`: capture by logical replication, the backfill discharge, markers and
+> the go-live re-read. [ADR-0002](../decisions/0002-async-data-flow.md) replaces
+> them with trigger capture and a build that applies from its first chunk. The
+> text is rewritten as that lands (#556).
+
 ## The pipeline
 
 ```mermaid
@@ -198,7 +204,7 @@ can't loop.
   commit is neither covered nor streamed — so the marker is parked with no
   fence, and the first discharge pass to see it takes one, a transaction id
   assigned after the commit, and records it for later passes
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#the-join-fence),
+  ([ADR-0002](../decisions/0002-async-data-flow.md#what-the-implementation-removes),
   #431). This discharge is the **only** capture path:
   every definition's initial build, resume and catch-up reads its source through
   it, and registration reads nothing
@@ -208,9 +214,9 @@ can't loop.
   (#425, #426). Only the
   staging worker runs the `ALTER`, including the shrink after a `DROP`: a `DROP`
   removes catalog rows and the worker's reconcile pass takes the table back out
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#consequences),
+  ([ADR-0002](../decisions/0002-async-data-flow.md#what-the-implementation-removes),
   #427). The inventory in
-  [ADR-0016](../decisions/0016-single-background-capture-path.md#inventory-of-capture-paths)
+  [ADR-0002](../decisions/0002-async-data-flow.md#what-the-implementation-removes)
   lists every capture path and its role.
 - **A marker is deleted only by the discharge that read it.** A table has one
   marker, and the catch-ups that park one (a direct build going live, a column
@@ -262,13 +268,13 @@ can't loop.
   (`CREATE_REPLICATION_SLOT … (SNAPSHOT 'export')`) would close that gap, but
   only by keeping a second capture path for fresh installs, and neither
   replication client Trellis uses supports it
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#rejected-alternatives)).
+  ([ADR-0002](../decisions/0002-async-data-flow.md#what-the-implementation-removes)).
   The discharge skips a table no definition reads yet, since no apply would
   consume its `Recompute` rows. A catalog that outlived its old slot can
   already hold applying definitions, so each marker is a go-live catch-up
   for the table's applying readers: they report `catching_up` until its
   discharge has re-read the table and swept their targets
-  ([ADR-0016](../decisions/0016-single-background-capture-path.md#a-fresh-install)).
+  ([ADR-0002](../decisions/0002-async-data-flow.md#what-the-implementation-removes)).
 
 ## The load-bearing invariants
 

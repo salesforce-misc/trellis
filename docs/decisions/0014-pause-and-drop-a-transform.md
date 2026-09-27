@@ -123,7 +123,7 @@ derives from it any longer. A table a sibling definition still reads stays publi
 Correct by construction, with the catalog as the only input.
 
 The shrink is deferred to that pass rather than applied at drop time
-([ADR-0016](0016-single-background-capture-path.md), #427): the staging worker is the only
+([ADR-0002](0002-async-data-flow.md#capture-by-statement-triggers), #427): the staging worker is the only
 process that changes the publication, so dropping a transform needs no publication
 privileges. The cost is that the table's changes keep being staged for up to one
 `reconcile_interval` with no reader, which is harmless, because apply skips a table
