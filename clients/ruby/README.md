@@ -68,10 +68,8 @@ definition ever reaches `:live`.
   calls on a handle it inherited raise `Trellis::ForkedHandleError` rather
   than hang, and `connect` in the child replaces it. `Trellis.shutdown` in a
   child that hasn't connected does nothing. If the parent connects too (to
-  migrate, say), shut it down before forking. The engine rebuilds its own
-  process-wide state in a forked child, so the child's `connect` doesn't wait
-  on a lock one of the parent's threads held, but it can't do that for locks
-  inside the libraries it uses.
+  migrate, say), shut it down before forking: a child forked while the
+  parent's handle is busy can inherit a lock one of its threads held.
 
   ```ruby
   # config/puma.rb

@@ -75,24 +75,6 @@ let worker = Trellis::connect(
 .await?;
 ```
 
-## Forking (issue #600)
-
-Preforking servers (Puma, Unicorn, Passenger, Resque) fork after boot. A
-handle doesn't survive `fork` (ADR-0010 decision 3), so each child connects
-its own, after forking. That new handle is safe to connect even if the parent
-still has a live handle whose threads were busy at the moment of the fork:
-the crate's own process-wide state (the enum type-name interner, the metrics
-registry) is rebuilt in a forked child rather than inherited, so the child
-never waits on a lock that one of the parent's threads held when it was
-copied. One consequence: a child's metrics start from zero, as any new
-process's do, and don't include the parent's.
-
-That guarantee covers this crate's own state only. A lock held at the fork
-inside the C library or another dependency is outside its reach, so
-shutting the parent's handle down before forking (the Ruby binding's
-`before_fork { Trellis.shutdown }`) is still the safer shape when the parent
-connected at all.
-
 ## The silent-stall hazard (issue #144)
 
 This shape has one sharp edge: **if the dedicated worker process is never

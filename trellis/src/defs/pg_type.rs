@@ -26,13 +26,12 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, OnceLock};
 
 use tokio_postgres::GenericClient;
 
 use super::ast::ValueType;
 use crate::float::FloatWidth;
-use crate::fork_local::ForkLocal;
 use crate::integer::IntWidth;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
@@ -149,23 +148,6 @@ pub enum PgType {
 /// an enum reference.
 const ENUM_TOKEN_PREFIX: &str = "enum:";
 
-/// The set [`intern_enum_token`] deduplicates against. A [`ForkLocal`], not a
-/// `OnceLock`, because classifying a column type is on the path a freshly
-/// connected handle takes (issue #600): a forked child whose parent had a
-/// thread inside this lock at the fork would otherwise wait on it forever.
-/// The child starts from an empty set, so it may leak one more copy of a
-/// token the parent already interned; tokens compare by contents, so the
-/// two copies are interchangeable.
-static INTERNED: ForkLocal<Mutex<HashSet<&'static str>>> =
-    ForkLocal::new(|| Mutex::new(HashSet::new()));
-
-fn interned() -> MutexGuard<'static, HashSet<&'static str>> {
-    INTERNED
-        .get()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Interns `qualified_name` (a `"schema.typname"` string with no embedded
 /// `.` in either component — see [`intake::publication::qualify`]) as this
 /// process's single, shared `&'static str` for that enum type's persisted
@@ -175,22 +157,16 @@ fn interned() -> MutexGuard<'static, HashSet<&'static str>> {
 /// chosen over threading an owned `String` through, which would cost
 /// [`PgType`]/[`ValueType`] their `Copy`-ness).
 fn intern_enum_token(qualified_name: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let token = format!("{ENUM_TOKEN_PREFIX}{qualified_name}");
-    let mut guard = interned();
+    let set = INTERNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = guard.get(token.as_str()) {
         return existing;
     }
     let leaked: &'static str = Box::leak(token.into_boxed_str());
     guard.insert(leaked);
     leaked
-}
-
-/// Test support for issue #600's fork test (`tests/fork_child_globals.rs`):
-/// holds the interner's lock for as long as the returned guard lives, the
-/// way an engine thread classifying a column would at the moment of a fork.
-#[cfg(feature = "internals")]
-pub fn hold_enum_interner_lock() -> MutexGuard<'static, HashSet<&'static str>> {
-    interned()
 }
 
 impl PgType {

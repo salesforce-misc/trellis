@@ -177,13 +177,6 @@ impl Trellis {
     /// definitions read (none yet is fine); with a non-zero `drain_threads`,
     /// that many application workers start.
     pub async fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
-        // Issue #600: build the metrics registry here, before any engine
-        // thread exists, rather than on the first metric an engine thread
-        // records. The first build calibrates `quanta`'s clock behind a
-        // process-wide `OnceCell` for a millisecond or more; a fork that
-        // landed in that window would leave a child that builds its own
-        // registry waiting on the half-finished `OnceCell` forever.
-        crate::metrics::ensure_installed();
         let pool = Pool::new(&config)?;
         let client = if options.staging || options.drain_threads > 0 {
             Some(Self::start_client(&config, &options)?)

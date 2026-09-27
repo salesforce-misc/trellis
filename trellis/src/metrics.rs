@@ -34,25 +34,17 @@
 //! enabled in `Cargo.toml`, so this never binds a socket) and installs it
 //! the first time any recording function in this module runs. Installation
 //! is idempotent and best-effort: if a global recorder is already installed
-//! (a second call racing the first, or — someday — an embedder installing
-//! its own before this crate's first call), later attempts simply lose and
-//! every macro call below still records into *this* module's own handle
-//! instead of whatever won, since nothing else in this process installs a
-//! recorder yet. A real multi-installer story is out of scope for this
-//! issue.
-//!
-//! What gets installed is a forwarding recorder, not the Prometheus
-//! recorder itself: "process-wide" is taken literally, so a forked child
-//! gets a fresh registry rather than the parent's (issue #600, see
-//! [`crate::fork_local`]).
+//! (a second call racing the [`OnceLock`], or — someday — an embedder
+//! installing its own before this crate's first call), later attempts
+//! simply lose and every macro call below still records into *this*
+//! module's own handle instead of whatever won, since nothing else in this
+//! process installs a recorder yet. A real multi-installer story is out of
+//! scope for this issue.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, SharedString, Unit};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
-
-use crate::fork_local::ForkLocal;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 /// ADR-0009 decision 6: exponential bucket boundaries spanning ~10ms-60s
 /// (`docs/observability.md`'s "sub-second to tens-of-seconds propagation
@@ -148,87 +140,20 @@ const INTAKE_RESTARTS_METRIC: &str = "trellis_intake_restarts_total";
 /// a counter, can't be summed across two clients in one process.
 const INTAKE_CONSECUTIVE_FAILURES_METRIC: &str = "trellis_intake_consecutive_failures";
 
-/// This process's recorder, and the handle that renders it.
-struct Registry {
-    recorder: PrometheusRecorder,
-    handle: PrometheusHandle,
-}
-
-/// Issue #600: a [`ForkLocal`], so a forked child records into a registry of
-/// its own. The registry's shards are `RwLock`s inside `metrics-util` that
-/// every macro call takes; a child that shared the parent's registry would
-/// hang on the first series it registered if a parent thread had been
-/// inside one of those locks at the fork. The child's series start empty,
-/// the same as any other new process's.
-static REGISTRY: ForkLocal<Registry> = ForkLocal::new(|| {
-    let recorder = described_recorder();
-    let handle = recorder.handle();
-    Registry { recorder, handle }
-});
-
-/// The recorder this module installs as the process's global one. It holds
-/// nothing itself and forwards every call to [`REGISTRY`], which is how a
-/// forked child ends up recording into its own registry even though the
-/// `metrics` crate's global recorder can only be set once per process (and
-/// the child inherits the parent's).
-struct ForkAwareRecorder;
-
-impl metrics::Recorder for ForkAwareRecorder {
-    fn describe_counter(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        REGISTRY
-            .get()
-            .recorder
-            .describe_counter(key, unit, description);
-    }
-
-    fn describe_gauge(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        REGISTRY
-            .get()
-            .recorder
-            .describe_gauge(key, unit, description);
-    }
-
-    fn describe_histogram(&self, key: KeyName, unit: Option<Unit>, description: SharedString) {
-        REGISTRY
-            .get()
-            .recorder
-            .describe_histogram(key, unit, description);
-    }
-
-    fn register_counter(&self, key: &Key, metadata: &Metadata<'_>) -> Counter {
-        REGISTRY.get().recorder.register_counter(key, metadata)
-    }
-
-    fn register_gauge(&self, key: &Key, metadata: &Metadata<'_>) -> Gauge {
-        REGISTRY.get().recorder.register_gauge(key, metadata)
-    }
-
-    fn register_histogram(&self, key: &Key, metadata: &Metadata<'_>) -> Histogram {
-        REGISTRY.get().recorder.register_histogram(key, metadata)
-    }
-}
-
-/// Whether some call has already tried to install [`ForkAwareRecorder`].
-/// A flag rather than a `OnceLock` so nothing waits on another thread's
-/// install (issue #600: a fork that caught that wait mid-way would leave the
-/// child waiting forever). The cost is that a thread racing the very first
-/// install can find no recorder installed yet for the instant `metrics`
-/// takes to publish it, and that one observation goes to the no-op recorder.
-static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-
-/// This process's registry handle, installing the global recorder first if
-/// nothing has yet. See the module doc comment's "Recorder installation"
-/// section.
+/// The process-wide recorder handle, built and installed on first use. See
+/// the module doc comment's "Recorder installation" section.
 fn handle() -> &'static PrometheusHandle {
-    if !INSTALL_ATTEMPTED.load(Ordering::Acquire) {
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        let recorder = described_recorder();
+        let handle = recorder.handle();
         // Best-effort install — see the module doc comment. `build_recorder`
         // (rather than `install`/`install_recorder`) is used deliberately:
         // those two are only compiled under the exporter's `http-listener`
         // feature, which this crate does not enable (no bound socket).
-        let _ = metrics::set_global_recorder(ForkAwareRecorder);
-        INSTALL_ATTEMPTED.store(true, Ordering::Release);
-    }
-    &REGISTRY.get().handle
+        let _ = metrics::set_global_recorder(recorder);
+        handle
+    })
 }
 
 /// A recorder with this crate's buckets and every metric's description.
@@ -237,7 +162,7 @@ fn handle() -> &'static PrometheusHandle {
 /// current-recorder lookup: a thread with a local recorder set (a test's
 /// `set_default_local_recorder`) that happens to be first to call
 /// [`handle`] would otherwise take every `# HELP` line with it.
-fn described_recorder() -> PrometheusRecorder {
+fn described_recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
     let recorder = PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS)
         .expect("LATENCY_BUCKETS is non-empty and every boundary is finite")

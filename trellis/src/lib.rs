@@ -87,9 +87,6 @@ pub mod numeric;
 pub mod otel;
 pub mod pool;
 
-// Process-global state a forked child rebuilds instead of inheriting (#600).
-mod fork_local;
-
 // Tier 3 (the engine) — see ADR-0012. Crate-private: no external crate names
 // `trellis::defs::*`, `trellis::staging::*`, or `trellis::intake::*`. The
 // curated crate-root re-exports below are the boundary, not a suggestion

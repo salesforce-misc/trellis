@@ -2225,7 +2225,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "deadpool-postgres",
- "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
