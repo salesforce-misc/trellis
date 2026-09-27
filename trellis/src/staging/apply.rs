@@ -9332,9 +9332,14 @@ pub async fn drain_many(
 /// Returns `Ok(Some(retry_folded))` if isolation evicted at least one key —
 /// the caller must retry with `folded` replaced by `retry_folded`.
 /// `Ok(None)` means "retry with `folded` unchanged" (a version fence
-/// miss, a transient failure, or an isolate attempt that evicted nothing).
+/// miss or a transient failure, within [`MAX_APPLY_ATTEMPTS`]).
 /// `Err(_)` propagates `err` (or a probe's own halting error) unmodified,
-/// once retries are exhausted or the failure must never be retried at all.
+/// once retries are exhausted or the failure must never be retried at all —
+/// which includes an isolate attempt that evicted nothing, whether no key
+/// reproduced the failure or the keys that did are still below the death
+/// threshold. That ends the drain call; the next drain cycle re-reads the
+/// batch and charges again (see [`quarantine::isolate_and_evict`]'s
+/// "one charge per drain call").
 #[allow(clippy::too_many_arguments)]
 async fn classify_and_retry(
     pool: &Pool,
@@ -9398,7 +9403,9 @@ async fn classify_and_retry(
         // Everything else: isolate each folded record alone to attribute
         // the failure to specific key(s), evicting any past the death
         // threshold and retrying without them. If nothing reproduces alone,
-        // the error is surfaced, not blamed.
+        // the error is surfaced, not blamed; if keys reproduce but none is
+        // past the threshold yet, they are charged and the error is surfaced
+        // too (the next drain cycle charges them again).
         quarantine::FailureClass::Isolate => {
             if attempt >= MAX_APPLY_ATTEMPTS {
                 tracing::warn!(
@@ -9419,19 +9426,63 @@ async fn classify_and_retry(
             )
             .await?
             {
-                Some(retry_folded) => {
-                    tracing::warn!(
-                        seg_seq,
-                        remaining = retry_folded.len(),
-                        "isolated and evicted at least one poisoned key; retrying without it"
-                    );
+                quarantine::IsolationOutcome::Evicted {
+                    retry_folded,
+                    charged,
+                } => {
+                    if charged.is_empty() {
+                        tracing::warn!(
+                            seg_seq,
+                            remaining = retry_folded.len(),
+                            "isolated and evicted at least one poisoned key; retrying without it"
+                        );
+                    } else {
+                        tracing::warn!(
+                            seg_seq,
+                            remaining = retry_folded.len(),
+                            threshold = quarantine::DEFAULT_DEATH_THRESHOLD,
+                            charged = %quarantine::describe_charged_keys(
+                                &charged,
+                                quarantine::DEFAULT_DEATH_THRESHOLD,
+                            ),
+                            "isolated and evicted at least one poisoned key; retrying without it \
+                             (other failing keys charged, still below the death threshold)"
+                        );
+                    }
                     Ok(Some(retry_folded))
                 }
-                None => {
+                // Warn, not debug: the operator should see which key is
+                // heading for eviction. Bounded, not spam — the key is
+                // charged once per drain cycle, so this repeats at most
+                // `threshold - 1` times per key before `evict_key`'s own warn
+                // replaces it (or a clean drain clears the count).
+                quarantine::IsolationOutcome::ChargedBelowThreshold { charged } => {
+                    tracing::warn!(
+                        seg_seq,
+                        threshold = quarantine::DEFAULT_DEATH_THRESHOLD,
+                        charged = %quarantine::describe_charged_keys(
+                            &charged,
+                            quarantine::DEFAULT_DEATH_THRESHOLD,
+                        ),
+                        error = %err,
+                        "isolation pinned the failure on key(s) still below the death threshold; \
+                         charged one death each and surfacing the original failure"
+                    );
+                    Err(err)
+                }
+                quarantine::IsolationOutcome::NothingReproduced => {
                     tracing::debug!(
                         seg_seq,
                         error = %err,
                         "isolation reproduced nothing; surfacing the original failure"
+                    );
+                    Err(err)
+                }
+                quarantine::IsolationOutcome::FuseDisabled => {
+                    tracing::debug!(
+                        seg_seq,
+                        error = %err,
+                        "row-level death fuse disabled; surfacing the original failure unisolated"
                     );
                     Err(err)
                 }

@@ -127,8 +127,9 @@ pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
 pub use liveness::{FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff};
 #[cfg(any(test, feature = "internals"))]
 pub use quarantine::{
-    DEFAULT_DEATH_THRESHOLD, FailureClass, HaltingStopStats, classify, halting_stop_stats,
-    isolate_and_evict, purge_dropped_table, record_halting_stop, release_key,
+    ChargedKey, DEFAULT_DEATH_THRESHOLD, FailureClass, HaltingStopStats, IsolationOutcome,
+    classify, halting_stop_stats, isolate_and_evict, purge_dropped_table, record_halting_stop,
+    release_key,
 };
 #[cfg(any(test, feature = "internals"))]
 pub use seal::{SealOutcome, fenced_rows};

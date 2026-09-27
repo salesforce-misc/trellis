@@ -24,7 +24,9 @@ use trellis::defs::{
 };
 use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
-use trellis::staging::{FoldedChange, StagedWatermark, isolate_and_evict};
+use trellis::staging::{
+    ChargedKey, FoldedChange, IsolationOutcome, StagedWatermark, isolate_and_evict,
+};
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
@@ -1455,8 +1457,9 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
         .await
         .expect("isolate_and_evict with threshold 0 must not error");
     assert!(
-        result.is_none(),
-        "threshold 0 must never evict, regardless of how many deaths a key already has"
+        matches!(result, IsolationOutcome::FuseDisabled),
+        "threshold 0 must never evict, regardless of how many deaths a key already has, \
+         got {result:?}"
     );
 
     assert!(
@@ -1532,9 +1535,9 @@ async fn isolate_and_evict_never_probes_or_poisons_a_deferred_relationship_rever
              outright, never probed",
         );
     assert!(
-        result.is_none(),
-        "a batch containing only a deferred reverse must report nothing evicted, so the \
-         caller surfaces the original failure instead of silently 'resolving' it"
+        matches!(result, IsolationOutcome::NothingReproduced),
+        "a batch containing only a deferred reverse must report nothing reproduced, so the \
+         caller surfaces the original failure instead of silently 'resolving' it, got {result:?}"
     );
 
     assert!(
@@ -1948,9 +1951,16 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
         let retry = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 1)
             .await
             .expect("isolate_and_evict must not error on an unevaluable change");
-        let retry = retry.unwrap_or_else(|| {
-            panic!("the key staged under {src_table:?} must have been evicted at threshold 1")
-        });
+        let IsolationOutcome::Evicted {
+            retry_folded: retry,
+            ..
+        } = retry
+        else {
+            panic!(
+                "the key staged under {src_table:?} must have been evicted at threshold 1, \
+                 got {retry:?}"
+            )
+        };
         assert!(
             retry.is_empty(),
             "the evicted key was the batch's only change, so nothing is left to retry"
@@ -1975,6 +1985,54 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
         "a threshold's worth of evictions for one logical source must trip the whole-transform \
          fuse even when they arrive under two different spellings of it (issue #283)"
     );
+}
+
+/// Issue #614: a key that reproduces the failure alone but is still below the
+/// death threshold must come back as `ChargedBelowThreshold`, naming the key and
+/// its death count — not as the same "nothing reproduced" answer a batch with no
+/// attributable key gets. Pre-fix both returned `Ok(None)`, so
+/// `classify_and_retry` logged "isolation reproduced nothing" for a key that was
+/// in fact a few drain cycles from eviction. The second call then shows the
+/// count carrying across calls (one charge per call) up to the eviction.
+#[tokio::test]
+async fn below_threshold_charge_is_reported_distinctly_from_nothing_reproduced() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    let qualified = qualify_fixture_table("orders");
+    let folded = vec![unevaluable_change(&qualified, "7")];
+
+    let first = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 2)
+        .await
+        .expect("first isolate_and_evict");
+    let IsolationOutcome::ChargedBelowThreshold { charged } = first else {
+        panic!("a reproducing key at 1 of 2 deaths must be reported as charged, got {first:?}")
+    };
+    assert_eq!(
+        charged,
+        vec![ChargedKey {
+            src_table: qualified.clone(),
+            key: "7".to_string(),
+            deaths: 1,
+        }]
+    );
+    assert!(!poison_marker_exists(&client, &qualified, "7").await);
+
+    let second = isolate_and_evict(&db.pool, 1, "worker", "trellis_quarantine_test", &folded, 2)
+        .await
+        .expect("second isolate_and_evict");
+    let IsolationOutcome::Evicted {
+        retry_folded,
+        charged,
+    } = second
+    else {
+        panic!("the second charge reaches the threshold of 2 and must evict, got {second:?}")
+    };
+    assert!(retry_folded.is_empty(), "the only key was evicted");
+    assert!(charged.is_empty(), "no other key was charged");
+    assert!(poison_marker_exists(&client, &qualified, "7").await);
 }
 
 /// The same canonical keying, one tier down: two spellings of one source must

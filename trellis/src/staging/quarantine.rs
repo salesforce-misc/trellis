@@ -427,38 +427,134 @@ async fn evict_key(
     Ok(())
 }
 
+/// A key [`isolate_and_evict`] reproduced a failure for and charged a death,
+/// but that is still below the row-level death threshold — so it stays in the
+/// batch, un-evicted. Carried out of [`isolate_and_evict`] so the caller can
+/// name it in its log (issue #614): without it, "isolation pinned this key,
+/// which is `deaths` of `threshold` from eviction" looked identical to
+/// "isolation reproduced nothing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChargedKey {
+    /// Canonical identity (issue #283) — the one the `key_deaths` row is under.
+    pub src_table: String,
+    pub key: String,
+    /// The key's death count *after* this charge.
+    pub deaths: i32,
+}
+
+/// What [`isolate_and_evict`] concluded about a failed batch.
+#[derive(Debug)]
+pub enum IsolationOutcome {
+    /// `threshold == 0`: the row-level fuse is disabled (per
+    /// [`DEFAULT_DEATH_THRESHOLD`]'s doc comment), so nothing was probed or
+    /// charged.
+    FuseDisabled,
+    /// No single key reproduced an isolate-eligible failure on its own: the
+    /// failure is not attributable to a key, so nothing was charged.
+    NothingReproduced,
+    /// At least one key reproduced the failure alone and was charged a death,
+    /// but none reached the threshold, so nothing was evicted. Every entry in
+    /// `charged` is below the threshold.
+    ChargedBelowThreshold { charged: Vec<ChargedKey> },
+    /// At least one key crossed the threshold and was evicted: `retry_folded`
+    /// is `folded` with every now-evicted key removed, ready for
+    /// [`super::apply::drain_once`] to recompute and reapply. `charged` lists
+    /// any *other* keys that reproduced the failure in the same probe pass but
+    /// stayed below the threshold — they are still in `retry_folded`.
+    Evicted {
+        retry_folded: Vec<FoldedChange>,
+        charged: Vec<ChargedKey>,
+    },
+}
+
+/// How many [`ChargedKey`]s [`describe_charged_keys`] spells out before
+/// summarizing the rest as a count: a batch where every key fails would
+/// otherwise put the whole batch into one log line.
+const DESCRIBED_CHARGED_KEYS: usize = 5;
+
+/// Renders `charged` for a log field, e.g.
+/// `public.gizmos key=2 (1/5 deaths), public.gizmos key=7 (3/5 deaths)`,
+/// capped at [`DESCRIBED_CHARGED_KEYS`] entries plus an "and N more" tail.
+pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> String {
+    let mut out = charged
+        .iter()
+        .take(DESCRIBED_CHARGED_KEYS)
+        .map(|c| {
+            format!(
+                "{} key={} ({}/{} deaths)",
+                c.src_table, c.key, c.deaths, threshold
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if charged.len() > DESCRIBED_CHARGED_KEYS {
+        out.push_str(&format!(
+            ", and {} more",
+            charged.len() - DESCRIBED_CHARGED_KEYS
+        ));
+    }
+    out
+}
+
+/// Splits each charged probe (paired with its post-charge death count) into
+/// "evict now" (`deaths >= threshold`) and "charged, still below threshold".
+fn partition_by_threshold(
+    charged: Vec<(PoisonedProbe, i32)>,
+    threshold: i32,
+) -> (Vec<PoisonedProbe>, Vec<ChargedKey>) {
+    let mut evict_now = Vec::new();
+    let mut below = Vec::new();
+    for (probe, deaths) in charged {
+        if deaths >= threshold {
+            evict_now.push(probe);
+        } else {
+            below.push(ChargedKey {
+                src_table: probe.canonical_src_table,
+                key: probe.key,
+                deaths,
+            });
+        }
+    }
+    (evict_now, below)
+}
+
 /// Runs `folded`'s (non-truncate) records one at a time, each computed and
 /// applied *alone* inside a probe transaction that always rolls back
 /// (skipping the drained mark), to attribute an isolate-eligible failure to
 /// the specific key(s) that fail on their own — doc 06's "Isolate before
-/// blaming."
+/// blaming." Every key that reproduces is charged one death.
 ///
-/// Returns:
-/// - `Ok(None)` if no single key reproduced an isolate-eligible failure (the
-///   error is surfaced, not blamed — [`super::apply::drain_once`] returns
-///   the *original* failure it already holds, unmodified), or if
-///   `threshold == 0` (the fuse is disabled, per [`DEFAULT_DEATH_THRESHOLD`]'s
-///   doc comment).
-/// - `Ok(Some(retry_folded))` if at least one key crossed the death
-///   threshold and was evicted: `retry_folded` is `folded` with every
-///   now-evicted key removed, ready for [`super::apply::drain_once`] to
-///   recompute and reapply.
+/// Returns (see [`IsolationOutcome`]'s variants):
+/// - `Ok(FuseDisabled)` if `threshold == 0`, without probing anything.
+/// - `Ok(NothingReproduced)` if no single key reproduced an isolate-eligible
+///   failure (the error is surfaced, not blamed —
+///   [`super::apply::drain_once`] returns the *original* failure it already
+///   holds, unmodified).
+/// - `Ok(ChargedBelowThreshold { .. })` if keys reproduced and were charged
+///   but none reached `threshold`; the caller surfaces the original failure,
+///   exactly as for `NothingReproduced`, but can say which keys it pinned.
+/// - `Ok(Evicted { retry_folded, .. })` if at least one key crossed the death
+///   threshold and was evicted.
 /// - `Err(_)` if a probe itself hit a [`FailureClass::Halting`] error: this
 ///   propagates immediately, unattributed to any key, per doc 06's "What
 ///   must never be quarantined" — discovered during isolation is no
 ///   different from discovered on the whole batch.
 ///
-/// **Accepted trade-off, not a bug**: [`super::apply::drain_once`] calls this
-/// once per failed attempt, and a key that keeps failing on every retry
-/// (not yet evicted — still below `threshold`) is charged again on each
-/// call, all before that one `drain_once` cycle either evicts it or gives
-/// up. That repeated within-cycle charging *is* the mechanism doc 06
-/// describes: a key's death count is exactly "how many real, observed
-/// attempts have failed for it", and eviction is meant to trigger partway
-/// through a single stubborn batch's retries just as much as across
-/// separate batches. Charging at most once per `drain_once` call, instead,
-/// would silently slow eviction for a batch that fails on every attempt —
-/// worse, not better.
+/// **Accepted trade-off, not a bug — one charge per drain call**: when no key
+/// reaches `threshold`, `apply::classify_and_retry` surfaces the
+/// original failure, which ends that drain call. So a key that fails
+/// deterministically, alone in its batch, is charged exactly once per drain
+/// call and is evicted on the `threshold`-th *separate* drain cycle — each
+/// cycle re-reads the same immutable batch, re-fails, and re-isolates. (A key
+/// that stays below the threshold while another key in the same probe pass is
+/// evicted *is* charged again within the call, since the retry without the
+/// evicted key re-fails on it.) The alternative — retrying within the call
+/// until the key is evicted — would evict faster, but would spend the call's
+/// whole `MAX_APPLY_ATTEMPTS` budget (also 5) on one key; eviction after a
+/// few drain cycles (about a second at the default) is the accepted cost.
+/// Either way a key's death count stays what doc 06 means by it: how many
+/// real, observed attempts have failed for it, cleared by any clean drain
+/// that applies it.
 pub async fn isolate_and_evict(
     pool: &Pool,
     seg_seq: i64,
@@ -466,9 +562,9 @@ pub async fn isolate_and_evict(
     wake_channel: &str,
     folded: &[FoldedChange],
     threshold: i32,
-) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+) -> Result<IsolationOutcome, ApplyError> {
     if threshold == 0 {
-        return Ok(None);
+        return Ok(IsolationOutcome::FuseDisabled);
     }
 
     // Issue #283: every counter/marker write below lands under the *canonical*
@@ -601,13 +697,13 @@ pub async fn isolate_and_evict(
     }
 
     if poisoned.is_empty() {
-        return Ok(None);
+        return Ok(IsolationOutcome::NothingReproduced);
     }
 
-    let mut evict_now: Vec<PoisonedProbe> = Vec::new();
+    let mut charged: Vec<(PoisonedProbe, i32)> = Vec::with_capacity(poisoned.len());
     {
         let client = pool.get().await?;
-        for probe in &poisoned {
+        for probe in poisoned {
             let deaths = record_key_death(
                 &**client,
                 &probe.canonical_src_table,
@@ -615,14 +711,13 @@ pub async fn isolate_and_evict(
                 &probe.last_error,
             )
             .await?;
-            if deaths >= threshold {
-                evict_now.push(probe.clone());
-            }
+            charged.push((probe, deaths));
         }
     }
+    let (evict_now, charged) = partition_by_threshold(charged, threshold);
 
     if evict_now.is_empty() {
-        return Ok(None);
+        return Ok(IsolationOutcome::ChargedBelowThreshold { charged });
     }
 
     let mut client = pool.get().await?;
@@ -677,7 +772,10 @@ pub async fn isolate_and_evict(
         .filter(|c| c.is_truncate || !evicted.contains(&(c.src_table.as_str(), c.key.as_str())))
         .cloned()
         .collect();
-    Ok(Some(retry_folded))
+    Ok(IsolationOutcome::Evicted {
+        retry_folded,
+        charged,
+    })
 }
 
 /// Resolves a ring row's raw `src_table` to the fully-qualified identity
@@ -2374,6 +2472,84 @@ pub async fn halting_stop_stats(pool: &Pool) -> Result<HaltingStopStats, ApplyEr
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    fn probe(src: &str, key: &str) -> PoisonedProbe {
+        PoisonedProbe {
+            raw_src_table: src.trim_start_matches("public.").to_string(),
+            canonical_src_table: src.to_string(),
+            key: key.to_string(),
+            last_error: "boom".to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_by_threshold_separates_evictions_from_below_threshold_charges() {
+        // Issue #614: the below-threshold keys must survive the partition as
+        // named `ChargedKey`s with their death count, rather than being dropped
+        // (which left the caller unable to tell them from "nothing reproduced").
+        let (evict, below) = partition_by_threshold(
+            vec![
+                (probe("public.gizmos", "1"), 5),
+                (probe("public.gizmos", "2"), 1),
+                (probe("public.gizmos", "3"), 7),
+                (probe("public.widgets", "4"), 4),
+            ],
+            5,
+        );
+        let evicted: Vec<&str> = evict.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(evicted, ["1", "3"], "deaths >= threshold evicts");
+        assert_eq!(
+            evict[0].raw_src_table, "gizmos",
+            "evicted probes keep the raw spelling for the retry filter"
+        );
+        assert_eq!(
+            below,
+            vec![
+                ChargedKey {
+                    src_table: "public.gizmos".to_string(),
+                    key: "2".to_string(),
+                    deaths: 1,
+                },
+                ChargedKey {
+                    src_table: "public.widgets".to_string(),
+                    key: "4".to_string(),
+                    deaths: 4,
+                },
+            ],
+            "below-threshold keys are reported under the canonical identity"
+        );
+    }
+
+    #[test]
+    fn describe_charged_keys_names_each_key_and_its_death_count() {
+        let charged = vec![ChargedKey {
+            src_table: "public.gizmos".to_string(),
+            key: "2".to_string(),
+            deaths: 1,
+        }];
+        assert_eq!(
+            describe_charged_keys(&charged, 5),
+            "public.gizmos key=2 (1/5 deaths)"
+        );
+    }
+
+    #[test]
+    fn describe_charged_keys_caps_the_list() {
+        let charged: Vec<ChargedKey> = (0..8)
+            .map(|i| ChargedKey {
+                src_table: "public.t".to_string(),
+                key: i.to_string(),
+                deaths: 2,
+            })
+            .collect();
+        let described = describe_charged_keys(&charged, 5);
+        assert_eq!(
+            described,
+            "public.t key=0 (2/5 deaths), public.t key=1 (2/5 deaths), \
+             public.t key=2 (2/5 deaths), public.t key=3 (2/5 deaths), \
+             public.t key=4 (2/5 deaths), and 3 more"
+        );
+    }
 
     #[test]
     fn classify_maps_hop_bound_to_halting() {

@@ -37,7 +37,7 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
 use trellis::intake::{self, publication, spill};
 use trellis::staging::apply;
-use trellis::staging::{FoldedChange, StagedWatermark, isolate_and_evict};
+use trellis::staging::{FoldedChange, IsolationOutcome, StagedWatermark, isolate_and_evict};
 
 // ---------------------------------------------------------------------
 // A minimal capturing `tracing_subscriber::Layer`
@@ -551,7 +551,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     .await
     .expect("isolate_and_evict");
     assert!(
-        result.is_some(),
+        matches!(result, IsolationOutcome::Evicted { .. }),
         "the failing key must be evicted at threshold 1"
     );
 
