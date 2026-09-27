@@ -249,8 +249,11 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
 ];
 
 /// The aggregate functions an [`super::ast::KeySpace::Aggregate`] definition
-/// may call in a calculated field. This table is the list of supported names;
-/// each entry's `arg_types` is only a representative declaration. Which
+/// may call in a calculated field. This table is the list of supported names,
+/// and each entry's `arg_types` length is its arity, which [`super::parser`]
+/// enforces. The declared types are exact only for the single-type
+/// aggregates (`BOOL_AND`/`BOOL_OR`/`JSONB_AGG`); for `SUM`/`MIN`/`MAX`/`AVG`
+/// and `BIT_AND`/`BIT_OR` they are a representative placeholder. Which
 /// argument types an aggregate actually accepts, and what it returns for
 /// each, is [`aggregate_result_type`]'s job (for example `MIN`/`MAX` also
 /// take text, temporal, `inet` and enum arguments, and `SUM` takes
