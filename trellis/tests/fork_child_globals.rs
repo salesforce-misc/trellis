@@ -19,6 +19,9 @@
 //! live inside `metrics-util` and can't be held from outside, so the
 //! metrics scenario checks the property that rules the hang out: the
 //! child's registry is not the parent's.
+//!
+//! The first scenario forks straight after the process's first `connect`,
+//! so it has to run before anything else here records a metric.
 
 #[cfg(unix)]
 fn main() {
@@ -48,7 +51,13 @@ mod unix {
     type Scenario = fn() -> Result<(), String>;
 
     pub fn main() {
-        let scenarios: [(&str, Scenario); 3] = [
+        let scenarios: [(&str, Scenario); 4] = [
+            // First: it needs a process in which nothing has recorded a
+            // metric yet.
+            (
+                "a child forked straight after the parent's first connect records metrics",
+                child_forked_straight_after_first_connect,
+            ),
             (
                 "interning an enum type while a parent thread holds the interner lock",
                 interner_lock_held_at_fork,
@@ -209,6 +218,54 @@ mod unix {
             }
             Ok(())
         })
+    }
+
+    /// The metrics registry's first build calibrates `quanta`'s TSC clock
+    /// behind a process-wide `OnceCell`, which takes a millisecond or more.
+    /// If the parent's first metric is recorded by an engine thread just
+    /// after `connect` returns, a fork straight after `connect` can land
+    /// inside that calibration, and a child that then builds its own
+    /// registry waits on the half-finished `OnceCell` forever. `connect`
+    /// builds the registry itself, before it returns, so this can't happen.
+    ///
+    /// Without that, this fails only when the fork lands in the window, but
+    /// it passes deterministically with it.
+    fn child_forked_straight_after_first_connect() -> Result<(), String> {
+        let cluster = TestCluster::start();
+        let setup = tokio::runtime::Runtime::new().expect("setup runtime");
+        let db = setup.block_on(cluster.create_empty_database());
+        drop(setup);
+        let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        {
+            let migrator = BlockingTrellis::connect(config.clone(), TrellisOptions::default())
+                .expect("migrator connects");
+            migrator.migrate().expect("migrate");
+            migrator.shutdown().expect("migrator shuts down");
+        }
+
+        // Staging on, so an engine thread records its first metric as soon
+        // as the client starts.
+        let parent = BlockingTrellis::connect(
+            config.clone(),
+            TrellisOptions {
+                staging: true,
+                drain_threads: 1,
+                ..Default::default()
+            },
+        )
+        .expect("parent connects");
+        let outcome = in_forked_child(CONNECTING_CHILD, move || {
+            let child = BlockingTrellis::connect(config, TrellisOptions::default())
+                .map_err(|e| format!("child connect: {e}"))?;
+            trellis::metrics::increment_intake_restarts("fork_fresh_child");
+            let rendered = child.metrics().render_prometheus();
+            if !rendered.contains("fork_fresh_child") {
+                return Err(format!("the child's own series is missing:\n{rendered}"));
+            }
+            Ok(())
+        });
+        parent.shutdown().expect("parent shuts down");
+        outcome
     }
 
     fn child_connects_while_parent_engine_is_live() -> Result<(), String> {
