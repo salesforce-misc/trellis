@@ -35,12 +35,15 @@ module Trellis
 
   # A registered transform definition, as Trellis.definitions lists it:
   # Definition's fields, with the time it was registered (a Time) in place
-  # of its source columns.
+  # of its source columns. backfill_failure is nil unless its source table's
+  # backfill keeps failing.
   DefinitionSummary = Data.define(:id, :target_table, :source_table, :source_version, :status,
-                                  :created_at) do
+                                  :created_at, :backfill_failure) do
     def self.from_native(hash)
-      new(**hash.except(:created_at_micros),
-          created_at: EpochMicros.to_time(hash.fetch(:created_at_micros)))
+      failure = hash[:backfill_failure]
+      new(**hash.except(:created_at_micros, :backfill_failure),
+          created_at: EpochMicros.to_time(hash.fetch(:created_at_micros)),
+          backfill_failure: failure && BackfillFailure.from_native(failure))
     end
   end
 

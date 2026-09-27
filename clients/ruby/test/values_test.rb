@@ -37,6 +37,23 @@ class ValuesTest < Minitest::Test
     ), status
   end
 
+  def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure
+    summary = Trellis::DefinitionSummary.from_native(
+      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
+      status: :waiting_to_backfill, created_at_micros: MICROS,
+      backfill_failure: { source_table: "public.s", attempts: 2, last_error: "timeout",
+                          next_attempt_at_micros: MICROS }
+    )
+    assert_equal Trellis::DefinitionSummary.new(
+      id: 1, target_table: "public.t", source_table: "public.s", source_version: 1,
+      status: :waiting_to_backfill, created_at: Trellis::EpochMicros.to_time(MICROS),
+      backfill_failure: Trellis::BackfillFailure.new(
+        source_table: "public.s", attempts: 2, last_error: "timeout",
+        next_attempt_at: Trellis::EpochMicros.to_time(MICROS)
+      )
+    ), summary
+  end
+
   def test_an_applied_carries_only_its_kinds_fields
     definition = { id: 1, target_table: "public.t", source_table: "public.s",
                    source_version: 1, status: :waiting_to_backfill, source_columns: {} }

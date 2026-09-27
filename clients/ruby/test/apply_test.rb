@@ -65,6 +65,7 @@ class ApplyTest < Minitest::Test
     assert_instance_of Trellis::DefinitionSummary, summary
     assert_equal "public.pet_weights", summary.target_table
     assert_instance_of Time, summary.created_at
+    assert_nil summary.backfill_failure
 
     await_status("pet_weights")
 

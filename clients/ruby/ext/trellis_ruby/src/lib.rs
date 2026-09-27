@@ -690,6 +690,10 @@ fn definition_hash(ruby: &Ruby, definition: PlainDefinition) -> Result<RHash, Er
 }
 
 fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Result<RHash, Error> {
+    let failure = summary
+        .backfill_failure
+        .map(|failure| backfill_failure_hash(ruby, failure))
+        .transpose()?;
     record(
         ruby,
         [
@@ -702,6 +706,7 @@ fn definition_summary_hash(ruby: &Ruby, summary: PlainDefinitionSummary) -> Resu
                 "created_at_micros",
                 ruby.into_value(summary.created_at_micros),
             ),
+            ("backfill_failure", ruby.into_value(failure)),
         ],
     )
 }
