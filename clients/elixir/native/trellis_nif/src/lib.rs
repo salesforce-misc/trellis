@@ -757,8 +757,8 @@ fn render_prometheus() -> NifReply<String> {
     Ok(trellis::Metrics::new().render_prometheus())
 }
 
-/// Installs `trellis-embed`'s log bridge as this OS process's global
-/// `tracing` subscriber, if no call has yet, and sets the most verbose level
+/// Installs `trellis-embed`'s log bridge as the global `tracing` subscriber
+/// of this library's own copy of `tracing`, if no call has yet, and sets the most verbose level
 /// it forwards (one of `trellis_embed::LOG_LEVEL_FILTERS`). A `conflict`
 /// error means another subscriber was installed first.
 #[rustler::nif(schedule = "DirtyIo")]

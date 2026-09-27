@@ -4,6 +4,7 @@ defmodule Trellis.LogBridgeTest do
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
+  import Trellis.Eventually
 
   alias Trellis.{LogBridge, TestCluster}
 
@@ -104,13 +105,11 @@ defmodule Trellis.LogBridgeTest do
   end
 
   defp wait_for_restart(old_pid) do
-    case Process.whereis(LogBridge) do
-      pid when is_pid(pid) and pid != old_pid ->
-        :ok
-
-      _ ->
-        Process.sleep(10)
-        wait_for_restart(old_pid)
-    end
+    eventually("the supervisor to restart Trellis.LogBridge", fn ->
+      case Process.whereis(LogBridge) do
+        pid when is_pid(pid) and pid != old_pid -> {:done, :ok}
+        other -> {:waiting, other}
+      end
+    end)
   end
 end

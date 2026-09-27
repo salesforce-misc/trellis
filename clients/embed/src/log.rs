@@ -31,10 +31,14 @@
 //!   verbose level forwarded and rebuilds `tracing`'s interest cache, so an
 //!   event above that level costs what it costs with no subscriber at all.
 //!
-//! A process has one global `tracing` subscriber, set once. If something
-//! else in the OS process set it first (another native extension, say),
-//! [`install_log_bridge`] returns a `conflict` error and the engine's events
-//! go to that subscriber instead. A host that composes its own subscriber
+//! `tracing` has one global subscriber, set once, per copy of `tracing` that
+//! is linked in. A binding's native library links its own copy, so the global
+//! is per library, not per OS process: another native extension's subscriber
+//! never sees the engine's events, and this bridge never sees its events.
+//! Only code linked into the same library can set the global first, such as
+//! a host's own build of a binding. Then [`install_log_bridge`] returns a
+//! `conflict` error and the engine's events go to that subscriber instead. A
+//! host that composes its own subscriber, from its own build of a binding,
 //! simply never calls [`install_log_bridge`].
 
 use std::fmt::{self, Write as _};
@@ -170,8 +174,8 @@ impl LogBridge {
     }
 }
 
-/// Installs the bridge as this OS process's global `tracing` subscriber,
-/// forwarding nothing until [`LogBridge::set_max_level`] says otherwise.
+/// Installs the bridge as the global `tracing` subscriber (of the copy of
+/// `tracing` linked into this library; see the module docs), forwarding nothing until [`LogBridge::set_max_level`] says otherwise.
 ///
 /// Idempotent: every call after the first returns the same bridge, or the
 /// same error. The error is `conflict`, when another global subscriber was
@@ -186,8 +190,8 @@ pub fn install_log_bridge() -> Result<&'static LogBridge, PlainError> {
     installed.map_err(|()| {
         PlainError::new(
             ErrorCode::Conflict,
-            "another tracing subscriber is already this OS process's global default, so \
-             Trellis's log lines go to it rather than to this bridge",
+            "another tracing subscriber is already the global default, so Trellis's log \
+             lines go to it rather than to this bridge",
         )
     })
 }
@@ -308,9 +312,23 @@ impl Visit for MessageVisitor {
 mod tests {
     use super::*;
 
+    /// Serializes every test here that sets a level or installs a
+    /// subscriber. Both rebuild `tracing`'s interest cache and its global max
+    /// level, and when only one dispatcher is registered, `tracing-core`
+    /// rebuilds from the *rebuilding thread's* default alone. A rebuild on
+    /// another test's thread can then set the max level to `off` while a
+    /// scoped test is emitting, and that test's events vanish. The global
+    /// subscriber the bindings install never meets this: it's the only
+    /// dispatcher, and every thread's default.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A bridge that isn't the global one, and a scoped dispatcher onto it,
     /// so these tests don't claim the process-wide subscriber.
     fn with_bridge(level: &str, emit: impl FnOnce()) -> &'static LogBridge {
+        let _serial = serial();
         let bridge: &'static LogBridge = Box::leak(Box::new(LogBridge::new(4)));
         bridge.set_max_level(level).unwrap();
         tracing::subscriber::with_default(bridge.subscriber(), emit);
@@ -432,6 +450,7 @@ mod tests {
     /// scoped tests above are unaffected: a thread's scoped default wins.
     #[test]
     fn the_installed_bridge_is_global_and_installing_again_returns_it() {
+        let _serial = serial();
         let bridge = install_log_bridge().unwrap();
         assert!(std::ptr::eq(bridge, install_log_bridge().unwrap()));
         assert!(std::ptr::eq(bridge, installed_log_bridge().unwrap()));
@@ -454,6 +473,7 @@ mod tests {
 
     #[test]
     fn an_unknown_level_is_a_validation_error() {
+        let _serial = serial();
         let bridge = LogBridge::new(1);
         for level in ["", "warning", "INFO", "verbose"] {
             let err = bridge.set_max_level(level).unwrap_err();

@@ -5,7 +5,7 @@ defmodule Trellis.LogBridge do
   The Rust engine logs through the `tracing` facade and never installs a
   subscriber itself (`docs/decisions/0009-observability-decisions.md`,
   decision 3). When the `:trellis` application starts, this process installs
-  one for the whole OS process, then drains what it queues into `Logger`,
+  one in the Trellis NIF library, then drains what it queues into `Logger`,
   with `domain: [:trellis]` and the emitting Rust module as `:target`
   metadata. It needs no `Trellis` handle: every handle's lines come through
   it.
@@ -17,9 +17,8 @@ defmodule Trellis.LogBridge do
       # arrives as `:debug`.
       config :trellis, log_level: :info
 
-      # Opt out, to compose your own `tracing` subscriber (from your own
-      # NIF, for example with the crate's `otlp` layer). Nothing is installed
-      # and this process doesn't start.
+      # Opt out: nothing is installed, this process doesn't start, and the
+      # engine's lines go nowhere.
       config :trellis, log_bridge: false
 
   The level is read once, when `:trellis` starts. The engine drops events
@@ -34,9 +33,16 @@ defmodule Trellis.LogBridge do
   down, restarting, or falling behind, new lines are dropped and counted,
   and the next drain logs a warning with the count.
 
-  A process has one global `tracing` subscriber. If another native library
-  installed one first, this process logs a warning and doesn't start, and
-  the engine's lines go to that subscriber instead.
+  ## Composing your own subscriber
+
+  `tracing`'s global subscriber lives inside the native library that links
+  it, and the Trellis NIF links its own copy. So a subscriber another NIF
+  installs never sees the engine's lines, and doesn't stop this bridge.
+  Sending them elsewhere, for example through the crate's `otlp` layer,
+  means building your own NIF around the `trellis` crate that installs that
+  subscriber. If a subscriber in the Trellis NIF was installed first, this
+  process logs a warning and doesn't start, and the engine's lines go to
+  that subscriber instead.
   """
 
   use GenServer

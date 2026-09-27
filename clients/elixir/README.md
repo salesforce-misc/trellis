@@ -29,10 +29,12 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146 and
 - `Trellis.LogBridge`: started with the `:trellis` application, it forwards
   the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
   as `:target` metadata). Set `config :trellis, log_level: :info` to choose
-  the most verbose level forwarded (default: `Logger.level()` at start), or
-  `config :trellis, log_bridge: false` to install your own `tracing`
-  subscriber instead. A line can be dropped if the bridge falls behind, and
-  a warning says how many; logging never blocks or crashes the engine.
+  the most verbose level forwarded (default: `Logger.level()`, read once at
+  start), or `config :trellis, log_bridge: false` to forward nothing. A
+  `tracing` subscriber installed by another NIF never sees the engine's
+  lines, since each native library links its own `tracing`; see
+  `Trellis.LogBridge`. A line can be dropped if the bridge falls behind,
+  and a warning says how many; logging never blocks or crashes the engine.
 
 ```elixir
 # A deploy's migration step: the defaults run nothing in the background.
