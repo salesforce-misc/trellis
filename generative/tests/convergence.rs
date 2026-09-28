@@ -56,8 +56,10 @@
 //!
 //! Case count defaults to 16 (design doc §9's 12–24 band) and is overridable
 //! for deep sweeps with `PROPTEST_CASES` (e.g. `PROPTEST_CASES=500 cargo test
-//! -p generative --test convergence`). Failing seeds are persisted to the
-//! checked-in `tests/proptest-regressions/convergence.txt` and replayed first.
+//! -p generative --test convergence`). Failing seeds are persisted to a local,
+//! git-ignored `convergence.proptest-regressions` and replayed first; a failure
+//! worth keeping is transcribed into a hand-built pin, since a seed replays into
+//! a different program once the strategy changes shape (#505).
 
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{

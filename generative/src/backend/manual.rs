@@ -557,6 +557,20 @@ impl ManualBackend {
         self.slot_and_publication = Some((slot.into(), publication.into()));
     }
 
+    /// Options for an operator's `Trellis` handle (one that runs no
+    /// background work): the backend's own publication, so
+    /// `request_backfill` checks membership in the publication the primary
+    /// client actually runs (issue #641), not the default one.
+    fn operator_options(&self) -> trellis::TrellisOptions {
+        trellis::TrellisOptions {
+            publication: self
+                .slot_and_publication
+                .as_ref()
+                .map(|(_, publication)| publication.clone()),
+            ..Default::default()
+        }
+    }
+
     /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
     /// across every segment sealed so far, straight from
     /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
@@ -1016,7 +1030,8 @@ impl ManualBackend {
     /// operator would use. Each resume is a fresh backfill from current
     /// source data; [`Backend::quiesce`] waits for them to finish.
     pub async fn resume_all(&self) -> Result<(), ManualBackendError> {
-        let facade = trellis::Trellis::connect(self.config.clone(), Default::default()).await?;
+        let facade =
+            trellis::Trellis::connect(self.config.clone(), self.operator_options()).await?;
         for def in &self.defs {
             facade
                 .apply(&format!("RESUME TRANSFORM {}", def.target))
@@ -1429,8 +1444,9 @@ impl super::ConcurrentBackend for ManualBackend {
             .await;
         }
         if self.operator.is_none() {
-            self.operator =
-                Some(trellis::Trellis::connect(self.config.clone(), Default::default()).await?);
+            self.operator = Some(
+                trellis::Trellis::connect(self.config.clone(), self.operator_options()).await?,
+            );
         }
         let operator = self.operator.as_ref().expect("connected just above");
         let address = |target: &str, column: &Option<String>| match column {

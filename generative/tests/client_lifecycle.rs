@@ -214,12 +214,9 @@ proptest! {
     /// miscompute. See this file's own top-of-file doc comment for the real,
     /// confirmed root cause and fix (a seal/append race, unrelated to
     /// restart or scale-out specifically — both simply perturb timing enough
-    /// to make it common). Re-enabled. The seeds saved in
-    /// `client_lifecycle.proptest-regressions` (this property's and
-    /// [`property_convergence_holds_across_a_mid_stream_client_restart`]'s) are kept,
-    /// not stale: proptest replays them on every run precisely so a
-    /// regression in this fix would be caught immediately, before any
-    /// randomly-generated case even runs.
+    /// to make it common). Re-enabled. The hand-built pins below guard the
+    /// fix; the seeds this property once persisted were deleted once #505's
+    /// generator change made them replay into unrelated programs.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_across_a_mid_stream_scale_out(

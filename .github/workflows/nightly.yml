@@ -19,9 +19,9 @@ name: Nightly
 #   nightly (not part of this repo's CI config) calibrates case counts across
 #   the rest -- see generative/README.md.
 #
-# Both lanes' `FileFailurePersistence`/regression-persistence behavior
-# (proptest's `tests/proptest-regressions/*.txt`) means a failure found here
-# should be committed as a fixture the fast lane will also replay -- see
+# A failure found here prints its program. Transcribe it into a hand-built
+# pin the fast lane runs; don't commit proptest's persisted seed, which
+# replays into a different program once the strategy changes shape -- see
 # generative/README.md.
 on:
   schedule:

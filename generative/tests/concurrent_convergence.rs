@@ -106,6 +106,15 @@
 //! common: [`group_moves_converge_on_disk`] pins it, `#[ignore]`d until
 //! #556 milestone D (#623) removes the recompute horizons.
 //!
+//! # Pinned cases
+//!
+//! A tier failure worth keeping is written out as data, not kept as a
+//! proptest seed: a seed replays into a different program as soon as the
+//! strategy changes shape. [`hot_key_case_3_11_converges`] is the first, the
+//! hot-key case that fails on tmpfs with no plant armed. Its ops and plan
+//! live in `tests/pins/hot_key_3_11.ops`, and it is an exit check for #623
+//! and #624.
+//!
 //! # The burst-batching knob
 //!
 //! `run_convergence`'s loop fully quiesces after every single op, so at most
@@ -401,15 +410,12 @@ fn run_concurrent_case(
             )
             .await
             .expect("connect concurrent backend");
-            // A unique slot per case, as issue #188 requires on a shared
-            // cluster. The publication keeps its default name: it is
-            // per-database, so it can't collide, and `request_backfill`
-            // only looks for the default one.
+            // Issue #188: unique per-case slot/publication names, as
+            // `run_one` uses. The backend hands its publication to the
+            // operator handle that takes the mid-burst actions, so
+            // `request_backfill` checks the one the engine runs (#641).
             let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(
-                format!("{unique}_slot"),
-                trellis::ClientOptions::default().publication,
-            );
+            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
@@ -778,6 +784,10 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     )
     .await
     .expect("connect concurrent backend");
+    // Non-default names, as the properties use: `request_backfill` has to
+    // check the backend's own publication, not the default one (#641).
+    let unique = db.name().replace('-', "_");
+    backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
         .await
@@ -883,10 +893,7 @@ async fn group_moves_converge_on_disk() {
         .await
         .expect("connect backend");
         let unique = db.name().replace('-', "_");
-        backend.set_slot_and_publication(
-            format!("{unique}_slot"),
-            trellis::ClientOptions::default().publication,
-        );
+        backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
         let pool =
             Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
         match run_convergence_concurrent(&mut backend, &pool, &program, &plan).await {
@@ -928,6 +935,329 @@ async fn group_moves_converge_on_disk() {
         diverged.is_empty(),
         "{} of {ATTEMPTS} attempts diverged: {diverged:?}",
         diverged.len()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Pinned hot-key case 3:11: an exit check for #623 and #624.
+// ---------------------------------------------------------------------
+
+/// How many attempts [`hot_key_case_3_11_converges`] makes. Unset, it
+/// returns at once, so the nightly's `--include-ignored` pays nothing for
+/// it.
+const PIN_ATTEMPTS_ENV: &str = "GENERATIVE_PIN_ATTEMPTS";
+
+/// A table whose primary key is its first column.
+fn pin_table(
+    name: &str,
+    columns: &[(&str, trellis::dev::defs::ast::ValueType)],
+    unique: &[&str],
+) -> generative::model::Table {
+    generative::model::Table {
+        name: name.to_string(),
+        pk_col: columns[0].0.to_string(),
+        columns: columns
+            .iter()
+            .map(|(name, value_type)| generative::model::Column {
+                name: name.to_string(),
+                value_type: *value_type,
+            })
+            .collect(),
+        unique_cols: unique.iter().map(|c| c.to_string()).collect(),
+    }
+}
+
+/// Reads a pinned case's ops and plan, one op per line, tab-separated,
+/// each line led by the burst and the lane that issue it:
+///
+/// ```text
+/// <burst>  <lane>  insert  <table>  <expect>  <col>=<value> ...
+/// <burst>  <lane>  update  <table>  <expect>  <pk>  <col>=<value> ...
+/// <burst>  <lane>  delete  <table>  <expect>  <pk>
+/// ```
+///
+/// Bursts run in file order, and each lane issues its ops in file order.
+/// `<expect>` is `ok`, `fails` or `none` (affects no rows). A value of `\N`
+/// is NULL, and `\\` is a backslash.
+fn pin_ops(
+    text: &str,
+) -> (
+    Vec<generative::model::Op>,
+    generative::model::ConcurrentPlan,
+) {
+    use generative::model::{Burst, ConcurrentPlan, Op, OpOutcome};
+    let value = |v: &str| (v != "\\N").then(|| v.replace("\\\\", "\\"));
+    let columns = |fields: &[&str]| -> Vec<(String, Option<String>)> {
+        fields
+            .iter()
+            .map(|field| {
+                let (column, v) = field
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("pinned op field {field:?}: expected <col>=<value>"));
+                (column.to_string(), value(v))
+            })
+            .collect()
+    };
+    let mut ops = Vec::new();
+    let mut plan = ConcurrentPlan::default();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [burst, lane, kind, table, expect, rest @ ..] = fields.as_slice() else {
+            panic!("pinned op {line:?}: too few fields");
+        };
+        let burst: usize = burst.parse().expect("a burst number");
+        let lane: usize = lane.parse().expect("a lane number");
+        let table = table.to_string();
+        let expect = match *expect {
+            "ok" => OpOutcome::Succeeds,
+            "fails" => OpOutcome::Fails,
+            "none" => OpOutcome::AffectsNoRows,
+            other => panic!("pinned op {line:?}: unknown outcome {other:?}"),
+        };
+        ops.push(match (*kind, rest) {
+            ("insert", row) => Op::Insert {
+                table,
+                row: columns(row),
+                expect,
+            },
+            ("update", [pk, changes @ ..]) => Op::Update {
+                table,
+                pk: pk.to_string(),
+                changes: columns(changes),
+                expect,
+            },
+            ("delete", [pk]) => Op::Delete {
+                table,
+                pk: pk.to_string(),
+                expect,
+            },
+            _ => panic!("pinned op {line:?}: unknown shape"),
+        });
+        assert!(
+            burst + 1 >= plan.bursts.len(),
+            "pinned op {line:?}: bursts must come in order"
+        );
+        if burst == plan.bursts.len() {
+            plan.bursts.push(Burst::default());
+        }
+        let lanes = &mut plan.bursts[burst].lanes;
+        if lanes.len() <= lane {
+            lanes.resize(lane + 1, Vec::new());
+        }
+        lanes[lane].push(ops.len() - 1);
+    }
+    (ops, plan)
+}
+
+/// Hot-key case 3:11, the one case #557 part 3a's planted-bug sweep saw
+/// fail on tmpfs with no plant armed (`GENERATIVE_PLANT_ONLY=3:11`), cut down
+/// by hand and written out op for op in `tests/pins/hot_key_3_11.ops`, so no
+/// generator change can move it.
+///
+/// `t2`, `t3` and `t4` all group `t0` by `c6`: `t2` with SUM, COUNT, AVG,
+/// MIN, MAX, BOOL_AND, BOOL_OR and `MIN(r0.c10)` through the to-one
+/// relationship `r0` (`t0.c8 -> t1.c16`), `t3` with AVG, MIN and MAX, `t4`
+/// with SUM, AVG, MIN, MAX, BOOL_OR and `SUM(r0.c10)`. The ops are three
+/// bursts over two lanes, 1,270 in all: 4 `t1` inserts and, on `t0`, 117
+/// inserts, 101 deletes, 601 updates to `c1` and `c2`, 273 that move a row
+/// between `c6` groups, and 174 to `c1` or `c4` alone. None changes the join
+/// column `c8`.
+///
+/// Cut from the drawn case: its 9 `t1` updates and its 741 ops that fail or
+/// touch no row. Both cuts made it fail more often, not less (see
+/// [`hot_key_case_3_11_converges`]).
+fn hot_key_case_3_11() -> (
+    generative::model::Program,
+    generative::model::ConcurrentPlan,
+) {
+    use trellis::IntWidth;
+    use trellis::dev::defs::ast::ValueType::{Boolean, Integer, Numeric, Text, Uuid};
+    let tables = vec![
+        pin_table(
+            "t0",
+            &[
+                ("c0", Integer(IntWidth::Int8)),
+                ("c1", Numeric),
+                ("c2", Numeric),
+                ("c3", Text),
+                ("c4", Boolean),
+                ("c5", Uuid),
+                ("c6", Numeric),
+                ("c7", Text),
+                ("c8", Text),
+            ],
+            &["c7"],
+        ),
+        pin_table(
+            "t1",
+            &[
+                ("c9", Integer(IntWidth::Int8)),
+                ("c10", Numeric),
+                ("c11", Numeric),
+                ("c12", Text),
+                ("c13", Boolean),
+                ("c14", Uuid),
+                ("c15", Numeric),
+                ("c16", Text),
+                ("c17", Text),
+            ],
+            &["c16"],
+        ),
+    ];
+    let relationships = vec![generative::model::Relationship {
+        name: "r0".to_string(),
+        from_table: "t0".to_string(),
+        from_col: "c8".to_string(),
+        to_table: "t1".to_string(),
+        to_col: "c16".to_string(),
+        cardinality: generative::model::Cardinality::ToOne,
+    }];
+    let defs: Vec<_> = [
+        "TRANSFORM t2 FROM t0 GROUP BY c6 SELECT c6 AS c6, SUM(c2) AS sum_c2, \
+         COUNT(*) AS cnt, AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
+         BOOL_AND(c4) AS bool_and_c4, BOOL_OR(c4) AS bool_or_c4, MIN(r0.c10) AS rel_agg",
+        "TRANSFORM t3 FROM t0 GROUP BY c6 SELECT c6 AS c6, AVG(c1) AS avg_c1, \
+         MIN(c1) AS min_c1, MAX(c2) AS max_c2",
+        "TRANSFORM t4 FROM t0 GROUP BY c6 SELECT c6 AS c6, SUM(c2) AS sum_c2, \
+         AVG(c1) AS avg_c1, MIN(c2) AS min_c2, MAX(c1) AS max_c1, \
+         BOOL_OR(c4) AS bool_or_c4, SUM(r0.c10) AS rel_agg",
+    ]
+    .iter()
+    .map(|text| trellis::dev::defs::parse(text).expect("a pinned definition parses"))
+    .collect();
+    let (ops, plan) = pin_ops(include_str!("pins/hot_key_3_11.ops"));
+    let program = generative::model::Program {
+        tables,
+        relationships,
+        def_install_after_op: vec![0; defs.len()],
+        defs,
+        ops,
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
+    };
+    (program, plan)
+}
+
+/// The pinned case loads in the default suite, so a change to the model or
+/// to `pin_ops` that breaks it shows up here rather than only when someone
+/// runs the ignored pin. It touches no database.
+#[test]
+fn hot_key_case_3_11_loads() {
+    let (program, plan) = hot_key_case_3_11();
+    assert_eq!(program.ops.len(), 1_270);
+    assert_eq!(plan.bursts.len(), 3);
+    assert!(plan.bursts.iter().all(|burst| burst.lanes.len() == 2));
+    assert_eq!(program.defs.len(), 3);
+}
+
+/// [`hot_key_case_3_11`] fails in about one run in five on tmpfs when run
+/// alone (15 of 80), and one in fifteen with four processes at once (13 of
+/// 200). Either a `GROUP BY`
+/// `SUM` is wrong once the second burst quiesces (`t2[1:0].sum_c2:
+/// expected=68`, with `got` anywhere from 4 to 148, or `t4[1:2].rel_agg:
+/// expected=69 got=4`), or the run never converges (`ConvergenceTimeout`).
+/// The input is identical every time; only the drain workers' timing
+/// differs. It is the exit check #556's milestones D (#623) and E (#624)
+/// can use.
+///
+/// What the failure needs, from cutting the drawn case down on tmpfs with
+/// four processes at once, 160 to 200 runs per row:
+///
+/// | the drawn case 3:11 ... | failed |
+/// |---|---|
+/// | as drawn | 6/160 (2 diverged, 4 never converged) |
+/// | without the relationship fields | 3/200 |
+/// | without the relationship fields and any `t1` op | 2/160 |
+/// | without the `t1` updates | 17/200 |
+/// | without the `t1` updates or the ops that change nothing (this pin) | 18/160 |
+/// | without the `t1` updates, `t2` alone | 0/160 |
+/// | without the group moves | 0/200 |
+///
+/// So it needs group moves and more than one `GROUP BY` definition over the
+/// hot table. It doesn't need the parent churn or the relationship, which
+/// only make it more likely, so it isn't #582's reverse-path lost update.
+/// Group moves under `MIN`/`MAX` recomputes are #494's shape (a key passing
+/// through a group inside one folded batch, under a recompute horizon, which
+/// #623 removes). Needing a second definition points at contention between
+/// their applies as well: #649's review saw up to 22 `deadlock detected` per
+/// run between the three definitions' aggregate pre-locks, which is #624's
+/// seam.
+///
+/// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
+/// with 8 drain workers and a 112ms seal, and fails if any attempt diverged
+/// or didn't converge. Unset, it returns at once:
+///
+/// ```text
+/// GENERATIVE_PIN_ATTEMPTS=20 cargo test -p generative \
+///     --test concurrent_convergence hot_key_case_3_11_converges \
+///     -- --ignored --nocapture
+/// ```
+///
+/// Twenty attempts take about three minutes and, at the rate above, miss
+/// the failure about one time in fifty. It respects `GENERATIVE_CLUSTER_DIR`,
+/// so it runs on disk too.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diverges or never converges in about one run in five until #623/#624 \
+            (#556 milestones D and E); run with GENERATIVE_PIN_ATTEMPTS set"]
+async fn hot_key_case_3_11_converges() {
+    let Some(attempts) = std::env::var(PIN_ATTEMPTS_ENV).ok().map(|v| {
+        v.parse::<usize>()
+            .expect("GENERATIVE_PIN_ATTEMPTS: a number")
+    }) else {
+        eprintln!("hot_key_case_3_11_converges: skipped, {PIN_ATTEMPTS_ENV} is not set");
+        return;
+    };
+    let cluster = start_cluster();
+    let (program, plan) = hot_key_case_3_11();
+    let mut failed = Vec::new();
+    for attempt in 1..=attempts {
+        let db = cluster.create_isolated_database().await;
+        let mut backend = ManualBackend::connect_with_options(
+            db.dsn(),
+            8,
+            Some(std::time::Duration::from_millis(112)),
+        )
+        .await
+        .expect("connect concurrent backend");
+        let unique = db.name().replace('-', "_");
+        backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let started = std::time::Instant::now();
+        let result = run_convergence_concurrent(&mut backend, &pool, &program, &plan).await;
+        let secs = started.elapsed().as_secs_f64();
+        let failure = match result {
+            Ok(run) if run.outcome.as_pass() => None,
+            Ok(run) => Some(format!("did not pass: {}", run.outcome)),
+            Err(RunError::Diverged(d)) => {
+                // The report's first lines name the wrong rows; the rest
+                // prints the whole program.
+                let report = d.report.to_string();
+                let rows: Vec<&str> = report
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| l.starts_with("  "))
+                    .collect();
+                Some(format!(
+                    "diverged in the burst ending at op {}: {}",
+                    d.op_index,
+                    rows.join(";")
+                ))
+            }
+            Err(other) => Some(format!("{other:?}")),
+        };
+        match failure {
+            None => eprintln!("attempt {attempt}: converged in {secs:.1}s"),
+            Some(failure) => {
+                eprintln!("attempt {attempt}: FAILED after {secs:.1}s: {failure}");
+                failed.push(attempt);
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {attempts} attempts failed: {failed:?}",
+        failed.len()
     );
 }
 

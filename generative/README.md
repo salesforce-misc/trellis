@@ -74,14 +74,18 @@ wired into two workflows:
   property_convergence_holds_for_trivial_programs -- --ignored`. This is the
   crate's most exercised property (see the design doc's property list) and
   the only one given an in-repo deep run today; the others are not deep-run
-  anywhere in this repo's CI config. The property's
-  `FileFailurePersistence::SourceParallel` config (see
-  `tests/convergence.rs`'s `proptest_config`) already writes any failing case
-  to `generative/tests/convergence.proptest-regressions` and replays it first
-  on the next run — commit that file if a deep run ever produces one, so the
-  failure becomes a real, replayable regression. Note that the fast lane does
-  *not* replay it (the property is ignored there); a regression worth pinning
-  on every push should also get a hand-minimized pin test.
+  anywhere in this repo's CI config.
+
+**Failing seeds stay local; failures become pins.** Every property's
+`FileFailurePersistence::SourceParallel` config writes a failing case's seed
+to `generative/tests/<file>.proptest-regressions` and replays it first on the
+next local run. Those files are git-ignored. A seed is only an RNG state, so
+it names the same program only while the strategy keeps its shape: after
+#505 changed the generator, every checked-in seed replayed into an unrelated
+program and guarded nothing, and they were deleted. A failure worth keeping
+is transcribed from its printed `Program` into a hand-built pin, which the
+fast lane runs on every push and no generator change can invalidate (see
+`tests/concurrent_convergence.rs`'s shrink-trust convention).
 
 Useful local invocations:
 

@@ -352,7 +352,10 @@ Two structural notes for when faults enter the stream:
   between them. Serialize shared-cluster access through a process-wide lock.
 - Dial case counts down (12–24 per property, env override for deep runs); give each
   property its own count by cost; give shrinking a generous iteration cap.
-- Persist failing seeds to a checked-in regression file, replayed first.
+- Persist failing seeds locally, replayed first on the next run, but never check
+  them in: a seed only names the same program while the strategy keeps its shape,
+  so a checked-in seed goes stale on the next generator change (#505). A failure
+  worth keeping becomes a hand-built pin.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 

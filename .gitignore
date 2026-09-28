@@ -1,2 +1,6 @@
 /target
 .claude/worktrees
+# A persisted proptest seed replays into an unrelated program as soon as a
+# strategy changes shape (#505), so seeds stay local. Transcribe a failure
+# into a hand-built pin instead (generative/README.md).
+*.proptest-regressions
