@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
-require "trellis"
+require "trellis/pg"
 require_relative "support/test_cluster"
 require_relative "support/eventually"
 

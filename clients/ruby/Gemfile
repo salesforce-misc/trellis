@@ -2,12 +2,22 @@
 
 source "https://rubygems.org"
 
-# Development only: the binding itself has no gem dependencies. Its Rails
-# integration (lib/trellis/railtie.rb, lib/trellis/migration.rb) loads only
-# in an app that has Rails, so activerecord and railties are here for its
-# tests alone.
-gem "activerecord", "~> 8.1"
-gem "minitest", "~> 5.25"
-gem "pg", "~> 1.6" # the tests' own connection to the testkit cluster
-gem "railties", "~> 8.1"
+# Development only. The gem's own dependencies are in trellis-pg.gemspec:
+# just rb_sys, to build the extension from source.
+gemspec
+
+# Building the extension and the gems (Rakefile).
 gem "rake", "~> 13.3"
+gem "rake-compiler", "~> 1.3"
+
+# The tests. The binding's Rails integration (lib/trellis/railtie.rb,
+# lib/trellis/migration.rb) loads only in an app that has Rails, so
+# activerecord and railties are here for its tests alone. The release
+# workflow's cross-compiling containers skip this group: pg needs libpq to
+# build.
+group :test do
+  gem "activerecord", "~> 8.1"
+  gem "minitest", "~> 5.25"
+  gem "pg", "~> 1.6" # the tests' own connection to the testkit cluster
+  gem "railties", "~> 8.1"
+end

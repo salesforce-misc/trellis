@@ -1,5 +1,14 @@
 /.bundle/
 /vendor/
-# The native extension `rake compile` copies out of the Cargo workspace's target/.
+# The native extension `rake compile` builds, and the per-Ruby-version
+# directories a platform gem's build (`rake native:<platform>`) puts them in.
 /lib/trellis/*.so
 /lib/trellis/*.bundle
+/lib/trellis/[0-9]*.[0-9]*/
+# rake-compiler's build directory, and the gems `rake gem` builds.
+/tmp/
+/pkg/
+# What .github/scripts/ruby-prepare-source-gem.sh adds for a source gem (it
+# also rewrites ext/trellis_ruby/Cargo.toml).
+/ext/trellis_ruby/Cargo.lock
+/LICENSE.txt

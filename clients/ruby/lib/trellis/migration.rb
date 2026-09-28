@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "active_record"
-require "trellis"
+require "trellis/pg"
 
 module Trellis
   # Trellis statements in an ActiveRecord migration, so a transform is

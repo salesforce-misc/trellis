@@ -1,0 +1,285 @@
+name: Ruby release
+
+# Releases the Ruby binding (clients/ruby) as the `trellis-pg` gem (issue
+# #154): a platform gem for each platform below, with a prebuilt extension
+# for every supported Ruby minor version, and the source gem as the fallback
+# for any other platform. Nothing else triggers it: merging a change does
+# nothing.
+#
+# - Pushing a `ruby-v<version>` tag, where <version> is Trellis::VERSION
+#   (clients/ruby/lib/trellis/version.rb), builds every gem, installs and
+#   loads each one, then pushes them to RubyGems, platform gems first. It
+#   authenticates as a RubyGems trusted publisher (OIDC), so there is no API
+#   key secret; see clients/ruby/README.md's "Releasing".
+# - Running it by hand (workflow_dispatch) builds and checks the same gems
+#   and keeps them as workflow artifacts. It publishes nothing.
+#
+# The org's Actions policy allows only a curated set of third-party actions
+# (see .github/actions/rust-toolchain/action.yml), so this uses GitHub's own
+# actions and repository scripts: rb-sys-dock directly rather than
+# oxidize-rb/actions/cross-gem (which runs it too), setup-ruby.sh rather
+# than ruby/setup-ruby, and curl rather than
+# rubygems/configure-rubygems-credentials.
+
+on:
+  push:
+    tags: ["ruby-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ruby-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  platform-gem:
+    name: Gem ${{ matrix.platform }}
+    # Every platform cross-compiles on an x86_64 runner, in rb-sys's
+    # container for it (.github/scripts/build-ruby-gem.sh).
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-linux
+          - x86_64-linux-musl
+          - aarch64-linux
+          - aarch64-linux-musl
+          - x86_64-darwin
+          - arm64-darwin
+    env:
+      # Only rb_sys (for rb-sys-dock) and rake-compiler are needed here; the
+      # test group's pg needs libpq to build.
+      BUNDLE_WITHOUT: test
+      BUNDLE_FROZEN: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag names the gem's version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(awk -F'"' '/VERSION = / { print $2; exit }' clients/ruby/lib/trellis/version.rb)"
+          if [ "$GITHUB_REF_NAME" != "ruby-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match clients/ruby/lib/trellis/version.rb's VERSION $version" >&2
+            exit 1
+          fi
+
+      - name: Install Ruby
+        # The token only authenticates the digest lookup.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - name: Install rb-sys-dock
+        working-directory: clients/ruby
+        run: bundle install
+
+      - name: Build the gem
+        run: .github/scripts/build-ruby-gem.sh "${{ matrix.platform }}" "$RUNNER_TEMP/gems"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: ${{ runner.temp }}/gems/*.gem
+          if-no-files-found: error
+
+  check-linux-gem:
+    # Installs each Linux gem into the official Ruby image of every Ruby it
+    # has an extension for (Debian for gnu, Alpine for musl), on a runner of
+    # its architecture, and loads it.
+    name: Check ${{ matrix.platform }} on Ruby ${{ matrix.ruby }}
+    needs: platform-gem
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "3.4", "4.0"]
+        platform: [x86_64-linux, x86_64-linux-musl, aarch64-linux, aarch64-linux-musl]
+        include:
+          - { platform: x86_64-linux, runner: ubuntu-24.04, variant: slim }
+          - { platform: x86_64-linux-musl, runner: ubuntu-24.04, variant: alpine }
+          - { platform: aarch64-linux, runner: ubuntu-24.04-arm, variant: slim }
+          - { platform: aarch64-linux-musl, runner: ubuntu-24.04-arm, variant: alpine }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: gems
+
+      - name: Install and load the gem
+        run: |
+          docker run --rm -v "$PWD/gems:/gems:ro" -v "$PWD/.github/scripts:/scripts:ro" \
+            "ruby:${{ matrix.ruby }}-${{ matrix.variant }}" \
+            sh -c 'gem install --local --no-document /gems/*.gem && ruby /scripts/ruby-gem-smoke.rb'
+
+  check-darwin-gem:
+    # Homebrew's Ruby, one minor version: macOS runners have no container to
+    # choose one with.
+    name: Check ${{ matrix.platform }}
+    needs: platform-gem
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: arm64-darwin, runner: macos-14 }
+          - { platform: x86_64-darwin, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: gems
+
+      - name: Install and load the gem
+        run: |
+          brew install ruby
+          ruby="$(brew --prefix ruby)/bin"
+          "$ruby/gem" install --local --no-document --install-dir "$RUNNER_TEMP/gem-home" gems/*.gem
+          GEM_HOME="$RUNNER_TEMP/gem-home" GEM_PATH="$RUNNER_TEMP/gem-home" \
+            "$ruby/ruby" .github/scripts/ruby-gem-smoke.rb
+
+  source-gem:
+    # The fallback for any platform without a platform gem: it builds the
+    # extension on install, with the host's own Rust toolchain.
+    name: Source gem
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Install Ruby
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - name: Install libclang
+        # rb-sys generates its bindings with bindgen, which loads libclang;
+        # see ci.yml's `ruby` job.
+        run: |
+          set -euo pipefail
+          if compgen -G "/usr/lib/llvm-*/lib/libclang.so*" >/dev/null ||
+             compgen -G "/usr/lib/x86_64-linux-gnu/libclang-[0-9]*.so*" >/dev/null; then
+            echo "libclang found"
+          else
+            sudo apt-get update
+            sudo apt-get install -y libclang-dev
+          fi
+
+      - name: Make the extension crate stand alone, and copy in the license
+        run: .github/scripts/ruby-prepare-source-gem.sh "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
+      - name: Build the gem
+        working-directory: clients/ruby
+        run: |
+          set -euo pipefail
+          gem build trellis-pg.gemspec
+          # A source gem that can't build outside this repository is no
+          # fallback: check it has what ruby-prepare-source-gem.sh added.
+          files="$(tar -xOf trellis-pg-*.gem metadata.gz | gunzip)"
+          for f in ext/trellis_ruby/Cargo.lock LICENSE.txt; do
+            grep -qx -- "- $f" <<<"$files" || { echo "the source gem lacks $f" >&2; exit 1; }
+          done
+          mkdir -p "$RUNNER_TEMP/gems"
+          mv trellis-pg-*.gem "$RUNNER_TEMP/gems/"
+
+      - name: Install and load the gem
+        # From outside the checkout, as a host would: Cargo fetches `trellis`
+        # at this commit, and the repository's rust-toolchain.toml doesn't
+        # apply. rb_sys comes from RubyGems.
+        working-directory: ${{ runner.temp }}
+        run: |
+          gem install --no-document --install-dir gem-home gems/trellis-pg-*.gem
+          GEM_HOME=gem-home GEM_PATH=gem-home \
+            ruby "$GITHUB_WORKSPACE/.github/scripts/ruby-gem-smoke.rb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem-source
+          path: ${{ runner.temp }}/gems/*.gem
+          if-no-files-found: error
+
+  publish:
+    needs: [platform-gem, check-linux-gem, check-darwin-gem, source-gem]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # The OIDC token RubyGems' trusted publishing exchanges for an API key.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ruby
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/setup-ruby.sh clients/ruby/.tool-versions
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gem-*
+          merge-multiple: true
+          path: gems
+
+      - name: Check every gem is here
+        run: |
+          ls -l gems
+          count="$(find gems -name 'trellis-pg-*.gem' | wc -l)"
+          if [ "$count" -ne 7 ]; then
+            echo "expected 7 gems (6 platforms and the source gem), found $count" >&2
+            exit 1
+          fi
+
+      - name: Get a RubyGems API key as a trusted publisher
+        # What rubygems/configure-rubygems-credentials does: exchange this
+        # job's OIDC token (audience rubygems.org) for a short-lived key.
+        # Fails unless rubygems.org lists this repository and workflow as a
+        # trusted publisher of trellis-pg.
+        run: |
+          set -euo pipefail
+          jwt="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" | jq -r .value)"
+          key="$(jq -n --arg jwt "$jwt" '{jwt: $jwt}' |
+            curl -sS --fail-with-body -X POST \
+              -H 'Content-Type: application/json' -H 'Accept: application/json' \
+              --data @- https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token |
+            jq -r .rubygems_api_key)"
+          if [ -z "$key" ] || [ "$key" = null ]; then
+            echo "RubyGems returned no API key; is this workflow a trusted publisher of trellis-pg?" >&2
+            exit 1
+          fi
+          echo "::add-mask::$key"
+          echo "GEM_HOST_API_KEY=$key" >> "$GITHUB_ENV"
+
+      - name: Push the gems
+        # Platform gems first, so no host ever finds only the source gem and
+        # compiles it for want of its platform's. A gem this version already
+        # has (a re-run after a partial push) is skipped.
+        run: |
+          set -euo pipefail
+          push() {
+            if out="$(gem push "$1" 2>&1)"; then
+              echo "$out"
+            elif grep -q "Repushing of gem versions is not allowed" <<<"$out"; then
+              echo "$1 is already on RubyGems"
+            else
+              echo "$out" >&2
+              exit 1
+            fi
+          }
+          for gem in gems/trellis-pg-*-*.gem; do
+            push "$gem"
+          done
+          push "$(find gems -name 'trellis-pg-*.gem' ! -name 'trellis-pg-*-*.gem')"

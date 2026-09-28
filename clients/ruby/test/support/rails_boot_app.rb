@@ -25,7 +25,7 @@ require "logger"
 require "rails"
 require "active_record/railtie" unless WITHOUT_ACTIVE_RECORD
 # After Rails, as Bundler.require in config/application.rb loads it.
-require "trellis"
+require "trellis/pg"
 
 class BootApp < Rails::Application
   config.root = __dir__

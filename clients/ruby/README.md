@@ -11,6 +11,43 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #151 and
 don't call for a difference. Every method is on the `Trellis` module, which
 holds the process's one handle.
 
+## Installing
+
+The gem is `trellis-pg` (the name `trellis` is taken on RubyGems), required
+as `trellis/pg`. The module is still `Trellis`.
+
+```ruby
+# Gemfile
+gem "trellis-pg"
+```
+
+`Bundler.require`, which a Rails app's `config/application.rb` runs,
+requires it by itself. Anywhere else, `require "trellis/pg"`.
+
+Platform gems carry a prebuilt extension for Ruby 3.3, 3.4 and 4.0 on:
+
+| Platform | Gem platform |
+|---|---|
+| Linux, glibc 2.29 or later, x86_64 and arm64 | `x86_64-linux`, `aarch64-linux` |
+| Linux, musl (Alpine), x86_64 and arm64 | `x86_64-linux-musl`, `aarch64-linux-musl` |
+| macOS, Apple silicon and Intel | `arm64-darwin`, `x86_64-darwin` |
+
+Anywhere else, RubyGems installs the source gem, which builds the extension
+as it installs. That needs a Rust toolchain (releases are built with Rust
+1.98), libclang (rb-sys generates its bindings with it: `libclang-dev` on
+Debian and Ubuntu, `clang-devel` on Fedora) and network access, since Cargo
+fetches the `trellis` crate from this repository at the released commit, and
+its dependencies from crates.io. To build from source on a listed platform
+too, on a glibc older than 2.29 say, ask for the source gem:
+`gem install trellis-pg --platform ruby`, or
+`gem "trellis-pg", force_ruby_platform: true` in a Gemfile.
+
+Neither kind of gem includes the `trellis` crate's optional `otlp` feature
+(OTLP trace export), so neither pulls in an OpenTelemetry or gRPC stack.
+Nothing in the binding uses it.
+
+## Usage
+
 - `Trellis.connect(url:, ...)`, `Trellis.migrate`, `Trellis.config`,
   `Trellis.shutdown`, `Trellis.connected?`: the handle's lifecycle.
 - `Trellis.apply(statement)`: any statement of Trellis's grammar
@@ -34,7 +71,7 @@ holds the process's one handle.
   reporting any divergence.
 
 ```ruby
-require "trellis"
+require "trellis/pg"
 
 # A deploy's migration step: the defaults run nothing in the background.
 Trellis.connect(url: "host=localhost dbname=app")
@@ -133,7 +170,7 @@ definition ever reaches `:live`.
 
 ## In a Rails app
 
-`require "trellis"` after Rails (which `Bundler.require` in
+`require "trellis/pg"` after Rails (which `Bundler.require` in
 `config/application.rb` does) loads `Trellis::Railtie`. Without Rails, the
 gem loads no Rails code and requires no gem at all; `activerecord` and
 `railties` are only ever the app's own dependencies.
@@ -291,16 +328,16 @@ migrating.
   and the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
   loaded only in an app that has Rails.
 - `ext/trellis_ruby/`: the extension crate, a member of the repository's
-  Cargo workspace. Plain-data conversion and error codes come from
-  `clients/embed` (`trellis-embed`), shared with the Elixir binding.
+  Cargo workspace, and the `extconf.rb` that builds it with rb-sys.
+  Plain-data conversion and error codes come from `clients/embed`
+  (`trellis-embed`), shared with the Elixir binding.
+- `trellis-pg.gemspec`: the source gem. The `Rakefile` derives the platform
+  gems from it.
 
 The crate's code sits behind its `ruby` feature: rb-sys needs a Ruby install
 and libclang to build, and the Rust-only CI job and `verify` have neither, so
 without the feature (`cargo build --workspace`) it compiles to an empty
 library. The root manifest leaves it out of `default-members` too.
-
-There's no gemspec yet: the published gem name is one of ADR-0010's open
-questions, so packaging comes later.
 
 ## Development
 
@@ -314,9 +351,10 @@ bundle install
 bundle exec rake test
 ```
 
-`rake compile` (which `rake test` runs first) builds the extension through
-Cargo into the workspace's `target/`, telling rb-sys which Ruby to build
-against, and copies it to `lib/trellis/`. The suite spawns
+`rake compile:dev` (which `rake test` runs first) builds the extension the
+way installing the source gem does, through `ext/trellis_ruby/extconf.rb`,
+but with Cargo's dev profile and into the workspace's `target/`, and copies
+it to `lib/trellis/`. `rake compile` builds the release profile. The suite spawns
 `trellis-testkit` (from `PATH`, else the workspace's debug build) for a
 Postgres cluster that is torn down when the run exits. It needs the Postgres
 server binaries on `PATH`, like the Rust tests.
@@ -326,3 +364,31 @@ reads like the Elixir binding's ExUnit suite, which this one mirrors.
 `test/parity_test.rb` runs `clients/parity/cases.json`, the fixture the
 Elixir suite runs too, so the two bindings can't drift apart unnoticed (see
 `clients/parity/README.md`).
+
+## Releasing
+
+`.github/workflows/ruby-release.yml` builds and publishes the gems. Pushing
+a `ruby-v<version>` tag, where `<version>` is `Trellis::VERSION`
+(`lib/trellis/version.rb`), builds the six platform gems and the source gem,
+installs and loads each one (every Linux gem on each Ruby it supports), and
+pushes them all to RubyGems, platform gems first. Running the workflow by
+hand does everything but the push, leaving the gems as workflow artifacts.
+
+It publishes as a RubyGems [trusted publisher](https://guides.rubygems.org/trusted-publishing/),
+so there's no API key to keep: on rubygems.org, `trellis-pg` (or, before its
+first release, a pending trusted publisher for it) names this repository and
+the workflow file `ruby-release.yml`.
+
+A platform gem builds in rb-sys's cross-compiling container for its
+platform, through `rb-sys-dock`, and takes one build of the extension per
+Ruby minor version. `.github/scripts/build-ruby-gem.sh <platform> <out-dir>`
+does that, locally too (it needs Docker or Podman; see the script). Adding a
+Ruby version means adding it to that script's `RUBY_VERSIONS`, the
+workflow's check matrix, the table above and, for a new oldest version,
+`required_ruby_version` in the gemspec.
+
+The source gem's extension crate has to build outside this repository, so
+`.github/scripts/ruby-prepare-source-gem.sh` rewrites its path dependencies
+as git dependencies on the released commit and gives it a lockfile, before
+`gem build`. A `gem build` of an unprepared checkout makes a gem that only
+installs from inside the checkout.

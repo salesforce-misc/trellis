@@ -5,7 +5,7 @@
 # process exits normally, so their at_exit hooks run and their handles are
 # freed as Ruby exits.
 
-require "trellis"
+require "trellis/pg"
 
 $stdout.sync = true
 dsn = ARGV.fetch(0)

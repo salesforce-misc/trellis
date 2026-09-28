@@ -16,11 +16,11 @@ class RailsTest < Minitest::Test
   BOOT_APP = File.expand_path("support/rails_boot_app.rb", __dir__)
 
   # With RubyGems off, only the standard library's own files can load, so
-  # this proves `require "trellis"` pulls in no gem, Rails least of all, and
+  # this proves `require "trellis/pg"` pulls in no gem, Rails least of all, and
   # that the handle works without one.
   def test_the_gem_loads_and_runs_without_rails
     script = <<~RUBY
-      require "trellis"
+      require "trellis/pg"
       abort "Rails got loaded" if defined?(::Rails) || defined?(::ActiveRecord)
       abort "RubyGems got loaded" if defined?(::Gem)
       abort "the Railtie loaded without Rails" if Trellis.const_defined?(:Railtie, false)

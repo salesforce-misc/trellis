@@ -1,24 +1,25 @@
 # frozen_string_literal: true
 
-require "fileutils"
-require "json"
 require "rake/testtask"
-require "rbconfig"
+require "rubygems/package_task"
+require "rb_sys/extensiontask"
 
-WORKSPACE = File.expand_path("../..", __dir__)
+GEMSPEC = Gem::Specification.load(File.expand_path("trellis-pg.gemspec", __dir__))
 
-desc "Build the native extension through Cargo and copy it into lib/trellis/"
-task :compile do
-  # rb-sys's build script asks this Ruby for its headers and link flags.
-  sh({ "RUBY" => RbConfig.ruby },
-     "cargo", "build", "-p", "trellis_ruby", "--features", "ruby", chdir: WORKSPACE)
+# `rake gem`: the source gem, into pkg/.
+Gem::PackageTask.new(GEMSPEC).define
 
-  metadata = JSON.parse(IO.popen(%w[cargo metadata --format-version 1 --no-deps],
-                                 chdir: WORKSPACE, &:read))
-  built = File.join(metadata.fetch("target_directory"), "debug",
-                    "libtrellis_ruby.#{RbConfig::CONFIG.fetch('SOEXT')}")
-  FileUtils.cp(built, File.join(__dir__, "lib", "trellis",
-                                "trellis_ruby.#{RbConfig::CONFIG.fetch('DLEXT')}"))
+# `rake compile` builds the extension with ext/trellis_ruby/extconf.rb, the
+# same way installing the source gem does, and copies it into lib/trellis/.
+# Cargo builds into the workspace's target/, so the build shares the
+# dependencies every other workspace build has already compiled.
+# `rake compile:dev` builds the dev profile instead of release.
+#
+# `rake native:<platform> gem` builds a platform gem. rb-sys-dock runs it
+# inside its cross-compiling containers, once per platform, with every Ruby
+# minor version in RUBY_CC_VERSION (.github/scripts/build-ruby-gem.sh).
+RbSys::ExtensionTask.new("trellis_ruby", GEMSPEC) do |ext|
+  ext.lib_dir = "lib/trellis"
 end
 
 Rake::TestTask.new(:test) do |t|
@@ -26,6 +27,8 @@ Rake::TestTask.new(:test) do |t|
   t.test_files = FileList["test/**/*_test.rb"]
   t.warning = true
 end
-task test: :compile
+# The dev profile: a debug build is quicker to compile, and it's what the
+# tests have always run against.
+task test: "compile:dev"
 
 task default: :test

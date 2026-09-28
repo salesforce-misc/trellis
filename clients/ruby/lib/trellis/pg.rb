@@ -1,10 +1,20 @@
 # frozen_string_literal: true
 
-require_relative "trellis/error"
-require_relative "trellis/values"
-# The native extension (ext/trellis_ruby), which `rake compile` builds and
-# copies here.
-require_relative "trellis/trellis_ruby"
+require_relative "error"
+require_relative "values"
+require_relative "version"
+require "rbconfig"
+
+# The native extension (ext/trellis_ruby). A platform gem carries one build
+# per Ruby minor version, each in lib/trellis/<major.minor>/; installing the
+# source gem, or `rake compile`, builds the one this Ruby needs into
+# lib/trellis/.
+if File.exist?(File.join(__dir__, RUBY_VERSION[/\A\d+\.\d+/],
+                         "trellis_ruby.#{RbConfig::CONFIG.fetch('DLEXT')}"))
+  require_relative "#{RUBY_VERSION[/\A\d+\.\d+/]}/trellis_ruby"
+else
+  require_relative "trellis_ruby"
+end
 
 # Embedded Trellis for Ruby apps: a native extension over the `trellis`
 # crate's BlockingTrellis, so a Rails app can define and run streaming
@@ -412,4 +422,4 @@ end
 # config/application.rb). Without Rails, nothing here requires a gem.
 # Trellis::Migration (lib/trellis/migration.rb) needs ActiveRecord: the
 # Railtie loads it with ActiveRecord, and an app without Rails requires it.
-require_relative "trellis/railtie" if defined?(::Rails::Railtie)
+require_relative "railtie" if defined?(::Rails::Railtie)

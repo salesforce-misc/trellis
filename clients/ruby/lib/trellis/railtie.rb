@@ -4,7 +4,7 @@ require "rails/railtie"
 
 module Trellis
   # Connects this process's handle as a Rails app boots, from the app's
-  # `config.trellis`. `require "trellis"` loads it when Rails is loaded
+  # `config.trellis`. `require "trellis/pg"` loads it when Rails is loaded
   # first, which is what Bundler.require in config/application.rb does.
   #
   #   # config/application.rb, or config/environments/*.rb

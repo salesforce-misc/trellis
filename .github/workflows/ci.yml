@@ -295,8 +295,9 @@ jobs:
         run: bundle install
 
       - name: Test
-        # `rake test` first builds the extension through Cargo (debug, into
-        # the workspace's target/, reusing the restored dependencies). The
+        # `rake test` first builds the extension from source, through the
+        # extconf.rb the source gem installs with (debug, into the
+        # workspace's target/, reusing the restored dependencies). The
         # suite includes the cross-language parity suite
         # (test/parity_test.rb), which runs the shared
         # clients/parity/cases.json the `elixir` job runs too.
@@ -305,3 +306,9 @@ jobs:
           BUNDLE_FROZEN: "true"
           BUNDLE_PATH: vendor/bundle
         run: bundle exec rake test
+
+      - name: Build the source gem
+        # Only that trellis-pg.gemspec loads and packs, without warnings.
+        # ruby-release.yml builds, installs and checks the released gems.
+        working-directory: clients/ruby
+        run: gem build trellis-pg.gemspec --strict
