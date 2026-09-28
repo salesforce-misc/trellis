@@ -16,7 +16,9 @@ use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType}
 use trellis::dev::defs::registry;
 
 use crate::backend::{DrainAudit, SPLIT_THRESHOLD_ROWS};
-use crate::model::{Cardinality, ConcurrentPlan, Op, OpOutcome, Program, Relationship};
+use crate::model::{
+    BurstAction, Cardinality, ConcurrentPlan, Op, OpOutcome, Program, Relationship,
+};
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
 /// keyed on the `&'static str` name of the variant it tallies, not the
@@ -138,6 +140,9 @@ pub struct Coverage {
     /// burst race, so the engine sees some interleaving of it, but which
     /// keys, groups and row counts a burst carries doesn't depend on that.
     pub concurrent_shape_cases: HashMap<&'static str, usize>,
+    /// How many of each mid-burst operator action the recorded concurrent
+    /// plans take, keyed by [`BurstAction::name`] (issue #557 part 2).
+    pub concurrent_actions: HashMap<&'static str, usize>,
     /// Every [`DrainAudit`] recorded by [`Coverage::record_drain`], added up
     /// (issue #557): what the engine actually sealed and claimed, where
     /// `concurrent_shape_cases` is only what the program offered it.
@@ -249,6 +254,12 @@ impl Coverage {
     /// [`Self::record_program`], which the harness calls as well.
     pub fn record_concurrent_plan(&mut self, program: &Program, plan: &ConcurrentPlan) {
         self.concurrent_bursts += plan.bursts.len();
+        for timed in plan.bursts.iter().flat_map(|b| &b.actions) {
+            *self
+                .concurrent_actions
+                .entry(timed.action.name())
+                .or_insert(0) += 1;
+        }
         for shape in concurrent_shapes(program, plan) {
             *self.concurrent_shape_cases.entry(shape.name()).or_insert(0) += 1;
         }
@@ -651,6 +662,27 @@ pub enum ConcurrentShape {
     NewGroup,
     /// A group loses its last member and gains one again within the burst.
     GroupRefill,
+    /// A `request_backfill` fires mid-burst on a table the burst writes
+    /// both before and after it (issue #557 part 2): the re-read overlaps
+    /// in-flight CDC for the same keys. This and the three shapes below
+    /// place an action by the burst's program order; the lanes race, so the
+    /// engine sees roughly that.
+    MidBurstBackfill,
+    /// A whole-transform `RESUME` fires on a definition whose source the
+    /// burst writes both before and after it.
+    MidBurstResume,
+    /// A column `RESUME` fires on a definition whose source the burst writes
+    /// both before and after it.
+    MidBurstColumnResume,
+    /// A definition installs on a source the burst writes both before and
+    /// after the install, so its build overlaps CDC (#625's shape).
+    MidBurstInstall,
+    /// A relationship's to-side table is truncated in a burst that also
+    /// writes its from-side table.
+    ToSideTruncate,
+    /// A relationship's to-side row is updated in a burst that also writes
+    /// its from-side table (#505).
+    ParentUpdate,
 }
 
 /// How many writes to one row, or to one group, make it hot
@@ -658,7 +690,25 @@ pub enum ConcurrentShape {
 pub const HOT_WRITES: usize = 8;
 
 impl ConcurrentShape {
-    pub const ALL: [ConcurrentShape; 6] = [
+    pub const ALL: [ConcurrentShape; 12] = [
+        ConcurrentShape::ConcurrentLanes,
+        ConcurrentShape::HotKey,
+        ConcurrentShape::HotGroup,
+        ConcurrentShape::SplitSized,
+        ConcurrentShape::NewGroup,
+        ConcurrentShape::GroupRefill,
+        ConcurrentShape::MidBurstBackfill,
+        ConcurrentShape::MidBurstResume,
+        ConcurrentShape::MidBurstColumnResume,
+        ConcurrentShape::MidBurstInstall,
+        ConcurrentShape::ToSideTruncate,
+        ConcurrentShape::ParentUpdate,
+    ];
+
+    /// The shapes part 1 of #557 added, which every hot-key case offers.
+    /// The rest come from mid-burst actions and to-side ops, which only
+    /// some cases draw.
+    pub const HOT_KEY: [ConcurrentShape; 6] = [
         ConcurrentShape::ConcurrentLanes,
         ConcurrentShape::HotKey,
         ConcurrentShape::HotGroup,
@@ -676,6 +726,12 @@ impl ConcurrentShape {
             ConcurrentShape::SplitSized => "split_sized",
             ConcurrentShape::NewGroup => "new_group",
             ConcurrentShape::GroupRefill => "group_refill",
+            ConcurrentShape::MidBurstBackfill => "mid_burst_backfill",
+            ConcurrentShape::MidBurstResume => "mid_burst_resume",
+            ConcurrentShape::MidBurstColumnResume => "mid_burst_column_resume",
+            ConcurrentShape::MidBurstInstall => "mid_burst_install",
+            ConcurrentShape::ToSideTruncate => "to_side_truncate",
+            ConcurrentShape::ParentUpdate => "parent_update",
         }
     }
 }
@@ -808,6 +864,8 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             }
         }
 
+        out.extend(burst_action_shapes(program, &burst.ops(), &burst.actions));
+
         if row_writes.values().any(|&n| n >= HOT_WRITES) {
             out.insert(ConcurrentShape::HotKey);
         }
@@ -819,6 +877,70 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
         }
         if changes >= SPLIT_THRESHOLD_ROWS && !whole_table {
             out.insert(ConcurrentShape::SplitSized);
+        }
+    }
+    out
+}
+
+/// The mid-burst action and to-side shapes one burst reaches (issue #557
+/// part 2). `ops` is the burst's op indices in program order; an action
+/// `after` `k` ops fires between `ops[k - 1]` and `ops[k]`.
+fn burst_action_shapes(
+    program: &Program,
+    ops: &[usize],
+    actions: &[crate::model::TimedAction],
+) -> HashSet<ConcurrentShape> {
+    let mut out = HashSet::new();
+    let writes = |table: &str, range: std::ops::Range<usize>| {
+        ops[range]
+            .iter()
+            .any(|&i| op_table_name(&program.ops[i]) == table)
+    };
+    let overlaps = |table: &str, at: usize| writes(table, 0..at) && writes(table, at..ops.len());
+    let source_of = |target: &str| {
+        program
+            .defs
+            .iter()
+            .find(|d| d.target == target)
+            .map(|d| d.source.as_str())
+    };
+    for timed in actions {
+        let (shape, table) = match &timed.action {
+            BurstAction::RequestBackfill { table } => {
+                (ConcurrentShape::MidBurstBackfill, Some(table.as_str()))
+            }
+            BurstAction::Resume {
+                target,
+                column: None,
+            } => (ConcurrentShape::MidBurstResume, source_of(target)),
+            BurstAction::Resume {
+                target,
+                column: Some(_),
+            } => (ConcurrentShape::MidBurstColumnResume, source_of(target)),
+            BurstAction::Install { def } => (
+                ConcurrentShape::MidBurstInstall,
+                program.defs.get(*def).map(|d| d.source.as_str()),
+            ),
+            BurstAction::Pause { .. } => continue,
+        };
+        if table.is_some_and(|table| overlaps(table, timed.after.min(ops.len()))) {
+            out.insert(shape);
+        }
+    }
+    for rel in &program.relationships {
+        if !writes(&rel.from_table, 0..ops.len()) {
+            continue;
+        }
+        for &i in ops {
+            let op = &program.ops[i];
+            if op_table_name(op) != rel.to_table || !matches!(op.expect(), OpOutcome::Succeeds) {
+                continue;
+            }
+            match op {
+                Op::Truncate { .. } => out.insert(ConcurrentShape::ToSideTruncate),
+                Op::Update { .. } => out.insert(ConcurrentShape::ParentUpdate),
+                _ => false,
+            };
         }
     }
     out
@@ -991,6 +1113,11 @@ impl fmt::Display for Coverage {
             write!(f, " {name}={count}")?;
         }
         writeln!(f)?;
+        write!(f, "concurrent_actions:")?;
+        for (name, count) in sorted_counts(&self.concurrent_actions) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
         let drain = &self.drain;
         writeln!(
             f,
@@ -1081,9 +1208,11 @@ mod tests {
             bursts: vec![
                 Burst {
                     lanes: vec![vec![0, 1, 2, 3]],
+                    ..Default::default()
                 },
                 Burst {
                     lanes: vec![even, odd],
+                    ..Default::default()
                 },
             ],
         };
@@ -1108,6 +1237,7 @@ mod tests {
         let plan = ConcurrentPlan {
             bursts: vec![Burst {
                 lanes: vec![(0..program.ops.len()).collect()],
+                ..Default::default()
             }],
         };
         assert_eq!(
@@ -1124,6 +1254,7 @@ mod tests {
         let one_burst = |program: &Program| ConcurrentPlan {
             bursts: vec![Burst {
                 lanes: vec![(0..program.ops.len()).collect()],
+                ..Default::default()
             }],
         };
         let program = build_program(&seeds, &[]);

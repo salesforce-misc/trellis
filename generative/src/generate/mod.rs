@@ -240,8 +240,8 @@ use trellis::dev::defs::ast::{
 };
 
 use crate::model::{
-    Burst, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome, Program, Relationship,
-    Table,
+    Burst, BurstAction, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome, Program,
+    Relationship, Table, TimedAction,
 };
 
 /// The inclusive upper bound of the calculated-field value domain.
@@ -2208,21 +2208,24 @@ pub const MAX_LANES: usize = 4;
 /// in order of first appearance, so the lanes stay balanced and the plan is
 /// a pure function of its arguments: a shrunk case replays the same plan.
 ///
+/// A deferred install (`program.def_install_after_op[i] == n`, issue #557
+/// part 2) becomes a [`BurstAction::Install`] in the burst holding op `n`,
+/// firing once the burst ops before `n` have been applied. The lanes race,
+/// so "before op `n`" becomes "after that many of the burst's ops": the
+/// build runs while the rest of the burst still writes the source.
+///
 /// # Panics
 ///
-/// If `burst_size` or `lanes` is `0`, or `program` schedules anything by op
-/// index (a deferred install, a restart or a scale-out), which the concurrent
-/// runner doesn't support.
+/// If `burst_size` or `lanes` is `0`, or `program` schedules a restart or a
+/// scale-out, which the concurrent runner doesn't support.
 pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> ConcurrentPlan {
     assert!(
         burst_size > 0 && lanes > 0,
         "concurrent_plan: burst_size and lanes must both be at least 1"
     );
     assert!(
-        program.def_install_after_op.iter().all(|&at| at == 0)
-            && program.restart_after_ops.is_empty()
-            && program.scale_out_after_ops.is_empty(),
-        "concurrent_plan: the concurrent tier doesn't schedule anything by op index"
+        program.restart_after_ops.is_empty() && program.scale_out_after_ops.is_empty(),
+        "concurrent_plan: the concurrent tier doesn't schedule a restart or a scale-out"
     );
     let whole_table: std::collections::HashSet<&str> = program
         .ops
@@ -2258,10 +2261,163 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
                 out[lane].push(index);
             }
             out.retain(|lane| !lane.is_empty());
-            Burst { lanes: out }
+            Burst {
+                lanes: out,
+                actions: Vec::new(),
+            }
         })
         .collect();
-    ConcurrentPlan { bursts }
+    let mut plan = ConcurrentPlan { bursts };
+    for (def, &at) in program.def_install_after_op.iter().enumerate() {
+        if at == 0 {
+            continue;
+        }
+        plan.bursts[at / burst_size].actions.push(TimedAction {
+            after: at % burst_size,
+            action: BurstAction::Install { def },
+        });
+    }
+    sort_actions(&mut plan);
+    plan
+}
+
+/// Orders every burst's actions by when they fire, keeping the order of
+/// actions that fire at the same point (a pause stays ahead of its resume).
+fn sort_actions(plan: &mut ConcurrentPlan) {
+    for burst in &mut plan.bursts {
+        burst.actions.sort_by_key(|action| action.after);
+    }
+}
+
+/// Which mid-burst operator action an [`ActionDraw`] asks for (issue #557
+/// part 2). Mid-burst installs aren't drawn here: they come from
+/// [`Program::def_install_after_op`] through [`concurrent_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    /// [`BurstAction::RequestBackfill`] on a table an installed definition
+    /// reads.
+    RequestBackfill,
+    /// A whole-transform [`BurstAction::Pause`], then its
+    /// [`BurstAction::Resume`] later in the same burst.
+    PauseResume,
+    /// A column [`BurstAction::Pause`] on a 1-1 definition, then its column
+    /// [`BurstAction::Resume`] later in the same burst.
+    ColumnPauseResume,
+}
+
+/// One drawn mid-burst action, before [`add_burst_actions`] resolves it
+/// against a program and its plan. Plain numbers, so it shrinks toward
+/// "earliest burst, first target, at the burst's start".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionDraw {
+    pub kind: ActionKind,
+    /// Picks a burst after the first, modulo how many there are.
+    pub burst: usize,
+    /// Picks the table, definition or column, modulo how many qualify.
+    pub target: usize,
+    /// Where in the burst the action (or a pair's pause) fires, in
+    /// thousandths of the burst's ops.
+    pub start: u16,
+    /// How much further on a pair's resume fires, in thousandths of the
+    /// burst's ops, capped at the burst's end.
+    pub span: u16,
+}
+
+/// Resolves `draws` against `program` and adds them to `plan`'s bursts
+/// (issue #557 part 2). Every action lands in a burst after the first: by
+/// then the previous burst has quiesced, so every definition installed up
+/// front is `live` and its tables are published, which `request_backfill`
+/// and a column resume both require. Only definitions installed up front
+/// (`def_install_after_op == 0`) are paused, and their tables re-read.
+///
+/// A draw that can't apply is dropped rather than bent into something
+/// else: a plan with one burst, a column pair with no 1-1 definition, and a
+/// second pair on a definition that already has one in that burst (two
+/// overlapping pairs on one definition would resume it twice, and a
+/// whole-transform resume leaves the definition rebuilding, where a column
+/// resume is refused).
+pub fn add_burst_actions(
+    mut plan: ConcurrentPlan,
+    program: &Program,
+    draws: &[ActionDraw],
+) -> ConcurrentPlan {
+    if plan.bursts.len() < 2 {
+        return plan;
+    }
+    let up_front: Vec<&TransformDef> = program
+        .defs
+        .iter()
+        .zip(&program.def_install_after_op)
+        .filter(|(_, at)| **at == 0)
+        .map(|(def, _)| def)
+        .collect();
+    let mut tables: Vec<&str> = Vec::new();
+    for def in &up_front {
+        if !tables.contains(&def.source.as_str()) {
+            tables.push(&def.source);
+        }
+    }
+    let one_to_one: Vec<&TransformDef> = up_front
+        .iter()
+        .copied()
+        .filter(|def| matches!(def.key_space, KeySpace::OneToOne) && !def.fields.is_empty())
+        .collect();
+    let mut paired: std::collections::HashSet<(usize, &str)> = std::collections::HashSet::new();
+
+    for draw in draws {
+        let burst_index = 1 + draw.burst % (plan.bursts.len() - 1);
+        let ops = plan.bursts[burst_index].ops().len();
+        let at = usize::from(draw.start.min(1000)) * ops / 1000;
+        let end = (at + usize::from(draw.span.min(1000)) * ops / 1000).min(ops);
+        let actions = &mut plan.bursts[burst_index].actions;
+        match draw.kind {
+            ActionKind::RequestBackfill => {
+                if tables.is_empty() {
+                    continue;
+                }
+                actions.push(TimedAction {
+                    after: at,
+                    action: BurstAction::RequestBackfill {
+                        table: tables[draw.target % tables.len()].to_string(),
+                    },
+                });
+            }
+            ActionKind::PauseResume | ActionKind::ColumnPauseResume => {
+                let (def, column) = if draw.kind == ActionKind::PauseResume {
+                    if up_front.is_empty() {
+                        continue;
+                    }
+                    (up_front[draw.target % up_front.len()], None)
+                } else {
+                    if one_to_one.is_empty() {
+                        continue;
+                    }
+                    let def = one_to_one[draw.target % one_to_one.len()];
+                    let field = &def.fields[(draw.target / one_to_one.len()) % def.fields.len()];
+                    (def, Some(field.name.clone()))
+                };
+                if !paired.insert((burst_index, def.target.as_str())) {
+                    continue;
+                }
+                actions.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Pause {
+                        target: def.target.clone(),
+                        column: column.clone(),
+                    },
+                });
+                actions.push(TimedAction {
+                    after: end,
+                    action: BurstAction::Resume {
+                        target: def.target.clone(),
+                        column,
+                    },
+                });
+            }
+        }
+    }
+    sort_actions(&mut plan);
+    plan
 }
 
 /// One concurrent-tier case (issue #557): the program, how it is issued,
@@ -3649,8 +3805,86 @@ mod strategy {
     /// lanes ([`concurrent_plan`]), against an engine with [`HOT_WORKERS`]
     /// drain workers sealing every [`HOT_SEAL_INTERVAL_MS`].
     pub fn hot_key_case() -> impl Strategy<Value = ConcurrentCase> {
+        hot_key_case_with(Just(None).boxed())
+    }
+
+    /// The concurrent tier's mid-burst case (issue #557 part 2): a
+    /// [`hot_key_case`] whose bursts also stage re-reads while CDC for the
+    /// same keys is in flight.
+    ///
+    /// - Three cases in four install one more `GROUP BY` definition over
+    ///   the hot table mid-burst (always with `COUNT(*)`), so its build runs
+    ///   while the hot table takes writes: #625's build-under-load shape.
+    /// - One to [`MAX_ACTION_DRAWS`] operator actions ([`ActionDraw`]),
+    ///   placed by [`add_burst_actions`]: `request_backfill`, a pause and
+    ///   resume, or a column pause and resume.
+    /// - Three cases in four that have a relationship's to-side table also
+    ///   truncate it once, somewhere in its op stream, while the from-side
+    ///   hot table keeps changing. Parent updates come with the to-side
+    ///   table's ops, spread through the hot table's (#505).
+    pub fn mid_burst_case() -> impl Strategy<Value = ConcurrentCase> {
+        hot_key_case_with(mid_burst_draws().prop_map(Some).boxed())
+    }
+
+    /// The most [`ActionDraw`]s one [`mid_burst_case`] draws.
+    pub const MAX_ACTION_DRAWS: usize = 4;
+
+    /// The longest a drawn pause lasts before its resume, in thousandths of
+    /// the burst. Short enough that most resumes fire with a good part of
+    /// the burst still to be written, rather than piling up at its end.
+    const MAX_ACTION_SPAN: u16 = 400;
+
+    /// What [`mid_burst_case`] adds to a [`hot_key_case`].
+    #[derive(Debug, Clone)]
+    struct MidBurstDraws {
+        /// Where in the to-side table's mutates a `TRUNCATE` goes, in
+        /// thousandths.
+        parent_truncate: Option<u16>,
+        /// A `GROUP BY` definition over the hot table, and where in the
+        /// program it installs, in thousandths of the ops.
+        deferred: Option<(Vec<AggregateFn>, u16)>,
+        actions: Vec<ActionDraw>,
+    }
+
+    fn mid_burst_draws() -> impl Strategy<Value = MidBurstDraws> {
+        let action = (
+            // A column pair only applies when the case has a 1-1
+            // definition, which about half don't, so it is drawn twice as
+            // often.
+            prop_oneof![
+                1 => Just(ActionKind::RequestBackfill),
+                1 => Just(ActionKind::PauseResume),
+                2 => Just(ActionKind::ColumnPauseResume),
+            ],
+            0..8usize,
+            0..16usize,
+            0..=1000u16,
+            0..=MAX_ACTION_SPAN,
+        )
+            .prop_map(|(kind, burst, target, start, span)| ActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            });
+        (
+            prop::option::weighted(0.75, 0..=1000u16),
+            prop::option::weighted(0.75, (aggregate_functions(), 0..=1000u16)),
+            prop::collection::vec(action, 1..=MAX_ACTION_DRAWS),
+        )
+            .prop_map(|(parent_truncate, deferred, actions)| MidBurstDraws {
+                parent_truncate,
+                deferred,
+                actions,
+            })
+    }
+
+    fn hot_key_case_with(
+        extras: BoxedStrategy<Option<MidBurstDraws>>,
+    ) -> impl Strategy<Value = ConcurrentCase> {
         (1..=2usize)
-            .prop_flat_map(|table_count| {
+            .prop_flat_map(move |table_count| {
                 (
                     hot_table_spec(HOT_KEYS, HOT_MUTATES),
                     prop::collection::vec(
@@ -3663,10 +3897,21 @@ mod strategy {
                     2..=MAX_LANES,
                     HOT_WORKERS,
                     HOT_SEAL_INTERVAL_MS,
+                    extras.clone(),
                 )
             })
             .prop_map(
-                |(hot, others, (functions, hot_rel), extra, burst_size, lanes, workers, seal)| {
+                |(
+                    hot,
+                    others,
+                    (functions, hot_rel),
+                    extra,
+                    burst_size,
+                    lanes,
+                    workers,
+                    seal,
+                    extras,
+                )| {
                     let mut tables = vec![hot];
                     tables.extend(others);
                     let mut defs = vec![(0, DefShape::Aggregate { functions })];
@@ -3677,6 +3922,24 @@ mod strategy {
                         derived.push(derived_shape);
                         rel_fields.push(rel_field);
                     }
+                    let extras = extras.unwrap_or(MidBurstDraws {
+                        parent_truncate: None,
+                        deferred: None,
+                        actions: Vec::new(),
+                    });
+                    if let (Some(at), Some(parent)) = (extras.parent_truncate, tables.get_mut(1)) {
+                        let position = usize::from(at) * parent.mutates.len() / 1000;
+                        parent.mutates.insert(position, Mutate::Truncate);
+                    }
+                    if let Some((functions, _)) = &extras.deferred {
+                        let mut functions = functions.clone();
+                        if !functions.contains(&AggregateFn::Count) {
+                            functions.insert(0, AggregateFn::Count);
+                        }
+                        defs.push((0, DefShape::Aggregate { functions }));
+                        derived.push(None);
+                        rel_fields.push(None);
+                    }
                     let program = build_program_multi_with_relationships(
                         &tables,
                         &defs,
@@ -3684,8 +3947,14 @@ mod strategy {
                         &rel_fields,
                     );
                     let schedule = spread_schedule(&program);
-                    let program = interleave_tables(program, &schedule);
+                    let mut program = interleave_tables(program, &schedule);
+                    if let Some((_, at)) = extras.deferred {
+                        let (def, ops) = (program.defs.len() - 1, program.ops.len());
+                        let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
+                        program = defer_def_install(program, def, after_op);
+                    }
                     let plan = concurrent_plan(&program, burst_size, lanes);
+                    let plan = add_burst_actions(plan, &program, &extras.actions);
                     ConcurrentCase {
                         program,
                         burst_size,
@@ -4064,9 +4333,10 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, hot_key_case, noise_plan_for,
-    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    restore_plan_for, trivial_one_to_one_program_with, trivial_program, trivial_program_with,
+    MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, hot_key_case,
+    mid_burst_case, noise_plan_for, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, restore_plan_for,
+    trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
@@ -4905,10 +5175,12 @@ mod tests {
                     // pk 1 -> lane 0, pk 2 -> lane 1, pk 3 -> lane 0.
                     Burst {
                         lanes: vec![vec![0, 2, 3], vec![1]],
+                        ..Default::default()
                     },
                     // pk 2 -> lane 0, pk 1 -> lane 1, pk 3 -> lane 0.
                     Burst {
                         lanes: vec![vec![4, 6], vec![5]],
+                        ..Default::default()
                     },
                 ]
             );
@@ -4935,15 +5207,152 @@ mod tests {
                 plan.bursts,
                 vec![Burst {
                     lanes: vec![vec![0, 1, 2], vec![3], vec![4]],
+                    ..Default::default()
                 }]
             );
         }
 
         #[test]
-        #[should_panic(expected = "doesn't schedule anything by op index")]
-        fn a_program_scheduled_by_op_index_is_refused() {
+        #[should_panic(expected = "doesn't schedule a restart or a scale-out")]
+        fn a_program_with_a_restart_is_refused() {
             let program = build_program(&[(Some(1), None), (Some(2), None)], &[]);
             concurrent_plan(&schedule_restart(program, 1), 1, 1);
+        }
+
+        /// Issue #557 part 2: a deferred install becomes an install action
+        /// in the burst holding its op, firing after the burst's ops before
+        /// it.
+        #[test]
+        fn a_deferred_install_fires_mid_burst_after_the_ops_before_it() {
+            let program = build_program_multi(
+                &[TableSpec::numeric_only(
+                    (1..=6).map(|i| (Some(i), None)).collect(),
+                    Vec::new(),
+                )],
+                &[0, 0],
+            );
+            let program = defer_def_install(program, 1, 5);
+            let plan = concurrent_plan(&program, 4, 2);
+            assert!(plan.bursts[0].actions.is_empty());
+            assert_eq!(
+                plan.bursts[1].actions,
+                vec![TimedAction {
+                    after: 1,
+                    action: BurstAction::Install { def: 1 },
+                }]
+            );
+        }
+
+        /// A program of two 1-1 definitions over one table, cut into three
+        /// bursts of 4 ops.
+        fn three_burst_plan() -> (Program, ConcurrentPlan) {
+            let program = build_program_multi(
+                &[TableSpec::numeric_only(
+                    (1..=12).map(|i| (Some(i), None)).collect(),
+                    Vec::new(),
+                )],
+                &[0, 0],
+            );
+            let plan = concurrent_plan(&program, 4, 2);
+            (program, plan)
+        }
+
+        /// Draws resolve to actions in a burst after the first, a pair's
+        /// resume after its pause, and a column pair names one of the
+        /// definition's own fields.
+        #[test]
+        fn burst_actions_land_after_the_first_burst_in_order() {
+            let (program, plan) = three_burst_plan();
+            let draw = |kind, burst, target, start, span| ActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            };
+            let plan = add_burst_actions(
+                plan,
+                &program,
+                &[
+                    draw(ActionKind::PauseResume, 0, 1, 500, 250),
+                    draw(ActionKind::RequestBackfill, 0, 0, 0, 0),
+                    draw(ActionKind::ColumnPauseResume, 1, 0, 1000, 1000),
+                ],
+            );
+            assert!(plan.bursts[0].actions.is_empty());
+            let t0 = program.tables[0].name.clone();
+            let (d0, d1) = (
+                program.defs[0].target.clone(),
+                program.defs[1].target.clone(),
+            );
+            assert_eq!(
+                plan.bursts[1].actions,
+                vec![
+                    TimedAction {
+                        after: 0,
+                        action: BurstAction::RequestBackfill { table: t0 },
+                    },
+                    TimedAction {
+                        after: 2,
+                        action: BurstAction::Pause {
+                            target: d1.clone(),
+                            column: None,
+                        },
+                    },
+                    TimedAction {
+                        after: 3,
+                        action: BurstAction::Resume {
+                            target: d1,
+                            column: None,
+                        },
+                    },
+                ]
+            );
+            let column = Some(program.defs[0].fields[0].name.clone());
+            assert_eq!(
+                plan.bursts[2].actions,
+                vec![
+                    TimedAction {
+                        after: 4,
+                        action: BurstAction::Pause {
+                            target: d0.clone(),
+                            column: column.clone(),
+                        },
+                    },
+                    TimedAction {
+                        after: 4,
+                        action: BurstAction::Resume { target: d0, column },
+                    },
+                ]
+            );
+        }
+
+        /// A second pair on a definition that already has one in the burst
+        /// is dropped, and a one-burst plan takes no actions at all.
+        #[test]
+        fn burst_actions_that_cannot_apply_are_dropped() {
+            let (program, plan) = three_burst_plan();
+            let pair = |kind| ActionDraw {
+                kind,
+                burst: 0,
+                target: 0,
+                start: 0,
+                span: 1000,
+            };
+            let plan = add_burst_actions(
+                plan,
+                &program,
+                &[
+                    pair(ActionKind::PauseResume),
+                    pair(ActionKind::ColumnPauseResume),
+                ],
+            );
+            assert_eq!(plan.bursts[1].actions.len(), 2);
+
+            let one_burst = concurrent_plan(&program, 100, 2);
+            let one_burst =
+                add_burst_actions(one_burst, &program, &[pair(ActionKind::PauseResume)]);
+            assert!(one_burst.bursts[0].actions.is_empty());
         }
 
         #[cfg(feature = "proptest")]

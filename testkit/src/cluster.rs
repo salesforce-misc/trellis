@@ -256,6 +256,18 @@ impl TestCluster {
         Self::start_listening(true)
     }
 
+    /// [`TestCluster::start`], but with the cluster's directory created under
+    /// `parent` rather than the system temp dir: for a run that needs the
+    /// cluster on a real disk, where the temp dir is a tmpfs (fsync, full-page
+    /// writes and WAL bandwidth cost nothing there). `parent` must exist, and
+    /// be short enough that the socket path stays under Postgres's 107-byte
+    /// limit. Orphans a killed earlier run left under `parent` are reaped
+    /// first, as [`TestCluster::start`] does for the temp dir.
+    pub fn start_in(parent: &Path) -> Self {
+        reap_orphans_in(parent);
+        Self::start_listening_in(parent, false)
+    }
+
     fn start_listening(tcp: bool) -> Self {
         // Reclaim segments/dirs leaked by prior runs that were killed before
         // `Drop` could stop their server. Once per process is enough: our own
@@ -263,12 +275,15 @@ impl TestCluster {
         // this process's segments directly, so nothing new to reap accrues
         // from us mid-run.
         reap_orphans_once();
+        Self::start_listening_in(&std::env::temp_dir(), tcp)
+    }
 
+    fn start_listening_in(parent: &Path, tcp: bool) -> Self {
         // Gate concurrent clusters before any `initdb`; a local so setup
         // panics release it, then moved into the returned cluster.
         let permit = CLUSTERS.acquire();
 
-        let root = std::env::temp_dir().join(format!("trellis-testkit-{}", unique_suffix()));
+        let root = parent.join(format!("trellis-testkit-{}", unique_suffix()));
         let data_dir = root.join("data");
         let socket_dir = root.join("sock");
         fs::create_dir_all(&socket_dir).expect("create socket dir");

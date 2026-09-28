@@ -2,12 +2,16 @@
 //! issued from separate tasks, each on its own connection, against a
 //! multi-worker engine.
 
+use std::sync::Arc;
+
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use trellis::Pool;
+use trellis::dev::defs::ast::TransformDef;
 
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
 use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};
-use crate::model::{ConcurrentPlan, Op, Program};
+use crate::model::{BurstAction, ConcurrentPlan, Op, Program};
 
 /// What [`run_convergence_concurrent`] reports alongside [`Outcome::Ran`]:
 /// how the engine actually sealed and claimed the run's batches.
@@ -21,8 +25,15 @@ pub struct ConcurrentRun {
 /// burst, each lane is one spawned task applying its ops in order on its own
 /// [`OpApplier`], concurrently with the other lanes, and checking each op's
 /// outcome against [`Op::expect`] as [`super::run_convergence`] does. Once
-/// every lane has finished, the engine is quiesced and every definition is
-/// checked against the oracle, once per burst.
+/// every lane has finished, the engine is quiesced and every definition
+/// installed so far is checked against the oracle, once per burst.
+///
+/// While the lanes run, this task takes the burst's operator actions
+/// ([`crate::model::Burst::actions`], issue #557 part 2) in order, each once
+/// its [`crate::model::TimedAction::after`] count of the burst's ops has been
+/// applied, through [`ConcurrentBackend::act`]. A definition deferred by
+/// [`Program::def_install_after_op`] is installed by the plan's
+/// [`BurstAction::Install`] rather than up front.
 ///
 /// Like [`super::run_convergence_bursty`], a divergence is only localized to
 /// its burst: [`super::Divergence::op_index`] is the burst's highest op
@@ -35,9 +46,10 @@ pub struct ConcurrentRun {
 ///
 /// # Panics
 ///
-/// If `plan` doesn't cover `program.ops` exactly once, or a lane isn't in
-/// program order: both are generator bugs (`crate::generate::concurrent_plan`
-/// builds every plan).
+/// If `plan` doesn't cover `program.ops` exactly once, a lane isn't in
+/// program order, or the plan's install actions aren't exactly the
+/// program's deferred definitions: each is a generator bug
+/// (`crate::generate::concurrent_plan` builds every plan).
 pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
     backend: &mut B,
     pool: &Pool,
@@ -57,10 +69,43 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
             .all(|lane| lane.is_sorted()),
         "run_convergence_concurrent: every lane must be in program order — a generator bug"
     );
+    let mut installs: Vec<usize> = plan
+        .bursts
+        .iter()
+        .flat_map(|b| &b.actions)
+        .filter_map(|a| match a.action {
+            BurstAction::Install { def } => Some(def),
+            _ => None,
+        })
+        .collect();
+    installs.sort_unstable();
+    let deferred: Vec<usize> = (0..program.defs.len())
+        .filter(|&def| program.def_install_after_op[def] != 0)
+        .collect();
+    assert_eq!(
+        installs, deferred,
+        "run_convergence_concurrent: the plan must install each deferred definition once — a \
+         generator bug"
+    );
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
 
+    let mut installed: Vec<TransformDef> = program
+        .defs
+        .iter()
+        .zip(&program.def_install_after_op)
+        .filter(|(_, at)| **at == 0)
+        .map(|(def, _)| def.clone())
+        .collect();
     backend
-        .install(program)
+        .install(&Program {
+            tables: program.tables.clone(),
+            relationships: program.relationships.clone(),
+            defs: installed.clone(),
+            def_install_after_op: vec![0; installed.len()],
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        })
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
     backend
@@ -85,24 +130,52 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
             .await
             .map_err(|e| RunError::Quiesce(format!("drain audit: {e:?}")))?;
 
+        // How many of the burst's ops the lanes have applied so far, which
+        // is what an action waits on. A lane that stops at a failed op
+        // counts the rest of its ops as applied, so no action waits forever.
+        let progress = Arc::new(watch::channel(0usize).0);
         let mut tasks = JoinSet::new();
         for (lane_index, lane) in burst.lanes.iter().enumerate() {
             let mut applier = appliers[lane_index]
                 .take()
                 .expect("each lane's applier is returned before the next burst");
             let ops: Vec<(usize, Op)> = lane.iter().map(|&i| (i, program.ops[i].clone())).collect();
+            let progress = Arc::clone(&progress);
             tasks.spawn(async move {
                 let mut result = Ok(());
-                for (op_index, op) in &ops {
+                for (done, (op_index, op)) in ops.iter().enumerate() {
                     let applied = applier.apply(op).await;
                     if let Err(e) = check_op_outcome(*op_index, op, &applied) {
                         result = Err(e);
+                        progress.send_modify(|n| *n += ops.len() - done);
                         break;
                     }
+                    progress.send_modify(|n| *n += 1);
                 }
                 (lane_index, applier, result)
             });
         }
+
+        let mut action_error: Option<RunError> = None;
+        let mut applied = progress.subscribe();
+        for timed in &burst.actions {
+            applied
+                .wait_for(|&n| n >= timed.after)
+                .await
+                .expect("this task holds the sender");
+            if let Err(e) = backend.act(program, &timed.action).await {
+                action_error = Some(RunError::BurstAction {
+                    burst: index,
+                    action: timed.action.clone(),
+                    error: format!("{e:?}"),
+                });
+                break;
+            }
+            if let BurstAction::Install { def } = timed.action {
+                installed.push(program.defs[def].clone());
+            }
+        }
+
         // Every lane runs to completion (or its own first failure) before
         // any error is reported, so no task outlives the burst.
         let mut first_error: Option<RunError> = None;
@@ -123,19 +196,12 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
                 }
             }
         }
-        if let Some(e) = first_error {
+        if let Some(e) = first_error.or(action_error) {
             return Err(e);
         }
 
-        quiesce_snapshot_and_check(
-            backend,
-            pool,
-            program,
-            last_op,
-            &program.defs,
-            timing_enabled,
-        )
-        .await?;
+        quiesce_snapshot_and_check(backend, pool, program, last_op, &installed, timing_enabled)
+            .await?;
     }
 
     let drain = backend

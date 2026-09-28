@@ -22,7 +22,7 @@ pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 use std::collections::BTreeMap;
 use std::future::Future;
 
-use crate::model::{Op, Program, RestartMode};
+use crate::model::{BurstAction, Op, Program, RestartMode};
 
 /// Merged source+derived state, read back deterministically: `table -> pk
 /// (rendered text) -> column -> value (rendered text, `None` is SQL
@@ -122,6 +122,17 @@ pub trait ConcurrentBackend: Backend {
 
     /// What the recording has seen so far.
     fn drain_audit(&mut self) -> impl Future<Output = Result<DrainAudit, Self::Error>> + Send;
+
+    /// Takes one operator action while a burst's lanes run (issue #557 part
+    /// 2), through the public API an operator would use: see each
+    /// [`BurstAction`] for the call. `program` supplies an
+    /// [`BurstAction::Install`]'s definition, which from then on is part of
+    /// what [`Backend::quiesce`] waits for and [`Backend::snapshot`] reads.
+    fn act(
+        &mut self,
+        program: &Program,
+        action: &BurstAction,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// The fewest rows a sealed batch needs for the engine to split it into

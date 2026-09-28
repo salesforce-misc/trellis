@@ -57,7 +57,7 @@ use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Intake
 use super::Snapshot;
 use super::sql::{self, quote_ident};
 use crate::model::{
-    Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, SlotLossKind, Table,
+    BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, SlotLossKind, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits for convergence before giving
@@ -392,6 +392,10 @@ pub struct ManualBackend {
     /// pool, and this backend's own raw connection provably share one
     /// instance identity.
     config: Config,
+    /// The public [`trellis::Trellis`] facade [`super::ConcurrentBackend::act`]
+    /// takes operator actions through, connected on first use. It runs no
+    /// background work of its own.
+    operator: Option<trellis::Trellis>,
 }
 
 impl ManualBackend {
@@ -521,6 +525,7 @@ impl ManualBackend {
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
             target_schema,
             config,
+            operator: None,
         })
     }
 
@@ -1398,5 +1403,54 @@ impl super::ConcurrentBackend for ManualBackend {
             max_rows_per_batch: count(4),
             keys_in_several_batches: count(5),
         })
+    }
+
+    async fn act(
+        &mut self,
+        program: &Program,
+        action: &BurstAction,
+    ) -> Result<(), ManualBackendError> {
+        if let BurstAction::Install { def } = action {
+            // The same front door as an up-front install: the relationships
+            // and tables went in with the first `install`.
+            let def = program.defs[*def].clone();
+            return super::Backend::install(
+                self,
+                &Program {
+                    tables: Vec::new(),
+                    relationships: Vec::new(),
+                    defs: vec![def],
+                    def_install_after_op: vec![0],
+                    ops: Vec::new(),
+                    restart_after_ops: Vec::new(),
+                    scale_out_after_ops: Vec::new(),
+                },
+            )
+            .await;
+        }
+        if self.operator.is_none() {
+            self.operator =
+                Some(trellis::Trellis::connect(self.config.clone(), Default::default()).await?);
+        }
+        let operator = self.operator.as_ref().expect("connected just above");
+        let address = |target: &str, column: &Option<String>| match column {
+            Some(column) => format!("{target}.{column}"),
+            None => target.to_string(),
+        };
+        match action {
+            BurstAction::RequestBackfill { table } => operator.request_backfill(table).await?,
+            BurstAction::Pause { target, column } => {
+                operator
+                    .apply(&format!("PAUSE TRANSFORM {}", address(target, column)))
+                    .await?;
+            }
+            BurstAction::Resume { target, column } => {
+                operator
+                    .apply(&format!("RESUME TRANSFORM {}", address(target, column)))
+                    .await?;
+            }
+            BurstAction::Install { .. } => unreachable!("handled above"),
+        }
+        Ok(())
     }
 }

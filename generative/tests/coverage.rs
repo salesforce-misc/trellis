@@ -10,8 +10,9 @@ use std::collections::HashSet;
 
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan, hot_key_case,
-    noise_plan_for, program_with_client_restart, program_with_mid_stream_def_install,
-    program_with_scale_out, table_streams, trivial_program, trivial_program_with,
+    mid_burst_case, noise_plan_for, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
+    trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, RelPath};
@@ -1563,7 +1564,11 @@ fn the_hot_key_tier_draws_every_concurrent_shape() {
          lane): {:?}\nafter (hot_key_case): {:?}",
         before.concurrent_shape_cases, after.concurrent_shape_cases
     );
-    for shape in ConcurrentShape::ALL {
+    assert!(
+        after.concurrent_actions.is_empty(),
+        "hot_key_case takes no mid-burst action (mid_burst_case does): {after}"
+    );
+    for shape in ConcurrentShape::HOT_KEY {
         let reached = after
             .concurrent_shape_cases
             .get(shape.name())
@@ -1573,6 +1578,51 @@ fn the_hot_key_tier_draws_every_concurrent_shape() {
             reached * 2 >= SAMPLES,
             "hot_key_case must reach {} in at least half of {SAMPLES} cases, got {reached}: \
              {after}",
+            shape.name()
+        );
+    }
+}
+
+/// Issue #557 part 2: the mid-burst cases reach every [`ConcurrentShape`],
+/// the mid-burst actions and to-side ops included (`hot_key_case` takes no
+/// action at all: `the_hot_key_tier_draws_every_concurrent_shape` checks
+/// that). Prints the shape tally and the per-action counts. The action
+/// shapes depend on which actions a case draws, so their floors are lower
+/// than the hot-key shapes'.
+#[test]
+fn the_mid_burst_tier_draws_every_action_shape() {
+    const SAMPLES: usize = 40;
+    let mut runner = TestRunner::deterministic();
+    let strategy = mid_burst_case();
+    let mut after = generative::run::Coverage::new();
+    for _ in 0..SAMPLES {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        after.record_program(&case.program);
+        after.record_concurrent_plan(&case.program, &case.plan);
+    }
+
+    eprintln!(
+        "concurrent shapes over {SAMPLES} cases (mid_burst_case): {:?}\nactions: {:?}",
+        after.concurrent_shape_cases, after.concurrent_actions
+    );
+    for shape in ConcurrentShape::ALL {
+        let reached = after
+            .concurrent_shape_cases
+            .get(shape.name())
+            .copied()
+            .unwrap_or(0);
+        let floor = if ConcurrentShape::HOT_KEY.contains(&shape) {
+            SAMPLES / 2
+        } else {
+            SAMPLES / 8
+        };
+        assert!(
+            reached >= floor,
+            "mid_burst_case must reach {} in at least {floor} of {SAMPLES} cases, got \
+             {reached}: {after}",
             shape.name()
         );
     }

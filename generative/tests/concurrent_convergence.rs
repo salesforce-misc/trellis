@@ -47,9 +47,52 @@
 //! really split across workers; the first only says the program gave the
 //! engine the chance.
 //!
-//! Mid-burst catch-up actions (`request_backfill`, resume, to-side
-//! truncate) and planted ordering bugs are #557's parts 2 and 3. A lane is
-//! where part 2 adds its actions (`model::Burst`).
+//! [`property_mid_burst_rereads_converge_under_concurrent_drains`] is the
+//! mid-burst tier (issue #557, part 2). It draws `generate::mid_burst_case`:
+//! a hot-key case whose bursts also stage re-reads while CDC for the same
+//! keys is in flight, instead of only at quiescent points. The harness takes
+//! each action from its own task while the lanes run, once a drawn share of
+//! the burst's ops has been applied (`model::TimedAction`):
+//!
+//! - `Trellis::request_backfill` on a table a live definition reads;
+//! - `PAUSE TRANSFORM` then `RESUME TRANSFORM`, of a whole definition or of
+//!   one column of a 1-1 definition (the column resume is the same call that
+//!   recovers a column after its poison fuse trips);
+//! - installing a `GROUP BY` definition over the hot table mid-burst, so its
+//!   build overlaps CDC on its source (#625's build-under-load shape);
+//! - a `TRUNCATE` of a relationship's to-side table, and to-side row updates,
+//!   while the from-side hot table churns.
+//!
+//! The actions are named after the public API an operator calls, not the
+//! mechanism behind it, because the mechanism is what epic #556 rewrites:
+//! today each stages a catch-up re-read, and under ADR-0002 milestone F
+//! (#625) each becomes a Re-derive. The coverage report adds per-shape
+//! counts (`mid_burst_backfill`, `mid_burst_resume`,
+//! `mid_burst_column_resume`, `mid_burst_install`, `to_side_truncate`,
+//! `parent_update`) and per-action counts (`concurrent_actions`).
+//!
+//! Planted ordering bugs are #557's part 3.
+//!
+//! # A disk-backed cluster
+//!
+//! This binary's shared cluster normally lives in the system temp dir, a
+//! tmpfs on the nightly box, where fsync and WAL writes cost nothing. #625's
+//! build-under-load divergence reproduced 5 times in 6 on disk and never on
+//! tmpfs, so commit timing matters. Set `GENERATIVE_CLUSTER_DIR` to a
+//! directory on a real disk to put the cluster there (the run refuses a
+//! tmpfs), and `TRELLIS_TESTKIT_PG_OPTIONS` for any server settings, e.g.
+//!
+//! ```text
+//! GENERATIVE_CLUSTER_DIR=$PWD/target/generative-disk \
+//! TRELLIS_TESTKIT_PG_OPTIONS='checkpoint_timeout=30s' \
+//! cargo test -p generative --test concurrent_convergence \
+//!     property_mid_burst -- --ignored
+//! ```
+//!
+//! On disk both concurrent-tier properties find a `GROUP BY` divergence
+//! within a few cases, where the tmpfs cluster converges. It needs neither
+//! the mid-burst actions nor concurrency:
+//! [`group_moves_converge_on_disk`] pins it, `#[ignore]`d until #625.
 //!
 //! # The burst-batching knob
 //!
@@ -125,9 +168,11 @@
 //! why); this file's `HARNESS` is its own, independent `thread_local`, so the
 //! two test binaries never share a cluster or a slot/publication.
 
-use generative::backend::{ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
+use generative::backend::{Backend, ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
 use generative::generate::{
-    ConcurrentCase, Mutate, build_program, hot_key_case, schedule_restart, schedule_scale_out,
+    ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
+    TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
+    defer_def_install, hot_key_case, mid_burst_case, schedule_restart, schedule_scale_out,
     trivial_program,
 };
 use generative::run::{
@@ -159,6 +204,8 @@ struct Harness {
     /// The hot-key property's own report (issue #557), kept apart from
     /// `coverage` so each property's numbers read on their own.
     hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// The mid-burst property's own report (issue #557 part 2).
+    mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
 }
 
 impl Drop for Harness {
@@ -178,16 +225,68 @@ impl Drop for Harness {
                 self.hot_key_coverage.borrow()
             );
         }
+        if self.mid_burst_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence mid-burst tier coverage:\n{}",
+                self.mid_burst_coverage.borrow()
+            );
+        }
     }
 }
 
 thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
-        cluster: TestCluster::start(),
+        cluster: start_cluster(),
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        mid_burst_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
+}
+
+/// The environment variable that puts the harness's cluster on a real disk
+/// (see the module doc comment's "A disk-backed cluster").
+const CLUSTER_DIR_ENV: &str = "GENERATIVE_CLUSTER_DIR";
+
+/// The harness's shared cluster: in the system temp dir, or under
+/// [`CLUSTER_DIR_ENV`] when it is set. Prints which storage the run uses, and
+/// refuses a [`CLUSTER_DIR_ENV`] on a tmpfs, since a tmpfs run passed off as a
+/// disk run would say nothing about disk timing.
+fn start_cluster() -> TestCluster {
+    let Some(dir) = std::env::var_os(CLUSTER_DIR_ENV) else {
+        eprintln!(
+            "generative: concurrent_convergence cluster in the temp dir; set {CLUSTER_DIR_ENV} \
+             for a disk-backed one"
+        );
+        return TestCluster::start();
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("create the cluster dir");
+    // Postgres data on btrfs shouldn't be copy-on-write; `+C` only takes
+    // effect on files created after it's set. Best effort: other filesystems
+    // refuse it, harmlessly.
+    let _ = std::process::Command::new("chattr")
+        .arg("+C")
+        .arg(&dir)
+        .status();
+    let fs_type = std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(&dir)
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert_ne!(
+        fs_type,
+        "tmpfs",
+        "{CLUSTER_DIR_ENV}={} is a tmpfs; point it at a real disk",
+        dir.display()
+    );
+    eprintln!(
+        "generative: concurrent_convergence cluster under {} ({fs_type})",
+        dir.display()
+    );
+    TestCluster::start_in(&dir)
 }
 
 fn proptest_config() -> ProptestConfig {
@@ -249,16 +348,18 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
     })
 }
 
-/// Runs one hot-key case (issue #557) against a fresh isolated database:
-/// the case's own worker count and seal cadence, its plan's lanes issued
-/// from separate tasks. Records the case's shapes and the engine's drain
-/// audit into the harness's coverage report.
-fn run_hot_key_case(case: &ConcurrentCase) -> Result<(), TestCaseError> {
+/// Runs one concurrent-tier case (issue #557) against a fresh isolated
+/// database: the case's own worker count and seal cadence, its plan's lanes
+/// issued from separate tasks, its mid-burst actions taken while they run.
+/// Records the case's shapes and the engine's drain audit into `coverage`.
+fn run_concurrent_case(
+    case: &ConcurrentCase,
+    coverage: impl Fn(&Harness) -> &std::cell::RefCell<generative::run::Coverage>,
+) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
-        h.hot_key_coverage
-            .borrow_mut()
-            .record_program(&case.program);
-        h.hot_key_coverage
+        let coverage = coverage(h);
+        coverage.borrow_mut().record_program(&case.program);
+        coverage
             .borrow_mut()
             .record_concurrent_plan(&case.program, &case.plan);
 
@@ -271,13 +372,22 @@ fn run_hot_key_case(case: &ConcurrentCase) -> Result<(), TestCaseError> {
             )
             .await
             .expect("connect concurrent backend");
+            // A unique slot per case, as issue #188 requires on a shared
+            // cluster. The publication keeps its default name: it is
+            // per-database, so it can't collide, and `request_backfill`
+            // only looks for the default one.
             let unique = db.name().replace('-', "_");
-            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
+            backend.set_slot_and_publication(
+                format!("{unique}_slot"),
+                trellis::ClientOptions::default().publication,
+            );
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
+            let actions: usize = case.plan.bursts.iter().map(|b| b.actions.len()).sum();
             let shape = format!(
-                "{} ops, burst_size {}, {} bursts, up to {} lanes, {} workers, seal every {}ms",
+                "{} ops, burst_size {}, {} bursts, up to {} lanes, {actions} actions, {} workers, \
+                 seal every {}ms",
                 case.program.ops.len(),
                 case.burst_size,
                 case.plan.bursts.len(),
@@ -292,7 +402,7 @@ fn run_hot_key_case(case: &ConcurrentCase) -> Result<(), TestCaseError> {
             );
             match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
                 Ok(run) => {
-                    h.hot_key_coverage.borrow_mut().record_drain(&run.drain);
+                    coverage.borrow_mut().record_drain(&run.drain);
                     if run.outcome.as_pass() {
                         Ok(())
                     } else {
@@ -303,8 +413,8 @@ fn run_hot_key_case(case: &ConcurrentCase) -> Result<(), TestCaseError> {
                     }
                 }
                 Err(RunError::Diverged(d)) => Err(TestCaseError::fail(format!(
-                    "hot-key case diverged in the burst ending at op {} (target {}; {shape}) — \
-                     see this file's module doc comment's shrink-trust convention before \
+                    "concurrent case diverged in the burst ending at op {} (target {}; {shape}) \
+                     — see this file's module doc comment's shrink-trust convention before \
                      trusting this as a minimal repro:\n{}",
                     d.op_index, d.def_target, d.report
                 ))),
@@ -333,7 +443,14 @@ proptest! {
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_hot_keys_converge_under_concurrent_drains(case in hot_key_case()) {
-        run_hot_key_case(&case)?;
+        run_concurrent_case(&case, |h| &h.hot_key_coverage)?;
+    }
+
+    /// Issue #557 part 2: the mid-burst tier. See the module doc comment.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_mid_burst_rereads_converge_under_concurrent_drains(case in mid_burst_case()) {
+        run_concurrent_case(&case, |h| &h.mid_burst_coverage)?;
     }
 }
 
@@ -530,4 +647,242 @@ async fn a_restart_and_a_scale_out_interleaved_still_converge_under_the_concurre
             )
         });
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
+}
+
+/// Issue #557 part 2: every kind of mid-burst action goes through the
+/// concurrent runner and the backend's public-API calls while its burst's
+/// lanes still write the source, and the burst still converges. The
+/// property draws these actions; this pin is what exercises them in the
+/// default suite, where the property doesn't run.
+///
+/// One hot table of 12 rows takes 240 writes, read by a `GROUP BY`
+/// definition (`d0`) and a 1-1 definition (`d1`). A second `GROUP BY`
+/// definition (`d2`) installs mid-burst. The second of two bursts also
+/// takes a `request_backfill`, a pause and resume of `d0`, and a column
+/// pause and resume of `d1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
+    const ROWS: i64 = 12;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let mutates = (0..240)
+        .map(|i| {
+            let pk = 1 + i % ROWS;
+            if i % 3 == 0 {
+                Mutate::MoveGroup {
+                    pk,
+                    grain: Some(i % 4),
+                }
+            } else {
+                Mutate::Update {
+                    pk,
+                    c1: Some(i),
+                    c2: Some(1),
+                }
+            }
+        })
+        .collect();
+    let mut hot =
+        TableSpec::numeric_only((1..=ROWS).map(|i| (Some(i), Some(1))).collect(), mutates);
+    hot.grain_values = (1..=ROWS).map(|i| Some((i % 3).to_string())).collect();
+    let program = build_program_multi_with_shapes(
+        &[hot],
+        &[
+            (
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count, AggregateFn::Sum(AggregateColumn::C1)],
+                },
+            ),
+            (0, DefShape::OneToOne),
+            (
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count],
+                },
+            ),
+        ],
+    );
+    assert_eq!(program.ops.len(), 252, "sanity check on the fixture shape");
+    // Bursts of 126 ops: `d2` installs 24 ops into the second.
+    let program = defer_def_install(program, 2, 150);
+    let draw = |kind, start| ActionDraw {
+        kind,
+        burst: 0,
+        target: 0,
+        start,
+        span: 300,
+    };
+    let plan = add_burst_actions(
+        concurrent_plan(&program, 126, 2),
+        &program,
+        &[
+            draw(ActionKind::RequestBackfill, 100),
+            draw(ActionKind::PauseResume, 300),
+            draw(ActionKind::ColumnPauseResume, 500),
+        ],
+    );
+    assert!(plan.bursts[0].actions.is_empty());
+    let mut names: Vec<&str> = plan.bursts[1]
+        .actions
+        .iter()
+        .map(|a| a.action.name())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "install",
+            "pause",
+            "pause_column",
+            "request_backfill",
+            "resume",
+            "resume_column"
+        ]
+    );
+
+    let mut backend = ManualBackend::connect_with_options(
+        db.dsn(),
+        4,
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await
+    .expect("connect concurrent backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
+        .await
+        .expect("every mid-burst action must be taken and the bursts must converge");
+    assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome);
+}
+
+/// The fixture [`group_moves_converge_on_disk`] runs: one table of 12 rows
+/// spread over groups `0..3`, then 1,488 updates that each move one row to
+/// another group (`Mutate::MoveGroup`, nothing else), read by one `GROUP BY`
+/// definition with `COUNT(*)` and `SUM`. Half the moves pick one of the 3
+/// hottest rows. The target group is drawn from a window of 8 that slides up
+/// 2 groups every 150 moves, so groups empty for good as well as refill. A
+/// fixed-seed generator draws it all, so every run gets the same program.
+fn group_moves() -> generative::model::Program {
+    const ROWS: i64 = 12;
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    let mutates = (0..1_488)
+        .map(|i| {
+            let pk = 1 + if next(2) == 0 {
+                next(3)
+            } else {
+                next(ROWS as u64)
+            } as i64;
+            let grain = (i / 150) as i64 * 2 + next(8) as i64;
+            Mutate::MoveGroup {
+                pk,
+                grain: Some(grain),
+            }
+        })
+        .collect();
+    let mut table =
+        TableSpec::numeric_only((1..=ROWS).map(|i| (Some(i), Some(1))).collect(), mutates);
+    table.grain_values = (1..=ROWS).map(|i| Some((i % 3).to_string())).collect();
+    build_program_multi_with_shapes(
+        &[table],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Count, AggregateFn::Sum(AggregateColumn::C2)],
+            },
+        )],
+    )
+}
+
+/// Found by #557 part 2's disk-backed cluster, and the shape #625's
+/// build-under-load divergence reports: on a real disk, plain group moves
+/// leave a `GROUP BY` target wrong for good. A group every row has left
+/// keeps its target row, or a group's `COUNT(*)` is one to three too high.
+/// No build overlaps the moves once the first burst has passed its check,
+/// and nothing is re-read or paused. It needs no concurrency either: one
+/// lane issues every op in program order and one drain worker applies
+/// them, so this is the serial runtime in effect. On the tmpfs test cluster
+/// the same run converges.
+///
+/// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
+/// bursts of 500 ops sealed every 85ms, and fails if any attempt diverged,
+/// reporting how many did and whether each divergence was still there after
+/// another 5 seconds and quiesce. Run it on disk:
+///
+/// ```text
+/// GENERATIVE_CLUSTER_DIR=$PWD/target/generative-disk \
+/// cargo test -p generative --test concurrent_convergence \
+///     group_moves_converge_on_disk -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diverges on a disk-backed cluster until #625 (#556 milestone F) fixes it; \
+            run with GENERATIVE_CLUSTER_DIR set"]
+async fn group_moves_converge_on_disk() {
+    const ATTEMPTS: usize = 20;
+    let cluster = start_cluster();
+    let program = group_moves();
+    let plan = concurrent_plan(&program, 500, 1);
+    let mut diverged = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let db = cluster.create_isolated_database().await;
+        let mut backend = ManualBackend::connect_with_options(
+            db.dsn(),
+            1,
+            Some(std::time::Duration::from_millis(85)),
+        )
+        .await
+        .expect("connect backend");
+        let unique = db.name().replace('-', "_");
+        backend.set_slot_and_publication(
+            format!("{unique}_slot"),
+            trellis::ClientOptions::default().publication,
+        );
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        match run_convergence_concurrent(&mut backend, &pool, &program, &plan).await {
+            Ok(run) => assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome),
+            Err(RunError::Diverged(d)) => {
+                // Diagnostic only: whether the engine corrects the target
+                // given more time, or it stays wrong (#625 saw the latter).
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                backend.quiesce().await.expect("quiesce again");
+                let snapshot = backend.snapshot().await.expect("snapshot again");
+                let later = generative::run::check_defs(&pool, &program, &program.defs, &snapshot)
+                    .await
+                    .expect("check again");
+                // The report's first lines name the wrong rows; the rest
+                // prints the whole program.
+                let report = d.report.to_string();
+                let rows: Vec<&str> = report
+                    .lines()
+                    .skip(1)
+                    .take_while(|l| l.starts_with("  "))
+                    .collect();
+                eprintln!(
+                    "attempt {attempt}: diverged in the burst ending at op {}: {} ({} 5s and \
+                     another quiesce later)",
+                    d.op_index,
+                    rows.join(";"),
+                    if later.is_some() {
+                        "still wrong"
+                    } else {
+                        "corrected"
+                    }
+                );
+                diverged.push(attempt);
+            }
+            Err(other) => panic!("attempt {attempt}: run error: {other:?}"),
+        }
+    }
+    assert!(
+        diverged.is_empty(),
+        "{} of {ATTEMPTS} attempts diverged: {diverged:?}",
+        diverged.len()
+    );
 }

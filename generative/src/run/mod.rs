@@ -39,7 +39,7 @@ use trellis::Pool;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 use crate::backend::{Backend, Snapshot};
-use crate::model::{DbAdminAction, Op, OpOutcome, Program};
+use crate::model::{BurstAction, DbAdminAction, Op, OpOutcome, Program};
 use crate::oracle::{self, ThreeWayReport};
 
 /// Classifies whether a property run counted as evidence at all (design doc
@@ -190,6 +190,15 @@ pub enum RunError {
     PausedAfterRestore {
         op_index: usize,
         paused: Vec<(String, String)>,
+    },
+    /// Issue #557 part 2: the engine refused, or the harness failed to
+    /// carry out, a mid-burst operator action in burst `burst`. The plan
+    /// only draws actions that apply (`crate::generate::add_burst_actions`),
+    /// so this is a generator, harness or engine bug.
+    BurstAction {
+        burst: usize,
+        action: BurstAction,
+        error: String,
     },
 }
 

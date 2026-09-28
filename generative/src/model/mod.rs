@@ -417,11 +417,79 @@ pub struct ConcurrentPlan {
 /// order at all, so Postgres commits their ops in whatever order the tasks
 /// happen to reach it.
 ///
-/// Part 2 of #557 extends a lane with mid-burst catch-up actions; today a
-/// lane is ops only.
+/// `actions` are operator actions the harness takes while the lanes run
+/// (issue #557 part 2), in order of [`TimedAction::after`]: each fires once
+/// that many of the burst's ops have been applied, by whichever lanes, so
+/// the re-read it stages overlaps the burst's CDC rather than landing at a
+/// quiescent point.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Burst {
     pub lanes: Vec<Vec<usize>>,
+    pub actions: Vec<TimedAction>,
+}
+
+/// A [`BurstAction`] and when in its burst it fires (issue #557 part 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedAction {
+    /// How many of the burst's ops must have been applied, across all its
+    /// lanes, before the action fires: `0` fires as the lanes start, the
+    /// burst's op count once they have all applied their last op (while the
+    /// engine is still draining them).
+    pub after: usize,
+    pub action: BurstAction,
+}
+
+/// An operator action the concurrent tier takes mid-burst (issue #557 part
+/// 2). Each is named after the public API call an operator makes, not the
+/// engine mechanism behind it, because the mechanism is what epic #556
+/// rewrites: today each one stages a catch-up re-read, and under ADR-0002
+/// milestone F (#625) each becomes a Re-derive. None of them changes what the
+/// converged targets should hold, so the oracle is unchanged: the burst is
+/// checked once it settles, like any other.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BurstAction {
+    /// `Trellis::request_backfill(table)`: re-derive every definition that
+    /// reads `table`.
+    RequestBackfill { table: String },
+    /// `PAUSE TRANSFORM <target>` or, with a column, `PAUSE TRANSFORM
+    /// <target>.<column>`. A generated plan always resumes it later in the
+    /// same burst: a definition left paused would never converge.
+    Pause {
+        target: String,
+        column: Option<String>,
+    },
+    /// `RESUME TRANSFORM <target>[.<column>]`. A whole-transform resume
+    /// rebuilds the target from the source; a column resume re-derives the
+    /// column on every row. The column form is the same call that recovers a
+    /// column after its poison fuse trips (ADR-0014: one paused state, two
+    /// triggers).
+    Resume {
+        target: String,
+        column: Option<String>,
+    },
+    /// `DEFINE TRANSFORM` for `program.defs[def]`, whose
+    /// [`Program::def_install_after_op`] falls in this burst: its build runs
+    /// while the burst still writes the source (the shape #625's
+    /// build-under-load divergence needs).
+    Install { def: usize },
+}
+
+impl BurstAction {
+    /// The name coverage reports this action under.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BurstAction::RequestBackfill { .. } => "request_backfill",
+            BurstAction::Pause { column: None, .. } => "pause",
+            BurstAction::Pause {
+                column: Some(_), ..
+            } => "pause_column",
+            BurstAction::Resume { column: None, .. } => "resume",
+            BurstAction::Resume {
+                column: Some(_), ..
+            } => "resume_column",
+            BurstAction::Install { .. } => "install",
+        }
+    }
 }
 
 impl Burst {
