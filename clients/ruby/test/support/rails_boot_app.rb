@@ -5,12 +5,25 @@
 # Prints one JSON line of what it saw.
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "json"
+require "tmpdir"
+
+# An app without ActiveRecord: the bundle has the gem, so this shadows it
+# with a file whose require fails the way it would if the app's Gemfile
+# didn't list it.
+WITHOUT_ACTIVE_RECORD = ARGV.fetch(0) == "rake_without_active_record"
+if WITHOUT_ACTIVE_RECORD
+  shadow = Dir.mktmpdir("no-active-record")
+  File.write(File.join(shadow, "active_record.rb"),
+             'raise LoadError, "cannot load such file -- active_record"')
+  $LOAD_PATH.unshift shadow
+end
+
 # ActiveRecord's own connection, never opened: with no config/database.yml,
 # loading ActiveRecord::Base needs one configured.
 ENV["DATABASE_URL"] = "postgresql://localhost/unused"
 require "logger"
 require "rails"
-require "active_record/railtie"
+require "active_record/railtie" unless WITHOUT_ACTIVE_RECORD
 # After Rails, as Bundler.require in config/application.rb loads it.
 require "trellis"
 
@@ -41,7 +54,7 @@ when "connect_on_boot_false"
   seen[:connected] = Trellis.connected?
   Trellis::Railtie.connect
   seen[:connected_after_connect] = Trellis.connected?
-when "rake"
+when "rake", "rake_without_active_record"
   # What `rails db:migrate` does: a rake run loads the tasks and runs one
   # that needs the app, whose `environment` prerequisite initializes it (by
   # requiring config/environment.rb, which this app hasn't got).

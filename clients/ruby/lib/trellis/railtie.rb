@@ -44,7 +44,8 @@ module Trellis
   #   before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
   #
   # With Puma's fork_worker, worker 0 forks the others, so it needs
-  # before_worker_fork and after_worker_fork hooks as well: see the README.
+  # before_worker_fork and after_worker_fork hooks as well: see "Forking
+  # servers" in the README.
   class Railtie < ::Rails::Railtie
     config.trellis = ActiveSupport::OrderedOptions.new
     config.trellis.connect = nil
@@ -54,8 +55,7 @@ module Trellis
       namespace :trellis do
         desc "Create or upgrade Trellis's own tables, with config.trellis.connect's url"
         task migrate: :environment do
-          require "trellis/migration"
-          Trellis::Migration.with_handle { nil }
+          Trellis::Railtie.with_handle { nil }
         end
       end
     end
@@ -73,9 +73,39 @@ module Trellis
       # Raises ValidationError if config.trellis.connect isn't set, and
       # whatever Trellis.connect raises.
       def connect
-        options = connect_options or
-          raise ValidationError, "config.trellis.connect is not set: give it Trellis.connect's options"
-        Trellis.connect(**options)
+        Trellis.connect(**required_connect_options)
+      end
+
+      # Runs the block with this process's handle, running Trellis.migrate
+      # first, and returns the block's value. If the process isn't connected
+      # (a rake task gets no boot handle), connects one for the length of
+      # the block from config.trellis.connect, with staging: false and
+      # drain_threads: 0 so it starts no background work, and shuts it down
+      # after. What `rails trellis:migrate` and Trellis::Migration's helpers
+      # run on, for a script or rake task of your own that needs Trellis the
+      # way a migration does. Needs no ActiveRecord.
+      #
+      # Raises what the block raises. If the shutdown fails too, that's a
+      # warning, so it doesn't hide the block's error; after a block that
+      # returned, the shutdown's error is raised. Raises ValidationError if
+      # the process isn't connected and config.trellis.connect isn't set.
+      def with_handle
+        if Trellis.connected?
+          Trellis.migrate
+          return yield
+        end
+
+        Trellis.connect(**required_connect_options.merge(staging: false, drain_threads: 0))
+        primary = nil
+        begin
+          Trellis.migrate
+          yield
+        rescue Exception => e # any exception, Interrupt too: it's re-raised
+          primary = e
+          raise
+        ensure
+          shutdown_after(primary)
+        end
       end
 
       # config.trellis.connect, as Trellis.connect's keyword options, or nil
@@ -89,6 +119,23 @@ module Trellis
         end
 
         options.to_h.transform_keys(&:to_sym)
+      end
+
+      private
+
+      def required_connect_options
+        connect_options or
+          raise ValidationError, "config.trellis.connect is not set: give it Trellis.connect's options"
+      end
+
+      # Shuts with_handle's own handle down. With a primary error on its way
+      # out, a failed shutdown is only a warning: raising would replace it.
+      def shutdown_after(primary)
+        Trellis.shutdown
+      rescue StandardError => e
+        raise unless primary
+
+        warn "trellis: shutting down after #{primary.class} failed: #{e.class}: #{e.message}"
       end
     end
 

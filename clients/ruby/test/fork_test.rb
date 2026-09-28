@@ -69,7 +69,9 @@ class ForkTest < Minitest::Test
                       "#{name}: Trellis::ForkedHandleError: this Trellis handle was connected by " \
                       "process #{parent}, and this is process #{child}: a handle does not survive " \
                       "fork, so call Trellis.connect in this process (after forking: Puma's " \
-                      "on_worker_boot, Passenger's starting_worker_process)",
+                      "before_worker_boot, Unicorn's after_fork, Passenger's " \
+                      "starting_worker_process; \"Forking servers\" in clients/ruby/README.md " \
+                      "covers preload_app! and fork_worker)",
                       output
     end
     assert_includes lines, "shutdown: returned", output
@@ -136,7 +138,9 @@ class ForkTest < Minitest::Test
                  "#{parent} while that process had a Trellis engine running, so it may have " \
                  "inherited a lock one of the engine's threads held, which nothing in this " \
                  "process can release: it can't connect. Call Trellis.shutdown before forking " \
-                 "(Puma's before_fork), and Trellis.connect after (on_worker_boot)\n", output
+                 "and Trellis.connect after: Puma's before_fork and before_worker_boot, and " \
+                 "with fork_worker, before_worker_fork and after_worker_fork too " \
+                 "(\"Forking servers\" in clients/ruby/README.md)\n", output
 
     # The server hangs up, so the connect fails, and its threads are gone.
     peer.close

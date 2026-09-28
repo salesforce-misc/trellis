@@ -35,7 +35,7 @@ Process.wait(child)
 puts "child exit: #{$?.exitstatus}"
 
 # The supported shape: shut down before forking (Puma's before_fork) and
-# connect after (on_worker_boot).
+# connect after (before_worker_boot).
 Trellis.shutdown
 worker = fork do
   Trellis.connect(url: dsn)

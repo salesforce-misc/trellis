@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "minitest/mock"
 require "tmpdir"
 require "test_helper"
 require_relative "support/rails_app"
@@ -247,6 +248,28 @@ class MigrationTest < Minitest::Test
     assert_match "config.trellis.connect", error.message
   end
 
+  # A shutdown that fails after the block has raised mustn't replace the
+  # block's error, which is the one that says what went wrong: it's
+  # raised, and the shutdown's failure is a warning (issue #645).
+  def test_a_failing_shutdown_does_not_mask_the_blocks_error
+    failing_shutdown do
+      _, err = capture_io do
+        assert_raises(Trellis::ParseError) do
+          Trellis::Migration.with_handle { Trellis.define("not a statement") }
+        end
+      end
+      assert_match "shutdown failed", err
+    end
+  end
+
+  # With nothing else to report, the shutdown's own failure is raised.
+  def test_a_failing_shutdown_after_a_block_that_returned_raises
+    failing_shutdown do
+      error = assert_raises(Trellis::InternalError) { Trellis::Migration.with_handle { :done } }
+      assert_equal "shutdown failed", error.message
+    end
+  end
+
   # The configuration's background work is ignored: a migration's handle
   # never runs the staging worker, whose connect would fail on a database
   # Trellis hasn't migrated, and the helper runs `migrate` first, so a
@@ -281,6 +304,12 @@ class MigrationTest < Minitest::Test
       username: info.fetch("user"), database: info.fetch("dbname")
     )
     TrellisTestApp.config.trellis.connect = { url: info.fetch("dsn"), **trellis_options }
+  end
+
+  # Runs the block with Trellis.shutdown raising InternalError, leaving the
+  # handle it didn't shut down to the teardown's real shutdown.
+  def failing_shutdown(&)
+    Trellis.stub(:shutdown, -> { raise Trellis::InternalError, "shutdown failed" }, &)
   end
 
   # Writes a migration file whose class body is `body`. Class names get the

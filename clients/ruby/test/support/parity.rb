@@ -62,7 +62,8 @@ module Parity
   RAILS_ONLY = {
     "Trellis::Railtie.connect" => "`connect` with config.trellis.connect's options",
     "Trellis::Railtie.connect_options" => "reads config.trellis.connect",
-    "Trellis::Migration.with_handle" => "a migration's own handle, connected around a block"
+    "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect, around a block",
+    "Trellis::Migration.with_handle" => "Trellis::Railtie.with_handle, raising a migration's error"
   }.freeze
 
   # The fixture's own steps, which drive the test rather than the binding.

@@ -100,39 +100,26 @@ module Trellis
   # The guard checks the target's name, not its definition: a changed
   # statement for a target that exists is an `ALTER TRANSFORM`.
   module Migration
-    # Runs the block with this process's handle, connecting one for the
-    # length of the block from config.trellis.connect (with staging: false
-    # and drain_threads: 0) if the process isn't connected, and running
-    # Trellis.migrate first either way. Returns the block's value. For a
-    # script or rake task that needs Trellis the way a migration does.
-    def self.with_handle
+    # The helpers' Trellis::Railtie.with_handle: runs the block with this
+    # process's handle, or one connected from config.trellis.connect for the
+    # length of the block, running Trellis.migrate first either way, and
+    # returns the block's value. Without Rails, it uses this process's
+    # handle. Raises ActiveRecord::MigrationError if there's neither.
+    def self.with_handle(&)
       if Trellis.connected?
         Trellis.migrate
         return yield
       end
 
-      Trellis.connect(**connect_options)
-      begin
-        Trellis.migrate
-        yield
-      ensure
-        Trellis.shutdown
-      end
-    end
-
-    # The options a migration's own handle connects with.
-    def self.connect_options
-      options = defined?(Trellis::Railtie) && Trellis::Railtie.connect_options
-      unless options
+      unless defined?(Trellis::Railtie) && Trellis::Railtie.connect_options
         raise ActiveRecord::MigrationError,
               "there's no Trellis to run this against: set config.trellis.connect to " \
               "Trellis.connect's options (config.trellis.connect = { url: ENV.fetch(\"DATABASE_URL\") }), " \
               "or call Trellis.connect before migrating"
       end
 
-      options.merge(staging: false, drain_threads: 0)
+      Trellis::Railtie.with_handle(&)
     end
-    private_class_method :connect_options
 
     # Registers a transform from a `TRANSFORM` statement and returns its
     # Definition: Trellis.define, run as the migration reaches it.

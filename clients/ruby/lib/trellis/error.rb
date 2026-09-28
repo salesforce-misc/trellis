@@ -74,9 +74,9 @@ module Trellis
   # A call on a handle this process inherited through `fork` rather than
   # connected itself. Rust threads don't cross `fork`, so the handle has
   # nothing left to answer it: every call raises this instead of hanging.
-  # Call Trellis.connect in the forked process (Puma's on_worker_boot,
-  # Passenger's starting_worker_process). A ValidationError, like any other
-  # call on a handle that can't serve it.
+  # Call Trellis.connect in the forked process (Puma's before_worker_boot,
+  # Passenger's starting_worker_process: "Forking servers" in the README).
+  # A ValidationError, like any other call on a handle that can't serve it.
   #
   # Also Trellis.connect's error in a process forked while its parent had a
   # handle running, which may have inherited a lock that handle's threads

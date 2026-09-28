@@ -98,7 +98,9 @@ definition ever reaches `:live`.
   inherited a lock one of that handle's threads held, which nothing in the
   child can release, so its `connect` raises `Trellis::ForkedHandleError`
   too, rather than risk hanging on it (issue #600). Forks whose children
-  never connect, and `system`/`spawn`, are unaffected.
+  never connect, and `system`/`spawn`, are unaffected. [Forking
+  servers](#forking-servers) has the hooks for Puma (with `preload_app!`
+  and `fork_worker`), Unicorn and Passenger.
 
   ```ruby
   # config/puma.rb, in a Rails app (see "In a Rails app" below)
@@ -169,6 +171,8 @@ the default, the Railtie does nothing. Two exceptions:
   server that forks without a hook to shut the handle down first (a
   preloading Passenger, say). Connect in each child with
   `Trellis::Railtie.connect`.
+
+### Forking servers
 
 A handle doesn't survive `fork` (issue #600). A server that loads the app
 before it forks has to shut the boot handle down in the parent and connect
@@ -275,9 +279,11 @@ the deploy step as well (`bin/rails trellis:migrate db:migrate`), so a
 deploy that upgrades the gem without a new define still upgrades the
 tables before the worker restarts.
 
-`Trellis::Migration.with_handle { ... }` is what the helpers use, for a
-script that needs Trellis the way a migration does. Outside Rails,
-`require "trellis/migration"` and `Trellis.connect` before migrating.
+`Trellis::Railtie.with_handle { ... }` is what `trellis:migrate` and the
+helpers use, for a script or rake task of your own that needs Trellis the
+way a migration does. Neither it nor `trellis:migrate` needs ActiveRecord.
+Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
+migrating.
 
 ## Layout
 

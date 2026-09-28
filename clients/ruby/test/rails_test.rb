@@ -62,6 +62,13 @@ class RailsTest < Minitest::Test
     assert_equal({ "connected" => false, "connected_after_migrate" => false }, boot("rake"))
   end
 
+  # Trellis.migrate needs no ActiveRecord, so neither does the task: it
+  # mustn't load the migration helpers, which do (issue #645).
+  def test_trellis_migrate_runs_in_an_app_without_active_record
+    assert_equal({ "connected" => false, "connected_after_migrate" => false },
+                 boot("rake_without_active_record"))
+  end
+
   # It's the running task that counts, not the loaded tasks: `rails test`
   # loads them to run test:prepare, then boots the app outside any task.
   def test_an_app_booted_after_a_rake_run_connects
