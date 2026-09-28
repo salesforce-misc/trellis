@@ -81,11 +81,13 @@ A change that reliably crashes the apply must not wedge its batch forever — bu
 silently skipping it makes a caller waiting on that change wait forever, or worse,
 be told it converged.
 
-**1. Isolate before blaming.** On a non-transient, non-halting apply failure, each
-folded record is applied *alone* inside a `BEGIN … ROLLBACK` probe. Blame lands on
-the specific key(s) that fail on their own, so an innocent batch-mate is neither
-charged nor evicted. If no single key reproduces it, the error is surfaced, not
-blamed.
+**1. Isolate before blaming.** On a non-transient, non-halting apply failure, the
+batch is bisected with `BEGIN … ROLLBACK` probes: each half is applied on its own,
+and only a half that fails is split and probed again, down to single records. Blame
+lands only on the specific key(s) that fail on their own, so an innocent batch-mate
+is neither charged nor evicted. If no single key reproduces it, the error is
+surfaced, not blamed. Bisection finds a failing key in about `2·log2(n)` probes
+rather than `n`, and a per-call probe cap bounds the rest.
 
 **2. Count deaths per key, off the immutable rows.** Batch rows are immutable and
 carry no counter, so the counter lives in its own table keyed by `(table, key)`. A

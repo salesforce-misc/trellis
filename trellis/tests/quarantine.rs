@@ -2341,3 +2341,166 @@ async fn the_v33_fold_combines_dual_spelling_quarantine_rows() {
          the one place the dual spelling over-counted rather than under-counted"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #655: isolation bisects a failed page instead of probing it one
+// record at a time.
+// ---------------------------------------------------------------------
+
+/// How many records the large-page isolation tests stage: big enough that
+/// probing every record alone (the pre-#655 isolation) runs for minutes, small
+/// enough that the bisection's two probes per level stay quick.
+const LARGE_PAGE: i32 = 4096;
+
+/// Stages `orders` inserts for keys `1..=LARGE_PAGE` into the ring in one
+/// statement, each with a valid price except the keys in `poisoned`, whose
+/// price is not a number, and seals them into one batch.
+async fn stage_large_page_with_poisoned(client: &mut Client, poisoned: &[i32]) -> (String, i64) {
+    stage_large_page(client, poisoned, "not-a-number").await
+}
+
+/// [`stage_large_page_with_poisoned`], with `poisoned_price` as the poisoned
+/// keys' price.
+async fn stage_large_page(
+    client: &mut Client,
+    poisoned: &[i32],
+    poisoned_price: &str,
+) -> (String, i64) {
+    let orders = qualify_fixture_table("orders");
+    client
+        .execute(
+            "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+             select $1, g::text, 'insert', pg_current_wal_insert_lsn(), null, \
+                    jsonb_build_object( \
+                        'price', case when g = any($2) then $4 else '1.00' end, \
+                        'tax', '1.00'), \
+                    0 \
+             from generate_series(1, $3) as g",
+            &[&orders, &poisoned, &LARGE_PAGE, &poisoned_price],
+        )
+        .await
+        .expect("stage the large page");
+    let seg_seq = seal_active_segment(client).await;
+    (orders, seg_seq)
+}
+
+/// `drain_once` for a batch expected to fail: the error it surfaces, or
+/// whatever it returned instead.
+async fn drain_result(
+    pool: &trellis::Pool,
+    seg_seq: i64,
+) -> Result<Option<apply::ApplyOutcome>, ApplyError> {
+    apply::drain_once(
+        pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_quarantine_test",
+        &StagedWatermark::saturated(),
+    )
+    .await
+}
+
+async fn charged_keys(client: &Client, src_table: &str) -> Vec<(String, i32)> {
+    client
+        .query(
+            "select key, deaths from key_deaths where src_table = $1 order by key::int",
+            &[&src_table],
+        )
+        .await
+        .expect("read key_deaths")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// Issue #655: one poisoned key, the only failure in a large page, is found and
+/// charged alone, and nothing else in the page is charged. Before #655 this
+/// probed all 4,096 records one at a time (a compute plus a rollback-only apply
+/// each); bisection gets there in about two probes per halving.
+#[tokio::test]
+async fn isolation_bisects_a_large_page_to_its_one_poisoned_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    let (orders, seg_seq) = stage_large_page_with_poisoned(&mut client, &[2731]).await;
+    let started = std::time::Instant::now();
+    let result = drain_result(&db.pool, seg_seq).await;
+    eprintln!(
+        "isolating a {LARGE_PAGE}-record page took {:?}",
+        started.elapsed()
+    );
+    match result {
+        Err(ApplyError::Eval(_)) => {}
+        other => panic!("expected the poisoned key's Eval error to surface, got {other:?}"),
+    }
+    assert_eq!(
+        charged_keys(&client, &orders).await,
+        vec![("2731".to_string(), 1)]
+    );
+    assert!(!segment_state_is_drained(&client, seg_seq).await);
+}
+
+/// Issue #655: two poisoned keys in one large page are both found and charged,
+/// each once, and no batch-mate is.
+#[tokio::test]
+async fn isolation_bisects_a_large_page_to_both_poisoned_keys() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+
+    let (orders, seg_seq) = stage_large_page_with_poisoned(&mut client, &[17, 3900]).await;
+    match drain_result(&db.pool, seg_seq).await {
+        Err(ApplyError::Eval(_)) => {}
+        other => panic!("expected a poisoned key's Eval error to surface, got {other:?}"),
+    }
+    assert_eq!(
+        charged_keys(&client, &orders).await,
+        vec![("17".to_string(), 1), ("3900".to_string(), 1)]
+    );
+}
+
+/// Issue #655: the same, for a failure only the apply hits (a check constraint
+/// on the target), so every probe of a half page computes and applies that
+/// half before rolling back.
+#[tokio::test]
+async fn isolation_bisects_a_large_page_to_a_key_that_fails_on_apply() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_order_totals(&db, &client).await;
+    client
+        .batch_execute(
+            "alter table order_totals add constraint total_below_1000 check (total < 1000)",
+        )
+        .await
+        .expect("add the check constraint the poisoned key trips");
+    // The live rows the 1-1 apply reads, matching the staged images.
+    client
+        .batch_execute(&format!(
+            "insert into orders (id, price, tax) \
+             select g, case when g = 1234 then 5000.00 else 1.00 end, 1.00 \
+             from generate_series(1, {LARGE_PAGE}) as g"
+        ))
+        .await
+        .expect("seed live orders rows");
+
+    let (orders, seg_seq) = stage_large_page(&mut client, &[1234], "5000.00").await;
+    let started = std::time::Instant::now();
+    let result = drain_result(&db.pool, seg_seq).await;
+    eprintln!(
+        "isolating a {LARGE_PAGE}-record page on apply took {:?}",
+        started.elapsed()
+    );
+    match result {
+        Err(ApplyError::Db(err)) => assert_eq!(err.code(), Some(&SqlState::CHECK_VIOLATION)),
+        other => panic!("expected the check violation to surface, got {other:?}"),
+    }
+    assert_eq!(
+        charged_keys(&client, &orders).await,
+        vec![("1234".to_string(), 1)]
+    );
+}

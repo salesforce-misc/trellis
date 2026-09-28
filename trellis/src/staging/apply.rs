@@ -9886,8 +9886,9 @@ async fn classify_and_retry(
             quarantine::record_halting_stop(pool, &err.to_string()).await?;
             Err(err)
         }
-        // Everything else: isolate each folded record alone to attribute
-        // the failure to specific key(s), evicting any past the death
+        // Everything else: bisect the folded records down to the ones that
+        // fail alone to attribute the failure to specific key(s) (issue
+        // #655), evicting any past the death
         // threshold and retrying without them. If nothing reproduces alone,
         // the error is surfaced, not blamed; if keys reproduce but none is
         // past the threshold yet, they are charged and the error is surfaced
@@ -9965,6 +9966,18 @@ async fn classify_and_retry(
                         seg_seq,
                         error = %err,
                         "isolation reproduced nothing; surfacing the original failure"
+                    );
+                    Err(err)
+                }
+                // Warn: unlike `NothingReproduced`, part of the batch went
+                // unprobed, so a failing key may still be in it (issue #655).
+                quarantine::IsolationOutcome::ProbeLimitReached { probes } => {
+                    tracing::warn!(
+                        seg_seq,
+                        probes,
+                        error = %err,
+                        "isolation hit its probe limit without pinning the failure on a key; \
+                         surfacing the original failure"
                     );
                     Err(err)
                 }
