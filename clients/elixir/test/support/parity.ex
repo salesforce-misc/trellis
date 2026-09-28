@@ -75,24 +75,42 @@ defmodule Trellis.Parity do
   @doc "The fixture's own steps, which drive the test rather than the binding."
   def harness_ops, do: ["sql", "now"]
 
+  # The calls whose success is a bare `:ok` (Ruby's `nil`). Every other
+  # call's success is `{:ok, value}`.
+  @unit_ops ["connect", "migrate", "request_backfill", "await_converged", "shutdown"]
+
   @doc """
-  A binding result in the fixture's canonical form: `{:ok, value}` is
-  `value`, `:ok` is `nil`, and `{:error, error}` is the error. Then `nil`,
-  booleans, integers, strings and lists as themselves; an atom as
+  What operation `op` returned, in the fixture's canonical form. The envelope
+  goes first, and must be the one `op` has: `{:error, %Trellis.Error{}}` is
+  the error; `:ok` from a unit call (`@unit_ops`) is `nil`; `{:ok, value}`
+  from any other call is `value`, through `canonical/1` (`apply/2`'s through
+  `canonical_applied/1`). Any other envelope raises `Mismatch`, so a call that
+  returns a bare value, or `:ok` where it should return `{:ok, nil}`, fails
+  its step.
+  """
+  def canonical_result(_op, {:error, %Trellis.Error{} = error}), do: canonical(error)
+  def canonical_result(op, :ok) when op in @unit_ops, do: nil
+  def canonical_result("apply", {:ok, applied}), do: canonical_applied(applied)
+  def canonical_result(op, {:ok, value}) when op not in @unit_ops, do: canonical(value)
+
+  def canonical_result(op, other) do
+    success = if op in @unit_ops, do: ":ok", else: "{:ok, value}"
+    mismatch("#{op} returned #{inspect(other)}, not #{success} or {:error, %Trellis.Error{}}")
+  end
+
+  @doc """
+  A binding value in the fixture's canonical form: `nil`, booleans,
+  integers, strings and lists as themselves; an atom as
   `%{"$word" => name}`; a `DateTime` as `%{"$time" => epoch microseconds}`;
   a struct as `%{"$record" => name, "fields" => ...}`; a map as
-  `%{"$map" => ...}`; a `Trellis.Error` as `%{"$error" => code}`. `apply/2`'s
-  tagged tuples are the one host-specific shape: `canonical_applied/1` spreads them
-  into the fixture's `Applied` record.
+  `%{"$map" => ...}`; a `Trellis.Error` as `%{"$error" => code}`. A result's
+  `{:ok, _}`/`:ok` envelope is `canonical_result/2`'s, so it is never
+  unwrapped here, below the top.
 
   Checks the Elixir-side conventions on the way (UTC microsecond times,
   string map keys, errors as `Trellis.Error`) and raises `Mismatch` when one
   is broken.
   """
-  def canonical({:ok, value}), do: canonical(value)
-  def canonical(:ok), do: nil
-  def canonical({:error, %Trellis.Error{} = error}), do: canonical(error)
-
   def canonical(value) when is_nil(value) or is_boolean(value) or is_integer(value), do: value
 
   def canonical(value) when is_binary(value) do
@@ -149,13 +167,11 @@ defmodule Trellis.Parity do
   @applied_fields [:definition, :relationship, :columns, :added, :dropped, :altered]
 
   @doc """
-  `Trellis.Applied`'s tagged tuple in canonical form, as the fixture's
+  A `Trellis.Applied.t()` tagged tuple in canonical form, as the fixture's
   `Applied` record: its kind, the fields that kind carries, and `nil` for
-  the rest (the shape the Ruby binding returns). Takes `apply/2`'s result
-  (an error is canonical like any other) or a bare `Trellis.Applied.t()`.
+  the rest (the shape the Ruby binding returns). `apply/2`'s tagged tuples
+  are the one host-specific shape the canonical form absorbs.
   """
-  def canonical_applied({:ok, applied}), do: canonical_applied(applied)
-  def canonical_applied({:error, _} = error), do: canonical(error)
   def canonical_applied(kind) when is_atom(kind), do: applied_record(kind, %{})
 
   def canonical_applied({:transform_defined, definition}),

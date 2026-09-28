@@ -70,7 +70,9 @@ absorbs them:
 
 - Elixir's `{:ok, value}` is `value`, and its `:ok` is `nil`, which is what
   Ruby returns from `migrate`, `request_backfill`, `await_converged`,
-  `connect` and `shutdown`.
+  `connect` and `shutdown`. Only a result's own envelope is unwrapped, and
+  it must be the call's: `:ok` from those five, `{:ok, value}` from every
+  other call (so `status` of an unknown target is `{:ok, nil}`).
 - Elixir's `apply/2` returns a tagged tuple (`{:resumed, columns}`,
   `:paused`, ...). It becomes the `Applied` record Ruby returns, with the
   kind's fields set and the rest `nil`.
@@ -124,3 +126,13 @@ no background workers, so its results are deterministic. Prefer it, and put
 a step in phase two (after the connect with the staging worker and drain
 threads) only if it needs a live definition. Then run both suites: the
 fixture only shows parity when both of them pass.
+
+In phase two, mind what runs after a step returns. `ALTER`, `RESUME` and
+`request_backfill` park a re-read of the transform's source, which rewrites
+every target that source feeds, some time later, and `await_converged`
+doesn't wait for a parked re-read. So a transform those statements touch
+reads a source table of its own (`parity_scratch_src`), and the overflowing
+`parity_ledger` rows are fixed before the column resume re-reads them.
+Name a specific status word only where the step is about it: the phase-one
+steps take any `transform_status`, since how a new definition starts is
+#556's to change.

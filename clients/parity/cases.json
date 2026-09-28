@@ -106,7 +106,7 @@
   },
   "live": [
     {
-      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below).",
+      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch reads a table of its own: ALTER, RESUME and request_backfill re-read a transform's source for every reader of it, so a shared source would rewrite another target under a later step.",
       "op": "sql",
       "args": [
         "create table parity_owners (id integer primary key, name text)",
@@ -116,6 +116,8 @@
         "insert into parity_items (id, owner_id, price) values (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)",
         "create table parity_ledger (id integer primary key, n integer)",
         "create table parity_gizmos (id integer primary key, price integer)",
+        "create table parity_scratch_src (id integer primary key, price integer)",
+        "alter table parity_scratch_src replica identity full",
         "create role parity_reader login"
       ]
     },
@@ -167,34 +169,33 @@
     {"op": "relationships", "expect": {"list": [{"record": "RelationshipSummary", "fields": {"name": {"eq": "parity_owner"}, "cardinality": {"word": "one"}}}]}},
 
     {
-      "about": "define returns a bare Definition at waiting_to_backfill; source_columns is every source column's name to its type's name.",
+      "about": "define returns a bare Definition, not yet live; source_columns is every source column's name to its type's name.",
       "op": "define",
       "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"],
       "expect": {"record": "Definition", "fields": {
         "target_table": {"eq": "public.parity_prices"},
         "source_table": {"eq": "public.parity_items"},
         "source_version": {"eq": 1},
-        "status": {"word": "waiting_to_backfill"},
         "source_columns": {"map": {"id": {"eq": "integer"}, "owner_id": {"eq": "integer"}, "price": {"eq": "integer"}}}
       }}
     },
     {"about": "The same target twice clashes.", "op": "define", "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"], "expect": {"error": "conflict"}},
     {
       "op": "apply",
-      "args": ["TRANSFORM parity_scratch FROM parity_items SELECT price AS price"],
+      "args": ["TRANSFORM parity_scratch FROM parity_scratch_src SELECT price AS price"],
       "covers": {"statement_kind": "define_transform"},
       "expect": {"record": "Applied", "fields": {
         "kind": {"word": "transform_defined"},
-        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}, "status": {"word": "waiting_to_backfill"}}},
+        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}}},
         "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null
       }}
     },
     {"op": "apply", "args": ["TRANSFORM parity_doubled FROM parity_ledger SELECT n + n AS doubled"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "apply", "args": ["TRANSFORM parity_gizmo_prices FROM parity_gizmos SELECT price AS price"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "definitions", "expect": {"list_of": {"record": "DefinitionSummary", "fields": {"backfill_failure": null}}}},
-    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": null}}},
+    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null}}},
     {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
-    {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word": "waiting_to_backfill"}, "paused_at": null, "last_error": null}}},
+    {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
     {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
 
     {
@@ -205,8 +206,9 @@
     },
     {"op": "relationships", "expect": {"list": []}},
 
+    {"about": "A write to a defined source, which nothing drains yet: the token below has work outstanding however changes are captured (#556).", "op": "sql", "args": ["insert into parity_scratch_src (id, price) values (1, 1)"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
-    {"about": "Nothing runs the staging worker yet, so no token can converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
+    {"about": "Nothing runs the staging worker yet, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
     {"about": "Likewise the audit: it gives up waiting rather than failing.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null}}},
     {"op": "shutdown", "expect": null},
@@ -293,6 +295,7 @@
     ]}}}},
     {"about": "The last page is the short one; it still carries a cursor.", "op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2, "after": {"$ref": "page_2.next_cursor"}}, "save": "page_3", "expect": {"record": "SamplePage", "fields": {"next_cursor": "string", "samples": {"list": [{"record": "PoisonSample", "fields": {"key": {"eq": "5"}}}]}}}},
     {"about": "Past the end: an empty page hands back the cursor it was given, unchanged.", "op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2, "after": {"$ref": "page_3.next_cursor"}}, "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": {"ref": "page_3.next_cursor"}}}},
+    {"about": "Fix the overflow first: the resume re-reads parity_ledger, and rows that still overflowed would pause the column again under the steps below.", "op": "sql", "args": ["update parity_ledger set n = 1"]},
     {
       "about": "A column resume reports the column it resumed, by address.",
       "op": "apply",

@@ -223,8 +223,7 @@ defmodule Trellis.ParityTest do
     end)
   end
 
-  defp canonical("apply", result), do: Parity.canonical_applied(result)
-  defp canonical(_op, result), do: Parity.canonical(result)
+  defp canonical(op, result), do: Parity.canonical_result(op, result)
 
   defp unwrap({:ok, value}), do: value
   defp unwrap(other), do: other
