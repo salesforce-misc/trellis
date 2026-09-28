@@ -200,6 +200,18 @@
 //! and deleted, which is what makes a generated program exercise ADR-0006's
 //! reverse propagation rather than only the forward direction.
 //!
+//! Issue **#505** makes that reverse direction reachable in earnest. The
+//! builders emit one table's whole op stream before the next, so on their
+//! own every parent-side op would come after every from-side op: a parent
+//! change would only ever meet a settled from-side, and no from-side change
+//! would ever land after a parent change it has to observe.
+//! `trivial_program_with` therefore draws one interleaving of the per-table
+//! streams ([`interleave_tables`]); only each table's own order is a real
+//! constraint. [`Mutate::ToggleNull`] then moves a row's `c1` across `NULL`
+//! on purpose, which on a referenced parent is the sharpest reverse-path
+//! edge. `run::Coverage::relationship_path_cases` reports how often each
+//! reverse path is reached.
+//!
 //! # Awkward values (issue #7, design doc §3)
 //!
 //! Of the four awkward-value classes the design doc calls out:
@@ -220,7 +232,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use trellis::dev::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
@@ -382,6 +394,16 @@ pub enum Mutate {
     /// [`Mutate::Update`]'s `c1`/`c2` writes. A `pk` naming no live row is a
     /// source no-op, exactly like `Update`.
     UpdateFlag { pk: i64, flag: Option<String> },
+    /// Move row `pk`'s `c1` across `NULL` (issue #505): to `NULL` if it is
+    /// currently non-`NULL`, otherwise to `value`. Renders to an `UPDATE` of
+    /// `c1` alone. A plain [`Mutate::Update`] draws `c1` independently of
+    /// what the row holds, so it crosses `NULL` only about a third of the
+    /// time; this always does. A relationship reads the to-side table's
+    /// `c1`, so on a referenced parent this is the sharpest reverse-path
+    /// edge: the related value leaves or joins every fold that reads it, and
+    /// `COUNT(<rel>.<col>)` starts or stops counting the row. A `pk` naming
+    /// no live row is a source no-op, exactly like `Update`.
+    ToggleNull { pk: i64, value: i64 },
     /// Delete row `pk`. A `pk` naming no seeded row is likewise a no-op.
     Delete { pk: i64 },
     /// Insert a *second* row at an already-seeded `pk`. When that pk is
@@ -428,7 +450,7 @@ pub enum Mutate {
     /// here (`OpOutcome::Succeeds` if any pk is still live, `AffectsNoRows`
     /// if the table happens to already be empty) — but unlike
     /// `Update`/`Delete`, which touch one pk, this clears every remaining
-    /// live pk at once: [`render_mutate`] empties the whole `live` set, so
+    /// live pk at once: [`render_mutate`] empties the whole `live` map, so
     /// every mutate after a `Truncate` sees an empty table exactly as real
     /// Postgres would.
     Truncate,
@@ -623,7 +645,15 @@ impl TableSpec {
 /// variant's pk is only ever drawn from an originally-seeded pk — see
 /// [`Mutate::DuplicateInsert`]'s doc comment for why a revival must carry
 /// them, not default them to `NULL`).
-fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut HashSet<i64>) -> Op {
+///
+/// `live` maps each live pk to its current `c1`, which is all of a row's
+/// state a mutate's rendering depends on ([`Mutate::ToggleNull`] reads it).
+fn render_mutate(
+    mutate: &Mutate,
+    table: &Table,
+    spec: &TableSpec,
+    live: &mut HashMap<i64, Option<i64>>,
+) -> Op {
     let table_name = &table.name;
     let c1 = &table.columns[1].name;
     let c2 = &table.columns[2].name;
@@ -632,29 +662,49 @@ fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut Ha
             table: table_name.clone(),
             pk: pk.to_string(),
             changes: vec![(c1.clone(), render(*a)), (c2.clone(), render(*b))],
-            expect: if live.contains(pk) {
-                OpOutcome::Succeeds
-            } else {
-                OpOutcome::AffectsNoRows
+            expect: match live.get_mut(pk) {
+                Some(current) => {
+                    *current = *a;
+                    OpOutcome::Succeeds
+                }
+                None => OpOutcome::AffectsNoRows,
             },
         },
         Mutate::UpdateFlag { pk, flag } => Op::Update {
             table: table_name.clone(),
             pk: pk.to_string(),
             changes: vec![(table.columns[4].name.clone(), flag.clone())],
-            expect: if live.contains(pk) {
+            expect: if live.contains_key(pk) {
                 OpOutcome::Succeeds
             } else {
                 OpOutcome::AffectsNoRows
             },
         },
+        Mutate::ToggleNull { pk, value } => {
+            let (new, expect) = match live.get_mut(pk) {
+                Some(current) => {
+                    *current = match current {
+                        Some(_) => None,
+                        None => Some(*value),
+                    };
+                    (*current, OpOutcome::Succeeds)
+                }
+                None => (Some(*value), OpOutcome::AffectsNoRows),
+            };
+            Op::Update {
+                table: table_name.clone(),
+                pk: pk.to_string(),
+                changes: vec![(c1.clone(), render(new))],
+                expect,
+            }
+        }
         Mutate::Delete { pk } => Op::Delete {
             table: table_name.clone(),
             pk: pk.to_string(),
             // `remove` reports whether `pk` was live, and (whether or
             // not it was) leaves it dead afterward — exactly the delete
             // semantics we're simulating.
-            expect: if live.remove(pk) {
+            expect: if live.remove(pk).is_some() {
                 OpOutcome::Succeeds
             } else {
                 OpOutcome::AffectsNoRows
@@ -665,10 +715,10 @@ fn render_mutate(mutate: &Mutate, table: &Table, spec: &TableSpec, live: &mut Ha
             // live. If an earlier mutate already deleted it, this isn't
             // a duplicate anymore — it's an ordinary successful insert
             // that revives the pk.
-            let expect = if live.contains(pk) {
+            let expect = if live.contains_key(pk) {
                 OpOutcome::Fails
             } else {
-                live.insert(*pk);
+                live.insert(*pk, *a);
                 OpOutcome::Succeeds
             };
             // This variant's pk is always one of `1..=spec.seed_values.len()`
@@ -774,7 +824,7 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 ///
 /// Every table gets its own numeric pk/`c1`/`c2` schema, plus (task B1) one
 /// `Text`/`Boolean`/`Uuid` column each, and its own independent pk-liveness
-/// simulation (a fresh `HashSet` per `TableSpec`, via [`render_mutate`]):
+/// simulation (a fresh liveness map per `TableSpec`, via [`render_mutate`]):
 /// table A's deletes and inserts can never be mistaken for table B's, and
 /// each table's seeded pks start at `1` regardless of how many rows an
 /// earlier table seeded — table identity, not draw order, is what a pk is
@@ -788,10 +838,11 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 ///
 /// Ops are emitted one table at a time, in `tables` order: all of table 0's
 /// seeds and mutates, then all of table 1's, and so on. This keeps a
-/// counterexample's op stream legible (every op naming table N groups
+/// hand-built pin's op stream legible (every op naming table N groups
 /// together) and is not a claim that real traffic interleaves tables that
 /// way — nothing about the model or the backend assumes any particular
-/// interleaving.
+/// interleaving. The drawn strategies interleave the tables afterward with
+/// [`interleave_tables`] (issue #505).
 ///
 /// Panics if `tables` or `def_sources` is empty, or if a `def_sources` entry
 /// is out of range for `tables` — both are generator bugs (every strategy
@@ -823,7 +874,7 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
 /// Every table gets its own numeric pk/`c1`/`c2` schema, plus (task B1) one
 /// `Text`/`Boolean`/`Uuid` column each, plus (task B4) one further Numeric
 /// "grain" column (see the module doc comment), and its own independent
-/// pk-liveness simulation (a fresh `HashSet` per `TableSpec`, via
+/// pk-liveness simulation (a fresh liveness map per `TableSpec`, via
 /// [`render_mutate`]): table A's deletes and inserts can never be mistaken
 /// for table B's, and each table's seeded pks start at `1` regardless of how
 /// many rows an earlier table seeded — table identity, not draw order, is
@@ -831,10 +882,11 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
 ///
 /// Ops are emitted one table at a time, in `tables` order: all of table 0's
 /// seeds and mutates, then all of table 1's, and so on. This keeps a
-/// counterexample's op stream legible (every op naming table N groups
+/// hand-built pin's op stream legible (every op naming table N groups
 /// together) and is not a claim that real traffic interleaves tables that
 /// way — nothing about the model or the backend assumes any particular
-/// interleaving.
+/// interleaving. The drawn strategies interleave the tables afterward with
+/// [`interleave_tables`] (issue #505).
 ///
 /// Panics if `tables` or `defs` is empty, or if a `defs` entry's table index
 /// is out of range for `tables` — both are generator bugs (every strategy
@@ -943,7 +995,12 @@ pub fn build_program_multi_with_shapes(
         // comment above. Every seeded pk starts live; every seed insert
         // always succeeds (pks are freshly minted, `1..=seed_count`, never
         // colliding *within this table*).
-        let mut live: HashSet<i64> = (1..=spec.seed_values.len() as i64).collect();
+        let mut live: HashMap<i64, Option<i64>> = spec
+            .seed_values
+            .iter()
+            .enumerate()
+            .map(|(i, (a, _))| ((i + 1) as i64, *a))
+            .collect();
 
         for (i, (a, b)) in spec.seed_values.iter().enumerate() {
             let pk = (i + 1) as i64;
@@ -1716,15 +1773,16 @@ pub fn build_program_multi_with_relationships(
 // shape this mirrors).
 //
 // [`build_program_multi_with_shapes_and_derived`] can't produce that shape
-// at all: it emits one table's *entire* seed+mutate stream before the
+// on its own: it emits one table's *entire* seed+mutate stream before the
 // next table's (see `render_mutate`'s call site above), and a relationship
-// always points from a lower-indexed table to a higher-indexed one, so a
-// from-side op and a parent-side op can never land adjacent to each other
-// in a generated op stream — the parent table's ops always come strictly
-// after every from-side op. [`build_relationship_interleaving_scenario`]
-// below still reuses that machinery for the base schema/relationship/
-// definition (via [`build_program_multi_with_relationships`]), then
-// appends the two critical, deliberately-adjacent ops by hand.
+// always points from a lower-indexed table to a higher-indexed one, so the
+// parent table's ops always come strictly after every from-side op. Issue
+// #505's [`interleave_tables`] now lets the drawn strategies reach it at
+// random; the scenarios below stay as its deterministic pins.
+// [`build_relationship_interleaving_scenario`] reuses the builder for the
+// base schema/relationship/definition (via
+// [`build_program_multi_with_relationships`]), then appends the two
+// critical, deliberately-adjacent ops by hand.
 // ---------------------------------------------------------------------
 
 /// Which shape the parent-side and from-side halves of a
@@ -1927,6 +1985,122 @@ pub fn build_relationship_interleaving_scenario(
         parent_op,
         from_side_op,
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #505: interleaving the per-table op streams.
+//
+// The builders above emit each table's whole stream before the next
+// table's, and a relationship always points to a higher-indexed table, so
+// in a table-ordered program every parent-side op comes after every
+// from-side op. The engine's reverse path (a parent change recomputing
+// from-side targets) then only ever runs against a settled from-side, and a
+// from-side change never lands after a parent change it has to observe.
+//
+// The only ordering a program really needs is *within* a table: its seeds
+// come first (every mutate draws its pk from the seeded range, and the
+// pk-liveness simulation in `render_mutate` assumes that order), and its
+// mutates keep their drawn order (that simulation's `expect`s depend on
+// it). Across tables there is nothing to respect: a relationship is a
+// logical join, not a Postgres foreign key, so a from-side row may name a
+// parent that doesn't exist yet (the join simply misses until it does), and
+// no op on one table changes another table's rows. That is also what
+// `ops_commute` already says: ops on different tables always commute at the
+// source.
+//
+// So a program is a set of per-table streams ([`table_streams`]) plus one
+// linearization of them ([`interleave_tables`]). The concurrent tier (#557)
+// can take the same streams and issue each from its own task, since the
+// streams are exactly the ordering constraints; the serial tiers draw one
+// linearization per case.
+// ---------------------------------------------------------------------
+
+/// `program.ops`' indices split into one stream per `program.tables` entry,
+/// in table order, each stream in its original op order (issue #505). The
+/// only ordering constraints a generated program carries are within a
+/// stream; see the section comment above.
+///
+/// # Panics
+///
+/// If an op names a table that isn't in `program.tables`, a generator bug.
+pub fn table_streams(program: &Program) -> Vec<Vec<usize>> {
+    let mut streams = vec![Vec::new(); program.tables.len()];
+    for (index, op) in program.ops.iter().enumerate() {
+        let table = op_table(op);
+        let position = program
+            .tables
+            .iter()
+            .position(|t| t.name == table)
+            .unwrap_or_else(|| {
+                panic!(
+                    "table_streams: op {index} names table {table:?}, which the program doesn't \
+                     have — a generator bug"
+                )
+            });
+        streams[position].push(index);
+    }
+    streams
+}
+
+/// How many values each [`interleave_tables`] schedule entry is drawn from:
+/// divisible by every possible count of tables with ops still to emit
+/// (`1..=MAX_TABLES`), so `pick % remaining` is uniform whatever the count.
+pub const INTERLEAVE_PICK_RANGE: usize = 6;
+const _: () =
+    assert!(INTERLEAVE_PICK_RANGE.is_multiple_of(2) && INTERLEAVE_PICK_RANGE.is_multiple_of(3));
+
+/// The most ops a `trivial_program_with` program can carry, and
+/// so the length of the schedule it draws for [`interleave_tables`].
+pub const MAX_INTERLEAVED_OPS: usize = MAX_TABLES * (MAX_SEED_ROWS + MAX_MUTATES);
+
+/// Reorders `program.ops` into one interleaving of its per-table streams
+/// ([`table_streams`]), keeping every table's own ops in order (issue #505).
+///
+/// Step `i` emits the next op of one of the tables that still has ops left:
+/// `schedule[i] % remaining` picks among those tables in table order, and a
+/// missing entry counts as `0`. An all-zero schedule therefore reproduces
+/// the table-by-table order exactly, which is what proptest shrinks a drawn
+/// schedule toward: a shrunk counterexample only stays interleaved where the
+/// interleaving is needed to fail.
+///
+/// Layered on top of an already-built program, like [`defer_def_install`];
+/// apply it *before* anything that records an op index.
+///
+/// # Panics
+///
+/// If `program` already has a deferred install, a restart or a scale-out:
+/// each is keyed to an op index this function would silently re-point.
+pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
+    assert!(
+        program.def_install_after_op.iter().all(|&at| at == 0)
+            && program.restart_after_ops.is_empty()
+            && program.scale_out_after_ops.is_empty(),
+        "interleave_tables: interleave before scheduling anything by op index — a generator bug"
+    );
+    let mut streams: Vec<std::collections::VecDeque<usize>> = table_streams(&program)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let mut order = Vec::with_capacity(program.ops.len());
+    for step in 0..program.ops.len() {
+        let remaining: Vec<usize> = (0..streams.len())
+            .filter(|&t| !streams[t].is_empty())
+            .collect();
+        let pick = schedule.get(step).copied().unwrap_or(0) % remaining.len();
+        let next = streams[remaining[pick]]
+            .pop_front()
+            .expect("a remaining stream is non-empty");
+        order.push(next);
+    }
+    let mut ops: Vec<Option<Op>> = std::mem::take(&mut program.ops)
+        .into_iter()
+        .map(Some)
+        .collect();
+    program.ops = order
+        .into_iter()
+        .map(|i| ops[i].take().expect("each op index is emitted once"))
+        .collect();
+    program
 }
 
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
@@ -3008,20 +3182,38 @@ mod strategy {
     /// reliably hits one across many samples — the same
     /// rare-but-reliable balance [`NULL_WEIGHT`]/[`AWKWARD_TEXT_WEIGHT`]
     /// strike for their own awkward values.
-    fn mutate(seed_count: usize, awkward_values: bool) -> impl Strategy<Value = Mutate> {
+    ///
+    /// `ToggleNull` (issue #505) draws its pk like `Update`, at weight `2`
+    /// and only with awkward values on (it writes `NULL`). It thins the other
+    /// variants by about an eighth; see [`Mutate::ToggleNull`] for what it
+    /// buys.
+    fn mutate(seed_count: usize, awkward_values: bool) -> BoxedStrategy<Mutate> {
         let pk = 1..=(seed_count as i64 + 1);
         let dup_pk = 1..=(seed_count as i64);
+        // Issue #505: only with awkward values on, since it writes `NULL`.
+        let toggle_null_weight = if awkward_values {
+            TOGGLE_NULL_WEIGHT
+        } else {
+            0
+        };
         prop_oneof![
             3 => (pk.clone(), value(awkward_values), value(awkward_values))
                 .prop_map(|(pk, c1, c2)| Mutate::Update { pk, c1, c2 }),
             2 => (pk.clone(), bool_value(awkward_values))
                 .prop_map(|(pk, flag)| Mutate::UpdateFlag { pk, flag }),
+            toggle_null_weight => (pk.clone(), 0..=VALUE_MAX)
+                .prop_map(|(pk, value)| Mutate::ToggleNull { pk, value }),
             3 => pk.prop_map(|pk| Mutate::Delete { pk }),
             3 => (dup_pk, value(awkward_values), value(awkward_values))
                 .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 }),
             1 => Just(Mutate::Truncate),
         ]
+        .boxed()
     }
+
+    /// [`Mutate::ToggleNull`]'s weight in [`mutate`] (issue #505), next to
+    /// `Update`'s `3` and `UpdateFlag`'s `2`.
+    const TOGGLE_NULL_WEIGHT: u32 = 2;
 
     /// One drawn table's seed rows and mutate stream (see [`TableSpec`]):
     /// seed `1..=MAX_SEED_ROWS` rows with random values (now including one
@@ -3107,14 +3299,19 @@ mod strategy {
     /// [`DerivedShape`] (every `OneToOne` def always gets one `derived`
     /// field) — all distinct, structural widenings, always available
     /// regardless of the flag.
+    ///
+    /// Issue #505: the built program's per-table op streams are then
+    /// interleaved by a drawn schedule ([`interleave_schedule`],
+    /// [`interleave_tables`]), so parent-side and from-side ops mix. The
+    /// schedule shrinks toward the table-by-table order.
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
         prop::collection::vec(table_spec(awkward_values), 1..=MAX_TABLES)
             .prop_flat_map(|tables| {
                 let table_count = tables.len();
                 let defs = prop::collection::vec(def_draw(table_count), 1..=MAX_DEFS);
-                (Just(tables), defs)
+                (Just(tables), defs, interleave_schedule())
             })
-            .prop_map(|(tables, draws)| {
+            .prop_map(|(tables, draws, schedule)| {
                 let mut defs: Vec<(usize, DefShape)> = Vec::with_capacity(draws.len());
                 let mut derived: Vec<Option<DerivedShape>> = Vec::with_capacity(draws.len());
                 let mut rel_fields: Vec<Option<RelFieldSpec>> = Vec::with_capacity(draws.len());
@@ -3123,8 +3320,19 @@ mod strategy {
                     derived.push(derived_shape);
                     rel_fields.push(rel_field);
                 }
-                build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields)
+                interleave_tables(
+                    build_program_multi_with_relationships(&tables, &defs, &derived, &rel_fields),
+                    &schedule,
+                )
             })
+    }
+
+    /// The [`interleave_tables`] schedule `trivial_program_with` draws (issue
+    /// #505): one uniform pick per op slot. Each entry shrinks toward `0`,
+    /// and an all-zero schedule is the table-by-table order, so a shrunk
+    /// counterexample keeps only the interleaving it needs to fail.
+    fn interleave_schedule() -> impl Strategy<Value = Vec<usize>> {
+        prop::collection::vec(0..INTERLEAVE_PICK_RANGE, MAX_INTERLEAVED_OPS)
     }
 
     /// The generator's default strategy: awkward values (NULLs) on, so real
@@ -3861,7 +4069,7 @@ mod tests {
         /// A `Delete` on table A's pk 1 must not affect table B's pk 1: an
         /// `Update` on table B's still-live pk 1, issued right after table
         /// A's delete, must still predict `Succeeds` — never `AffectsNoRows`
-        /// — proving the two tables' `live` sets don't leak into each other.
+        /// — proving the two tables' `live` maps don't leak into each other.
         #[test]
         fn a_delete_on_one_table_does_not_affect_the_same_pk_on_another_table() {
             let program = build_program_multi(
@@ -4118,6 +4326,131 @@ mod tests {
                 "three independent single-row groups must reorder under a group-order reversal: \
                  {reordered:#?}"
             );
+        }
+    }
+
+    /// Issue #505: `ToggleNull` and the table interleaving.
+    mod reverse_path {
+        use super::*;
+
+        fn c1_change(op: &Op) -> (Option<String>, &OpOutcome) {
+            let Op::Update {
+                changes, expect, ..
+            } = op
+            else {
+                panic!("expected an update, got {op:?}");
+            };
+            assert_eq!(changes.len(), 1, "ToggleNull writes c1 alone: {op:?}");
+            (changes[0].1.clone(), expect)
+        }
+
+        #[test]
+        fn toggle_null_moves_c1_across_null_each_way() {
+            let program = build_program(
+                &[(Some(5), None), (None, None)],
+                &[
+                    Mutate::ToggleNull { pk: 1, value: 7 },
+                    Mutate::ToggleNull { pk: 2, value: 8 },
+                    Mutate::ToggleNull { pk: 1, value: 9 },
+                ],
+            );
+            // ops: [seed 1, seed 2, toggle 1, toggle 2, toggle 1]
+            assert_eq!(c1_change(&program.ops[2]), (None, &OpOutcome::Succeeds));
+            assert_eq!(
+                c1_change(&program.ops[3]),
+                (Some("8".to_string()), &OpOutcome::Succeeds)
+            );
+            assert_eq!(
+                c1_change(&program.ops[4]),
+                (Some("9".to_string()), &OpOutcome::Succeeds),
+                "the second toggle of pk 1 must see the NULL the first one wrote"
+            );
+        }
+
+        #[test]
+        fn toggle_null_tracks_updates_revivals_and_dead_rows() {
+            let program = build_program(
+                &[(Some(5), None)],
+                &[
+                    Mutate::Update {
+                        pk: 1,
+                        c1: None,
+                        c2: None,
+                    },
+                    Mutate::ToggleNull { pk: 1, value: 3 },
+                    Mutate::Delete { pk: 1 },
+                    Mutate::ToggleNull { pk: 1, value: 4 },
+                    Mutate::DuplicateInsert {
+                        pk: 1,
+                        c1: Some(6),
+                        c2: None,
+                    },
+                    Mutate::ToggleNull { pk: 1, value: 4 },
+                ],
+            );
+            // ops: [seed, update, toggle, delete, toggle, revive, toggle]
+            assert_eq!(
+                c1_change(&program.ops[2]),
+                (Some("3".to_string()), &OpOutcome::Succeeds),
+                "the toggle must see the NULL the update wrote"
+            );
+            assert_eq!(c1_change(&program.ops[4]).1, &OpOutcome::AffectsNoRows);
+            assert_eq!(
+                c1_change(&program.ops[6]),
+                (None, &OpOutcome::Succeeds),
+                "the toggle must see the revived row's c1"
+            );
+        }
+
+        fn three_table_program() -> Program {
+            build_program_multi(
+                &[
+                    TableSpec::numeric_only(
+                        vec![(Some(1), None), (Some(2), None)],
+                        vec![Mutate::Delete { pk: 1 }],
+                    ),
+                    TableSpec::numeric_only(vec![(Some(3), None)], vec![Mutate::Truncate]),
+                    TableSpec::numeric_only(vec![(Some(4), None)], Vec::new()),
+                ],
+                &[0],
+            )
+        }
+
+        #[test]
+        fn an_all_zero_schedule_keeps_the_table_by_table_order() {
+            let program = three_table_program();
+            assert_eq!(interleave_tables(program.clone(), &[]), program);
+            assert_eq!(
+                interleave_tables(program.clone(), &[0, INTERLEAVE_PICK_RANGE, 0]),
+                program,
+                "a pick is taken modulo the tables left, so a full-range pick is 0 too"
+            );
+        }
+
+        #[test]
+        fn interleaving_keeps_each_tables_order_and_moves_ops_across_tables() {
+            let program = three_table_program();
+            // Always the last table with ops left.
+            let schedule = [2, 1, 1, 1, 0, 0];
+            let interleaved = interleave_tables(program.clone(), &schedule);
+            let tables: Vec<&str> = interleaved.ops.iter().map(op_table).collect();
+            let t = |i: usize| program.tables[i].name.as_str();
+            assert_eq!(tables, vec![t(2), t(1), t(1), t(0), t(0), t(0)]);
+            for (stream_before, stream_after) in table_streams(&program)
+                .iter()
+                .zip(table_streams(&interleaved))
+            {
+                let before: Vec<&Op> = stream_before.iter().map(|&i| &program.ops[i]).collect();
+                let after: Vec<&Op> = stream_after.iter().map(|&i| &interleaved.ops[i]).collect();
+                assert_eq!(before, after, "a table's own ops must keep their order");
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "interleave before scheduling anything by op index")]
+        fn interleaving_after_scheduling_by_op_index_is_a_generator_bug() {
+            let program = schedule_restart(three_table_program(), 2);
+            interleave_tables(program, &[1]);
         }
     }
 }

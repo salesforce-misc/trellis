@@ -22,7 +22,7 @@ mod noise;
 mod restore;
 mod two_instance;
 
-pub use coverage::Coverage;
+pub use coverage::{Coverage, RelPath};
 pub use db_admin::{check_slot_loss_detected, run_convergence_with_db_admin};
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};

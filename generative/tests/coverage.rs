@@ -14,6 +14,7 @@ use generative::generate::{
     trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::run::RelPath;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
@@ -1433,4 +1434,44 @@ fn trivial_program_draws_matching_missing_and_null_relationship_foreign_keys() {
         "relationship foreign keys must cover all three join outcomes across 500 samples \
          (matching={saw_match}, missing={saw_miss}, null={saw_null})"
     );
+}
+
+/// Issue #505: every relationship shape reaches every reverse-propagation
+/// path ([`RelPath`]), including a from-side write landing after the parent
+/// it joins changed. That last path needs the tables' op streams
+/// interleaved (`generate::interleave_tables`): with each table's whole
+/// stream emitted in turn, every parent-side op came after every from-side
+/// op, and it was never drawn at all.
+///
+/// Sampled with [`TestRunner::deterministic`], so this pins what a fixed
+/// seed draws rather than being a probabilistic floor.
+#[test]
+fn trivial_program_drives_every_relationship_reverse_path() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program();
+    let mut coverage = generative::run::Coverage::new();
+    for _ in 0..1_000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&program);
+    }
+    for shape in [
+        "to_one_bare",
+        "to_many_in_aggregate",
+        "to_one_in_aggregate_def",
+    ] {
+        for path in RelPath::ALL {
+            let path = path.name();
+            assert!(
+                coverage
+                    .relationship_path_cases
+                    .get(&(shape, path))
+                    .is_some_and(|&n| n > 0),
+                "the {shape} relationship shape must reach the {path} reverse path across 1,000 \
+                 deterministic samples: {coverage}"
+            );
+        }
+    }
 }

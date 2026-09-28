@@ -113,6 +113,16 @@ pub struct Coverage {
     /// tallied; the argument is `"*"` (no argument), `"column"`, `"rel"` (a
     /// relationship path), or `"expr"` (anything else).
     pub aggregate_call_cases: HashMap<(&'static str, &'static str, &'static str), usize>,
+    /// How many recorded programs (cases) drive each relationship
+    /// **reverse-propagation path**, keyed `(shape, path)` where `shape` is a
+    /// [`Self::relationship_shapes`] name and `path` is one of the
+    /// [`RelPath`] names (issue #505). Computed by replaying the program's
+    /// ops against an in-memory copy of the source tables, so "referenced"
+    /// means a live from-side row joins the parent row *at that moment*, not
+    /// merely that the program declares a relationship. A reverse-path bug
+    /// can only be caught by a case that reaches its path, so this is the
+    /// number a deep run reports to show the parent side really got fuzzed.
+    pub relationship_path_cases: HashMap<(&'static str, &'static str), usize>,
     /// The largest [`Op::BulkInsert`] row count seen across every recorded
     /// program (improvement-plan task E6) — a floor test asserts this
     /// actually gets large across enough samples of
@@ -199,56 +209,19 @@ impl Coverage {
             .iter()
             .map(|r| (r.name.as_str(), r))
             .collect();
+        let mut reads = Vec::new();
         for def in &program.defs {
             for field in &def.fields {
-                self.record_relationship_shapes(&field.expr, def, &by_name, false);
+                collect_relationship_reads(&field.expr, def, &by_name, false, &mut reads);
             }
         }
-    }
+        for read in &reads {
+            *self.relationship_shapes.entry(read.shape).or_insert(0) += 1;
+        }
 
-    /// Walks `expr` tallying every relationship *reference* shape it reads
-    /// into [`Self::relationship_shapes`] (issue #34). `wrapped` tracks
-    /// whether the current subexpression sits directly under an aggregate
-    /// call, since that — together with the relationship's cardinality and
-    /// the definition's key-space — is exactly what distinguishes the three
-    /// legal shapes from each other.
-    fn record_relationship_shapes(
-        &mut self,
-        expr: &Expr,
-        def: &TransformDef,
-        by_name: &HashMap<&str, &Relationship>,
-        wrapped: bool,
-    ) {
-        match expr {
-            Expr::RelationshipPath { rel, .. } => {
-                let cardinality = by_name.get(rel.as_str()).map(|r| r.cardinality);
-                let in_aggregate_def = matches!(def.key_space, KeySpace::Aggregate { .. });
-                let name = match (cardinality, wrapped, in_aggregate_def) {
-                    (Some(Cardinality::ToOne), false, false) => "to_one_bare",
-                    (Some(Cardinality::ToMany), true, false) => "to_many_in_aggregate",
-                    (Some(Cardinality::ToOne), true, true) => "to_one_in_aggregate_def",
-                    _ => "other",
-                };
-                *self.relationship_shapes.entry(name).or_insert(0) += 1;
-            }
-            Expr::Column(_)
-            | Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::TypedLiteral { .. } => {}
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                self.record_relationship_shapes(lhs, def, by_name, false);
-                self.record_relationship_shapes(rhs, def, by_name, false);
-            }
-            Expr::FunctionCall { args, .. } => {
-                // Only a *single*-argument call can be the aggregate-over-a-
-                // path shape (ADR-0006: "wrapped in exactly one aggregate
-                // function"), so a path buried among several arguments of a
-                // scalar call is deliberately not counted as wrapped.
-                let wrapped = args.len() == 1;
-                for arg in args {
-                    self.record_relationship_shapes(arg, def, by_name, wrapped);
-                }
-            }
+        // Issue #505.
+        for key in relationship_path_events(program, &reads) {
+            *self.relationship_path_cases.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -334,6 +307,281 @@ fn collect_aggregate_calls(
         | Expr::TypedLiteral { .. }
         | Expr::RelationshipPath { .. } => {}
     }
+}
+
+/// One calculated field's read of a relationship: which declaration it
+/// names (`None` if the name resolves to nothing), which to-side column it
+/// reads, and which of the three engine-supported shapes it is.
+struct RelationshipRead<'a> {
+    rel: Option<&'a Relationship>,
+    column: &'a str,
+    shape: &'static str,
+}
+
+/// Walks `expr` collecting every relationship *reference* it reads, with its
+/// [`Coverage::relationship_shapes`] name (issue #34). `wrapped` tracks
+/// whether the current subexpression sits directly under an aggregate call,
+/// since that, together with the relationship's cardinality and the
+/// definition's key-space, is exactly what distinguishes the three legal
+/// shapes from each other.
+fn collect_relationship_reads<'a>(
+    expr: &'a Expr,
+    def: &TransformDef,
+    by_name: &HashMap<&str, &'a Relationship>,
+    wrapped: bool,
+    out: &mut Vec<RelationshipRead<'a>>,
+) {
+    match expr {
+        Expr::RelationshipPath { rel, column } => {
+            let rel = by_name.get(rel.as_str()).copied();
+            let in_aggregate_def = matches!(def.key_space, KeySpace::Aggregate { .. });
+            let shape = match (rel.map(|r| r.cardinality), wrapped, in_aggregate_def) {
+                (Some(Cardinality::ToOne), false, false) => "to_one_bare",
+                (Some(Cardinality::ToMany), true, false) => "to_many_in_aggregate",
+                (Some(Cardinality::ToOne), true, true) => "to_one_in_aggregate_def",
+                _ => "other",
+            };
+            out.push(RelationshipRead { rel, column, shape });
+        }
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_relationship_reads(lhs, def, by_name, false, out);
+            collect_relationship_reads(rhs, def, by_name, false, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            // Only a *single*-argument call can be the aggregate-over-a-
+            // path shape (ADR-0006: "wrapped in exactly one aggregate
+            // function"), so a path buried among several arguments of a
+            // scalar call is deliberately not counted as wrapped.
+            let wrapped = args.len() == 1;
+            for arg in args {
+                collect_relationship_reads(arg, def, by_name, wrapped, out);
+            }
+        }
+    }
+}
+
+/// The relationship reverse-propagation paths
+/// [`Coverage::relationship_path_cases`] tallies (issue #505). "Parent" is
+/// the relationship's to-side row, whichever cardinality: it is the row whose
+/// change the engine must propagate *back* into from-side targets. A parent
+/// is "referenced" when some live from-side row joins it at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelPath {
+    /// A referenced parent's read column moves between `NULL` and
+    /// non-`NULL`, either way. The sharpest reverse-path edge for
+    /// `COUNT(<rel>.<col>)` (the row stops or starts counting) and for
+    /// `MIN`/`MAX`/`AVG` (a value leaves or joins the fold).
+    ParentNullFlip,
+    /// A referenced parent's read column changes between two different
+    /// non-`NULL` values.
+    ParentValueChange,
+    /// A parent row appears while a live from-side row already joins it.
+    ParentInsert,
+    /// A referenced parent row is deleted.
+    ParentDelete,
+    /// A referenced parent row is removed by a `TRUNCATE` of its table.
+    ParentTruncate,
+    /// A from-side row is written after the parent it joins (before or after
+    /// the write) was deleted, truncated, or had its read column changed
+    /// earlier in the same program: the parent change and the from-side
+    /// change are both in the engine's pipeline, the lost-update shape of
+    /// #582. Only reachable when a program interleaves tables.
+    FromSideAfterParentChange,
+}
+
+impl RelPath {
+    pub const ALL: [RelPath; 6] = [
+        RelPath::ParentNullFlip,
+        RelPath::ParentValueChange,
+        RelPath::ParentInsert,
+        RelPath::ParentDelete,
+        RelPath::ParentTruncate,
+        RelPath::FromSideAfterParentChange,
+    ];
+
+    /// The name [`Coverage::relationship_path_cases`] keys on.
+    pub fn name(self) -> &'static str {
+        match self {
+            RelPath::ParentNullFlip => "parent_null_flip",
+            RelPath::ParentValueChange => "parent_value_change",
+            RelPath::ParentInsert => "parent_insert",
+            RelPath::ParentDelete => "parent_delete",
+            RelPath::ParentTruncate => "parent_truncate",
+            RelPath::FromSideAfterParentChange => "from_side_after_parent_change",
+        }
+    }
+}
+
+/// A source row as the replay in [`relationship_path_events`] holds it:
+/// column name to rendered value (`None` is SQL `NULL`, and so is a column
+/// the inserting op didn't name).
+type SimRow = HashMap<String, Option<String>>;
+
+/// Applies `op` to `rows` (one table, keyed by rendered pk) exactly as
+/// Postgres would. It ignores `op.expect()`, so the replay's accounting
+/// can't be skewed by a generator bug in the expected outcomes.
+fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
+    let pk_of = |row: &[(String, Option<String>)]| {
+        row.iter()
+            .find(|(c, _)| c == pk_col)
+            .and_then(|(_, v)| v.clone())
+    };
+    let to_row = |row: &[(String, Option<String>)]| row.iter().cloned().collect::<SimRow>();
+    match op {
+        Op::Insert { row, .. } => {
+            if let Some(pk) = pk_of(row)
+                && !rows.contains_key(&pk)
+            {
+                rows.insert(pk, to_row(row));
+            }
+        }
+        Op::BulkInsert { rows: new_rows, .. } => {
+            let pks: Vec<Option<String>> = new_rows.iter().map(|r| pk_of(r)).collect();
+            let distinct: HashSet<&Option<String>> = pks.iter().collect();
+            let atomic_ok = distinct.len() == pks.len()
+                && pks
+                    .iter()
+                    .all(|pk| pk.as_ref().is_some_and(|pk| !rows.contains_key(pk)));
+            if atomic_ok {
+                for (pk, row) in pks.into_iter().zip(new_rows) {
+                    rows.insert(pk.expect("checked above"), to_row(row));
+                }
+            }
+        }
+        Op::Update { pk, changes, .. } => {
+            if let Some(row) = rows.get_mut(pk) {
+                for (column, value) in changes {
+                    row.insert(column.clone(), value.clone());
+                }
+            }
+        }
+        Op::Delete { pk, .. } => {
+            rows.remove(pk);
+        }
+        Op::Truncate { .. } => rows.clear(),
+    }
+}
+
+fn op_table_name(op: &Op) -> &str {
+    match op {
+        Op::Insert { table, .. }
+        | Op::Update { table, .. }
+        | Op::Delete { table, .. }
+        | Op::Truncate { table, .. }
+        | Op::BulkInsert { table, .. } => table,
+    }
+}
+
+/// Replays `program.ops` against in-memory copies of its source tables and
+/// returns every `(shape, path)` pair (see [`RelPath`]) the op stream drives
+/// for any of `reads` (issue #505).
+fn relationship_path_events(
+    program: &Program,
+    reads: &[RelationshipRead<'_>],
+) -> HashSet<(&'static str, &'static str)> {
+    let mut out = HashSet::new();
+    let reads: Vec<(&Relationship, &str, &'static str)> = reads
+        .iter()
+        .filter_map(|r| Some((r.rel?, r.column, r.shape)))
+        .collect();
+    if reads.is_empty() {
+        return out;
+    }
+    let pk_cols: HashMap<&str, &str> = program
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t.pk_col.as_str()))
+        .collect();
+    let mut state: HashMap<&str, HashMap<String, SimRow>> = HashMap::new();
+    // `(relationship name, join value)` of every parent changed so far.
+    let mut changed_parents: HashSet<(&str, String)> = HashSet::new();
+    let value = |row: &SimRow, column: &str| row.get(column).cloned().flatten();
+
+    for op in &program.ops {
+        let table = op_table_name(op);
+        let Some(pk_col) = pk_cols.get(table) else {
+            continue;
+        };
+        let before = state.get(table).cloned().unwrap_or_default();
+        apply_to_rows(op, pk_col, state.entry(table).or_default());
+        let after = &state[table];
+
+        let mut pks: Vec<&String> = before.keys().chain(after.keys()).collect();
+        pks.sort_unstable();
+        pks.dedup();
+        for pk in pks {
+            let old = before.get(pk);
+            let new = after.get(pk);
+            let touched = old != new || (matches!(op, Op::Update { pk: p, .. } if p == pk));
+            if !touched {
+                continue;
+            }
+            for &(rel, column, shape) in &reads {
+                if rel.to_table == table {
+                    let referenced = |row: &SimRow| {
+                        value(row, &rel.to_col).is_some_and(|key| {
+                            state.get(rel.from_table.as_str()).is_some_and(|from| {
+                                from.values()
+                                    .any(|f| value(f, &rel.from_col).as_ref() == Some(&key))
+                            })
+                        })
+                    };
+                    let path = match (old, new) {
+                        (None, Some(n)) => referenced(n).then_some(RelPath::ParentInsert),
+                        (Some(o), None) if matches!(op, Op::Truncate { .. }) => {
+                            referenced(o).then_some(RelPath::ParentTruncate)
+                        }
+                        (Some(o), None) => referenced(o).then_some(RelPath::ParentDelete),
+                        (Some(o), Some(n)) => {
+                            let (was, is) = (value(o, column), value(n, column));
+                            if was == is || !referenced(n) {
+                                None
+                            } else if was.is_none() != is.is_none() {
+                                Some(RelPath::ParentNullFlip)
+                            } else {
+                                Some(RelPath::ParentValueChange)
+                            }
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some(path) = path {
+                        out.insert((shape, path.name()));
+                    }
+                    // Any mutation of an existing parent counts for the
+                    // from-side path, referenced or not: a from-side row that
+                    // starts joining it afterward must still see the new
+                    // state. A parent *insert* doesn't: a from-side row
+                    // arriving after it is the ordinary forward read.
+                    let changed = match (old, new) {
+                        (Some(o), Some(n)) => value(o, column) != value(n, column),
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    if changed {
+                        for row in old.into_iter().chain(new) {
+                            if let Some(key) = value(row, &rel.to_col) {
+                                changed_parents.insert((rel.name.as_str(), key));
+                            }
+                        }
+                    }
+                }
+                if rel.from_table == table {
+                    let joins_a_changed_parent = old.into_iter().chain(new).any(|row| {
+                        value(row, &rel.from_col)
+                            .is_some_and(|key| changed_parents.contains(&(rel.name.as_str(), key)))
+                    });
+                    if joins_a_changed_parent {
+                        out.insert((shape, RelPath::FromSideAfterParentChange.name()));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn op_kind(op: &Op) -> &'static str {
@@ -489,6 +737,13 @@ impl fmt::Display for Coverage {
         for ((key_space, function, argument), count) in calls {
             write!(f, " {key_space}:{function}({argument})={count}")?;
         }
+        writeln!(f)?;
+        write!(f, "relationship_path_cases:")?;
+        let mut paths: Vec<_> = self.relationship_path_cases.iter().collect();
+        paths.sort_unstable();
+        for ((shape, path), count) in paths {
+            write!(f, " {shape}:{path}={count}")?;
+        }
         writeln!(f)
     }
 }
@@ -496,7 +751,62 @@ impl fmt::Display for Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generate::build_program;
+    use crate::generate::{
+        DefShape, Mutate, RelFieldKind, RelFieldSpec, TableSpec, build_program,
+        build_program_multi_with_relationships, interleave_tables,
+    };
+
+    /// A from-side row joined to a parent whose `c1` is toggled to `NULL`,
+    /// read through a bare to-one enrichment (issue #505).
+    fn toggled_parent_program() -> Program {
+        let mut from_side = TableSpec::numeric_only(vec![(Some(1), None)], Vec::new());
+        from_side.rel_fk_values = vec![Some("k1".to_string())];
+        let parent = TableSpec::numeric_only(
+            vec![(Some(5), None)],
+            vec![Mutate::ToggleNull { pk: 1, value: 0 }],
+        );
+        build_program_multi_with_relationships(
+            &[from_side, parent],
+            &[(0, DefShape::OneToOne)],
+            &[None],
+            &[Some(RelFieldSpec {
+                to_table: 1,
+                kind: RelFieldKind::ToOneBare,
+            })],
+        )
+    }
+
+    fn paths(program: &Program) -> Vec<&'static str> {
+        let mut coverage = Coverage::new();
+        coverage.record_program(program);
+        let mut paths: Vec<&'static str> = coverage
+            .relationship_path_cases
+            .keys()
+            .map(|&(shape, path)| {
+                assert_eq!(shape, "to_one_bare");
+                path
+            })
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    #[test]
+    fn a_table_ordered_program_reaches_the_parent_paths_only() {
+        // ops: [from-side seed, parent seed, parent toggle]
+        assert_eq!(
+            paths(&toggled_parent_program()),
+            vec!["parent_insert", "parent_null_flip"]
+        );
+    }
+
+    #[test]
+    fn a_from_side_write_after_the_parent_changed_is_its_own_path() {
+        // ops: [parent seed, parent toggle, from-side seed]: the parent is
+        // unreferenced when it changes, and the from-side row then joins it.
+        let interleaved = interleave_tables(toggled_parent_program(), &[1, 1, 0]);
+        assert_eq!(paths(&interleaved), vec!["from_side_after_parent_change"]);
+    }
 
     #[test]
     fn record_program_tallies_a_trivial_convergent_program() {
