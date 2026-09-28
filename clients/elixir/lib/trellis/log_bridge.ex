@@ -4,7 +4,7 @@ defmodule Trellis.LogBridge do
 
   The Rust engine logs through the `tracing` facade and never installs a
   subscriber itself (`docs/decisions/0009-observability-decisions.md`,
-  decision 3). When the `:trellis` application starts, this process installs
+  decision 3). When the `:trellis_pg` application starts, this process installs
   one in the Trellis NIF library, then drains what it queues into `Logger`,
   with `domain: [:trellis]` and the emitting Rust module as `:target`
   metadata. It needs no `Trellis` handle: every handle's lines come through
@@ -13,15 +13,15 @@ defmodule Trellis.LogBridge do
   ## Configuration
 
       # Forward events at this level and more severe ones. Defaults to
-      # `Logger.level()` when `:trellis` starts. Rust's `trace` level
+      # `Logger.level()` when `:trellis_pg` starts. Rust's `trace` level
       # arrives as `:debug`.
-      config :trellis, log_level: :info
+      config :trellis_pg, log_level: :info
 
       # Opt out: nothing is installed, this process doesn't start, and the
       # engine's lines go nowhere.
-      config :trellis, log_bridge: false
+      config :trellis_pg, log_bridge: false
 
-  The level is read once, when `:trellis` starts. The engine drops events
+  The level is read once, when `:trellis_pg` starts. The engine drops events
   above it before formatting them, so a later `Logger.configure/1` can make
   `Logger` stricter but can't bring back a level the bridge filtered.
 
@@ -77,7 +77,7 @@ defmodule Trellis.LogBridge do
 
   @impl true
   def init(:ok) do
-    level = Application.get_env(:trellis, :log_level, Logger.level())
+    level = Application.get_env(:trellis_pg, :log_level, Logger.level())
 
     case Native.install_log_bridge(filter(level)) do
       {:ok, :ok} ->
@@ -152,6 +152,6 @@ defmodule Trellis.LogBridge do
 
   def filter(level) do
     raise ArgumentError,
-          "config :trellis, log_level: expected a Logger level, got: #{inspect(level)}"
+          "config :trellis_pg, log_level: expected a Logger level, got: #{inspect(level)}"
   end
 end

@@ -1,0 +1,6 @@
+# Read by Cargo when it runs from this directory, as the NIF's builds do
+# (Rustler's `mix compile`, and .github/scripts/build-elixir-nif.sh). Rust
+# links musl's C runtime statically by default, and a statically linked
+# target can't produce the `cdylib` the BEAM loads.
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=-crt-static"]

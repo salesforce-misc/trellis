@@ -1,6 +1,6 @@
 # `define "TRANSFORM ..."` in a migration reads like Ecto's own `create
 # table(...)`, so the formatter leaves both without parentheses, here and,
-# through `import_deps: [:trellis]`, in a host app's migrations.
+# through `import_deps: [:trellis_pg]`, in a host app's migrations.
 locals_without_parens = [define: 1, apply: 1]
 
 [

@@ -87,7 +87,7 @@ defmodule Trellis.MigrationTest do
     {:ok, _} = Application.ensure_all_started(:ecto_sql)
     {:ok, _} = Application.ensure_all_started(:postgrex)
 
-    Application.put_env(:trellis, TestRepo,
+    Application.put_env(:trellis_pg, TestRepo,
       socket_dir: cluster["host"],
       port: cluster["port"],
       username: cluster["user"],
@@ -170,9 +170,9 @@ defmodule Trellis.MigrationTest do
   end
 
   test "a repo with no :trellis key raises naming it" do
-    config = Application.fetch_env!(:trellis, TestRepo)
-    Application.put_env(:trellis, TestRepo, Keyword.delete(config, :trellis))
-    on_exit(fn -> Application.put_env(:trellis, TestRepo, config) end)
+    config = Application.fetch_env!(:trellis_pg, TestRepo)
+    Application.put_env(:trellis_pg, TestRepo, Keyword.delete(config, :trellis))
+    on_exit(fn -> Application.put_env(:trellis_pg, TestRepo, config) end)
 
     error =
       assert_raise Ecto.MigrationError, fn ->

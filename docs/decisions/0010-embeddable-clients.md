@@ -160,8 +160,10 @@ where there is one implementation to get right — decision 2 applied to types.
 
 ## Open questions
 
-* Published package and module names on Hex and RubyGems — expensive to change
-  after release, and `trellis` may be taken on either.
+* ~~Published package and module names on Hex and RubyGems.~~ Decided
+  2026-09-28 (#150): `trellis` is taken, so the packages are `trellis-pg`, and
+  `trellis_pg` on Hex, which allows no hyphen (its OTP app is `:trellis_pg`).
+  The module names stay `Trellis` and `Trellis::`.
 * A multi-tenant host (one app, several databases) implies several handles, in
   tension with decision 3's per-process singleton. Deferred until a concrete need.
 

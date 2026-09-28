@@ -2,3 +2,10 @@
 /deps/
 /priv/native/
 erl_crash.dump
+/doc/
+# Written by the release workflow before it publishes
+# (.github/scripts/elixir-prepare-hex-package.sh and
+# `mix rustler_precompiled.download`), never committed.
+/LICENSE.txt
+/checksum-Elixir.Trellis.Native.exs
+/native/trellis_nif/Cargo.lock

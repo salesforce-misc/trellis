@@ -5,5 +5,5 @@ defmodule Trellis.TestRepo do
   # `:trellis` key included, from the application environment the test puts
   # there, as `Ecto.Migrator` reads a host repo's.
 
-  use Ecto.Repo, otp_app: :trellis, adapter: Ecto.Adapters.Postgres
+  use Ecto.Repo, otp_app: :trellis_pg, adapter: Ecto.Adapters.Postgres
 end

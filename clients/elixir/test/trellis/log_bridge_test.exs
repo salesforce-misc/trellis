@@ -99,8 +99,8 @@ defmodule Trellis.LogBridgeTest do
   test "opting out starts nothing" do
     assert Trellis.Application.children() == [LogBridge]
 
-    Application.put_env(:trellis, :log_bridge, false)
-    on_exit(fn -> Application.delete_env(:trellis, :log_bridge) end)
+    Application.put_env(:trellis_pg, :log_bridge, false)
+    on_exit(fn -> Application.delete_env(:trellis_pg, :log_bridge) end)
     assert Trellis.Application.children() == []
   end
 

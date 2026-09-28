@@ -1,0 +1,179 @@
+name: Elixir release
+
+# Releases the Elixir binding (clients/elixir) as the `trellis_pg` Hex
+# package (issue #150). Nothing else triggers it: merging a change does
+# nothing.
+#
+# - Pushing an `elixir-v<version>` tag, where <version> is mix.exs's
+#   @version, builds the precompiled NIF for every target Trellis.Native
+#   lists, attaches them to the tag's GitHub release (the URL
+#   rustler_precompiled downloads from), writes the checksum file from what
+#   that release now serves, and publishes the package to Hex with it. The
+#   Hex step needs the HEX_API_KEY repository secret.
+# - Running it by hand (workflow_dispatch) builds the same NIFs and keeps them
+#   as workflow artifacts, then checks the package the way a release would
+#   build it, from source. It creates no release and publishes nothing.
+
+on:
+  push:
+    tags: ["elixir-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: elixir-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: NIF ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every Linux target cross-builds on one x86_64 runner with
+          # cargo-zigbuild, which links the gnu targets against an old glibc
+          # (see build-elixir-nif.sh). Both macOS targets build on an Apple
+          # silicon runner, whose toolchain links either architecture.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag names mix.exs's version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(awk -F'"' '/^  @version / { print $2; exit }' clients/elixir/mix.exs)"
+          if [ "$GITHUB_REF_NAME" != "elixir-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match clients/elixir/mix.exs's @version $version" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        # From PyPI, which ships both it and Zig as wheels, pinned. In a venv
+        # put first on PATH, so its `python3 -m ziglang` is how
+        # cargo-zigbuild finds Zig.
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet cargo-zigbuild==0.23.4 ziglang==0.15.2
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build the NIF
+        run: .github/scripts/build-elixir-nif.sh "${{ matrix.target }}" "$RUNNER_TEMP/nif"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nif-${{ matrix.target }}
+          path: ${{ runner.temp }}/nif/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    # Attaches the NIFs to the tag's GitHub release, creating it if a
+    # previous attempt didn't, so a re-run replaces them.
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nif-*
+          merge-multiple: true
+          path: nif
+
+      - name: Attach the NIFs to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l nif
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" nif/*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" nif/*.tar.gz --verify-tag \
+              --title "trellis_pg ${GITHUB_REF_NAME#elixir-v} (Elixir)" \
+              --notes "Precompiled NIFs for the \`trellis_pg\` Hex package, which downloads them. See clients/elixir/README.md."
+          fi
+
+  package:
+    # A tag publishes to Hex; a manual run stops after `mix hex.build`.
+    needs: [build, release]
+    # `release` is skipped on a manual run; run anyway unless something failed.
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Install Erlang/OTP and Elixir
+        run: .github/scripts/setup-beam.sh clients/elixir/.tool-versions "$RUNNER_TEMP/beam"
+
+      - name: Make the NIF crate stand alone, and copy in the license
+        run: .github/scripts/elixir-prepare-hex-package.sh "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
+      - name: Fetch Mix dependencies
+        working-directory: clients/elixir
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: Build from source, as TRELLIS_PG_BUILD=1 would
+        # In :dev the NIF always builds from source, here from the crate
+        # the package ships: this is the source build a host on an unlisted
+        # target gets. It also records the module's download metadata, which
+        # the checksum step reads.
+        working-directory: clients/elixir
+        run: mix compile --warnings-as-errors
+
+      - name: Write the checksum file from the GitHub release
+        # Without --ignore-unavailable: a target the release doesn't serve
+        # fails the run instead of shipping a package that can't install
+        # there. 5 is the length of Trellis.Native's `targets` (and of the
+        # build matrix above).
+        if: github.ref_type == 'tag'
+        working-directory: clients/elixir
+        run: |
+          mix rustler_precompiled.download Trellis.Native --all --print
+          targets="$(grep -c '"sha256:' checksum-Elixir.Trellis.Native.exs)"
+          if [ "$targets" -ne 5 ]; then
+            echo "checksum-Elixir.Trellis.Native.exs lists $targets NIFs, not 5" >&2
+            exit 1
+          fi
+
+      - name: Build the package
+        working-directory: clients/elixir
+        run: mix hex.build
+
+      - name: Publish to Hex
+        if: github.ref_type == 'tag'
+        working-directory: clients/elixir
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: |
+          if [ -z "$HEX_API_KEY" ]; then
+            echo "the HEX_API_KEY secret isn't set; the NIFs are released, but nothing was published" >&2
+            exit 1
+          fi
+          mix hex.publish --yes

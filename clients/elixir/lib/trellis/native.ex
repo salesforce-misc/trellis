@@ -5,14 +5,47 @@ defmodule Trellis.Native do
   # `Trellis` turns the error into a `Trellis.Error`. Every one that can wait
   # runs on a dirty IO scheduler; the NIF crate's module docs list the two
   # that don't, and why.
+  #
+  # A host gets the NIF precompiled: rustler_precompiled downloads the build
+  # for its target from the `elixir-v<version>` GitHub release, which
+  # .github/workflows/elixir-release.yml builds, and checks it against
+  # checksum-Elixir.Trellis.Native.exs, which ships in the Hex package.
+  # `TRELLIS_PG_BUILD=1` builds it from source instead (it needs Rust and
+  # the host's own `{:rustler, ...}` dep), for a target not listed below.
+  # Inside this repository (dev and test; a dependency always compiles in
+  # :prod) it always builds from source, so CI tests the NIF it builds.
 
-  use Rustler,
-    otp_app: :trellis,
-    crate: "trellis_nif",
-    # Debug outside :prod, so a dev or test build reuses the Cargo
-    # workspace's own debug build of `trellis` (Cargo builds this workspace
-    # member into the repository's `target/`).
-    mode: if(Mix.env() == :prod, do: :release, else: :debug)
+  version = Mix.Project.config()[:version]
+
+  force_build =
+    if System.get_env("TRELLIS_PG_BUILD") in ["1", "true"] or Mix.env() in [:dev, :test],
+      # Otherwise unset, so rustler_precompiled's own switches still apply
+      # (`config :rustler_precompiled, :force_build, trellis_pg: true`).
+      do: [force_build: true],
+      else: []
+
+  use RustlerPrecompiled,
+      [
+        otp_app: :trellis_pg,
+        crate: "trellis_nif",
+        version: version,
+        base_url:
+          "https://github.com/salesforce-misc/trellis/releases/download/elixir-v#{version}",
+        # The release workflow's matrix. Every build is for NIF version
+        # 2.15, which loads on OTP 22 and up.
+        targets: ~w(
+          aarch64-apple-darwin
+          x86_64-apple-darwin
+          aarch64-unknown-linux-gnu
+          x86_64-unknown-linux-gnu
+          x86_64-unknown-linux-musl
+        ),
+        nif_versions: ["2.15"],
+        # A source build: debug outside :prod, so a dev or test build reuses
+        # the Cargo workspace's own debug build of `trellis` (Cargo builds
+        # this workspace member into the repository's `target/`).
+        mode: if(Mix.env() == :prod, do: :release, else: :debug)
+      ] ++ force_build
 
   def connect(_options), do: :erlang.nif_error(:nif_not_loaded)
   def migrate(_handle), do: :erlang.nif_error(:nif_not_loaded)

@@ -61,7 +61,7 @@ defmodule Trellis.ParityTest do
   test "every conversion returns its expected shape" do
     # Loads every struct module, so each field name the native maps use
     # already exists as an atom.
-    Enum.each(Application.spec(:trellis, :modules), &Code.ensure_loaded!/1)
+    Enum.each(Application.spec(:trellis_pg, :modules), &Code.ensure_loaded!/1)
 
     for conversion <- Parity.fixture()["conversions"] do
       native = Parity.native(conversion["native"])
@@ -108,7 +108,7 @@ defmodule Trellis.ParityTest do
     records = Parity.fixture()["records"]
 
     host =
-      for module <- Application.spec(:trellis, :modules),
+      for module <- Application.spec(:trellis_pg, :modules),
           Code.ensure_loaded!(module),
           function_exported?(module, :__struct__, 0),
           # The handle, and exceptions (`Trellis.Error` is checked by code).

@@ -24,7 +24,7 @@ defmodule Trellis do
     `self_check/3`.
   - **Observability:** `Trellis.Metrics.render_prometheus/0` for a scrape
     route the host serves, and `Trellis.LogBridge`, which forwards the
-    engine's log lines to `Logger` from the moment `:trellis` starts.
+    engine's log lines to `Logger` from the moment `:trellis_pg` starts.
 
       # A deploy's migration step: the defaults run nothing in the background.
       {:ok, migrator} = Trellis.connect(url: "postgres://localhost/app")

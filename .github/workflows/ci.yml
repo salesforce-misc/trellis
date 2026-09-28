@@ -191,8 +191,11 @@ jobs:
         run: mix format --check-formatted
 
       - name: Test
-        # `mix compile` builds the NIF through Cargo (debug, into the
-        # workspace's target/, reusing the restored dependencies). The
+        # `mix compile` builds the NIF from source through Cargo (debug, into
+        # the workspace's target/, reusing the restored dependencies): in
+        # :test, Trellis.Native never downloads a released NIF, so this tests
+        # the NIF this commit builds. elixir-release.yml builds the
+        # precompiled ones. The
         # suite includes the cross-language parity suite
         # (test/trellis/parity_test.exs), which runs the shared
         # clients/parity/cases.json the `ruby` job runs too.
