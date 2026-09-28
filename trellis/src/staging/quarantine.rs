@@ -671,6 +671,15 @@ pub async fn isolate_and_evict(
         .await;
         let _ = txn.rollback().await;
         if let Err(err) = outcome {
+            // Issue #620: a probe that finds its claim gone reproduced the
+            // lost claim, not this key's failure, and every later probe would
+            // reproduce it too, charging every key in the page a death. Stop
+            // and surface it, as `apply::classify_and_retry` does for a
+            // page's own `ClaimLost`: whoever holds the buckets now re-drains
+            // the page, and a genuinely failing key is charged then.
+            if matches!(err, ApplyError::ClaimLost) {
+                return Err(err);
+            }
             let class = classify(&err);
             if class == FailureClass::Halting {
                 tracing::error!(

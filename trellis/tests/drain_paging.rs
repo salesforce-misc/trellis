@@ -882,3 +882,250 @@ async fn a_drain_never_claims_a_segment_before_its_fence_is_published() {
     assert_eq!(outcome.segments_drained, vec![(seg, true)]);
     assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
 }
+
+/// Ages and reclaims only `bucket`'s claim on `seg_seq`: the partial reclaim a
+/// sweep makes when it wins some of a worker's rows and skips others.
+async fn reclaim_bucket(client: &Client, seg_seq: i64, bucket: i16) -> u64 {
+    client
+        .execute(
+            "update seg_claims set claimed_at = now() - interval '1 hour' \
+             where seg_seq = $1 and bucket = $2",
+            &[&seg_seq, &bucket],
+        )
+        .await
+        .expect("age one claim");
+    liveness::reclaim_stale(client, Duration::from_secs(30))
+        .await
+        .expect("reclaim stale claims")
+}
+
+/// Pauses worker A before page `page` of `seg_seq` at `cap`, takes bucket 0
+/// away from it (reclaimed, claimed and fully drained by worker B), then lets A
+/// resume. Returns A's result.
+async fn lose_bucket_zero_before_page(
+    db: &testkit::TestDatabase,
+    client: &Client,
+    seg_seq: i64,
+    cap: usize,
+    page: usize,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let pool = db.pool.clone();
+    let worker_a = tokio::spawn(async move {
+        let mut hooks = DrainHooks {
+            pause_before_page: Some((page, paused_tx, resume_rx)),
+            ..DrainHooks::default()
+        };
+        drain(&pool, seg_seq, "worker-a", cap, &mut hooks).await
+    });
+    paused_rx.await.expect("worker A reaches the page");
+
+    assert_eq!(reclaim_bucket(client, seg_seq, 0).await, 1);
+    assert_eq!(
+        claim::claim(client, seg_seq, "worker-b", 1)
+            .await
+            .expect("worker B claims"),
+        vec![0],
+        "B takes exactly the reclaimed bucket"
+    );
+    let b = drain(
+        &db.pool,
+        seg_seq,
+        "worker-b",
+        cap,
+        &mut DrainHooks::default(),
+    )
+    .await
+    .expect("worker B drains bucket 0")
+    .expect("worker B holds bucket 0");
+    assert_eq!(b.segments_drained, vec![(seg_seq, false)]);
+
+    resume_tx.send(()).expect("resume worker A");
+    worker_a.await.expect("worker A's task")
+}
+
+/// Releases worker A's leftover claims (as the client loop does on error) and
+/// lets worker C drain what remains.
+async fn finish_with_worker_c(
+    db: &testkit::TestDatabase,
+    client: &Client,
+    seg_seq: i64,
+    cap: usize,
+) {
+    liveness::release(client, seg_seq, "worker-a")
+        .await
+        .expect("release worker A");
+    let c = drain(
+        &db.pool,
+        seg_seq,
+        "worker-c",
+        cap,
+        &mut DrainHooks::default(),
+    )
+    .await
+    .expect("worker C drains the rest")
+    .expect("worker C claims the rest");
+    assert_eq!(c.segments_drained, vec![(seg_seq, true)]);
+}
+
+/// The completion rule: a page completes only if *every* one of its buckets is
+/// still claimed. Worker A folds its whole direct share (8 buckets), then loses
+/// bucket 0 to worker B, who drains it. Under the old "at least one bucket"
+/// rule A's completion would still have committed, applying bucket 0's deltas
+/// a second time.
+#[tokio::test]
+async fn a_direct_drain_that_lost_one_of_its_buckets_commits_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=300).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let result = lose_bucket_zero_before_page(&db, &client, seg, 1000, 1).await;
+    assert!(
+        matches!(result, Err(ApplyError::ClaimLost)),
+        "A's completion must find every bucket it folded: {result:?}"
+    );
+    finish_with_worker_c(&db, &client, seg, 1000).await;
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
+
+/// The page claim check: a non-final page commits only if the claim still
+/// holds *every* bucket the worker paged. Worker A pages its 8 buckets as one
+/// union; before page 3 it loses bucket 0 to worker B, who resumes bucket 0
+/// from A's cursor and finishes it. A's page 3 must then roll back, or it
+/// would apply bucket 0's keys in that page a second time.
+#[tokio::test]
+async fn a_page_whose_worker_lost_one_held_bucket_rolls_back() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=300).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let result = lose_bucket_zero_before_page(&db, &client, seg, 40, 3).await;
+    assert!(
+        matches!(result, Err(ApplyError::ClaimLost)),
+        "A's page 3 must fail its claim check: {result:?}"
+    );
+    finish_with_worker_c(&db, &client, seg, 40).await;
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
+
+/// A claimant whose buckets sit at different cursors pages each cursor group
+/// separately. Worker A pages all 8 buckets for two pages; after a reclaim,
+/// worker B takes 4 of them and pages one more; after another reclaim, worker
+/// C holds all 8 across two cursors, and finishes both groups to the oracle.
+#[tokio::test]
+async fn a_claimant_resuming_buckets_at_two_cursors_finishes_each_to_the_oracle() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=300).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let mut stop = DrainHooks {
+        stop_after_pages: Some(2),
+        ..DrainHooks::default()
+    };
+    drain(&db.pool, seg, "worker-a", 25, &mut stop)
+        .await
+        .expect("worker A's pages")
+        .expect("worker A claims");
+    assert!(reclaim(&client, seg).await > 0);
+
+    let mut stop = DrainHooks {
+        stop_after_pages: Some(1),
+        ..DrainHooks::default()
+    };
+    let b = apply::drain_many_with_hooks(
+        &db.pool,
+        &[seg],
+        "worker-b",
+        2,
+        WAKE,
+        &StagedWatermark::saturated(),
+        25,
+        &mut stop,
+    )
+    .await
+    .expect("worker B's page")
+    .expect("worker B claims half");
+    assert_eq!(b.pages, 1);
+    assert!(reclaim(&client, seg).await > 0);
+
+    let cursors: i64 = client
+        .query_one(
+            "select count(distinct (after_route, after_src_table, after_key)) \
+             from drain_cursor where seg_seq = $1",
+            &[&seg],
+        )
+        .await
+        .expect("distinct cursors")
+        .get(0);
+    assert_eq!(cursors, 2, "B's half moved past A's cursor");
+
+    let c = drain(&db.pool, seg, "worker-c", 25, &mut DrainHooks::default())
+        .await
+        .expect("worker C's pages")
+        .expect("worker C claims everything");
+    assert_eq!(c.segments_drained, vec![(seg, true)]);
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
+
+/// Isolation never blames keys for a lost claim. A probe whose rollback-only
+/// apply fails with `ClaimLost` reproduced the lost claim, not the key's
+/// failure; charging it would give every key in the page a death whenever a
+/// genuinely failing page also loses its claim.
+#[tokio::test]
+async fn isolation_surfaces_a_lost_claim_without_charging_any_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    insert_items(&client, &(1..=20).collect::<Vec<_>>()).await;
+    let seg = seal(&mut client).await;
+    let folded = {
+        let mut conn = db.pool.get().await.expect("pool");
+        let txn = conn.transaction().await.expect("txn");
+        let folded = trellis::staging::fold(&txn, seg, trellis::staging::BucketFilter::all())
+            .await
+            .expect("fold");
+        txn.commit().await.expect("commit");
+        folded
+    };
+    assert_eq!(folded.len(), 20);
+
+    // "worker-a" holds no claim on `seg`: every probe's completion step finds
+    // none, exactly as it would after a reclaim.
+    let outcome = trellis::staging::quarantine::isolate_and_evict(
+        &db.pool,
+        seg,
+        "worker-a",
+        WAKE,
+        &folded,
+        trellis::staging::quarantine::DEFAULT_DEATH_THRESHOLD,
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(ApplyError::ClaimLost)),
+        "a probe that loses the claim surfaces it: {outcome:?}"
+    );
+    let deaths: i64 = client
+        .query_one("select count(*) from key_deaths", &[])
+        .await
+        .expect("count key deaths")
+        .get(0);
+    assert_eq!(deaths, 0);
+}

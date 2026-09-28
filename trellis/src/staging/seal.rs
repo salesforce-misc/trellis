@@ -159,10 +159,13 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
         .get(0);
     // The truncate barrier (issue #60, "The ordering hazard"): a batch
     // containing any `op = 'truncate'` row must seal single-bucket, so the
-    // whole-keyspace clear and any same-batch post-truncate writes run as
-    // one atomic Phase-3 transaction — never split across workers, which
+    // whole-keyspace clear and any same-batch post-truncate writes are
+    // drained by one bucket's claimant — never split across workers, which
     // could apply a post-truncate insert on one worker before another
-    // worker's clear runs on the same target. Checked in the same
+    // worker's clear runs on the same target. (Issue #620: a batch over the
+    // drain cap pages, so the clear and the writes can commit in different
+    // Phase-3 transactions, but the sentinel sorts first and the bucket's
+    // cursor orders the pages, so the clear still lands first.) Checked in the same
     // transaction as the row count above and the flip below, for the same
     // reason `bucket_count` itself is: nothing can still be appending into
     // this slot once this transaction commits, so this is the batch's true,
