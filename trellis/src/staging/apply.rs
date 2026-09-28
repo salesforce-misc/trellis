@@ -8884,12 +8884,15 @@ pub(crate) async fn apply_page(
 /// **A non-final page** (issue #620 A2a) runs the claim check, then advances
 /// the cursor:
 ///
-/// - `update seg_claims set claimed_at = now() ... returning bucket` must
-///   return every bucket the worker still holds, or the page is
+/// - `update seg_claims set claimed_at = clock_timestamp() ... returning
+///   bucket` must return every bucket the worker still holds, or the page is
 ///   [`ApplyError::ClaimLost`] and its whole transaction rolls back. The row
 ///   lock this takes is what makes `RECLAIM_STALE_SQL`'s `skip locked` pass
-///   over an in-flight page, and the update doubles as a heartbeat. A reclaim
-///   that committed first deleted the row, so the update misses it; a
+///   over an in-flight page, and the update doubles as a heartbeat. It stamps
+///   the clock, not `now()`: `now()` is the transaction's start, so a page
+///   whose apply ran for 20 s would commit a claim already 20 s old,
+///   overwriting the daemon's fresher refresh from mid-page (issue #654). A
+///   reclaim that committed first deleted the row, so the update misses it; a
 ///   reclaim still in flight holds the row lock, so the update waits and then
 ///   misses it. Either way a stale claimant's page never commits, so no
 ///   delta applies twice.
@@ -8925,7 +8928,7 @@ async fn end_segment_step(
     {
         let refreshed: std::collections::HashSet<i16> = txn
             .query(
-                "update seg_claims set claimed_at = now() \
+                "update seg_claims set claimed_at = clock_timestamp() \
                  where seg_seq = $1 and claimed_by = $2 returning bucket",
                 &[&seg_seq, &claimed_by],
             )

@@ -1591,7 +1591,10 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // does need to run on every iteration — `drainers.last_seen` decays
         // over `drainer_window` (30s by default), and this loop's own
         // `poll_interval` floor (200ms by default) is comfortably inside
-        // that window even when idle. What's wasteful isn't the cadence,
+        // that window even when idle. A drain can outlast the window (a
+        // paged one runs for minutes), so while this worker's claims are
+        // registered with `heartbeat`, the daemon refreshes the same row on
+        // its own tick (issue #654). What's wasteful isn't the cadence,
         // it's checking out a separate pooled connection just for it: one
         // connection serves both this and `next_claimable_segments` below.
         // A failed refresh isn't fatal — it costs this worker one tick of

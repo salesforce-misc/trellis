@@ -13,13 +13,17 @@
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
 //! (`trellis/src/staging/liveness.rs`'s `#[cfg(test)]`), not here.
 
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime};
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::ValueType;
+use trellis::defs::{create_aggregate_target_table, create_definition, parse};
+use trellis::staging::apply::{self, DrainHooks};
 use trellis::staging::{
-    HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, claim, liveness, seal,
+    HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, StagedWatermark, claim, liveness, seal,
 };
 
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
@@ -366,4 +370,226 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
         "the daemon closed its connection after {:?}, before its {idle_timeout:?} idle timeout",
         deregistered_at.elapsed()
     );
+}
+
+/// Issue #654, first half. A page's claim check doubles as a heartbeat, and it
+/// used to stamp `claimed_at = now()`: the page transaction's *start* time. A
+/// page whose apply ran for 18 s therefore wrote a claim that was already 18 s
+/// old at commit, overwriting whatever fresher value the daemon had set while
+/// the page ran (the daemon skips the row only while the page holds its lock).
+/// The sweep then saw a live claim as old as the page, and one page longer than
+/// the TTL let it reclaim a claim still in use.
+///
+/// Here the page's apply is held behind a lock on the target table. The claim
+/// its commit leaves behind must be stamped no earlier than the moment the
+/// lock was released, i.e. at the time of the heartbeat, not at the time the
+/// transaction began. No timing tolerance: the comparison is between two
+/// server clock readings with a strict order between them.
+#[tokio::test]
+async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_start() {
+    const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
+         SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table items (id integer primary key, grp integer, amount numeric); \
+             alter table items replica identity full",
+        )
+        .await
+        .expect("create items");
+    let columns: HashMap<String, ValueType> = ["id", "grp", "amount"]
+        .iter()
+        .map(|n| (n.to_string(), ValueType::Numeric))
+        .collect();
+    let def = parse(GROUP_TOTALS).expect("parse");
+    create_definition(&db.pool, GROUP_TOTALS, &columns)
+        .await
+        .expect("create aggregate definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &columns)
+        .await
+        .expect("create aggregate target");
+
+    // 300 keys at cap 40: page 1 is not the last page, so it runs the claim
+    // check (and heartbeat) rather than the completion.
+    let slot = trellis::staging::active_ring_slot(&client)
+        .await
+        .expect("active ring slot");
+    let src_table = format!("{DEFAULT_SCHEMA}.items");
+    for id in 1..=300i32 {
+        client
+            .execute(
+                "insert into items (id, grp, amount) values ($1, $1 % 7, $1)",
+                &[&id],
+            )
+            .await
+            .expect("insert item");
+        let image = format!(r#"{{"grp":"{}","amount":"{id}"}}"#, id % 7);
+        client
+            .execute(
+                &format!(
+                    "insert into seg_{slot} (src_table, key, op, lsn, new_image, hop_gen) \
+                     values ($1, $2, 'insert', pg_current_wal_insert_lsn(), $3::text::jsonb, 0)"
+                ),
+                &[&src_table, &id.to_string(), &image],
+            )
+            .await
+            .expect("stage insert");
+    }
+    let seg = seal_active_segment(&mut client).await;
+
+    // Writes to the target wait behind this lock; reads (the fold, compute)
+    // do not.
+    let mut blocker = connect_raw(db.dsn()).await;
+    let blocker_txn = blocker.transaction().await.expect("begin blocker");
+    blocker_txn
+        .batch_execute("lock table public.grp_totals in exclusive mode")
+        .await
+        .expect("lock the target");
+
+    let pool = db.pool.clone();
+    let drain = tokio::spawn(async move {
+        let mut hooks = DrainHooks {
+            stop_after_pages: Some(1),
+            ..DrainHooks::default()
+        };
+        apply::drain_many_with_hooks(
+            &pool,
+            &[seg],
+            "worker",
+            1,
+            "trellis_liveness_test",
+            &StagedWatermark::saturated(),
+            40,
+            &mut hooks,
+        )
+        .await
+    });
+
+    // Waiting on a precondition, not on convergence: the page's apply
+    // transaction has begun and is parked on the lock.
+    wait_until("the page's apply to block on the target lock", || async {
+        client
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock')",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get::<_, bool>(0)
+    })
+    .await;
+    // Let the blocked transaction age visibly before releasing it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let released_at: SystemTime = blocker_txn
+        .query_one("select clock_timestamp()", &[])
+        .await
+        .expect("read the release time")
+        .get(0);
+    blocker_txn.commit().await.expect("release the target lock");
+
+    let outcome = drain
+        .await
+        .expect("drain task")
+        .expect("drain")
+        .expect("the drain claims the segment");
+    assert_eq!(outcome.pages, 1, "the hook stops after the first page");
+
+    let stamps: Vec<SystemTime> = client
+        .query(
+            "select claimed_at from seg_claims where seg_seq = $1 and claimed_by = 'worker'",
+            &[&seg],
+        )
+        .await
+        .expect("read the claim")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(!stamps.is_empty(), "the claim is still held after page 1");
+    for stamp in stamps {
+        let lag = released_at
+            .duration_since(stamp)
+            .map(|d| format!("{d:?} before"))
+            .unwrap_or_else(|_| "after".into());
+        assert!(
+            stamp >= released_at,
+            "page 1's heartbeat stamped the claim {lag} the target lock was released, \
+             so the sweep sees a live claim as old as the page's transaction"
+        );
+    }
+}
+
+/// Issue #654, second half. `drainers.last_seen` used to be bumped only by the
+/// worker loop, between drains, so a worker inside a paged drain longer than
+/// the drainer window stopped counting toward the share denominator. The
+/// daemon that keeps a worker's claims alive now keeps its drainer row alive
+/// too: a claimant the daemon holds claims for is refreshed, one it doesn't
+/// is left to age out.
+#[tokio::test]
+async fn a_daemon_keeps_its_claimants_drainer_row_fresh_through_a_long_drain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let seg_seq = seal_one_bucket_batch(&mut client, "k").await;
+    assert!(
+        !claim::claim(&client, seg_seq, "busy-worker", 1)
+            .await
+            .expect("claim")
+            .is_empty()
+    );
+    // Both workers last came around their loop an hour ago: the busy one
+    // because it has been inside one drain ever since.
+    for id in ["busy-worker", "idle-worker"] {
+        claim::register_drainer(&client, id)
+            .await
+            .expect("register drainer");
+    }
+    client
+        .execute(
+            "update drainers set last_seen = now() - interval '1 hour'",
+            &[],
+        )
+        .await
+        .expect("backdate drainers");
+
+    let daemon = HeartbeatDaemon::spawn(
+        db.dsn(),
+        DEFAULT_SCHEMA,
+        HeartbeatDaemonConfig {
+            interval: Duration::from_millis(50),
+            idle_timeout: Duration::from_secs(60),
+        },
+    );
+    daemon.register(seg_seq, "busy-worker").await;
+
+    let window = claim::DEFAULT_DRAINER_WINDOW.as_secs_f64();
+    let live = |id: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "select last_seen > now() - (interval '1 second' * $2) \
+                     from drainers where drainer_id = $1",
+                    &[&id, &window],
+                )
+                .await
+                .expect("read drainer")
+                .get::<_, bool>(0)
+        }
+    };
+    wait_until(
+        "the daemon to refresh the busy worker's drainer row",
+        || live("busy-worker"),
+    )
+    .await;
+    assert!(
+        !live("idle-worker").await,
+        "a worker with no claim registered must not be kept alive"
+    );
+
+    daemon.deregister(seg_seq, "busy-worker").await;
 }

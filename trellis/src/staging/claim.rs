@@ -57,9 +57,10 @@ pub const DEFAULT_DRAINER_WINDOW: Duration = Duration::from_secs(30);
 
 /// Upserts `id`'s row in the drainer registry, bumping `last_seen` to now —
 /// the registration half of the share denominator [`count_live_drainers`]
-/// reads. This is just "a worker exists," called once per claim; it does
-/// not ride on [`super::liveness::HeartbeatDaemon`], which refreshes
-/// `seg_claims`, not `drainers`.
+/// reads. This is just "a worker exists," called once per worker-loop
+/// iteration. While a drain runs, the loop doesn't come back around, so
+/// [`super::liveness::HeartbeatDaemon`] refreshes the same row on its own
+/// tick for every claimant it holds claims for (issue #654).
 pub async fn register_drainer(client: &impl GenericClient, id: &str) -> Result<(), StagingError> {
     client
         .execute(

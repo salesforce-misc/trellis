@@ -243,6 +243,19 @@ const DAEMON_REFRESH_SQL: &str = "\
     from locked l \
     where c.seg_seq = l.seg_seq and c.bucket = l.bucket";
 
+/// Bumps `drainers.last_seen` for every distinct claimant in the daemon's
+/// registry: a worker holding a claim the daemon is refreshing is, by
+/// definition, a live drainer. The worker loop's own
+/// [`super::claim::register_drainer`] only runs between drains, so without
+/// this a worker inside a paged drain longer than the drainer window (30 s)
+/// dropped out of [`super::claim::count_live_drainers`], and claims made
+/// meanwhile divided the free buckets among the idle workers only (issue
+/// #654).
+const DAEMON_DRAINER_REFRESH_SQL: &str = "\
+    insert into drainers (drainer_id, last_seen) \
+    select distinct d, now() from unnest($1::text[]) as d \
+    on conflict (drainer_id) do update set last_seen = excluded.last_seen";
+
 /// [`HeartbeatDaemon`] tuning. Defaults match doc 04's numbers (5 s
 /// interval, "exits after a minute idle"); tests use much shorter windows
 /// so they run fast against a real cluster.
@@ -273,7 +286,9 @@ type Registry = Arc<AsyncMutex<HashSet<(i64, String)>>>;
 /// registered claim's `claimed_at` fresh against wall-clock time rather
 /// than against how much work any one drain is doing (doc 04, "Keeping a
 /// claim alive" — this is why the bulk shape doesn't livelock the reclaim
-/// sweep).
+/// sweep). On the same tick it keeps each registered claimant's
+/// `drainers.last_seen` fresh too (`DAEMON_DRAINER_REFRESH_SQL`), so a
+/// worker stays counted as live for as long as a drain holds its claims.
 ///
 /// Cheap and safe by construction, not by a special case: the daemon's
 /// background task only inspects its registry once per `interval`, on a
@@ -444,10 +459,14 @@ async fn run_daemon(
             // execute error we drop the connection and flip `connected`
             // false; the next tick reopens against the still-non-empty
             // registry (bumping `connections_opened`) and resumes refreshing.
-            if c.execute(DAEMON_REFRESH_SQL, &[&seg_seqs, &claimed_bys])
-                .await
-                .is_err()
-            {
+            let refreshed = c
+                .execute(DAEMON_REFRESH_SQL, &[&seg_seqs, &claimed_bys])
+                .await;
+            let seen = match refreshed {
+                Ok(_) => c.execute(DAEMON_DRAINER_REFRESH_SQL, &[&claimed_bys]).await,
+                Err(err) => Err(err),
+            };
+            if seen.is_err() {
                 client = None;
                 connected.store(false, Ordering::Relaxed);
             }
