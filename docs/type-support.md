@@ -142,7 +142,9 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
   a normalized stored form), enforced at define time on every key column: join
   columns (#590), and source keys, `GROUP BY` keys and relationship endpoint keys
-  (#638). `char(n)`'s hazard is blank-padding, not volatility.
+  (#638), and on any column a `STRPOS`/`REGEXP_COUNT` call reads, which Postgres
+  refuses under a nondeterministic collation. `char(n)`'s hazard is
+  blank-padding, not volatility.
 * **`timestamptz`** — value comparison immutable, and *text rendering* now
   is too: it is GUC-dependent (`TimeZone`), and issue #246 pins `TimeZone`
   to `'UTC'` in `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` on **every**

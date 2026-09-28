@@ -117,9 +117,9 @@ use super::model::{
 use super::parser::{parse, parse_relationship};
 use super::pg_type::PgType;
 use super::validate::{
-    KeyColumnRole, NondeterministicKeyCollation, RelationshipTypeMismatch, RelationshipWarning,
-    ResolvedRelationship, ValidationError, infer_field_types, reject_primary_key_named_fields,
-    validate,
+    KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
+    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
+    infer_field_types, reject_primary_key_named_fields, validate,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -1712,6 +1712,13 @@ pub async fn alter_transform(
         .await?;
     }
 
+    // Issue #638's follow-up: an added or altered field's `STRPOS`/
+    // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
+    // as at install. Before any DDL, like the rechecks above.
+    let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
+    assert_collation_safe_text_functions(&txn, &merged, &current.source_table, Some(&edited))
+        .await?;
+
     // The same version-fence bump `create_definition_inner` makes for a
     // brand-new definition — see this function's own doc comment. It runs
     // *before* the DDL below, not after it: a drain's Phase 3 takes this
@@ -2422,9 +2429,11 @@ async fn create_definition_inner(
         .await
         .map_err(CatalogError::Ddl)?;
     // Issue #638: the source's key and any `GROUP BY` key need a
-    // deterministic collation. Placed with the key-type check above for the
+    // deterministic collation, and so does any column a field's `STRPOS`/
+    // `REGEXP_COUNT` reads. Placed with the key-type check above for the
     // same reason: it is the first read of the live source relation.
     assert_deterministic_definition_keys(&txn, &def, &qualified_source, &source_key).await?;
+    assert_collation_safe_text_functions(&txn, &def, &qualified_source, None).await?;
     // Issue #376: the authoritative copy of `install_definition`'s fail-fast
     // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
@@ -3981,23 +3990,88 @@ async fn assert_deterministic_definition_keys(
                 .await?;
             }
             GroupByKey::RelationshipPath { rel, column } => {
-                // The relationship is declared on the qualified source
-                // (issue #288); `validate` already refused an unknown one.
-                let Some((schema, table)) = qualified_source.split_once('.') else {
-                    continue;
-                };
-                let Some(relationship) = relationship_by_name_in(txn, schema, table, rel).await?
+                let Some(to_table) =
+                    relationship_to_table_in_txn(txn, qualified_source, rel).await?
                 else {
                     continue;
                 };
                 assert_deterministic_key_collation_in_txn(
                     txn,
                     KeyColumnRole::GroupBy,
-                    &relationship.qualified_to_table(),
+                    &to_table,
                     column,
                 )
                 .await?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// The qualified to-side of relationship `rel` declared on `qualified_source`
+/// (issue #288), or `None` if there is none; `validate` has already refused
+/// an unknown relationship name, so the collation checks that call this skip
+/// one rather than raise a second error for it.
+async fn relationship_to_table_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    qualified_source: &str,
+    rel: &str,
+) -> Result<Option<String>, CatalogError> {
+    let Some((schema, table)) = qualified_source.split_once('.') else {
+        return Ok(None);
+    };
+    Ok(relationship_by_name_in(txn, schema, table, rel)
+        .await?
+        .map(|relationship| relationship.qualified_to_table()))
+}
+
+/// Issue #638's follow-up: refuses a definition whose field `STRPOS`/
+/// `REGEXP_COUNT` reads a column with a nondeterministic collation
+/// ([`super::validate::collation_refusing_function_reads`]). Postgres raises
+/// `0A000` for both under such a collation, while the engine computes them
+/// from the exact text, so the two would disagree. `only_fields`, if given,
+/// limits the check to those fields (`ALTER TRANSFORM`'s added and altered
+/// ones). A column that doesn't exist passes, as in
+/// [`assert_deterministic_key_collation_in_txn`]: `validate` owns that error.
+async fn assert_collation_safe_text_functions(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+    qualified_source: &str,
+    only_fields: Option<&[FieldDef]>,
+) -> Result<(), CatalogError> {
+    for read in super::validate::collation_refusing_function_reads(def) {
+        if let Some(only) = only_fields
+            && !only.iter().any(|field| field.name == read.field)
+        {
+            continue;
+        }
+        let (table, column) = match &read.column {
+            super::validate::TextColumnRef::Source(column) => {
+                (qualified_source.to_string(), column)
+            }
+            super::validate::TextColumnRef::Relationship { rel, column } => {
+                match relationship_to_table_in_txn(txn, qualified_source, rel).await? {
+                    Some(to_table) => (to_table, column),
+                    None => continue,
+                }
+            }
+        };
+        let Some(resolved) = column_in_txn(txn, &table, column).await? else {
+            continue;
+        };
+        if !resolved.collation_deterministic {
+            return Err(
+                ValidationError::NondeterministicCollationTextFunction(Box::new(
+                    NondeterministicCollationTextFunction {
+                        field: read.field,
+                        function: read.function,
+                        table,
+                        column: column.clone(),
+                        collation: resolved.collation.unwrap_or_default(),
+                    },
+                ))
+                .into(),
+            );
         }
     }
     Ok(())

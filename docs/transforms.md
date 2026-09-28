@@ -40,6 +40,14 @@ The error names the column and its collation. A deterministic collation other
 than the default, such as `"C"`, is fine. The target's own key columns take the
 database default collation, which Postgres always makes deterministic.
 
+The same goes for a column that a field passes to `STRPOS` or `REGEXP_COUNT`,
+directly or through `COALESCE`, another field or a relationship path. Postgres
+refuses substring searches and regular expressions under a nondeterministic
+collation, while Trellis would compute them from the exact text, so such a
+definition, or an `ALTER TRANSFORM` that adds or alters such a field, is
+rejected. `CHAR_LENGTH` and `OCTET_LENGTH` don't depend on collation, so they
+accept any column.
+
 Some shapes need more than the key. An aggregate, and any read through a to-one
 relationship, needs a deleted or re-keyed source row's whole old image, which
 Postgres logs only under `REPLICA IDENTITY FULL`. That, too, is checked and

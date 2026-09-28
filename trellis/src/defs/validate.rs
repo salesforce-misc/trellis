@@ -378,6 +378,13 @@ pub enum ValidationError {
     /// define time for the same reason (#590's decision: reject, never
     /// reinterpret).
     NondeterministicKeyCollation(Box<NondeterministicKeyCollation>),
+    /// A calculated field passes a column with a nondeterministic collation
+    /// to `STRPOS` or `REGEXP_COUNT` (issue #638's inline follow-up). Postgres
+    /// refuses both under such a collation (`0A000`: no substring search, no
+    /// regular expressions), while the engine would compute a value from the
+    /// exact text, so the engine and Postgres would disagree. Refused at
+    /// define time, as #590 decided for join and key columns.
+    NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
     /// A *to-many* relationship's to-side (issue #41) lacks a replica identity
     /// that carries the join column in row pre-images. For to-many, the join
     /// key (`to_col`) is a *non-PK* column on the to-side, and the staging
@@ -490,6 +497,142 @@ pub struct NondeterministicKeyCollation {
     pub table: String,
     pub column: String,
     pub collation: String,
+}
+
+/// Payload of [`ValidationError::NondeterministicCollationTextFunction`],
+/// boxed out of the enum for the same reason as [`RelationshipTypeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NondeterministicCollationTextFunction {
+    /// The calculated field whose own expression makes the call.
+    pub field: String,
+    /// `STRPOS` or `REGEXP_COUNT`.
+    pub function: String,
+    /// The column's table as the check resolved it (`schema.table`): the
+    /// source, or a relationship path's to-side.
+    pub table: String,
+    pub column: String,
+    pub collation: String,
+}
+
+/// The registry functions whose Postgres implementation refuses a
+/// nondeterministic collation with `0A000`, so the engine can't compute them
+/// the way Postgres would on such a column: `strpos` ("not supported for
+/// substring searches") and `regexp_count` ("not supported for regular
+/// expressions"). The registry's other text functions, `char_length` and
+/// `octet_length`, don't depend on collation.
+pub(crate) const NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS: &[&str] =
+    &["STRPOS", "REGEXP_COUNT"];
+
+/// A column an argument of a [`NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS`]
+/// call reads, directly or through `COALESCE` or another calculated field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum TextColumnRef {
+    /// A column of the definition's source.
+    Source(String),
+    /// A `<rel>.<column>` relationship path: a column of `rel`'s to-side.
+    Relationship { rel: String, column: String },
+}
+
+/// One read [`collation_refusing_function_reads`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CollationRefusingRead {
+    /// The field whose own expression makes the call.
+    pub field: String,
+    pub function: String,
+    pub column: TextColumnRef,
+}
+
+/// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
+/// fields reads (issue #638's follow-up), for the catalog to check each
+/// one's collation. In Postgres an argument's collation comes from the
+/// columns under it: directly, through `COALESCE`, or through another
+/// calculated field it references (whose expression Postgres would inline).
+/// So this follows all three, resolving a bare name the way [`super::eval`]
+/// does: another field of that name first, unless the name is the enclosing
+/// field's own (a passthrough of the source column it's named after). Each
+/// read is reported once, in field order.
+pub(crate) fn collation_refusing_function_reads(def: &TransformDef) -> Vec<CollationRefusingRead> {
+    let fields_by_name: HashMap<&str, &FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut reads = Vec::new();
+    for field in &def.fields {
+        collect_refusing_calls(&field.expr, &field.name, &fields_by_name, &mut reads);
+    }
+    let mut seen = HashSet::new();
+    reads.retain(|read| seen.insert(read.clone()));
+    reads
+}
+
+fn collect_refusing_calls(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&str, &FieldDef>,
+    out: &mut Vec<CollationRefusingRead>,
+) {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str()) {
+                let mut columns = Vec::new();
+                let mut visited = HashSet::new();
+                for arg in args {
+                    collect_text_columns(arg, field, fields_by_name, &mut visited, &mut columns);
+                }
+                out.extend(columns.into_iter().map(|column| CollationRefusingRead {
+                    field: field.to_string(),
+                    function: name.clone(),
+                    column,
+                }));
+            }
+            for arg in args {
+                collect_refusing_calls(arg, field, fields_by_name, out);
+            }
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_refusing_calls(lhs, field, fields_by_name, out);
+            collect_refusing_calls(rhs, field, fields_by_name, out);
+        }
+        Expr::Column(_)
+        | Expr::RelationshipPath { .. }
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => {}
+    }
+}
+
+/// The columns under `expr`, an expression evaluated inside field `field`,
+/// following references to other calculated fields (`visited` guards a
+/// cycle, which [`validate`] has already refused).
+fn collect_text_columns<'a>(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&str, &'a FieldDef>,
+    visited: &mut HashSet<&'a str>,
+    out: &mut Vec<TextColumnRef>,
+) {
+    match expr {
+        Expr::Column(name) => match fields_by_name.get(name.as_str()) {
+            Some(other) if name != field => {
+                if visited.insert(other.name.as_str()) {
+                    collect_text_columns(&other.expr, &other.name, fields_by_name, visited, out);
+                }
+            }
+            _ => out.push(TextColumnRef::Source(name.clone())),
+        },
+        Expr::RelationshipPath { rel, column } => out.push(TextColumnRef::Relationship {
+            rel: rel.clone(),
+            column: column.clone(),
+        }),
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_text_columns(arg, field, fields_by_name, visited, out);
+            }
+        }
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            collect_text_columns(lhs, field, fields_by_name, visited, out);
+            collect_text_columns(rhs, field, fields_by_name, visited, out);
+        }
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+    }
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -773,6 +916,22 @@ impl fmt::Display for ValidationError {
                  nondeterministic; its `=` matches strings that differ (e.g. by case), but \
                  Trellis matches keys by their exact text, so key columns need a \
                  deterministic collation"
+                )
+            }
+            ValidationError::NondeterministicCollationTextFunction(refused) => {
+                let NondeterministicCollationTextFunction {
+                    field,
+                    function,
+                    table,
+                    column,
+                    collation,
+                } = refused.as_ref();
+                write!(
+                    f,
+                    "calculated field '{field}': {function} reads {table}.{column}, whose \
+                     collation \"{collation}\" is nondeterministic; Postgres refuses {function} \
+                     under a nondeterministic collation, while Trellis would compute it from \
+                     the exact text, so the column needs a deterministic collation"
                 )
             }
             ValidationError::RelationshipToManyRequiresReplicaIdentity {
@@ -3932,5 +4091,73 @@ mod tests {
         // `id AS order_id` is an ordinary column that happens to copy the key.
         let d = parsed("TRANSFORM t FROM s SELECT id AS order_id, amount AS amount");
         assert_eq!(reject_primary_key_named_fields(&d.fields, &["id"]), Ok(()));
+    }
+
+    fn source(column: &str) -> TextColumnRef {
+        TextColumnRef::Source(column.to_string())
+    }
+
+    fn read(field: &str, function: &str, column: TextColumnRef) -> CollationRefusingRead {
+        CollationRefusingRead {
+            field: field.to_string(),
+            function: function.to_string(),
+            column,
+        }
+    }
+
+    /// Issue #638's follow-up: every column under a `STRPOS`/`REGEXP_COUNT`
+    /// argument is reported, directly, through `COALESCE`, through another
+    /// field and through a relationship path, each once and attributed to the
+    /// field that makes the call. `CHAR_LENGTH`/`OCTET_LENGTH` don't depend
+    /// on collation and report nothing.
+    #[test]
+    fn collation_refusing_reads_follow_coalesce_fields_and_relationship_paths() {
+        let d = parsed(
+            "TRANSFORM t FROM s SELECT \
+             strpos(title, 'x') AS direct, \
+             coalesce(title, body) AS merged, \
+             regexp_count(merged, 'a') AS via_field, \
+             strpos(post.author, lower_title) AS via_rel, \
+             title AS lower_title, \
+             char_length(body) + octet_length(body) AS lengths, \
+             strpos(title, title) AS twice",
+        );
+        assert_eq!(
+            collation_refusing_function_reads(&d),
+            vec![
+                read("direct", "STRPOS", source("title")),
+                read("via_field", "REGEXP_COUNT", source("title")),
+                read("via_field", "REGEXP_COUNT", source("body")),
+                read(
+                    "via_rel",
+                    "STRPOS",
+                    TextColumnRef::Relationship {
+                        rel: "post".to_string(),
+                        column: "author".to_string(),
+                    }
+                ),
+                read("via_rel", "STRPOS", source("title")),
+                read("twice", "STRPOS", source("title")),
+            ]
+        );
+    }
+
+    /// A field named after the source column it passes through reads that
+    /// column, not itself, and a call nested in an aggregate is still found.
+    #[test]
+    fn collation_refusing_reads_resolve_a_self_passthrough_and_nested_calls() {
+        let d = parsed("TRANSFORM t FROM s SELECT title AS title, strpos(title, 'x') AS pos");
+        assert_eq!(
+            collation_refusing_function_reads(&d),
+            vec![read("pos", "STRPOS", source("title"))]
+        );
+        let d =
+            parsed("TRANSFORM t FROM s GROUP BY region SELECT sum(regexp_count(note, 'a')) AS n");
+        assert_eq!(
+            collation_refusing_function_reads(&d),
+            vec![read("n", "REGEXP_COUNT", source("note"))]
+        );
+        let d = parsed("TRANSFORM t FROM s SELECT char_length(title) AS n");
+        assert_eq!(collation_refusing_function_reads(&d), vec![]);
     }
 }
