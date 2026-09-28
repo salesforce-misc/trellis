@@ -1,7 +1,7 @@
 //! The Ruby binding's native extension: a thin Magnus wrapper over
 //! [`trellis::BlockingTrellis`] (`docs/decisions/0010-embeddable-clients.md`).
 //!
-//! Only `lib/trellis.rb` calls these; the public API, defaults, the
+//! Only `lib/trellis/pg.rb` calls these; the public API, defaults, the
 //! module-level singleton and the value classes live in the Ruby files under
 //! `lib/`. The contract here is deliberately narrow:
 //!
@@ -24,7 +24,7 @@
 //!   hang. See the [`engine`] module.
 //! - **Only plain data crosses** (decision 4). The flattening is
 //!   `trellis-embed`'s; this crate turns its plain values into hashes, and
-//!   `lib/trellis.rb` turns those into `Data` objects. Words become symbols
+//!   `lib/trellis/pg.rb` turns those into `Data` objects. Words become symbols
 //!   (statuses, quarantine states, relationship cardinalities, `apply`
 //!   outcome kinds, `self_check` outcomes and divergence kinds), but only
 //!   words from the closed sets `trellis-embed` lists, which [`init`] interns
@@ -398,7 +398,7 @@ impl Handle {
 }
 
 /// Connects a new instance. Every option is required here: the defaults are
-/// `lib/trellis.rb`'s to document, and nothing falls back to the environment.
+/// `lib/trellis/pg.rb`'s to document, and nothing falls back to the environment.
 ///
 /// Raises `Trellis::ForkedHandleError`, before starting anything, in a
 /// process forked while its parent had an engine running (issue #600).
@@ -654,7 +654,7 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
 }
 
 /// A hash from symbol keys to `fields`' values: the shape every record
-/// crosses as, for `lib/trellis.rb` to turn into its `Data` value.
+/// crosses as, for `lib/trellis/pg.rb` to turn into its `Data` value.
 fn record<const N: usize>(ruby: &Ruby, fields: [(&str, Value); N]) -> Result<RHash, Error> {
     let hash = ruby.hash_new();
     for (name, value) in fields {

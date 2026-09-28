@@ -5,13 +5,20 @@ require_relative "values"
 require_relative "version"
 require "rbconfig"
 
-# The native extension (ext/trellis_ruby). A platform gem carries one build
-# per Ruby minor version, each in lib/trellis/<major.minor>/; installing the
-# source gem, or `rake compile`, builds the one this Ruby needs into
-# lib/trellis/.
-if File.exist?(File.join(__dir__, RUBY_VERSION[/\A\d+\.\d+/],
-                         "trellis_ruby.#{RbConfig::CONFIG.fetch('DLEXT')}"))
-  require_relative "#{RUBY_VERSION[/\A\d+\.\d+/]}/trellis_ruby"
+# The native extension (ext/trellis_ruby). Installing the source gem, or
+# `rake compile`, builds the one this Ruby needs into lib/trellis/. A platform
+# gem instead carries one build per Ruby minor version, each in
+# lib/trellis/<major.minor>/, and none in lib/trellis/ itself.
+#
+# A lib/trellis/ build wins when both are there: in a checkout, a
+# per-version directory is only ever left over from building a platform gem
+# (it's ignored by git, so nothing shows it), and `rake test` must load the
+# extension it just compiled, not that one.
+dlext = RbConfig::CONFIG.fetch("DLEXT")
+per_version = "#{RUBY_VERSION[/\A\d+\.\d+/]}/trellis_ruby"
+if !File.exist?(File.join(__dir__, "trellis_ruby.#{dlext}")) &&
+   File.exist?(File.join(__dir__, "#{per_version}.#{dlext}"))
+  require_relative per_version
 else
   require_relative "trellis_ruby"
 end

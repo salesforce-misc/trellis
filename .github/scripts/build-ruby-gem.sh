@@ -39,7 +39,8 @@ version="$(awk -F'"' '/VERSION = / { print $2; exit }' "$gem_dir/lib/trellis/ver
 # Clears every build output in clients/ruby, before building (rake-compiler
 # would package an extension it finds staged for this platform rather than
 # build it again) and after (lib/trellis/ would otherwise keep this
-# platform's extensions, which `rake test` would load: see lib/trellis/pg.rb).
+# platform's extensions; lib/trellis/pg.rb loads one only when no `rake
+# compile` build is there, but a checkout shouldn't keep them anyway).
 clean() {
   rm -rf "$gem_dir/tmp" "$gem_dir/pkg" "$gem_dir"/lib/trellis/*.so \
     "$gem_dir"/lib/trellis/*.bundle "$gem_dir"/lib/trellis/[0-9]*.[0-9]*/
