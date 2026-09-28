@@ -185,7 +185,17 @@ impl std::fmt::Display for BackfillError {
     }
 }
 
-impl std::error::Error for BackfillError {}
+impl std::error::Error for BackfillError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BackfillError::Db(err) => Some(err),
+            BackfillError::Pool(err) => Some(err),
+            BackfillError::Ddl(err) => Some(err),
+            BackfillError::Propagation(err) => Some(err.as_ref()),
+            BackfillError::Unsupported(_) | BackfillError::Superseded => None,
+        }
+    }
+}
 
 impl From<tokio_postgres::Error> for BackfillError {
     fn from(err: tokio_postgres::Error) -> Self {

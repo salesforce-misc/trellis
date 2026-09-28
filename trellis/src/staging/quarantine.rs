@@ -150,21 +150,46 @@ pub fn classify(err: &ApplyError) -> FailureClass {
     }
 }
 
+/// Whether `err` is a transient Postgres or pool failure, whichever
+/// [`ApplyError`] variant wraps it (issue #653). The drain reaches the same
+/// deadlock or dropped connection through `ApplyError::Db`, through a nested
+/// module's error (`StagingError::Db` from `append::append`,
+/// `CatalogError::Db`, `DdlError::Db`, ...), and through a pool checkout
+/// (`ApplyError::Pool`), so this walks the [`std::error::Error::source`]
+/// chain rather than matching one variant. The first
+/// [`tokio_postgres::Error`] on the chain decides by its SQLSTATE
+/// ([`is_transient_sqlstate`]); a pool timeout (waiting for a free
+/// connection, creating one, or recycling one) is transient too, since it
+/// is load or a briefly unreachable server, not anything a record did.
+fn is_transient(err: &ApplyError) -> bool {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return is_transient_sqlstate(pg.code());
+        }
+        if let Some(deadpool_postgres::PoolError::Timeout(_)) =
+            err.downcast_ref::<deadpool_postgres::PoolError>()
+        {
+            return true;
+        }
+        link = err.source();
+    }
+    false
+}
+
 /// The transient SQLSTATEs doc 05 names (`40001`/`40P01`, lock-not-available,
 /// statement timeout) plus a dropped connection — [`tokio_postgres::Error::code`]
 /// is `None` for a connection-level failure (never reached the server to get
 /// a SQLSTATE at all), which is exactly the "dropped connection" case doc 05
 /// lists alongside the coded ones.
-fn is_transient(err: &ApplyError) -> bool {
-    let ApplyError::Db(db_err) = err else {
-        return false;
-    };
-    match db_err.code() {
+fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool {
+    use tokio_postgres::error::SqlState;
+    match code {
         Some(code) => {
-            *code == tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE
-                || *code == tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED
-                || *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
-                || *code == tokio_postgres::error::SqlState::QUERY_CANCELED
+            *code == SqlState::T_R_SERIALIZATION_FAILURE
+                || *code == SqlState::T_R_DEADLOCK_DETECTED
+                || *code == SqlState::LOCK_NOT_AVAILABLE
+                || *code == SqlState::QUERY_CANCELED
         }
         None => true,
     }
@@ -2593,6 +2618,136 @@ mod unit_tests {
         // an unattributable isolate-classified error still surfaces rather
         // than getting blamed on something.)
         assert_eq!(classify(&ApplyError::ClaimLost), FailureClass::Isolate);
+    }
+
+    /// A `tokio_postgres::Error` with no SQLSTATE, the shape a dropped
+    /// connection takes. `tokio_postgres` has no public constructor for a
+    /// coded error, so the coded SQLSTATEs are covered by
+    /// [`is_transient_sqlstate`]'s own test and these tests cover routing:
+    /// whichever variant wraps the Postgres error, `classify` must reach it.
+    fn uncoded_pg_error() -> tokio_postgres::Error {
+        tokio_postgres::Error::__private_api_timeout()
+    }
+
+    fn pool_timeout() -> crate::error::Error {
+        crate::error::Error::Pool(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Wait,
+        ))
+    }
+
+    #[test]
+    fn classify_finds_a_transient_pg_error_whichever_variant_wraps_it() {
+        // Issue #653: only `ApplyError::Db` used to be inspected, so the same
+        // dropped connection surfaced through a nested module's error was
+        // `Isolate`, and the drain probed the whole page one record at a time
+        // for a failure no single record could reproduce.
+        use crate::defs::backfill::BackfillError;
+        use crate::defs::catalog::CatalogError;
+        use crate::intake::IntakeError;
+        use crate::staging::error::StagingError;
+        let wrapped = [
+            ("Db", ApplyError::Db(uncoded_pg_error())),
+            (
+                "Staging(Db)",
+                ApplyError::Staging(StagingError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Catalog(Db)",
+                ApplyError::Catalog(CatalogError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Catalog(Ddl(Db))",
+                ApplyError::Catalog(CatalogError::Ddl(DdlError::Db(uncoded_pg_error()))),
+            ),
+            ("Ddl(Db)", ApplyError::Ddl(DdlError::Db(uncoded_pg_error()))),
+            (
+                "Backfill(Db)",
+                ApplyError::Backfill(BackfillError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Intake(Db)",
+                ApplyError::Intake(IntakeError::Db(uncoded_pg_error())),
+            ),
+            (
+                "Pool(Connect)",
+                ApplyError::Pool(crate::error::Error::Connect(uncoded_pg_error())),
+            ),
+            (
+                "Pool(Pool(Backend))",
+                ApplyError::Pool(crate::error::Error::Pool(
+                    deadpool_postgres::PoolError::Backend(uncoded_pg_error()),
+                )),
+            ),
+        ];
+        for (name, err) in wrapped {
+            assert_eq!(classify(&err), FailureClass::Transient, "{name}");
+        }
+    }
+
+    #[test]
+    fn classify_treats_a_pool_timeout_as_transient_whichever_variant_wraps_it() {
+        use crate::defs::catalog::CatalogError;
+        use crate::staging::error::StagingError;
+        let wrapped = [
+            ("Pool", ApplyError::Pool(pool_timeout())),
+            (
+                "Staging(Config)",
+                ApplyError::Staging(StagingError::Config(pool_timeout())),
+            ),
+            (
+                "Catalog(Pool)",
+                ApplyError::Catalog(CatalogError::Pool(pool_timeout())),
+            ),
+            ("Ddl(Pool)", ApplyError::Ddl(DdlError::Pool(pool_timeout()))),
+        ];
+        for (name, err) in wrapped {
+            assert_eq!(classify(&err), FailureClass::Transient, "{name}");
+        }
+        for timeout in [
+            deadpool_postgres::TimeoutType::Create,
+            deadpool_postgres::TimeoutType::Recycle,
+        ] {
+            let err = ApplyError::Pool(crate::error::Error::Pool(
+                deadpool_postgres::PoolError::Timeout(timeout),
+            ));
+            assert_eq!(classify(&err), FailureClass::Transient, "{timeout:?}");
+        }
+    }
+
+    #[test]
+    fn is_transient_sqlstate_matches_doc_05s_set() {
+        use tokio_postgres::error::SqlState;
+        for code in [
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::QUERY_CANCELED,
+        ] {
+            assert!(is_transient_sqlstate(Some(&code)), "{}", code.code());
+        }
+        assert!(
+            is_transient_sqlstate(None),
+            "no SQLSTATE: dropped connection"
+        );
+        for code in [
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::UNDEFINED_TABLE,
+            SqlState::DIVISION_BY_ZERO,
+        ] {
+            assert!(!is_transient_sqlstate(Some(&code)), "{}", code.code());
+        }
+    }
+
+    #[test]
+    fn classify_keeps_non_transient_pool_failures_as_isolate() {
+        // A closed pool means shutdown, and a config error never heals by
+        // retrying; neither is a transient failure.
+        let closed = ApplyError::Pool(crate::error::Error::Pool(
+            deadpool_postgres::PoolError::Closed,
+        ));
+        assert_eq!(classify(&closed), FailureClass::Isolate);
+        let config = ApplyError::Pool(crate::error::Error::Config("bad dsn".to_string()));
+        assert_eq!(classify(&config), FailureClass::Isolate);
     }
     /// `EXPLAIN`'s plan text for `sql` with `params` bound, one line per row.
     async fn explain_plan(
