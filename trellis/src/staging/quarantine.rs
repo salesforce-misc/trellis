@@ -157,15 +157,23 @@ pub fn classify(err: &ApplyError) -> FailureClass {
 /// `CatalogError::Db`, `DdlError::Db`, ...), and through a pool checkout
 /// (`ApplyError::Pool`), so this walks the [`std::error::Error::source`]
 /// chain rather than matching one variant. The first
-/// [`tokio_postgres::Error`] on the chain decides by its SQLSTATE
-/// ([`is_transient_sqlstate`]); a pool timeout (waiting for a free
-/// connection, creating one, or recycling one) is transient too, since it
-/// is load or a briefly unreachable server, not anything a record did.
+/// [`tokio_postgres::Error`] on the chain decides: by its SQLSTATE
+/// ([`is_transient_sqlstate`]), or as a lost connection however it was
+/// reported. A dropped connection reaches the caller either with no SQLSTATE
+/// (the socket closed first) or as the server's own `FATAL` (`08xxx`,
+/// `57P01` from `pg_terminate_backend`, `57P02`, `57P03`, `57P05`), whichever
+/// arrives first, and [`crate::error_code::classify_pg_error`] already maps
+/// both to [`crate::error_code::ErrorCode::Connectivity`]. A pool timeout
+/// (waiting for a free connection, creating one, or recycling one) is
+/// transient too, since it is load or a briefly unreachable server, not
+/// anything a record did.
 fn is_transient(err: &ApplyError) -> bool {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
         if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
-            return is_transient_sqlstate(pg.code());
+            return is_transient_sqlstate(pg.code())
+                || crate::error_code::classify_pg_error(pg)
+                    == crate::error_code::ErrorCode::Connectivity;
         }
         if let Some(deadpool_postgres::PoolError::Timeout(_)) =
             err.downcast_ref::<deadpool_postgres::PoolError>()
@@ -2852,6 +2860,24 @@ mod unit_tests {
             classify(&err),
             FailureClass::Transient,
             "dropped connection"
+        );
+
+        // The same dropped connection can instead reach the caller as the
+        // server's own `FATAL` (`57P01` admin shutdown here, what
+        // `pg_terminate_backend` sends), depending on which arrives first.
+        // A session terminating itself gets it deterministically, as the
+        // query's own error.
+        let suicidal = connect().await;
+        let goodbye = suicidal
+            .simple_query("select pg_terminate_backend(pg_backend_pid())")
+            .await
+            .expect_err("the session terminates itself");
+        assert_eq!(goodbye.code(), Some(&SqlState::ADMIN_SHUTDOWN));
+        let err = ApplyError::Staging(StagingError::Db(goodbye));
+        assert_eq!(
+            classify(&err),
+            FailureClass::Transient,
+            "57P01 admin shutdown"
         );
     }
     /// `EXPLAIN`'s plan text for `sql` with `params` bound, one line per row.
