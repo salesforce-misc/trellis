@@ -91,8 +91,10 @@
 //!
 //! On disk both concurrent-tier properties find a `GROUP BY` divergence
 //! within a few cases, where the tmpfs cluster converges. It needs neither
-//! the mid-burst actions nor concurrency:
-//! [`group_moves_converge_on_disk`] pins it, `#[ignore]`d until #625.
+//! the mid-burst actions nor concurrency. It is #494's shape (a key passing
+//! through a group inside one folded batch), which disk commit timing makes
+//! common: [`group_moves_converge_on_disk`] pins it, `#[ignore]`d until
+//! #556 milestone D (#623) removes the recompute horizons.
 //!
 //! # The burst-batching knob
 //!
@@ -269,17 +271,24 @@ fn start_cluster() -> TestCluster {
         .arg("+C")
         .arg(&dir)
         .status();
+    // Fails closed: a filesystem it can't name is refused too, rather than
+    // run as though it were a disk.
     let fs_type = std::process::Command::new("stat")
         .args(["-f", "-c", "%T"])
         .arg(&dir)
         .output()
         .ok()
+        .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_default();
-    assert_ne!(
-        fs_type,
-        "tmpfs",
-        "{CLUSTER_DIR_ENV}={} is a tmpfs; point it at a real disk",
+    assert!(
+        !fs_type.is_empty(),
+        "{CLUSTER_DIR_ENV}={}: couldn't tell its filesystem type (`stat -f`)",
+        dir.display()
+    );
+    assert!(
+        !matches!(fs_type.as_str(), "tmpfs" | "ramfs"),
+        "{CLUSTER_DIR_ENV}={} is a {fs_type}; point it at a real disk",
         dir.display()
     );
     eprintln!(
@@ -800,20 +809,31 @@ fn group_moves() -> generative::model::Program {
     )
 }
 
-/// Found by #557 part 2's disk-backed cluster, and the shape #625's
-/// build-under-load divergence reports: on a real disk, plain group moves
-/// leave a `GROUP BY` target wrong for good. A group every row has left
-/// keeps its target row, or a group's `COUNT(*)` is one to three too high.
-/// No build overlaps the moves once the first burst has passed its check,
-/// and nothing is re-read or paused. It needs no concurrency either: one
-/// lane issues every op in program order and one drain worker applies
-/// them, so this is the serial runtime in effect. On the tmpfs test cluster
-/// the same run converges.
+/// Found by #557 part 2's disk-backed cluster: on a real disk, plain group
+/// moves leave a `GROUP BY` target wrong for good. A group every row has
+/// left keeps its target row, or a group's `COUNT(*)` is one to three too
+/// high. It needs no concurrency: one lane issues every op in program order
+/// and one drain worker applies them. It needs no `SUM` (`COUNT(*)` alone
+/// fails as often) and no build (it fails as often when the definition is
+/// `live` before the first op), but it does need group moves: inserts and
+/// deletes alone converge. On the tmpfs test cluster the same run converges.
+///
+/// It is #494's shape. A batch's forced re-derive reads the source live, so
+/// it counts a key that a later, still-undrained commit moved into group
+/// `z`, and stamps the group's recompute horizon above that commit. The key
+/// then leaves `z` in a commit above the horizon, and both moves fold into
+/// one later batch as `a -> b`. The fold keeps only the first old image and
+/// the last new one, so nothing names `z` and its count is never taken back.
+/// On disk, intake runs far enough behind the source that most group writes
+/// are such re-derives, where on tmpfs they are rare. #556 milestone D
+/// (#623) removes the horizons and lists #494 in its acceptance.
 ///
 /// Runs [`group_moves`] `ATTEMPTS` times, each on a fresh database, in
 /// bursts of 500 ops sealed every 85ms, and fails if any attempt diverged,
 /// reporting how many did and whether each divergence was still there after
-/// another 5 seconds and quiesce. Run it on disk:
+/// another 5 seconds and quiesce. It says nothing on a tmpfs, so without
+/// `GENERATIVE_CLUSTER_DIR` it returns at once (the nightly runs every
+/// ignored test in this binary). Run it on disk:
 ///
 /// ```text
 /// GENERATIVE_CLUSTER_DIR=$PWD/target/generative-disk \
@@ -821,10 +841,14 @@ fn group_moves() -> generative::model::Program {
 ///     group_moves_converge_on_disk -- --ignored --nocapture
 /// ```
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "diverges on a disk-backed cluster until #625 (#556 milestone F) fixes it; \
+#[ignore = "#494's shape diverges on a disk-backed cluster until #623 (#556 milestone D); \
             run with GENERATIVE_CLUSTER_DIR set"]
 async fn group_moves_converge_on_disk() {
     const ATTEMPTS: usize = 20;
+    if std::env::var_os(CLUSTER_DIR_ENV).is_none() {
+        eprintln!("group_moves_converge_on_disk: skipped, {CLUSTER_DIR_ENV} is not set");
+        return;
+    }
     let cluster = start_cluster();
     let program = group_moves();
     let plan = concurrent_plan(&program, 500, 1);
@@ -849,7 +873,7 @@ async fn group_moves_converge_on_disk() {
             Ok(run) => assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome),
             Err(RunError::Diverged(d)) => {
                 // Diagnostic only: whether the engine corrects the target
-                // given more time, or it stays wrong (#625 saw the latter).
+                // given more time, or it stays wrong.
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 backend.quiesce().await.expect("quiesce again");
                 let snapshot = backend.snapshot().await.expect("snapshot again");
