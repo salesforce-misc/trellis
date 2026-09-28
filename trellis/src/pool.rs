@@ -50,13 +50,17 @@ pub type Client = deadpool_postgres::Client;
 #[derive(Debug, Clone)]
 pub struct Pool {
     inner: DeadpoolPool,
+    /// The connection settings the pool's connections are opened with,
+    /// client keepalives included, kept so [`Pool::connect_unpooled`] can
+    /// open one more the same way. `tokio_postgres::Config`'s `Debug`
+    /// redacts the password (issue #591).
+    pg_config: tokio_postgres::Config,
     /// A copy of the [`Config::schema`] this pool was built from — see
     /// [`Pool::schema`].
     schema: String,
     /// A copy of the [`Config::target_schema`] this pool was built from —
-    /// see [`Pool::target_schema`]. Only the test-fixture registration
-    /// entry points read it, so it is compiled out of production builds.
-    #[cfg(any(test, feature = "test-util"))]
+    /// see [`Pool::target_schema`]. [`Pool::connect_unpooled`] bootstraps
+    /// its connection's `search_path` with it.
     target_schema: String,
 }
 
@@ -84,7 +88,7 @@ impl Pool {
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        let manager = Manager::from_config(pg_config, NoTls, manager_config);
+        let manager = Manager::from_config(pg_config.clone(), NoTls, manager_config);
 
         let schema = config.schema().to_string();
         let target_schema = config.target_schema().to_string();
@@ -112,8 +116,8 @@ impl Pool {
 
         Ok(Self {
             inner,
+            pg_config,
             schema: config.schema().to_string(),
-            #[cfg(any(test, feature = "test-util"))]
             target_schema: config.target_schema().to_string(),
         })
     }
@@ -126,6 +130,27 @@ impl Pool {
     /// via [`Error::code`]) instead of hanging indefinitely (issue #182).
     pub async fn get(&self) -> Result<Client, Error> {
         Ok(self.inner.get().await?)
+    }
+
+    /// Opens one connection outside the pool, set up exactly like a pooled
+    /// one ([`session_bootstrap`]), and spawns its driver. It closes when the
+    /// returned client is dropped, and it never counts against
+    /// `pool_max_size` or waits on it.
+    ///
+    /// For session state that must never reach a pooled connection: a paged
+    /// drain's `TEMP` table (issue #620, [`crate::staging::page`]) lives on
+    /// one of these, so however the drain ends (finished, failed, or its
+    /// future dropped mid-page) the table goes with the session, and no later
+    /// borrower of a pooled connection can inherit it.
+    pub(crate) async fn connect_unpooled(&self) -> Result<tokio_postgres::Client, Error> {
+        let (mut client, connection) = self.pg_config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::debug!(error = %err, "unpooled connection ended with an error");
+            }
+        });
+        session_bootstrap(&mut client, &self.schema, &self.target_schema).await?;
+        Ok(client)
     }
 
     /// The [`Config::schema`] this pool was built with: the instance's own

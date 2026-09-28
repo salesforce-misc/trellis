@@ -1423,3 +1423,215 @@ async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bound
     assert_eq!(b.segments_drained, vec![(seg, true)]);
     assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
 }
+
+/// How many paged-drain `TEMP` tables exist in this database, in any session.
+async fn page_tables(client: &Client) -> i64 {
+    client
+        .query_one(
+            "select count(*) from pg_class \
+             where relname = 'trellis_drain_page' and relpersistence = 't'",
+            &[],
+        )
+        .await
+        .expect("count page tables")
+        .get(0)
+}
+
+/// Waits (bounded) for every paged-drain `TEMP` table to be gone. A session
+/// drops its temp tables as its backend exits, which trails the client
+/// closing the socket by a moment; this waits on that teardown only.
+async fn no_page_tables_within(client: &Client, deadline: Duration) {
+    let start = std::time::Instant::now();
+    while page_tables(client).await > 0 {
+        assert!(
+            start.elapsed() < deadline,
+            "a paged drain's TEMP table outlived its drain call"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The backend of a pooled connection, and whether that session has a page
+/// table of its own.
+async fn pooled_session(pool: &trellis::Pool) -> (i32, bool) {
+    let client = pool.get().await.expect("pooled connection");
+    let row = client
+        .query_one(
+            "select pg_backend_pid(), to_regclass('pg_temp.trellis_drain_page') is not null",
+            &[],
+        )
+        .await
+        .expect("pooled session");
+    (row.get(0), row.get(1))
+}
+
+/// Stages `ids` as inserts into the live table and the ring, each then
+/// updated twice, for the 1-1 copy: grp 0, final amount `id * 10 + 2`.
+async fn stage_copy_keys(client: &Client, ids: &[i32]) {
+    for &id in ids {
+        client
+            .execute(
+                "insert into items (id, grp, amount) values ($1, 0, $1 * 10 + 2)",
+                &[&id],
+            )
+            .await
+            .expect("insert live item");
+    }
+    stage(client, "insert", ids, |_| None, |id| Some((0, id * 10))).await;
+    for step in 1..=2 {
+        stage(
+            client,
+            "update",
+            ids,
+            |id| Some((0, id * 10 + step - 1)),
+            |id| Some((0, id * 10 + step)),
+        )
+        .await;
+    }
+}
+
+/// Issue #620 A2b: a reclaim while the first claimant still holds its
+/// materialized share. Worker A materializes 60 keys at cap 10, commits page
+/// 1 and pauses before page 2 with its `TEMP` table live. Its claim is
+/// reclaimed, and worker B drains the rest start to finish in its own session,
+/// materialized from A's cursor: B writes exactly the 50 keys A didn't, in at
+/// most 5 pages. A then resumes on its stale table: page 2 fails its claim
+/// check and applies nothing. Neither session's table outlives it.
+#[tokio::test]
+async fn a_reclaim_mid_materialized_drain_resumes_from_the_cursor_in_a_new_session() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_copy(&db, &client).await;
+
+    let ids: Vec<i32> = (1..=60).collect();
+    stage_copy_keys(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let pool = db.pool.clone();
+    let worker_a = tokio::spawn(async move {
+        let mut hooks = DrainHooks {
+            pause_before_page: Some((2, paused_tx, resume_rx)),
+            ..DrainHooks::default()
+        };
+        drain(&pool, seg, "worker-a", 10, &mut hooks).await
+    });
+    paused_rx.await.expect("worker A reaches page 2");
+    assert_eq!(
+        page_tables(&client).await,
+        1,
+        "A's materialized share is live while it pauses"
+    );
+    let after_one_page = read_copy(&client).await;
+    assert_eq!(after_one_page.len(), 10, "A committed page 1 only");
+
+    assert!(reclaim(&client, seg).await > 0, "A's claim is reclaimed");
+    let b = drain_within(&db.pool, seg, "worker-b", 10, &mut DrainHooks::default()).await;
+    assert_eq!(b.segments_drained, vec![(seg, true)]);
+    assert_eq!(
+        b.keys_written, 50,
+        "B resumed after A's cursor, not from the start: {b:?}"
+    );
+    assert!(b.pages <= 5, "50 records at cap 10: {b:?}");
+    assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
+
+    resume_tx.send(()).expect("resume worker A");
+    let result = worker_a.await.expect("worker A's task");
+    assert!(
+        matches!(result, Err(ApplyError::ClaimLost)),
+        "A's page 2 must fail its claim check: {result:?}"
+    );
+    assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
+    no_page_tables_within(&client, Duration::from_secs(10)).await;
+}
+
+/// Issue #620 A2b: a paged drain's `TEMP` table never reaches a pooled
+/// connection and never outlives its drain call, whether the call finishes,
+/// fails its claim check, or is dropped mid-page. The pool here has exactly
+/// one connection, reused by every call: its backend never changes, and it
+/// never holds a page table. One connection also shows a paged drain never
+/// waits on the pool for its session.
+#[tokio::test]
+async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_copy(&db, &client).await;
+    let config = trellis::Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_pool_max_size(1)
+        .expect("pool size");
+    let pool = trellis::Pool::new(&config).expect("one-connection pool");
+    let (backend, has_table) = pooled_session(&pool).await;
+    assert!(!has_table);
+
+    // Finished: a paged drain to the end.
+    stage_copy_keys(&client, &(1..=40).collect::<Vec<_>>()).await;
+    let seg = seal(&mut client).await;
+    let outcome = drain_within(&pool, seg, "worker", 10, &mut DrainHooks::default()).await;
+    assert!(outcome.pages > 1, "the share pages: {outcome:?}");
+    no_page_tables_within(&client, Duration::from_secs(10)).await;
+    assert_eq!(pooled_session(&pool).await, (backend, false));
+
+    // Dropped mid-page: the drain's future is aborted while it pauses before
+    // page 2 with its table live.
+    stage_copy_keys(&client, &(101..=140).collect::<Vec<_>>()).await;
+    let seg = seal(&mut client).await;
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let task_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        let mut hooks = DrainHooks {
+            pause_before_page: Some((2, paused_tx, resume_rx)),
+            ..DrainHooks::default()
+        };
+        drain(&task_pool, seg, "worker-a", 10, &mut hooks).await
+    });
+    paused_rx.await.expect("the drain reaches page 2");
+    assert_eq!(page_tables(&client).await, 1, "the table is live mid-drain");
+    assert_eq!(
+        pooled_session(&pool).await,
+        (backend, false),
+        "the pooled connection never holds the table"
+    );
+    worker.abort();
+    let _ = worker.await;
+    no_page_tables_within(&client, Duration::from_secs(10)).await;
+    assert_eq!(pooled_session(&pool).await, (backend, false));
+
+    // Failed: the next claimant resumes from the cursor, pauses before its
+    // page 2, loses its claim, and that page fails with `ClaimLost`.
+    assert!(reclaim(&client, seg).await > 0);
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let task_pool = pool.clone();
+    let worker = tokio::spawn(async move {
+        let mut hooks = DrainHooks {
+            pause_before_page: Some((2, paused_tx, resume_rx)),
+            ..DrainHooks::default()
+        };
+        drain(&task_pool, seg, "worker-b", 10, &mut hooks).await
+    });
+    paused_rx.await.expect("worker B reaches its page 2");
+    assert!(reclaim(&client, seg).await > 0);
+    let won = claim::claim(&client, seg, "worker-c", 1)
+        .await
+        .expect("worker C claims");
+    assert!(!won.is_empty());
+    resume_tx.send(()).expect("resume worker B");
+    let result = worker.await.expect("worker B's task");
+    assert!(
+        matches!(result, Err(ApplyError::ClaimLost)),
+        "B's page must fail its claim check: {result:?}"
+    );
+    no_page_tables_within(&client, Duration::from_secs(10)).await;
+    assert_eq!(pooled_session(&pool).await, (backend, false));
+
+    let rest = drain_within(&pool, seg, "worker-c", 10, &mut DrainHooks::default()).await;
+    assert_eq!(rest.segments_drained, vec![(seg, true)]);
+    no_page_tables_within(&client, Duration::from_secs(10)).await;
+    assert_eq!(pooled_session(&pool).await, (backend, false));
+    assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
+}

@@ -267,8 +267,8 @@ const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
 /// fold sharing the claim's snapshot.
 ///
 /// Unbounded: this returns the whole share. The drain itself never calls it
-/// that way; it uses [`fold_limited`] or pages ([`page_boundary`] and
-/// [`fold_page`]) so what it holds in memory is bounded by
+/// that way; it uses [`fold_limited`] or pages ([`materialize_share`] and
+/// [`read_page`]) so what it holds in memory is bounded by
 /// `ClientOptions::drain_batch_cap`.
 #[cfg(any(test, feature = "internals"))]
 pub async fn fold(
@@ -276,7 +276,7 @@ pub async fn fold(
     seg_seq: i64,
     bucket: BucketFilter,
 ) -> Result<Vec<FoldedChange>, StagingError> {
-    fold_scoped(txn, seg_seq, &bucket, None, None, None).await
+    fold_scoped(txn, seg_seq, &bucket, None).await
 }
 
 /// [`fold`] with a `limit`: at most `limit` records, in no particular order
@@ -290,35 +290,15 @@ pub(crate) async fn fold_limited(
     bucket: &BucketFilter,
     limit: usize,
 ) -> Result<Vec<FoldedChange>, StagingError> {
-    fold_scoped(txn, seg_seq, bucket, None, None, Some(limit)).await
-}
-
-/// One page of the fold (issue #620): the records whose [`PageKey`] is
-/// strictly after `after` (from the start when `None`) and at or before
-/// `through` (to the end when `None`). A key's page key is fixed by the key
-/// itself, so every ring row of one key lands in the same page: a key never
-/// splits inside a segment, which is what keeps the fold's whole-window rules
-/// (first old image, last new image, `ends_in_delete`, `vanished_images`) and
-/// `poison_held`'s `(src_table, key, seg_seq)` key sound under paging.
-///
-/// The truncate-void filter still reads every truncate in the fenced window,
-/// not just this page's: a page past the one holding the truncate sentinel
-/// must still drop a key's rows at or below that truncate. Only the
-/// `filtered` rows are narrowed to the page.
-pub(crate) async fn fold_page(
-    txn: &Transaction<'_>,
-    seg_seq: i64,
-    bucket: &BucketFilter,
-    after: Option<&PageKey>,
-    through: Option<&PageKey>,
-) -> Result<Vec<FoldedChange>, StagingError> {
-    fold_scoped(txn, seg_seq, bucket, Some(after), through, None).await
+    fold_scoped(txn, seg_seq, bucket, Some(limit)).await
 }
 
 /// Where one key sorts in a bucket's page order (issue #620, ADR-0002 I8):
 /// `(route, src_table, key)`, compared byte-wise (`collate "C"`). `route` is
 /// the ring row's stored hash, which already defines buckets, so the sort
 /// leads with an integer; `key` breaks ties between keys that hash alike.
+/// `route` is a function of `(src_table, key)` alone, so every ring row of a
+/// key has the same page key, and a key never splits across pages.
 ///
 /// A truncate sentinel's `route` is `-1`, below every real key's (a real
 /// route is masked to 31 bits, never negative), so the clear always lands on
@@ -338,121 +318,151 @@ pub struct PageKey {
 /// parameter list can borrow it for any lifetime.
 static PAGE_SENTINEL_KEY: &str = super::append::TRUNCATE_SENTINEL_KEY;
 
-/// The page-key row expression over a ring row's own columns, with the
-/// truncate sentinel bound at `$sentinel_idx`. The one definition both the
-/// boundary query and the page fold compare against, so the two agree on
-/// order and on equality.
-fn page_key_sql(sentinel_idx: usize) -> String {
+/// Pushes `after` onto `params` and returns the `and ...` clause keeping a
+/// ring row only if its page key sorts strictly after `after`, with the
+/// truncate sentinel already bound at `sentinel_idx`. Pushes nothing and
+/// returns an empty clause when `after` is `None`.
+fn push_after<'a>(
+    params: &mut Vec<&'a (dyn ToSql + Sync)>,
+    sentinel_idx: usize,
+    after: Option<&'a PageKey>,
+) -> String {
+    let Some(after) = after else {
+        return String::new();
+    };
+    params.push(&after.route);
+    params.push(&after.src_table);
+    params.push(&after.key);
+    let i = params.len() - 2;
     format!(
-        "(case when key = ${sentinel_idx}::text then -1::bigint else route end, \
-          src_table collate \"C\", key collate \"C\")"
+        " and (case when key = ${sentinel_idx}::text then -1::bigint else route end, \
+               src_table collate \"C\", key collate \"C\") \
+             > (${i}::bigint, ${}::text collate \"C\", ${}::text collate \"C\")",
+        i + 1,
+        i + 2
     )
 }
 
-/// Pushes the bounds (and, unless the caller already bound it at
-/// `sentinel_idx`, the sentinel) onto `params` and returns the `and ...`
-/// clause restricting a ring row to `(after, through]`. Pushes nothing and
-/// returns an empty clause when both bounds are open: an unreferenced
-/// parameter would fail to type.
-fn push_page_range<'a>(
-    params: &mut Vec<&'a (dyn ToSql + Sync)>,
-    sentinel_idx: Option<usize>,
-    after: Option<&'a PageKey>,
-    through: Option<&'a PageKey>,
-) -> String {
-    if after.is_none() && through.is_none() {
-        return String::new();
-    }
-    let sentinel_idx = sentinel_idx.unwrap_or_else(|| {
-        params.push(&PAGE_SENTINEL_KEY);
-        params.len()
-    });
-    let key = page_key_sql(sentinel_idx);
-    let mut clause = String::new();
-    for (bound, op) in [(after, ">"), (through, "<=")] {
-        if let Some(bound) = bound {
-            params.push(&bound.route);
-            params.push(&bound.src_table);
-            params.push(&bound.key);
-            let i = params.len() - 2;
-            clause.push_str(&format!(
-                " and {key} {op} (${i}::bigint, ${}::text collate \"C\", ${}::text collate \"C\")",
-                i + 1,
-                i + 2
-            ));
-        }
-    }
-    clause
-}
+/// The session `TEMP` table a paged drain folds its share into (issue #620
+/// A2b). Always named with its `pg_temp.` qualifier when dropped or read, so
+/// a Trellis table that happened to share the name could never be touched.
+/// One per session: a new group's materialize replaces the last one.
+const PAGE_TABLE: &str = "trellis_drain_page";
 
-/// The rescan pager's boundary query (issue #620): the page key the next page
-/// ends at, or `None` when at most `cap` keys remain after `after`, so the
-/// next page is the share's last and runs to its end.
+/// The fold's own output columns, in [`folded_from_row`]'s order: what a
+/// page reads back from [`PAGE_TABLE`].
+const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed, origin_lsn, \
+     lsn, hop_gen, first_seen, group_key, is_truncate, relationship_reverse_deferred, \
+     retry_count, prior_image, min_image_lsn, row_count, has_recompute, vanished_images, \
+     ends_in_delete";
+
+/// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
+/// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
+/// page key so [`read_page`] walks it by keyset (issue #620 A2b, the design's
+/// Q2 (c)). Returns how many folded records it holds.
 ///
-/// A top-K over the distinct page keys of `bucket`'s rows after `after`:
-/// `offset cap - 1 limit 2` returns the `cap`-th key and, when more remain,
-/// the one after it. Counts keys, not records, so a key whose every row a
-/// truncate voids still counts: a page can come out with fewer than `cap`
-/// records, never more.
-pub(crate) async fn page_boundary(
+/// One fold, as the direct path runs it, so the cost is linear in the share:
+/// one statement and one snapshot (I7), with no ring index and no WAL for the
+/// rows. The fold's whole-window rules hold because a key never splits
+/// (see [`PageKey`]), and the truncate-void filter still reads every
+/// truncate in the window, so a resume past the page that held the sentinel
+/// still drops a key's pre-truncate rows. Only the `filtered` rows are
+/// narrowed to `after`.
+///
+/// The table is session state, so the caller must hold this session for
+/// every [`read_page`] of the share and must never hand it to anyone else:
+/// the drain runs it on [`crate::Pool::connect_unpooled`]'s connection, and
+/// the table goes when that connection closes.
+pub(crate) async fn materialize_share(
     txn: &Transaction<'_>,
     seg_seq: i64,
     bucket: &BucketFilter,
     after: Option<&PageKey>,
-    cap: usize,
-) -> Result<Option<PageKey>, StagingError> {
+) -> Result<u64, StagingError> {
     txn.batch_execute(FOLD_WORK_MEM).await?;
-    let (window_sql, fence_params) = fenced_window(txn, seg_seq, "src_table, key, route").await?;
-    let offset = cap.max(1) as i64 - 1;
+    let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
         .iter()
         .map(|p| p as &(dyn ToSql + Sync))
         .collect();
     params.push(&bucket.bucket_count);
-    let bucket_count_idx = params.len();
     params.push(&bucket.buckets);
-    let buckets_idx = params.len();
     params.push(&PAGE_SENTINEL_KEY);
     let sentinel_idx = params.len();
-    let range = push_page_range(&mut params, Some(sentinel_idx), after, None);
-    params.push(&offset);
-    let offset_idx = params.len();
-
-    let sql = format!(
-        "with fenced as ({window_sql}) \
-         select page_route, src_table, key from ( \
-             select distinct \
-                 case when key = ${sentinel_idx}::text then -1::bigint else route end \
-                     as page_route, \
-                 src_table collate \"C\" as src_table, \
-                 key collate \"C\" as key \
-             from fenced \
-             where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) {range} \
-         ) keys \
-         order by page_route, src_table, key \
-         offset ${offset_idx} limit 2"
+    let range = push_after(&mut params, sentinel_idx, after);
+    let page_route = format!(
+        ", case when filtered.key = ${sentinel_idx}::text then -1::bigint \
+               else min(route) end as page_route"
     );
-    let rows = txn.query(&sql, &params).await?;
-    if rows.len() < 2 {
-        return Ok(None);
-    }
-    Ok(Some(PageKey {
-        route: rows[0].get(0),
-        src_table: rows[0].get(1),
-        key: rows[0].get(2),
-    }))
+    let sql = fold_sql(&window_sql, fence_params.len(), &range, &page_route, "");
+
+    txn.batch_execute(&format!("drop table if exists pg_temp.{PAGE_TABLE}"))
+        .await?;
+    let records = txn
+        .execute(&format!("create temp table {PAGE_TABLE} as {sql}"), &params)
+        .await?;
+    txn.batch_execute(&format!(
+        "create index on pg_temp.{PAGE_TABLE} \
+             (page_route, src_table collate \"C\", key collate \"C\")"
+    ))
+    .await?;
+    Ok(records)
 }
 
-/// The shared body of [`fold`], [`fold_limited`] and [`fold_page`]. `page`
-/// is `Some(after)` for a page (`after` itself may be `None`: the first page),
-/// `None` for the unpaged fold.
+/// Reads the next page of this session's [`PAGE_TABLE`] (issue #620 A2b): at
+/// most `cap` folded records, in page-key order, strictly after `after`.
+/// Returns the records and the last page key they cover when more follow, or
+/// `None` when this page reaches the end of the materialized share. An index
+/// range scan, so each page costs its own size, not the share's.
+pub(crate) async fn read_page(
+    client: &tokio_postgres::Client,
+    after: Option<&PageKey>,
+    cap: usize,
+) -> Result<(Vec<FoldedChange>, Option<PageKey>), StagingError> {
+    let cap = cap.max(1);
+    let limit = cap as i64 + 1;
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+    if let Some(after) = after {
+        params.push(&after.route);
+        params.push(&after.src_table);
+        params.push(&after.key);
+    }
+    params.push(&limit);
+    let sql = read_page_sql(after.is_some());
+    let rows = client.query(&sql, &params).await?;
+    let next = (rows.len() > cap).then(|| PageKey {
+        route: rows[cap - 1].get(19),
+        src_table: rows[cap - 1].get(0),
+        key: rows[cap - 1].get(1),
+    });
+    Ok((rows.iter().take(cap).map(folded_from_row).collect(), next))
+}
+
+/// [`read_page`]'s statement: `$1..=$3` bind `after` when `with_after`, and
+/// the last parameter is the row limit.
+fn read_page_sql(with_after: bool) -> String {
+    let (range, limit_idx) = if with_after {
+        (
+            "where (page_route, src_table collate \"C\", key collate \"C\") \
+                 > ($1::bigint, $2::text collate \"C\", $3::text collate \"C\")",
+            4,
+        )
+    } else {
+        ("", 1)
+    };
+    format!(
+        "select {FOLDED_COLUMNS}, page_route from pg_temp.{PAGE_TABLE} {range} \
+         order by page_route, src_table collate \"C\", key collate \"C\" \
+         limit ${limit_idx}"
+    )
+}
+
+/// The shared body of [`fold`] and [`fold_limited`].
 async fn fold_scoped(
     txn: &Transaction<'_>,
     seg_seq: i64,
     bucket: &BucketFilter,
-    page: Option<Option<&PageKey>>,
-    through: Option<&PageKey>,
     limit: Option<usize>,
 ) -> Result<Vec<FoldedChange>, StagingError> {
     txn.batch_execute(FOLD_WORK_MEM).await?;
@@ -466,10 +476,6 @@ async fn fold_scoped(
         .collect();
     params.push(&bucket.bucket_count);
     params.push(&bucket.buckets);
-    let range = match page {
-        Some(after) => push_page_range(&mut params, None, after, through),
-        None => String::new(),
-    };
     let tail = match &limit {
         Some(limit) => {
             params.push(limit);
@@ -477,47 +483,58 @@ async fn fold_scoped(
         }
         None => String::new(),
     };
-    let sql = fold_sql(&window_sql, fence_params.len(), &range, &tail);
+    let sql = fold_sql(&window_sql, fence_params.len(), "", "", &tail);
 
     let rows = txn.query(&sql, &params).await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| FoldedChange {
-            src_table: row.get(0),
-            key: row.get(1),
-            new_image: row.get(2),
-            old_image: row.get(3),
-            src_changed: row.get(4),
-            origin_lsn: row.get(5),
-            lsn: row.get(6),
-            hop_gen: row.get(7),
-            first_seen: row.get(8),
-            group_key: row.get(9),
-            is_truncate: row.get(10),
-            relationship_reverse_deferred: row.get(11),
-            retry_count: row.get(12),
-            prior_image: row.get(13),
-            min_image_lsn: row.get(14),
-            // `count(*)` is a non-negative bigint.
-            row_count: row.get::<_, i64>(15) as u64,
-            has_recompute: row.get(16),
-            vanished_images: {
-                // A key born and died in one group has one image, twice.
-                let mut images = row.get::<_, Option<Vec<String>>>(17).unwrap_or_default();
-                images.dedup();
-                images
-            },
-            ends_in_delete: row.get(18),
-        })
-        .collect())
+    Ok(rows.iter().map(folded_from_row).collect())
+}
+
+/// One fold output row as a [`FoldedChange`], by position ([`FOLDED_COLUMNS`]'
+/// order), from either the fold itself or [`PAGE_TABLE`].
+fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
+    FoldedChange {
+        src_table: row.get(0),
+        key: row.get(1),
+        new_image: row.get(2),
+        old_image: row.get(3),
+        src_changed: row.get(4),
+        origin_lsn: row.get(5),
+        lsn: row.get(6),
+        hop_gen: row.get(7),
+        first_seen: row.get(8),
+        group_key: row.get(9),
+        is_truncate: row.get(10),
+        relationship_reverse_deferred: row.get(11),
+        retry_count: row.get(12),
+        prior_image: row.get(13),
+        min_image_lsn: row.get(14),
+        // `count(*)` is a non-negative bigint.
+        row_count: row.get::<_, i64>(15) as u64,
+        has_recompute: row.get(16),
+        vanished_images: {
+            // A key born and died in one group has one image, twice.
+            let mut images = row.get::<_, Option<Vec<String>>>(17).unwrap_or_default();
+            images.dedup();
+            images
+        },
+        ends_in_delete: row.get(18),
+    }
 }
 
 /// The fold statement over `window_sql` (the fenced window, binding
 /// `$1..=$fence_param_count`), with the bucket count and bucket list bound
 /// as the next two parameters. `range` is appended to the `filtered` rows'
-/// predicate (a page's key range, issue #620; empty for the whole share) and
-/// `tail` to the statement (a `limit`, or empty).
-fn fold_sql(window_sql: &str, fence_param_count: usize, range: &str, tail: &str) -> String {
+/// predicate (a resume's `after` bound, issue #620; empty for the whole
+/// share), `extra` to the select list after [`FOLDED_COLUMNS`] (the page
+/// key's route when materializing; empty otherwise) and `tail` to the
+/// statement (a `limit`, or empty).
+fn fold_sql(
+    window_sql: &str,
+    fence_param_count: usize,
+    range: &str,
+    extra: &str,
+    tail: &str,
+) -> String {
     let bucket_count_idx = fence_param_count + 1;
     let buckets_idx = fence_param_count + 2;
 
@@ -679,7 +696,7 @@ fn fold_sql(window_sql: &str, fence_param_count: usize, range: &str, tail: &str)
                            filter (where new_image is null and old_image is not null \
                                      and op <> 'recompute')], null) \
              end as vanished_images, \
-             coalesce({last}[1][2] = 'delete', false) as ends_in_delete \
+             coalesce({last}[1][2] = 'delete', false) as ends_in_delete{extra} \
          from filtered \
          group by src_table, key{tail}"
     )
@@ -1567,7 +1584,7 @@ mod plan_tests {
                 fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
                     .await
                     .expect("fenced window");
-            let sql = fold_sql(&window_sql, fence_params.len(), "", "");
+            let sql = fold_sql(&window_sql, fence_params.len(), "", "", "");
             let bucket = BucketFilter::all();
             let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
                 .iter()
@@ -1604,6 +1621,131 @@ mod plan_tests {
                 );
             }
         }
+    }
+
+    /// Issue #620 A2b: a materialized share reads back in page-key order,
+    /// truncate sentinel first, each record exactly once, in pages of at most
+    /// the cap; and each page is an index range scan of the `TEMP` table, not
+    /// a sort of all of it, so paging stays linear in the share.
+    #[tokio::test]
+    async fn a_materialized_share_pages_in_key_order_by_index_range_scan() {
+        // Large enough that the planner costs a page's index range scan
+        // below a sort of the whole table, as it does for any real share
+        // (one over the 100k default cap).
+        const ROWS: i64 = 40_000;
+        const CAP: usize = 2_000;
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+            .await
+            .expect("set search_path");
+        client
+            .batch_execute(&format!(
+                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, \
+                                    origin_lsn, src_changed, hop_gen) \
+                 select 'orders', 'k' || g, 'update', ('0/' || to_hex(g))::pg_lsn, \
+                        jsonb_build_object('v', g), jsonb_build_object('v', g + 1), \
+                        ('0/' || to_hex(g))::pg_lsn, now(), 0 \
+                 from generate_series(1, {ROWS}) g"
+            ))
+            .await
+            .expect("stage updates");
+        // Halfway through: voids every key at or below it.
+        client
+            .execute(
+                "insert into seg_0 (src_table, key, op, lsn, src_changed, hop_gen) \
+                 values ('orders', $1, 'truncate', ('0/' || to_hex($2::bigint))::pg_lsn, \
+                         now(), 0)",
+                &[&super::super::TRUNCATE_SENTINEL_KEY, &(ROWS / 2)],
+            )
+            .await
+            .expect("stage truncate");
+        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+
+        let txn = client.transaction().await.expect("begin");
+        let records = materialize_share(&txn, outcome.sealed_seg_seq, &BucketFilter::all(), None)
+            .await
+            .expect("materialize");
+        txn.commit().await.expect("commit");
+        let expected = (ROWS / 2 + 1) as u64;
+        assert_eq!(records, expected, "the surviving half plus the sentinel");
+
+        let mut after: Option<PageKey> = None;
+        let mut seen: Vec<PageKey> = Vec::new();
+        let mut pages = 0;
+        loop {
+            let (page, next) = read_page(&client, after.as_ref(), CAP).await.expect("page");
+            pages += 1;
+            assert!(page.len() <= CAP);
+            if pages == 1 {
+                assert!(page[0].is_truncate, "the sentinel sorts first");
+            }
+            let routes: HashMap<String, i64> = client
+                .query(
+                    "select key, page_route from pg_temp.trellis_drain_page \
+                     where key = any($1::text[])",
+                    &[&page.iter().map(|c| c.key.clone()).collect::<Vec<_>>()],
+                )
+                .await
+                .expect("routes")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            for change in &page {
+                seen.push(PageKey {
+                    route: routes[&change.key],
+                    src_table: change.src_table.clone(),
+                    key: change.key.clone(),
+                });
+            }
+            match next {
+                Some(next) => {
+                    assert_eq!(Some(&next), seen.last(), "next is the page's last key");
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen.len() as u64, expected, "every record exactly once");
+        assert_eq!(pages, (expected as usize).div_ceil(CAP));
+        let mut sorted = seen.clone();
+        sorted.sort_by(|a, b| {
+            (a.route, a.src_table.as_bytes(), a.key.as_bytes()).cmp(&(
+                b.route,
+                b.src_table.as_bytes(),
+                b.key.as_bytes(),
+            ))
+        });
+        sorted.dedup();
+        assert_eq!(seen, sorted, "strictly increasing page keys");
+
+        let mid = &seen[seen.len() / 2];
+        let limit = CAP as i64 + 1;
+        let plan = client
+            .query(
+                &format!("explain (costs off) {}", read_page_sql(true)),
+                &[&mid.route, &mid.src_table, &mid.key, &limit],
+            )
+            .await
+            .expect("explain a page read")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Index Scan") && !plan.contains("Sort"),
+            "a page must be an index range scan, not a sort of the whole table:\n{plan}"
+        );
     }
 
     /// Issue #581: a ring slot refilled after reclaim still carries
@@ -1679,7 +1821,7 @@ mod plan_tests {
         let (window_sql, fence_params) = fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
             .await
             .expect("fenced window");
-        let sql = fold_sql(&window_sql, fence_params.len(), "", "");
+        let sql = fold_sql(&window_sql, fence_params.len(), "", "", "");
         let bucket = BucketFilter::all();
         let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
             .iter()

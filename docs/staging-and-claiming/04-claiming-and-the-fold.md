@@ -281,9 +281,9 @@ leads with an integer and `key` breaks ties. Three properties follow:
   one bucket, so one worker runs its pages in order.
 - **Cross-key order is arbitrary**, as it always was.
 
-Each page re-folds its key range against the **whole** fenced window's truncate
-rows, so a key on page 5 still drops its rows at or below a truncate that page 1
-applied.
+A resume folds only the keys after its cursor, but still against the **whole**
+fenced window's truncate rows, so a key on page 5 still drops its rows at or below
+a truncate that page 1 applied.
 
 **The cursor.** Each page is its own compute-and-apply transaction. A page that is
 not its buckets' last checks the claim and advances the buckets' `drain_cursor`
@@ -298,12 +298,21 @@ the two is harmless: the next claimant parks the poisoned key idempotently). If 
 transform's fuse trips mid-segment, later pages skip the quarantined transform;
 resuming it rebuilds the target.
 
-**Where pages come from.** Today each page rescans the fenced window twice: a
-top-K over the distinct page keys after the cursor finds the page's last key, then
-the fold runs over that range. That is quadratic in the share's size, a bridge
-until a once-per-claim materialize into a session `TEMP` table replaces it behind
-the same page-source interface (#620 A2b). There is no ring index: its append cost
-would spend ADR-0002's whole capture budget.
+**Where pages come from.** A paged drain folds its share once, from the cursor,
+into a session `TEMP` table indexed on the page key, then reads each page back by
+keyset: `limit cap + 1` rows after the last page's key. The cost is linear in the
+share. The fold is one statement and one snapshot, as on the direct path, and the
+table's rows write no WAL. There is no ring index: its append cost would spend
+ADR-0002's whole capture budget.
+
+The table is session state, so it lives on a connection the drain opens outside
+the pool and closes when the call ends. Every page read runs on that connection,
+and whether the call finishes, fails on a page or is cancelled, the table goes
+with the session. A pooled connection never carries one, and the page loop never
+waits on the pool for it. A share whose claim is reclaimed mid-drain has nothing
+to hand over: the next claimant opens its own session and materializes again from
+the bucket's cursor. A dropped connection surfaces as an error, never as an empty
+table a worker could mistake for a drained share.
 
 ## Keeping a claim alive
 

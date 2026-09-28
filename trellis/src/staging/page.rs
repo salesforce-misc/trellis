@@ -1,4 +1,4 @@
-//! Bounded drain paging (issue #620, epic #556 milestone A2a). See
+//! Bounded drain paging (issue #620, epic #556 milestone A2). See
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, "Paging a share
 //! larger than the cap".
 //!
@@ -6,9 +6,10 @@
 //! once. A share that fits is folded directly, as before; a share that
 //! doesn't is walked in pages, keyset-ordered on [`PageKey`], each page its
 //! own compute-and-apply transaction that advances the bucket's
-//! `drain_cursor` row. This module is where pages come from ([`PageSource`])
-//! and where the cursor is read back ([`read_cursors`]); the page's apply,
-//! claim check and cursor write live in `super::apply`.
+//! `drain_cursor` row. This module is where pages come from
+//! ([`MaterializedPages`]) and where the cursor is read back
+//! ([`read_cursors`]); the page's apply, claim check and cursor write live in
+//! `super::apply`.
 
 use std::collections::HashMap;
 
@@ -30,47 +31,65 @@ pub(crate) struct Page {
     pub next: Option<PageKey>,
 }
 
-/// Where an oversized share's pages come from. A page never splits a key and
-/// never holds more than `cap` records; successive calls, each starting after
-/// the previous page's [`Page::next`], cover the share exactly once.
+/// Where an oversized share's pages come from (issue #620 A2b): the share is
+/// folded once into a session `TEMP` table ([`fold::materialize_share`]),
+/// then read back a page at a time by keyset ([`fold::read_page`]). Linear in
+/// the share, where A2a's rescan pager re-scanned the fenced window for every
+/// page and was quadratic.
 ///
-/// A2a's source is [`RescanPages`]: each page re-scans the fenced window, which
-/// is quadratic in the share's size. A2b replaces it with a once-per-claim
-/// materialize into a session `TEMP` table, read back by keyset, behind this
-/// same interface. The caller resumes from a `drain_cursor` row by passing it
-/// as `after`, so a source must not assume it started at the beginning.
-pub(crate) trait PageSource {
-    async fn next_page(&mut self, after: Option<&PageKey>, cap: usize) -> Result<Page, ApplyError>;
-}
-
-/// The rescan pager: each page is two statements over the fenced window, in
-/// one read transaction. [`fold::page_boundary`] finds the page's last key
-/// (a top-K over the distinct keys after `after`), then [`fold::fold_page`]
-/// folds that key range.
-pub(crate) struct RescanPages<'a> {
-    pool: &'a Pool,
+/// A page never splits a key and never holds more than `cap` records;
+/// successive pages, each starting after the previous page's
+/// [`Page::next`], cover the materialized share exactly once.
+///
+/// **The session is this struct's own.** A `TEMP` table lives in one backend,
+/// so the table and every page read of it share one connection, opened by
+/// [`Pool::connect_unpooled`] rather than borrowed from the pool, and owned
+/// here. Dropping this struct closes the connection, and Postgres drops the
+/// table with the session. That holds however the drain call ends: finished,
+/// failed on a page, or its future dropped mid-page. A pooled connection
+/// never carries the table, so no later borrower can inherit a stale one;
+/// and the page loop never waits on the pool for the session, so a paged
+/// drain still runs on a one-connection pool. A reclaimed share's next
+/// claimant has its own session and materializes again from the bucket's
+/// cursor.
+pub(crate) struct MaterializedPages {
+    client: tokio_postgres::Client,
     seg_seq: i64,
-    filter: BucketFilter,
 }
 
-impl<'a> RescanPages<'a> {
-    pub(crate) fn new(pool: &'a Pool, seg_seq: i64, filter: BucketFilter) -> Self {
-        Self {
-            pool,
+impl MaterializedPages {
+    /// Opens the session a paged drain of `seg_seq` materializes into.
+    pub(crate) async fn open(pool: &Pool, seg_seq: i64) -> Result<Self, ApplyError> {
+        Ok(Self {
+            client: pool.connect_unpooled().await?,
             seg_seq,
-            filter,
-        }
+        })
     }
-}
 
-impl PageSource for RescanPages<'_> {
-    async fn next_page(&mut self, after: Option<&PageKey>, cap: usize) -> Result<Page, ApplyError> {
-        let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
-        let next = fold::page_boundary(&txn, self.seg_seq, &self.filter, after, cap).await?;
-        let records =
-            fold::fold_page(&txn, self.seg_seq, &self.filter, after, next.as_ref()).await?;
+    /// Folds `filter`'s share from strictly after `after` (a resumed
+    /// cursor, or the start) into the session's table, replacing the table
+    /// any earlier cursor group left. One transaction, committed before any
+    /// page applies. Returns the folded record count.
+    pub(crate) async fn materialize(
+        &mut self,
+        filter: &BucketFilter,
+        after: Option<&PageKey>,
+    ) -> Result<u64, ApplyError> {
+        let txn = self.client.transaction().await?;
+        let records = fold::materialize_share(&txn, self.seg_seq, filter, after).await?;
         txn.commit().await?;
+        Ok(records)
+    }
+
+    /// The next page of the last [`Self::materialize`]d share after `after`.
+    /// Its caller passes the previous page's [`Page::next`], starting from
+    /// the `after` it materialized from.
+    pub(crate) async fn next_page(
+        &self,
+        after: Option<&PageKey>,
+        cap: usize,
+    ) -> Result<Page, ApplyError> {
+        let (records, next) = fold::read_page(&self.client, after, cap).await?;
         Ok(Page { records, next })
     }
 }
