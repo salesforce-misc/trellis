@@ -169,3 +169,6 @@ server binaries on `PATH`, like the Rust tests.
 
 The tests use Minitest: it ships with Ruby, and its plain `assert_*` style
 reads like the Elixir binding's ExUnit suite, which this one mirrors.
+`test/parity_test.rb` runs `clients/parity/cases.json`, the fixture the
+Elixir suite runs too, so the two bindings can't drift apart unnoticed (see
+`clients/parity/README.md`).

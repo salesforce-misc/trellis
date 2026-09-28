@@ -102,3 +102,7 @@ mix test
 the suite spawns `trellis-testkit` (from `PATH`, else the workspace's debug
 build) for a Postgres cluster that is torn down when the test run exits. It
 needs the Postgres server binaries on `PATH`, like the Rust tests.
+
+`test/trellis/parity_test.exs` runs `clients/parity/cases.json`, the fixture
+the Ruby suite runs too, so the two bindings can't drift apart unnoticed
+(see `clients/parity/README.md`).

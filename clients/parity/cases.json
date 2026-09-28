@@ -1,0 +1,339 @@
+{
+  "about": "The cross-language parity fixture (issue #155). Both host suites run every step below against a Trellis they connect themselves, and check each result against the same expected shape; neither suite owns this file. See README.md for the shape language and what each host maps onto it.",
+  "records": {
+    "Definition": {
+      "id": "integer",
+      "target_table": "string",
+      "source_table": "string",
+      "source_version": "integer",
+      "status": {"word_in": "transform_status"},
+      "source_columns": {"map_of": "string"}
+    },
+    "DefinitionSummary": {
+      "id": "integer",
+      "target_table": "string",
+      "source_table": "string",
+      "source_version": "integer",
+      "status": {"word_in": "transform_status"},
+      "created_at": "time",
+      "backfill_failure": {"nullable": {"record": "BackfillFailure"}}
+    },
+    "Status": {
+      "status": {"word_in": "transform_status"},
+      "backfill_failure": {"nullable": {"record": "BackfillFailure"}}
+    },
+    "BackfillFailure": {
+      "source_table": "string",
+      "attempts": "integer",
+      "last_error": "string",
+      "next_attempt_at": "time"
+    },
+    "Relationship": {
+      "id": "integer",
+      "name": "string",
+      "from_schema": "string",
+      "from_table": "string",
+      "from_col": "string",
+      "to_schema": "string",
+      "to_table": "string",
+      "to_col": "string",
+      "cardinality": {"word_in": "cardinality"},
+      "warnings": {"list_of": "string"}
+    },
+    "RelationshipSummary": {
+      "id": "integer",
+      "name": "string",
+      "from_schema": "string",
+      "from_table": "string",
+      "from_col": "string",
+      "to_schema": "string",
+      "to_table": "string",
+      "to_col": "string",
+      "cardinality": {"word_in": "cardinality"},
+      "created_at": "time"
+    },
+    "Applied": {
+      "kind": {"word_in": "applied_kind"},
+      "definition": {"nullable": {"record": "Definition"}},
+      "relationship": {"nullable": {"record": "Relationship"}},
+      "columns": {"nullable": {"list_of": "string"}},
+      "added": {"nullable": {"list_of": "string"}},
+      "dropped": {"nullable": {"list_of": "string"}},
+      "altered": {"nullable": {"list_of": "string"}}
+    },
+    "QuarantineEntry": {
+      "target": "string",
+      "state": {"word_in": "quarantine_state"},
+      "paused_at": {"nullable": "time"},
+      "last_error": {"nullable": "string"}
+    },
+    "PoisonEntry": {
+      "src_table": "string",
+      "key": "string",
+      "last_error": "string",
+      "poisoned_at": "time"
+    },
+    "PoisonSample": {
+      "src_table": "string",
+      "key": "string",
+      "error_message": "string"
+    },
+    "SamplePage": {
+      "samples": {"list_of": {"record": "PoisonSample"}},
+      "next_cursor": {"nullable": "string"}
+    },
+    "SelfCheckReport": {
+      "target": "string",
+      "outcome": {"word_in": "self_check_outcome"},
+      "divergences": {"list_of": {"record": "Divergence"}},
+      "rows_compared": "integer",
+      "next_after": {"nullable": "string"},
+      "checked_through": "string"
+    },
+    "Divergence": {
+      "kind": {"word_in": "divergence_kind"},
+      "key": {"nullable": "string"},
+      "column": {"nullable": "string"},
+      "persisted": {"nullable": "string"},
+      "recomputed": {"nullable": "string"}
+    },
+    "Config": {
+      "schema": "string",
+      "target_schema": "string",
+      "pool_max_size": "integer",
+      "pool_wait_timeout_ms": "integer"
+    }
+  },
+  "live": [
+    {
+      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below).",
+      "op": "sql",
+      "args": [
+        "create table parity_owners (id integer primary key, name text)",
+        "create table parity_items (id integer primary key, owner_id integer, price integer)",
+        "alter table parity_owners replica identity full",
+        "alter table parity_items replica identity full",
+        "insert into parity_items (id, owner_id, price) values (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)",
+        "create table parity_ledger (id integer primary key, n integer)",
+        "create table parity_gizmos (id integer primary key, price integer)",
+        "create role parity_reader login"
+      ]
+    },
+
+    {"about": "A connect option the host itself refuses, before the engine sees it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "drain_threads": -1}, "expect": {"error": "validation"}},
+
+    {"about": "Phase one: a handle that runs nothing in the background, so nothing below changes under it.", "op": "connect", "opts": {"url": {"$dsn": {}}}, "expect": null},
+    {"op": "migrate", "expect": null},
+    {"op": "config", "expect": {"record": "Config", "fields": {"schema": {"eq": "trellis"}, "target_schema": {"eq": "public"}}}},
+
+    {"about": "Every list read on an empty catalog is an empty list, not nil or an error.", "op": "definitions", "expect": {"list": []}},
+    {"op": "relationships", "expect": {"list": []}},
+    {"op": "quarantined", "expect": {"list": []}},
+    {"op": "poisoned_since", "args": [{"$time_micros": 0}], "expect": {"list": []}},
+    {"about": "An unknown target's status is nil (Rust's None), not an error.", "op": "status", "args": ["parity_prices"], "expect": null},
+    {"op": "has_live_drain_workers", "expect": {"eq": false}},
+    {"op": "has_live_staging_worker", "expect": {"eq": false}},
+
+    {"about": "The quarantine reads name a transform, so an unknown one is not_found rather than empty.", "op": "quarantine_status", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
+    {"op": "sample_quarantined", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
+    {"op": "self_check", "args": ["parity_nowhere"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"error": "not_found"}},
+    {"op": "request_backfill", "args": ["parity_nowhere"], "expect": {"error": "not_found"}},
+    {"op": "apply", "args": ["TRANSFORM parity_oops"], "expect": {"error": "parse"}},
+    {"about": "define refuses any other statement form before applying it.", "op": "define", "args": ["DROP TRANSFORM parity_prices"], "expect": {"error": "validation"}},
+    {"about": "A limit the host itself refuses.", "op": "sample_quarantined", "args": ["parity_prices.price"], "opts": {"limit": 0}, "expect": {"error": "validation"}},
+
+    {
+      "about": "No index on parity_items.owner_id comes back as a warning; parity_owners.id is a primary key, so the cardinality is one.",
+      "op": "apply",
+      "args": ["RELATIONSHIP parity_owner FROM parity_items.owner_id TO parity_owners.id"],
+      "covers": {"statement_kind": "define_relationship"},
+      "expect": {"record": "Applied", "fields": {
+        "kind": {"word": "relationship_defined"},
+        "definition": null,
+        "relationship": {"record": "Relationship", "fields": {
+          "name": {"eq": "parity_owner"},
+          "from_schema": {"eq": "public"},
+          "from_table": {"eq": "parity_items"},
+          "from_col": {"eq": "owner_id"},
+          "to_schema": {"eq": "public"},
+          "to_table": {"eq": "parity_owners"},
+          "to_col": {"eq": "id"},
+          "cardinality": {"word": "one"},
+          "warnings": {"list": ["string"]}
+        }},
+        "columns": null, "added": null, "dropped": null, "altered": null
+      }}
+    },
+    {"op": "relationships", "expect": {"list": [{"record": "RelationshipSummary", "fields": {"name": {"eq": "parity_owner"}, "cardinality": {"word": "one"}}}]}},
+
+    {
+      "about": "define returns a bare Definition at waiting_to_backfill; source_columns is every source column's name to its type's name.",
+      "op": "define",
+      "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"],
+      "expect": {"record": "Definition", "fields": {
+        "target_table": {"eq": "public.parity_prices"},
+        "source_table": {"eq": "public.parity_items"},
+        "source_version": {"eq": 1},
+        "status": {"word": "waiting_to_backfill"},
+        "source_columns": {"map": {"id": {"eq": "integer"}, "owner_id": {"eq": "integer"}, "price": {"eq": "integer"}}}
+      }}
+    },
+    {"about": "The same target twice clashes.", "op": "define", "args": ["TRANSFORM parity_prices FROM parity_items SELECT price AS price"], "expect": {"error": "conflict"}},
+    {
+      "op": "apply",
+      "args": ["TRANSFORM parity_scratch FROM parity_items SELECT price AS price"],
+      "covers": {"statement_kind": "define_transform"},
+      "expect": {"record": "Applied", "fields": {
+        "kind": {"word": "transform_defined"},
+        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}, "status": {"word": "waiting_to_backfill"}}},
+        "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null
+      }}
+    },
+    {"op": "apply", "args": ["TRANSFORM parity_doubled FROM parity_ledger SELECT n + n AS doubled"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "apply", "args": ["TRANSFORM parity_gizmo_prices FROM parity_gizmos SELECT price AS price"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "definitions", "expect": {"list_of": {"record": "DefinitionSummary", "fields": {"backfill_failure": null}}}},
+    {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": null}}},
+    {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
+    {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word": "waiting_to_backfill"}, "paused_at": null, "last_error": null}}},
+    {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
+
+    {
+      "op": "apply",
+      "args": ["DROP RELATIONSHIP parity_items.parity_owner"],
+      "covers": {"statement_kind": "drop_relationship"},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+    },
+    {"op": "relationships", "expect": {"list": []}},
+
+    {"op": "watermark_token", "save": "idle_token", "expect": "string"},
+    {"about": "Nothing runs the staging worker yet, so no token can converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
+    {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
+    {"about": "Likewise the audit: it gives up waiting rather than failing.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null}}},
+    {"op": "shutdown", "expect": null},
+
+    {"about": "connect is lazy, so an unreachable database is the first call's connectivity error.", "op": "connect", "opts": {"url": "host=/nonexistent-trellis-parity port=1 dbname=parity"}, "expect": null},
+    {"op": "definitions", "expect": {"error": "connectivity"}},
+    {"op": "shutdown", "expect": null},
+
+    {"about": "A migration the database refuses (no CREATE on the database) is internal: a deployment fault, not the caller's input.", "op": "connect", "opts": {"url": {"$dsn": {"user": "parity_reader"}}, "schema": "parity_reader_schema"}, "expect": null},
+    {"op": "migrate", "expect": {"error": "internal"}},
+    {"op": "shutdown", "expect": null},
+
+    {"about": "Phase two: the background workers, so definitions go live.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 1}, "expect": null},
+    {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
+    {"op": "has_live_drain_workers", "until": {"eq": true}, "waiting_for": "a live drain worker"},
+    {"op": "status", "args": ["parity_prices"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_prices to go live"},
+    {"op": "status", "args": ["parity_doubled"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_doubled to go live"},
+    {"op": "status", "args": ["parity_gizmo_prices"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_gizmo_prices to go live"},
+    {"op": "status", "args": ["parity_scratch"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_scratch to go live"},
+
+    {
+      "about": "ALTER TRANSFORM edits only a live definition, which is why these statement forms wait for phase two.",
+      "op": "apply",
+      "args": ["ALTER TRANSFORM parity_scratch ADD price + price AS doubled"],
+      "covers": {"statement_kind": "alter_transform"},
+      "expect": {"record": "Applied", "fields": {
+        "kind": {"word": "altered"},
+        "definition": {"record": "Definition", "fields": {"target_table": {"eq": "public.parity_scratch"}}},
+        "relationship": null, "columns": null,
+        "added": {"list": [{"eq": "doubled"}]}, "dropped": {"list": []}, "altered": {"list": []}
+      }}
+    },
+    {
+      "op": "apply",
+      "args": ["PAUSE TRANSFORM parity_scratch"],
+      "covers": {"statement_kind": "pause_transform"},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+    },
+    {
+      "about": "A whole-transform resume has no columns to report: an empty list, not nil.",
+      "op": "apply",
+      "args": ["RESUME TRANSFORM parity_scratch"],
+      "covers": {"statement_kind": "resume_transform"},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "definition": null, "relationship": null, "columns": {"list": []}, "added": null, "dropped": null, "altered": null}}
+    },
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_scratch"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {
+      "op": "apply",
+      "args": ["DROP TRANSFORM parity_scratch"],
+      "covers": {"statement_kind": "drop_transform"},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+    },
+    {"op": "status", "args": ["parity_scratch"], "expect": null},
+
+    {"about": "Self-check paging: five rows two at a time, the cursor carried from each report to the next.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000}, "save": "check_1", "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "converged"}, "divergences": {"list": []}, "rows_compared": {"eq": 2}, "next_after": "string"}}},
+    {"op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_1.next_after"}}, "save": "check_2", "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 2}, "next_after": "string"}}},
+    {"about": "The last page: fewer rows than the limit, and no cursor.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 2, "timeout_ms": 30000, "after": {"$ref": "check_2.next_after"}}, "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "converged"}, "rows_compared": {"eq": 1}, "next_after": null}}},
+    {"about": "A target row edited behind Trellis's back is a cell divergence, its values as Postgres renders them.", "op": "sql", "args": ["update parity_prices set price = 999 where id = 1"]},
+    {
+      "op": "self_check",
+      "args": ["parity_prices"],
+      "opts": {"limit": 10, "timeout_ms": 30000, "mode": {"$word": "strict"}},
+      "expect": {"record": "SelfCheckReport", "fields": {
+        "outcome": {"word": "diverged"},
+        "rows_compared": {"eq": 5},
+        "next_after": null,
+        "divergences": {"list": [{"record": "Divergence", "fields": {"kind": {"word": "cell"}, "key": {"eq": "1"}, "column": {"eq": "price"}, "persisted": {"eq": "999"}, "recomputed": {"eq": "10"}}}]}
+      }}
+    },
+
+    {"about": "Doubling 2e9 overflows integer, so each row fails the column; five trip its pause.", "op": "sql", "args": ["insert into parity_ledger (id, n) values (1, 2000000000), (2, 2000000000), (3, 2000000000), (4, 2000000000), (5, 2000000000)"]},
+    {"op": "quarantine_status", "args": ["parity_doubled.doubled"], "until": {"record": "QuarantineEntry", "fields": {"state": {"word": "paused"}}}, "waiting_for": "parity_doubled.doubled to pause", "save": "paused"},
+    {"about": "Every write so far drained, so the sample below is complete (#585).", "op": "watermark_token", "save": "ledger_token", "expect": "string"},
+    {"op": "await_converged", "args": [{"$ref": "ledger_token"}], "opts": {"timeout_ms": 30000}, "expect": null},
+    {"op": "quarantine_status", "args": ["parity_doubled.doubled"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_doubled.doubled"}, "state": {"word": "paused"}, "paused_at": "time", "last_error": "string"}}},
+    {"op": "quarantined", "expect": {"list": [{"ref": "paused"}]}},
+    {"about": "Sample paging: first page.", "op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2}, "save": "page_1", "expect": {"record": "SamplePage", "fields": {"next_cursor": "string", "samples": {"list": [
+      {"record": "PoisonSample", "fields": {"src_table": {"eq": "public.parity_ledger"}, "key": {"eq": "1"}}},
+      {"record": "PoisonSample", "fields": {"src_table": {"eq": "public.parity_ledger"}, "key": {"eq": "2"}}}
+    ]}}}},
+    {"op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2, "after": {"$ref": "page_1.next_cursor"}}, "save": "page_2", "expect": {"record": "SamplePage", "fields": {"next_cursor": "string", "samples": {"list": [
+      {"record": "PoisonSample", "fields": {"key": {"eq": "3"}}},
+      {"record": "PoisonSample", "fields": {"key": {"eq": "4"}}}
+    ]}}}},
+    {"about": "The last page is the short one; it still carries a cursor.", "op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2, "after": {"$ref": "page_2.next_cursor"}}, "save": "page_3", "expect": {"record": "SamplePage", "fields": {"next_cursor": "string", "samples": {"list": [{"record": "PoisonSample", "fields": {"key": {"eq": "5"}}}]}}}},
+    {"about": "Past the end: an empty page hands back the cursor it was given, unchanged.", "op": "sample_quarantined", "args": ["parity_doubled.doubled"], "opts": {"limit": 2, "after": {"$ref": "page_3.next_cursor"}}, "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": {"ref": "page_3.next_cursor"}}}},
+    {
+      "about": "A column resume reports the column it resumed, by address.",
+      "op": "apply",
+      "args": ["RESUME TRANSFORM parity_doubled.doubled"],
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "resumed"}, "columns": {"list": [{"eq": "parity_doubled.doubled"}]}}}
+    },
+    {"op": "quarantined", "expect": {"list": []}},
+    {"about": "Returns once the re-read is queued; nothing after this reads parity_items's targets.", "op": "request_backfill", "args": ["parity_items"], "expect": null},
+
+    {"about": "A write the target's own constraint refuses poisons its key. Last, because a poisoned key holds await_converged back (#588).", "op": "sql", "args": ["alter table parity_gizmo_prices add constraint parity_cheap check (price < 100)"]},
+    {"op": "now", "save": "before_poison"},
+    {"op": "sql", "args": ["insert into parity_gizmos (id, price) values (1, 5), (2, 500)"]},
+    {"op": "poisoned_since", "args": [{"$ref": "before_poison"}], "until": {"list": [{"record": "PoisonEntry", "fields": {"src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "waiting_for": "parity_gizmos key 2 to be poisoned", "save": "poisoned"},
+    {"about": "The watermark is exclusive and its time round-trips to the microsecond, so nothing is newer than the entry itself.", "op": "poisoned_since", "args": [{"$ref": "poisoned.0.poisoned_at"}], "expect": {"list": []}},
+    {"about": "A whole transform's sample is its poisoned keys.", "op": "sample_quarantined", "args": ["parity_gizmo_prices"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": [{"record": "PoisonSample", "fields": {"src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "next_cursor": "string"}}},
+    {"op": "shutdown", "expect": null}
+  ],
+  "conversions": [
+    {
+      "about": "A failing backfill, which a live run can't produce cheaply: the retry time is rehydrated from epoch microseconds exactly.",
+      "type": "Status",
+      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}},
+      "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}}}
+    },
+    {
+      "about": "A time a microsecond before the epoch lands on that microsecond, not a second off.",
+      "type": "DefinitionSummary",
+      "native": {"id": 7, "target_table": "public.t", "source_table": "public.s", "source_version": 2, "status": {"$word": "live"}, "created_at_micros": -1, "backfill_failure": null},
+      "expect": {"record": "DefinitionSummary", "fields": {"id": {"eq": 7}, "created_at": {"time_micros": -1}, "backfill_failure": null}}
+    },
+    {
+      "about": "An outcome newer than the binding is still a success, with no detail.",
+      "type": "Applied",
+      "native": {"kind": {"$word": "unknown"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null},
+      "expect": {"record": "Applied", "fields": {"kind": {"word": "unknown"}, "definition": null, "relationship": null, "columns": null, "added": null, "dropped": null, "altered": null}}
+    },
+    {
+      "about": "An error code newer than the binding falls back to unknown rather than crashing.",
+      "type": "Error",
+      "native": {"code": "parity_future_code", "message": "something new"},
+      "expect": {"error": "unknown"}
+    }
+  ]
+}

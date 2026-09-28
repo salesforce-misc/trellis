@@ -192,7 +192,10 @@ jobs:
 
       - name: Test
         # `mix compile` builds the NIF through Cargo (debug, into the
-        # workspace's target/, reusing the restored dependencies).
+        # workspace's target/, reusing the restored dependencies). The
+        # suite includes the cross-language parity suite
+        # (test/trellis/parity_test.exs), which runs the shared
+        # clients/parity/cases.json the `ruby` job runs too.
         working-directory: clients/elixir
         env:
           MIX_ENV: test
@@ -290,7 +293,10 @@ jobs:
 
       - name: Test
         # `rake test` first builds the extension through Cargo (debug, into
-        # the workspace's target/, reusing the restored dependencies).
+        # the workspace's target/, reusing the restored dependencies). The
+        # suite includes the cross-language parity suite
+        # (test/parity_test.rb), which runs the shared
+        # clients/parity/cases.json the `elixir` job runs too.
         working-directory: clients/ruby
         env:
           BUNDLE_FROZEN: "true"
