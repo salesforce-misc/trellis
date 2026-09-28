@@ -2049,10 +2049,6 @@ pub const INTERLEAVE_PICK_RANGE: usize = 6;
 const _: () =
     assert!(INTERLEAVE_PICK_RANGE.is_multiple_of(2) && INTERLEAVE_PICK_RANGE.is_multiple_of(3));
 
-/// The most ops a `trivial_program_with` program can carry, and
-/// so the length of the schedule it draws for [`interleave_tables`].
-pub const MAX_INTERLEAVED_OPS: usize = MAX_TABLES * (MAX_SEED_ROWS + MAX_MUTATES);
-
 /// Reorders `program.ops` into one interleaving of its per-table streams
 /// ([`table_streams`]), keeping every table's own ops in order (issue #505).
 ///
@@ -3324,9 +3320,15 @@ mod strategy {
             .prop_flat_map(|tables| {
                 let table_count = tables.len();
                 let defs = prop::collection::vec(def_draw(table_count), 1..=MAX_DEFS);
-                (Just(tables), defs, interleave_schedule())
+                let op_count = tables
+                    .iter()
+                    .map(|t| t.seed_values.len() + t.mutates.len())
+                    .sum();
+                // The schedule comes before the defs so it shrinks first
+                // (see `interleave_schedule`).
+                (Just(tables), interleave_schedule(op_count), defs)
             })
-            .prop_map(|(tables, draws, schedule)| {
+            .prop_map(|(tables, schedule, draws)| {
                 let mut defs: Vec<(usize, DefShape)> = Vec::with_capacity(draws.len());
                 let mut derived: Vec<Option<DerivedShape>> = Vec::with_capacity(draws.len());
                 let mut rel_fields: Vec<Option<RelFieldSpec>> = Vec::with_capacity(draws.len());
@@ -3346,8 +3348,15 @@ mod strategy {
     /// #505): one uniform pick per op slot. Each entry shrinks toward `0`,
     /// and an all-zero schedule is the table-by-table order, so a shrunk
     /// counterexample keeps only the interleaving it needs to fail.
-    fn interleave_schedule() -> impl Strategy<Value = Vec<usize>> {
-        prop::collection::vec(0..INTERLEAVE_PICK_RANGE, MAX_INTERLEAVED_OPS)
+    ///
+    /// Proptest caps shrinking at `4 * cases` iterations, and each op the
+    /// flat-map's outer shrink removes redraws this schedule at random, so
+    /// the schedule has to be cheap to shrink or the cap lands mid-schedule
+    /// and leaves a needlessly interleaved counterexample. It is therefore
+    /// exactly `op_count` long (no dead entries past the last op to walk
+    /// down to `0`), and `trivial_program_with` shrinks it before the defs.
+    fn interleave_schedule(op_count: usize) -> impl Strategy<Value = Vec<usize>> {
+        prop::collection::vec(0..INTERLEAVE_PICK_RANGE, op_count)
     }
 
     /// The generator's default strategy: awkward values (NULLs) on, so real

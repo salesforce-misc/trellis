@@ -11,12 +11,12 @@ use std::collections::HashSet;
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, noise_plan_for,
     program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    trivial_program, trivial_program_with,
+    table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::RelPath;
 use proptest::strategy::{Strategy, ValueTree};
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use trellis::dev::defs::invertibility::{AggregateArg, CountArg, Invertibility, classify};
 
@@ -1474,4 +1474,53 @@ fn trivial_program_drives_every_relationship_reverse_path() {
             );
         }
     }
+}
+
+/// Issue #505: a failure that doesn't need the tables interleaved shrinks
+/// back to the table-by-table order, within proptest's real shrink budget
+/// (`4 * cases` iterations; `16` is the convergence properties' default
+/// case count). The planted failure is "a `TRUNCATE` in a program with at
+/// least two tables", which op order can't affect. Each run is seeded, so
+/// this pins what the shrinker does rather than being a probabilistic floor.
+#[test]
+fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
+    let is_table_ordered = |program: &Program| {
+        let order: Vec<usize> = table_streams(program).concat();
+        order.iter().copied().eq(0..program.ops.len())
+    };
+    let (mut failures, mut table_ordered) = (0, 0);
+    for seed in 1..=40u8 {
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases: 16,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]),
+        );
+        let result = runner.run(&trivial_program(), |program| {
+            let truncates = program
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Truncate { .. }));
+            if truncates && program.tables.len() >= 2 {
+                Err(TestCaseError::fail("planted"))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(TestError::Fail(_, shrunk)) = result {
+            failures += 1;
+            table_ordered += usize::from(is_table_ordered(&shrunk));
+        }
+    }
+    assert!(
+        failures >= 20,
+        "the planted failure must be found: {failures}/40 seeds"
+    );
+    assert!(
+        table_ordered * 10 >= failures * 9,
+        "an order-independent failure must shrink to the table-by-table order: only \
+         {table_ordered} of {failures} shrunk counterexamples did"
+    );
 }
