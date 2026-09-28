@@ -387,7 +387,7 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
         other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
     }
     let message = err.to_string();
-    assert!(message.contains("not the same type"), "{message}");
+    assert!(message.contains("which don't match"), "{message}");
 
     let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
@@ -782,16 +782,35 @@ async fn varchar_columns_with_different_lengths_are_rejected() {
 }
 
 /// Issue #590: a domain is its own type (its `CHECK` could reject a key cast
-/// from the base type), so it doesn't join its base type.
+/// from the base type), so it doesn't join its base type. No domain is on the
+/// join-key allowlist, and the allowlist runs first, so the error names the
+/// domain column as an unsupported join key rather than advising the user to
+/// alter the `integer` side into the domain.
 #[tokio::test]
 async fn a_domain_join_column_is_rejected_against_its_base_type() {
-    let types = expect_join_column_mismatch(
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let err = declare_over_join_columns(
+        &db.pool,
         "create domain product_ref as integer check (value > 0);",
         "product_ref",
         "integer",
     )
-    .await;
-    assert_eq!(types, ("product_ref".to_string(), "integer".to_string()));
+    .await
+    .expect_err("a domain join column must be rejected");
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            table,
+            column,
+            pg_type,
+            ..
+        }) => {
+            assert_eq!(table, "order_line_items");
+            assert_eq!(column, "product_id");
+            assert_eq!(pg_type, "product_ref");
+        }
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+    }
 }
 
 /// Issue #590: two different collations are rejected, and the error shows
@@ -822,14 +841,35 @@ async fn join_columns_with_different_collations_are_rejected() {
 /// Issue #590: a nondeterministic collation is rejected even when both sides
 /// share it. Its `=` matches `'A'` to `'a'`; the engine's exact-text key
 /// match doesn't.
+///
+/// Only ICU provides nondeterministic collations. A server built without ICU,
+/// or a cluster whose encoding ICU doesn't support (`SQL_ASCII`, which
+/// `initdb` picks under `LANG=C`), refuses the `CREATE COLLATION` with
+/// `0A000`; the test skips then, and the pure check is still covered by
+/// `defs::catalog`'s `join_column_tests`.
 #[tokio::test]
 async fn a_nondeterministic_collation_join_column_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    if let Err(err) = client
+        .batch_execute(
+            "create collation case_insensitive \
+             (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+        )
+        .await
+    {
+        if err.code() == Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED) {
+            let reason = err.as_db_error().map(|db| db.message().to_string());
+            eprintln!("skipping: this server can't create an ICU collation: {reason:?}");
+            return;
+        }
+        panic!("create a nondeterministic ICU collation: {err:?}");
+    }
+    drop(client);
     let err = declare_over_join_columns(
         &db.pool,
-        "create collation case_insensitive \
-         (provider = icu, locale = 'und-u-ks-level2', deterministic = false);",
+        "",
         "text collate case_insensitive",
         "text collate case_insensitive",
     )
@@ -2227,10 +2267,12 @@ async fn endpoints_with_supported_non_integer_primary_keys_are_accepted() {
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 }
 
-/// Issue #429 checked the join-key allowlist on the to-side on its own, for a
-/// from-side whose type was fine. Since #590 the two sides must share one
-/// type, so a to-side type outside the allowlist fails as a mismatch first,
-/// and `a_character_n_join_key_is_rejected` covers the allowlist itself.
+/// Issue #429: the join-key allowlist holds on the to-side on its own, when
+/// the from-side's type is fine. `a_character_n_join_key_is_rejected` fails
+/// on the from-side first. The pair also differs in type, but the allowlist
+/// runs before #590's sameness check, so the error names the side that can
+/// never be a join key rather than advising the user to alter `text` into
+/// `character(8)`.
 #[tokio::test]
 async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
     let cluster = TestCluster::start();
@@ -2246,12 +2288,15 @@ async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
     .unwrap_err();
 
     match &err {
-        CatalogError::Validate(ValidationError::RelationshipTypeMismatch(mismatch)) => {
-            assert_eq!(mismatch.to_table, "products");
-            assert_eq!(mismatch.to_col, "code");
-            assert_eq!(mismatch.to_type, "character(8)");
+        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
+            table,
+            column,
+            ..
+        }) => {
+            assert_eq!(table, "products");
+            assert_eq!(column, "code");
         }
-        other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
+        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
     }
     let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await

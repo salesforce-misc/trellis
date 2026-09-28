@@ -671,9 +671,9 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
-                     {to_table}.{to_col} ({to_type}), which are not the same type; join \
-                     columns must have the same type, type modifier and collation, because \
-                     Trellis never casts a join key, so alter one column to match the other"
+                     {to_table}.{to_col} ({to_type}), which don't match: join columns must \
+                     have the same type, type modifier and collation, because Trellis never \
+                     casts a join key. Alter one column to match the other"
                 )
             }
             ValidationError::DuplicateRelationshipName { from_table, name } => write!(

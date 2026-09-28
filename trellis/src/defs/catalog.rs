@@ -2772,12 +2772,15 @@ struct ValidatedRelationship {
 /// In order, returning the first failure:
 ///
 /// 1. **Join columns.** Both `table.column`s exist ([`join_column_in_txn`]),
-///    they have the same type, type modifier and collation
+///    each one's type is on the join-key allowlist
+///    ([`assert_join_key_type_supported`]; the engine matches join keys as
+///    text), they have the same type, type modifier and collation
 ///    ([`assert_joinable_as_is`], ADR-0006's "type-check the join", made
-///    exact by #590), that type is on the join-key allowlist
-///    ([`assert_join_key_type_supported`]), and its collation, if any, is
-///    deterministic ([`assert_deterministic_join_collation`]): the engine
-///    matches join keys as text.
+///    exact by #590), and that collation, if any, is deterministic
+///    ([`assert_deterministic_join_collation`]). The allowlist runs first so
+///    a type that can never be a join key is named as such, rather than
+///    reported as a mismatch whose advice ("alter one column to match the
+///    other") could steer the user onto it.
 /// 2. **Each endpoint**, from-side then to-side
 ///    ([`validate_relationship_endpoint`]): intake can key it, its key's
 ///    types are on the key allowlist, and it is `live` if it is one of this
@@ -2809,8 +2812,8 @@ async fn validate_relationship(
 ) -> Result<ValidatedRelationship, CatalogError> {
     let from = join_column_in_txn(txn, qualified_from, &def.from_table, &def.from_col).await?;
     let to = join_column_in_txn(txn, qualified_to, &def.to_table, &def.to_col).await?;
-    assert_joinable_as_is(def, &from, &to)?;
     assert_join_key_type_supported(txn, def, &from.pg_type, &to.pg_type).await?;
+    assert_joinable_as_is(def, &from, &to)?;
     assert_deterministic_join_collation(def, &from, &to)?;
     let to_type = to.pg_type;
 
@@ -4228,8 +4231,10 @@ pub(crate) async fn is_enum_type_name(
 /// per review of #27/#28 (a numeric-only blocklist missed `character(n)`,
 /// `citext`, and `timestamptz`, which also diverge under the engine's
 /// `::text`-equality join vs. the Postgres oracle's native typed `=`). Runs
-/// after [`assert_joinable_as_is`], so both sides already have one type; it
-/// still checks each side so the error names the from-side column first.
+/// before [`assert_joinable_as_is`] and checks each side on its own, so a
+/// `text`/`character(8)` pair is refused for the `character(8)` side rather
+/// than as a mismatch that `ALTER`ing the `text` side would only move onto
+/// this check.
 async fn assert_join_key_type_supported(
     txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
@@ -4267,16 +4272,20 @@ async fn assert_join_key_type_supported(
 ///   it stops being harmless the moment one side gains a modifier (below).
 ///   A domain is its own type (its own `atttypid`): its `CHECK` can reject a
 ///   key cast from its base type, so a domain never joins its base type or
-///   another domain over the same base.
+///   another domain over the same base. (No domain is on the join-key
+///   allowlist today, so [`assert_join_key_type_supported`] refuses it
+///   first; comparing OIDs keeps this check right on its own.)
 /// * **Modifier.** The same cast carries the modifier, and an explicit cast
 ///   to one truncates or rounds instead of failing: a `varchar(255)` key cast
 ///   to `varchar(50)` loses its tail, and a `timestamp(6)` key cast to
 ///   `timestamp(3)` is rounded, so either could match a different row.
 /// * **Collation.** Two columns with different non-default collations can't
 ///   be compared at all without a `COLLATE` clause (42P22 in the oracle's and
-///   backfill's `a.x = b.y`), and a default-against-non-default pair compares
-///   under whichever one Postgres picks. Requiring the same collation leaves
-///   nothing to pick.
+///   backfill's `a.x = b.y`). A default-against-non-default pair does compare
+///   (under the non-default one), and for two deterministic collations its
+///   `=` is byte equality either way, so that pair is refused by the rule
+///   (the maintainer's call on #590: one collation, nothing to pick), not
+///   because it would fail today.
 ///
 /// Compared by OID and `atttypmod` from `pg_attribute`, not by type name, so
 /// two same-named types in different schemas are two types.
