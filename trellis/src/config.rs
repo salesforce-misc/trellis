@@ -71,6 +71,12 @@ pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 /// that only happens after hundreds of runaway workers. Override via
 /// `TRELLIS_POOL_MAX_SIZE` if an operator's own `drain_threads` count needs
 /// more.
+///
+/// It isn't every connection a client opens: Trellis's dedicated sessions
+/// (producer, maintenance loop, heartbeat daemon, wake listener) sit outside
+/// it, and so does each paged drain's `TEMP`-table session (issue #620, see
+/// `ClientOptions::drain_batch_cap`), up to one per drain thread while
+/// oversized shares page.
 pub const DEFAULT_POOL_MAX_SIZE: usize = 20;
 
 /// The default timeout [`crate::Pool::get`] waits for a free connection

@@ -152,6 +152,13 @@ pub struct ClientOptions {
     /// [`staging::DEFAULT_DRAIN_BATCH_CAP`] (100,000); peak drain memory is
     /// about `application_threads` × this × bytes per change. Zero is treated
     /// as one.
+    ///
+    /// A share over the cap is folded once into a session `TEMP` table on a
+    /// Postgres connection the drain opens outside the pool and closes when
+    /// it finishes, so while paging a client holds up to
+    /// `application_threads` connections beyond `pool_max_size`. Leave that
+    /// headroom under the server's `max_connections`: without it, an
+    /// oversized share fails to connect, is released, and retries each poll.
     pub drain_batch_cap: usize,
 }
 

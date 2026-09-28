@@ -1625,13 +1625,20 @@ mod plan_tests {
 
     /// Issue #620 A2b: a materialized share reads back in page-key order,
     /// truncate sentinel first, each record exactly once, in pages of at most
-    /// the cap; and each page is an index range scan of the `TEMP` table, not
-    /// a sort of all of it, so paging stays linear in the share.
+    /// the cap; and the `TEMP` table's index serves a page read in page-key
+    /// order as an index range scan, with no sort, so paging stays linear in
+    /// the share.
+    ///
+    /// The plan check forces the planner off seq and bitmap scans rather than
+    /// trusting its costing: the temp table has no statistics, so whether it
+    /// picks the index depends on the share's size against the cap (at a
+    /// real share, 625k to 2.5M records against the 100k cap, it does; at
+    /// under ~15k rows against a 2k cap it sorts). Forced, the assertion
+    /// fails only when no index can yield the page order, which is what a
+    /// missing index or a collation mismatch between the index and the
+    /// read's `order by` would do.
     #[tokio::test]
     async fn a_materialized_share_pages_in_key_order_by_index_range_scan() {
-        // Large enough that the planner costs a page's index range scan
-        // below a sort of the whole table, as it does for any real share
-        // (one over the 100k default cap).
         const ROWS: i64 = 40_000;
         const CAP: usize = 2_000;
         let cluster = testkit::TestCluster::start();
@@ -1731,7 +1738,11 @@ mod plan_tests {
 
         let mid = &seen[seen.len() / 2];
         let limit = CAP as i64 + 1;
-        let plan = client
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute("set local enable_seqscan = off; set local enable_bitmapscan = off")
+            .await
+            .expect("force the planner off scans that can't yield order");
+        let plan = txn
             .query(
                 &format!("explain (costs off) {}", read_page_sql(true)),
                 &[&mid.route, &mid.src_table, &mid.key, &limit],
@@ -1742,10 +1753,117 @@ mod plan_tests {
             .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>()
             .join("\n");
+        txn.rollback().await.expect("rollback");
         assert!(
             plan.contains("Index Scan") && !plan.contains("Sort"),
             "a page must be an index range scan, not a sort of the whole table:\n{plan}"
         );
+    }
+
+    /// Issue #620 A2b: keys that share a `route` are ordered by `(src_table,
+    /// key)` byte-wise, and the resume's `after` bound (in the materialize,
+    /// over ring rows), the page read's `after` bound and its `order by`
+    /// must all agree on that order. Each pair here collides on `route`, and
+    /// the database's own collation (the test cluster's locale) orders it the
+    /// other way round from `"C"`: `'B6445' < 'a11890'` byte-wise, `'a11890'
+    /// < 'B6445'` under `en_US`. Walking the share one key per page and
+    /// re-materializing from every cursor, as a reclaim before each page
+    /// would, must still see every key exactly once. Any of the three
+    /// comparisons falling back to the default collation skips or repeats
+    /// the second key of a pair.
+    #[tokio::test]
+    async fn resuming_between_keys_that_share_a_route_skips_and_repeats_nothing() {
+        // `hashtextextended('orders' || E'\x1f' || key, 0) & 2147483647`
+        // collides within each pair (asserted below).
+        const PAIRS: [(&str, &str); 3] = [
+            ("a11890", "B6445"),
+            ("a20327", "B116921"),
+            ("a22170", "B23932"),
+        ];
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+            .await
+            .expect("set search_path");
+
+        let mut keys: Vec<String> = PAIRS
+            .iter()
+            .flat_map(|(a, b)| [a.to_string(), b.to_string()])
+            .collect();
+        keys.extend((1..=6).map(|i| format!("k{i}")));
+        for (i, key) in keys.iter().enumerate() {
+            client
+                .execute(
+                    "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, \
+                                        origin_lsn, src_changed, hop_gen) \
+                     values ('orders', $1, 'update', ('0/' || to_hex($2::bigint))::pg_lsn, \
+                             '{\"v\": 0}', '{\"v\": 1}', ('0/' || to_hex($2::bigint))::pg_lsn, \
+                             now(), 0)",
+                    &[key, &(i as i64 + 1)],
+                )
+                .await
+                .expect("stage update");
+        }
+        for (a, b) in PAIRS {
+            let row = client
+                .query_one(
+                    "select (select route from seg_0 where key = $1), \
+                            (select route from seg_0 where key = $2), \
+                            $1::text < $2::text, $1::text collate \"C\" < $2::text collate \"C\"",
+                    &[&a, &b],
+                )
+                .await
+                .expect("pair");
+            assert_eq!(
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                "{a} and {b} collide"
+            );
+            assert_ne!(
+                row.get::<_, bool>(2),
+                row.get::<_, bool>(3),
+                "the database's collation must order {a} and {b} unlike \"C\" \
+                 for this test to mean anything"
+            );
+        }
+        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+
+        let mut after: Option<PageKey> = None;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let txn = client.transaction().await.expect("begin");
+            materialize_share(
+                &txn,
+                outcome.sealed_seg_seq,
+                &BucketFilter::all(),
+                after.as_ref(),
+            )
+            .await
+            .expect("materialize from the cursor");
+            txn.commit().await.expect("commit");
+            let (page, next) = read_page(&client, after.as_ref(), 1).await.expect("page");
+            seen.extend(page.into_iter().map(|change| change.key));
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+            assert!(seen.len() <= keys.len(), "the walk repeats keys: {seen:?}");
+        }
+        let mut sorted_seen = seen.clone();
+        sorted_seen.sort();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(sorted_seen, sorted_keys, "every key exactly once: {seen:?}");
     }
 
     /// Issue #581: a ring slot refilled after reclaim still carries
