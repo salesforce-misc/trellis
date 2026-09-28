@@ -30,6 +30,14 @@
 //! segment before allocating a new one. A killed run's postmaster doesn't die
 //! with it either; it's reparented and keeps running, so the reaper also stops
 //! a postmaster whose owning test process is gone (#576).
+//!
+//! **Extra server settings.** `TRELLIS_TESTKIT_PG_OPTIONS` holds
+//! whitespace-separated `key=value` pairs, each passed to `postgres` as its
+//! own `-c key=value` after the built-in ones (so a later one wins), e.g.
+//! `TRELLIS_TESTKIT_PG_OPTIONS='shared_buffers=1GB checkpoint_timeout=1min
+//! max_wal_size=4GB'` for a benchmark on disk. No shell parsing or quoting: a
+//! value can't contain whitespace, and a token without `=` (or with an empty
+//! key) panics rather than being passed through. See [`extra_pg_options`].
 
 use std::fs;
 use std::io::Write;
@@ -863,10 +871,37 @@ fn spawn_server(
         // `postgresql.conf` and any later `ALTER SYSTEM`.
         .arg("-c")
         .arg("logging_collector=off")
+        .args(
+            extra_pg_options(&std::env::var(PG_OPTIONS_ENV).unwrap_or_default())
+                .into_iter()
+                .flat_map(|setting| ["-c".to_string(), setting]),
+        )
         .stdout(Stdio::from(log_file.try_clone().expect("clone log handle")))
         .stderr(Stdio::from(log_file))
         .spawn()
         .expect("spawn postgres")
+}
+
+/// The environment variable [`extra_pg_options`] reads (see the module doc).
+pub const PG_OPTIONS_ENV: &str = "TRELLIS_TESTKIT_PG_OPTIONS";
+
+/// Splits [`PG_OPTIONS_ENV`]'s value into `key=value` settings, one per
+/// whitespace-separated token, each to be passed as `-c <setting>`. Panics
+/// on a token that isn't `key=value` with a non-empty key, so a typo fails
+/// the run instead of silently measuring stock settings.
+pub fn extra_pg_options(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(|token| {
+            let (key, _value) = token.split_once('=').unwrap_or_else(|| {
+                panic!("{PG_OPTIONS_ENV}: {token:?} is not a key=value setting")
+            });
+            assert!(
+                !key.is_empty() && !key.starts_with('-'),
+                "{PG_OPTIONS_ENV}: {token:?} has no setting name"
+            );
+            token.to_string()
+        })
+        .collect()
 }
 
 /// Runs [`reap_orphans_in`] against the system temp dir exactly once per
@@ -1194,6 +1229,34 @@ fn run_to_completion(command: &mut Command, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_pg_options_split_on_whitespace() {
+        assert!(extra_pg_options("").is_empty());
+        assert!(extra_pg_options("  \n ").is_empty());
+        assert_eq!(
+            extra_pg_options(" shared_buffers=1GB\tcheckpoint_timeout=1min  max_wal_size=4GB "),
+            [
+                "shared_buffers=1GB",
+                "checkpoint_timeout=1min",
+                "max_wal_size=4GB"
+            ]
+        );
+        // `=` inside the value is the value's business.
+        assert_eq!(extra_pg_options("search_path=a=b"), ["search_path=a=b"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a key=value setting")]
+    fn extra_pg_options_reject_a_bare_word() {
+        extra_pg_options("shared_buffers=1GB fsync");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no setting name")]
+    fn extra_pg_options_reject_an_empty_key() {
+        extra_pg_options("=off");
+    }
 
     // No real postmaster runs here, so the shmem id on line 7 is a bogus one
     // that can't match a live segment; `reap_shmem_segment`'s `ipcrm` on it is

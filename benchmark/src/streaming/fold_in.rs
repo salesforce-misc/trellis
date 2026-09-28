@@ -39,6 +39,7 @@ use tokio_postgres::Client as RawClient;
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{numeric_columns, wait_for_live, warm_up_aggregate};
 use crate::streaming::contention::{self, ContentionSummary};
+use crate::streaming::disk_tier;
 use crate::streaming::load::{Pace, ParallelLoad, generator_bound, run_parallel_load};
 use crate::streaming::rate::{
     self, InWindowRate, QUERY_SAMPLE_INTERVAL, in_window_rate, json_in_window, json_rate,
@@ -143,6 +144,13 @@ pub struct FoldInResult {
     /// `pg_stat_database` rolled-back transactions over the offer window —
     /// see [`contention::deadlocks_and_rollbacks`].
     pub xact_rollbacks: i64,
+    /// [`disk_tier`] columns from the offer window opening until the target
+    /// drained (or the grace deadline): WAL bytes (source and engine writes
+    /// together, also per source row issued), fsyncs/s, checkpoint buffers
+    /// and the cluster's storage, so a `bench --disk` before/after (#620,
+    /// #629) carries its own I/O context.
+    pub disk: disk_tier::DiskTier,
+    pub wal_bytes_per_row: f64,
 }
 
 impl FoldInResult {
@@ -157,6 +165,7 @@ impl FoldInResult {
              \"e2e_count\":{},\"e2e_p50_bucket_frac\":{:.4},\"e2e_p99_bucket_frac\":{:.4},\
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\
+             \"wal_bytes\":{},\"wal_bytes_per_row\":{:.1},{},\
              \"contention\":{}}}",
             scenario,
             self.fold_in_ratio,
@@ -189,6 +198,9 @@ impl FoldInResult {
             },
             self.deadlocks,
             self.xact_rollbacks,
+            self.disk.wal_bytes,
+            self.wal_bytes_per_row,
+            self.disk.json_fields(),
             self.contention.to_json(),
         )
     }
@@ -322,6 +334,7 @@ pub async fn run_probe(
         pace: Pace::RowsPerSec(target_rows_per_sec),
     };
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
+    let disk_start = disk_tier::sample(&sampler).await;
     let offer_start = Instant::now();
     let (raw_ref, terminal_ref) = (&raw, terminal.as_str());
     let (load, fold_samples, contention) = tokio::join!(
@@ -373,6 +386,7 @@ pub async fn run_probe(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let drained = drained_after.is_some();
+    let disk = disk_tier::since(&sampler, &disk_start).await;
 
     let after = scrape();
     let changes_now = counter_value(&after, CHANGES_APPLIED_METRIC, &terminal);
@@ -422,6 +436,8 @@ pub async fn run_probe(
         contention,
         deadlocks: deadlocks_after - deadlocks_before,
         xact_rollbacks: rollbacks_after - rollbacks_before,
+        wal_bytes_per_row: disk.wal_bytes as f64 / load.rows_issued.max(1) as f64,
+        disk,
     }
 }
 

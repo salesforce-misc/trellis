@@ -55,16 +55,26 @@
 //!   other throughput number sits under.
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
+//! - [`build_under_load`]: a large aggregate build under a paced mixed write
+//!   load, checked against a SQL oracle, with peak RSS per phase (#617's
+//!   experiment 5 harness; #620, #629).
+//! - [`disk_tier`]: WAL/fsync/checkpoint deltas over a window, the cluster's
+//!   storage, and a fixed-size commit-latency histogram.
+//! - [`process_memory`]: in-process `VmRSS` sampling (peak, per phase,
+//!   `VmHWM`, the cgroup's `memory.peak`).
 
+pub mod build_under_load;
 pub mod chain;
 pub mod cli;
 pub mod contention;
+pub mod disk_tier;
 pub mod fold_in;
 pub mod generator_reach;
 pub mod hop_latency;
 pub mod idle_cost;
 pub mod intake_ceiling;
 pub mod load;
+pub mod process_memory;
 pub mod rate;
 pub mod scrape;
 pub mod throughput;

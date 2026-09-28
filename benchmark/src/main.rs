@@ -183,6 +183,14 @@ const RELATIONSHIP_COMMENTS: i64 = 4_500_000;
 const RELATIONSHIP_AGGREGATE_CEILING: Duration = Duration::from_secs(10);
 
 fn main() {
+    // Opt-in engine logs for debugging a probe: TRELLIS_BENCH_LOG=warn (or a
+    // full EnvFilter directive) writes tracing output to stderr.
+    if let Ok(filter) = std::env::var("TRELLIS_BENCH_LOG") {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let name = args.first().map(String::as_str).unwrap_or("both");
 

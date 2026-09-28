@@ -1,7 +1,7 @@
 //! Argument parsing and dispatch for the streaming scenarios.
 //!
 //! Kept out of `main.rs` so the backfill scenarios there stay readable: these
-//! six scenarios carry far more knobs than the `--n`/`--g`/`--ceiling-secs`
+//! scenarios carry far more knobs than the `--n`/`--g`/`--ceiling-secs`
 //! shape `main.rs`'s own parser handles, and they all share the same
 //! [`EngineTuning`] flags.
 
@@ -10,7 +10,8 @@ use std::time::Duration;
 use crate::streaming::rate::{human_rate, restaged_in_window};
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::{
-    fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load, throughput,
+    build_under_load, fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load,
+    throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -24,6 +25,7 @@ pub const SCENARIOS: &[&str] = &[
     "intake-ceiling",
     "idle-cost",
     "generator-reach",
+    "build-under-load",
 ];
 
 /// The latency ladder's defaults. #266: "low offered rate (e.g. 10
@@ -87,6 +89,52 @@ const IDLE_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_DEFAULT_DURATION: Duration = Duration::from_secs(60);
 
 const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
+
+/// `build-under-load`'s knobs (see [`build_under_load`]'s module doc for the
+/// scenario), over #617's defaults:
+///
+/// - `--rows <n>` (10,000,000) COPY-loaded into `agg_src`, `grp` uniform over
+///   `--groups <n>` (100,000), by `--loaders <n>` (4) connections;
+/// - `--writers <n>` (8) paced writers at `--write-rate <stmt/s>` (2,000 in
+///   total), starting `--pre-define-secs` (2) before the definition and
+///   running `--duration-secs` (20) after it reads `live`;
+/// - `--build-timeout-secs` (3,600) for define -> `live`, `--grace-secs`
+///   (600) for the target to converge once the writers stop, and at least
+///   `--oracle-poll-min-secs` (5) between full-source oracle comparisons after
+///   a mismatch;
+/// - `--progress-secs` (30; 0 turns it off): how often stderr gets an RSS
+///   progress line.
+///
+/// Plus the engine flags every throughput scenario takes (`--application-threads`,
+/// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
+/// `--reconcile-interval-ms`, `--group-commit`). Postgres settings for a disk
+/// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
+/// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
+fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
+    let positive = |name: &str, default: f64| {
+        let v = number(args, name).unwrap_or(default);
+        assert!(v > 0.0, "{name} must be positive, got {v}");
+        v
+    };
+    let progress = number(args, "--progress-secs").unwrap_or(30.0);
+    assert!(
+        progress >= 0.0,
+        "--progress-secs must not be negative, got {progress}"
+    );
+    build_under_load::BuildUnderLoad {
+        rows: positive("--rows", 10_000_000.0) as u64,
+        groups: positive("--groups", 100_000.0) as i32,
+        loaders: positive("--loaders", 4.0) as usize,
+        writers: positive("--writers", 8.0) as usize,
+        write_rate: positive("--write-rate", 2_000.0),
+        pre_define: secs(args, "--pre-define-secs").unwrap_or(Duration::from_secs(2)),
+        post_live: secs(args, "--duration-secs").unwrap_or(Duration::from_secs(20)),
+        build_timeout: secs(args, "--build-timeout-secs").unwrap_or(Duration::from_secs(3600)),
+        grace: secs(args, "--grace-secs").unwrap_or(Duration::from_secs(600)),
+        oracle_poll_min: secs(args, "--oracle-poll-min-secs").unwrap_or(Duration::from_secs(5)),
+        progress: (progress > 0.0).then(|| Duration::from_secs_f64(progress)),
+    }
+}
 
 /// `--connections <n>`: the multi-connection generator's
 /// ([`load::run_parallel_load`]) writer count, for every scenario that uses
@@ -379,6 +427,22 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(ok)
         }
 
+        // #617's large aggregate build under write load (#620, #629).
+        "build-under-load" => {
+            let cfg = build_under_load_config(args);
+            let tuning = throughput_tuning(args);
+            let result = runtime().block_on(build_under_load::run(cfg, &tuning));
+            println!("{}", result.to_json(name));
+            eprintln!("{}", result.human());
+            if !result.oracle_ok {
+                eprintln!(
+                    "CORRECTNESS FAILURE: {} groups disagree with the oracle",
+                    result.oracle_mismatched_groups
+                );
+            }
+            Some(result.oracle_ok && result.writes.errors == 0)
+        }
+
         "intake-ceiling" => {
             let connections = connections(args).unwrap_or(load::DEFAULT_CONNECTIONS);
             let rows_per_commit = number(args, "--rows-per-commit")
@@ -520,6 +584,13 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
     let mut ok = true;
     for result in results {
         println!("{}", result.to_json(scenario));
+        eprintln!(
+            "{scenario}: {} groups, {} application threads: {}, {:.0} WAL bytes/row",
+            result.groups,
+            result.application_threads,
+            result.disk.human(),
+            result.wal_bytes_per_row
+        );
         match result.oracle_ok {
             Some(true) => {}
             Some(false) => {
@@ -897,6 +968,8 @@ mod tests {
             contention: Default::default(),
             deadlocks: 0,
             xact_rollbacks: 0,
+            disk: Default::default(),
+            wal_bytes_per_row: 0.0,
         }
     }
 
@@ -1078,6 +1151,46 @@ mod tests {
         assert!(json.contains("\"kept_target_rate\":false"), "{json}");
         assert!(json.contains("\"drained\":true"), "{json}");
         assert!(!json.contains("sustained"), "{json}");
+    }
+
+    #[test]
+    fn build_under_load_defaults_and_flags() {
+        let d = build_under_load_config(&argv(&["build-under-load"]));
+        assert_eq!(
+            (d.rows, d.groups, d.loaders, d.writers, d.write_rate),
+            (10_000_000, 100_000, 4, 8, 2_000.0)
+        );
+        assert_eq!(d.pre_define, Duration::from_secs(2));
+        assert_eq!(d.post_live, Duration::from_secs(20));
+        assert_eq!(d.build_timeout, Duration::from_secs(3600));
+        assert_eq!(d.grace, Duration::from_secs(600));
+        assert_eq!(d.oracle_poll_min, Duration::from_secs(5));
+        assert_eq!(d.progress, Some(Duration::from_secs(30)));
+        let c = build_under_load_config(&argv(&[
+            "build-under-load",
+            "--rows",
+            "200000",
+            "--groups",
+            "1000",
+            "--writers",
+            "2",
+            "--write-rate",
+            "500",
+            "--duration-secs",
+            "5",
+            "--grace-secs",
+            "60",
+            "--oracle-poll-min-secs",
+            "2.5",
+            "--progress-secs",
+            "0",
+        ]));
+        assert_eq!(c.oracle_poll_min, Duration::from_millis(2500));
+        assert_eq!((c.rows, c.groups, c.writers), (200_000, 1000, 2));
+        assert_eq!(c.write_rate, 500.0);
+        assert_eq!(c.post_live, Duration::from_secs(5));
+        assert_eq!(c.grace, Duration::from_secs(60));
+        assert_eq!(c.progress, None);
     }
 
     #[test]
