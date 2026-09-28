@@ -55,10 +55,17 @@ class RailsTest < Minitest::Test
                  boot("connect_on_boot_false"))
   end
 
-  # A rake process gets no boot handle, as Ecto migrates without starting
-  # the app; trellis:migrate connects one of its own and shuts it down.
+  # An app booted by a rake task gets no boot handle, as Ecto migrates
+  # without starting the app; trellis:migrate connects one of its own and
+  # shuts it down.
   def test_a_rake_task_gets_no_boot_handle_and_trellis_migrate_runs_on_its_own
     assert_equal({ "connected" => false, "connected_after_migrate" => false }, boot("rake"))
+  end
+
+  # It's the running task that counts, not the loaded tasks: `rails test`
+  # loads them to run test:prepare, then boots the app outside any task.
+  def test_an_app_booted_after_a_rake_run_connects
+    assert_equal({ "connected" => true }, boot("tasks_loaded_before_boot"))
   end
 
   # The documented Puma wiring: before_fork shuts the boot handle down, and

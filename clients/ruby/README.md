@@ -155,12 +155,16 @@ With it set, the app's handle connects as the app boots (an
 `after_initialize` hook), and the `at_exit` hook shuts it down. Left `nil`,
 the default, the Railtie does nothing. Two exceptions:
 
-- **Rake tasks get no boot handle.** `rails db:create` may run before the
-  database exists, and `rails db:migrate` must not start a worker's
-  background work, so a rake process stays disconnected, as Ecto migrates
-  without starting the app. The migration helpers connect a handle of their
-  own. A rake task of your own that calls Trellis calls
-  `Trellis::Railtie.connect` first.
+- **An app booted by a rake task gets no boot handle.** `rails db:create`
+  may run before the database exists, and `rails db:migrate` must not start
+  a worker's background work, so the process stays disconnected, as Ecto
+  migrates without starting the app. The migration helpers connect a handle
+  of their own. A rake task of your own that calls Trellis calls
+  `Trellis::Railtie.connect` first. It's the running task that counts:
+  `rails test` boots the app outside any task and connects, but tests run
+  by a rake task (`bin/rails db:test:prepare test`, or plain `rake`) don't,
+  so a test helper that needs the handle can call
+  `Trellis::Railtie.connect unless Trellis.connected?`.
 - **`config.trellis.connect_on_boot = false`** skips the boot connect, for a
   server that forks without a hook to shut the handle down first (a
   preloading Passenger, say). Connect in each child with
@@ -176,15 +180,26 @@ worker:
 before_fork { Trellis.shutdown }               # the parent's boot handle
 before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
 
-# With fork_worker, worker 0 forks the others too.
-before_refork { Trellis.shutdown }
-after_refork { Trellis::Railtie.connect }
+# Only with fork_worker, where worker 0 forks the others (at boot, on a
+# respawn and on a refork): shut its handle down around each fork. The
+# master, already disconnected by before_fork, stays that way.
+trellis_was_connected = false
+before_worker_fork { trellis_was_connected = Trellis.connected?; Trellis.shutdown }
+after_worker_fork { Trellis::Railtie.connect if trellis_was_connected }
 ```
+
+(`before_refork`/`after_refork` aren't enough for `fork_worker`: worker 0
+forks the first workers at boot, and respawns a dead one, without running
+them.) Without `preload_app!`, each worker boots the app itself and the boot
+connect is all it needs: leave these hooks out, since `Trellis` isn't loaded
+yet when they run.
 
 Unicorn's `before_fork` and `after_fork`, and Passenger's
 `starting_worker_process` (with `connect_on_boot = false`), work the same
 way. If the hooks are missing, the child's calls raise
-`Trellis::ForkedHandleError` rather than hang.
+`Trellis::ForkedHandleError` rather than hang. (Puma logs a hook's
+exception as a warning and boots the worker anyway, so a failed connect
+shows up as that warning and then as errors from the worker's calls.)
 
 ### Migrations
 
@@ -243,6 +258,16 @@ end
   The guard checks the target's name, not its definition. A changed
   statement for a target that exists is an `ALTER TRANSFORM`, in a
   migration of its own.
+- **Schema dumps don't carry Trellis's definitions.** `db/schema.rb` (or
+  `structure.sql`) records a transform's target table as a plain table and
+  its migration as run, but not the definition, which is a row in Trellis's
+  own tables. A database built from the dump rather than the migrations
+  (`db:schema:load`, `db:prepare` or `db:setup` on a new database, or the
+  test database that `maintain_test_schema!` loads) has the target tables
+  and no transforms: nothing ever writes them, and a define of one fails
+  with `ConflictError`, since its table exists. Build a database that needs
+  its transforms by running the migrations (`bin/rails db:create
+  db:migrate`).
 
 `rails trellis:migrate` creates or upgrades Trellis's own tables the same
 way. The helpers run it whenever a migration defines something; run it in

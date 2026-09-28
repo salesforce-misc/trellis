@@ -42,14 +42,33 @@ when "connect_on_boot_false"
   Trellis::Railtie.connect
   seen[:connected_after_connect] = Trellis.connected?
 when "rake"
-  # What `rails db:migrate` does: load the tasks, then the environment
-  # (the `environment` task requires config/environment.rb, which
-  # initializes the app; this app has no such file).
-  BootApp.load_tasks
+  # What `rails db:migrate` does: a rake run loads the tasks and runs one
+  # that needs the app, whose `environment` prerequisite initializes it (by
+  # requiring config/environment.rb, which this app hasn't got).
+  require "rake"
+  Rake.with_application do |rake|
+    rake.init("rails", ["probe"])
+    BootApp.load_tasks
+    Rake::Task["environment"].enhance { BootApp.initialize! }
+    Rake::Task.define_task(probe: :environment) do
+      seen[:connected] = Trellis.connected?
+      Rake::Task["trellis:migrate"].invoke
+      seen[:connected_after_migrate] = Trellis.connected?
+    end
+    rake.top_level
+  end
+when "tasks_loaded_before_boot"
+  # What `rails test` does: it loads the tasks to run test:prepare, and
+  # only then, outside any task, boots the app.
+  require "rake"
+  Rake.with_application do |rake|
+    rake.init("rails", ["test:prepare"])
+    BootApp.load_tasks
+    Rake::Task.define_task("test:prepare")
+    rake.top_level
+  end
   BootApp.initialize!
   seen[:connected] = Trellis.connected?
-  Rake::Task["trellis:migrate"].invoke
-  seen[:connected_after_migrate] = Trellis.connected?
 when "puma_hooks"
   # A preloading server: the app boots in the parent, which shuts its handle
   # down before forking (before_fork), and each worker connects its own

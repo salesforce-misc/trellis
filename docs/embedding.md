@@ -147,7 +147,8 @@ rather than risk the hang. In a Rails app under a preloading server, that
 means shutting the boot handle down in the parent and connecting one in each
 worker: Puma's `before_fork { Trellis.shutdown }` and
 `before_worker_boot { Trellis::Railtie.connect }` (`clients/ruby/README.md`
-covers Unicorn, Passenger and Puma's `fork_worker`). The BEAM never forks,
+covers Unicorn, Passenger and Puma's `fork_worker`, which needs
+`before_worker_fork`/`after_worker_fork` too). The BEAM never forks,
 so the Elixir binding has nothing to enforce.
 
 ## The silent-stall hazard (issue #144)
@@ -465,6 +466,15 @@ The guard checks the target's name, not its definition. A changed statement
 for a target that already exists is an `ALTER TRANSFORM`
 ([Changing a definition](transforms.md#changing-a-definition)), in a
 migration of its own, not a second define.
+
+A schema dump doesn't carry a definition. Rails' `db/schema.rb` and
+`structure.sql`, and Ecto's `structure.sql`, record the target table and
+mark the defining migration as run, but a definition is a row in Trellis's
+own tables, which no schema dump holds. A database loaded from the dump
+(`db:schema:load`, `db:prepare` on a new database, Rails' test database,
+`mix ecto.load`) has the target tables but no transforms, and defining one
+then fails with a `conflict` error because its table exists. Build a
+database that needs its transforms by running the migrations.
 
 ## Poll to `live`, don't wait
 

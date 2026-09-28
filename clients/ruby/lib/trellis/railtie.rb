@@ -22,12 +22,15 @@ module Trellis
   # When it's set, the app's handle connects in an after_initialize hook,
   # except in these two cases:
   #
-  # - A rake task (`rails db:migrate`, `rails db:create`, ...): like Ecto,
-  #   which migrates without starting the app, those get no boot handle. The
-  #   database may not exist yet, and a migration run must not start the
-  #   worker's background work. The migration helpers connect a handle of
-  #   their own; a task of your own that calls Trellis calls
-  #   Trellis::Railtie.connect.
+  # - An app booted by a rake task (`rails db:migrate`, `rails db:create`,
+  #   ...): like Ecto, which migrates without starting the app, those get no
+  #   boot handle. The database may not exist yet, and a migration run must
+  #   not start the worker's background work. The migration helpers connect
+  #   a handle of their own; a task of your own that calls Trellis calls
+  #   Trellis::Railtie.connect. It's the task that counts, not the command:
+  #   `rails test` loads the tasks to run test:prepare, then boots the app
+  #   outside any task, so it gets its handle (but `bin/rails db:test:prepare
+  #   test` boots it inside the first task, so it doesn't).
   # - config.trellis.connect_on_boot = false, for a server that forks with
   #   no hook to shut the handle down first (see below).
   #
@@ -39,16 +42,15 @@ module Trellis
   #   # config/puma.rb
   #   before_fork { Trellis.shutdown }
   #   before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
+  #
+  # With Puma's fork_worker, worker 0 forks the others, so it needs
+  # before_worker_fork and after_worker_fork hooks as well: see the README.
   class Railtie < ::Rails::Railtie
     config.trellis = ActiveSupport::OrderedOptions.new
     config.trellis.connect = nil
     config.trellis.connect_on_boot = true
 
-    # Runs in a rake process only, before any task loads the app: the
-    # railtie instance is `self` here.
     rake_tasks do
-      @rake_task = true
-
       namespace :trellis do
         desc "Create or upgrade Trellis's own tables, with config.trellis.connect's url"
         task migrate: :environment do
@@ -93,12 +95,20 @@ module Trellis
     private
 
     def boot
-      return if @rake_task
+      return if rake_running?
 
       settings = ::Rails.application.config.trellis
       return unless settings.connect && settings.connect_on_boot
 
       self.class.connect
+    end
+
+    # Whether the app is booting inside a rake run (`rails db:migrate`,
+    # `rake db:create`), not just in a process that loaded the tasks:
+    # `rails test` loads them to run test:prepare, and only then, outside
+    # any task, boots the app.
+    def rake_running?
+      defined?(::Rake.application) && ::Rake.application.top_level_tasks.any?
     end
   end
 end
