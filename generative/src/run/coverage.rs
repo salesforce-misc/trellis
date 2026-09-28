@@ -683,6 +683,12 @@ pub enum ConcurrentShape {
     /// A relationship's to-side row is updated in a burst that also writes
     /// its from-side table (#505).
     ParentUpdate,
+    /// A row a 1-1 definition reads is written twice or more in a burst
+    /// that also has a hot key, and its last write in the whole program
+    /// falls in the burst's middle fifth to four fifths (#557 part 3b): a
+    /// key that goes quiet while the rest of the burst still writes, so an
+    /// out-of-order 1-1 write to it is never healed by a later change.
+    CoolingKey,
 }
 
 /// How many writes to one row, or to one group, make it hot
@@ -690,7 +696,7 @@ pub enum ConcurrentShape {
 pub const HOT_WRITES: usize = 8;
 
 impl ConcurrentShape {
-    pub const ALL: [ConcurrentShape; 12] = [
+    pub const ALL: [ConcurrentShape; 13] = [
         ConcurrentShape::ConcurrentLanes,
         ConcurrentShape::HotKey,
         ConcurrentShape::HotGroup,
@@ -703,6 +709,7 @@ impl ConcurrentShape {
         ConcurrentShape::MidBurstInstall,
         ConcurrentShape::ToSideTruncate,
         ConcurrentShape::ParentUpdate,
+        ConcurrentShape::CoolingKey,
     ];
 
     /// The shapes part 1 of #557 added, which every hot-key case offers.
@@ -732,6 +739,7 @@ impl ConcurrentShape {
             ConcurrentShape::MidBurstInstall => "mid_burst_install",
             ConcurrentShape::ToSideTruncate => "to_side_truncate",
             ConcurrentShape::ParentUpdate => "parent_update",
+            ConcurrentShape::CoolingKey => "cooling_key",
         }
     }
 }
@@ -763,6 +771,34 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
         }
     }
     let value = |row: &SimRow, column: &str| row.get(column).cloned().flatten();
+    // Each row's last single-row write, and the tables a 1-1 definition
+    // reads, for `CoolingKey`.
+    let mut last_write: HashMap<(&str, String), usize> = HashMap::new();
+    for (index, op) in program.ops.iter().enumerate() {
+        let (table, pk) = match op {
+            Op::Insert { table, row, .. } => {
+                let pk_col = pk_cols.get(table.as_str()).copied().unwrap_or_default();
+                let pk = row
+                    .iter()
+                    .find(|(c, _)| c == pk_col)
+                    .and_then(|(_, v)| v.clone());
+                (table, pk)
+            }
+            Op::Update { table, pk, .. } | Op::Delete { table, pk, .. } => {
+                (table, Some(pk.clone()))
+            }
+            Op::Truncate { .. } | Op::BulkInsert { .. } => continue,
+        };
+        if let Some(pk) = pk {
+            last_write.insert((table.as_str(), pk), index);
+        }
+    }
+    let one_to_one: HashSet<&str> = program
+        .defs
+        .iter()
+        .filter(|d| d.key_space == KeySpace::OneToOne)
+        .map(|d| d.source.as_str())
+        .collect();
     let mut state: HashMap<&str, HashMap<String, SimRow>> = HashMap::new();
     let mut sizes: HashMap<Group<'_>, usize> = HashMap::new();
     let mut ever: HashSet<Group<'_>> = HashSet::new();
@@ -775,8 +811,10 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
         let mut group_writes: HashMap<Group<'_>, (usize, HashSet<String>)> = HashMap::new();
         let mut emptied: HashSet<Group<'_>> = HashSet::new();
         let (mut changes, mut whole_table) = (0usize, false);
+        let mut cooling = false;
+        let ops = burst.ops();
 
-        for index in burst.ops() {
+        for (position, &index) in ops.iter().enumerate() {
             let op = &program.ops[index];
             let table = op_table_name(op);
             let Some(pk_col) = pk_cols.get(table) else {
@@ -822,7 +860,13 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
                 if !touched {
                     continue;
                 }
-                *row_writes.entry((table, pk.clone())).or_insert(0) += 1;
+                let writes = row_writes.entry((table, pk.clone())).or_insert(0);
+                *writes += 1;
+                cooling |= *writes >= 2
+                    && one_to_one.contains(table)
+                    && last_write.get(&(table, pk.clone())) == Some(&index)
+                    && position * 5 >= ops.len()
+                    && position * 5 <= ops.len() * 4;
                 for &(group_table, column) in &groupings {
                     if group_table != table {
                         continue;
@@ -868,6 +912,9 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
 
         if row_writes.values().any(|&n| n >= HOT_WRITES) {
             out.insert(ConcurrentShape::HotKey);
+            if cooling {
+                out.insert(ConcurrentShape::CoolingKey);
+            }
         }
         if group_writes
             .values()

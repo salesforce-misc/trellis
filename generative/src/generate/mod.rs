@@ -344,6 +344,40 @@ pub const HOT_WORKERS: std::ops::RangeInclusive<usize> = 4..=8;
 /// its long end fewer that clear the split threshold.
 pub const HOT_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 20..=200;
 
+/// The cooling-key shape's key count (issue #557 part 3b): how many keys its
+/// cooling table takes, each written a few times and then never again.
+/// Hundreds, so every burst holds many keys going quiet at once.
+pub const COOLING_KEYS: std::ops::RangeInclusive<usize> = 150..=400;
+
+/// How many writes one cooling key takes: its insert, then one to three
+/// updates (the last sometimes a delete).
+pub const COOLING_WRITES: std::ops::RangeInclusive<usize> = 2..=4;
+
+/// Where in its burst a cooling key's last write goes, in thousandths of the
+/// burst ([`CoolingPlace::last`]): the middle, so the batches holding it
+/// drain while the rest of the burst still writes.
+pub const COOLING_LAST: std::ops::RangeInclusive<u16> = 200..=800;
+
+/// How far apart a cooling key's writes are, in thousandths of the burst
+/// ([`CoolingPlace::gap`]): close together. The harness issues a burst in
+/// about 15 to 40ms on a tmpfs cluster, so at [`COOLING_SEAL_INTERVAL_MS`]
+/// some of a key's writes share a batch and some straddle a seal.
+pub const COOLING_GAP: std::ops::RangeInclusive<u16> = 30..=200;
+
+/// The range of drain workers the cooling-key shape runs the engine with.
+/// Fewer than [`HOT_WORKERS`]: in tmpfs probes, 4 to 8 workers caught a
+/// stale 1-1 write in about 1 case in 15, 2 to 6 in about 1 in 4 (#557 part
+/// 3b's PR). The likely reason is that a busier pool lets sealed batches
+/// queue, so one worker's drain of a coalesced backlog overlaps another's
+/// drain of a fresh, short batch, and the newer batch can commit first.
+pub const COOLING_WORKERS: std::ops::RangeInclusive<usize> = 3..=6;
+
+/// The cooling-key shape's seal cadences, in milliseconds. Shorter than
+/// [`HOT_SEAL_INTERVAL_MS`]: the harness issues a whole burst in tens of
+/// milliseconds, so the hot-key cadence seals most bursts into one or two
+/// batches, and a cooling key's writes into the same one.
+pub const COOLING_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 5..=20;
+
 /// Index, within every generated source table's `columns`, of the
 /// relationship **key** column (issue #34): a `Text` column carrying a real
 /// single-column `UNIQUE` constraint (`crate::model::Table::unique_cols`),
@@ -2159,6 +2193,12 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
             .expect("a remaining stream is non-empty");
         order.push(next);
     }
+    reorder_ops(&mut program, order);
+    program
+}
+
+/// Puts `program.ops` in `order`, a permutation of their indices.
+fn reorder_ops(program: &mut Program, order: Vec<usize>) {
     let mut ops: Vec<Option<Op>> = std::mem::take(&mut program.ops)
         .into_iter()
         .map(Some)
@@ -2167,6 +2207,151 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
         .into_iter()
         .map(|i| ops[i].take().expect("each op index is emitted once"))
         .collect();
+}
+
+/// Of the streams with ops left to emit, the one furthest behind its own
+/// share: the smallest fraction `emitted[t] / totals[t]`, the first on a tie
+/// (issue #557). `None` once every stream is done.
+fn furthest_behind(totals: &[usize], emitted: &[usize]) -> Option<usize> {
+    // Smallest fraction emitted, compared without division.
+    (0..totals.len())
+        .filter(|&t| emitted[t] < totals[t])
+        .min_by(|&a, &b| (emitted[a] * totals[b]).cmp(&(emitted[b] * totals[a])))
+}
+
+// ---------------------------------------------------------------------
+// Issue #557 part 3b: cooling keys.
+//
+// The hot-key tier's keys keep changing until their burst ends, so a batch
+// holding a key's change is nearly always followed by a later batch that
+// rewrites the key. A 1-1 write that lands out of order (#344's bug) is then
+// healed before the burst is checked. What a stale write needs to survive
+// is a key that goes quiet mid-burst: its last change sits in one batch, an
+// older change in another, both drain while hot traffic keeps the workers
+// busy, and nothing writes the key again.
+//
+// A cooling table is that population: hundreds of keys, each inserted and
+// then written one to three more times close together, and never again.
+// [`place_cooling_keys`] places each key's writes inside one burst, with the
+// last one in the burst's middle rather than its tail, and spreads the rest
+// of the program (the hot table, and any other) evenly around them.
+// ---------------------------------------------------------------------
+
+/// Where one cooling key's writes go (issue #557 part 3b). Plain numbers,
+/// resolved against the program by [`place_cooling_keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoolingPlace {
+    /// Picks the burst, modulo how many there are.
+    pub burst: usize,
+    /// Where in the burst the key's last write goes, in thousandths of the
+    /// burst's ops.
+    pub last: u16,
+    /// How far apart the key's writes are, in thousandths of the burst's
+    /// ops (at least one op).
+    pub gap: u16,
+}
+
+/// Orders `program.ops` so every key of table `cooling_table` has its writes
+/// where `places` says (issue #557 part 3b), one [`CoolingPlace`] per key in
+/// order of the key's first op. The other tables' ops are spread evenly
+/// through the rest of the program, as the hot-key tier spreads them, each
+/// table keeping its own order.
+///
+/// Each key's writes go in the burst its place picks (bursts being
+/// consecutive runs of `burst_size` ops, as [`concurrent_plan`] cuts them,
+/// leaving out a short last one): the last at `last` thousandths of the way
+/// through, each earlier one `gap` thousandths before the next, pulled
+/// closer together if they would start before the burst does. Where two writes want the same position the
+/// later-placed one moves up a slot, so a busy stretch drifts a little later;
+/// a key's own writes always stay in order.
+///
+/// # Panics
+///
+/// If `places` doesn't have one entry per cooling key, `burst_size` is `0`,
+/// or `program` already schedules anything by op index (as
+/// [`interleave_tables`]).
+pub fn place_cooling_keys(
+    mut program: Program,
+    cooling_table: usize,
+    places: &[CoolingPlace],
+    burst_size: usize,
+) -> Program {
+    assert!(
+        program.def_install_after_op.iter().all(|&at| at == 0)
+            && program.restart_after_ops.is_empty()
+            && program.scale_out_after_ops.is_empty(),
+        "place_cooling_keys: place keys before scheduling anything by op index — a generator bug"
+    );
+    assert!(
+        burst_size > 0,
+        "place_cooling_keys: burst_size must be at least 1"
+    );
+    let mut streams = table_streams(&program);
+    let cooling = streams.remove(cooling_table);
+    let spec = &program.tables[cooling_table];
+
+    // The cooling table's ops, key by key, each key's in program order.
+    let mut keys: Vec<Vec<usize>> = Vec::new();
+    let mut key_of: HashMap<String, usize> = HashMap::new();
+    for index in cooling {
+        let pk = op_pk_value(&program.ops[index], spec)
+            .expect("a cooling table takes only single-row ops — a generator bug");
+        let next = keys.len();
+        let key = *key_of.entry(pk).or_insert(next);
+        if key == keys.len() {
+            keys.push(Vec::new());
+        }
+        keys[key].push(index);
+    }
+    assert_eq!(
+        keys.len(),
+        places.len(),
+        "place_cooling_keys: one place per cooling key — a generator bug"
+    );
+
+    let total = program.ops.len();
+    // Full bursts only: a short last burst has no middle to speak of.
+    let bursts = (total / burst_size).max(1);
+    // (wanted position, key, op index), sorted: a key's positions strictly
+    // increase, so its ops stay in order.
+    let mut wanted: Vec<(usize, usize, usize)> = Vec::new();
+    for (key, (ops, place)) in keys.iter().zip(places).enumerate() {
+        let start = (place.burst % bursts) * burst_size;
+        let len = burst_size.min(total - start);
+        let last = start + usize::from(place.last.min(1000)) * (len - 1) / 1000;
+        let spans = ops.len() - 1;
+        let mut gap = (usize::from(place.gap) * len / 1000).max(1);
+        if let Some(room) = (last - start).checked_div(spans) {
+            gap = gap.min(room).max(1);
+        }
+        for (j, &index) in ops.iter().enumerate() {
+            wanted.push((last.saturating_sub((spans - j) * gap), key, index));
+        }
+    }
+    wanted.sort_unstable();
+
+    // The other tables, spread evenly, fill every slot a cooling op doesn't
+    // want.
+    let totals: Vec<usize> = streams.iter().map(Vec::len).collect();
+    let mut emitted = vec![0usize; streams.len()];
+    let mut wanted = wanted.into_iter().peekable();
+    let mut order = Vec::with_capacity(total);
+    while order.len() < total {
+        let slot = order.len();
+        let take_cooling = match (wanted.peek(), furthest_behind(&totals, &emitted)) {
+            (Some(&(at, _, _)), Some(_)) => at <= slot,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if take_cooling {
+            order.push(wanted.next().expect("peeked").2);
+        } else {
+            let table = furthest_behind(&totals, &emitted).expect("a stream has ops left");
+            order.push(streams[table][emitted[table]]);
+            emitted[table] += 1;
+        }
+    }
+    reorder_ops(&mut program, order);
     program
 }
 
@@ -3805,7 +3990,7 @@ mod strategy {
     /// lanes ([`concurrent_plan`]), against an engine with [`HOT_WORKERS`]
     /// drain workers sealing every [`HOT_SEAL_INTERVAL_MS`].
     pub fn hot_key_case() -> impl Strategy<Value = ConcurrentCase> {
-        hot_key_case_with(Just(None).boxed())
+        hot_key_case_with(Just(CaseExtras::None).boxed())
     }
 
     /// The concurrent tier's mid-burst case (issue #557 part 2): a
@@ -3823,7 +4008,133 @@ mod strategy {
     ///   hot table keeps changing. Parent updates come with the to-side
     ///   table's ops, spread through the hot table's (#505).
     pub fn mid_burst_case() -> impl Strategy<Value = ConcurrentCase> {
-        hot_key_case_with(mid_burst_draws().prop_map(Some).boxed())
+        hot_key_case_with(mid_burst_draws().prop_map(CaseExtras::MidBurst).boxed())
+    }
+
+    /// The concurrent tier's cooling-key case (issue #557 part 3b): a
+    /// [`hot_key_case`] plus a cooling table read by a 1-1 definition.
+    ///
+    /// The cooling table has [`COOLING_KEYS`] keys. Each is inserted, then
+    /// written one to three more times close together (one key in five
+    /// ending in a delete), and never again, with its last write in the
+    /// middle of a burst ([`place_cooling_keys`]). The hot table keeps
+    /// taking writes all around them. The engine seals every
+    /// [`COOLING_SEAL_INTERVAL_MS`], so a key's writes seal into different
+    /// batches that drain alongside each other: the shape where a 1-1 write
+    /// applied out of order (#344) survives to the end of the burst,
+    /// because no later change to the key heals it.
+    pub fn cooling_key_case() -> impl Strategy<Value = ConcurrentCase> {
+        hot_key_case_with(cooling_draws().prop_map(CaseExtras::Cooling).boxed())
+    }
+
+    /// What a case adds to the hot-key shape.
+    #[derive(Debug, Clone)]
+    enum CaseExtras {
+        None,
+        MidBurst(MidBurstDraws),
+        Cooling(CoolingDraws),
+    }
+
+    /// What [`cooling_key_case`] adds to a [`hot_key_case`].
+    #[derive(Debug, Clone)]
+    struct CoolingDraws {
+        /// One seeded row per cooling key, and each key's later writes, key
+        /// by key.
+        table: TableSpec,
+        /// The 1-1 definition's derived field.
+        derived: DerivedShape,
+        places: Vec<CoolingPlace>,
+        workers: usize,
+        seal_interval_ms: u64,
+    }
+
+    /// Pk `pk`'s version of a drawn cooling write.
+    fn with_pk(mutate: &Mutate, pk: i64) -> Mutate {
+        match mutate.clone() {
+            Mutate::Update { c1, c2, .. } => Mutate::Update { pk, c1, c2 },
+            Mutate::UpdateFlag { flag, .. } => Mutate::UpdateFlag { pk, flag },
+            Mutate::Delete { .. } => Mutate::Delete { pk },
+            other => unreachable!("cooling writes are updates and deletes, not {other:?}"),
+        }
+    }
+
+    /// One cooling key's writes after its insert (the pk is filled in
+    /// later): mostly value updates, some flag updates, and one key in five
+    /// ends in a delete.
+    fn cooling_writes() -> impl Strategy<Value = Vec<Mutate>> {
+        let write = prop_oneof![
+            4 => (value(true), value(true)).prop_map(|(c1, c2)| Mutate::Update { pk: 0, c1, c2 }),
+            1 => bool_value(true).prop_map(|flag| Mutate::UpdateFlag { pk: 0, flag }),
+        ];
+        (
+            prop::collection::vec(
+                write,
+                (COOLING_WRITES.start() - 1)..=(COOLING_WRITES.end() - 1),
+            ),
+            prop::bool::weighted(0.2),
+        )
+            .prop_map(|(mut writes, delete)| {
+                if delete {
+                    *writes.last_mut().expect("at least one write") = Mutate::Delete { pk: 0 };
+                }
+                writes
+            })
+    }
+
+    fn cooling_draws() -> impl Strategy<Value = CoolingDraws> {
+        let place = (0..64usize, COOLING_LAST, COOLING_GAP)
+            .prop_map(|(burst, last, gap)| CoolingPlace { burst, last, gap });
+        COOLING_KEYS
+            .prop_flat_map(move |keys| {
+                (
+                    prop::collection::vec((value(true), value(true)), keys),
+                    prop::collection::vec(text_value(true), keys),
+                    prop::collection::vec(bool_value(true), keys),
+                    prop::collection::vec(uuid_value(true), keys),
+                    prop::collection::vec(cooling_writes(), keys),
+                    prop::collection::vec(place.clone(), keys),
+                    derived_shape(),
+                    COOLING_WORKERS,
+                    COOLING_SEAL_INTERVAL_MS,
+                )
+            })
+            .prop_map(
+                |(
+                    seed_values,
+                    text_values,
+                    bool_values,
+                    uuid_values,
+                    writes,
+                    places,
+                    derived,
+                    workers,
+                    seal_interval_ms,
+                )| {
+                    let keys = seed_values.len();
+                    let mutates = writes
+                        .iter()
+                        .zip(1i64..)
+                        .flat_map(|(writes, pk)| writes.iter().map(move |w| with_pk(w, pk)))
+                        .collect();
+                    CoolingDraws {
+                        table: TableSpec {
+                            seed_values,
+                            text_values,
+                            bool_values,
+                            uuid_values,
+                            // Only the 1-1 definition reads the cooling
+                            // table: no group, no relationship.
+                            grain_values: vec![None; keys],
+                            rel_fk_values: vec![None; keys],
+                            mutates,
+                        },
+                        derived,
+                        places,
+                        workers,
+                        seal_interval_ms,
+                    }
+                },
+            )
     }
 
     /// The most [`ActionDraw`]s one [`mid_burst_case`] draws.
@@ -3881,7 +4192,7 @@ mod strategy {
     }
 
     fn hot_key_case_with(
-        extras: BoxedStrategy<Option<MidBurstDraws>>,
+        extras: BoxedStrategy<CaseExtras>,
     ) -> impl Strategy<Value = ConcurrentCase> {
         (1..=2usize)
             .prop_flat_map(move |table_count| {
@@ -3922,6 +4233,11 @@ mod strategy {
                         derived.push(derived_shape);
                         rel_fields.push(rel_field);
                     }
+                    let (extras, cooling) = match extras {
+                        CaseExtras::None => (None, None),
+                        CaseExtras::MidBurst(extras) => (Some(extras), None),
+                        CaseExtras::Cooling(cooling) => (None, Some(cooling)),
+                    };
                     let extras = extras.unwrap_or(MidBurstDraws {
                         parent_truncate: None,
                         deferred: None,
@@ -3940,14 +4256,30 @@ mod strategy {
                         derived.push(None);
                         rel_fields.push(None);
                     }
+                    // The cooling table goes last, so no relationship drawn
+                    // above can point at it.
+                    let cooling_table = tables.len();
+                    if let Some(cooling) = &cooling {
+                        tables.push(cooling.table.clone());
+                        defs.push((cooling_table, DefShape::OneToOne));
+                        derived.push(Some(cooling.derived.clone()));
+                        rel_fields.push(None);
+                    }
                     let program = build_program_multi_with_relationships(
                         &tables,
                         &defs,
                         &derived,
                         &rel_fields,
                     );
-                    let schedule = spread_schedule(&program);
-                    let mut program = interleave_tables(program, &schedule);
+                    let mut program = match &cooling {
+                        Some(cooling) => {
+                            place_cooling_keys(program, cooling_table, &cooling.places, burst_size)
+                        }
+                        None => {
+                            let schedule = spread_schedule(&program);
+                            interleave_tables(program, &schedule)
+                        }
+                    };
                     if let Some((_, at)) = extras.deferred {
                         let (def, ops) = (program.defs.len() - 1, program.ops.len());
                         let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
@@ -3959,8 +4291,8 @@ mod strategy {
                         program,
                         burst_size,
                         plan,
-                        workers,
-                        seal_interval_ms: seal,
+                        workers: cooling.as_ref().map_or(workers, |c| c.workers),
+                        seal_interval_ms: cooling.map_or(seal, |c| c.seal_interval_ms),
                     }
                 },
             )
@@ -3976,17 +4308,9 @@ mod strategy {
         let mut emitted = vec![0usize; totals.len()];
         let mut schedule = Vec::with_capacity(program.ops.len());
         for _ in 0..program.ops.len() {
-            let remaining: Vec<usize> = (0..totals.len())
-                .filter(|&t| emitted[t] < totals[t])
-                .collect();
-            // Smallest fraction emitted, compared without division.
-            let (pick, &table) = remaining
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    (emitted[**a] * totals[**b]).cmp(&(emitted[**b] * totals[**a]))
-                })
+            let table = furthest_behind(&totals, &emitted)
                 .expect("a table still has ops while steps remain");
+            let pick = (0..table).filter(|&t| emitted[t] < totals[t]).count();
             emitted[table] += 1;
             schedule.push(pick);
         }
@@ -4333,8 +4657,8 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, hot_key_case,
-    mid_burst_case, noise_plan_for, program_with_client_restart,
+    MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_key_case,
+    db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for, program_with_client_restart,
     program_with_mid_stream_def_install, program_with_scale_out, restore_plan_for,
     trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
@@ -5396,6 +5720,76 @@ mod tests {
                 highest_group > HOT_GRAIN_MAX + HOT_GROUP_SLIDE,
                 "the group window must slide past its first position: highest group \
                  {highest_group}"
+            );
+        }
+
+        #[cfg(feature = "proptest")]
+        /// The drawn cooling-key cases (#557 part 3b): every op is in one
+        /// lane, a 1-1 definition reads the cooling table, and each cooling
+        /// key's writes stay in order, inside one burst, with the last of
+        /// them in the burst's middle rather than its tail.
+        #[test]
+        fn cooling_key_cases_go_quiet_mid_burst() {
+            use proptest::strategy::{Strategy, ValueTree};
+            use proptest::test_runner::TestRunner;
+
+            let mut runner = TestRunner::deterministic();
+            let (mut keys, mut in_middle) = (0usize, 0usize);
+            for _ in 0..8 {
+                let case = cooling_key_case()
+                    .new_tree(&mut runner)
+                    .expect("a case")
+                    .current();
+                let mut covered: Vec<usize> =
+                    case.plan.bursts.iter().flat_map(|b| b.ops()).collect();
+                covered.sort_unstable();
+                assert!(covered.iter().copied().eq(0..case.program.ops.len()));
+                assert!(COOLING_SEAL_INTERVAL_MS.contains(&case.seal_interval_ms));
+                let cooling = case.program.tables.last().expect("a cooling table");
+                assert!(
+                    case.program.defs.iter().any(
+                        |def| def.source == cooling.name && def.key_space == KeySpace::OneToOne
+                    )
+                );
+
+                // Each cooling key's writes, as (burst, position in burst).
+                let mut writes: HashMap<String, Vec<(usize, usize, usize)>> = HashMap::new();
+                for (burst_index, burst) in case.plan.bursts.iter().enumerate() {
+                    let mut ops = burst.ops();
+                    ops.sort_unstable();
+                    for (position, &index) in ops.iter().enumerate() {
+                        let op = &case.program.ops[index];
+                        if op_table(op) == cooling.name {
+                            let pk = op_pk_value(op, cooling).expect("a single-row op");
+                            writes
+                                .entry(pk)
+                                .or_default()
+                                .push((burst_index, position, ops.len()));
+                        }
+                    }
+                }
+                assert!(COOLING_KEYS.contains(&writes.len()));
+                for (pk, writes) in &writes {
+                    assert!(
+                        COOLING_WRITES.contains(&writes.len()),
+                        "key {pk}: {} writes",
+                        writes.len()
+                    );
+                    let &(burst, last, len) = writes.last().expect("a write");
+                    assert!(
+                        writes.iter().all(|w| w.0 == burst),
+                        "key {pk}'s writes span bursts: {writes:?}"
+                    );
+                    keys += 1;
+                    // Placement drifts a little later where writes crowd.
+                    if last * 10 >= len && last * 10 <= len * 9 {
+                        in_middle += 1;
+                    }
+                }
+            }
+            assert!(
+                in_middle * 100 >= keys * 95,
+                "{in_middle} of {keys} cooling keys have their last write mid-burst"
             );
         }
     }

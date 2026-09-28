@@ -12,7 +12,7 @@
 //!
 //! [`EngineClient`]: trellis::Client
 //!
-//! # Two properties
+//! # The properties
 //!
 //! [`property_convergence_holds_under_the_concurrent_backend`] is the
 //! original D4 tier: `trivial_program`'s small programs, applied **in the
@@ -71,6 +71,20 @@
 //! `mid_burst_column_resume`, `mid_burst_install`, `to_side_truncate`,
 //! `parent_update`) and per-action counts (`concurrent_actions`).
 //!
+//! [`property_cooling_keys_converge_under_concurrent_drains`] is the
+//! cooling-key tier (issue #557 part 3b). It draws
+//! `generate::cooling_key_case`: a hot-key case plus a cooling table of 150
+//! to 400 keys read by a 1-1 definition. Each cooling key is inserted and
+//! written one to three more times close together, then never again, with
+//! its last write in the middle of a burst while the hot table keeps
+//! taking writes (`generate::place_cooling_keys`). The engine runs 3 to 6
+//! drain workers and seals every 5 to 20ms, several times per burst, so a
+//! key's writes seal into different batches that drain side by side. It is
+//! the shape where a 1-1 write applied out of order survives to the end of
+//! the burst, because no later change to the key heals it (#344), which
+//! the hot-key tier's keys, busy until the burst ends, almost never offer.
+//! The coverage report counts it as `cooling_key`.
+//!
 //! # Planted ordering bugs
 //!
 //! [`planted_bugs_are_caught`] is the tier's check on itself (issue #557
@@ -80,6 +94,8 @@
 //! starts with `TRELLIS_TEST_PLANT=<name>`. The sweep runs the same seeded
 //! cases unplanted and then once per plant, each in its own process, and
 //! reports each plant's catch rate and each seed's cases-to-first-catch.
+//! It draws from the cooling-key tier by default: the only tier that
+//! catches all four plants at a useful rate.
 //! `trellis/src/plant.rs`'s module doc says how to add a plant. Epic #556's
 //! milestones add theirs there (#623, #625), and this sweep is their gate.
 //!
@@ -193,8 +209,8 @@ use generative::backend::{Backend, ConcurrentBackend, ManualBackend, SPLIT_THRES
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
-    defer_def_install, hot_key_case, mid_burst_case, schedule_restart, schedule_scale_out,
-    trivial_program,
+    cooling_key_case, defer_def_install, hot_key_case, mid_burst_case, schedule_restart,
+    schedule_scale_out, trivial_program,
 };
 use generative::run::{
     RunError, run_convergence, run_convergence_bursty, run_convergence_concurrent,
@@ -227,6 +243,8 @@ struct Harness {
     hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// The mid-burst property's own report (issue #557 part 2).
     mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// The cooling-key property's own report (issue #557 part 3b).
+    cooling_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// A planted-bug sweep's report (issue #557 part 3), printed by each
     /// sweep process for the cases it ran.
     plant_coverage: std::cell::RefCell<generative::run::Coverage>,
@@ -255,6 +273,12 @@ impl Drop for Harness {
                 self.mid_burst_coverage.borrow()
             );
         }
+        if self.cooling_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence cooling-key tier coverage:\n{}",
+                self.cooling_coverage.borrow()
+            );
+        }
         if self.plant_coverage.borrow().cases > 0 {
             eprintln!(
                 "generative: concurrent_convergence planted-bug sweep coverage:\n{}",
@@ -271,6 +295,7 @@ thread_local! {
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         mid_burst_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        cooling_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         plant_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
@@ -386,6 +411,21 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
     })
 }
 
+/// Why a concurrent-tier case failed.
+#[derive(Debug)]
+struct CaseFailure {
+    /// The target that diverged from the oracle, when the case failed by
+    /// diverging rather than by erroring.
+    target: Option<String>,
+    message: String,
+}
+
+impl From<CaseFailure> for TestCaseError {
+    fn from(failure: CaseFailure) -> Self {
+        TestCaseError::fail(failure.message)
+    }
+}
+
 /// Runs one concurrent-tier case (issue #557) against a fresh isolated
 /// database: the case's own worker count and seal cadence, its plan's lanes
 /// issued from separate tasks, its mid-burst actions taken while they run.
@@ -393,7 +433,7 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
 fn run_concurrent_case(
     case: &ConcurrentCase,
     coverage: impl Fn(&Harness) -> &std::cell::RefCell<generative::run::Coverage>,
-) -> Result<(), TestCaseError> {
+) -> Result<(), CaseFailure> {
     HARNESS.with(|h| {
         let coverage = coverage(h);
         coverage.borrow_mut().record_program(&case.program);
@@ -441,21 +481,25 @@ fn run_concurrent_case(
                     if run.outcome.as_pass() {
                         Ok(())
                     } else {
-                        Err(TestCaseError::fail(format!(
-                            "run did not pass ({shape}): {}",
-                            run.outcome
-                        )))
+                        Err(CaseFailure {
+                            target: None,
+                            message: format!("run did not pass ({shape}): {}", run.outcome),
+                        })
                     }
                 }
-                Err(RunError::Diverged(d)) => Err(TestCaseError::fail(format!(
-                    "concurrent case diverged in the burst ending at op {} (target {}; {shape}) \
-                     — see this file's module doc comment's shrink-trust convention before \
-                     trusting this as a minimal repro:\n{}",
-                    d.op_index, d.def_target, d.report
-                ))),
-                Err(other) => Err(TestCaseError::fail(format!(
-                    "run error ({shape}): {other:?}"
-                ))),
+                Err(RunError::Diverged(d)) => Err(CaseFailure {
+                    message: format!(
+                        "concurrent case diverged in the burst ending at op {} (target {}; \
+                         {shape}) — see this file's module doc comment's shrink-trust \
+                         convention before trusting this as a minimal repro:\n{}",
+                        d.op_index, d.def_target, d.report
+                    ),
+                    target: Some(d.def_target),
+                }),
+                Err(other) => Err(CaseFailure {
+                    target: None,
+                    message: format!("run error ({shape}): {other:?}"),
+                }),
             }
         })
     })
@@ -486,6 +530,14 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_mid_burst_rereads_converge_under_concurrent_drains(case in mid_burst_case()) {
         run_concurrent_case(&case, |h| &h.mid_burst_coverage)?;
+    }
+
+    /// Issue #557 part 3b: the cooling-key tier. See the module doc
+    /// comment.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_cooling_keys_converge_under_concurrent_drains(case in cooling_key_case()) {
+        run_concurrent_case(&case, |h| &h.cooling_coverage)?;
     }
 }
 
@@ -1309,7 +1361,8 @@ const PLANTS_ENV: &str = "GENERATIVE_PLANTS";
 const PLANT_SEEDS_ENV: &str = "GENERATIVE_PLANT_SEEDS";
 /// How many cases a sweep draws from each seed (default [`PLANT_CASES`]).
 const PLANT_CASES_ENV: &str = "GENERATIVE_PLANT_CASES";
-/// Which tier's cases a sweep draws: `hot_key` (the default) or `mid_burst`.
+/// Which tier's cases a sweep draws: `cooling_key` (the default),
+/// `hot_key` or `mid_burst`.
 const PLANT_TIER_ENV: &str = "GENERATIVE_PLANT_TIER";
 /// Runs one case only, as `<seed>:<case>` (1-based), to look at a failure
 /// the sweep reported. Each failing case's report heads are printed to
@@ -1320,26 +1373,7 @@ const PLANT_ONLY_ENV: &str = "GENERATIVE_PLANT_ONLY";
 const PLANT_CHILD_ENV: &str = "GENERATIVE_PLANT_CHILD";
 /// Prefixes each case's result on a sweep process's stdout.
 const SWEEP_LINE: &str = "plant-sweep\t";
-/// Plants the tier is known not to catch yet. The sweep runs and reports
-/// them, but doesn't fail when they go uncaught; it says so when one is
-/// caught, so the entry can go.
-///
-/// `stale_one_to_one_write` (#344): the plant fires in a third to a half of
-/// the cases, but a stale 1-1 value only survives when the batch holding a
-/// key's *last* change commits before an older batch for that key. The tier's
-/// hot keys keep changing until the burst ends, so a later batch nearly
-/// always rewrites the key, and the tail batches are too few to invert. It
-/// was caught once in about 390 cases (#557 part 3's PR). #556's "compare LSN
-/// instead of visibility" plant (#623) sits on the same seam, so the tier
-/// needs a shape for it (keys that go quiet mid-burst) before that gate can
-/// mean anything.
-const KNOWN_MISSES: &[&str] = &["stale_one_to_one_write"];
 const PLANT_SEEDS: u64 = 4;
-/// The sweep fails if the baseline fails more than one case in this many.
-/// The hot-key tier fails a few cases in 1,000 unplanted on tmpfs, most of
-/// them seed 3 case 11 (#557 part 3's PR), and a disk cluster fails most of
-/// them.
-const MAX_BASELINE_FAILURE_SHARE: usize = 20;
 const PLANT_CASES: usize = 12;
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -1351,12 +1385,78 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// A tier a sweep can draw its cases from, and how the sweep judges it.
+struct SweepTier {
+    name: &'static str,
+    strategy: BoxedStrategy<ConcurrentCase>,
+    /// Plants the tier is known not to catch yet. The sweep runs and reports
+    /// them, but doesn't fail when they go uncaught; it says so when one is
+    /// caught, so the entry can go.
+    known_misses: &'static [&'static str],
+    /// The sweep fails if the baseline fails more than one case in this
+    /// many: the run is then on the wrong storage (a disk cluster fails most
+    /// cases on #494), and no rate means anything.
+    max_baseline_failure_share: usize,
+}
+
+/// `stale_one_to_one_write` (#344) in the hot-key and mid-burst tiers: the
+/// plant fires in a third to a half of their cases, but a stale 1-1 value
+/// only survives when the batch holding a key's *last* change commits before
+/// an older batch for that key. Their hot keys keep changing until the burst
+/// ends, so a later batch nearly always rewrites the key. It was caught once
+/// in about 390 cases (#557 part 3a's PR). The cooling-key tier is the shape
+/// that catches it.
+const HOT_KEY_MISSES: &[&str] = &["stale_one_to_one_write"];
+
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
-fn plant_tier() -> (&'static str, BoxedStrategy<ConcurrentCase>) {
+///
+/// The hot-key and mid-burst tiers fail a few cases in 1,000 unplanted on
+/// tmpfs, most of them hot-key seed 3 case 11 (#557 part 3a's PR, pinned as
+/// [`hot_key_case_3_11_converges`]). The cooling-key tier fails a few in 100:
+/// its short seal cadence makes #494's shape (a key passing through a group
+/// inside one folded batch, pinned as [`group_moves_converge_on_disk`]) far
+/// more common, so its bar is looser until #623 removes the recompute
+/// horizons that shape needs (#557 part 3b's PR).
+fn sweep_tier() -> SweepTier {
     match std::env::var(PLANT_TIER_ENV).as_deref() {
-        Err(_) | Ok("hot_key") => ("hot_key", hot_key_case().boxed()),
-        Ok("mid_burst") => ("mid_burst", mid_burst_case().boxed()),
-        Ok(other) => panic!("{PLANT_TIER_ENV}={other:?}: expected hot_key or mid_burst"),
+        Err(_) | Ok("cooling_key") => SweepTier {
+            name: "cooling_key",
+            strategy: cooling_key_case().boxed(),
+            known_misses: &[],
+            max_baseline_failure_share: 8,
+        },
+        Ok("hot_key") => SweepTier {
+            name: "hot_key",
+            strategy: hot_key_case().boxed(),
+            known_misses: HOT_KEY_MISSES,
+            max_baseline_failure_share: 20,
+        },
+        Ok("mid_burst") => SweepTier {
+            name: "mid_burst",
+            strategy: mid_burst_case().boxed(),
+            known_misses: HOT_KEY_MISSES,
+            max_baseline_failure_share: 20,
+        },
+        Ok(other) => {
+            panic!("{PLANT_TIER_ENV}={other:?}: expected cooling_key, hot_key or mid_burst")
+        }
+    }
+}
+
+/// Whether `plant` can make a target with `key_space` diverge: each plant
+/// breaks one apply path, so a divergence in a target it never writes is an
+/// unplanted failure, not a catch. The baseline reaches everything.
+fn plant_reaches(plant: &str, key_space: &trellis::dev::defs::ast::KeySpace) -> bool {
+    use trellis::dev::plant::Plant;
+    let aggregate = matches!(
+        key_space,
+        trellis::dev::defs::ast::KeySpace::Aggregate { .. }
+    );
+    match Plant::from_name(plant) {
+        None => true,
+        Some(Plant::ClaimAllBuckets) => true,
+        Some(Plant::DropRacingGroupDelta | Plant::IgnoreRecomputeHorizon) => aggregate,
+        Some(Plant::StaleOneToOneWrite) => !aggregate,
     }
 }
 
@@ -1396,48 +1496,55 @@ struct SweepCase {
     failed: bool,
     /// How many times the plant changed the engine's behavior in this case.
     fired: u64,
+    /// Whether the plant can have caused the failure: the case failed in a
+    /// target the plant writes ([`plant_reaches`]), or failed without
+    /// diverging (an error or a quiesce timeout). `true` for a pass.
+    reachable: bool,
     secs: f64,
     reason: String,
 }
 
 impl SweepCase {
-    /// Whether this case caught its plant: it failed, and the plant changed
-    /// the engine's behavior in it. A planted case that failed with the
-    /// plant never firing hit something else, an unplanted divergence, and
-    /// says nothing about the plant. For the baseline, whether it failed.
+    /// Whether this case caught its plant: it failed, the plant changed the
+    /// engine's behavior in it, and the failure is one the plant can cause
+    /// (`reachable`). A planted case that failed any other way hit an
+    /// unplanted divergence, and says nothing about the plant. For the
+    /// baseline, whether it failed.
     ///
-    /// The converse doesn't hold: the baseline passing the same case doesn't
-    /// rule out an unplanted failure in the planted run, since the schedule
-    /// isn't replayed, only the case. So a plant that fires in most cases
-    /// can be credited with the tier's rare unplanted divergences. At the
-    /// tmpfs baseline rate (a few in 1,000) that barely moves a rate, but a
-    /// gate that needs one catch should read the report's failure lines.
+    /// The baseline passing the same case doesn't rule out an unplanted
+    /// failure in the planted run, since the schedule isn't replayed, only
+    /// the case. The target check narrows that: the cooling-key tier's
+    /// unplanted failures (#494's shape) are all in `GROUP BY` targets, which
+    /// `stale_one_to_one_write` never writes. The aggregate plants can still
+    /// be credited with one, at the baseline's rate.
     fn caught(&self) -> bool {
-        self.failed && (self.fired > 0 || self.plant == "baseline")
+        self.failed && (self.plant == "baseline" || (self.fired > 0 && self.reachable))
     }
 
     fn to_line(&self) -> String {
         format!(
-            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
+            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
             self.plant,
             self.seed,
             self.case,
             if self.failed { "FAIL" } else { "pass" },
             self.fired,
+            self.reachable,
             self.secs,
             self.reason
         )
     }
 
     fn from_line(line: &str) -> Option<SweepCase> {
-        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(7, '\t');
-        let mut next = || fields.next().expect("a sweep line has 7 fields");
+        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(8, '\t');
+        let mut next = || fields.next().expect("a sweep line has 8 fields");
         Some(SweepCase {
             plant: next().to_string(),
             seed: next().parse().ok()?,
             case: next().parse().ok()?,
             failed: next() == "FAIL",
             fired: next().parse().ok()?,
+            reachable: next().parse().ok()?,
             secs: next().parse().ok()?,
             reason: next().to_string(),
         })
@@ -1452,7 +1559,11 @@ fn armed_name() -> &'static str {
 /// A sweep process: runs every seed's cases against this process's plant
 /// (or none, for the baseline), printing one [`SWEEP_LINE`] per case.
 fn run_plant_sweep_cases() {
-    let (tier, strategy) = plant_tier();
+    let SweepTier {
+        name: tier,
+        strategy,
+        ..
+    } = sweep_tier();
     let seeds: u64 = env_or(PLANT_SEEDS_ENV, PLANT_SEEDS);
     let cases: usize = env_or(PLANT_CASES_ENV, PLANT_CASES);
     let plant = armed_name();
@@ -1473,12 +1584,24 @@ fn run_plant_sweep_cases() {
             let fired_before = trellis::dev::plant::fired();
             let started = std::time::Instant::now();
             let result = run_concurrent_case(case, |h| &h.plant_coverage);
+            let reachable = match &result {
+                Err(CaseFailure {
+                    target: Some(target),
+                    ..
+                }) => case
+                    .program
+                    .defs
+                    .iter()
+                    .find(|def| def.target == *target)
+                    .is_none_or(|def| plant_reaches(plant, &def.key_space)),
+                _ => true,
+            };
             let reason = match &result {
                 Ok(()) => String::new(),
                 Err(err) => {
                     // The report's head names the wrong rows; the rest is
                     // the whole program.
-                    let text = err.to_string();
+                    let text = &err.message;
                     let head: Vec<&str> = text.lines().take(24).collect();
                     eprintln!(
                         "({tier}) {plant} seed {seed} case {} failed:\n{}",
@@ -1494,6 +1617,7 @@ fn run_plant_sweep_cases() {
                 case: index + 1,
                 failed: result.is_err(),
                 fired: trellis::dev::plant::fired() - fired_before,
+                reachable,
                 secs: started.elapsed().as_secs_f64(),
                 reason,
             }
@@ -1508,8 +1632,8 @@ fn run_plant_sweep_cases() {
 /// bug (`trellis::dev::plant::Plant`), and how often.
 ///
 /// Draws the same seeded cases ([`PLANT_SEEDS_ENV`] seeds of
-/// [`PLANT_CASES_ENV`] cases each, from the hot-key tier unless
-/// [`PLANT_TIER_ENV`] says `mid_burst`) and runs them once with no plant, as
+/// [`PLANT_CASES_ENV`] cases each, from the cooling-key tier unless
+/// [`PLANT_TIER_ENV`] names another) and runs them once with no plant, as
 /// the baseline, then once per plant. Each run is its own process (this
 /// test binary, re-run on this test alone), because a plant is armed per
 /// process by `TRELLIS_TEST_PLANT`; see `trellis/src/plant.rs` for why.
@@ -1520,10 +1644,11 @@ fn run_plant_sweep_cases() {
 /// A plant is only judged on cases the baseline passed, on the same
 /// storage: use the tmpfs cluster, since the disk one fails the baseline on
 /// #494. A failure only counts as a catch if the plant fired in that case
-/// (`SweepCase::caught`); the report lists the rest apart, since both tiers
-/// hit a rare unplanted divergence on tmpfs too. Fails if the baseline fails more than one case in
-/// [`MAX_BASELINE_FAILURE_SHARE`], or if a plant not in [`KNOWN_MISSES`] is
-/// never caught.
+/// and the failure is in a target the plant writes (`SweepCase::caught`);
+/// the report lists the rest apart, since every tier hits unplanted
+/// divergences on tmpfs too. Fails if the baseline fails more than the
+/// tier's `SweepTier::max_baseline_failure_share`, or if a plant not in the
+/// tier's `SweepTier::known_misses` is never caught.
 ///
 /// Returns at once without [`PLANTS_ENV`], so the nightly's
 /// `--include-ignored` run of this binary pays nothing for it. Run it with:
@@ -1591,8 +1716,8 @@ fn planted_bugs_are_caught() {
         results.extend(lines);
     }
 
-    let (tier, _) = plant_tier();
-    let report = plant_sweep_report(tier, &results);
+    let tier = sweep_tier();
+    let report = plant_sweep_report(&tier, &results);
     eprintln!("{report}");
     // A case the baseline failed says nothing about any plant, so it is left
     // out of every plant's count (the report says which). The baseline has
@@ -1605,34 +1730,36 @@ fn planted_bugs_are_caught() {
         .collect();
     let baseline_cases = results.iter().filter(|r| r.plant == "baseline").count();
     assert!(
-        baseline_failed.len() * MAX_BASELINE_FAILURE_SHARE <= baseline_cases,
+        baseline_failed.len() * tier.max_baseline_failure_share <= baseline_cases,
         "the unplanted baseline failed {} of {baseline_cases} cases, more than 1 in \
-         {MAX_BASELINE_FAILURE_SHARE}, so no plant can be judged against it (see the report \
+         {}, so no plant can be judged against it (see the report \
          above; rerun one with {PLANT_ONLY_ENV}=<seed>:<case>)",
-        baseline_failed.len()
+        baseline_failed.len(),
+        tier.max_baseline_failure_share
     );
     let caught = |name: &str| {
         results
             .iter()
             .any(|r| r.plant == name && r.caught() && !baseline_failed.contains(&(r.seed, r.case)))
     };
-    for name in KNOWN_MISSES.iter().filter(|name| caught(name)) {
+    for name in tier.known_misses.iter().filter(|name| caught(name)) {
         eprintln!("planted_bugs_are_caught: known miss {name} was caught; consider gating it");
     }
     let missed: Vec<&str> = plants
         .iter()
         .map(|p| p.name())
-        .filter(|name| !KNOWN_MISSES.contains(name) && !caught(name))
+        .filter(|name| !tier.known_misses.contains(name) && !caught(name))
         .collect();
     assert!(
         missed.is_empty(),
-        "the concurrent tier never caught {missed:?} (see the report above)"
+        "the {} tier never caught {missed:?} (see the report above)",
+        tier.name
     );
 }
 
 /// The sweep's summary: per plant, how many cases it was caught in, how many
 /// cases it fired in, and each seed's cases-to-first-catch.
-fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
+fn plant_sweep_report(tier: &SweepTier, results: &[SweepCase]) -> String {
     use std::collections::HashMap;
     use std::fmt::Write;
     let mut plants: Vec<&str> = Vec::new();
@@ -1648,10 +1775,11 @@ fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
         .map(|r| (r.seed, r.case))
         .collect();
     let mut out = format!(
-        "planted-bug sweep ({tier} tier; plant rows leave out the {} case(s) the baseline \
+        "planted-bug sweep ({} tier; plant rows leave out the {} case(s) the baseline \
          failed):\n\
-         plant | caught | fired in | failed unfired | cases to first catch, per seed | \
+         plant | caught | fired in | failed, not attributable | cases to first catch, per seed | \
          mean case secs\n",
+        tier.name,
         excluded.len()
     );
     for plant in plants {
@@ -1664,7 +1792,7 @@ fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
         let caught = rows.iter().filter(|r| r.caught()).count();
         let fired = rows.iter().filter(|r| r.fired > 0).count();
         // Failures a plant can't have caused: see `SweepCase::caught`.
-        let unfired = rows.iter().filter(|r| r.failed && !r.caught()).count();
+        let unattributable = rows.iter().filter(|r| r.failed && !r.caught()).count();
         let mut seeds: Vec<u64> = rows.iter().map(|r| r.seed).collect();
         seeds.dedup();
         let firsts: Vec<String> = seeds
@@ -1678,14 +1806,14 @@ fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
             })
             .collect();
         let secs = rows.iter().map(|r| r.secs).sum::<f64>() / rows.len().max(1) as f64;
-        let known = if KNOWN_MISSES.contains(&plant) {
+        let known = if tier.known_misses.contains(&plant) {
             " (known miss)"
         } else {
             ""
         };
         let _ = writeln!(
             out,
-            "{plant}{known} | {caught}/{} | {fired}/{} | {unfired} | {} | {secs:.1}",
+            "{plant}{known} | {caught}/{} | {fired}/{} | {unattributable} | {} | {secs:.1}",
             rows.len(),
             rows.len(),
             firsts.join(", ")
@@ -1707,8 +1835,10 @@ fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
             r.case,
             if r.caught() {
                 "caught"
-            } else {
+            } else if r.fired == 0 {
                 "plant never fired"
+            } else {
+                "in a target the plant doesn't write"
             },
             r.reason
         );

@@ -9,8 +9,8 @@
 use std::collections::HashSet;
 
 use generative::generate::{
-    Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan, hot_key_case,
-    mid_burst_case, noise_plan_for, program_with_client_restart,
+    Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan,
+    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, program_with_client_restart,
     program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
     trivial_program_with,
 };
@@ -1608,7 +1608,11 @@ fn the_mid_burst_tier_draws_every_action_shape() {
         "concurrent shapes over {SAMPLES} cases (mid_burst_case): {:?}\nactions: {:?}",
         after.concurrent_shape_cases, after.concurrent_actions
     );
-    for shape in ConcurrentShape::ALL {
+    // Cooling keys are `cooling_key_case`'s shape, checked on their own.
+    for shape in ConcurrentShape::ALL
+        .into_iter()
+        .filter(|&s| s != ConcurrentShape::CoolingKey)
+    {
         let reached = after
             .concurrent_shape_cases
             .get(shape.name())
@@ -1626,4 +1630,47 @@ fn the_mid_burst_tier_draws_every_action_shape() {
             shape.name()
         );
     }
+}
+
+/// Issue #557 part 3b: the cooling-key cases keep every hot-key shape and
+/// add cooling keys, in nearly every case, and take no mid-burst action.
+#[test]
+fn the_cooling_key_tier_draws_cooling_keys_and_every_hot_key_shape() {
+    const SAMPLES: usize = 24;
+    let mut runner = TestRunner::deterministic();
+    let strategy = cooling_key_case();
+    let mut after = generative::run::Coverage::new();
+    for _ in 0..SAMPLES {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        after.record_program(&case.program);
+        after.record_concurrent_plan(&case.program, &case.plan);
+    }
+
+    eprintln!(
+        "concurrent shapes over {SAMPLES} cases (cooling_key_case): {:?}",
+        after.concurrent_shape_cases
+    );
+    assert!(after.concurrent_actions.is_empty(), "{after}");
+    let reached = |shape: ConcurrentShape| {
+        after
+            .concurrent_shape_cases
+            .get(shape.name())
+            .copied()
+            .unwrap_or(0)
+    };
+    for shape in ConcurrentShape::HOT_KEY {
+        assert!(
+            reached(shape) * 2 >= SAMPLES,
+            "cooling_key_case must reach {} in at least half of {SAMPLES} cases: {after}",
+            shape.name()
+        );
+    }
+    assert_eq!(
+        reached(ConcurrentShape::CoolingKey),
+        SAMPLES,
+        "every cooling_key_case has cooling keys: {after}"
+    );
 }

@@ -9400,6 +9400,18 @@ async fn held_share(
 
 impl HeldShare {
     fn filter(&self, buckets: &[i16]) -> fold::BucketFilter {
+        // Planted bug (#557): drop claim exclusivity, so a claimer folds every
+        // bucket of a split batch, not just its own. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(
+            crate::plant::Plant::ClaimAllBuckets,
+            !buckets.is_empty() && buckets.len() < self.bucket_count as usize,
+        ) {
+            return fold::BucketFilter::buckets(
+                i64::from(self.bucket_count),
+                (0..i64::from(self.bucket_count)).collect(),
+            );
+        }
         fold::BucketFilter::buckets(
             i64::from(self.bucket_count),
             buckets.iter().map(|&b| i64::from(b)).collect(),
