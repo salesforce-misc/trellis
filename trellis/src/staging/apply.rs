@@ -7458,6 +7458,11 @@ async fn apply_target(
     // Issue #344: settle every change whose source row moved on since Phase
     // 2 against the current row, before locking or writing anything.
     let reconciled = reconcile_with_source(txn, target, plan).await?;
+    // Planted bug (#557): #344, apply every change as computed even when its
+    // source row moved on. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let reconciled =
+        reconciled.filter(|_| !crate::plant::fires(crate::plant::Plant::StaleOneToOneWrite, true));
     let (plan_writes, plan_deletes, restage): (&[TargetWrite], &[TargetDelete], Vec<Restage>) =
         match &reconciled {
             Some((writes, deletes, restage)) => (writes, deletes, restage.clone()),

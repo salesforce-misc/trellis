@@ -3390,7 +3390,14 @@ async fn apply_delta_groups_bulk(
 /// the read never saw, and those re-derive. Pinned by
 /// `a_seam_writer_with_a_pre_commit_token_straddling_a_forced_recompute`.
 fn delta_may_be_absorbed(min_image_lsn: Option<PgLsn>, horizon: Option<PgLsn>) -> bool {
-    matches!((min_image_lsn, horizon), (Some(lsn), Some(horizon)) if lsn <= horizon)
+    let absorbed = matches!((min_image_lsn, horizon), (Some(lsn), Some(horizon)) if lsn <= horizon);
+    // Planted bug (#557): #321, apply a delta the live read behind the
+    // horizon may already have counted. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::IgnoreRecomputeHorizon, absorbed) {
+        return false;
+    }
+    absorbed
 }
 
 /// The target's extinct horizon (issue #321, `aggregate_extinct_horizon`):
@@ -3527,6 +3534,26 @@ pub(super) async fn apply_aggregate_target(
     let target_ident = ddl::qualified_target_table_ident(target);
     let all_groups: Vec<&GroupPlan> = group_keys.iter().map(|k| &plan.groups[*k]).collect();
     let arity = plan.group_by.len();
+
+    // Planted bug (#557): claim each group with a transaction-scoped
+    // advisory lock that never waits, and note the ones another apply
+    // transaction already holds; their deltas are dropped below. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let racing_groups: HashSet<String> =
+        if crate::plant::armed() == Some(crate::plant::Plant::DropRacingGroupDelta) {
+            txn.query(
+                "select k from unnest($2::text[]) as k \
+                 where not pg_try_advisory_xact_lock(hashtext($1), hashtext(k))",
+                &[&target, &group_keys],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+        } else {
+            HashSet::new()
+        };
 
     // Ascending-ordered pre-lock over every touched group's existing target
     // row, in one statement — see this function's doc comment. Locks nothing
@@ -3672,6 +3699,15 @@ pub(super) async fn apply_aggregate_target(
         }
 
         if !group.horizon_check_only && group_has_activity(plan, group) {
+            // Planted bug (#557): drop the delta of a group another apply
+            // transaction held when this one started. See `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if crate::plant::fires(
+                crate::plant::Plant::DropRacingGroupDelta,
+                racing_groups.contains(key.as_str()),
+            ) {
+                continue;
+            }
             delta_groups.push((key, group));
         }
     }

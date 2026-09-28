@@ -136,6 +136,10 @@ pub mod jsonb;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod dev;
+// Issue #557 part 3: planted ordering bugs, armed per process by an env var.
+// Test-only, like `dev`; reached from other crates through `dev::plant`.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) mod plant;
 
 // --- Tier 1: the facade ---------------------------------------------------
 pub use app::{

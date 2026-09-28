@@ -71,7 +71,17 @@
 //! `mid_burst_column_resume`, `mid_burst_install`, `to_side_truncate`,
 //! `parent_update`) and per-action counts (`concurrent_actions`).
 //!
-//! Planted ordering bugs are #557's part 3.
+//! # Planted ordering bugs
+//!
+//! [`planted_bugs_are_caught`] is the tier's check on itself (issue #557
+//! part 3). The engine carries a few known ordering bugs behind test-only
+//! hooks (`trellis::dev::plant::Plant`, `trellis/src/plant.rs`). None is
+//! compiled into a production build, and none is armed unless the process
+//! starts with `TRELLIS_TEST_PLANT=<name>`. The sweep runs the same seeded
+//! cases unplanted and then once per plant, each in its own process, and
+//! reports each plant's catch rate and each seed's cases-to-first-catch.
+//! `trellis/src/plant.rs`'s module doc says how to add a plant. Epic #556's
+//! milestones add theirs there (#623, #625), and this sweep is their gate.
 //!
 //! # A disk-backed cluster
 //!
@@ -208,6 +218,9 @@ struct Harness {
     hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// The mid-burst property's own report (issue #557 part 2).
     mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// A planted-bug sweep's report (issue #557 part 3), printed by each
+    /// sweep process for the cases it ran.
+    plant_coverage: std::cell::RefCell<generative::run::Coverage>,
 }
 
 impl Drop for Harness {
@@ -233,6 +246,12 @@ impl Drop for Harness {
                 self.mid_burst_coverage.borrow()
             );
         }
+        if self.plant_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence planted-bug sweep coverage:\n{}",
+                self.plant_coverage.borrow()
+            );
+        }
     }
 }
 
@@ -243,6 +262,7 @@ thread_local! {
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         mid_burst_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        plant_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
 
@@ -909,4 +929,415 @@ async fn group_moves_converge_on_disk() {
         "{} of {ATTEMPTS} attempts diverged: {diverged:?}",
         diverged.len()
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #557 part 3: planted ordering bugs.
+// ---------------------------------------------------------------------
+
+/// Names the plants a sweep runs: `all`, or a comma-separated list of
+/// `trellis::dev::plant::Plant` names. Unset, [`planted_bugs_are_caught`]
+/// returns at once.
+const PLANTS_ENV: &str = "GENERATIVE_PLANTS";
+/// How many seeds a sweep draws its cases from (default [`PLANT_SEEDS`]).
+const PLANT_SEEDS_ENV: &str = "GENERATIVE_PLANT_SEEDS";
+/// How many cases a sweep draws from each seed (default [`PLANT_CASES`]).
+const PLANT_CASES_ENV: &str = "GENERATIVE_PLANT_CASES";
+/// Which tier's cases a sweep draws: `hot_key` (the default) or `mid_burst`.
+const PLANT_TIER_ENV: &str = "GENERATIVE_PLANT_TIER";
+/// Runs one case only, as `<seed>:<case>` (1-based), to look at a failure
+/// the sweep reported. Each failing case's report heads are printed to
+/// stderr.
+const PLANT_ONLY_ENV: &str = "GENERATIVE_PLANT_ONLY";
+/// Set by the sweep on each process it spawns: run the cases and print one
+/// [`SWEEP_LINE`] per case, rather than spawn more processes.
+const PLANT_CHILD_ENV: &str = "GENERATIVE_PLANT_CHILD";
+/// Prefixes each case's result on a sweep process's stdout.
+const SWEEP_LINE: &str = "plant-sweep\t";
+/// Plants the tier is known not to catch yet. The sweep runs and reports
+/// them, but doesn't fail when they go uncaught; it says so when one is
+/// caught, so the entry can go.
+///
+/// `stale_one_to_one_write` (#344): the plant fires in a third to a half of
+/// the cases, but a stale 1-1 value only survives when the batch holding a
+/// key's *last* change commits before an older batch for that key. The tier's
+/// hot keys keep changing until the burst ends, so a later batch nearly
+/// always rewrites the key, and the tail batches are too few to invert. It
+/// was caught once in about 390 cases (#557 part 3's PR). #556's "compare LSN
+/// instead of visibility" plant (#623) sits on the same seam, so the tier
+/// needs a shape for it (keys that go quiet mid-burst) before that gate can
+/// mean anything.
+const KNOWN_MISSES: &[&str] = &["stale_one_to_one_write"];
+const PLANT_SEEDS: u64 = 4;
+/// The sweep fails if the baseline fails more than one case in this many.
+/// The hot-key tier fails about 1 in 100 unplanted on tmpfs (#557 part 3's
+/// PR), and a disk cluster fails most of them.
+const MAX_BASELINE_FAILURE_SHARE: usize = 20;
+const PLANT_CASES: usize = 12;
+
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={v:?} doesn't parse")),
+        Err(_) => default,
+    }
+}
+
+/// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
+fn plant_tier() -> (&'static str, BoxedStrategy<ConcurrentCase>) {
+    match std::env::var(PLANT_TIER_ENV).as_deref() {
+        Err(_) | Ok("hot_key") => ("hot_key", hot_key_case().boxed()),
+        Ok("mid_burst") => ("mid_burst", mid_burst_case().boxed()),
+        Ok(other) => panic!("{PLANT_TIER_ENV}={other:?}: expected hot_key or mid_burst"),
+    }
+}
+
+/// Seed `seed`'s first `cases` cases of `strategy`. The same seed draws the
+/// same cases in every process, which is what lets a sweep judge each plant
+/// against an unplanted baseline over exactly the cases the plant ran.
+fn seeded_cases(
+    strategy: &BoxedStrategy<ConcurrentCase>,
+    seed: u64,
+    cases: usize,
+) -> Vec<ConcurrentCase> {
+    use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+    let mut bytes = [0u8; 32];
+    for chunk in bytes.chunks_mut(8) {
+        chunk.copy_from_slice(&seed.to_le_bytes());
+    }
+    let mut runner = TestRunner::new_with_rng(
+        ProptestConfig::default(),
+        TestRng::from_seed(RngAlgorithm::ChaCha, &bytes),
+    );
+    (0..cases)
+        .map(|_| {
+            strategy
+                .new_tree(&mut runner)
+                .expect("the tier's strategy draws a case")
+                .current()
+        })
+        .collect()
+}
+
+/// One case's result in a sweep, as a sweep process prints it.
+#[derive(Debug)]
+struct SweepCase {
+    plant: String,
+    seed: u64,
+    case: usize,
+    failed: bool,
+    /// How many times the plant changed the engine's behavior in this case.
+    fired: u64,
+    secs: f64,
+    reason: String,
+}
+
+impl SweepCase {
+    /// Whether this case caught its plant: it failed, and the plant changed
+    /// the engine's behavior in it. A planted case that failed with the
+    /// plant never firing hit something else, an unplanted divergence, and
+    /// says nothing about the plant. For the baseline, whether it failed.
+    fn caught(&self) -> bool {
+        self.failed && (self.fired > 0 || self.plant == "baseline")
+    }
+
+    fn to_line(&self) -> String {
+        format!(
+            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
+            self.plant,
+            self.seed,
+            self.case,
+            if self.failed { "FAIL" } else { "pass" },
+            self.fired,
+            self.secs,
+            self.reason
+        )
+    }
+
+    fn from_line(line: &str) -> Option<SweepCase> {
+        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(7, '\t');
+        let mut next = || fields.next().expect("a sweep line has 7 fields");
+        Some(SweepCase {
+            plant: next().to_string(),
+            seed: next().parse().ok()?,
+            case: next().parse().ok()?,
+            failed: next() == "FAIL",
+            fired: next().parse().ok()?,
+            secs: next().parse().ok()?,
+            reason: next().to_string(),
+        })
+    }
+}
+
+/// The name a sweep reports this process's plant under.
+fn armed_name() -> &'static str {
+    trellis::dev::plant::armed().map_or("baseline", |p| p.name())
+}
+
+/// A sweep process: runs every seed's cases against this process's plant
+/// (or none, for the baseline), printing one [`SWEEP_LINE`] per case.
+fn run_plant_sweep_cases() {
+    let (tier, strategy) = plant_tier();
+    let seeds: u64 = env_or(PLANT_SEEDS_ENV, PLANT_SEEDS);
+    let cases: usize = env_or(PLANT_CASES_ENV, PLANT_CASES);
+    let plant = armed_name();
+    let only: Option<(u64, usize)> = std::env::var(PLANT_ONLY_ENV).ok().map(|v| {
+        let (seed, case) = v
+            .split_once(':')
+            .unwrap_or_else(|| panic!("{PLANT_ONLY_ENV}={v:?}: expected <seed>:<case>"));
+        (
+            seed.parse().expect("a seed number"),
+            case.parse().expect("a case number"),
+        )
+    });
+    for seed in 1..=seeds {
+        for (index, case) in seeded_cases(&strategy, seed, cases).iter().enumerate() {
+            if only.is_some_and(|only| only != (seed, index + 1)) {
+                continue;
+            }
+            let fired_before = trellis::dev::plant::fired();
+            let started = std::time::Instant::now();
+            let result = run_concurrent_case(case, |h| &h.plant_coverage);
+            let reason = match &result {
+                Ok(()) => String::new(),
+                Err(err) => {
+                    // The report's head names the wrong rows; the rest is
+                    // the whole program.
+                    let text = err.to_string();
+                    let head: Vec<&str> = text.lines().take(24).collect();
+                    eprintln!(
+                        "({tier}) {plant} seed {seed} case {} failed:\n{}",
+                        index + 1,
+                        head.join("\n")
+                    );
+                    text.replace(['\t', '\n'], " ").chars().take(240).collect()
+                }
+            };
+            let line = SweepCase {
+                plant: plant.to_string(),
+                seed,
+                case: index + 1,
+                failed: result.is_err(),
+                fired: trellis::dev::plant::fired() - fired_before,
+                secs: started.elapsed().as_secs_f64(),
+                reason,
+            }
+            .to_line();
+            println!("{line}");
+            eprintln!("({tier}) {line}");
+        }
+    }
+}
+
+/// Issue #557 part 3: shows the concurrent tier catches each planted ordering
+/// bug (`trellis::dev::plant::Plant`), and how often.
+///
+/// Draws the same seeded cases ([`PLANT_SEEDS_ENV`] seeds of
+/// [`PLANT_CASES_ENV`] cases each, from the hot-key tier unless
+/// [`PLANT_TIER_ENV`] says `mid_burst`) and runs them once with no plant, as
+/// the baseline, then once per plant. Each run is its own process (this
+/// test binary, re-run on this test alone), because a plant is armed per
+/// process by `TRELLIS_TEST_PLANT`; see `trellis/src/plant.rs` for why.
+/// Every case runs to the end, caught or not, so the report gives each
+/// plant's catch rate and each seed's cases-to-first-catch, not just
+/// whether it was caught once.
+///
+/// A plant is only judged on cases the baseline passed, on the same
+/// storage: use the tmpfs cluster, since the disk one fails the baseline on
+/// #494. A failure only counts as a catch if the plant fired in that case
+/// (`SweepCase::caught`); the report lists the rest apart, since both tiers
+/// hit a rare unplanted divergence on tmpfs too. Fails if the baseline fails more than one case in
+/// [`MAX_BASELINE_FAILURE_SHARE`], or if a plant not in [`KNOWN_MISSES`] is
+/// never caught.
+///
+/// Returns at once without [`PLANTS_ENV`], so the nightly's
+/// `--include-ignored` run of this binary pays nothing for it. Run it with:
+///
+/// ```text
+/// GENERATIVE_PLANTS=all cargo test -p generative --test concurrent_convergence \
+///     planted_bugs_are_caught -- --ignored --nocapture
+/// ```
+///
+/// The properties catch a plant on their own too, one process per plant:
+/// `TRELLIS_TEST_PLANT=claim_all_buckets cargo test -p generative --test
+/// concurrent_convergence property_hot_keys -- --ignored`.
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn planted_bugs_are_caught() {
+    use trellis::dev::plant::{PLANT_ENV, Plant};
+
+    if std::env::var_os(PLANT_CHILD_ENV).is_some() {
+        run_plant_sweep_cases();
+        return;
+    }
+    let Ok(requested) = std::env::var(PLANTS_ENV) else {
+        eprintln!("planted_bugs_are_caught: skipped, {PLANTS_ENV} is not set");
+        return;
+    };
+    let plants: Vec<Plant> = if requested.trim() == "all" {
+        Plant::ALL.to_vec()
+    } else {
+        requested
+            .split(',')
+            .map(|name| {
+                Plant::from_name(name.trim())
+                    .unwrap_or_else(|| panic!("{PLANTS_ENV}: {name:?} names no plant"))
+            })
+            .collect()
+    };
+
+    let exe = std::env::current_exe().expect("this test binary's path");
+    let mut results: Vec<SweepCase> = Vec::new();
+    for plant in std::iter::once(None).chain(plants.iter().copied().map(Some)) {
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args([
+                "planted_bugs_are_caught",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PLANT_CHILD_ENV, "1")
+            .stderr(std::process::Stdio::inherit());
+        match plant {
+            Some(plant) => command.env(PLANT_ENV, plant.name()),
+            None => command.env_remove(PLANT_ENV),
+        };
+        let output = command.output().expect("spawn a sweep process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<SweepCase> = stdout.lines().filter_map(SweepCase::from_line).collect();
+        assert!(
+            output.status.success() && !lines.is_empty(),
+            "the sweep process for {} failed ({}):\n{stdout}",
+            plant.map_or("baseline", |p| p.name()),
+            output.status
+        );
+        results.extend(lines);
+    }
+
+    let (tier, _) = plant_tier();
+    let report = plant_sweep_report(tier, &results);
+    eprintln!("{report}");
+    // A case the baseline failed says nothing about any plant, so it is left
+    // out of every plant's count (the report says which). The baseline has
+    // to be mostly green, or the run is on the wrong storage (the disk
+    // cluster fails it on #494) and no rate here means anything.
+    let baseline_failed: Vec<(u64, usize)> = results
+        .iter()
+        .filter(|r| r.plant == "baseline" && r.failed)
+        .map(|r| (r.seed, r.case))
+        .collect();
+    let baseline_cases = results.iter().filter(|r| r.plant == "baseline").count();
+    assert!(
+        baseline_failed.len() * MAX_BASELINE_FAILURE_SHARE <= baseline_cases,
+        "the unplanted baseline failed {} of {baseline_cases} cases, more than 1 in \
+         {MAX_BASELINE_FAILURE_SHARE}, so no plant can be judged against it (see the report \
+         above; rerun one with {PLANT_ONLY_ENV}=<seed>:<case>)",
+        baseline_failed.len()
+    );
+    let caught = |name: &str| {
+        results
+            .iter()
+            .any(|r| r.plant == name && r.caught() && !baseline_failed.contains(&(r.seed, r.case)))
+    };
+    for name in KNOWN_MISSES.iter().filter(|name| caught(name)) {
+        eprintln!("planted_bugs_are_caught: known miss {name} was caught; consider gating it");
+    }
+    let missed: Vec<&str> = plants
+        .iter()
+        .map(|p| p.name())
+        .filter(|name| !KNOWN_MISSES.contains(name) && !caught(name))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "the concurrent tier never caught {missed:?} (see the report above)"
+    );
+}
+
+/// The sweep's summary: per plant, how many cases it was caught in, how many
+/// cases it fired in, and each seed's cases-to-first-catch.
+fn plant_sweep_report(tier: &str, results: &[SweepCase]) -> String {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+    let mut plants: Vec<&str> = Vec::new();
+    for r in results {
+        if !plants.contains(&r.plant.as_str()) {
+            plants.push(&r.plant);
+        }
+    }
+    // Cases the baseline failed, left out of every plant's row.
+    let excluded: Vec<(u64, usize)> = results
+        .iter()
+        .filter(|r| r.plant == "baseline" && r.failed)
+        .map(|r| (r.seed, r.case))
+        .collect();
+    let mut out = format!(
+        "planted-bug sweep ({tier} tier; plant rows leave out the {} case(s) the baseline \
+         failed):\n\
+         plant | caught | fired in | failed unfired | cases to first catch, per seed | \
+         mean case secs\n",
+        excluded.len()
+    );
+    for plant in plants {
+        let rows: Vec<&SweepCase> = results
+            .iter()
+            .filter(|r| {
+                r.plant == plant && (plant == "baseline" || !excluded.contains(&(r.seed, r.case)))
+            })
+            .collect();
+        let caught = rows.iter().filter(|r| r.caught()).count();
+        let fired = rows.iter().filter(|r| r.fired > 0).count();
+        // Failures a plant can't have caused: see `SweepCase::caught`.
+        let unfired = rows.iter().filter(|r| r.failed && !r.caught()).count();
+        let mut seeds: Vec<u64> = rows.iter().map(|r| r.seed).collect();
+        seeds.dedup();
+        let firsts: Vec<String> = seeds
+            .iter()
+            .map(|&seed| {
+                let of_seed: Vec<&&SweepCase> = rows.iter().filter(|r| r.seed == seed).collect();
+                of_seed
+                    .iter()
+                    .find(|r| r.caught())
+                    .map_or(format!(">{}", of_seed.len()), |r| r.case.to_string())
+            })
+            .collect();
+        let secs = rows.iter().map(|r| r.secs).sum::<f64>() / rows.len().max(1) as f64;
+        let known = if KNOWN_MISSES.contains(&plant) {
+            " (known miss)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{plant}{known} | {caught}/{} | {fired}/{} | {unfired} | {} | {secs:.1}",
+            rows.len(),
+            rows.len(),
+            firsts.join(", ")
+        );
+    }
+    // The first few failures per plant, to say what the tier saw.
+    let mut listed: HashMap<&str, usize> = HashMap::new();
+    for r in results.iter().filter(|r| r.failed) {
+        let count = listed.entry(r.plant.as_str()).or_default();
+        *count += 1;
+        if *count > 3 {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  {} seed {} case {} ({}): {}",
+            r.plant,
+            r.seed,
+            r.case,
+            if r.caught() {
+                "caught"
+            } else {
+                "plant never fired"
+            },
+            r.reason
+        );
+    }
+    out
 }

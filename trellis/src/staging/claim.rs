@@ -204,5 +204,17 @@ pub async fn owned_bucket_filter(
             bucket as i64
         })
         .collect();
+    // Planted bug (#557): drop claim exclusivity, so a claimer folds every
+    // bucket of a split batch, not just its own. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(
+        crate::plant::Plant::ClaimAllBuckets,
+        !buckets.is_empty() && buckets.len() < bucket_count as usize,
+    ) {
+        return Ok(BucketFilter::buckets(
+            bucket_count as i64,
+            (0..bucket_count as i64).collect(),
+        ));
+    }
     Ok(BucketFilter::buckets(bucket_count as i64, buckets))
 }

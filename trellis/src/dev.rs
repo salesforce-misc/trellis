@@ -87,3 +87,10 @@ pub mod staging {
         seal_phase2, watermark_token,
     };
 }
+
+/// Planted ordering bugs (issue #557 part 3). A harness reads which plant
+/// this process runs with and how often it fired; it never arms one, since
+/// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
+pub mod plant {
+    pub use crate::plant::{PLANT_ENV, Plant, armed, fired};
+}
