@@ -11,15 +11,24 @@
 //!   closes a phase with [`RssSampler::end_phase`]);
 //! - `VmHWM` at the end, the kernel's own high-water mark, which also
 //!   catches a spike shorter than the interval;
-//! - the enclosing cgroup's `memory.peak` (cgroup v2), when there is one. Under
-//!   `systemd-run --scope -p MemoryMax=...` that is the number the cap is
-//!   enforced against. It counts the cluster's postgres processes and, on
-//!   tmpfs, the cluster's files too, so it runs well above the process's RSS.
+//! - the enclosing cgroup's `memory.peak` (cgroup v2) **since the sampler
+//!   started**, when there is one. Under `systemd-run --scope -p
+//!   MemoryMax=...` that is the usage the cap is enforced against. It counts
+//!   the cluster's postgres processes and the page cache they fault in (on
+//!   tmpfs, the cluster's files themselves), so it runs well above the
+//!   process's RSS. The cgroup's own lifetime peak would also count whatever
+//!   ran in the scope first, and `bench` runs `cargo build` there, so the
+//!   sampler resets a private watermark on its own `memory.peak` descriptor
+//!   (Linux 6.12+) and reads that; `null` where the kernel can't. Only
+//!   meaningful when the benchmark has the cgroup to itself, i.e. under its
+//!   own scope.
 //!
 //! Optionally it prints one progress line to stderr per `progress` interval
 //! (elapsed, RSS, peak), so a long run's log shows memory over time without
 //! a sampler script next to it.
 
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,15 +63,30 @@ fn cgroup_v2_path(cgroup: &str) -> Option<&str> {
     cgroup.lines().find_map(|line| line.strip_prefix("0::"))
 }
 
-/// The enclosing cgroup's `memory.peak`, in bytes, when cgroup v2 exposes it.
-pub fn cgroup_memory_peak() -> Option<u64> {
+/// The enclosing cgroup's `memory.peak`, opened read-write with its
+/// watermark reset for this descriptor only: reading it back gives the
+/// cgroup's peak usage since now (cgroup v2 on Linux 6.12+; `None` without
+/// the file or where the kernel refuses the write). Other readers of the file,
+/// and the cap, are unaffected.
+fn cgroup_memory_peak_since_now() -> Option<File> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let path = cgroup_v2_path(&cgroup)?;
-    std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.peak"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .open(format!("/sys/fs/cgroup{path}/memory.peak"))
+        .ok()?;
+    file.write_all(b"reset\n").ok()?;
+    Some(file)
+}
+
+/// The peak, in bytes, that a [`cgroup_memory_peak_since_now`] descriptor
+/// has seen.
+fn read_peak(file: &mut File) -> Option<u64> {
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut text).ok()?;
+    text.trim().parse().ok()
 }
 
 /// Peak sampled RSS per phase, in the order the phases ended.
@@ -74,8 +98,9 @@ pub struct RssSummary {
     pub peak_at_secs: f64,
     /// `VmHWM` when the sampler stopped (`None` off Linux).
     pub hwm_bytes: Option<u64>,
-    /// The cgroup's `memory.peak` when the sampler stopped (`None` without
-    /// cgroup v2's `memory.peak`).
+    /// The cgroup's peak usage from [`RssSampler::start`] to
+    /// [`RssSampler::finish`] (`None` without cgroup v2's `memory.peak`, or
+    /// on a kernel that can't reset it per descriptor).
     pub cgroup_peak_bytes: Option<u64>,
     /// `(phase, peak sampled VmRSS in it)` for every [`RssSampler::end_phase`].
     pub phases: Vec<(&'static str, u64)>,
@@ -141,12 +166,14 @@ struct Shared {
 pub struct RssSampler {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    cgroup_peak: Option<File>,
 }
 
 impl RssSampler {
     /// Starts sampling every `interval`; with `progress`, also prints
     /// `<label>: +<s>s rss <MB> MB (peak <MB> MB)` to stderr that often.
     pub fn start(interval: Duration, progress: Option<(Duration, &'static str)>) -> Self {
+        let cgroup_peak = cgroup_memory_peak_since_now();
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             peak: AtomicU64::new(0),
@@ -189,6 +216,7 @@ impl RssSampler {
         RssSampler {
             shared,
             thread: Some(thread),
+            cgroup_peak,
         }
     }
 
@@ -217,7 +245,7 @@ impl RssSampler {
             peak_bytes: s.peak.load(Ordering::Relaxed),
             peak_at_secs: s.peak_at_ms.load(Ordering::Relaxed) as f64 / 1000.0,
             hwm_bytes: status_kb(&self_status(), "VmHWM"),
-            cgroup_peak_bytes: cgroup_memory_peak(),
+            cgroup_peak_bytes: self.cgroup_peak.as_mut().and_then(read_peak),
             phases: s.phases.lock().expect("phase list").clone(),
             samples: s.samples.load(Ordering::Relaxed),
         }
@@ -259,7 +287,10 @@ mod tests {
     #[test]
     fn a_sampler_reports_this_process_and_its_phases() {
         let sampler = RssSampler::start(Duration::from_millis(5), None);
+        // 32 MB, every page touched, inside the sampled window.
+        let ballast = std::hint::black_box(vec![1u8; 32 << 20]);
         std::thread::sleep(Duration::from_millis(30));
+        drop(ballast);
         sampler.end_phase("first");
         sampler.end_phase("second");
         let s = sampler.finish();
@@ -272,7 +303,16 @@ mod tests {
             ["first", "second"]
         );
         assert!(s.phases.iter().all(|&(_, b)| b > 0 && b <= s.peak_bytes));
-        assert!(s.hwm_bytes.unwrap() >= s.peak_bytes, "{s:?}");
+        // Both saw the ballast. Not `hwm >= peak`: the kernel's high-water
+        // mark comes from approximate per-CPU RSS counters, and after a large
+        // free it can read a little under a sampled (exact) `VmRSS`.
+        assert!(s.peak_bytes >= 32 << 20, "{s:?}");
+        assert!(s.hwm_bytes.unwrap() >= 32 << 20, "{s:?}");
+        // The cgroup's peak since start includes the ballast (where this
+        // kernel lets the sampler reset its own watermark at all).
+        if let Some(cgroup_peak) = s.cgroup_peak_bytes {
+            assert!(cgroup_peak >= 32 << 20, "{s:?}");
+        }
         let json = s.json_fields();
         assert!(json.contains("\"peak_rss_first_mb\":"), "{json}");
         assert!(json.contains("\"peak_rss_second_mb\":"), "{json}");

@@ -14,7 +14,9 @@
 //! `--duration-secs` after the definition reads `live`. Once they stop, the
 //! target must equal a from-scratch `GROUP BY` over the source (the SQL
 //! oracle) within `--grace-secs`. That comparison is a full scan, so it only
-//! runs once the definition is `live` and the ring is empty, and after a
+//! runs once the definition is `live` and the engine reports nothing pending
+//! through the writers' last commit (`converged_through` on a token read
+//! after they stopped; `engine_converged_secs` records when), and after a
 //! mismatch waits `max(--oracle-poll-min-secs, 2 x its last duration)` before
 //! the next (`oracle_checks`/`oracle_check_secs` record how many ran and how
 //! long the last took).
@@ -34,8 +36,9 @@
 //! - the oldest client `xmin` held from define to the writers' stop, and the
 //!   oldest open transaction;
 //! - peak process RSS ([`process_memory`](super::process_memory)): overall,
-//!   and per phase (`load`: COPY + index; `build`: define -> `live`;
-//!   `converge`: `live` -> converged), plus `VmHWM` and the enclosing
+//!   and per phase (`load`: COPY + index; `build`: client start, the
+//!   `--pre-define-secs` of writes, then define -> `live`; `converge`:
+//!   `live` -> converged or the grace deadline), plus `VmHWM` and the enclosing
 //!   cgroup's `memory.peak`. #617 found today's drain holds a bucket's whole
 //!   share of the go-live re-read's segment in memory (about 650 B per
 //!   staged row, killed at 13.8 GB for 20M rows); the `converge` peak is the
@@ -149,6 +152,10 @@ pub struct BuildUnderLoadResult {
     pub converged_secs: Option<f64>,
     /// writers stopped -> the target equalled the oracle.
     pub tail_secs: Option<f64>,
+    /// writers stopped -> the engine first reported nothing pending through
+    /// their last commit (`None`: not within grace). A run whose oracle fails
+    /// with this set converged to a wrong value; with it `None`, it was stuck.
+    pub engine_converged_secs: Option<f64>,
     pub oracle_ok: bool,
     pub oracle_mismatched_groups: i64,
     /// Full-source oracle comparisons run inside the measured window.
@@ -298,7 +305,8 @@ impl BuildUnderLoadResult {
              \"application_threads\":{},\"load_secs\":{:.3},\"load_rows_per_sec\":{:.0},\
              \"index_secs\":{:.3},\"build_secs\":{:.3},\"chunks\":{},\"first_claim_secs\":{},\
              \"first_chunk_secs\":{},\"chunks_per_sec\":{},\"define_to_live_secs\":{:.3},\
-             \"post_live_secs\":{:.3},\"converged_secs\":{},\"tail_secs\":{},\"oracle_ok\":{},\
+             \"post_live_secs\":{:.3},\"converged_secs\":{},\"tail_secs\":{},\
+             \"engine_converged_secs\":{},\"oracle_ok\":{},\
              \"oracle_mismatched_groups\":{},\"oracle_checks\":{},\"oracle_check_secs\":{},\
              \"writer_secs\":{:.3},\"achieved_write_rate\":{:.1},\
              \"kept_target_rate\":{},\"writes_issued\":{{{}}},\"writes_noop\":{},\
@@ -326,6 +334,7 @@ impl BuildUnderLoadResult {
             self.cfg.post_live.as_secs_f64(),
             opt_f(self.converged_secs),
             opt_f(self.tail_secs),
+            opt_f(self.engine_converged_secs),
             self.oracle_ok,
             self.oracle_mismatched_groups,
             self.oracle_checks,
@@ -359,7 +368,7 @@ impl BuildUnderLoadResult {
         let w = &self.writes;
         format!(
             "build-under-load: {} rows / {} groups, loaded at {:.0} rows/s; build {:.1}s over {} \
-             chunks (first done {}), live after {:.1}s; converged {} (tail {}, {} oracle checks of {}), oracle_ok={} \
+             chunks (first done {}), live after {:.1}s; converged {} (tail {}, engine settled {}, {} oracle checks of {}), oracle_ok={} \
              ({} mismatched); writers {:.0}/{} stmt/s (kept={}), commit p50/p99 {}/{} ms \
              overall, {}/{} ms during build; {}; {}",
             self.cfg.rows,
@@ -377,6 +386,9 @@ impl BuildUnderLoadResult {
             self.tail_secs
                 .map(|s| format!("{s:.1}s"))
                 .unwrap_or_else(|| "-".into()),
+            self.engine_converged_secs
+                .map(|s| format!("+{s:.1}s"))
+                .unwrap_or_else(|| "never".into()),
             self.oracle_checks,
             self.oracle_check_secs
                 .map(|s| format!("{s:.2}s"))
@@ -672,35 +684,46 @@ async fn dump_mismatches(raw: &RawClient, terminal: &str) {
     }
 }
 
-/// Whether every undrained segment of the staging ring is empty: nothing
-/// staged is still waiting to be applied. One `exists` per undrained segment,
-/// not a `count(*)`, so a poll stays cheap while a 20M-row go-live segment is
-/// draining.
-async fn ring_empty(raw: &RawClient) -> bool {
-    let slots: Vec<i16> = raw
+/// Whether the engine reports nothing pending through `token` (a WAL position
+/// taken after every writer's last commit): intake has confirmed past it, no
+/// ring slot holds an unapplied row at or below it (a phase-gap straggler in
+/// a drained segment's slot included) and nothing is parked in
+/// `poison_held`. This is the engine's own one-statement, one-snapshot
+/// predicate (`converged_through`), used only to decide when the full-source
+/// oracle is worth running, never as the verdict. A hand-rolled ring probe
+/// can't answer it: it would miss commits intake hasn't staged yet, a
+/// straggler and a parked row, and its per-slot queries race a seal.
+async fn engine_converged(raw: &RawClient, token: trellis::PgLsn) -> bool {
+    trellis::dev::staging::converged_through(raw, token)
+        .await
+        .expect("check the engine's convergence through the writers' last commit")
+}
+
+/// What the engine still holds when the target disagrees with the oracle, so
+/// a failed run's log says whether it was stuck (a parked row, a segment
+/// never drained) or converged to a wrong value.
+async fn dump_pending(raw: &RawClient, token: trellis::PgLsn) {
+    let segments = raw
         .query(
-            "select ring_slot from trellis.segments where state <> 'drained'",
+            "select state::text, count(*) from trellis.segments group by 1 order by 1",
             &[],
         )
         .await
-        .expect("read segments")
+        .expect("read segment states")
         .iter()
-        .map(|r| r.get(0))
-        .collect();
-    for slot in slots {
-        let any: bool = raw
-            .query_one(
-                &format!("select exists (select 1 from trellis.seg_{slot})"),
-                &[],
-            )
-            .await
-            .expect("probe a ring segment")
-            .get(0);
-        if any {
-            return false;
-        }
-    }
-    true
+        .map(|r| format!("{}={}", r.get::<_, String>(0), r.get::<_, i64>(1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let parked: i64 = raw
+        .query_one("select count(*) from trellis.poison_held", &[])
+        .await
+        .expect("count parked rows")
+        .get(0);
+    eprintln!(
+        "build-under-load: engine converged through the writers' last commit: {}; \
+         segments: {segments}; poison_held rows: {parked}",
+        engine_converged(raw, token).await
+    );
 }
 
 /// Groups where the target disagrees with a from-scratch `GROUP BY` over the
@@ -830,20 +853,41 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let writer_secs = stopped_at.duration_since(shared.start).as_secs_f64();
     let achieved_write_rate = writes.total() as f64 / writer_secs;
 
-    // Converged: the definition is live, the ring holds nothing staged, and
-    // the target equals the oracle. The first two are cheap and polled every
-    // CONVERGE_POLL; the oracle is a full-source GROUP BY (a full scan at
-    // 100M rows, inside the disk window), so it runs only once both hold,
-    // and after a mismatch not again for oracle_backoff.
+    // Every writer has returned, so each of its statements has committed:
+    // a position read now bounds all of them from above. One zero-budget
+    // `await_converged` checks once and, if intake hasn't confirmed this far,
+    // asks it to (a logical message), so the poll below isn't left waiting
+    // on a ~10s keepalive once the source has gone quiet.
+    let token = trellis::dev::staging::watermark_token(&raw)
+        .await
+        .expect("read the writers' stop position");
+    let _ = trellis::dev::staging::await_converged(&raw, token, Duration::ZERO).await;
+
+    // Converged: the definition is live, the engine reports nothing pending
+    // through `token`, and the target equals the oracle. The first two are
+    // cheap and polled every CONVERGE_POLL; the oracle is a full-source
+    // GROUP BY (a full scan at 100M rows, inside the disk window), so it runs
+    // only once both hold, and after a mismatch not again for oracle_backoff.
     let deadline = stopped_at + cfg.grace;
     let mut converged_at = None;
+    let mut engine_converged_at = None;
     let mut mismatched = None;
     let mut oracle_checks = 0u32;
     let mut oracle_check_secs = None;
     let mut next_oracle = Instant::now();
     loop {
         let observed = Instant::now();
-        if observed >= next_oracle && ring_empty(&raw).await && is_live(&raw, &terminal).await {
+        let settled = match engine_converged_at {
+            Some(_) => true,
+            None => {
+                let settled = engine_converged(&raw, token).await;
+                if settled {
+                    engine_converged_at = Some(observed);
+                }
+                settled
+            }
+        };
+        if observed >= next_oracle && settled && is_live(&raw, &terminal).await {
             let m = mismatched_groups(&raw, &terminal).await;
             let took = observed.elapsed();
             oracle_checks += 1;
@@ -872,6 +916,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     };
     if mismatched != 0 {
         dump_mismatches(&raw, &terminal).await;
+        dump_pending(&raw, token).await;
     }
 
     client.shutdown().await.expect("client shutdown");
@@ -894,6 +939,8 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         define_to_live_secs,
         converged_secs: converged_at.map(|t| t.duration_since(define_at).as_secs_f64()),
         tail_secs: converged_at.map(|t| t.duration_since(stopped_at).as_secs_f64()),
+        engine_converged_secs: engine_converged_at
+            .map(|t| t.duration_since(stopped_at).as_secs_f64()),
         oracle_ok: mismatched == 0,
         oracle_mismatched_groups: mismatched,
         oracle_checks,
