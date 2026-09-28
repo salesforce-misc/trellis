@@ -1015,7 +1015,7 @@ fn pin_ops(
             other => panic!("pinned op {line:?}: unknown outcome {other:?}"),
         };
         ops.push(match (*kind, rest) {
-            ("insert", row) => Op::Insert {
+            ("insert", row) if !row.is_empty() => Op::Insert {
                 table,
                 row: columns(row),
                 expect,
@@ -1034,8 +1034,8 @@ fn pin_ops(
             _ => panic!("pinned op {line:?}: unknown shape"),
         });
         assert!(
-            burst + 1 >= plan.bursts.len(),
-            "pinned op {line:?}: bursts must come in order"
+            burst == plan.bursts.len() || burst + 1 == plan.bursts.len(),
+            "pinned op {line:?}: bursts must come in order, without gaps"
         );
         if burst == plan.bursts.len() {
             plan.bursts.push(Burst::default());
@@ -1046,7 +1046,37 @@ fn pin_ops(
         }
         lanes[lane].push(ops.len() - 1);
     }
+    assert!(!ops.is_empty(), "a pinned case with no ops");
     (ops, plan)
+}
+
+/// [`pin_ops`] refuses a malformed line instead of skipping it, so a pin
+/// can't quietly lose ops.
+#[test]
+fn pin_ops_rejects_malformed_lines() {
+    let (ops, plan) = pin_ops("0\t0\tinsert\tt0\tok\tc0=1\tc1=\\N\n1\t1\tdelete\tt0\tnone\t1\n");
+    assert_eq!(ops.len(), 2);
+    assert_eq!(plan.bursts.len(), 2);
+    assert_eq!(plan.bursts[1].lanes, vec![vec![], vec![1]]);
+    let delete = |burst: usize, pk: usize| format!("{burst}\t0\tdelete\tt0\tok\t{pk}\n");
+    for bad in [
+        String::new(),
+        delete(0, 1) + "\n" + &delete(0, 2),
+        "0\t0\tinsert\tt0".to_string(),
+        "0\t0\tinsert\tt0\tok".to_string(),
+        "0\t0\tinsert\tt0\tok\tc0".to_string(),
+        "0\t0\tinsert\tt0\tmaybe\tc0=1".to_string(),
+        "0\t0\tupsert\tt0\tok\tc0=1".to_string(),
+        "0\t0\tdelete\tt0\tok\t1\t2".to_string(),
+        "x\t0\tdelete\tt0\tok\t1".to_string(),
+        delete(0, 1) + &delete(2, 2),
+        delete(0, 1) + &delete(1, 2) + &delete(0, 3),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| pin_ops(&bad)).is_err(),
+            "{bad:?} parsed"
+        );
+    }
 }
 
 /// Hot-key case 3:11, the one case #557 part 3a's planted-bug sweep saw
@@ -1150,15 +1180,17 @@ fn hot_key_case_3_11_loads() {
     assert_eq!(program.defs.len(), 3);
 }
 
-/// [`hot_key_case_3_11`] fails in about one run in five on tmpfs when run
-/// alone (15 of 80), and one in fifteen with four processes at once (13 of
-/// 200). Either a `GROUP BY`
-/// `SUM` is wrong once the second burst quiesces (`t2[1:0].sum_c2:
-/// expected=68`, with `got` anywhere from 4 to 148, or `t4[1:2].rel_agg:
-/// expected=69 got=4`), or the run never converges (`ConvergenceTimeout`).
-/// The input is identical every time; only the drain workers' timing
-/// differs. It is the exit check #556's milestones D (#623) and E (#624)
-/// can use.
+/// [`hot_key_case_3_11`] fails some of the time on tmpfs, at a rate that
+/// swings with whatever else the box is doing: 15 of 80 alone and 13 of 200
+/// with four processes at once when it was written, but 0 of 70 alone and 3
+/// of 80 with four processes at once in review, while other work shared the
+/// box. Usually a `GROUP BY` `SUM` is wrong once a burst quiesces
+/// (`t2[1:0].sum_c2: expected=68`, with `got` anywhere from 4 to 148, or
+/// `t4[1:2].rel_agg: expected=69 got=4`), or the run never converges
+/// (`ConvergenceTimeout`). The input is identical every time; only the drain
+/// workers' timing differs. It is the exit check #556's milestones D (#623)
+/// and E (#624) can use, as long as the same box shows it failing before the
+/// fix: a pass means little unless the unfixed engine fails the same run.
 ///
 /// What the failure needs, from cutting the drawn case down on tmpfs with
 /// four processes at once, 160 to 200 runs per row:
@@ -1173,15 +1205,18 @@ fn hot_key_case_3_11_loads() {
 /// | without the `t1` updates, `t2` alone | 0/160 |
 /// | without the group moves | 0/200 |
 ///
-/// So it needs group moves and more than one `GROUP BY` definition over the
-/// hot table. It doesn't need the parent churn or the relationship, which
-/// only make it more likely, so it isn't #582's reverse-path lost update.
-/// Group moves under `MIN`/`MAX` recomputes are #494's shape (a key passing
-/// through a group inside one folded batch, under a recompute horizon, which
-/// #623 removes). Needing a second definition points at contention between
-/// their applies as well: #649's review saw up to 22 `deadlock detected` per
-/// run between the three definitions' aggregate pre-locks, which is #624's
-/// seam.
+/// So it needs group moves, and it needs more than one `GROUP BY` definition
+/// over the hot table, or at least the apply load a second one adds: the
+/// table can't tell those apart. It doesn't need the relationship (it still
+/// diverges without it) or the parent updates (without them it fails more
+/// often, not less), so it isn't #582's reverse-path lost update. Both
+/// remaining suspects are #623's scope. Group moves under `MIN`/`MAX`
+/// recomputes are #494's shape: a key passing through a group inside one
+/// folded batch, under a recompute horizon. And #649's review saw up to 22
+/// `deadlock detected` per run between the three definitions' aggregate
+/// pre-locks (#326's group pre-lock). #623 removes both the horizons and the
+/// pre-lock. The pin keeps the relationship fields, and `t4`'s `rel_agg` has
+/// diverged too, so it re-checks #624's factored relationships as well.
 ///
 /// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
 /// with 8 drain workers and a 112ms seal, and fails if any attempt diverged
@@ -1193,11 +1228,12 @@ fn hot_key_case_3_11_loads() {
 ///     -- --ignored --nocapture
 /// ```
 ///
-/// Twenty attempts take about three minutes and, at the rate above, miss
-/// the failure about one time in fifty. It respects `GENERATIVE_CLUSTER_DIR`,
-/// so it runs on disk too.
+/// Twenty attempts take two to three minutes. At 19% they would miss the
+/// failure about one time in fifty, but at 4% about half the time, so an
+/// exit check wants a hundred or more attempts, split over several
+/// processes. It respects `GENERATIVE_CLUSTER_DIR`, so it runs on disk too.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "diverges or never converges in about one run in five until #623/#624 \
+#[ignore = "diverges or never converges in 0-19% of runs, by box load, until #623/#624 \
             (#556 milestones D and E); run with GENERATIVE_PIN_ATTEMPTS set"]
 async fn hot_key_case_3_11_converges() {
     let Some(attempts) = std::env::var(PIN_ATTEMPTS_ENV).ok().map(|v| {

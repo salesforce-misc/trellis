@@ -257,7 +257,8 @@ designed out — but we still enforce the shape:
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
 
-- **Saved seeds**, replayed first every run — cheap exact-regression catching.
+- **Saved seeds**, replayed first on the next local run — cheap exact-regression
+  catching while the generator keeps its shape. Kept local, never checked in (§9).
 - **Hand-built minimized programs** in the model's types — durable pins that double
   as documentation, immune to generator refactors.
 - **A control test beside each finding** — a case that must *converge* — proving the
