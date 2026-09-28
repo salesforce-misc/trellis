@@ -70,6 +70,10 @@ pub struct EngineTuning {
     /// `ClientOptions::default()`) is stock `main`'s shipped, default-on
     /// behavior; `None` measures the un-grouped escape hatch instead.
     pub group_commit: Option<trellis::GroupCommitConfig>,
+    /// The most folded records one drain batch holds
+    /// ([`ClientOptions::drain_batch_cap`], issue #620). A small value forces
+    /// paging on a scenario whose segments would otherwise drain whole.
+    pub drain_batch_cap: usize,
 }
 
 impl Default for EngineTuning {
@@ -87,6 +91,7 @@ impl Default for EngineTuning {
             maintenance_interval: STOCK_MAINTENANCE_INTERVAL,
             reconcile_interval: STOCK_RECONCILE_INTERVAL,
             group_commit: Some(trellis::GroupCommitConfig::default()),
+            drain_batch_cap: trellis::ClientOptions::default().drain_batch_cap,
         }
     }
 }
@@ -117,6 +122,7 @@ impl EngineTuning {
             maintenance_interval: self.maintenance_interval,
             reconcile_interval: self.reconcile_interval,
             group_commit: self.group_commit,
+            drain_batch_cap: self.drain_batch_cap,
             ..Default::default()
         }
     }

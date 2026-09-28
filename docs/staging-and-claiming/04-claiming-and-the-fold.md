@@ -53,10 +53,12 @@ RETURNING seg_seq, bucket;
 Two workers computing overlapping shares both insert; the loser is returned fewer
 rows. No bucket is ever held twice.
 
-> **Measured cost (issue #277):** "the loser is returned fewer rows" happens
-> only *after* the winner commits. `ON CONFLICT` against an uncommitted insert
-> waits on the inserter's transaction, and the claim shares one with the fold
-> (`drain_many`'s Phase 1). Workers that compute the same free share from the
+> **Measured cost (issue #277, fixed in #620):** "the loser is returned fewer rows"
+> happens only *after* the winner commits. `ON CONFLICT` against an uncommitted
+> insert waits on the inserter's transaction, and the claim used to share one
+> with the fold. Since #620 the claim commits on its own and the fold runs after
+> it, in its own read transaction (the fenced window is immutable, so nothing
+> needs the claim's snapshot). What follows is the measurement from before. Workers that compute the same free share from the
 > same snapshot all go for the same lowest bucket, so every loser waits out the
 > winner's whole fold, then gets nothing and moves on. Under saturating load
 > with 8 drain workers, ~40% of busy engine backend time went to this wait, and
@@ -73,6 +75,14 @@ Splitting them opens a crash window: a process dying in the gap leaves claim row
 on a still-`sealed` batch, the completion guard `state = 'draining'` then matches
 nothing, and that worker can never complete a bucket it legitimately holds until
 the 30 s reclaim TTL.
+
+**Never claim an unfenced batch.** Seal phase 2 publishes the fence only on a batch
+still `sealed`, so a committed `sealed → draining` flip on a batch whose fence isn't
+out yet would leave it unfenced, and undrainable, for good. The fold used to share
+the claim's transaction and fail on the missing fence, rolling the flip back. Since
+the claim commits on its own (#620), the drain checks the fence first and refuses
+the batch without claiming it; a fence only ever goes from absent to present, so a
+batch fenced at the check stays fenced.
 
 > **Postgres gotcha:** a data-modifying CTE that nothing references can be planned
 > away. The flip CTE must be referenced through a `count(*)` guard in the outer
@@ -241,6 +251,60 @@ would fold it to NULL and lose the truncate.
   and its age is unbounded during idle, so creation-time latency over-reports wildly
   — a change drained in milliseconds appears to take seconds.
 
+## Paging a share larger than the cap
+
+A drain holds at most `ClientOptions::drain_batch_cap` folded records at once
+(100,000 by default; ADR-0002's I8). Memory is then bounded by the cap, not by how
+large a segment grew: a go-live re-read stages every source key into one segment,
+and a sealer starved by a slow drain lets the active segment grow at the write
+rate. The cap counts **folded records**, not ring rows: that is what the worker
+holds, and capping rows would cut a 1000:1 fold into pages of 100 records.
+
+**Picking the path.** The seal stores the row count it already takes as
+`segments.row_count`. A share estimated at `row_count / bucket_count × buckets
+held` that fits the cap folds whole, as it always did, with a `limit cap + 1`
+guard (the fenced window can hold a predecessor's late rows the count never saw).
+A share over the cap, a tripped guard, or a bucket with a cursor from an earlier
+claimant pages instead. Segments coalesce into one drain only while their row
+counts sum under the cap, so a segment over the cap drains alone.
+
+**Page order.** Pages are keyset ranges on `(route, src_table, key)`, compared
+byte-wise. `route` is the stored hash that already defines buckets, so the sort
+leads with an integer and `key` breaks ties. Three properties follow:
+
+- **A key never splits inside a segment.** Every row of a key has the same page
+  key, so the fold's whole-window rules (first old image, last new image, an
+  image-less delete ending the key, born-and-died images) and quarantine's
+  `(src_table, key, seg_seq)` parking hold per page unchanged.
+- **The truncate sentinel sorts first** (its route is `-1`), so the clear always
+  lands on page 1, before any key of the segment applies. A truncate segment has
+  one bucket, so one worker runs its pages in order.
+- **Cross-key order is arbitrary**, as it always was.
+
+Each page re-folds its key range against the **whole** fenced window's truncate
+rows, so a key on page 5 still drops its rows at or below a truncate that page 1
+applied.
+
+**The cursor.** Each page is its own compute-and-apply transaction. A page that is
+not its buckets' last checks the claim and advances the buckets' `drain_cursor`
+row in that same transaction; the last page completes instead
+([05](05-apply-and-exactly-once-deltas.md#a-page-is-its-own-transaction)). A drain
+that fails, or a worker that dies, leaves the cursor at the last committed page,
+and the next claimant resumes there.
+
+**Per-page failure handling.** Quarantine isolation probes one page's records, not
+the whole share, and its evictions commit before the page does (a crash between
+the two is harmless: the next claimant parks the poisoned key idempotently). If a
+transform's fuse trips mid-segment, later pages skip the quarantined transform;
+resuming it rebuilds the target.
+
+**Where pages come from.** Today each page rescans the fenced window twice: a
+top-K over the distinct page keys after the cursor finds the page's last key, then
+the fold runs over that range. That is quadratic in the share's size, a bridge
+until a once-per-claim materialize into a session `TEMP` table replaces it behind
+the same page-source interface (#620 A2b). There is no ring index: its append cost
+would spend ADR-0002's whole capture budget.
+
 ## Keeping a claim alive
 
 *Progress* (never correctness) depends on a live worker keeping its claim, and
@@ -272,11 +336,12 @@ it yields rather than waits on a row an in-flight apply holds.
 ## Two ways a claim comes back
 
 Both clear the claimant and bump the claim epoch. Because the rows were never
-consumed, either way the re-claim is a clean re-drain from scratch.
+consumed, either way the re-claim is a clean re-drain from the bucket's cursor:
+from scratch, unless a paged drain committed pages before it stopped.
 
-**Released**, immediately, by the worker itself, on **any** error. Nothing was
-applied — a fold error precedes every write and an apply error rolls back — so the
-claim covers work that did not happen. This is load-bearing for *latency*: without
+**Released**, immediately, by the worker itself, on **any** error. Nothing of the
+failing page was applied — a fold error precedes every write and an apply error
+rolls back — so the claim covers work that did not happen. This is load-bearing for *latency*: without
 it the only route back is the TTL, parking a routine, retryable failure for 30
 seconds. And it isn't exotic: **every definition change trips the version fence**
 on a worker whose loaded schema predates it — exactly what "change a formula, then

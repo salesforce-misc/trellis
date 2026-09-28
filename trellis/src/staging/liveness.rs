@@ -178,6 +178,7 @@ impl FenceMissBackoff {
 
     /// Called on any clean drain: the next miss (if any) is treated as
     /// isolated again, not a continuation of a prior run of misses.
+    #[cfg(any(test, feature = "internals"))]
     pub fn reset(&mut self) {
         self.pending = None;
     }

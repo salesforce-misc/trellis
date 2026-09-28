@@ -336,12 +336,18 @@ state that orders its writes.
 - **Must (fold):** the fold statement never plans a nested loop over stale
   ring statistics (#581).
 - **Must (I8):** a batch folds, re-reads and applies at most a fixed number
-  of changes (a per-batch row cap on the order of 10^5) and pages through a
-  larger bucket in `(lsn, change_id)` order. Splitting one key's changes
-  across two pages is safe: Apply is per-key ordered by `applied_lsn` and
-  takes its old side from the ledger, so the second page needs nothing from
-  the first. (The first-image fold rule this replaces needed all of a key's
-  changes together to name the old group.) *Evidence:*
+  of changes (a per-batch cap on folded records, on the order of 10^5) and
+  pages through a larger bucket in key-range pages; per-key `(lsn,
+  change_id)` order holds inside the fold. Pages are keyset ranges on
+  `(route, src_table, key)` with a truncate sentinel first, so a key never
+  splits inside a segment and the fold's whole-window rules (first old
+  image, last new image, an image-less delete ending the key) hold per page
+  unchanged. Cross-key order is arbitrary, which I3 allows, so this order is
+  permanent: the ledger would make split keys safe (Apply is per-key ordered
+  by `applied_lsn` and takes its old side from the ledger) but does not need
+  them. Each page is its own transaction behind a claim check, advancing a
+  durable per-bucket cursor; only a bucket's last page marks it drained
+  (#620). *Evidence:*
   [#617 step 3](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5857993459),
   [#556 requirement](https://github.com/salesforce-misc/trellis/issues/556#issuecomment-5859042432).
 - **Must (I7):** every lock statement in Apply runs under `lock_timeout`; a
@@ -694,8 +700,8 @@ Deliverable 4 of #556. Nothing below polls for convergence (#297).
    revoked privilege and disabled trigger (audit reports); `REPEATABLE
    READ` and `SERIALIZABLE` writers straddling a seal (no lost rows).
 6. **Drain paging:** a segment several times the batch cap drains with peak
-   RSS bounded by the cap, and a key whose changes straddle two pages
-   converges.
+   RSS bounded by the cap; a key whose changes straddle two segments, a
+   paged truncate segment, and a reclaim between two pages all converge.
 
 ## Open questions
 

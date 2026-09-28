@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio_postgres::GenericClient;
 
 use super::error::StagingError;
+#[cfg(any(test, feature = "internals"))]
 use super::fold::BucketFilter;
 
 /// How many buckets a batch that clears [`MIN_ROWS_TO_SPLIT`] is split
@@ -180,6 +181,7 @@ pub async fn claim(
 /// on `seg_seq`, read from `seg_claims` — never recomputed (doc 04: "Which
 /// buckets a worker holds is read from the claims table, never
 /// recomputed") — paired with the batch's own fixed `bucket_count`.
+#[cfg(any(test, feature = "internals"))]
 pub async fn owned_bucket_filter(
     client: &impl GenericClient,
     seg_seq: i64,

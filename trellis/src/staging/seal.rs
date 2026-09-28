@@ -149,7 +149,9 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
     // as the flip is what pins `bucket_count` from the moment the batch is
     // sealed: no other writer can still be appending into it by the time
     // this transaction commits (the active pointer already moved), so the
-    // count taken here is the batch's true, final row count.
+    // count taken here is the batch's true, final row count. Issue #620: it
+    // is stored as `segments.row_count` too, so a drain can tell from it
+    // whether its share fits `ClientOptions::drain_batch_cap` or must page.
     let table = ring_table_name(ring_slot)?;
     let row_count: i64 = txn
         .query_one(&format!("select count(*) from {table}"), &[])
@@ -185,10 +187,10 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
         .query_opt(
             "update segments \
                set state = 'sealed', sealed_at = now(), seal_step1 = pg_current_xact_id(), \
-                   bucket_count = $2, has_truncate = $3 \
+                   bucket_count = $2, has_truncate = $3, row_count = $4 \
              where seg_seq = $1 and state = 'active' \
              returning seg_seq",
-            &[&active_seq, &bucket_count, &has_truncate],
+            &[&active_seq, &bucket_count, &has_truncate, &row_count],
         )
         .await?;
     if sealed.is_none() {

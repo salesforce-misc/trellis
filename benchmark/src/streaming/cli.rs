@@ -107,7 +107,7 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
-/// `--reconcile-interval-ms`, `--group-commit`). Postgres settings for a disk
+/// `--reconcile-interval-ms`, `--group-commit`, `--drain-batch-cap`). Postgres settings for a disk
 /// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
 /// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
@@ -217,6 +217,9 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
         reconcile_interval: millis(args, "--reconcile-interval-ms")
             .unwrap_or(default.reconcile_interval),
         group_commit: group_commit(args, default.group_commit),
+        drain_batch_cap: number(args, "--drain-batch-cap")
+            .map(|v| v as usize)
+            .unwrap_or(default.drain_batch_cap),
     }
 }
 
@@ -829,6 +832,22 @@ mod tests {
         assert_eq!(t.poll_interval, Duration::from_millis(20));
         assert_eq!(t.maintenance_interval, Duration::from_millis(10));
         assert_eq!(t.application_threads, 8);
+    }
+
+    #[test]
+    fn tuning_reads_the_drain_batch_cap_or_keeps_the_stock_default() {
+        assert_eq!(
+            tuning(&argv(&["build-under-load"]), EngineTuning::default()).drain_batch_cap,
+            trellis::ClientOptions::default().drain_batch_cap
+        );
+        assert_eq!(
+            tuning(
+                &argv(&["build-under-load", "--drain-batch-cap", "5000"]),
+                EngineTuning::default()
+            )
+            .drain_batch_cap,
+            5000
+        );
     }
 
     #[test]

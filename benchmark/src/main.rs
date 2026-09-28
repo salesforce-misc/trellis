@@ -96,7 +96,10 @@
 //! `--maintenance-interval-ms`, `--reconcile-interval-ms` and
 //! `--group-commit <max_rows>,<max_delay_ms>|off` (issue #274; the last
 //! defaults to stock `ClientOptions::default()`'s shipped-on group-commit,
-//! `off` measures the un-grouped escape hatch) —
+//! `off` measures the un-grouped escape hatch), and `--drain-batch-cap`
+//! (issue #620: the most folded records one drain batch holds; a small value
+//! forces paging, and `TRELLIS_BENCH_LOG=trellis::staging::apply=info` logs
+//! each paged drain's page count) —
 //! [`streaming::tuning::EngineTuning`], which is also where a later child of
 //! #269 adds a knob of its own. `intake-ceiling` takes its own
 //! `--group-commit` directly (it is deliberately not built from

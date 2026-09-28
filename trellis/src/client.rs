@@ -142,6 +142,17 @@ pub struct ClientOptions {
     /// tightly than the batch's `max_delay`, at the cost of this option's
     /// whole point). See [`intake::GroupCommitConfig`]'s own doc comment.
     pub group_commit: Option<intake::GroupCommitConfig>,
+    /// The most folded records one drain batch holds at once (issue #620,
+    /// ADR-0002): a segment share larger than this drains in pages of at most
+    /// this many, each its own compute-and-apply transaction, so a worker's
+    /// memory is bounded by this cap rather than by how large a segment grew
+    /// (a go-live re-read, or a backlog built while seal was refused).
+    /// Several small sealed segments coalesce into one drain only while their
+    /// ring rows sum to at most this. Defaults to
+    /// [`staging::DEFAULT_DRAIN_BATCH_CAP`] (100,000); peak drain memory is
+    /// about `application_threads` × this × bytes per change. Zero is treated
+    /// as one.
+    pub drain_batch_cap: usize,
 }
 
 impl Default for ClientOptions {
@@ -161,6 +172,7 @@ impl Default for ClientOptions {
             heartbeat: HeartbeatDaemonConfig::default(),
             poll_interval: Duration::from_millis(200),
             group_commit: Some(intake::GroupCommitConfig::default()),
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
         }
     }
 }
@@ -628,6 +640,7 @@ async fn run(
             reclaim_ttl: options.reclaim_ttl,
             chunk_reclaim_interval: options.maintenance_interval,
             watermark: watermark.clone(),
+            drain_batch_cap: options.drain_batch_cap,
         };
         app_worker_tasks.push(tokio::spawn(app_worker_loop(
             worker_config,
@@ -1475,6 +1488,9 @@ struct AppWorkerConfig {
     /// record it drains. See `run()`'s own doc comment on this field for
     /// the multi-process-fleet caveat.
     watermark: staging::StagedWatermark,
+    /// [`ClientOptions::drain_batch_cap`]: bounds both how many segments one
+    /// drain coalesces and how many folded records one page holds.
+    drain_batch_cap: usize,
 }
 
 /// One application-worker task: registers itself as a drainer, runs an
@@ -1508,6 +1524,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         reclaim_ttl,
         chunk_reclaim_interval,
         watermark,
+        drain_batch_cap,
     } = config;
 
     // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
@@ -1582,16 +1599,17 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // it doesn't block trying `next_claimable_segments` on the same
         // connection.
         //
-        // Issue #63 Milestone 2: asks for up to `MAX_COALESCE_SEGMENTS` at
-        // once rather than just the lowest one, so a burst of quickly
-        // sealing segments (many ready before this worker gets back around
-        // to claiming) drains in one coalesced `drain_many` call instead of
-        // one `drain_once` call — and one full compute-and-apply pass —
-        // per segment.
+        // Issue #63 Milestone 2: asks for several segments at once rather
+        // than just the lowest one, so a burst of quickly sealing segments
+        // (many ready before this worker gets back around to claiming)
+        // drains in one coalesced `drain_many` call instead of one full
+        // compute-and-apply pass per segment. Issue #620: as many as fit
+        // `drain_batch_cap` by row count; a segment over the cap comes back
+        // alone and pages.
         let seg_seqs = match pool.get().await {
             Ok(client) => {
                 let _ = staging::register_drainer(&**client, &claimed_by).await;
-                staging::next_claimable_segments(&**client, staging::MAX_COALESCE_SEGMENTS).await
+                staging::next_claimable_segments(&**client, drain_batch_cap).await
             }
             Err(err) => Err(err.into()),
         };
@@ -1623,13 +1641,14 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             Err(_) => 1,
         };
 
-        let outcome = staging::drain_many(
+        let outcome = staging::drain_many_with_cap(
             &pool,
             &seg_seqs,
             &claimed_by,
             live_workers,
             &wake_channel,
             &watermark,
+            drain_batch_cap,
         )
         .await;
         let drain_failed = outcome.is_err();

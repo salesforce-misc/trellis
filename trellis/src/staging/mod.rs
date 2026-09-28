@@ -18,8 +18,10 @@
 //!   out-of-band heartbeat daemon, release-on-error, reclaim-on-TTL, and
 //!   the consecutive-fence-miss backoff.
 //! - [`apply`] is stage 05's apply ∪ mark-drained (issue #11), 1-1/scalar
-//!   subset only: the three-phase drain (claim + fold, compute, apply ∪
-//!   mark-drained), the version fence, and downstream propagation.
+//!   subset only: the three-phase drain (claim, then fold, compute, apply ∪
+//!   mark-drained per page), the version fence, and downstream propagation.
+//! - [`page`] is where an oversized share's pages come from (issue #620):
+//!   the page-source interface and the `drain_cursor` read-back.
 //! - [`retire`] is stage 06's retirement half (issue #13/#58): freeing a
 //!   `drained` segment's ring slot once nobody can still need it.
 //! - [`quarantine`] is stage 06's other half (issue #16): isolate, evict,
@@ -56,6 +58,7 @@ pub mod converge;
 pub mod error;
 pub mod fold;
 pub mod liveness;
+pub(crate) mod page;
 pub mod quarantine;
 pub mod retire;
 pub mod seal;
@@ -75,7 +78,11 @@ pub mod worker_registry;
 #[cfg(any(test, feature = "internals"))]
 pub use append::append;
 pub use append::{CdcOp, StagedChange};
-pub use apply::{ApplyError, MAX_COALESCE_SEGMENTS, drain_many, next_claimable_segments};
+#[cfg(any(test, feature = "internals"))]
+pub use apply::drain_many;
+pub use apply::{
+    ApplyError, DEFAULT_DRAIN_BATCH_CAP, drain_many_with_cap, next_claimable_segments,
+};
 pub use claim::{DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, register_drainer};
 pub use error::StagingError;
 pub use liveness::{
@@ -116,13 +123,16 @@ pub use append::{RING_SIZE, TRUNCATE_SENTINEL_KEY, active_ring_slot, ring_slot_i
 #[cfg(any(test, feature = "internals"))]
 pub use apply::next_claimable_segment;
 #[cfg(any(test, feature = "internals"))]
-pub use apply::{ApplyOutcome, ApplyPlan, MAX_HOP_GEN, ManyApplyOutcome, drain_once};
+pub use apply::{
+    ApplyOutcome, ApplyPlan, DrainHooks, MAX_HOP_GEN, ManyApplyOutcome, drain_many_with_hooks,
+    drain_once,
+};
 #[cfg(any(test, feature = "internals"))]
 pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS, owned_bucket_filter};
 #[cfg(any(test, feature = "internals"))]
 pub use converge::{converged_through, pending_count};
 #[cfg(any(test, feature = "internals"))]
-pub use fold::{BucketFilter, FoldedChange, fold, merge_folded_changes};
+pub use fold::{BucketFilter, FoldedChange, PageKey, fold, merge_folded_changes};
 #[cfg(any(test, feature = "internals"))]
 pub use liveness::{FENCE_MISS_INITIAL_DELAY, FENCE_MISS_MAX_DELAY, FenceMissBackoff};
 #[cfg(any(test, feature = "internals"))]

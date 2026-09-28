@@ -18,8 +18,12 @@ sequenceDiagram
     participant DB as Postgres
 
     rect rgb(31,111,235,0.10)
-    Note over W,DB: Phase 1 — claim + fold (one short txn)
-    W->>DB: claim a bucket share (1 statement)
+    Note over W,DB: Phase 1 — claim (one statement, committed alone)
+    W->>DB: claim a bucket share (1 statement), COMMIT
+    end
+
+    rect rgb(31,111,235,0.05)
+    Note over W,DB: fold (a read txn; one page of at most drain_batch_cap records)
     W->>DB: fold the fenced window → one record per (table, key)
     end
 
@@ -37,11 +41,19 @@ sequenceDiagram
     W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: per-key ordering lock + basis check)
     W->>DB: 3. aggregate + join maintenance (delta arithmetic)
     W->>DB: 4. downstream staging — into the ACTIVE batch
-    W->>DB: 5. mark this claim's buckets drained
+    W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
     W->>DB: 6. pg_notify
     W->>DB: COMMIT
     end
 ```
+
+Phases 2 and 3 run once per **page**. A share that fits
+`ClientOptions::drain_batch_cap` (100,000 folded records by default) is one page,
+folded whole; a larger one is walked in pages of at most the cap, each its own
+fold, compute and Phase 3 transaction (see
+[04](04-claiming-and-the-fold.md#paging-a-share-larger-than-the-cap)). The claim
+commits on its own before any fold, so a peer's claim never waits on this
+worker's fold (#328).
 
 **Phase 2 holds no locks and no transaction.** Deliberate: compute can be
 arbitrarily expensive without blocking intake, another worker, or — by holding a
@@ -71,7 +83,8 @@ store and the staging store are the same Postgres database: without a shared
 transaction there is no exactly-once for non-idempotent effects.
 
 - A crash **before** the commit rolls back the delta *and* the mark. The claim
-  expires, the batch returns to `sealed`, and it re-drains from scratch.
+  expires, the batch returns to `sealed`, and it re-drains from the last
+  committed page.
 - A crash **after** commits both.
 
 Under a bucket claim the unit is the claimed *bucket set*: its apply, the deletion
@@ -82,8 +95,10 @@ The completion statement does two jobs at once:
 
 ```sql
 -- (1) the claim check and the mask are one act
-DELETE FROM seg_claims WHERE seg_seq = :s AND claimed_by = :me RETURNING bucket;
--- an EMPTY result means "my claim was lost mid-drain" → raise → the whole
+DELETE FROM seg_claims
+ WHERE seg_seq = :s AND claimed_by = :me AND bucket = ANY(:page_buckets)
+RETURNING bucket;
+-- any page bucket MISSING means "my claim was lost mid-drain" → raise → the whole
 -- Phase-3 transaction rolls back → the current claimant re-drains it exactly once
 
 -- (2) OR my buckets in; complete iff that fills every bucket
@@ -93,6 +108,40 @@ UPDATE segments
                     THEN 'drained' ELSE state END
  WHERE seg_seq = :s AND state = 'draining';
 ```
+
+#### A page is its own transaction
+
+A share larger than the cap drains in pages, and each page commits its own
+apply. What makes that exactly-once is a durable per-bucket cursor,
+`drain_cursor(seg_seq, bucket)`: the last page key a committed page covered. A
+page that is not its buckets' last ends its Phase 3 transaction with a claim
+check and a cursor advance instead of the completion statement:
+
+```sql
+-- (1) the claim check, and a heartbeat
+UPDATE seg_claims SET claimed_at = now()
+ WHERE seg_seq = :s AND claimed_by = :me RETURNING bucket;
+-- must return EVERY bucket :me holds, or raise ClaimLost → the page rolls back
+
+-- (2) the cursor moves in the same commit as the page's apply
+INSERT INTO drain_cursor (seg_seq, bucket, after_route, after_src_table, after_key)
+SELECT :s, b, :route, :src_table, :key FROM unnest(:page_buckets) AS b
+ON CONFLICT (seg_seq, bucket) DO UPDATE SET ...;
+```
+
+- A committed cursor means "applied through here", exactly once. Only the last
+  page runs the completion statement, so `drained_mask` gains a bucket's bit only
+  when the whole share has applied.
+- The update's row lock is what makes the reclaim sweep's `SKIP LOCKED` pass over
+  an in-flight page. A reclaim that committed first deleted the row, so the update
+  misses it; one still in flight holds the lock, so the update waits and then
+  misses it. Either way a stale claimant's page never commits.
+- The cursor lives in its own table, not on `seg_claims`: reclaim deletes the
+  claim row, and a cursor that died with it would make the next claimant re-apply
+  every committed page. A bucket with a cursor and no claim is free under the
+  unchanged claim statement, and its next claimant resumes after the cursor.
+- A key never splits inside a segment (pages are key ranges), so the fold's rules
+  below hold per page unchanged.
 
 ### 3. The per-key fold telescopes
 
@@ -388,6 +437,7 @@ key, or a schema error into a silently parked one. The classification:
 | **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
 | **Halting schema diagnosis** | a tripped hop bound (a real cross-table value cycle); a relationship endpoint that is not a source column | **propagate loudly**; never quarantine. Quarantining would convert a loud, actionable error into a key that blocks reads forever |
 | **Ordering artefact** | a delta guard tripped while a lower-numbered batch is still outstanding | self-heals; charge only once every predecessor has drained |
+| **Claim lost** | a page's claim check or completion finds a held bucket's claim gone | surface; never isolate. The page rolled back, and whoever holds the buckets now resumes from the last committed cursor |
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 
 The halting class deserves emphasis: **failing that way stops the whole instance,
@@ -405,7 +455,8 @@ identical from outside otherwise.
    exclusivity is wrong.
 2. **The claimed batch is immutable.** Every producer writes to the *active*
    batch, including a worker doing downstream propagation.
-3. **Apply and the drained mark are one commit**, per claimed bucket set.
+3. **Apply and its claim ending are one commit**, per claimed bucket set and
+   page: the cursor advance on an earlier page, the drained mark on the last.
    Splitting them reintroduces double-counting on the non-idempotent delta path.
 4. **A row's bucket is a total function of the row and its batch** — no row in
    two buckets, none in zero.

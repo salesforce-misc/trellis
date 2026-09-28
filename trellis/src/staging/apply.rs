@@ -8,11 +8,11 @@
 //!
 //! The design's three phases map onto three functions:
 //!
-//! - Phase 1 (claim + fold, one short transaction) is [`drain_once`]'s own
-//!   opening block, reusing [`super::claim::claim`],
-//!   [`super::claim::owned_bucket_filter`], and [`super::fold::fold`]
-//!   directly — there is nothing 1-1-specific about claiming or folding, so
-//!   this module adds no wrapper around them.
+//! - Phase 1 (the claim, committed on its own) is `drain_segments`' opening
+//!   block, reusing [`super::claim::claim`] directly. The fold runs after it
+//!   commits, in its own read transaction: [`super::fold::fold_limited`] for
+//!   a share that fits `drain_batch_cap`, pages from [`super::page`]
+//!   otherwise (issue #620).
 //! - Phase 2 (compute: evaluate `f()` against every folded change, no
 //!   transaction, no locks) is [`compute`].
 //! - Phase 3 (apply ∪ mark-drained, one transaction) is
@@ -7896,6 +7896,7 @@ pub async fn apply_and_mark_drained(
         batch_drained: outcome.segments_drained[0].1,
         deferral_counts: outcome.deferral_counts,
         fairness_escalations: outcome.fairness_escalations,
+        pages: outcome.pages,
     })
 }
 
@@ -7925,20 +7926,69 @@ pub async fn apply_and_mark_drained(
 /// [`apply_aggregate::apply_aggregate_target`] span this call makes (one per
 /// consuming transform), since each of those runs inside this async fn's own
 /// `#[tracing::instrument]`-created span.
+pub async fn apply_and_mark_drained_many(
+    txn: &Transaction<'_>,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    plan: &ApplyPlan,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+) -> Result<ManyApplyOutcome, ApplyError> {
+    let steps: Vec<SegmentStep> = seg_seqs
+        .iter()
+        .map(|&seg_seq| SegmentStep {
+            seg_seq,
+            page: None,
+        })
+        .collect();
+    apply_page(txn, &steps, claimed_by, plan, wake_channel, watermark).await
+}
+
+/// How one segment's claim ends a Phase 3 transaction (issue #620 A2a).
+#[derive(Debug, Clone)]
+pub(crate) struct SegmentStep {
+    pub(crate) seg_seq: i64,
+    /// `None`: the pre-paging contract [`apply_and_mark_drained_many`] keeps
+    /// for its direct callers (the quarantine probe, tests): complete whatever
+    /// buckets `claimed_by` holds, [`ApplyError::ClaimLost`] only if it holds
+    /// none. The drain itself always passes `Some`.
+    pub(crate) page: Option<PageClaim>,
+}
+
+/// The buckets one page covers, and whether it is their last.
+#[derive(Debug, Clone)]
+pub(crate) struct PageClaim {
+    /// The buckets this page's records came from.
+    pub(crate) buckets: Vec<i16>,
+    /// Every bucket `claimed_by` still holds on the segment: `buckets`, plus
+    /// any it holds under a different cursor and pages separately. The claim
+    /// check must find all of them, or the page is `ClaimLost`.
+    pub(crate) held: Vec<i16>,
+    /// `Some(k)`: more pages follow, so the transaction heartbeats the claim
+    /// and advances `buckets`' cursors to `k`. `None`: this page ends
+    /// `buckets`' share, so the transaction releases them and ORs them into
+    /// `drained_mask`, as the unpaged drain always did.
+    pub(crate) next: Option<fold::PageKey>,
+}
+
+/// [`apply_and_mark_drained_many`] with an explicit claim ending per segment
+/// (issue #620 A2a): a non-final page's transaction applies, checks the claim
+/// and advances the cursor; a final page's applies and completes. Everything
+/// before step 5 is the same either way.
 #[tracing::instrument(
     name = "staging.apply_and_mark_drained",
-    skip(txn, plan, wake_channel, watermark),
+    skip(txn, steps, plan, wake_channel, watermark),
     fields(
-        segments = seg_seqs.len(),
+        segments = steps.len(),
         targets = plan.targets.len(),
         aggregate_targets = plan.aggregate_targets.len(),
         keys_written = tracing::field::Empty,
         keys_deleted = tracing::field::Empty,
     )
 )]
-pub async fn apply_and_mark_drained_many(
+pub(crate) async fn apply_page(
     txn: &Transaction<'_>,
-    seg_seqs: &[i64],
+    steps: &[SegmentStep],
     claimed_by: &str,
     plan: &ApplyPlan,
     wake_channel: &str,
@@ -7980,7 +8030,7 @@ pub async fn apply_and_mark_drained_many(
     // bookkeeping ("which batch's contribution is this"), not something
     // later correctness depends on picking exactly right among several
     // equally-valid coalesced segments.
-    quarantine::park_batch_contribution(txn, seg_seqs[0], &plan.poisoned_park).await?;
+    quarantine::park_batch_contribution(txn, steps[0].seg_seq, &plan.poisoned_park).await?;
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
@@ -8783,58 +8833,13 @@ pub async fn apply_and_mark_drained_many(
     // buckets drained, in one statement per segment — inherently per-segment
     // (each has its own `seg_claims` rows and `drained_mask`), unlike steps
     // 1-4 above, which already ran once for the whole coalesced batch.
-    let mut segments_drained = Vec::with_capacity(seg_seqs.len());
-    for &seg_seq in seg_seqs {
-        let bucket_count: i16 = txn
-            .query_one(
-                "select bucket_count from segments where seg_seq = $1",
-                &[&seg_seq],
-            )
-            .await?
-            .get(0);
-
-        let claimed_buckets: Vec<i16> = txn
-            .query(
-                "delete from seg_claims where seg_seq = $1 and claimed_by = $2 returning bucket",
-                &[&seg_seq, &claimed_by],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-
-        if claimed_buckets.is_empty() {
-            tracing::warn!(
-                seg_seq,
-                claimed_by = %claimed_by,
-                "claim was gone by completion time; nothing applied twice, but its buckets \
-                 must be reclaimed by whoever holds them now"
-            );
-            return Err(ApplyError::ClaimLost);
-        }
-
-        let mut mask: i64 = 0;
-        for bucket in &claimed_buckets {
-            mask |= 1i64 << bucket;
-        }
-        let full_mask: i64 = (1i64 << bucket_count) - 1;
-
-        let completed = txn
-            .query_opt(
-                "update segments \
-                 set drained_mask = drained_mask | $2::bigint, \
-                     state = case when (drained_mask | $2::bigint) = $3::bigint \
-                                  then 'drained' else state end \
-                 where seg_seq = $1 and state = 'draining' \
-                 returning state",
-                &[&seg_seq, &mask, &full_mask],
-            )
-            .await?;
-        let batch_drained = matches!(
-            completed.map(|row| row.get::<_, String>(0)),
-            Some(state) if state == "drained"
-        );
-        segments_drained.push((seg_seq, batch_drained));
+    //
+    // Issue #620 A2a: a page that isn't its buckets' last instead checks the
+    // claim and advances their cursor. See `end_segment_step`.
+    let mut segments_drained = Vec::with_capacity(steps.len());
+    for step in steps {
+        let batch_drained = end_segment_step(txn, step, claimed_by).await?;
+        segments_drained.push((step.seg_seq, batch_drained));
     }
 
     // 6. Wake anything awaiting convergence.
@@ -8864,7 +8869,154 @@ pub async fn apply_and_mark_drained_many(
         segments_drained,
         deferral_counts,
         fairness_escalations,
+        pages: 1,
     })
+}
+
+/// Step 5 of [`apply_page`] for one segment: returns whether this
+/// transaction flipped the segment to `'drained'`.
+///
+/// **A non-final page** (issue #620 A2a) runs the claim check, then advances
+/// the cursor:
+///
+/// - `update seg_claims set claimed_at = now() ... returning bucket` must
+///   return every bucket the worker still holds, or the page is
+///   [`ApplyError::ClaimLost`] and its whole transaction rolls back. The row
+///   lock this takes is what makes `RECLAIM_STALE_SQL`'s `skip locked` pass
+///   over an in-flight page, and the update doubles as a heartbeat. A reclaim
+///   that committed first deleted the row, so the update misses it; a
+///   reclaim still in flight holds the row lock, so the update waits and then
+///   misses it. Either way a stale claimant's page never commits, so no
+///   delta applies twice.
+/// - The page's buckets' `drain_cursor` rows move to the page's last key, in
+///   this same transaction, so a committed cursor always means "applied
+///   through here".
+///
+/// **A final page** runs the completion statement: delete the page's buckets'
+/// claims and OR them into `drained_mask`, flipping the segment to
+/// `'drained'` once every bucket is in. The delete must return every one of
+/// the page's buckets (and, when the worker still holds other buckets it
+/// pages separately, the heartbeat above checks those too). A bucket's
+/// `drained_mask` bit is set only here, on its last page.
+async fn end_segment_step(
+    txn: &Transaction<'_>,
+    step: &SegmentStep,
+    claimed_by: &str,
+) -> Result<bool, ApplyError> {
+    let seg_seq = step.seg_seq;
+    let claim_lost = |detail: &str| {
+        tracing::warn!(
+            seg_seq,
+            claimed_by = %claimed_by,
+            detail,
+            "claim was gone by completion time; nothing applied twice, but its buckets \
+             must be reclaimed by whoever holds them now"
+        );
+        ApplyError::ClaimLost
+    };
+
+    if let Some(page) = &step.page
+        && (page.next.is_some() || page.held.len() != page.buckets.len())
+    {
+        let refreshed: std::collections::HashSet<i16> = txn
+            .query(
+                "update seg_claims set claimed_at = now() \
+                 where seg_seq = $1 and claimed_by = $2 returning bucket",
+                &[&seg_seq, &claimed_by],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !page.held.iter().all(|bucket| refreshed.contains(bucket)) {
+            return Err(claim_lost("a held bucket's claim is gone"));
+        }
+        if let Some(after) = &page.next {
+            txn.execute(
+                "insert into drain_cursor \
+                     (seg_seq, bucket, after_route, after_src_table, after_key) \
+                 select $1, bucket, $3, $4, $5 from unnest($2::smallint[]) as bucket \
+                 on conflict (seg_seq, bucket) do update \
+                 set after_route = excluded.after_route, \
+                     after_src_table = excluded.after_src_table, \
+                     after_key = excluded.after_key",
+                &[
+                    &seg_seq,
+                    &page.buckets,
+                    &after.route,
+                    &after.src_table,
+                    &after.key,
+                ],
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+
+    let bucket_count: i16 = txn
+        .query_one(
+            "select bucket_count from segments where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await?
+        .get(0);
+
+    let claimed_buckets: Vec<i16> = match &step.page {
+        None => txn
+            .query(
+                "delete from seg_claims where seg_seq = $1 and claimed_by = $2 returning bucket",
+                &[&seg_seq, &claimed_by],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect(),
+        Some(page) => txn
+            .query(
+                "delete from seg_claims \
+                 where seg_seq = $1 and claimed_by = $2 and bucket = any($3::smallint[]) \
+                 returning bucket",
+                &[&seg_seq, &claimed_by, &page.buckets],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect(),
+    };
+
+    if claimed_buckets.is_empty() {
+        return Err(claim_lost("no claim left to complete"));
+    }
+    if let Some(page) = &step.page
+        && !page
+            .buckets
+            .iter()
+            .all(|bucket| claimed_buckets.contains(bucket))
+    {
+        return Err(claim_lost("one of the page's buckets' claim is gone"));
+    }
+
+    let mut mask: i64 = 0;
+    for bucket in &claimed_buckets {
+        mask |= 1i64 << bucket;
+    }
+    let full_mask: i64 = (1i64 << bucket_count) - 1;
+
+    let completed = txn
+        .query_opt(
+            "update segments \
+             set drained_mask = drained_mask | $2::bigint, \
+                 state = case when (drained_mask | $2::bigint) = $3::bigint \
+                              then 'drained' else state end \
+             where seg_seq = $1 and state = 'draining' \
+             returning state",
+            &[&seg_seq, &mask, &full_mask],
+        )
+        .await?;
+    Ok(matches!(
+        completed.map(|row| row.get::<_, String>(0)),
+        Some(state) if state == "drained"
+    ))
 }
 
 /// Issue #166 (a genuine `SIGKILL`-mid-drain test, not an in-process
@@ -8966,6 +9118,8 @@ pub struct ApplyOutcome {
     /// Reused from [`ManyApplyOutcome::fairness_escalations`] via
     /// [`apply_and_mark_drained`]'s wrapper.
     pub fairness_escalations: u64,
+    /// Issue #620: see [`ManyApplyOutcome::pages`].
+    pub pages: usize,
 }
 
 /// What one successful [`apply_and_mark_drained_many`] call did — the
@@ -8987,36 +9141,60 @@ pub struct ManyApplyOutcome {
     /// Issue #135: see [`ApplyOutcome::fairness_escalations`]'s doc comment
     /// (this field is that one's source, for the coalesced-segment path).
     pub fairness_escalations: u64,
+    /// Issue #620: how many compute-and-apply transactions (pages) the drain
+    /// committed. 1 when the share fit `drain_batch_cap`; at most
+    /// ⌈share / cap⌉ when it didn't (a page can come out short, never over).
+    /// One Phase 3 transaction is one page.
+    pub pages: usize,
 }
 
 // ---------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------
 
-/// The most drain attempts [`drain_once`] retries before giving up and
-/// surfacing the last error — a bound on a fence-miss/serialization-failure
-/// loop that never resolves (e.g. a source under constant, colliding
+/// The most drain attempts one page's compute-and-apply retries before giving
+/// up and surfacing the last error — a bound on a fence-miss/serialization-
+/// failure loop that never resolves (e.g. a source under constant, colliding
 /// definition churn), rather than retrying forever.
 const MAX_APPLY_ATTEMPTS: u32 = 5;
 
-/// Runs one full drain attempt against `seg_seq`: Phase 1 (claim + fold, in
-/// one short transaction), Phase 2 (compute), and Phase 3 (apply ∪
-/// mark-drained), retrying Phase 2+3 on a version-fence miss or a
-/// serialization failure/deadlock — the design doc's "reload, recompute,
-/// retry" loop — using [`FenceMissBackoff`] between attempts.
-///
-/// Returns `Ok(None)` if this call's claim won (and already owned) nothing
-/// — the buckets were all already claimed by someone else — without
-/// folding or computing anything. Otherwise returns the winning attempt's
-/// [`ApplyOutcome`].
+/// [`crate::client::ClientOptions::drain_batch_cap`]'s default: the most
+/// folded records one drain batch holds at once (issue #620, ADR-0002). A
+/// worker's peak memory is about this many changes' worth, whatever size the
+/// segment it drains grew to: ~0.8 GB across 8 workers at ~1 KB per
+/// image-less change, ~3.2 GB at ~4 KB per image-bearing one.
+pub const DEFAULT_DRAIN_BATCH_CAP: usize = 100_000;
+
+/// Test seams for [`drain_many_with_hooks`] (issue #620 A2a): the
+/// exactly-once tests need a drainer stopped between two pages, and a
+/// drainer whose claim is taken away mid-page, without timing anything.
+/// Both default to off, which is what every production drain passes.
+#[derive(Debug, Default)]
+pub struct DrainHooks {
+    /// Return right after this many pages have committed, leaving the claim
+    /// held and the cursor where the last page left it: a drainer that died
+    /// between two pages.
+    pub stop_after_pages: Option<usize>,
+    /// Before page `n` (1-based) computes, send on the first channel and
+    /// wait on the second: the test does whatever it wants to the claim in
+    /// between (age it, reclaim it, claim it for someone else).
+    pub pause_before_page: Option<(
+        usize,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+}
+
+/// Runs one full drain of `seg_seq`: see [`drain_many`], which this is the
+/// single-segment form of. Returns `Ok(None)` if this call's claim won (and
+/// already owned) nothing.
 ///
 /// Issue #56/ADR-0009 decision 3: the outermost span in the propagation
-/// tree's apply phase — parent, across however many retries this call
-/// takes, of every [`compute`]/[`apply_and_mark_drained`] span (and, through
-/// those, every per-transform [`apply_target`] span) a winning attempt
-/// makes. `attempt` is recorded once per loop iteration, so its final
-/// exported value is however many attempts this call actually took, not
-/// just the first.
+/// tree's apply phase — parent, across however many retries and pages this
+/// call takes, of every [`compute`]/[`apply_and_mark_drained`] span (and,
+/// through those, every per-transform [`apply_target`] span). `attempt` is
+/// recorded once per loop iteration, so its final exported value is however
+/// many attempts the last page took.
 #[tracing::instrument(
     name = "staging.drain_once",
     skip(pool, wake_channel, watermark),
@@ -9031,19 +9209,495 @@ pub async fn drain_once(
     wake_channel: &str,
     watermark: &StagedWatermark,
 ) -> Result<Option<ApplyOutcome>, ApplyError> {
-    let mut folded = {
+    let outcome = drain_segments(
+        pool,
+        &[seg_seq],
+        claimed_by,
+        live_workers,
+        wake_channel,
+        watermark,
+        DEFAULT_DRAIN_BATCH_CAP,
+        &mut DrainHooks::default(),
+    )
+    .await?;
+    Ok(outcome.map(|outcome| ApplyOutcome {
+        keys_written: outcome.keys_written,
+        keys_deleted: outcome.keys_deleted,
+        batch_drained: outcome
+            .segments_drained
+            .first()
+            .is_some_and(|&(_, drained)| drained),
+        deferral_counts: outcome.deferral_counts,
+        fairness_escalations: outcome.fairness_escalations,
+        pages: outcome.pages,
+    }))
+}
+
+/// Drains this worker's share of `seg_seqs` with the default
+/// [`DEFAULT_DRAIN_BATCH_CAP`]: see [`drain_many_with_cap`].
+#[cfg(any(test, feature = "internals"))]
+pub async fn drain_many(
+    pool: &Pool,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    live_workers: i64,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    drain_many_with_cap(
+        pool,
+        seg_seqs,
+        claimed_by,
+        live_workers,
+        wake_channel,
+        watermark,
+        DEFAULT_DRAIN_BATCH_CAP,
+    )
+    .await
+}
+
+/// Claims this worker's share of `seg_seqs` and drains it, holding at most
+/// `drain_batch_cap` folded records at a time (issue #620 A2a).
+///
+/// **Phase 1, the claim**, is `CLAIM_SQL` per segment and a commit, nothing
+/// else. The fold used to share the claim's transaction, so every peer's
+/// `CLAIM_SQL` queued on the uncommitted `sealed -> draining` flip and
+/// `seg_claims` rows for the whole fold (#328). The fenced window is immutable
+/// once fenced, so the fold needs no shared snapshot with the claim.
+///
+/// **The direct path.** When no held bucket has a `drain_cursor` row and the
+/// share, estimated from `segments.row_count` (rows over buckets, times the
+/// buckets held), fits the cap, each segment folds in full, with a `limit cap
+/// + 1` guard, and the merged records run one compute-and-apply pass whose
+/// transaction completes every held bucket: the pre-paging drain, one page.
+/// [`next_claimable_segments`] only coalesces segments whose row counts sum
+/// under the cap, so a coalesced batch takes this path.
+///
+/// **The paged path.** Otherwise (the estimate is over the cap, the guard
+/// tripped, or a bucket has a cursor from an earlier claimant), the first
+/// segment drains alone and any other is released for a later call. Its held
+/// buckets are grouped by cursor (all at the start, normally) and each group
+/// is walked in pages of at most `drain_batch_cap` records, keyset-ordered on
+/// [`fold::PageKey`] with the truncate sentinel first. Each page is its own
+/// compute-and-apply transaction: a non-final page checks the claim and
+/// advances the cursor, the final page completes (see [`end_segment_step`]).
+/// Quarantine isolation and the fuse see one page at a time. A page that
+/// fails surfaces its error like any drain failure; the caller releases the
+/// claim, and the next claimant resumes at that page.
+///
+/// Returns `Ok(None)` if this call's claims won nothing at all.
+///
+/// Issue #56/ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
+/// span this creates — same role, just parenting a coalesced batch's spans
+/// instead of a single segment's.
+#[tracing::instrument(
+    name = "staging.drain_many",
+    skip(pool, wake_channel, watermark),
+    fields(
+        claimed_by = %claimed_by,
+        segments = seg_seqs.len(),
+        attempt = tracing::field::Empty,
+    )
+)]
+pub async fn drain_many_with_cap(
+    pool: &Pool,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    live_workers: i64,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    drain_batch_cap: usize,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    drain_segments(
+        pool,
+        seg_seqs,
+        claimed_by,
+        live_workers,
+        wake_channel,
+        watermark,
+        drain_batch_cap,
+        &mut DrainHooks::default(),
+    )
+    .await
+}
+
+/// [`drain_many_with_cap`] with [`DrainHooks`], for the exactly-once tests.
+#[cfg(any(test, feature = "internals"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_many_with_hooks(
+    pool: &Pool,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    live_workers: i64,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    drain_batch_cap: usize,
+    hooks: &mut DrainHooks,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    drain_segments(
+        pool,
+        seg_seqs,
+        claimed_by,
+        live_workers,
+        wake_channel,
+        watermark,
+        drain_batch_cap,
+        hooks,
+    )
+    .await
+}
+
+/// The buckets this worker holds on one segment after Phase 1, with what the
+/// drain needs to choose its path.
+struct HeldShare {
+    seg_seq: i64,
+    bucket_count: i16,
+    buckets: Vec<i16>,
+    /// `segments.row_count` over `bucket_count`, times the buckets held: the
+    /// share's ring rows if routes spread evenly. Rows, not records, so it
+    /// over-counts a share whose keys repeat.
+    estimated_rows: i64,
+    /// Whether any held bucket has a `drain_cursor` row: an earlier claimant
+    /// committed pages of it, so this drain resumes rather than starts.
+    has_cursor: bool,
+}
+
+async fn held_share(
+    client: &impl GenericClient,
+    seg_seq: i64,
+    claimed_by: &str,
+) -> Result<HeldShare, ApplyError> {
+    let row = client
+        .query_one(
+            "select s.bucket_count, s.row_count, \
+                    array(select bucket from seg_claims \
+                          where seg_seq = $1 and claimed_by = $2 order by bucket), \
+                    exists (select 1 from drain_cursor c join seg_claims k \
+                              on k.seg_seq = c.seg_seq and k.bucket = c.bucket \
+                            where c.seg_seq = $1 and k.claimed_by = $2) \
+             from segments s where s.seg_seq = $1",
+            &[&seg_seq, &claimed_by],
+        )
+        .await?;
+    let bucket_count: i16 = row.get(0);
+    let row_count: i64 = row.get(1);
+    let buckets: Vec<i16> = row.get(2);
+    let has_cursor: bool = row.get(3);
+    let estimated_rows = row_count * buckets.len() as i64 / i64::from(bucket_count.max(1));
+    Ok(HeldShare {
+        seg_seq,
+        bucket_count,
+        buckets,
+        estimated_rows,
+        has_cursor,
+    })
+}
+
+impl HeldShare {
+    fn filter(&self, buckets: &[i16]) -> fold::BucketFilter {
+        fold::BucketFilter::buckets(
+            i64::from(self.bucket_count),
+            buckets.iter().map(|&b| i64::from(b)).collect(),
+        )
+    }
+}
+
+impl ManyApplyOutcome {
+    /// Folds one page's outcome into a running total across a paged drain.
+    fn absorb(&mut self, page: ManyApplyOutcome) {
+        self.keys_written += page.keys_written;
+        self.keys_deleted += page.keys_deleted;
+        for (seg_seq, drained) in page.segments_drained {
+            match self
+                .segments_drained
+                .iter_mut()
+                .find(|(s, _)| *s == seg_seq)
+            {
+                Some(entry) => entry.1 = drained,
+                None => self.segments_drained.push((seg_seq, drained)),
+            }
+        }
+        for (label, count) in page.deferral_counts {
+            *self.deferral_counts.entry(label).or_default() += count;
+        }
+        self.fairness_escalations += page.fairness_escalations;
+        self.pages += page.pages;
+    }
+}
+
+/// The body [`drain_once`], [`drain_many_with_cap`] and
+/// [`drain_many_with_hooks`] share; see [`drain_many_with_cap`].
+#[allow(clippy::too_many_arguments)]
+async fn drain_segments(
+    pool: &Pool,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+    live_workers: i64,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    drain_batch_cap: usize,
+    hooks: &mut DrainHooks,
+) -> Result<Option<ManyApplyOutcome>, ApplyError> {
+    let cap = drain_batch_cap.max(1);
+    if seg_seqs.is_empty() {
+        return Ok(None);
+    }
+
+    // Phase 1: the claim, committed on its own. Segments are claimed in
+    // order until one would take the batch past the cap: a share that must
+    // page (over the cap, or resuming a cursor) drains alone, so it either
+    // comes first and ends the batch, or its claim is undone in this same
+    // transaction and a later call takes it. A segment whose buckets peers
+    // already hold costs nothing here, so a later segment still coalesces
+    // behind it.
+    let held: Vec<HeldShare> = {
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        claim::claim(&*txn, seg_seq, claimed_by, live_workers).await?;
-        let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by).await?;
-        if filter.is_empty() {
-            txn.commit().await?;
-            return Ok(None);
+        let mut held: Vec<HeldShare> = Vec::with_capacity(seg_seqs.len());
+        let mut estimated: i64 = 0;
+        for &seg_seq in seg_seqs {
+            // Never commit a claim on a segment whose fence isn't published
+            // yet (seal phase 1 done, phase 2 not): `CLAIM_SQL`'s `sealed ->
+            // draining` flip would then commit, and phase 2 (and the stuck-seal
+            // recovery) only ever fence a segment still `sealed`, so it would
+            // stay unfenced, and undrainable, for good. The fold used to share
+            // this transaction and fail on the missing fence, rolling the flip
+            // back; now the claim commits first, so the check comes first. A
+            // fence only ever goes from absent to present, so a segment fenced
+            // here stays fenced.
+            let fenced: bool = txn
+                .query_one(
+                    "select fence_snapshot is not null from segments where seg_seq = $1",
+                    &[&seg_seq],
+                )
+                .await?
+                .get(0);
+            if !fenced {
+                if held.is_empty() {
+                    return Err(StagingError::UnfencedSealedSegment { seg_seq }.into());
+                }
+                break;
+            }
+            claim::claim(&*txn, seg_seq, claimed_by, live_workers).await?;
+            let share = held_share(&*txn, seg_seq, claimed_by).await?;
+            if share.buckets.is_empty() {
+                continue;
+            }
+            let pages = share.has_cursor || share.estimated_rows > cap as i64;
+            if held.is_empty() {
+                estimated = share.estimated_rows;
+                held.push(share);
+                if pages {
+                    break;
+                }
+            } else if pages || estimated + share.estimated_rows > cap as i64 {
+                super::liveness::release(&*txn, seg_seq, claimed_by).await?;
+                break;
+            } else {
+                estimated += share.estimated_rows;
+                held.push(share);
+            }
         }
-        let folded = fold::fold(&txn, seg_seq, filter).await?;
         txn.commit().await?;
-        folded
+        held
     };
+    if held.is_empty() {
+        return Ok(None);
+    }
+
+    let estimated: i64 = held.iter().map(|share| share.estimated_rows).sum();
+    if !held.iter().any(|share| share.has_cursor) && estimated <= cap as i64 {
+        let per_segment = {
+            let mut client = pool.get().await?;
+            let txn = client.transaction().await?;
+            let mut per_segment = Vec::with_capacity(held.len());
+            let mut total = 0usize;
+            for share in &held {
+                let folded =
+                    fold::fold_limited(&txn, share.seg_seq, &share.filter(&share.buckets), cap + 1)
+                        .await?;
+                total += folded.len();
+                per_segment.push(folded);
+                if total > cap {
+                    break;
+                }
+            }
+            txn.commit().await?;
+            (total <= cap).then_some(per_segment)
+        };
+        if let Some(per_segment) = per_segment {
+            let steps: Vec<SegmentStep> = held
+                .iter()
+                .map(|share| SegmentStep {
+                    seg_seq: share.seg_seq,
+                    page: Some(PageClaim {
+                        buckets: share.buckets.clone(),
+                        held: share.buckets.clone(),
+                        next: None,
+                    }),
+                })
+                .collect();
+            if let Some(n) = pause_before(hooks, 1) {
+                pause(n).await;
+            }
+            let outcome = drain_batch(
+                pool,
+                fold::merge_folded_changes(per_segment),
+                &steps,
+                claimed_by,
+                wake_channel,
+                watermark,
+            )
+            .await?;
+            return Ok(Some(outcome));
+        }
+        tracing::debug!(
+            seg_seq = held[0].seg_seq,
+            cap,
+            "direct fold's guard tripped: the share holds more than the cap; paging instead"
+        );
+    }
+
+    // Paged: the first segment drains alone. Only a tripped guard gets here
+    // holding more than one; the others go back for a later call.
+    if held.len() > 1 {
+        let client = pool.get().await?;
+        for share in &held[1..] {
+            super::liveness::release(&**client, share.seg_seq, claimed_by).await?;
+        }
+    }
+    let share = &held[0];
+    let cursors = if share.has_cursor {
+        let client = pool.get().await?;
+        super::page::read_cursors(&**client, share.seg_seq, &share.buckets).await?
+    } else {
+        HashMap::new()
+    };
+    let mut groups: BTreeMap<Option<fold::PageKey>, Vec<i16>> = BTreeMap::new();
+    for &bucket in &share.buckets {
+        groups
+            .entry(cursors.get(&bucket).cloned())
+            .or_default()
+            .push(bucket);
+    }
+
+    let mut still_held: Vec<i16> = share.buckets.clone();
+    let mut total = ManyApplyOutcome {
+        keys_written: 0,
+        keys_deleted: 0,
+        segments_drained: Vec::new(),
+        deferral_counts: HashMap::new(),
+        fairness_escalations: 0,
+        pages: 0,
+    };
+    let mut records = 0usize;
+    for (start, buckets) in groups {
+        let mut source = super::page::RescanPages::new(pool, share.seg_seq, share.filter(&buckets));
+        let mut after = start;
+        loop {
+            let page = super::page::PageSource::next_page(&mut source, after.as_ref(), cap).await?;
+            records += page.records.len();
+            let step = SegmentStep {
+                seg_seq: share.seg_seq,
+                page: Some(PageClaim {
+                    buckets: buckets.clone(),
+                    held: still_held.clone(),
+                    next: page.next.clone(),
+                }),
+            };
+            if let Some(n) = pause_before(hooks, total.pages + 1) {
+                pause(n).await;
+            }
+            let outcome = drain_batch(
+                pool,
+                page.records,
+                std::slice::from_ref(&step),
+                claimed_by,
+                wake_channel,
+                watermark,
+            )
+            .await?;
+            total.absorb(outcome);
+            if hooks
+                .stop_after_pages
+                .is_some_and(|stop| total.pages >= stop)
+            {
+                return Ok(Some(total));
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        still_held.retain(|bucket| !buckets.contains(bucket));
+    }
+    tracing::info!(
+        seg_seq = share.seg_seq,
+        pages = total.pages,
+        records,
+        cap,
+        "paged drain: the share was larger than the drain batch cap"
+    );
+    Ok(Some(total))
+}
+
+/// Takes [`DrainHooks::pause_before_page`]'s channels when `page` is the one
+/// it names.
+fn pause_before(
+    hooks: &mut DrainHooks,
+    page: usize,
+) -> Option<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+)> {
+    if hooks
+        .pause_before_page
+        .as_ref()
+        .is_some_and(|(n, ..)| *n == page)
+    {
+        hooks
+            .pause_before_page
+            .take()
+            .map(|(_, paused, resume)| (paused, resume))
+    } else {
+        None
+    }
+}
+
+async fn pause(
+    (paused, resume): (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ),
+) {
+    let _ = paused.send(());
+    let _ = resume.await;
+}
+
+/// Phase 2 (compute) and Phase 3 (apply, then `steps`' claim endings) over one
+/// batch of folded records, retrying on a version-fence miss, a transient
+/// failure, or an isolated-and-evicted poison key — the design doc's
+/// "reload, recompute, retry" loop, using [`FenceMissBackoff`] between
+/// attempts. One call is one page: the direct path's whole share, or one page
+/// of an oversized one.
+async fn drain_batch(
+    pool: &Pool,
+    mut folded: Vec<FoldedChange>,
+    steps: &[SegmentStep],
+    claimed_by: &str,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+) -> Result<ManyApplyOutcome, ApplyError> {
+    // Every retry-classification helper below (`classify_and_retry`,
+    // `isolate_and_evict`) takes one representative `seg_seq` purely as
+    // audit/probe bookkeeping (which batch's contribution a parked poison
+    // row names; which real claim a rollback-only probe transaction's
+    // completion step exercises) — never as something correctness depends
+    // on picking exactly right among several equally-valid coalesced
+    // segments. The lowest of this call's segments is as good a
+    // representative as any; see `apply_page`'s doc comment on the same
+    // choice for `poisoned_park`.
+    let representative_seg_seq = steps[0].seg_seq;
 
     let mut backoff = FenceMissBackoff::new();
     let mut attempt = 0u32;
@@ -9061,7 +9715,7 @@ pub async fn drain_once(
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.
                 tracing::warn!(
-                    seg_seq,
+                    seg_seq = representative_seg_seq,
                     source_table = %source_table,
                     "source table no longer exists; purging its staged rows and retrying \
                      without it"
@@ -9078,182 +9732,6 @@ pub async fn drain_once(
             // surely as it would fail Phase 3, and isolation must attribute
             // it the same way regardless of which phase first tripped over
             // it.
-            Err(err) => {
-                if let Some(retry_folded) = classify_and_retry(
-                    pool,
-                    seg_seq,
-                    claimed_by,
-                    wake_channel,
-                    &folded,
-                    attempt,
-                    &mut backoff,
-                    err,
-                )
-                .await?
-                {
-                    folded = retry_folded;
-                }
-                continue;
-            }
-        };
-
-        let mut client = pool.get().await?;
-        let txn = client.transaction().await?;
-        match apply_and_mark_drained(&txn, seg_seq, claimed_by, &plan, wake_channel, watermark)
-            .await
-        {
-            Ok(outcome) => {
-                txn.commit().await?;
-                // Epic #49 cross-cutting review fix (issues #51/#52): only
-                // flush `plan`'s buffered metrics now, once this attempt's
-                // transaction has actually committed — never from inside
-                // `compute` itself, which the loop above may have called
-                // more than once for this same `folded` input.
-                flush_apply_metrics(&plan);
-                // Issue #134/#135 review follow-up: same post-commit-only
-                // contract, for the deferral counters this attempt's own
-                // Phase 3 pass discovered.
-                flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
-                // Issue #135: same post-commit-only contract, for the
-                // fairness-escalation count this attempt's own Phase 3 pass
-                // discovered.
-                flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
-                backoff.reset();
-                return Ok(Some(outcome));
-            }
-            Err(err) => {
-                let _ = txn.rollback().await;
-                if let Some(retry_folded) = classify_and_retry(
-                    pool,
-                    seg_seq,
-                    claimed_by,
-                    wake_channel,
-                    &folded,
-                    attempt,
-                    &mut backoff,
-                    err,
-                )
-                .await?
-                {
-                    folded = retry_folded;
-                }
-            }
-        }
-    }
-}
-
-/// The most sealed segments [`drain_many`] will coalesce into a single
-/// compute-and-apply pass. A burst of incremental writes seals a new
-/// segment roughly every 300ms (`ClientOptions::maintenance_interval`'s
-/// default); this bounds how much of that backlog one drain call takes on
-/// at once, so a very long burst still drains in several coalesced calls
-/// rather than one unbounded one holding a single transaction (and its
-/// locks) open over an ever-growing plan.
-pub const MAX_COALESCE_SEGMENTS: usize = 32;
-
-/// [`drain_once`] generalized over more than one sealed segment (issue #63
-/// Milestone 2): claims and folds every segment in `seg_seqs` in one short
-/// transaction (Phase 1), merges their folded changes into one
-/// [`fold::merge_folded_changes`] list, then runs Phase 2 (compute) and
-/// Phase 3 (apply ∪ mark-drained, via [`apply_and_mark_drained_many`])
-/// exactly *once* over the merged list — collapsing what would have been
-/// one full compute-and-apply pass per segment (each with its own version
-/// fence read, its own ordered pre-lock/upsert, its own forced-group
-/// bulk-recompute for any [`crate::defs::ast::KeySpace::Aggregate`] target,
-/// and its own downstream-propagation staging) into one such pass for the
-/// whole batch.
-///
-/// `seg_seqs` should come from [`next_claimable_segments`], which already
-/// enforces the invariant this function relies on but does not itself
-/// re-check: never mix a truncate-bearing segment with any other (a
-/// truncate is drained alone — see that function's own doc comment on the
-/// barrier). `seg_seqs` need not be claimable in full — a segment every one
-/// of whose buckets a peer already holds simply contributes nothing and is
-/// dropped before Phase 2 runs (mirroring [`drain_once`]'s `filter.is_empty()`
-/// short-circuit, just per-segment instead of for the one segment it has).
-///
-/// Returns `Ok(None)` if this call's claims won nothing at all across every
-/// segment in `seg_seqs` (every bucket of every one of them was already
-/// claimed by a peer). Otherwise returns the winning attempt's
-/// [`ManyApplyOutcome`], covering only the segments this call actually
-/// claimed at least one bucket from — never a segment it claimed nothing
-/// on, which [`apply_and_mark_drained_many`]'s completion step would
-/// otherwise misreport as [`ApplyError::ClaimLost`].
-///
-/// Issue #56/ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
-/// span this creates — same role, just parenting a coalesced batch's spans
-/// instead of a single segment's.
-#[tracing::instrument(
-    name = "staging.drain_many",
-    skip(pool, wake_channel, watermark),
-    fields(
-        claimed_by = %claimed_by,
-        segments = seg_seqs.len(),
-        attempt = tracing::field::Empty,
-    )
-)]
-pub async fn drain_many(
-    pool: &Pool,
-    seg_seqs: &[i64],
-    claimed_by: &str,
-    live_workers: i64,
-    wake_channel: &str,
-    watermark: &StagedWatermark,
-) -> Result<Option<ManyApplyOutcome>, ApplyError> {
-    if seg_seqs.is_empty() {
-        return Ok(None);
-    }
-
-    let (mut folded, owned_segments) = {
-        let mut client = pool.get().await?;
-        let txn = client.transaction().await?;
-        let mut per_segment: Vec<Vec<FoldedChange>> = Vec::with_capacity(seg_seqs.len());
-        let mut owned: Vec<i64> = Vec::with_capacity(seg_seqs.len());
-        for &seg_seq in seg_seqs {
-            claim::claim(&*txn, seg_seq, claimed_by, live_workers).await?;
-            let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by).await?;
-            if filter.is_empty() {
-                continue;
-            }
-            owned.push(seg_seq);
-            per_segment.push(fold::fold(&txn, seg_seq, filter).await?);
-        }
-        txn.commit().await?;
-        if owned.is_empty() {
-            return Ok(None);
-        }
-        (fold::merge_folded_changes(per_segment), owned)
-    };
-
-    // Every retry-classification helper below (`classify_and_retry`,
-    // `isolate_and_evict`) takes one representative `seg_seq` purely as
-    // audit/probe bookkeeping (which batch's contribution a parked poison
-    // row names; which real claim a rollback-only probe transaction's
-    // completion step exercises) — never as something correctness depends
-    // on picking exactly right among several equally-valid coalesced
-    // segments. The lowest of this call's owned segments is as good a
-    // representative as any; see `apply_and_mark_drained_many`'s doc
-    // comment on the same choice for `poisoned_park`.
-    let representative_seg_seq = owned_segments[0];
-
-    let mut backoff = FenceMissBackoff::new();
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        tracing::Span::current().record("attempt", attempt);
-        let plan = match compute(pool, &folded).await {
-            Ok(plan) => plan,
-            Err(ApplyError::SourceTableDropped { source_table }) => {
-                tracing::warn!(
-                    source_table = %source_table,
-                    "source table no longer exists; purging its staged rows and retrying \
-                     without it"
-                );
-                quarantine::purge_dropped_table(pool, &source_table).await?;
-                folded.retain(|c| c.src_table != source_table);
-                attempt -= 1;
-                continue;
-            }
             Err(err) => {
                 if let Some(retry_folded) = classify_and_retry(
                     pool,
@@ -9275,32 +9753,24 @@ pub async fn drain_many(
 
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        match apply_and_mark_drained_many(
-            &txn,
-            &owned_segments,
-            claimed_by,
-            &plan,
-            wake_channel,
-            watermark,
-        )
-        .await
-        {
+        match apply_page(&txn, steps, claimed_by, &plan, wake_channel, watermark).await {
             Ok(outcome) => {
                 txn.commit().await?;
-                // Epic #49 cross-cutting review fix (issues #51/#52): see
-                // `drain_once`'s matching call — flush only now that this
-                // attempt's (possibly multi-segment) transaction has
-                // actually committed.
+                // Epic #49 cross-cutting review fix (issues #51/#52): only
+                // flush `plan`'s buffered metrics now, once this attempt's
+                // transaction has actually committed — never from inside
+                // `compute` itself, which the loop above may have called
+                // more than once for this same `folded` input.
                 flush_apply_metrics(&plan);
-                // Issue #134/#135 review follow-up: see `drain_once`'s
-                // matching call.
+                // Issue #134/#135 review follow-up: same post-commit-only
+                // contract, for the deferral counters this attempt's own
+                // Phase 3 pass discovered.
                 flush_relationship_reverse_deferral_metrics(&outcome.deferral_counts);
                 // Issue #135: same post-commit-only contract, for the
                 // fairness-escalation count this attempt's own Phase 3 pass
                 // discovered.
                 flush_relationship_reverse_fairness_escalation_metric(outcome.fairness_escalations);
-                backoff.reset();
-                return Ok(Some(outcome));
+                return Ok(outcome);
             }
             Err(err) => {
                 let _ = txn.rollback().await;
@@ -9351,6 +9821,14 @@ async fn classify_and_retry(
     backoff: &mut FenceMissBackoff,
     err: ApplyError,
 ) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+    // Issue #620 A2a: a lost claim is nobody's key's fault, and nothing in
+    // this call can get it back. Isolating it would probe every record under
+    // the same lost claim, reproduce `ClaimLost` for each, and charge every
+    // key in the page a death. Surface it: the caller releases, and whoever
+    // holds the buckets now resumes from the last committed cursor.
+    if matches!(err, ApplyError::ClaimLost) {
+        return Err(err);
+    }
     match quarantine::classify(&err) {
         // Version fence miss: reload schema and retry, backing off only on
         // consecutive misses — `FenceMissBackoff` is exactly that state
@@ -9522,39 +10000,45 @@ pub async fn next_claimable_segment(
     Ok(next_claimable_segments(client, 1).await?.into_iter().next())
 }
 
-/// [`next_claimable_segment`] generalized to return up to `max_batch`
-/// claimable segments at once (issue #63 Milestone 2), for [`drain_many`] to
-/// coalesce — the batch a burst of quickly-sealing segments needs so each
-/// one doesn't pay its own full compute-and-apply pass.
+/// [`next_claimable_segment`] generalized to return several claimable
+/// segments at once (issue #63 Milestone 2), for [`drain_many`] to coalesce —
+/// the batch a burst of quickly-sealing segments needs so each one doesn't
+/// pay its own full compute-and-apply pass.
+///
+/// Issue #620 A2a: bounded by `drain_batch_cap`, not a segment count. The
+/// first segment always comes back, however large; the ones after it come
+/// back in ascending order while their `segments.row_count`s sum to at most
+/// the cap (an oversized first segment doesn't count against them: if peers
+/// hold all of it, this worker coalesces what follows instead of idling).
+/// [`drain_many`] then claims in order and stops at the first share that
+/// must page, so an oversized segment still drains alone. Row counts are
+/// ring rows, never fewer than the folded records they produce, so a
+/// coalesced batch's shares fit the cap by construction (up to the late rows
+/// the direct fold's guard exists for).
 ///
 /// Runs the exact same barrier-respecting query [`next_claimable_segment`]
-/// does (see its doc comment for the truncate barrier `B`), just without
-/// `next_claimable_segment`'s `limit 1`. The only additional rule this adds
-/// is the one [`drain_many`]'s doc comment calls out as its caller-side
-/// invariant: **a truncate-bearing segment is never coalesced with another
-/// segment.** Because `B` is by definition the *lowest* seg_seq among
-/// undrained truncate-bearing segments and this query never returns
-/// anything past `B`, the only truncate-bearing segment that can ever
-/// appear in the result set is `B` itself, and — being the barrier's own
-/// upper bound — it is always the *last* (highest-`seg_seq`) row, never the
-/// first. So: walk the ascending rows, taking ordinary (non-truncate)
-/// segments into the batch; the moment a truncate-bearing row is reached,
-/// stop — returning it alone if the batch collected so far is otherwise
-/// empty (it's the lowest claimable segment, so it must be handed out on
-/// its own), or returning what's already been collected without it
+/// does (see its doc comment for the truncate barrier `B`). The only
+/// additional rule this adds is the one [`drain_many`]'s doc comment calls
+/// out as its caller-side invariant: **a truncate-bearing segment is never
+/// coalesced with another segment.** Because `B` is by definition the
+/// *lowest* seg_seq among undrained truncate-bearing segments and this query
+/// never returns anything past `B`, the only truncate-bearing segment that
+/// can ever appear in the result set is `B` itself, and — being the
+/// barrier's own upper bound — it is always the *last* (highest-`seg_seq`)
+/// row, never the first. So: walk the ascending rows, taking ordinary
+/// (non-truncate) segments into the batch; the moment a truncate-bearing row
+/// is reached, stop — returning it alone if the batch collected so far is
+/// otherwise empty (it's the lowest claimable segment, so it must be handed
+/// out on its own), or returning what's already been collected without it
 /// otherwise (it'll be handed out alone on some future call, once nothing
 /// ordinary remains ahead of it).
 pub async fn next_claimable_segments(
     client: &impl GenericClient,
-    max_batch: usize,
+    drain_batch_cap: usize,
 ) -> Result<Vec<i64>, ApplyError> {
-    if max_batch == 0 {
-        return Ok(Vec::new());
-    }
-    let limit = max_batch as i64;
     let rows = client
         .query(
-            "select seg_seq, has_truncate from segments \
+            "select seg_seq, has_truncate, row_count from segments \
              where state in ('sealed', 'draining') \
                and drained_mask <> ((1::bigint << bucket_count) - 1) \
                and seg_seq <= coalesce( \
@@ -9563,21 +10047,35 @@ pub async fn next_claimable_segments(
                       and drained_mask <> ((1::bigint << bucket_count) - 1)), \
                    seg_seq \
                ) \
-             order by seg_seq asc \
-             limit $1",
-            &[&limit],
+             order by seg_seq asc",
+            &[],
         )
         .await?;
 
+    let cap = drain_batch_cap as i64;
+    let mut rows_taken: i64 = 0;
     let mut batch = Vec::with_capacity(rows.len());
     for row in rows {
         let seg_seq: i64 = row.get(0);
         let has_truncate: bool = row.get(1);
+        let row_count: i64 = row.get(2);
         if has_truncate {
             if batch.is_empty() {
                 batch.push(seg_seq);
             }
             break;
+        }
+        if batch.is_empty() {
+            // The first segment always comes back. When it is over the cap it
+            // pages alone if this worker wins any of it, and costs nothing if
+            // peers hold all of it, so it doesn't count against the ones after.
+            if row_count <= cap {
+                rows_taken = row_count;
+            }
+        } else if row_count > cap || rows_taken + row_count > cap {
+            break;
+        } else {
+            rows_taken += row_count;
         }
         batch.push(seg_seq);
     }

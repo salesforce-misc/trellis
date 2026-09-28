@@ -70,6 +70,7 @@ impl BucketFilter {
     /// Whether this filter names no buckets at all — the signal
     /// [`super::apply::drain_once`] uses to short-circuit a claim attempt
     /// that won (and owns) nothing, before folding or computing anything.
+    #[cfg(any(test, feature = "internals"))]
     pub fn is_empty(&self) -> bool {
         self.buckets.is_empty()
     }
@@ -259,20 +260,205 @@ const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
 /// window. See the module doc and docs/.../04-claiming-and-the-fold.md for
 /// the rules this SQL encodes.
 ///
-/// Takes a `&Transaction` rather than any `GenericClient`: the fold is meant
-/// to run inside the claim's transaction, atomically with the apply (#11),
-/// and the type enforces that rather than relying on a caller to remember
-/// it — `SET LOCAL work_mem` would otherwise silently evaporate on a bare
-/// autocommit `Client`.
+/// Takes a `&Transaction` rather than any `GenericClient` so `SET LOCAL
+/// work_mem` can't silently evaporate on a bare autocommit `Client`. Since
+/// issue #620 the drain runs it in its own read transaction, after the claim
+/// has committed: the fenced window is immutable, so nothing depends on the
+/// fold sharing the claim's snapshot.
+///
+/// Unbounded: this returns the whole share. The drain itself never calls it
+/// that way; it uses [`fold_limited`] or pages ([`page_boundary`] and
+/// [`fold_page`]) so what it holds in memory is bounded by
+/// `ClientOptions::drain_batch_cap`.
+#[cfg(any(test, feature = "internals"))]
 pub async fn fold(
     txn: &Transaction<'_>,
     seg_seq: i64,
     bucket: BucketFilter,
 ) -> Result<Vec<FoldedChange>, StagingError> {
+    fold_scoped(txn, seg_seq, &bucket, None, None, None).await
+}
+
+/// [`fold`] with a `limit`: at most `limit` records, in no particular order
+/// (issue #620). The direct fold's guard: a drain whose share should fit the
+/// cap by the seal's row count folds with `limit cap + 1`, and a full result
+/// means the estimate was wrong (the fenced window can hold a predecessor's
+/// late rows the count never saw), so the drain pages instead.
+pub(crate) async fn fold_limited(
+    txn: &Transaction<'_>,
+    seg_seq: i64,
+    bucket: &BucketFilter,
+    limit: usize,
+) -> Result<Vec<FoldedChange>, StagingError> {
+    fold_scoped(txn, seg_seq, bucket, None, None, Some(limit)).await
+}
+
+/// One page of the fold (issue #620): the records whose [`PageKey`] is
+/// strictly after `after` (from the start when `None`) and at or before
+/// `through` (to the end when `None`). A key's page key is fixed by the key
+/// itself, so every ring row of one key lands in the same page: a key never
+/// splits inside a segment, which is what keeps the fold's whole-window rules
+/// (first old image, last new image, `ends_in_delete`, `vanished_images`) and
+/// `poison_held`'s `(src_table, key, seg_seq)` key sound under paging.
+///
+/// The truncate-void filter still reads every truncate in the fenced window,
+/// not just this page's: a page past the one holding the truncate sentinel
+/// must still drop a key's rows at or below that truncate. Only the
+/// `filtered` rows are narrowed to the page.
+pub(crate) async fn fold_page(
+    txn: &Transaction<'_>,
+    seg_seq: i64,
+    bucket: &BucketFilter,
+    after: Option<&PageKey>,
+    through: Option<&PageKey>,
+) -> Result<Vec<FoldedChange>, StagingError> {
+    fold_scoped(txn, seg_seq, bucket, Some(after), through, None).await
+}
+
+/// Where one key sorts in a bucket's page order (issue #620, ADR-0002 I8):
+/// `(route, src_table, key)`, compared byte-wise (`collate "C"`). `route` is
+/// the ring row's stored hash, which already defines buckets, so the sort
+/// leads with an integer; `key` breaks ties between keys that hash alike.
+///
+/// A truncate sentinel's `route` is `-1`, below every real key's (a real
+/// route is masked to 31 bits, never negative), so the clear always lands on
+/// page 1, before any key of the segment applies. Truncate segments seal with
+/// one bucket, so one worker runs their pages in order.
+///
+/// Stored per bucket in `drain_cursor` as the last key a committed page
+/// covered; the next page starts strictly after it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageKey {
+    pub route: i64,
+    pub src_table: String,
+    pub key: String,
+}
+
+/// `TRUNCATE_SENTINEL_KEY` bound as a query parameter, in a `static` so the
+/// parameter list can borrow it for any lifetime.
+static PAGE_SENTINEL_KEY: &str = super::append::TRUNCATE_SENTINEL_KEY;
+
+/// The page-key row expression over a ring row's own columns, with the
+/// truncate sentinel bound at `$sentinel_idx`. The one definition both the
+/// boundary query and the page fold compare against, so the two agree on
+/// order and on equality.
+fn page_key_sql(sentinel_idx: usize) -> String {
+    format!(
+        "(case when key = ${sentinel_idx}::text then -1::bigint else route end, \
+          src_table collate \"C\", key collate \"C\")"
+    )
+}
+
+/// Pushes the bounds (and, unless the caller already bound it at
+/// `sentinel_idx`, the sentinel) onto `params` and returns the `and ...`
+/// clause restricting a ring row to `(after, through]`. Pushes nothing and
+/// returns an empty clause when both bounds are open: an unreferenced
+/// parameter would fail to type.
+fn push_page_range<'a>(
+    params: &mut Vec<&'a (dyn ToSql + Sync)>,
+    sentinel_idx: Option<usize>,
+    after: Option<&'a PageKey>,
+    through: Option<&'a PageKey>,
+) -> String {
+    if after.is_none() && through.is_none() {
+        return String::new();
+    }
+    let sentinel_idx = sentinel_idx.unwrap_or_else(|| {
+        params.push(&PAGE_SENTINEL_KEY);
+        params.len()
+    });
+    let key = page_key_sql(sentinel_idx);
+    let mut clause = String::new();
+    for (bound, op) in [(after, ">"), (through, "<=")] {
+        if let Some(bound) = bound {
+            params.push(&bound.route);
+            params.push(&bound.src_table);
+            params.push(&bound.key);
+            let i = params.len() - 2;
+            clause.push_str(&format!(
+                " and {key} {op} (${i}::bigint, ${}::text collate \"C\", ${}::text collate \"C\")",
+                i + 1,
+                i + 2
+            ));
+        }
+    }
+    clause
+}
+
+/// The rescan pager's boundary query (issue #620): the page key the next page
+/// ends at, or `None` when at most `cap` keys remain after `after`, so the
+/// next page is the share's last and runs to its end.
+///
+/// A top-K over the distinct page keys of `bucket`'s rows after `after`:
+/// `offset cap - 1 limit 2` returns the `cap`-th key and, when more remain,
+/// the one after it. Counts keys, not records, so a key whose every row a
+/// truncate voids still counts: a page can come out with fewer than `cap`
+/// records, never more.
+pub(crate) async fn page_boundary(
+    txn: &Transaction<'_>,
+    seg_seq: i64,
+    bucket: &BucketFilter,
+    after: Option<&PageKey>,
+    cap: usize,
+) -> Result<Option<PageKey>, StagingError> {
+    txn.batch_execute(FOLD_WORK_MEM).await?;
+    let (window_sql, fence_params) = fenced_window(txn, seg_seq, "src_table, key, route").await?;
+    let offset = cap.max(1) as i64 - 1;
+
+    let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
+        .iter()
+        .map(|p| p as &(dyn ToSql + Sync))
+        .collect();
+    params.push(&bucket.bucket_count);
+    let bucket_count_idx = params.len();
+    params.push(&bucket.buckets);
+    let buckets_idx = params.len();
+    params.push(&PAGE_SENTINEL_KEY);
+    let sentinel_idx = params.len();
+    let range = push_page_range(&mut params, Some(sentinel_idx), after, None);
+    params.push(&offset);
+    let offset_idx = params.len();
+
+    let sql = format!(
+        "with fenced as ({window_sql}) \
+         select page_route, src_table, key from ( \
+             select distinct \
+                 case when key = ${sentinel_idx}::text then -1::bigint else route end \
+                     as page_route, \
+                 src_table collate \"C\" as src_table, \
+                 key collate \"C\" as key \
+             from fenced \
+             where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) {range} \
+         ) keys \
+         order by page_route, src_table, key \
+         offset ${offset_idx} limit 2"
+    );
+    let rows = txn.query(&sql, &params).await?;
+    if rows.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(PageKey {
+        route: rows[0].get(0),
+        src_table: rows[0].get(1),
+        key: rows[0].get(2),
+    }))
+}
+
+/// The shared body of [`fold`], [`fold_limited`] and [`fold_page`]. `page`
+/// is `Some(after)` for a page (`after` itself may be `None`: the first page),
+/// `None` for the unpaged fold.
+async fn fold_scoped(
+    txn: &Transaction<'_>,
+    seg_seq: i64,
+    bucket: &BucketFilter,
+    page: Option<Option<&PageKey>>,
+    through: Option<&PageKey>,
+    limit: Option<usize>,
+) -> Result<Vec<FoldedChange>, StagingError> {
     txn.batch_execute(FOLD_WORK_MEM).await?;
 
     let (window_sql, fence_params) = fenced_window(txn, seg_seq, FOLD_COLUMNS).await?;
-    let sql = fold_sql(&window_sql, fence_params.len());
+    let limit = limit.map(|l| l as i64);
 
     let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
         .iter()
@@ -280,6 +466,18 @@ pub async fn fold(
         .collect();
     params.push(&bucket.bucket_count);
     params.push(&bucket.buckets);
+    let range = match page {
+        Some(after) => push_page_range(&mut params, None, after, through),
+        None => String::new(),
+    };
+    let tail = match &limit {
+        Some(limit) => {
+            params.push(limit);
+            format!(" limit ${}", params.len())
+        }
+        None => String::new(),
+    };
+    let sql = fold_sql(&window_sql, fence_params.len(), &range, &tail);
 
     let rows = txn.query(&sql, &params).await?;
     Ok(rows
@@ -316,8 +514,10 @@ pub async fn fold(
 
 /// The fold statement over `window_sql` (the fenced window, binding
 /// `$1..=$fence_param_count`), with the bucket count and bucket list bound
-/// as the next two parameters.
-fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
+/// as the next two parameters. `range` is appended to the `filtered` rows'
+/// predicate (a page's key range, issue #620; empty for the whole share) and
+/// `tail` to the statement (a `limit`, or empty).
+fn fold_sql(window_sql: &str, fence_param_count: usize, range: &str, tail: &str) -> String {
     let bucket_count_idx = fence_param_count + 1;
     let buckets_idx = fence_param_count + 2;
 
@@ -432,7 +632,7 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
          ), \
          filtered as ( \
              select * from fenced f \
-             where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) \
+             where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) {range} \
                and not exists ( \
                    select 1 from truncates t \
                    where t.src_table = f.src_table \
@@ -481,7 +681,7 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
              end as vanished_images, \
              coalesce({last}[1][2] = 'delete', false) as ends_in_delete \
          from filtered \
-         group by src_table, key"
+         group by src_table, key{tail}"
     )
 }
 
@@ -1367,7 +1567,7 @@ mod plan_tests {
                 fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
                     .await
                     .expect("fenced window");
-            let sql = fold_sql(&window_sql, fence_params.len());
+            let sql = fold_sql(&window_sql, fence_params.len(), "", "");
             let bucket = BucketFilter::all();
             let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
                 .iter()
@@ -1479,7 +1679,7 @@ mod plan_tests {
         let (window_sql, fence_params) = fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
             .await
             .expect("fenced window");
-        let sql = fold_sql(&window_sql, fence_params.len());
+        let sql = fold_sql(&window_sql, fence_params.len(), "", "");
         let bucket = BucketFilter::all();
         let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
             .iter()
