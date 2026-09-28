@@ -65,7 +65,7 @@ class RailsTest < Minitest::Test
   # Trellis.migrate needs no ActiveRecord, so neither does the task: it
   # mustn't load the migration helpers, which do (issue #645).
   def test_trellis_migrate_runs_in_an_app_without_active_record
-    assert_equal({ "connected" => false, "connected_after_migrate" => false },
+    assert_equal({ "connected" => false, "connected_after_migrate" => false, "active_record" => false },
                  boot("rake_without_active_record"))
   end
 

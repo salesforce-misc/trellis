@@ -67,6 +67,8 @@ when "rake", "rake_without_active_record"
       seen[:connected] = Trellis.connected?
       Rake::Task["trellis:migrate"].invoke
       seen[:connected_after_migrate] = Trellis.connected?
+      # The scenario's premise: nothing loaded ActiveRecord.
+      seen[:active_record] = defined?(::ActiveRecord) ? true : false if WITHOUT_ACTIVE_RECORD
     end
     rake.top_level
   end

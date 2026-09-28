@@ -129,7 +129,7 @@ runs check the same shapes.
 The Ruby suite checks its Rails integration the same way. Each migration
 helper (`Trellis::Migration#define`, `#apply` and `#status`) has to be the
 fixture operation of the same name. Its other public calls
-(`Trellis::Railtie.connect` and `.connect_options`, and
+(`Trellis::Railtie.connect`, `.connect_options` and `.with_handle`, and
 `Trellis::Migration.with_handle`) are Rails-only, and `Parity::RAILS_ONLY`
 lists each with its reason. A call added to either module fails the suite
 until it's listed.
