@@ -116,8 +116,15 @@ Each suite also fails when:
 - a record in `records` is never checked, or the binding has a value type
   (or field) the fixture doesn't describe;
 - a public call of the binding isn't a fixture operation, or an operation is
-  never run. Ruby's `connected?` is the one exception: it has no Elixir
-  counterpart, because the Elixir handle is a value the caller holds.
+  never run. Each suite lists its exceptions, with the reason: Ruby's
+  `connected?` has no Elixir counterpart, because the Elixir handle is a
+  value the caller holds, and Elixir's `child_spec` and `start_link` have no
+  Ruby counterpart, because only the BEAM has a supervisor to own a handle.
+
+The Elixir suite runs the live script twice: once on a handle, and once on
+a supervised Trellis, where `connect` starts `{Trellis, options}`,
+`shutdown` stops it, and every other call goes through its process. Both
+runs check the same shapes.
 
 ## Adding a case
 

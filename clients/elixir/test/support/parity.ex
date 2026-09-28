@@ -72,6 +72,19 @@ defmodule Trellis.Parity do
 
   defp call(handle, args, fun), do: Kernel.apply(Trellis, fun, [handle | args])
 
+  @doc """
+  The public functions of `Trellis` with no fixture operation, and why. A
+  supervisor owns a handle only on the BEAM; `supervised_test.exs` covers
+  these, and the fixture's operations run through a supervised handle there
+  too.
+  """
+  def not_operations do
+    %{
+      "child_spec" => "`{Trellis, options}` in a supervision tree",
+      "start_link" => "`{Trellis, options}` in a supervision tree"
+    }
+  end
+
   @doc "The fixture's own steps, which drive the test rather than the binding."
   def harness_ops, do: ["sql", "now"]
 

@@ -6,7 +6,8 @@ defmodule Trellis do
 
   The surface mirrors the Rust crate's `BlockingTrellis`:
 
-  - **Lifecycle:** `connect/1`, `migrate/1`, `config/1`, `shutdown/1`.
+  - **Lifecycle:** `connect/1`, `migrate/1`, `config/1`, `shutdown/1`, and
+    `start_link/1` for a handle a supervisor owns.
   - **Every statement form:** `apply/2` runs one statement of Trellis's
     grammar (`TRANSFORM`, `RELATIONSHIP`, `PAUSE TRANSFORM`,
     `RESUME TRANSFORM`, `DROP TRANSFORM`, `DROP RELATIONSHIP`,
@@ -38,7 +39,9 @@ defmodule Trellis do
       :ok = Trellis.shutdown(trellis)
 
   Every function here blocks the calling process on a database round trip,
-  on a dirty IO scheduler, so no normal scheduler is held up. Non-bang functions
+  on a dirty IO scheduler, so no normal scheduler is held up. (Called through
+  a supervised Trellis's name, only its owning process runs on one, and the
+  caller waits for its reply.) Non-bang functions
   return `{:ok, value}` (or `:ok`) and `{:error, %Trellis.Error{}}`; the bang
   variants return the value or raise the `Trellis.Error`.
 
@@ -60,6 +63,28 @@ defmodule Trellis do
   the background workers. Connect once, at boot, and share the handle; don't
   connect per request. The handle is shut down when `shutdown/1` is called,
   or, as a backstop, when it is garbage collected.
+
+  In an application, let a supervisor own it: `{Trellis, options}` in the
+  supervision tree starts a process that connects the handle as it starts
+  and shuts it down when the supervisor stops it (see `start_link/1`).
+  Every function here that takes a handle takes that process's name too:
+
+      # config/runtime.exs
+      config :my_app, MyApp.Trellis,
+        name: MyApp.Trellis,
+        url: System.fetch_env!("DATABASE_URL")
+
+      # lib/my_app/application.ex
+      children = [
+        MyApp.Repo,
+        {Trellis, Application.fetch_env!(:my_app, MyApp.Trellis)},
+        MyAppWeb.Endpoint
+      ]
+
+      # Anywhere in the app.
+      {:ok, status} = Trellis.status(MyApp.Trellis, "widget_prices")
+
+  For the migrations that define transforms, see `Trellis.Migration`.
   """
 
   # `apply/2` is this module's own; `Kernel.apply/2` is never called here.
@@ -84,6 +109,18 @@ defmodule Trellis do
   defstruct [:ref]
 
   @opaque t :: %__MODULE__{ref: reference()}
+
+  @typedoc """
+  What every function but `connect/1` takes: a handle `connect/1` returned,
+  or the name or pid of a supervised Trellis (`start_link/1`).
+  """
+  @type trellis :: t() | GenServer.server()
+
+  # A handle, or something `GenServer.call/3` can address. `nil` and the
+  # booleans are atoms but never a server's name.
+  defguardp is_trellis(trellis)
+            when is_struct(trellis, __MODULE__) or is_pid(trellis) or is_tuple(trellis) or
+                   (is_atom(trellis) and trellis not in [nil, true, false])
 
   @typedoc """
   Options for `connect/1`:
@@ -145,6 +182,52 @@ defmodule Trellis do
   @spec connect!([option()] | %{optional(atom()) => term()}) :: t()
   def connect!(options), do: bang(connect(options))
 
+  @typedoc """
+  Options for `start_link/1`: every `t:option/0`, plus `:name`, the name to
+  register the process under (see `GenServer.start_link/3`). Without one,
+  call it by its pid.
+  """
+  @type start_option :: option() | {:name, GenServer.name()}
+
+  @doc """
+  Starts a process that owns a handle: it connects with `options` (see
+  `t:start_option/0`) as it starts, and shuts the handle down as its
+  supervisor stops it. Put it in a supervision tree as `{Trellis, options}`
+  rather than calling this directly.
+
+  Returns `{:error, %Trellis.Error{}}` if the connect fails, so the
+  supervisor's start fails with the reason. A second `staging: true`
+  process fails that way (`:conflict`) while the first is alive: in a
+  rolling deploy, stop the old one before the new one starts.
+
+  Every call made through the process's name runs in the process, one at a
+  time, as it would on the handle, which runs one call at a time anyway.
+  Only the owning process waits on a dirty IO scheduler, and the callers
+  wait in its mailbox. A caller's call has no timeout of its own, so a
+  call made behind a long `await_converged/3` or `self_check/3` waits for it.
+
+  `shutdown/1` refuses the process's name: its supervisor stops it. The
+  child spec gives it 30 seconds to shut down, since `shutdown/1` waits for
+  the background threads to exit and an in-flight call finishes first;
+  change it with `Supervisor.child_spec/2`. A process killed before it shuts
+  down leaves the handle to be shut down when it is garbage collected.
+  """
+  @spec start_link([start_option()]) :: GenServer.on_start()
+  def start_link(options) when is_list(options), do: Trellis.Owner.start_link(options)
+
+  @doc """
+  The child spec `{Trellis, options}` stands for in a supervision tree. Its
+  id is the `:name` option, so one tree can hold several.
+  """
+  @spec child_spec([start_option()]) :: Supervisor.child_spec()
+  def child_spec(options) when is_list(options) do
+    %{
+      id: Keyword.get(options, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [options]},
+      shutdown: 30_000
+    }
+  end
+
   @doc """
   Creates or upgrades Trellis's own tables in the configured schema. Safe to
   run on every boot.
@@ -154,23 +237,23 @@ defmodule Trellis do
   starts, so a `staging: true` connect to an unmigrated schema fails with a
   `:not_found` error.
   """
-  @spec migrate(t()) :: :ok | {:error, Error.t()}
-  def migrate(%__MODULE__{ref: ref}), do: unit(Native.migrate(ref))
+  @spec migrate(trellis()) :: :ok | {:error, Error.t()}
+  def migrate(trellis) when is_trellis(trellis), do: unit(run(trellis, :migrate, []))
 
   @doc "Like `migrate/1`, but raises `Trellis.Error`."
-  @spec migrate!(t()) :: :ok
+  @spec migrate!(trellis()) :: :ok
   def migrate!(trellis), do: bang(migrate(trellis))
 
   @doc "The configuration `trellis` connected with. See `Trellis.Config`."
-  @spec config(t()) :: {:ok, Config.t()} | {:error, Error.t()}
-  def config(%__MODULE__{ref: ref}) do
-    with {:ok, config} <- native(Native.config(ref)) do
+  @spec config(trellis()) :: {:ok, Config.t()} | {:error, Error.t()}
+  def config(trellis) when is_trellis(trellis) do
+    with {:ok, config} <- native(run(trellis, :config, [])) do
       {:ok, Config.from_native(config)}
     end
   end
 
   @doc "Like `config/1`, but raises `Trellis.Error`."
-  @spec config!(t()) :: Config.t()
+  @spec config!(trellis()) :: Config.t()
   def config!(trellis), do: bang(config(trellis))
 
   @doc """
@@ -187,24 +270,24 @@ defmodule Trellis do
   Trellis runs this on its own connections, not in the caller's transaction:
   if an enclosing Ecto migration rolls back, the definition stays.
   """
-  @spec define(t(), String.t()) :: {:ok, Definition.t()} | {:error, Error.t()}
-  def define(%__MODULE__{ref: ref}, text) when is_binary(text) do
-    with {:ok, definition} <- native(Native.define(ref, text)) do
+  @spec define(trellis(), String.t()) :: {:ok, Definition.t()} | {:error, Error.t()}
+  def define(trellis, text) when is_trellis(trellis) and is_binary(text) do
+    with {:ok, definition} <- native(run(trellis, :define, [text])) do
       {:ok, Definition.from_native(definition)}
     end
   end
 
   @doc "Like `define/2`, but raises `Trellis.Error`."
-  @spec define!(t(), String.t()) :: Definition.t()
+  @spec define!(trellis(), String.t()) :: Definition.t()
   def define!(trellis, text), do: bang(define(trellis, text))
 
   @doc """
   The status of the transform that writes `target_table`, or `nil` if none
   does.
   """
-  @spec status(t(), String.t()) :: {:ok, Status.t() | nil} | {:error, Error.t()}
-  def status(%__MODULE__{ref: ref}, target_table) when is_binary(target_table) do
-    case native(Native.status(ref, target_table)) do
+  @spec status(trellis(), String.t()) :: {:ok, Status.t() | nil} | {:error, Error.t()}
+  def status(trellis, target_table) when is_trellis(trellis) and is_binary(target_table) do
+    case native(run(trellis, :status, [target_table])) do
       {:ok, nil} -> {:ok, nil}
       {:ok, status} -> {:ok, Status.from_native(status)}
       {:error, _} = error -> error
@@ -212,7 +295,7 @@ defmodule Trellis do
   end
 
   @doc "Like `status/2`, but raises `Trellis.Error`."
-  @spec status!(t(), String.t()) :: Status.t() | nil
+  @spec status!(trellis(), String.t()) :: Status.t() | nil
   def status!(trellis, target_table), do: bang(status(trellis, target_table))
 
   @doc """
@@ -234,35 +317,35 @@ defmodule Trellis do
   Don't retry it; read the result back with `status/2`, `definitions/1` or
   `relationships/1` if you need it.
   """
-  @spec apply(t(), String.t()) :: {:ok, Applied.t()} | {:error, Error.t()}
-  def apply(%__MODULE__{ref: ref}, text) when is_binary(text) do
-    with {:ok, applied} <- native(Native.apply(ref, text)) do
+  @spec apply(trellis(), String.t()) :: {:ok, Applied.t()} | {:error, Error.t()}
+  def apply(trellis, text) when is_trellis(trellis) and is_binary(text) do
+    with {:ok, applied} <- native(run(trellis, :apply, [text])) do
       {:ok, Applied.from_native(applied)}
     end
   end
 
   @doc "Like `apply/2`, but raises `Trellis.Error`."
-  @spec apply!(t(), String.t()) :: Applied.t()
+  @spec apply!(trellis(), String.t()) :: Applied.t()
   def apply!(trellis, text), do: bang(__MODULE__.apply(trellis, text))
 
   @doc "Every registered transform definition, oldest first."
-  @spec definitions(t()) :: {:ok, [DefinitionSummary.t()]} | {:error, Error.t()}
-  def definitions(%__MODULE__{ref: ref}) do
-    list(Native.definitions(ref), &DefinitionSummary.from_native/1)
+  @spec definitions(trellis()) :: {:ok, [DefinitionSummary.t()]} | {:error, Error.t()}
+  def definitions(trellis) when is_trellis(trellis) do
+    list(run(trellis, :definitions, []), &DefinitionSummary.from_native/1)
   end
 
   @doc "Like `definitions/1`, but raises `Trellis.Error`."
-  @spec definitions!(t()) :: [DefinitionSummary.t()]
+  @spec definitions!(trellis()) :: [DefinitionSummary.t()]
   def definitions!(trellis), do: bang(definitions(trellis))
 
   @doc "Every registered relationship, oldest first."
-  @spec relationships(t()) :: {:ok, [RelationshipSummary.t()]} | {:error, Error.t()}
-  def relationships(%__MODULE__{ref: ref}) do
-    list(Native.relationships(ref), &RelationshipSummary.from_native/1)
+  @spec relationships(trellis()) :: {:ok, [RelationshipSummary.t()]} | {:error, Error.t()}
+  def relationships(trellis) when is_trellis(trellis) do
+    list(run(trellis, :relationships, []), &RelationshipSummary.from_native/1)
   end
 
   @doc "Like `relationships/1`, but raises `Trellis.Error`."
-  @spec relationships!(t()) :: [RelationshipSummary.t()]
+  @spec relationships!(trellis()) :: [RelationshipSummary.t()]
   def relationships!(trellis), do: bang(relationships(trellis))
 
   @doc """
@@ -276,13 +359,14 @@ defmodule Trellis do
   queued for it. Only a table Trellis already captures can be re-read; any
   other is refused.
   """
-  @spec request_backfill(t(), String.t()) :: :ok | {:error, Error.t()}
-  def request_backfill(%__MODULE__{ref: ref}, source_table) when is_binary(source_table) do
-    unit(Native.request_backfill(ref, source_table))
+  @spec request_backfill(trellis(), String.t()) :: :ok | {:error, Error.t()}
+  def request_backfill(trellis, source_table)
+      when is_trellis(trellis) and is_binary(source_table) do
+    unit(run(trellis, :request_backfill, [source_table]))
   end
 
   @doc "Like `request_backfill/2`, but raises `Trellis.Error`."
-  @spec request_backfill!(t(), String.t()) :: :ok
+  @spec request_backfill!(trellis(), String.t()) :: :ok
   def request_backfill!(trellis, source_table), do: bang(request_backfill(trellis, source_table))
 
   @doc """
@@ -290,41 +374,45 @@ defmodule Trellis do
   oldest first. Poll it with the last entry's `poisoned_at` so a
   whole-table failure doesn't sit unnoticed.
   """
-  @spec poisoned_since(t(), DateTime.t()) :: {:ok, [PoisonEntry.t()]} | {:error, Error.t()}
-  def poisoned_since(%__MODULE__{ref: ref}, %DateTime{} = since) do
-    list(Native.poisoned_since(ref, Trellis.Time.to_micros(since)), &PoisonEntry.from_native/1)
+  @spec poisoned_since(trellis(), DateTime.t()) :: {:ok, [PoisonEntry.t()]} | {:error, Error.t()}
+  def poisoned_since(trellis, %DateTime{} = since) when is_trellis(trellis) do
+    list(
+      run(trellis, :poisoned_since, [Trellis.Time.to_micros(since)]),
+      &PoisonEntry.from_native/1
+    )
   end
 
   @doc "Like `poisoned_since/2`, but raises `Trellis.Error`."
-  @spec poisoned_since!(t(), DateTime.t()) :: [PoisonEntry.t()]
+  @spec poisoned_since!(trellis(), DateTime.t()) :: [PoisonEntry.t()]
   def poisoned_since!(trellis, since), do: bang(poisoned_since(trellis, since))
 
   @doc """
   Every quarantined transform and paused column, across every transform.
   Cheap enough for a dashboard or health check to poll.
   """
-  @spec quarantined(t()) :: {:ok, [QuarantineEntry.t()]} | {:error, Error.t()}
-  def quarantined(%__MODULE__{ref: ref}) do
-    list(Native.quarantined(ref), &QuarantineEntry.from_native/1)
+  @spec quarantined(trellis()) :: {:ok, [QuarantineEntry.t()]} | {:error, Error.t()}
+  def quarantined(trellis) when is_trellis(trellis) do
+    list(run(trellis, :quarantined, []), &QuarantineEntry.from_native/1)
   end
 
   @doc "Like `quarantined/1`, but raises `Trellis.Error`."
-  @spec quarantined!(t()) :: [QuarantineEntry.t()]
+  @spec quarantined!(trellis()) :: [QuarantineEntry.t()]
   def quarantined!(trellis), do: bang(quarantined(trellis))
 
   @doc """
   The state of one target: a transform (`"order_totals"`) or one of its
   columns (`"order_totals.total"`). A column that isn't paused is `:live`.
   """
-  @spec quarantine_status(t(), String.t()) :: {:ok, QuarantineEntry.t()} | {:error, Error.t()}
-  def quarantine_status(%__MODULE__{ref: ref}, target) when is_binary(target) do
-    with {:ok, entry} <- native(Native.quarantine_status(ref, target)) do
+  @spec quarantine_status(trellis(), String.t()) ::
+          {:ok, QuarantineEntry.t()} | {:error, Error.t()}
+  def quarantine_status(trellis, target) when is_trellis(trellis) and is_binary(target) do
+    with {:ok, entry} <- native(run(trellis, :quarantine_status, [target])) do
       {:ok, QuarantineEntry.from_native(entry)}
     end
   end
 
   @doc "Like `quarantine_status/2`, but raises `Trellis.Error`."
-  @spec quarantine_status!(t(), String.t()) :: QuarantineEntry.t()
+  @spec quarantine_status!(trellis(), String.t()) :: QuarantineEntry.t()
   def quarantine_status!(trellis, target), do: bang(quarantine_status(trellis, target))
 
   @typedoc """
@@ -345,18 +433,18 @@ defmodule Trellis do
       {:ok, page} = Trellis.sample_quarantined(trellis, "order_totals.total", limit: 50)
       {:ok, next} = Trellis.sample_quarantined(trellis, "order_totals.total", limit: 50, after: page.next_cursor)
   """
-  @spec sample_quarantined(t(), String.t(), [sample_option()]) ::
+  @spec sample_quarantined(trellis(), String.t(), [sample_option()]) ::
           {:ok, SamplePage.t()} | {:error, Error.t()}
-  def sample_quarantined(%__MODULE__{ref: ref}, target, options \\ [])
-      when is_binary(target) and is_list(options) do
+  def sample_quarantined(trellis, target, options \\ [])
+      when is_trellis(trellis) and is_binary(target) and is_list(options) do
     with {:ok, limit, cursor} <- sample_options(options),
-         {:ok, page} <- native(Native.sample_quarantined(ref, target, cursor, limit)) do
+         {:ok, page} <- native(run(trellis, :sample_quarantined, [target, cursor, limit])) do
       {:ok, SamplePage.from_native(page)}
     end
   end
 
   @doc "Like `sample_quarantined/3`, but raises `Trellis.Error`."
-  @spec sample_quarantined!(t(), String.t(), [sample_option()]) :: SamplePage.t()
+  @spec sample_quarantined!(trellis(), String.t(), [sample_option()]) :: SamplePage.t()
   def sample_quarantined!(trellis, target, options \\ []),
     do: bang(sample_quarantined(trellis, target, options))
 
@@ -364,24 +452,24 @@ defmodule Trellis do
   Whether at least one drain worker is alive anywhere in the fleet. With
   none, nothing reaches a target table: poll this from a health check.
   """
-  @spec has_live_drain_workers(t()) :: {:ok, boolean()} | {:error, Error.t()}
-  def has_live_drain_workers(%__MODULE__{ref: ref}),
-    do: native(Native.has_live_drain_workers(ref))
+  @spec has_live_drain_workers(trellis()) :: {:ok, boolean()} | {:error, Error.t()}
+  def has_live_drain_workers(trellis) when is_trellis(trellis),
+    do: native(run(trellis, :has_live_drain_workers, []))
 
   @doc "Like `has_live_drain_workers/1`, but raises `Trellis.Error`."
-  @spec has_live_drain_workers!(t()) :: boolean()
+  @spec has_live_drain_workers!(trellis()) :: boolean()
   def has_live_drain_workers!(trellis), do: bang(has_live_drain_workers(trellis))
 
   @doc """
   Whether the staging worker (change capture) is alive anywhere in the
   fleet. The other half of the health check.
   """
-  @spec has_live_staging_worker(t()) :: {:ok, boolean()} | {:error, Error.t()}
-  def has_live_staging_worker(%__MODULE__{ref: ref}),
-    do: native(Native.has_live_staging_worker(ref))
+  @spec has_live_staging_worker(trellis()) :: {:ok, boolean()} | {:error, Error.t()}
+  def has_live_staging_worker(trellis) when is_trellis(trellis),
+    do: native(run(trellis, :has_live_staging_worker, []))
 
   @doc "Like `has_live_staging_worker/1`, but raises `Trellis.Error`."
-  @spec has_live_staging_worker!(t()) :: boolean()
+  @spec has_live_staging_worker!(trellis()) :: boolean()
   def has_live_staging_worker!(trellis), do: bang(has_live_staging_worker(trellis))
 
   @typedoc "An opaque `watermark_token/1` token."
@@ -392,11 +480,12 @@ defmodule Trellis do
   Take it after a source-table write commits, then pass it to
   `await_converged/3` to wait for that write to reach its targets.
   """
-  @spec watermark_token(t()) :: {:ok, watermark()} | {:error, Error.t()}
-  def watermark_token(%__MODULE__{ref: ref}), do: native(Native.watermark_token(ref))
+  @spec watermark_token(trellis()) :: {:ok, watermark()} | {:error, Error.t()}
+  def watermark_token(trellis) when is_trellis(trellis),
+    do: native(run(trellis, :watermark_token, []))
 
   @doc "Like `watermark_token/1`, but raises `Trellis.Error`."
-  @spec watermark_token!(t()) :: watermark()
+  @spec watermark_token!(trellis()) :: watermark()
   def watermark_token!(trellis), do: bang(watermark_token(trellis))
 
   @doc """
@@ -410,18 +499,18 @@ defmodule Trellis do
   process, waits behind this one for up to `timeout_ms`. Size it
   accordingly.
   """
-  @spec await_converged(t(), watermark(), non_neg_integer()) :: :ok | {:error, Error.t()}
-  def await_converged(%__MODULE__{ref: ref}, token, timeout_ms)
-      when is_binary(token) and is_integer(timeout_ms) do
+  @spec await_converged(trellis(), watermark(), non_neg_integer()) :: :ok | {:error, Error.t()}
+  def await_converged(trellis, token, timeout_ms)
+      when is_trellis(trellis) and is_binary(token) and is_integer(timeout_ms) do
     if timeout_ms in 0..@max_timeout_ms do
-      unit(Native.await_converged(ref, token, timeout_ms))
+      unit(run(trellis, :await_converged, [token, timeout_ms]))
     else
       invalid(":timeout_ms must be a non-negative integer, got: #{inspect(timeout_ms)}")
     end
   end
 
   @doc "Like `await_converged/3`, but raises `Trellis.Error`."
-  @spec await_converged!(t(), watermark(), non_neg_integer()) :: :ok
+  @spec await_converged!(trellis(), watermark(), non_neg_integer()) :: :ok
   def await_converged!(trellis, token, timeout_ms),
     do: bang(await_converged(trellis, token, timeout_ms))
 
@@ -466,28 +555,27 @@ defmodule Trellis do
   handle of its own, connected with the defaults so it runs no background
   work.
   """
-  @spec self_check(t(), String.t(), [self_check_option()]) ::
+  @spec self_check(trellis(), String.t(), [self_check_option()]) ::
           {:ok, SelfCheckReport.t()} | {:error, Error.t()}
-  def self_check(%__MODULE__{ref: ref}, target_table, options)
-      when is_binary(target_table) and is_list(options) do
+  def self_check(trellis, target_table, options)
+      when is_trellis(trellis) and is_binary(target_table) and is_list(options) do
     with {:ok, opts} <- self_check_options(options),
          {:ok, report} <-
            native(
-             Native.self_check(
-               ref,
+             run(trellis, :self_check, [
                target_table,
                opts.after,
                opts.limit,
                Atom.to_string(opts.mode),
                opts.timeout_ms
-             )
+             ])
            ) do
       {:ok, SelfCheckReport.from_native(report)}
     end
   end
 
   @doc "Like `self_check/3`, but raises `Trellis.Error`."
-  @spec self_check!(t(), String.t(), [self_check_option()]) :: SelfCheckReport.t()
+  @spec self_check!(trellis(), String.t(), [self_check_option()]) :: SelfCheckReport.t()
   def self_check!(trellis, target_table, options),
     do: bang(self_check(trellis, target_table, options))
 
@@ -496,11 +584,18 @@ defmodule Trellis do
   later call on the handle returns a `:validation` error; shutting down again
   is `:ok`.
   """
-  @spec shutdown(t()) :: :ok | {:error, Error.t()}
+  @spec shutdown(trellis()) :: :ok | {:error, Error.t()}
   def shutdown(%__MODULE__{ref: ref}), do: unit(Native.shutdown(ref))
 
+  def shutdown(server) when is_trellis(server) do
+    invalid(
+      "#{inspect(server)} is a supervised Trellis, which its supervisor shuts down; " <>
+        "stop it with Supervisor.terminate_child/2, not shutdown/1"
+    )
+  end
+
   @doc "Like `shutdown/1`, but raises `Trellis.Error`."
-  @spec shutdown!(t()) :: :ok
+  @spec shutdown!(trellis()) :: :ok
   def shutdown!(trellis), do: bang(shutdown(trellis))
 
   defp validate_options(options) do
@@ -609,6 +704,13 @@ defmodule Trellis do
   end
 
   defp invalid(message), do: {:error, Error.validation(message)}
+
+  # A native call on a handle, or on the handle a supervised Trellis owns,
+  # run in its owning process (`Trellis.Owner`).
+  defp run(%__MODULE__{ref: ref}, function, args),
+    do: Kernel.apply(Native, function, [ref | args])
+
+  defp run(server, function, args), do: Trellis.Owner.call(server, function, args)
 
   defp list(reply, from_native) do
     with {:ok, items} <- native(reply) do

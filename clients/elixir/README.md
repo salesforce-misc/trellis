@@ -23,6 +23,9 @@ The surface mirrors the Rust crate's `BlockingTrellis` (issues #146, #147,
   `has_live_staging_worker/1`, `watermark_token/1`, `await_converged/3`.
 - `self_check/3`: audit one page of a target against a fresh recompute from
   its source, reporting any divergence.
+- `start_link/1`, as `{Trellis, options}` in a supervision tree: a process
+  that owns the handle, so every function above also takes its name.
+- `Trellis.Migration`: `define`, `apply` and `status` in an Ecto migration.
 - `Trellis.Metrics.render_prometheus/0`: the process-wide metrics registry
   as Prometheus text, for a `/metrics` route the host already serves (the
   binding opens no port). It needs no handle.
@@ -80,9 +83,77 @@ and some connection must run drain threads, or no definition ever reaches
 - Every call that takes a handle runs on a dirty IO scheduler.
   `Trellis.Metrics.render_prometheus/0` runs on a dirty CPU scheduler.
 
+## In a Phoenix app
+
+Let the application's supervisor own the handle. `{Trellis, options}` starts
+a process that connects with `connect/1`'s options as it starts, runs every
+call made through its name, and shuts the handle down when the supervisor
+stops it:
+
+```elixir
+# config/runtime.exs
+database_url = System.fetch_env!("DATABASE_URL")
+
+config :my_app, MyApp.Trellis,
+  name: MyApp.Trellis,
+  url: database_url,
+  # Only the fleet's one worker node runs the background work.
+  staging: System.get_env("TRELLIS_WORKER") == "true",
+  drain_threads: if(System.get_env("TRELLIS_WORKER") == "true", do: 2, else: 0)
+
+# lib/my_app/application.ex
+children = [
+  MyApp.Repo,
+  {Trellis, Application.fetch_env!(:my_app, MyApp.Trellis)},
+  MyAppWeb.Endpoint
+]
+
+# Anywhere in the app: the name stands in for the handle.
+{:ok, status} = Trellis.status(MyApp.Trellis, "widget_prices")
+```
+
+The calls run in the owning process one at a time, as they would on the
+handle, so only that process waits on a dirty IO scheduler however many
+processes call it. `shutdown/1` refuses the name; the supervisor stops it.
+
+Define transforms in Ecto migrations with `Trellis.Migration`. Trellis never
+joins a migration's transaction, so a migration that uses it must set
+`@disable_ddl_transaction true` (the helpers raise before applying anything
+if a transaction is open), and must define `up/0` and `down/0`:
+
+```elixir
+defmodule MyApp.Repo.Migrations.DefineWidgetPrices do
+  use Ecto.Migration
+  use Trellis.Migration
+
+  @disable_ddl_transaction true
+
+  def up do
+    define "TRANSFORM widget_prices FROM widgets SELECT price AS price"
+  end
+
+  def down do
+    apply "PAUSE TRANSFORM widget_prices"
+    apply "DROP TRANSFORM widget_prices"
+  end
+end
+```
+
+Ecto doesn't start the application to migrate, so each helper connects a
+handle of its own, from the repo's `:trellis` configuration
+(`config :my_app, MyApp.Repo, trellis: [url: database_url]`), and runs
+`migrate/1` on it first. A define isn't idempotent, and the helpers don't
+make it so: Ecto's `schema_migrations` runs each migration once. See
+`Trellis.Migration` for the details, and for an optional guard.
+
+Add `import_deps: [:trellis]` to the app's `.formatter.exs` to keep
+`define` and `apply` free of parentheses, like Ecto's own commands.
+
 ## Layout
 
-- `lib/`: the public `Trellis` module and its structs.
+- `lib/`: the public `Trellis` module and its structs, the process that
+  owns a supervised handle (`Trellis.Owner`), and `Trellis.Migration`, which
+  is compiled only when the host depends on `ecto_sql`.
 - `native/trellis_nif/`: the NIF crate, a member of the repository's Cargo
   workspace. Plain-data conversion and error codes come from
   `clients/embed` (`trellis-embed`), shared with the Ruby binding.

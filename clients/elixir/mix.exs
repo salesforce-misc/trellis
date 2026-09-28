@@ -22,6 +22,9 @@ defmodule Trellis.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.38.0", runtime: false},
+      # `Trellis.Migration` is compiled only when the host depends on
+      # `ecto_sql`; nothing else here uses it.
+      {:ecto_sql, "~> 3.13", optional: true},
       # The integration suite writes source rows and reads target rows over
       # its own connection, the way a host app would.
       {:postgrex, "~> 0.22", only: :test}

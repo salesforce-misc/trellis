@@ -19,23 +19,36 @@ defmodule Trellis.ParityTest do
   # poisoning a key, which would disturb the shared cluster (#588).
   @tag timeout: 300_000
   test "every live step returns its expected shape" do
+    run_live(:handle)
+  end
+
+  # The same script with a supervised Trellis in place of the handle: each
+  # `connect` starts `{Trellis, options}` under the test's supervisor, each
+  # `shutdown` stops it, and every other call goes through the process.
+  @tag timeout: 300_000
+  test "every live step returns its expected shape through a supervised Trellis" do
+    run_live(:supervised)
+  end
+
+  defp run_live(mode) do
     cluster = TestCluster.private!()
     pg = TestCluster.postgrex!(cluster)
-    # The connected handle, if any. Unlinked, so it outlives the test
-    # process for the `on_exit` below.
+    # The connected handle (or supervised process), if any. Unlinked, so it
+    # outlives the test process for the `on_exit` below.
     {:ok, state} = Agent.start(fn -> nil end)
 
     # Registered after `private!/0`'s teardown, so it runs first: the handle
-    # is shut down before its cluster goes away.
+    # is shut down before its cluster goes away. (A supervised process is
+    # stopped before any `on_exit` runs.)
     on_exit(fn ->
-      if handle = Agent.get(state, & &1), do: Trellis.shutdown(handle)
+      with %Trellis{} = handle <- Agent.get(state, & &1), do: Trellis.shutdown(handle)
       Agent.stop(state)
     end)
 
     Parity.fixture()["live"]
     |> Enum.with_index()
     |> Enum.reduce(%{}, fn {step, index}, saved ->
-      run_step(step, index, pg, cluster, state, saved)
+      run_step(step, index, pg, cluster, {mode, state}, saved)
     end)
 
     # The script ends with a shutdown; forward the engine's last log lines
@@ -126,7 +139,8 @@ defmodule Trellis.ParityTest do
   end
 
   # Every public function of this binding is a fixture operation (its bang
-  # variant alongside), and every operation is used by some step.
+  # variant alongside), or one `Parity.not_operations/0` names with the
+  # reason Ruby has no counterpart, and every operation is used by some step.
   test "every public function is a fixture operation that some step runs" do
     public =
       for {name, _arity} <- Trellis.__info__(:functions),
@@ -135,7 +149,9 @@ defmodule Trellis.ParityTest do
           uniq: true,
           do: String.trim_trailing(name, "!")
 
-    assert Enum.sort(public) == Enum.sort(Map.keys(Parity.operations()))
+    not_operations = Map.keys(Parity.not_operations())
+    assert not_operations -- public == [], "exceptions that aren't public functions"
+    assert Enum.sort(public -- not_operations) == Enum.sort(Map.keys(Parity.operations()))
 
     used = Parity.fixture()["live"] |> Enum.map(& &1["op"]) |> Enum.uniq()
     assert Enum.sort(used) == Enum.sort(Map.keys(Parity.operations()) ++ Parity.harness_ops())
@@ -177,8 +193,26 @@ defmodule Trellis.ParityTest do
 
   # The operation's `{:ok, value}`, `:ok` or `{:error, error}`. A successful
   # `connect` hands its handle to the steps after it, and `shutdown` takes it
-  # away again.
-  defp call_operation(op, args, opts, state) do
+  # away again. Supervised, they start and stop `{Trellis, options}`, whose
+  # failed start is the connect's `{:error, %Trellis.Error{}}`.
+  defp call_operation("connect", [], opts, {:supervised, state}) do
+    case start_supervised({Trellis, Map.to_list(opts)}) do
+      {:ok, pid} ->
+        Agent.update(state, fn _ -> pid end)
+        :ok
+
+      {:error, {%Trellis.Error{} = error, _child}} ->
+        {:error, error}
+    end
+  end
+
+  defp call_operation("shutdown", [], _opts, {:supervised, state}) do
+    :ok = stop_supervised(Trellis)
+    Agent.update(state, fn _ -> nil end)
+    :ok
+  end
+
+  defp call_operation(op, args, opts, {_mode, state}) do
     handle = Agent.get(state, & &1)
     fun = String.to_existing_atom(op)
     result = Parity.operations() |> Map.fetch!(op) |> then(& &1.(handle, args, opts, fun))
@@ -197,8 +231,11 @@ defmodule Trellis.ParityTest do
     end
   end
 
-  # The bang variant of a step that returned an error raises that error.
-  defp assert_bang_raises(code, op, args, opts, state, what) do
+  # The bang variant of a step that returned an error raises that error. A
+  # supervised Trellis starts through its child spec, which has none.
+  defp assert_bang_raises(_code, "connect", _args, _opts, {:supervised, _state}, _what), do: :ok
+
+  defp assert_bang_raises(code, op, args, opts, {_mode, state}, what) do
     handle = Agent.get(state, & &1)
     fun = String.to_existing_atom(op <> "!")
 
