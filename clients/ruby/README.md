@@ -88,7 +88,8 @@ definition ever reaches `:live`.
   register its transform (`Trellis.status` tells you whether it did), and
   the handle serves no other call until the abandoned one has finished.
 - **A handle doesn't survive `fork`.** Connect after forking: Puma's
-  `on_worker_boot`, Passenger's `starting_worker_process`. A forked child's
+  `before_worker_boot` (`on_worker_boot` before Puma 7), Passenger's
+  `starting_worker_process`. A forked child's
   calls on a handle it inherited raise `Trellis::ForkedHandleError` rather
   than hang. `Trellis.shutdown` in a child that hasn't connected does
   nothing. If the parent connects too (to migrate, say), shut it down before
@@ -100,14 +101,9 @@ definition ever reaches `:live`.
   never connect, and `system`/`spawn`, are unaffected.
 
   ```ruby
-  # config/puma.rb
-  before_fork do
-    Trellis.shutdown
-  end
-
-  on_worker_boot do
-    Trellis.connect(url: ENV.fetch("TRELLIS_URL"), drain_threads: 1)
-  end
+  # config/puma.rb, in a Rails app (see "In a Rails app" below)
+  before_fork { Trellis.shutdown }
+  before_worker_boot { Trellis::Railtie.connect }
   ```
 - **Errors** are raised as a subclass of `Trellis::Error` per error code
   (`ParseError`, `ValidationError`, `ConnectivityError`, `ConflictError`,
@@ -133,9 +129,136 @@ definition ever reaches `:live`.
   `Trellis::QuarantineEntry`, ...), so they compare by value and
   pattern-match: `case Trellis.apply(stmt) in { kind: :resumed, columns: }`.
 
+## In a Rails app
+
+`require "trellis"` after Rails (which `Bundler.require` in
+`config/application.rb` does) loads `Trellis::Railtie`. Without Rails, the
+gem loads no Rails code and requires no gem at all; `activerecord` and
+`railties` are only ever the app's own dependencies.
+
+### Configuration and boot
+
+The Rails integration reads `Trellis.connect`'s options from one place,
+`config.trellis.connect`:
+
+```ruby
+# config/application.rb (or config/environments/*.rb)
+config.trellis.connect = {
+  url: ENV.fetch("DATABASE_URL"),
+  # The one dedicated worker process sets TRELLIS_WORKER=1.
+  staging: ENV["TRELLIS_WORKER"] == "1",
+  drain_threads: ENV["TRELLIS_WORKER"] == "1" ? 2 : 0
+}
+```
+
+With it set, the app's handle connects as the app boots (an
+`after_initialize` hook), and the `at_exit` hook shuts it down. Left `nil`,
+the default, the Railtie does nothing. Two exceptions:
+
+- **Rake tasks get no boot handle.** `rails db:create` may run before the
+  database exists, and `rails db:migrate` must not start a worker's
+  background work, so a rake process stays disconnected, as Ecto migrates
+  without starting the app. The migration helpers connect a handle of their
+  own. A rake task of your own that calls Trellis calls
+  `Trellis::Railtie.connect` first.
+- **`config.trellis.connect_on_boot = false`** skips the boot connect, for a
+  server that forks without a hook to shut the handle down first (a
+  preloading Passenger, say). Connect in each child with
+  `Trellis::Railtie.connect`.
+
+A handle doesn't survive `fork` (issue #600). A server that loads the app
+before it forks has to shut the boot handle down in the parent and connect
+one in each child. Puma preloads by default whenever it runs more than one
+worker:
+
+```ruby
+# config/puma.rb
+before_fork { Trellis.shutdown }               # the parent's boot handle
+before_worker_boot { Trellis::Railtie.connect } # on_worker_boot before Puma 7
+
+# With fork_worker, worker 0 forks the others too.
+before_refork { Trellis.shutdown }
+after_refork { Trellis::Railtie.connect }
+```
+
+Unicorn's `before_fork` and `after_fork`, and Passenger's
+`starting_worker_process` (with `connect_on_boot = false`), work the same
+way. If the hooks are missing, the child's calls raise
+`Trellis::ForkedHandleError` rather than hang.
+
+### Migrations
+
+`Trellis::Migration` makes Trellis statements read like the migration's
+own:
+
+```ruby
+class DefineOrderTotals < ActiveRecord::Migration[8.1]
+  include Trellis::Migration
+
+  # Required: the helpers raise before applying anything if the migration
+  # has a transaction open.
+  disable_ddl_transaction!
+
+  def up
+    define "TRANSFORM order_totals FROM orders SELECT price + tax AS total"
+  end
+
+  def down
+    apply "PAUSE TRANSFORM order_totals"
+    apply "DROP TRANSFORM order_totals"
+  end
+end
+```
+
+- `define`, `apply` and `status` are `Trellis.define`, `Trellis.apply` and
+  `Trellis.status`, run as the migration reaches them, so a transform can
+  read a table created earlier in the same migration.
+- **No transaction.** Trellis never joins the migration's transaction: each
+  call commits on Trellis's own connections. `define` and `apply` raise
+  `ActiveRecord::MigrationError` before applying anything if the
+  migration's connection has a transaction open, so a migration missing
+  `disable_ddl_transaction!` rolls back with nothing applied on either
+  side.
+- **`up` and `down`, not `change`.** ActiveRecord can't reverse a Trellis
+  statement: undoing a define is a `PAUSE TRANSFORM` and a `DROP
+  TRANSFORM` of a target only the statement names. A migration that
+  includes `Trellis::Migration` and defines a public `change` raises
+  before anything runs.
+- **Which handle.** If the process is connected, the helpers use its
+  handle. Otherwise (`rails db:migrate` is never connected), each call
+  connects one from `config.trellis.connect`, always with `staging: false`
+  and `drain_threads: 0`, runs `Trellis.migrate`, makes its call and shuts
+  the handle down.
+- **Once per database.** A define isn't idempotent, and the helpers add no
+  guard: `schema_migrations` already records which migrations have run.
+  A migration that has to tolerate a transform defined some other way can
+  guard its define itself, if you choose to:
+
+  ```ruby
+  def up
+    define "TRANSFORM order_totals FROM orders SELECT price + tax AS total" if status("order_totals").nil?
+  end
+  ```
+
+  The guard checks the target's name, not its definition. A changed
+  statement for a target that exists is an `ALTER TRANSFORM`, in a
+  migration of its own.
+
+`rails trellis:migrate` creates or upgrades Trellis's own tables the same
+way. The helpers run it whenever a migration defines something; run it in
+the deploy step as well (`bin/rails trellis:migrate db:migrate`), so a
+deploy that upgrades the gem without a new define still upgrades the
+tables before the worker restarts.
+
+`Trellis::Migration.with_handle { ... }` is what the helpers use, for a
+script that needs Trellis the way a migration does. Outside Rails,
+`require "trellis/migration"` and `Trellis.connect` before migrating.
+
 ## Layout
 
-- `lib/`: the `Trellis` module, its error classes and its `Data` values.
+- `lib/`: the `Trellis` module, its error classes and its `Data` values,
+  and the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
+  loaded only in an app that has Rails.
 - `ext/trellis_ruby/`: the extension crate, a member of the repository's
   Cargo workspace. Plain-data conversion and error codes come from
   `clients/embed` (`trellis-embed`), shared with the Elixir binding.

@@ -67,6 +67,15 @@ doesn't start the application to migrate, so a migration run gets a handle
 of its own from `Trellis.Migration`, always with the defaults (see
 [Migrations and transactions](#migrations-and-transactions)).
 
+In a Rails app, `Trellis::Railtie` connects each process's handle as the
+app boots, from `config.trellis.connect`, so a process's role is its
+configuration: the worker process sets `staging` and `drain_threads`, the
+web processes leave the defaults. Rake tasks, `rails db:migrate` included,
+get no boot handle, the way Ecto migrates without starting the app: a
+migration gets a handle of its own from `Trellis::Migration`, always with
+the defaults (see [Migrations and transactions](#migrations-and-transactions)
+and `clients/ruby/README.md`).
+
 A third option, `worker_threads`, is unrelated to either: it sizes the
 runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
 2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
@@ -134,7 +143,11 @@ reach the locks inside its dependencies. The host language's binding owns
 the fork boundary instead. The Ruby binding enforces the contract: every
 call on an inherited handle raises `Trellis::ForkedHandleError`, and so does
 `Trellis.connect` in a child forked while its parent had a handle running,
-rather than risk the hang (`clients/ruby/README.md`). The BEAM never forks,
+rather than risk the hang. In a Rails app under a preloading server, that
+means shutting the boot handle down in the parent and connecting one in each
+worker: Puma's `before_fork { Trellis.shutdown }` and
+`before_worker_boot { Trellis::Railtie.connect }` (`clients/ruby/README.md`
+covers Unicorn, Passenger and Puma's `fork_worker`). The BEAM never forks,
 so the Elixir binding has nothing to enforce.
 
 ## The silent-stall hazard (issue #144)
@@ -278,10 +291,10 @@ transient blip to retry past.
 **Trellis never joins your migration's transaction.** `migrate`, `define` and
 `apply` each run on the handle's own pooled connections, and each commits
 before it returns. None of them takes a connection or a transaction from the
-host, and the Elixir binding's migration helper, `Trellis.Migration`, doesn't
-change that either. Rails and Ecto both wrap each migration in a transaction
-by default, so a define made inside one behaves in four ways you might not
-expect:
+host, and neither binding's migration helper changes that: not Elixir's
+`Trellis.Migration`, and not Ruby's `Trellis::Migration`. Rails and Ecto both
+wrap each migration in a transaction by default, so a define made inside one
+behaves in four ways you might not expect:
 
 * **A rollback doesn't undo it.** If the migration fails after `define`
   returned, the host's changes roll back, but the definition and its target
@@ -317,22 +330,24 @@ So keep Trellis out of the host's transaction, in this order:
 4. The dedicated worker starts or restarts. It doesn't need the definitions
    to exist first; it picks each one up on its next pass.
 
-Step 3 belongs in a migration of its own with the host's transaction turned
-off (`@disable_ddl_transaction true` in Ecto, `disable_ddl_transaction!` in
-Rails), so it's recorded like any other migration. Keep it to its Trellis
-statements where you can: without the transaction, a migration that fails
-partway leaves whatever ran before the failure in place, on both sides. The
-simplest order is to create or alter the source table in one migration and
-define the transform in the next, but a transform defined against a table
-created earlier in the same non-transactional migration is fine too: the
-hazard is a rollback, not the order.
+Step 3 can be a deploy step of its own, run after migrations, or a migration
+of its own with the host's transaction turned off (`@disable_ddl_transaction
+true` in Ecto, `disable_ddl_transaction!` in Rails), so it's recorded like
+any other migration. Keep it to its Trellis statements where you can:
+without the transaction, a step that fails partway leaves whatever ran
+before the failure in place, on both sides. The simplest order is to create
+or alter the source table in one step and define the transform in the next,
+but a transform defined against a table created earlier in the same
+non-transactional step is fine too: the hazard is a rollback, not the order.
 
-A define isn't idempotent, and here it doesn't need to be: the host's
-migration tooling (Ecto's and Rails's `schema_migrations`) records which
-migrations have run, so a migration that defines a transform runs once per
-database. Its `down` undoes the define with `PAUSE TRANSFORM` and then
-`DROP TRANSFORM`: `DROP` refuses a transform that isn't paused, and takes
-the target table and its data with it.
+A deploy step runs on every deploy, and a define isn't idempotent, so a
+deploy step checks `status` first: it returns nothing for a target no
+transform writes. A migration is different: the host's migration tooling
+(Ecto's and Rails's `schema_migrations`) records which migrations have run,
+so a migration that defines a transform runs once per database and needs no
+such guard. Either way, `down` undoes the define with `PAUSE TRANSFORM` and
+then `DROP TRANSFORM`: `DROP` refuses a transform that isn't paused, and
+takes the target table and its data with it.
 
 In Elixir, `Trellis.Migration` makes those statements read like Ecto's own:
 
@@ -387,27 +402,45 @@ defmodule MyApp.Release do
 end
 ```
 
-In Rails, as a migration of its own, after the one that creates `orders`:
+In Rails, as a migration of its own, after the one that creates `orders`.
+`Trellis::Migration` makes the statements read like the migration's own:
 
 ```ruby
-class DefineOrderTotals < ActiveRecord::Migration[7.2]
-  # Trellis commits on its own connection. A transaction here would protect
-  # nothing, and could only make a rollback look like it undid the define.
+class DefineOrderTotals < ActiveRecord::Migration[8.1]
+  include Trellis::Migration
+
+  # Required: the helpers raise before applying anything if the migration
+  # has a transaction open.
   disable_ddl_transaction!
 
   # Assumes an initializer connected this process's handle with the
   # defaults (staging: false, drain_threads: 0), and that `Trellis.migrate`
   # has run.
   def up
-    Trellis.define("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+    define "TRANSFORM order_totals FROM orders SELECT price + tax AS total"
   end
 
   def down
-    Trellis.apply("PAUSE TRANSFORM order_totals")
-    Trellis.apply("DROP TRANSFORM order_totals")
+    apply "PAUSE TRANSFORM order_totals"
+    apply "DROP TRANSFORM order_totals"
   end
 end
 ```
+
+A migration's define runs once per database: ActiveRecord's
+`schema_migrations` records which migrations have run, so the helpers add no
+guard. Its `down` undoes the define with `PAUSE TRANSFORM` and then `DROP
+TRANSFORM`: `DROP` refuses a transform that isn't paused, and takes the
+target table and its data with it. A migration that includes
+`Trellis::Migration` has to define `up` and `down`, since ActiveRecord can't
+reverse a Trellis statement on its own: one that defines `change` raises
+before anything runs.
+
+`rails db:migrate` has no handle of its own (rake tasks skip the boot
+connect), so each helper connects one from `config.trellis.connect`, with
+the defaults, and runs `migrate` on it first. That covers step 2 whenever a
+migration defines something. To upgrade Trellis's tables on a deploy that
+doesn't, run `bin/rails trellis:migrate` in the deploy step too.
 
 A migration that has to tolerate a transform defined some other way (by
 hand, or by a deploy step of your own) can guard its define. The guard is
@@ -424,9 +457,7 @@ end
 
 ```ruby
 def up
-  return if Trellis.status("order_totals")
-
-  Trellis.define("TRANSFORM order_totals FROM orders SELECT price + tax AS total")
+  define "TRANSFORM order_totals FROM orders SELECT price + tax AS total" if status("order_totals").nil?
 end
 ```
 

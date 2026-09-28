@@ -54,8 +54,9 @@ require_relative "trellis/trellis_ruby"
 # result comes from a closed set, never from a string the database returned.
 #
 # A handle doesn't survive `fork`. Shut down before forking (Puma's
-# before_fork) and connect after (on_worker_boot, Passenger's
-# starting_worker_process). A forked child's calls on a handle it inherited
+# before_fork) and connect after (Puma's before_worker_boot, Passenger's
+# starting_worker_process); in a Rails app, Trellis::Railtie.connect does
+# the connecting. A forked child's calls on a handle it inherited
 # raise Trellis::ForkedHandleError, except Trellis.shutdown, which leaves the
 # parent's handle alone and does nothing. So does Trellis.connect in a child
 # forked while its parent's handle was running (issue #600).
@@ -406,3 +407,9 @@ module Trellis
     end
   end
 end
+
+# The Rails integration, only when Rails is loaded first (Bundler.require in
+# config/application.rb). Without Rails, nothing here requires a gem.
+# Trellis::Migration (lib/trellis/migration.rb) needs ActiveRecord: the
+# Railtie loads it with ActiveRecord, and an app without Rails requires it.
+require_relative "trellis/railtie" if defined?(::Rails::Railtie)

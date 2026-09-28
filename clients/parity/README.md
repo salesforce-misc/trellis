@@ -126,6 +126,14 @@ a supervised Trellis, where `connect` starts `{Trellis, options}`,
 `shutdown` stops it, and every other call goes through its process. Both
 runs check the same shapes.
 
+The Ruby suite checks its Rails integration the same way. Each migration
+helper (`Trellis::Migration#define`, `#apply` and `#status`) has to be the
+fixture operation of the same name. Its other public calls
+(`Trellis::Railtie.connect` and `.connect_options`, and
+`Trellis::Migration.with_handle`) are Rails-only, and `Parity::RAILS_ONLY`
+lists each with its reason. A call added to either module fails the suite
+until it's listed.
+
 ## Adding a case
 
 Add a step where the script already has the state it needs. Phase one runs

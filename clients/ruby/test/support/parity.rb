@@ -53,6 +53,18 @@ module Parity
     "connected?" => "Ruby's module-held handle"
   }.freeze
 
+  # The Rails integration's public calls outside the migration helpers, none
+  # of them on `Trellis` itself, and why each has no fixture operation. (Each
+  # migration helper, Trellis::Migration#define, #apply and #status, is the
+  # fixture operation of the same name; test/migration_test.rb runs them.)
+  # Elixir lists its supervision calls, child_spec and start_link, the same
+  # way.
+  RAILS_ONLY = {
+    "Trellis::Railtie.connect" => "`connect` with config.trellis.connect's options",
+    "Trellis::Railtie.connect_options" => "reads config.trellis.connect",
+    "Trellis::Migration.with_handle" => "a migration's own handle, connected around a block"
+  }.freeze
+
   # The fixture's own steps, which drive the test rather than the binding.
   HARNESS_OPS = %w[sql now].freeze
 

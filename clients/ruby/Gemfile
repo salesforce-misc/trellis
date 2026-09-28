@@ -2,7 +2,12 @@
 
 source "https://rubygems.org"
 
-# Development only: the binding itself has no gem dependencies.
+# Development only: the binding itself has no gem dependencies. Its Rails
+# integration (lib/trellis/railtie.rb, lib/trellis/migration.rb) loads only
+# in an app that has Rails, so activerecord and railties are here for its
+# tests alone.
+gem "activerecord", "~> 8.1"
 gem "minitest", "~> 5.25"
 gem "pg", "~> 1.6" # the tests' own connection to the testkit cluster
+gem "railties", "~> 8.1"
 gem "rake", "~> 13.3"

@@ -2,6 +2,7 @@
 
 require "test_helper"
 require_relative "support/parity"
+require_relative "support/rails_app"
 
 # The cross-language parity suite (issue #155): clients/parity/cases.json,
 # a script of (operation, input, expected shape) steps that the Elixir suite
@@ -83,6 +84,21 @@ class ParityTest < Minitest::Test
 
     used = Parity.fixture.fetch("live").map { |step| step.fetch("op") }.uniq
     assert_equal (Parity::OPERATIONS.keys + Parity::HARNESS_OPS).sort, used.sort
+  end
+
+  # The Rails integration adds no call to `Trellis`: each migration helper
+  # is the fixture operation of the same name, and every other public call
+  # it has is a listed Rails-only exception.
+  def test_the_rails_integration_is_fixture_operations_or_listed_exceptions
+    # exec_migration is ActiveRecord's hook, which the helpers wrap, not a
+    # helper.
+    helpers = Trellis::Migration.public_instance_methods(false).map(&:to_s) - ["exec_migration"]
+    assert_equal %w[apply define status], helpers.sort
+    assert_empty helpers - Parity::OPERATIONS.keys
+
+    calls = { "Trellis::Railtie" => Trellis::Railtie, "Trellis::Migration" => Trellis::Migration }
+            .flat_map { |name, mod| mod.singleton_methods(false).map { |call| "#{name}.#{call}" } }
+    assert_equal Parity::RAILS_ONLY.keys.sort, calls.sort
   end
 
   private
