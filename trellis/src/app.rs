@@ -151,6 +151,14 @@ pub struct TrellisOptions {
     /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
     /// threads couldn't run anything anyway.
     pub worker_threads: Option<usize>,
+    /// The publication this connection's staging worker reconciles, and the
+    /// one [`Trellis::request_backfill`] checks a table's membership in.
+    /// `None` (the default) is [`ClientOptions`]' own default publication.
+    ///
+    /// Set it on every connection in a fleet whose staging worker runs a
+    /// non-default publication, including one that runs no background work
+    /// of its own and only calls `request_backfill` (issue #641).
+    pub publication: Option<String>,
 }
 
 /// A connected Trellis instance — see the [module docs](self).
@@ -161,6 +169,10 @@ pub struct TrellisOptions {
 pub struct Trellis {
     config: Config,
     pool: Pool,
+    /// The publication resolved from [`TrellisOptions::publication`]: the
+    /// one the background client (if any) runs, and the one
+    /// [`Trellis::request_backfill`] checks.
+    publication: String,
     /// `Some` iff `options.staging || options.drain_threads > 0` — the live
     /// pipeline this connection started.
     client: Option<Client>,
@@ -178,14 +190,19 @@ impl Trellis {
     /// that many application workers start.
     pub async fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let pool = Pool::new(&config)?;
+        let publication = options
+            .publication
+            .clone()
+            .unwrap_or_else(|| ClientOptions::default().publication);
         let client = if options.staging || options.drain_threads > 0 {
-            Some(Self::start_client(&config, &options)?)
+            Some(Self::start_client(&config, &options, &publication)?)
         } else {
             None
         };
         Ok(Self {
             config,
             pool,
+            publication,
             client,
         })
     }
@@ -657,7 +674,8 @@ impl Trellis {
     /// target, say), refreshes the settled projections of a relationship
     /// whose to-side the table is, and flips the readers back `live`.
     ///
-    /// Only valid for a table that's already a publication member: a
+    /// Only valid for a table that's already a member of this connection's
+    /// publication ([`TrellisOptions::publication`]): a
     /// never-published table is backfilled in full on first contact by the
     /// running staging worker, so this is refused there
     /// ([`TrellisError::TableNotPublished`]). The running staging worker
@@ -677,7 +695,7 @@ impl Trellis {
             .get(0);
         let qualified = format!("{schema}.{source_table}");
 
-        let publication = ClientOptions::default().publication;
+        let publication = &self.publication;
         let already_published: bool = client
             .query_one(
                 "select exists(select 1 from pg_publication_tables \
@@ -689,7 +707,7 @@ impl Trellis {
         if !already_published {
             return Err(TrellisError::TableNotPublished {
                 table: qualified,
-                publication,
+                publication: publication.clone(),
             });
         }
 
@@ -1196,10 +1214,15 @@ impl Trellis {
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. The staging worker reads the tables to publish from the
     /// catalog itself (issue #427), so an empty catalog is fine.
-    fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
+    fn start_client(
+        config: &Config,
+        options: &TrellisOptions,
+        publication: &str,
+    ) -> Result<Client, TrellisError> {
         let client_options = ClientOptions {
             staging_worker: options.staging,
             application_threads: options.drain_threads,
+            publication: publication.to_string(),
             ..Default::default()
         };
         // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —

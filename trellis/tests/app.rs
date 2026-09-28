@@ -515,6 +515,63 @@ async fn request_backfill_parks_a_marker_and_reports_a_park_failure_as_db() {
     );
 }
 
+/// Issue #641: `request_backfill` checks membership in the publication this
+/// connection was configured with, not the default one. It used to read
+/// `ClientOptions::default().publication`, so an instance running a
+/// non-default publication got `TableNotPublished` for every table.
+#[tokio::test]
+async fn request_backfill_checks_the_configured_publication() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table widgets (id bigint primary key); \
+             create table gadgets (id bigint primary key); \
+             create publication custom_pub for table widgets; \
+             create publication trellis_pub for table gadgets;",
+        )
+        .await
+        .expect("seed one table per publication");
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(
+        config,
+        TrellisOptions {
+            publication: Some("custom_pub".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("widgets is in the configured publication");
+    let parked: i64 = client
+        .query_one(
+            "select count(*) from pending_backfill where table_name = 'trellis.widgets'",
+            &[],
+        )
+        .await
+        .expect("read markers")
+        .get(0);
+    assert_eq!(parked, 1, "request_backfill parks one marker");
+
+    let err = trellis
+        .request_backfill("gadgets")
+        .await
+        .expect_err("gadgets is only in the default publication");
+    match err {
+        trellis::TrellisError::TableNotPublished { table, publication } => {
+            assert_eq!(table, "trellis.gadgets");
+            assert_eq!(publication, "custom_pub");
+        }
+        other => panic!("expected TableNotPublished, got {other:?}: {other}"),
+    }
+}
+
 /// Issue #427: the staging worker reads what to publish from the catalog
 /// itself, so it no longer needs a definition registered before it can start
 /// (this used to fail with `TrellisError::NoDefinitions`). It starts with an

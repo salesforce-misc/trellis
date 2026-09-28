@@ -436,6 +436,7 @@ fn connect(options: ConnectOptions) -> NifReply<ResourceArc<Handle>> {
             staging: options.staging,
             drain_threads: options.drain_threads,
             worker_threads: Some(options.worker_threads),
+            ..Default::default()
         },
     )
     .map_err(plain)?;

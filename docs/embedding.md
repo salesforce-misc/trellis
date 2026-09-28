@@ -71,6 +71,12 @@ A third option, `worker_threads`, is unrelated to either: it sizes the
 runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
 2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
 
+Rust's `TrellisOptions` also takes a `publication` name, for a fleet whose
+staging worker runs a publication other than the default `trellis_pub`. Set
+it on every handle in that fleet, not only the staging one, because
+`request_backfill` checks a table's membership in the handle's own
+publication. The bindings don't expose it yet.
+
 ```rust
 // A web process: define transforms, never drains anything.
 let trellis = Trellis::connect(Config::resolve(None)?, TrellisOptions::default()).await?;
