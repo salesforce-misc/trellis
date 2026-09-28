@@ -609,9 +609,11 @@ enum Pending {
         run: Range<usize>,
         half_of: Option<usize>,
     },
-    /// Probe each record of `run` alone, lowest index first: the fallback
-    /// for a dead end (see [`Bisector`]).
-    Singles(Range<usize>),
+    /// Probe each record of `region` alone: the fallback for a dead end (see
+    /// [`Bisector`]). `step` counts the records already handed out; they run
+    /// from [`Bisector::dead_end_offset`] (modulo the region's length) up,
+    /// wrapping around to the region's start.
+    Singles { region: Range<usize>, step: usize },
 }
 
 /// A failing run that [`Bisector`] split, and how many of its two halves
@@ -647,10 +649,15 @@ struct Split {
 /// record's delta alone crosses a check and a batch-mate's negative delta
 /// cancels it. Bisection alone would miss that record on every drain, where
 /// probing each record alone found it (review of #655). So at a dead end each
-/// record of both halves is probed alone, lowest index first, within
-/// `max_probes`. A dead end high in a large batch can therefore spend the
-/// rest of the probe limit on single records and still not reach a masked
-/// record near its end.
+/// record of both halves is probed alone, within `max_probes`. A dead end
+/// high in a large batch has more records than the probe limit leaves room
+/// for, so those probes start at `dead_end_offset` into the dead end and wrap
+/// around: [`isolate_and_evict`] picks the offset at random on each call, so
+/// across repeated drains of a wedged page every record is eventually probed
+/// alone (in about `len / max_probes` drains), where a fixed start would miss
+/// a masked record past the window on every drain. Everything else runs
+/// lowest index first, and [`Bisection::failing`] is in index order however
+/// the records were reached.
 struct Bisector<E> {
     /// Work still to do. A stack, so the search is depth first and lowest
     /// index first: a failing record is pinned (and so charged) before the
@@ -660,16 +667,19 @@ struct Bisector<E> {
     splits: Vec<Split>,
     /// The `half_of` of the run [`Self::next_run`] handed out last.
     current_half_of: Option<usize>,
+    /// Where a dead end's single-record probes start, modulo its length.
+    dead_end_offset: usize,
     max_probes: usize,
     found: Bisection<E>,
 }
 
 impl<E> Bisector<E> {
-    fn new(n: usize, max_probes: usize) -> Self {
+    fn new(n: usize, max_probes: usize, dead_end_offset: usize) -> Self {
         let mut bisector = Bisector {
             pending: Vec::new(),
             splits: Vec::new(),
             current_half_of: None,
+            dead_end_offset,
             max_probes,
             found: Bisection {
                 failing: Vec::new(),
@@ -727,12 +737,17 @@ impl<E> Bisector<E> {
                 self.current_half_of = half_of;
                 Some(run)
             }
-            Pending::Singles(run) => {
+            Pending::Singles { region, step } => {
                 self.current_half_of = None;
-                if run.len() > 1 {
-                    self.pending.push(Pending::Singles(run.start + 1..run.end));
+                let len = region.len();
+                let index = region.start + (self.dead_end_offset % len + step) % len;
+                if step + 1 < len {
+                    self.pending.push(Pending::Singles {
+                        region,
+                        step: step + 1,
+                    });
                 }
-                Some(run.start..run.start + 1)
+                Some(index..index + 1)
             }
         }
     }
@@ -761,20 +776,36 @@ impl<E> Bisector<E> {
     }
 
     /// A dead end at `run`: queues each record of its halves to be probed
-    /// alone, lowest first, skipping a half that is one record (already
-    /// probed alone).
+    /// alone, skipping a half that is one record (already probed alone).
     fn probe_halves_alone(&mut self, run: Range<usize>) {
         let mid = run.start + run.len() / 2;
-        for half in [mid..run.end, run.start..mid] {
-            if half.len() > 1 {
-                self.pending.push(Pending::Singles(half));
-            }
-        }
+        let region = match run.len() {
+            // Both halves are single records.
+            0..=2 => return,
+            // The lower half is a single record.
+            3 => mid..run.end,
+            _ => run,
+        };
+        self.pending.push(Pending::Singles { region, step: 0 });
     }
 
-    fn finish(self) -> Bisection<E> {
+    fn finish(mut self) -> Bisection<E> {
+        // A dead end's single-record probes can wrap around; everything else
+        // already finds records in index order.
+        self.found.failing.sort_by_key(|(index, _)| *index);
         self.found
     }
+}
+
+/// A fresh random [`Bisector::dead_end_offset`] for one isolation call, so a
+/// dead end larger than the probe limit is probed from a different place on
+/// each drain. No crate dependency: [`RandomState`] is randomly keyed per
+/// instance.
+///
+/// [`RandomState`]: std::collections::hash_map::RandomState
+fn random_dead_end_offset() -> usize {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now()) as usize
 }
 
 /// Computes and applies `records` inside a transaction that always rolls
@@ -842,12 +873,15 @@ async fn probe_records(
 /// tell the two apart, and descending no further would miss the masked key
 /// on every drain, where probing each record alone charged it and so
 /// eventually evicted it. So at a dead end [`Bisector`] probes each record of
-/// both halves alone, lowest first, within [`MAX_ISOLATION_PROBES`]. A dead
-/// end deep in the search is small and costs a few probes. One high in a
-/// large page spends the rest of the limit on single records (cheap probes)
-/// and ends `ProbeLimitReached` unless a key was pinned; a masked key past
-/// the first couple of hundred records of such a dead end is still missed.
-/// A combination-only failure charges nothing either way, as before.
+/// both halves alone, within [`MAX_ISOLATION_PROBES`]. A dead end deep in the
+/// search is small and costs a few probes. One high in a large page spends
+/// the rest of the limit on single records (cheap probes) and ends
+/// `ProbeLimitReached` unless a key was pinned. Those probes start at a
+/// random offset into the dead end on each call and wrap around, so a masked
+/// key beyond one call's reach is found on a later drain: after about
+/// `len / MAX_ISOLATION_PROBES` drains on average, each bounded by the limit,
+/// where probing each record alone took one unbounded drain. A
+/// combination-only failure charges nothing either way, as before.
 ///
 /// **A transient error or version fence miss inside a probe** says nothing
 /// about the probed records. For a run of several records it is treated like
@@ -946,7 +980,11 @@ pub async fn isolate_and_evict(
         Cow::Owned(folded.iter().filter(|c| probeable(c)).cloned().collect())
     };
 
-    let mut bisector = Bisector::new(candidates.len(), MAX_ISOLATION_PROBES);
+    let mut bisector = Bisector::new(
+        candidates.len(),
+        MAX_ISOLATION_PROBES,
+        random_dead_end_offset(),
+    );
     while let Some(run) = bisector.next_run() {
         let records = &candidates[run.clone()];
         let Some(err) = probe_records(pool, seg_seq, claimed_by, wake_channel, records).await?
@@ -2843,7 +2881,18 @@ mod unit_tests {
         max_probes: usize,
         verdict: impl Fn(&Range<usize>) -> ProbeVerdict<()>,
     ) -> Bisection<()> {
-        let mut bisector = Bisector::new(n, max_probes);
+        bisect_from(n, max_probes, 0, verdict)
+    }
+
+    /// [`bisect_with`], with dead ends' single-record probes starting at
+    /// `dead_end_offset`.
+    fn bisect_from(
+        n: usize,
+        max_probes: usize,
+        dead_end_offset: usize,
+        verdict: impl Fn(&Range<usize>) -> ProbeVerdict<()>,
+    ) -> Bisection<()> {
+        let mut bisector = Bisector::new(n, max_probes, dead_end_offset);
         while let Some(run) = bisector.next_run() {
             let outcome = verdict(&run);
             bisector.record(run, outcome);
@@ -2946,6 +2995,64 @@ mod unit_tests {
         // alone, so the dead end costs nothing more.
         let found = bisect_with(2, MAX_ISOLATION_PROBES, pair(0, 1));
         assert_eq!((found.failing.len(), found.probes), (0, 2));
+    }
+
+    /// Review of #655: a dead end larger than the probe limit is probed from
+    /// `dead_end_offset` and wraps around, so a masked record out of reach of
+    /// one call's window is reached by a call with another offset, and random
+    /// offsets reach it within a bounded number of calls.
+    #[test]
+    fn bisect_rotates_a_large_dead_ends_single_record_probes() {
+        let n = 100_000;
+        let masked = |k: usize| {
+            move |run: &Range<usize>| {
+                let holds = |i: usize| run.contains(&i);
+                if holds(k) && (!holds(5) || holds(90_000)) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            }
+        };
+        // Record 30,000 is masked by record 5 in the lower half, and 90,000
+        // in the upper half completes the failure: a dead end at the top.
+        // Out of reach from offset 0: the window is records 0..254.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 0, masked(30_000));
+        assert!(found.failing.is_empty());
+        assert!(found.exhausted);
+        // An offset whose window covers it finds it.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 29_900, masked(30_000));
+        assert_eq!(failing_indexes(&found), vec![30_000]);
+        // The window wraps from the dead end's last record to its first.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, n - 100, masked(50));
+        assert_eq!(failing_indexes(&found), vec![50]);
+        // The offset is taken modulo the dead end's length.
+        let found = bisect_from(n, MAX_ISOLATION_PROBES, 3 * n + 29_900, masked(30_000));
+        assert_eq!(failing_indexes(&found), vec![30_000]);
+
+        // Seeded offsets (splitmix64), one per call as `isolate_and_evict`
+        // draws them: the masked record is found well within the bound. Each
+        // call's window covers 254 of 100,000 records, so about 394 calls are
+        // expected; 4,000 is ten times that.
+        let mut seed: u64 = 0x655;
+        let mut next_offset = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as usize
+        };
+        let calls = (1..=4_000)
+            .find(|_| {
+                let found = bisect_from(n, MAX_ISOLATION_PROBES, next_offset(), masked(30_000));
+                assert!(found.probes <= MAX_ISOLATION_PROBES);
+                !found.failing.is_empty()
+            })
+            .expect("a masked record out of one window's reach is found within 4,000 calls");
+        assert!(
+            calls > 1,
+            "the first seeded offset should not happen to cover it"
+        );
     }
 
     /// Review of #655: a record that fails alone, masked inside its half by a
