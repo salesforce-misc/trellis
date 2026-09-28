@@ -566,7 +566,8 @@ fn partition_by_threshold(
 /// room for about seven such keys in a page that size, and for many more in a
 /// smaller one. It bounds the cases where bisection alone is not cheap:
 /// most of a page failing on its own (up to `2n` probes to find them all),
-/// or a run of probes that each hit a transient error. Hitting it charges
+/// a run of probes that each hit a transient error, or a dead end's
+/// single-record probes (see [`Bisector`]). Hitting it charges
 /// whatever keys were already pinned; the keys it didn't reach are probed
 /// again on the batch's next failed drain.
 pub const MAX_ISOLATION_PROBES: usize = 256;
@@ -598,18 +599,27 @@ struct Bisection<E> {
     exhausted: bool,
 }
 
-/// Pushes `run` onto `pending` split in two, the lower half on top so it is
-/// probed first. A single-record run is pushed whole.
-fn push_halves(pending: &mut Vec<Range<usize>>, run: Range<usize>) {
-    if run.len() <= 1 {
-        if !run.is_empty() {
-            pending.push(run);
-        }
-        return;
-    }
-    let mid = run.start + run.len() / 2;
-    pending.push(mid..run.end);
-    pending.push(run.start..mid);
+/// One entry on a [`Bisector`]'s stack of work still to do.
+#[derive(Debug)]
+enum Pending {
+    /// Probe `run`. `half_of` is the index in [`Bisector::splits`] of the
+    /// failing run it is a half of, or `None` for a run split because it
+    /// hit a transient error, or for a lone record.
+    Run {
+        run: Range<usize>,
+        half_of: Option<usize>,
+    },
+    /// Probe each record of `run` alone, lowest index first: the fallback
+    /// for a dead end (see [`Bisector`]).
+    Singles(Range<usize>),
+}
+
+/// A failing run that [`Bisector`] split, and how many of its two halves
+/// have come back clean.
+#[derive(Debug)]
+struct Split {
+    run: Range<usize>,
+    clean_halves: u8,
 }
 
 /// Adaptive group testing over records `0..n` (issue #655): probes the two
@@ -629,28 +639,76 @@ fn push_halves(pending: &mut Vec<Range<usize>>, run: Range<usize>) {
 /// against the `n` of probing each record alone. The probes cover `2n`
 /// records in total for one failing record (each halving covers half of what
 /// the one before it did, two runs at a time).
+///
+/// **Dead ends.** A failing run whose halves both come back clean fails only
+/// through records on both sides of the split. That is a failure that only
+/// appears in combination, or a record that fails alone masked by a
+/// batch-mate in its own half: an aggregate group's sum, say, where one
+/// record's delta alone crosses a check and a batch-mate's negative delta
+/// cancels it. Bisection alone would miss that record on every drain, where
+/// probing each record alone found it (review of #655). So at a dead end each
+/// record of both halves is probed alone, lowest index first, within
+/// `max_probes`. A dead end high in a large batch can therefore spend the
+/// rest of the probe limit on single records and still not reach a masked
+/// record near its end.
 struct Bisector<E> {
-    /// Runs still to probe. A stack, so the search is depth first and lowest
+    /// Work still to do. A stack, so the search is depth first and lowest
     /// index first: a failing record is pinned (and so charged) before the
     /// probe limit can stop the search, and in the batch's own order.
-    pending: Vec<Range<usize>>,
+    pending: Vec<Pending>,
+    /// Every failing run split so far, for detecting dead ends.
+    splits: Vec<Split>,
+    /// The `half_of` of the run [`Self::next_run`] handed out last.
+    current_half_of: Option<usize>,
     max_probes: usize,
     found: Bisection<E>,
 }
 
 impl<E> Bisector<E> {
     fn new(n: usize, max_probes: usize) -> Self {
-        let mut pending = Vec::new();
-        push_halves(&mut pending, 0..n);
-        Bisector {
-            pending,
+        let mut bisector = Bisector {
+            pending: Vec::new(),
+            splits: Vec::new(),
+            current_half_of: None,
             max_probes,
             found: Bisection {
                 failing: Vec::new(),
                 probes: 0,
                 exhausted: false,
             },
+        };
+        match n {
+            0 => {}
+            1 => bisector.pending.push(Pending::Run {
+                run: 0..1,
+                half_of: None,
+            }),
+            // The whole batch already failed with an isolate-class error.
+            _ => bisector.split(0..n, true),
         }
+        bisector
+    }
+
+    /// Pushes `run`'s two halves, the lower on top so it is probed first.
+    /// `failed` records `run` as a failing split, whose halves both coming
+    /// back clean is a dead end; a run that only hit a transient error is not.
+    fn split(&mut self, run: Range<usize>, failed: bool) {
+        let mid = run.start + run.len() / 2;
+        let half_of = failed.then(|| {
+            self.splits.push(Split {
+                run: run.clone(),
+                clean_halves: 0,
+            });
+            self.splits.len() - 1
+        });
+        self.pending.push(Pending::Run {
+            run: mid..run.end,
+            half_of,
+        });
+        self.pending.push(Pending::Run {
+            run: run.start..mid,
+            half_of,
+        });
     }
 
     /// The next run to probe, counted as a probe, or `None` once the search
@@ -664,18 +722,53 @@ impl<E> Bisector<E> {
             return None;
         }
         self.found.probes += 1;
-        self.pending.pop()
+        match self.pending.pop()? {
+            Pending::Run { run, half_of } => {
+                self.current_half_of = half_of;
+                Some(run)
+            }
+            Pending::Singles(run) => {
+                self.current_half_of = None;
+                if run.len() > 1 {
+                    self.pending.push(Pending::Singles(run.start + 1..run.end));
+                }
+                Some(run.start..run.start + 1)
+            }
+        }
     }
 
     /// What probing `run` (the last [`Self::next_run`]) showed.
     fn record(&mut self, run: Range<usize>, verdict: ProbeVerdict<E>) {
+        let half_of = self.current_half_of.take();
         match verdict {
-            ProbeVerdict::Clean => {}
+            ProbeVerdict::Clean => {
+                if let Some(index) = half_of {
+                    let split = &mut self.splits[index];
+                    split.clean_halves += 1;
+                    if split.clean_halves == 2 {
+                        let dead_end = split.run.clone();
+                        self.probe_halves_alone(dead_end);
+                    }
+                }
+            }
             ProbeVerdict::Failed(err) if run.len() == 1 => {
                 self.found.failing.push((run.start, err))
             }
             ProbeVerdict::Unknown if run.len() == 1 => {}
-            ProbeVerdict::Failed(_) | ProbeVerdict::Unknown => push_halves(&mut self.pending, run),
+            ProbeVerdict::Failed(_) => self.split(run, true),
+            ProbeVerdict::Unknown => self.split(run, false),
+        }
+    }
+
+    /// A dead end at `run`: queues each record of its halves to be probed
+    /// alone, lowest first, skipping a half that is one record (already
+    /// probed alone).
+    fn probe_halves_alone(&mut self, run: Range<usize>) {
+        let mid = run.start + run.len() / 2;
+        for half in [mid..run.end, run.start..mid] {
+            if half.len() > 1 {
+                self.pending.push(Pending::Singles(half));
+            }
         }
     }
 
@@ -740,19 +833,21 @@ async fn probe_records(
 /// fails alone is ever charged, exactly as before; bisection only decides
 /// which single records get probed. [`MAX_ISOLATION_PROBES`] caps the total.
 ///
-/// That relies on a run holding a record that fails alone failing too. When
-/// it does not (another record in the run masks the failure), bisection
-/// misses the key this drain where probing every record would have found it;
-/// it is never charged wrongly, and the page fails again and is probed again
-/// on its next drain.
-///
-/// **A failure that only appears in combination** (two records fine alone,
-/// failing together) makes some run fail while neither of its halves does.
-/// Bisection stops there, charging nothing for it, which is what probing
-/// each record alone concluded as well — so a batch with only that failure
-/// returns `NothingReproduced`, and the page fails again on its next drain.
-/// It no longer re-runs an unbounded isolation each time: the dead end costs
-/// at most two probes per halving above the split, `2 * log2(n)` in all.
+/// **Dead ends.** Bisection relies on a run holding a record that fails
+/// alone failing too, and a batch-mate can mask it: in an aggregate group,
+/// one record's delta alone can cross a check that another record's negative
+/// delta in the same half cancels. Then some failing run has two clean
+/// halves, which is also what a failure that only appears in combination
+/// (two records fine alone, failing together) looks like. Bisection can't
+/// tell the two apart, and descending no further would miss the masked key
+/// on every drain, where probing each record alone charged it and so
+/// eventually evicted it. So at a dead end [`Bisector`] probes each record of
+/// both halves alone, lowest first, within [`MAX_ISOLATION_PROBES`]. A dead
+/// end deep in the search is small and costs a few probes. One high in a
+/// large page spends the rest of the limit on single records (cheap probes)
+/// and ends `ProbeLimitReached` unless a key was pinned; a masked key past
+/// the first couple of hundred records of such a dead end is still missed.
+/// A combination-only failure charges nothing either way, as before.
 ///
 /// **A transient error or version fence miss inside a probe** says nothing
 /// about the probed records. For a run of several records it is treated like
@@ -2820,36 +2915,84 @@ mod unit_tests {
 
     /// Two records that are fine alone but fail together: bisection follows
     /// the pair down until the halving that splits it, where neither half
-    /// fails, and stops there with nothing to blame. That dead end costs at
-    /// most two probes per halving, however large the page.
+    /// fails. That dead end probes each record of both halves alone, finds
+    /// nothing to blame, and blames nothing. Deep in the search that is a few
+    /// probes; at the top of a large page it is the rest of the probe limit.
     #[test]
     fn bisect_blames_nothing_for_a_failure_that_only_appears_in_combination() {
         let n = 100_000;
-        for (a, b) in [(10, 60_000), (10, 11), (49_999, 50_000)] {
-            let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
+        let pair = |a: usize, b: usize| {
+            move |run: &Range<usize>| {
                 if run.contains(&a) && run.contains(&b) {
                     ProbeVerdict::Failed(())
                 } else {
                     ProbeVerdict::Clean
                 }
-            });
-            assert!(found.failing.is_empty(), "({a}, {b}): {:?}", found.failing);
-            assert!(!found.exhausted);
-            assert!(
-                found.probes <= 2 * halvings(n),
-                "({a}, {b}): {} probes",
-                found.probes
-            );
-        }
-        // Split by the very first halving: two clean halves, done.
-        let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
-            if run.contains(&10) && run.contains(&60_000) {
-                ProbeVerdict::Failed(())
-            } else {
-                ProbeVerdict::Clean
             }
-        });
-        assert_eq!(found.probes, 2);
+        };
+        // Split deep in the search: a small dead end.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, pair(10, 11));
+        assert!(found.failing.is_empty(), "{:?}", found.failing);
+        assert!(!found.exhausted);
+        assert!(found.probes <= 2 * halvings(n), "{} probes", found.probes);
+        // Split by the first halving: the dead end is the whole page.
+        for (a, b) in [(10, 60_000), (49_999, 50_000)] {
+            let found = bisect_with(n, MAX_ISOLATION_PROBES, pair(a, b));
+            assert!(found.failing.is_empty(), "({a}, {b}): {:?}", found.failing);
+            assert!(found.exhausted);
+            assert_eq!(found.probes, MAX_ISOLATION_PROBES);
+        }
+        // A two-record page: its halves are single records, already probed
+        // alone, so the dead end costs nothing more.
+        let found = bisect_with(2, MAX_ISOLATION_PROBES, pair(0, 1));
+        assert_eq!((found.failing.len(), found.probes), (0, 2));
+    }
+
+    /// Review of #655: a record that fails alone, masked inside its half by a
+    /// batch-mate (a run fails only if it holds `k` without `m`, or `k`, `m`
+    /// and `r` together, as an aggregate sum crossing a check might). The
+    /// failing run whose halves both come back clean is a dead end, and
+    /// probing its records alone pins `k`, as probing every record alone
+    /// did before bisection.
+    #[test]
+    fn bisect_pins_a_record_masked_by_a_batch_mate_in_its_half() {
+        let masked = |k: usize, m: usize, r: usize| {
+            move |run: &Range<usize>| {
+                let holds = |i: usize| run.contains(&i);
+                if holds(k) && (!holds(m) || holds(r)) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            }
+        };
+        // Halves {0, 1} and {2, 3} both pass: two half probes, four singles.
+        let found = bisect_with(4, MAX_ISOLATION_PROBES, masked(1, 0, 3));
+        assert_eq!(failing_indexes(&found), vec![1]);
+        assert_eq!(found.probes, 6);
+        assert!(!found.exhausted);
+
+        // A dead end deep in a large page is small and cheap.
+        let n = 100_000;
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(1001, 1000, 1010));
+        assert_eq!(failing_indexes(&found), vec![1001]);
+        assert!(!found.exhausted);
+        assert!(
+            found.probes <= 2 * halvings(n) + 8,
+            "{} probes",
+            found.probes
+        );
+
+        // A dead end at the top of a large page: the single-record probes
+        // reach a masked record near its start before the probe limit, and
+        // the limit stops them past that.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(100, 5, 90_000));
+        assert_eq!(failing_indexes(&found), vec![100]);
+        assert!(found.exhausted);
+        // Only single records are probed past the first two halves.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, masked(1000, 5, 90_000));
+        assert!(found.failing.is_empty());
+        assert!(found.exhausted);
     }
 
     /// A transient error says nothing about the run. Bisection looks inside a

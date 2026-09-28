@@ -2504,3 +2504,116 @@ async fn isolation_bisects_a_large_page_to_a_key_that_fails_on_apply() {
         vec![("1234".to_string(), 1)]
     );
 }
+
+/// Issue #655 review: a key that fails alone can be masked inside a run by a
+/// batch-mate. Here three keys share one brand-new aggregate group under a
+/// `total <= 8` check: key 1 adds 10 (fails alone), key 2 subtracts 5 and
+/// key 3 adds 5, and key 4 is in another group. The page fails (10), but
+/// its halves `{1, 2}` (5) and `{3, 4}` (5 and 1) both pass: the failure
+/// needs records from both halves, and key 2 masks key 1 inside its half.
+/// Isolation must still pin key 1, which fails alone, as probing every
+/// record alone did before #655, or nothing is ever charged and the page
+/// stays wedged. Evicting key 1 is what lets the page drain.
+#[tokio::test]
+async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            "create table order_items (id integer primary key, order_id integer, amount numeric); \
+             alter table order_items replica identity full",
+        )
+        .await
+        .expect("create source table");
+    let source = "TRANSFORM order_summary FROM order_items GROUP BY order_id \
+                   SELECT order_id AS order_id, SUM(amount) AS total";
+    let source_columns = numeric_columns(&["id", "order_id", "amount"]);
+    create_definition(&db.pool, source, &source_columns)
+        .await
+        .expect("create aggregate definition");
+    let def = parse(source).expect("parse aggregate definition");
+    create_aggregate_target_table(&db.pool, &def, "public", &source_columns)
+        .await
+        .expect("create aggregate target table");
+    client
+        .batch_execute(
+            "alter table order_summary add constraint total_at_most_8 check (total <= 8)",
+        )
+        .await
+        .expect("add the check constraint");
+    client
+        .batch_execute(
+            "insert into order_items (id, order_id, amount) values \
+             (1, 1, 10.00), (2, 1, -5.00), (3, 1, 5.00), (4, 2, 1.00)",
+        )
+        .await
+        .expect("seed live order_items rows");
+
+    let order_items = qualify_fixture_table("order_items");
+    for (key, image) in [
+        ("1", r#"{"order_id":"1","amount":"10.00"}"#),
+        ("2", r#"{"order_id":"1","amount":"-5.00"}"#),
+        ("3", r#"{"order_id":"1","amount":"5.00"}"#),
+        ("4", r#"{"order_id":"2","amount":"1.00"}"#),
+    ] {
+        insert_cdc_row(
+            &client,
+            "seg_0",
+            &order_items,
+            key,
+            "insert",
+            None,
+            Some(image),
+        )
+        .await;
+    }
+    let seg_seq = seal_active_segment(&mut client).await;
+
+    match drain_result(&db.pool, seg_seq).await {
+        Err(ApplyError::Db(err)) => assert_eq!(err.code(), Some(&SqlState::CHECK_VIOLATION)),
+        other => panic!("expected the check violation to surface, got {other:?}"),
+    }
+    assert_eq!(
+        charged_keys(&client, &order_items).await,
+        vec![("1".to_string(), 1)],
+        "key 1 fails alone and must be charged, masked or not; nothing else is"
+    );
+
+    let mut failures = 1;
+    let outcome = loop {
+        match drain_result(&db.pool, seg_seq).await {
+            Ok(Some(outcome)) => break outcome,
+            Ok(None) => panic!("drain_once claimed nothing on a still-undrained segment"),
+            Err(_) => {
+                failures += 1;
+                assert!(
+                    failures <= 20,
+                    "key 1 was never evicted; the page stays wedged"
+                );
+            }
+        }
+    };
+    assert_eq!(
+        outcome.keys_written, 2,
+        "both groups are written once key 1 is evicted"
+    );
+    assert!(poison_marker_exists(&client, &order_items, "1").await);
+    assert!(segment_state_is_drained(&client, seg_seq).await);
+    let totals: Vec<(i32, String)> = client
+        .query(
+            "select order_id::int, total::text from order_summary order by order_id",
+            &[],
+        )
+        .await
+        .expect("read order_summary")
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        totals,
+        vec![(1, "0.00".to_string()), (2, "1.00".to_string())],
+        "keys 2, 3 and 4 applied; key 1 is held"
+    );
+}
