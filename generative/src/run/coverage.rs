@@ -387,9 +387,12 @@ pub enum RelPath {
     ParentTruncate,
     /// A from-side row is written after the parent it joins (before or after
     /// the write) was deleted, truncated, or had its read column changed
-    /// earlier in the same program: the parent change and the from-side
-    /// change are both in the engine's pipeline, the lost-update shape of
-    /// #582. Only reachable when a program interleaves tables.
+    /// earlier in the same program. Only reachable when a program interleaves
+    /// tables. The serial tiers quiesce after every op, so there the parent
+    /// change has settled before the from-side write lands; only a tier that
+    /// applies several ops before quiescing (the bursty concurrent tier,
+    /// #557) can have both in the engine's pipeline at once, the lost-update
+    /// shape of #582.
     FromSideAfterParentChange,
 }
 
