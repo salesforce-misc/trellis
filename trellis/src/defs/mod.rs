@@ -107,7 +107,10 @@ pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]
 pub use parser::parse_relationship;
 #[cfg(any(test, feature = "internals"))]
-pub use validate::{RelationshipTypeMismatch, RelationshipWarning, ValidationError};
+pub use validate::{
+    KeyColumnRole, NondeterministicKeyCollation, RelationshipTypeMismatch, RelationshipWarning,
+    ValidationError,
+};
 
 #[cfg(test)]
 mod tests {

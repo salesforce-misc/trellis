@@ -22,6 +22,24 @@ A table whose replica identity is `USING INDEX` over a unique index is accepted
 too, since that index plays the primary key's part, but a primary key is the
 rule to design to.
 
+**Key columns need a deterministic collation** (#638). Trellis matches keys by
+their exact text, but a nondeterministic collation's `=` (an ICU collation
+created with `deterministic = false`, such as a case-insensitive one) treats
+strings that differ as equal, so its `GROUP BY` and unique indexes would fold
+rows Trellis keeps apart. Trellis rejects such a collation when the definition
+or relationship is created, and never reinterprets it. The rule covers every
+column Trellis uses as a key:
+
+- the source's primary key (or the unique index standing in for one), which a
+  1-1 target inherits;
+- each `GROUP BY` key: a source column, or a relationship path's to-side column;
+- a relationship's join columns, and each endpoint's primary key (see
+  [Relationships](#relationships)).
+
+The error names the column and its collation. A deterministic collation other
+than the default, such as `"C"`, is fine. The target's own key columns take the
+database default collation, which Postgres always makes deterministic.
+
 Some shapes need more than the key. An aggregate, and any read through a to-one
 relationship, needs a deleted or re-keyed source row's whole old image, which
 Postgres logs only under `REPLICA IDENTITY FULL`. That, too, is checked and
@@ -166,7 +184,8 @@ key to a `bigint` primary key is rejected, and so are `text` against
 different collations. The error names both columns and both types. To fix it,
 alter one column to match the other, for example
 `ALTER TABLE order_line_items ALTER COLUMN product_id TYPE bigint`. A join
-column also needs a deterministic collation.
+column, and each endpoint's primary key, also needs a deterministic collation
+(see [Source tables](#source-tables)).
 
 See [0006-relationships](decisions/0006-relationships.md) for the full design and
 [0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)

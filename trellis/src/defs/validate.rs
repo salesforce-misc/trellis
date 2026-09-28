@@ -18,7 +18,7 @@ use std::fmt;
 use regex::Regex;
 
 use super::ast::{Expr, FieldDef, GroupByKey, KeySpace, Predicate, TransformDef, ValueType};
-use super::model::RelationshipCardinality;
+use super::model::{RelationshipCardinality, RelationshipSide};
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
 use crate::integer::IntWidth;
@@ -39,6 +39,39 @@ pub struct ResolvedRelationship {
     pub to_table: String,
     pub to_col: String,
     pub column_types: HashMap<String, ValueType>,
+}
+
+/// Which key a [`ValidationError::NondeterministicKeyCollation`] column
+/// belongs to (issue #638). Every one of them is matched by the engine as
+/// exact text: apply keys changes and target rows by the source's and each
+/// relationship endpoint's row-identity key, and an aggregate's group key is
+/// its `GROUP BY` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyColumnRole {
+    /// Part of the definition's source's row-identity key (its primary key,
+    /// or the unique index `ddl::source_primary_key` falls back to).
+    SourceKey,
+    /// A `GROUP BY` key: a source column, or a to-one relationship path's
+    /// to-side column.
+    GroupBy,
+    /// Part of a relationship endpoint's row-identity key.
+    RelationshipEndpointKey {
+        /// The relationship's name.
+        name: String,
+        side: RelationshipSide,
+    },
+}
+
+impl fmt::Display for KeyColumnRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyColumnRole::SourceKey => write!(f, "part of the source's row-identity key"),
+            KeyColumnRole::GroupBy => write!(f, "a GROUP BY key"),
+            KeyColumnRole::RelationshipEndpointKey { name, side } => {
+                write!(f, "part of relationship '{name}''s {side} row-identity key")
+            }
+        }
+    }
 }
 
 /// Why a [`TransformDef`] was rejected by the validator.
@@ -335,6 +368,16 @@ pub enum ValidationError {
         column: String,
         collation: String,
     },
+    /// A column the engine matches as a key by its exact text has a
+    /// nondeterministic collation (issue #638): the source's row-identity key,
+    /// a `GROUP BY` key, or a relationship endpoint's row-identity key. Such a
+    /// collation's `=` (and so `GROUP BY` and a unique index) treats distinct
+    /// strings as equal (`'A'` and `'a'` under a case-insensitive one), so
+    /// Postgres would fold rows the engine keeps apart. The key-column twin of
+    /// [`ValidationError::RelationshipNondeterministicCollation`], refused at
+    /// define time for the same reason (#590's decision: reject, never
+    /// reinterpret).
+    NondeterministicKeyCollation(Box<NondeterministicKeyCollation>),
     /// A *to-many* relationship's to-side (issue #41) lacks a replica identity
     /// that carries the join column in row pre-images. For to-many, the join
     /// key (`to_col`) is a *non-PK* column on the to-side, and the staging
@@ -436,6 +479,17 @@ pub enum ValidationError {
         function: String,
         rel: String,
     },
+}
+
+/// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
+/// the enum for the same reason as [`RelationshipTypeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NondeterministicKeyCollation {
+    pub key: KeyColumnRole,
+    /// The column's table as the check resolved it (`schema.table`).
+    pub table: String,
+    pub column: String,
+    pub collation: String,
 }
 
 /// Payload of [`ValidationError::RelationshipTypeMismatch`], boxed out of the
@@ -706,6 +760,21 @@ impl fmt::Display for ValidationError {
                  (e.g. by case), but Trellis matches join keys by their exact text, so join \
                  columns need a deterministic collation"
             ),
+            ValidationError::NondeterministicKeyCollation(refused) => {
+                let NondeterministicKeyCollation {
+                    key,
+                    table,
+                    column,
+                    collation,
+                } = refused.as_ref();
+                write!(
+                    f,
+                    "{table}.{column} is {key}, and its collation \"{collation}\" is \
+                 nondeterministic; its `=` matches strings that differ (e.g. by case), but \
+                 Trellis matches keys by their exact text, so key columns need a \
+                 deterministic collation"
+                )
+            }
             ValidationError::RelationshipToManyRequiresReplicaIdentity {
                 name,
                 to_table,

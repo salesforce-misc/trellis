@@ -102,8 +102,8 @@ use crate::pool::{Pool, quote_ident};
 use tokio_postgres::GenericClient;
 
 use super::ast::{
-    AlterClause, AlterTransform, Expr, FieldDef, KeySpace, RelationshipDef, TransformDef,
-    ValueType, render_definition_text,
+    AlterClause, AlterTransform, Expr, FieldDef, GroupByKey, KeySpace, RelationshipDef,
+    TransformDef, ValueType, render_definition_text,
 };
 use super::backfill::{self, BackfillError};
 use super::ddl::{self, DdlError};
@@ -117,8 +117,9 @@ use super::model::{
 use super::parser::{parse, parse_relationship};
 use super::pg_type::PgType;
 use super::validate::{
-    RelationshipTypeMismatch, RelationshipWarning, ResolvedRelationship, ValidationError,
-    infer_field_types, reject_primary_key_named_fields, validate,
+    KeyColumnRole, NondeterministicKeyCollation, RelationshipTypeMismatch, RelationshipWarning,
+    ResolvedRelationship, ValidationError, infer_field_types, reject_primary_key_named_fields,
+    validate,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -2417,9 +2418,13 @@ async fn create_definition_inner(
     // returns — so an aggregate over a `numeric`-keyed table, or chained off
     // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
     // used to be accepted here and then halt on its first live change.
-    ddl::source_primary_key_in_txn(&*txn, &qualified_source)
+    let source_key = ddl::source_primary_key_in_txn(&*txn, &qualified_source)
         .await
         .map_err(CatalogError::Ddl)?;
+    // Issue #638: the source's key and any `GROUP BY` key need a
+    // deterministic collation. Placed with the key-type check above for the
+    // same reason: it is the first read of the live source relation.
+    assert_deterministic_definition_keys(&txn, &def, &qualified_source, &source_key).await?;
     // Issue #376: the authoritative copy of `install_definition`'s fail-fast
     // check, placed with the key check above because it reads the live
     // source relation (an own-target source is exempt before that query).
@@ -2783,8 +2788,9 @@ struct ValidatedRelationship {
 ///    other") could steer the user onto it.
 /// 2. **Each endpoint**, from-side then to-side
 ///    ([`validate_relationship_endpoint`]): intake can key it, its key's
-///    types are on the key allowlist, and it is `live` if it is one of this
-///    instance's targets.
+///    types are on the key allowlist and its key's collations are
+///    deterministic, and it is `live` if it is one of this instance's
+///    targets.
 /// 3. **Name.** Not already declared on the qualified from-table
 ///    ([`ValidationError::DuplicateRelationshipName`], a friendlier surfacing
 ///    of the rule `relationship_definitions_from_schema_from_table_name_key`
@@ -2917,6 +2923,10 @@ async fn validate_relationship(
 ///   that same function, so the gate here is exactly the runtime one. Own
 ///   targets are not exempt: a 1-1 target mirrors its source's (already
 ///   gated) key, but an aggregate target's key is its `GROUP BY` columns.
+/// - **Key collations deterministic**
+///   ([`assert_deterministic_key_collation_in_txn`], #638): that same key is
+///   matched by its exact text, which a nondeterministic collation's `=`
+///   disagrees with.
 /// - **Live, if one of this instance's targets** ([`reject_non_live_upstream`],
 ///   #403): the seam is such an endpoint's only change feed, and a build's
 ///   writes land outside it.
@@ -2928,7 +2938,22 @@ async fn validate_relationship_endpoint(
 ) -> Result<(), CatalogError> {
     reject_unkeyed_relationship_endpoint(txn, side, qualified_endpoint).await?;
     match ddl::source_primary_key_in_txn(txn, qualified_endpoint).await {
-        Ok(_) => {}
+        // Issue #638: the same key, matched by its exact text, so it needs a
+        // deterministic collation too.
+        Ok(key) => {
+            for column in &key {
+                assert_deterministic_key_collation_in_txn(
+                    txn,
+                    KeyColumnRole::RelationshipEndpointKey {
+                        name: name.to_string(),
+                        side,
+                    },
+                    qualified_endpoint,
+                    &column.name,
+                )
+                .await?;
+            }
+        }
         Err(DdlError::UnsupportedPrimaryKeyType {
             column, pg_type, ..
         }) => {
@@ -3768,7 +3793,8 @@ async fn column_type_in_txn(
 
 /// A relationship join column's type and collation as Postgres reports them
 /// (`pg_attribute`, `pg_collation`), for [`assert_joinable_as_is`] and
-/// [`assert_deterministic_join_collation`] (issue #590).
+/// [`assert_deterministic_join_collation`] (issue #590), and a key column's
+/// for [`assert_deterministic_key_collation`] (issue #638).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JoinColumn {
     /// `format_type(atttypid, atttypmod)`: the type's name with any
@@ -3811,6 +3837,26 @@ async fn join_column_in_txn(
     display_table: &str,
     column: &str,
 ) -> Result<JoinColumn, CatalogError> {
+    column_in_txn(txn, query_table, column)
+        .await?
+        .ok_or_else(|| {
+            ValidationError::UnknownRelationshipColumn {
+                table: display_table.to_string(),
+                column: column.to_string(),
+            }
+            .into()
+        })
+}
+
+/// [`join_column_in_txn`]'s lookup without its error: `None` for a table or
+/// column that doesn't exist. Also serves the key-column collation check
+/// ([`assert_deterministic_key_collation_in_txn`], issue #638), whose caller
+/// has already resolved the column some other way.
+async fn column_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    query_table: &str,
+    column: &str,
+) -> Result<Option<JoinColumn>, CatalogError> {
     let row = txn
         .query_opt(
             "select pg_catalog.format_type(a.atttypid, a.atttypmod),
@@ -3828,21 +3874,133 @@ async fn join_column_in_txn(
             &[&ddl::regclass_arg(query_table), &column],
         )
         .await?;
-    match row {
-        Some(row) => Ok(JoinColumn {
-            pg_type: row.get(0),
-            type_oid: row.get(1),
-            typmod: row.get(2),
-            collation_oid: row.get(3),
-            collation: row.get(4),
-            collation_deterministic: row.get(5),
-        }),
-        None => Err(ValidationError::UnknownRelationshipColumn {
-            table: display_table.to_string(),
-            column: column.to_string(),
-        }
-        .into()),
+    Ok(row.map(|row| JoinColumn {
+        pg_type: row.get(0),
+        type_oid: row.get(1),
+        typmod: row.get(2),
+        collation_oid: row.get(3),
+        collation: row.get(4),
+        collation_deterministic: row.get(5),
+    }))
+}
+
+/// Rejects `table.column`, a column the engine matches as a key in the role
+/// `key`, if [`column_in_txn`] finds it has a nondeterministic collation
+/// (issue #638). A column that doesn't exist passes: every caller has already
+/// resolved it (it came from the table's own key index, or [`validate`]
+/// checked it), and the check that resolved it owns that error.
+async fn assert_deterministic_key_collation_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    key: KeyColumnRole,
+    table: &str,
+    column: &str,
+) -> Result<(), CatalogError> {
+    match column_in_txn(txn, table, column).await? {
+        Some(resolved) => Ok(assert_deterministic_key_collation(
+            key, table, column, &resolved,
+        )?),
+        None => Ok(()),
     }
+}
+
+/// [`assert_deterministic_key_collation_in_txn`]'s decision, on a column
+/// already looked up (issue #638). The key-column twin of
+/// [`assert_deterministic_join_collation`]: a nondeterministic collation's
+/// `=` (and so its `GROUP BY` and unique indexes) treats distinct strings as
+/// equal, while the engine matches keys by their exact text, so Postgres
+/// would fold rows the engine keeps apart. Refused, never reinterpreted
+/// (#590's decision).
+///
+/// A column with no collation, or the database default's, always passes:
+/// Postgres has no nondeterministic database default (`CREATE DATABASE`
+/// takes no `deterministic` option, and the `default` collation's
+/// `collisdeterministic` is always true), which is also why a target Trellis
+/// creates can't have a nondeterministic key. The check reads
+/// `collisdeterministic` rather than assuming that, so it would still hold if
+/// Postgres ever allowed one.
+fn assert_deterministic_key_collation(
+    key: KeyColumnRole,
+    table: &str,
+    column: &str,
+    resolved: &JoinColumn,
+) -> Result<(), ValidationError> {
+    if resolved.collation_deterministic {
+        return Ok(());
+    }
+    Err(ValidationError::NondeterministicKeyCollation(Box::new(
+        NondeterministicKeyCollation {
+            key,
+            table: table.to_string(),
+            column: column.to_string(),
+            collation: resolved.collation.clone().unwrap_or_default(),
+        },
+    )))
+}
+
+/// Issue #638: refuses a definition if any column the engine matches as one
+/// of its keys has a nondeterministic collation
+/// ([`assert_deterministic_key_collation`]). Those keys are:
+///
+/// - the source's row-identity key (`source_key`, which
+///   [`ddl::source_primary_key_in_txn`] just resolved): apply keys every
+///   staged change by it, and a 1-1 target mirrors it as its own key;
+/// - an aggregate's `GROUP BY` keys: a source column, or a relationship
+///   path's to-side column. The target's group key is their exact text.
+///
+/// The target's own key columns need no check: Trellis creates the target
+/// with no `COLLATE` clause, so they take the database default, which is
+/// always deterministic. Relationship join columns and endpoint keys are
+/// checked when the relationship is declared ([`validate_relationship`]).
+async fn assert_deterministic_definition_keys(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+    qualified_source: &str,
+    source_key: &[ddl::PrimaryKeyColumn],
+) -> Result<(), CatalogError> {
+    for column in source_key {
+        assert_deterministic_key_collation_in_txn(
+            txn,
+            KeyColumnRole::SourceKey,
+            qualified_source,
+            &column.name,
+        )
+        .await?;
+    }
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        return Ok(());
+    };
+    for key in group_by {
+        match key {
+            GroupByKey::Column(column) => {
+                assert_deterministic_key_collation_in_txn(
+                    txn,
+                    KeyColumnRole::GroupBy,
+                    qualified_source,
+                    column,
+                )
+                .await?;
+            }
+            GroupByKey::RelationshipPath { rel, column } => {
+                // The relationship is declared on the qualified source
+                // (issue #288); `validate` already refused an unknown one.
+                let Some((schema, table)) = qualified_source.split_once('.') else {
+                    continue;
+                };
+                let Some(relationship) = relationship_by_name_in(txn, schema, table, rel).await?
+                else {
+                    continue;
+                };
+                assert_deterministic_key_collation_in_txn(
+                    txn,
+                    KeyColumnRole::GroupBy,
+                    &relationship.qualified_to_table(),
+                    column,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Strips a `format_type` rendering's `(...)` type modifier, wherever it
@@ -7007,5 +7165,69 @@ mod join_column_tests {
 
         let text = collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default");
         assert!(assert_deterministic_join_collation(&def(), &text, &text).is_ok());
+    }
+
+    /// Issue #638: a key column with a nondeterministic collation is refused
+    /// in every key role, and the error names the column, its collation and
+    /// the key it belongs to.
+    #[test]
+    fn a_nondeterministic_key_column_is_rejected_naming_column_collation_and_role() {
+        let mut ci = collated(column("text", TEXT, -1), 16_385, "case_insensitive");
+        ci.collation_deterministic = false;
+        for (key, role) in [
+            (
+                KeyColumnRole::SourceKey,
+                "part of the source's row-identity key",
+            ),
+            (KeyColumnRole::GroupBy, "a GROUP BY key"),
+            (
+                KeyColumnRole::RelationshipEndpointKey {
+                    name: "product".to_string(),
+                    side: RelationshipSide::To,
+                },
+                "part of relationship 'product''s to-side row-identity key",
+            ),
+        ] {
+            let err = assert_deterministic_key_collation(key.clone(), "shop.orders", "code", &ci)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                ValidationError::NondeterministicKeyCollation(Box::new(
+                    NondeterministicKeyCollation {
+                        key,
+                        table: "shop.orders".to_string(),
+                        column: "code".to_string(),
+                        collation: "case_insensitive".to_string(),
+                    }
+                ))
+            );
+            let message = err.to_string();
+            assert!(
+                message.starts_with(&format!("shop.orders.code is {role}, and its collation"))
+                    && message.contains(r#""case_insensitive" is nondeterministic"#),
+                "{message}"
+            );
+        }
+    }
+
+    /// Issue #638: a deterministic collation passes whether it's the default,
+    /// a non-default one (`"C"`), or absent (a type that isn't collatable).
+    #[test]
+    fn a_deterministic_or_absent_key_collation_passes() {
+        for resolved in [
+            collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default"),
+            collated(column("text", TEXT, -1), C_COLLATION, "C"),
+            column("bigint", INT8, -1),
+        ] {
+            assert!(
+                assert_deterministic_key_collation(
+                    KeyColumnRole::GroupBy,
+                    "public.t",
+                    "k",
+                    &resolved
+                )
+                .is_ok()
+            );
+        }
     }
 }
