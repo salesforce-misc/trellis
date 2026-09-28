@@ -3190,25 +3190,40 @@ mod strategy {
     fn mutate(seed_count: usize, awkward_values: bool) -> BoxedStrategy<Mutate> {
         let pk = 1..=(seed_count as i64 + 1);
         let dup_pk = 1..=(seed_count as i64);
-        // Issue #505: only with awkward values on, since it writes `NULL`.
-        let toggle_null_weight = if awkward_values {
-            TOGGLE_NULL_WEIGHT
+        let update = (pk.clone(), value(awkward_values), value(awkward_values))
+            .prop_map(|(pk, c1, c2)| Mutate::Update { pk, c1, c2 });
+        let update_flag = (pk.clone(), bool_value(awkward_values))
+            .prop_map(|(pk, flag)| Mutate::UpdateFlag { pk, flag });
+        let toggle_null =
+            (pk.clone(), 0..=VALUE_MAX).prop_map(|(pk, value)| Mutate::ToggleNull { pk, value });
+        let delete = pk.prop_map(|pk| Mutate::Delete { pk });
+        let duplicate_insert = (dup_pk, value(awkward_values), value(awkward_values))
+            .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 });
+        // Issue #505: `ToggleNull` only with awkward values on, since it
+        // writes `NULL`. It is left out of the union rather than weighted
+        // `0`, because a `prop_oneof!` shrinks toward its earlier arms
+        // whatever their weight: a weight-`0` arm would still be reached by
+        // shrinking a `Delete`, `DuplicateInsert` or `Truncate`.
+        if awkward_values {
+            prop_oneof![
+                3 => update,
+                2 => update_flag,
+                TOGGLE_NULL_WEIGHT => toggle_null,
+                3 => delete,
+                3 => duplicate_insert,
+                1 => Just(Mutate::Truncate),
+            ]
+            .boxed()
         } else {
-            0
-        };
-        prop_oneof![
-            3 => (pk.clone(), value(awkward_values), value(awkward_values))
-                .prop_map(|(pk, c1, c2)| Mutate::Update { pk, c1, c2 }),
-            2 => (pk.clone(), bool_value(awkward_values))
-                .prop_map(|(pk, flag)| Mutate::UpdateFlag { pk, flag }),
-            toggle_null_weight => (pk.clone(), 0..=VALUE_MAX)
-                .prop_map(|(pk, value)| Mutate::ToggleNull { pk, value }),
-            3 => pk.prop_map(|pk| Mutate::Delete { pk }),
-            3 => (dup_pk, value(awkward_values), value(awkward_values))
-                .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 }),
-            1 => Just(Mutate::Truncate),
-        ]
-        .boxed()
+            prop_oneof![
+                3 => update,
+                2 => update_flag,
+                3 => delete,
+                3 => duplicate_insert,
+                1 => Just(Mutate::Truncate),
+            ]
+            .boxed()
+        }
     }
 
     /// [`Mutate::ToggleNull`]'s weight in [`mutate`] (issue #505), next to
@@ -3646,6 +3661,36 @@ mod strategy {
     /// smallest one that still reproduces a failure.
     pub fn bulk_insert_program() -> impl Strategy<Value = Program> {
         (1..=MAX_BULK_INSERT_ROWS).prop_map(build_bulk_insert_program)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        /// With awkward values off, a mutate must never become a
+        /// `ToggleNull` (it writes `NULL`), not even while shrinking: a
+        /// `prop_oneof!` shrinks toward its earlier arms whatever their
+        /// weight, so a weight-`0` arm would still be reachable by shrinking.
+        #[test]
+        fn awkward_values_off_never_shrinks_a_mutate_into_toggle_null() {
+            let mut runner = TestRunner::deterministic();
+            let strategy = mutate(3, false);
+            for _ in 0..200 {
+                let mut tree = strategy.new_tree(&mut runner).expect("a mutate");
+                loop {
+                    assert!(
+                        !matches!(tree.current(), Mutate::ToggleNull { .. }),
+                        "awkward_values=false reached a ToggleNull: {:?}",
+                        tree.current()
+                    );
+                    if !tree.simplify() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
