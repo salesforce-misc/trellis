@@ -294,8 +294,10 @@ pub enum ValidationError {
     /// checking, even though it never issues DDL against the table itself.
     UnknownRelationshipColumn { table: String, column: String },
     /// A relationship's `from_col`/`to_col` (issue #27, ADR-0006's "type-check
-    /// the join") resolved to Postgres types that aren't comparable — e.g.
-    /// joining a `text` column to a `uuid` column.
+    /// the join") differ in type, type modifier or collation (issue #590):
+    /// `integer` against `bigint`, `text` against `character varying`,
+    /// `varchar(50)` against `varchar(255)`, or two collations. Trellis joins
+    /// only columns Postgres can compare as-is and never casts a join key.
     RelationshipTypeMismatch(Box<RelationshipTypeMismatch>),
     /// A relationship name was already declared on the same `from_table`
     /// (issue #27, surfacing ADR-0006's "Naming and scope": unique
@@ -322,6 +324,16 @@ pub enum ValidationError {
         table: String,
         column: String,
         pg_type: String,
+    },
+    /// A relationship's join column has a nondeterministic collation (issue
+    /// #590), whose `=` treats distinct strings as equal (e.g. case-
+    /// insensitively). The engine matches join keys by their exact text, so
+    /// it would disagree with Postgres about which rows join.
+    RelationshipNondeterministicCollation {
+        name: String,
+        table: String,
+        column: String,
+        collation: String,
     },
     /// A *to-many* relationship's to-side (issue #41) lacks a replica identity
     /// that carries the join column in row pre-images. For to-many, the join
@@ -659,7 +671,9 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "relationship '{name}' joins {from_table}.{from_col} ({from_type}) to \
-                     {to_table}.{to_col} ({to_type}), which are not comparable types"
+                     {to_table}.{to_col} ({to_type}), which are not the same type; join \
+                     columns must have the same type, type modifier and collation, because \
+                     Trellis never casts a join key, so alter one column to match the other"
                 )
             }
             ValidationError::DuplicateRelationshipName { from_table, name } => write!(
@@ -679,6 +693,18 @@ impl fmt::Display for ValidationError {
                  would silently diverge from the Postgres oracle's typed join; supported join \
                  key types are {}",
                 super::catalog::supported_join_key_types()
+            ),
+            ValidationError::RelationshipNondeterministicCollation {
+                name,
+                table,
+                column,
+                collation,
+            } => write!(
+                f,
+                "relationship '{name}' joins on {table}.{column}, whose collation \
+                 \"{collation}\" is nondeterministic; its `=` matches strings that differ \
+                 (e.g. by case), but Trellis matches join keys by their exact text, so join \
+                 columns need a deterministic collation"
             ),
             ValidationError::RelationshipToManyRequiresReplicaIdentity {
                 name,

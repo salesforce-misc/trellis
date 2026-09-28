@@ -1603,7 +1603,7 @@ async fn install_definition_relationship_enriched_path_resolves_a_bare_from_chai
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
              insert into s (id, a) select g, g from generate_series(1, 50) g; \
-             create table tags (id serial primary key, label text); \
+             create table tags (id bigserial primary key, label text); \
              alter table tags replica identity full; \
              insert into tags (id, label) select g, 'tagged' from generate_series(1, 50) g",
         )

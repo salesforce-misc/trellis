@@ -157,6 +157,16 @@ through paths whose head is the relationship name. How depends on **cardinality*
   Referenced only when wrapped in exactly one aggregate (`sum(comments.word_count)`),
   computed over the related rows like a `GROUP BY` aggregate.
 
+The two join columns must have **the same type, type modifier and collation**,
+because Trellis never casts a join key to make two columns meet. An `integer`
+foreign key to a `bigint` primary key is rejected, and so are `text` against
+`varchar`, `varchar(50)` against `varchar(255)`, a domain against its base
+type, and two columns with different collations. The error names both columns
+and both types. To fix it, alter one column to match the other, for example
+`ALTER TABLE order_line_items ALTER COLUMN product_id TYPE bigint`. A join
+column also needs a deterministic collation, and its type must be on the
+join-key allowlist in [type-support.md](type-support.md).
+
 See [0006-relationships](decisions/0006-relationships.md) for the full design and
 [0005-source-schema-is-user-owned](decisions/0005-source-schema-is-user-owned.md)
 for how the cardinality/uniqueness prerequisites are validated (never imposed) on

@@ -387,7 +387,7 @@ async fn a_type_mismatch_between_endpoints_is_rejected() {
         other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
     }
     let message = err.to_string();
-    assert!(message.contains("not comparable"));
+    assert!(message.contains("not the same type"), "{message}");
 
     let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await
@@ -441,7 +441,7 @@ async fn a_numeric_join_key_is_rejected() {
 
 /// Issue #28 review (epic #19 cross-cutting): the join-key guard is a
 /// positive allowlist of text-stable types, not just a numeric blocklist.
-/// `character(n)` shares a `type_family` with `text`/`varchar` but its native
+/// `character(n)` is a string type like `text`/`varchar`, but its native
 /// `=` is blank-padding-insensitive while its `::text` form is blank-padded,
 /// so the engine's text-equality join would diverge from the oracle's typed
 /// join. Rejected at `create_relationship` time.
@@ -480,7 +480,7 @@ async fn a_character_n_join_key_is_rejected() {
 /// on every connection Trellis opens (including the walsender) its `::text`
 /// was not text-stable. It is a text-stable join key now
 /// (`catalog::TEXT_STABLE_JOIN_KEY_TYPES`), so this asserts the opposite —
-/// acceptance, mirroring `compatible_integer_widths_are_accepted`'s setup
+/// acceptance, mirroring `join_columns_of_one_type_modifier_and_collation_are_accepted`'s setup
 /// (a real primary key plus `REPLICA IDENTITY FULL` on both sides).
 #[tokio::test]
 async fn a_timestamptz_join_key_is_accepted() {
@@ -683,89 +683,192 @@ async fn a_to_many_to_side_with_non_covering_replica_identity_index_is_rejected(
     assert!(missing.is_none());
 }
 
-/// Slightly different integer widths (`integer` FK to `bigint`-identity-style
-/// PK) are still comparable — the common case a strict exact-type-match rule
-/// would wrongly reject.
-#[tokio::test]
-async fn compatible_integer_widths_are_accepted() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    create_table_with_plain_column(&db.pool, "order_line_items", "product_id").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
-    let client = db.pool.get().await.expect("get connection");
+/// Issue #590: creates `order_line_items(product_id <from_decl>)` and
+/// `products(id <to_decl> primary key)`, both `REPLICA IDENTITY FULL` so the
+/// to-one relationship between them can fail only on its join columns, runs
+/// `setup` first (for a domain or collation the declarations name), and
+/// declares the relationship.
+async fn declare_over_join_columns(
+    pool: &trellis::pool::Pool,
+    setup: &str,
+    from_decl: &str,
+    to_decl: &str,
+) -> Result<(), CatalogError> {
+    let client = pool.get().await.expect("get connection");
     client
-        .batch_execute(
-            "create table products (id bigint primary key); \
-             alter table products replica identity full",
-        )
+        .batch_execute(&format!(
+            "{setup}
+             create table order_line_items (row_id serial primary key, product_id {from_decl});
+             alter table order_line_items replica identity full;
+             create table products (id {to_decl} primary key);
+             alter table products replica identity full"
+        ))
         .await
-        .expect("create products with bigint pk");
+        .expect("create the endpoint tables");
     drop(client);
-
     create_relationship(
-        &db.pool,
+        pool,
         "RELATIONSHIP product FROM order_line_items.product_id TO products.id",
     )
     .await
-    .expect("integer-to-bigint join should be accepted as comparable");
+    .map(|_| ())
 }
 
-/// `text` and `character varying(n)` are the same [`type_family`] bucket,
-/// but `format_type` renders the latter with its length modifier
-/// (`character varying(255)`) — a regression check that bucket matching
-/// strips the modifier rather than comparing the two renderings verbatim
-/// (which would wrongly reject this as a mismatch).
-#[tokio::test]
-async fn text_and_varchar_are_accepted_as_comparable() {
+/// [`declare_over_join_columns`], expecting issue #590's rejection. Returns
+/// the reported `(from_type, to_type)` after checking the message names both
+/// columns with their types and states the rule, and that nothing was
+/// stored.
+async fn expect_join_column_mismatch(
+    setup: &str,
+    from_decl: &str,
+    to_decl: &str,
+) -> (String, String) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    create_table_with_text_column(&db.pool, "order_line_items", "sku").await;
-    set_replica_identity_full(&db.pool, "order_line_items").await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table products (sku character varying(255) primary key); \
-             alter table products replica identity full",
-        )
+    let err = declare_over_join_columns(&db.pool, setup, from_decl, to_decl)
         .await
-        .expect("create products with varchar pk");
-    drop(client);
-
-    create_relationship(
-        &db.pool,
-        "RELATIONSHIP product FROM order_line_items.sku TO products.sku",
-    )
-    .await
-    .expect("text-to-varchar join should be accepted as comparable");
+        .expect_err("mismatched join columns must be rejected");
+    let message = err.to_string();
+    let CatalogError::Validate(ValidationError::RelationshipTypeMismatch(mismatch)) = err else {
+        panic!("expected RelationshipTypeMismatch, got {err:?}");
+    };
+    let RelationshipTypeMismatch {
+        from_type, to_type, ..
+    } = *mismatch;
+    assert!(
+        message.contains(&format!("order_line_items.product_id ({from_type})"))
+            && message.contains(&format!("products.id ({to_type})"))
+            && message.contains("same type, type modifier and collation"),
+        "{message}"
+    );
+    let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
+        .await
+        .expect("read query");
+    assert!(missing.is_none());
+    (from_type, to_type)
 }
 
-/// Two `character varying` columns with different length modifiers
-/// (`varchar(50)` vs `varchar(255)`) are comparable — same regression as
-/// [`text_and_varchar_are_accepted_as_comparable`], but for two modifier
-/// renderings that differ from each other rather than one lacking a
-/// modifier at all.
+/// Issue #590: an `integer` FK to a `bigint` key is rejected. The runtime
+/// casts one side's keys to the other's type, and a `bigint` key above 2^31
+/// cast to `integer` raises 22003, poisoning the key.
 #[tokio::test]
-async fn varchar_columns_with_different_lengths_are_accepted() {
+async fn integer_and_bigint_join_columns_are_rejected() {
+    let types = expect_join_column_mismatch("", "integer", "bigint").await;
+    assert_eq!(types, ("integer".to_string(), "bigint".to_string()));
+}
+
+/// Issue #590: `text` against `character varying` is a cast too, so it is
+/// rejected like any other pair of distinct types.
+#[tokio::test]
+async fn text_and_varchar_join_columns_are_rejected() {
+    let types = expect_join_column_mismatch("", "text", "character varying").await;
+    assert_eq!(types, ("text".to_string(), "character varying".to_string()));
+}
+
+/// Issue #590: the same type with different modifiers is rejected. The
+/// runtime's cast carries the modifier and an explicit cast truncates, so a
+/// long `varchar(255)` key cast to `varchar(50)` could match another row.
+#[tokio::test]
+async fn varchar_columns_with_different_lengths_are_rejected() {
+    let types =
+        expect_join_column_mismatch("", "character varying(50)", "character varying(255)").await;
+    assert_eq!(
+        types,
+        (
+            "character varying(50)".to_string(),
+            "character varying(255)".to_string()
+        )
+    );
+}
+
+/// Issue #590: a domain is its own type (its `CHECK` could reject a key cast
+/// from the base type), so it doesn't join its base type.
+#[tokio::test]
+async fn a_domain_join_column_is_rejected_against_its_base_type() {
+    let types = expect_join_column_mismatch(
+        "create domain product_ref as integer check (value > 0);",
+        "product_ref",
+        "integer",
+    )
+    .await;
+    assert_eq!(types, ("product_ref".to_string(), "integer".to_string()));
+}
+
+/// Issue #590: two different collations are rejected, and the error shows
+/// each side's collation. Two non-default ones make `a.x = b.y` raise 42P22
+/// in the oracle and in backfill; a default-against-`"C"` pair is rejected
+/// too, since the rule is "the same collation".
+#[tokio::test]
+async fn join_columns_with_different_collations_are_rejected() {
+    let types =
+        expect_join_column_mismatch("", r#"text collate "C""#, r#"text collate "POSIX""#).await;
+    assert_eq!(
+        types,
+        (
+            r#"text COLLATE "C""#.to_string(),
+            r#"text COLLATE "POSIX""#.to_string()
+        )
+    );
+    let types = expect_join_column_mismatch("", r#"text collate "C""#, "text").await;
+    assert_eq!(
+        types,
+        (
+            r#"text COLLATE "C""#.to_string(),
+            r#"text COLLATE "default""#.to_string()
+        )
+    );
+}
+
+/// Issue #590: a nondeterministic collation is rejected even when both sides
+/// share it. Its `=` matches `'A'` to `'a'`; the engine's exact-text key
+/// match doesn't.
+#[tokio::test]
+async fn a_nondeterministic_collation_join_column_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = db.pool.get().await.expect("get connection");
-    client
-        .batch_execute(
-            "create table order_line_items (id serial primary key, sku character varying(50));
-             alter table order_line_items replica identity full;
-             create table products (sku character varying(255) primary key);
-             alter table products replica identity full",
-        )
-        .await
-        .expect("create tables with differing varchar lengths");
-    drop(client);
-
-    create_relationship(
+    let err = declare_over_join_columns(
         &db.pool,
-        "RELATIONSHIP product FROM order_line_items.sku TO products.sku",
+        "create collation case_insensitive \
+         (provider = icu, locale = 'und-u-ks-level2', deterministic = false);",
+        "text collate case_insensitive",
+        "text collate case_insensitive",
     )
     .await
-    .expect("varchar(50)-to-varchar(255) join should be accepted as comparable");
+    .expect_err("a nondeterministic join collation must be rejected");
+    match &err {
+        CatalogError::Validate(ValidationError::RelationshipNondeterministicCollation {
+            table,
+            column,
+            collation,
+            ..
+        }) => {
+            assert_eq!(table, "order_line_items");
+            assert_eq!(column, "product_id");
+            assert_eq!(collation, "case_insensitive");
+        }
+        other => panic!("expected RelationshipNondeterministicCollation, got {other:?}"),
+    }
+}
+
+/// Issue #590's matching pairs still pass: the same integer width, and the
+/// same modified type under the same explicit collation.
+#[tokio::test]
+async fn join_columns_of_one_type_modifier_and_collation_are_accepted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    declare_over_join_columns(&db.pool, "", "bigint", "bigint")
+        .await
+        .expect("bigint-to-bigint join columns are accepted");
+
+    let db = cluster.create_isolated_database().await;
+    declare_over_join_columns(
+        &db.pool,
+        "",
+        r#"character varying(50) collate "C""#,
+        r#"character varying(50) collate "C""#,
+    )
+    .await
+    .expect("identical varchar(50) COLLATE \"C\" join columns are accepted");
 }
 
 /// ADR-0006's endpoint-resolution requirement: a relationship whose
@@ -1441,7 +1544,7 @@ async fn a_relationship_to_table_resolves_a_bare_name_chained_off_a_non_default_
         .batch_execute(
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
-             create table order_line_items (id integer primary key, t2_id integer); \
+             create table order_line_items (id integer primary key, t2_id bigint); \
              alter table order_line_items replica identity full",
         )
         .await
@@ -1516,7 +1619,7 @@ async fn a_calculated_field_relationship_path_resolves_a_to_table_chained_off_a_
         .batch_execute(
             "create schema custom; \
              create table s (id bigint primary key, a numeric); \
-             create table order_line_items (id integer primary key, t2_id integer); \
+             create table order_line_items (id integer primary key, t2_id bigint); \
              alter table order_line_items replica identity full; \
              insert into order_line_items (id, t2_id) values (1, 1), (2, 2)",
         )
@@ -2124,9 +2227,10 @@ async fn endpoints_with_supported_non_integer_primary_keys_are_accepted() {
     assert_eq!(created.cardinality, RelationshipCardinality::ToOne);
 }
 
-/// Issue #429: the join-key allowlist holds on the to-side on its own, when
-/// the from-side's type is fine and the two are comparable.
-/// `a_character_n_join_key_is_rejected` fails on the from-side first.
+/// Issue #429 checked the join-key allowlist on the to-side on its own, for a
+/// from-side whose type was fine. Since #590 the two sides must share one
+/// type, so a to-side type outside the allowlist fails as a mismatch first,
+/// and `a_character_n_join_key_is_rejected` covers the allowlist itself.
 #[tokio::test]
 async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
     let cluster = TestCluster::start();
@@ -2142,15 +2246,12 @@ async fn a_to_side_join_key_outside_the_allowlist_is_rejected() {
     .unwrap_err();
 
     match &err {
-        CatalogError::Validate(ValidationError::RelationshipUnsupportedJoinKeyType {
-            table,
-            column,
-            ..
-        }) => {
-            assert_eq!(table, "products");
-            assert_eq!(column, "code");
+        CatalogError::Validate(ValidationError::RelationshipTypeMismatch(mismatch)) => {
+            assert_eq!(mismatch.to_table, "products");
+            assert_eq!(mismatch.to_col, "code");
+            assert_eq!(mismatch.to_type, "character(8)");
         }
-        other => panic!("expected RelationshipUnsupportedJoinKeyType, got {other:?}"),
+        other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
     }
     let missing = relationship_by_name(&db.pool, SCHEMA, "order_line_items", "product")
         .await

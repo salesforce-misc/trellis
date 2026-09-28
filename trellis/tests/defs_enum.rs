@@ -228,7 +228,7 @@ async fn enum_join_key_and_primary_key_are_admitted() {
 
 /// A hand-built enum type must never be conflated with a different one, even
 /// when both are otherwise perfectly good join key types: the relationship
-/// type-check (`assert_comparable_types`) still rejects joining two distinct
+/// type-check (`assert_joinable_as_is`) still rejects joining two distinct
 /// enum types against each other exactly as it would `uuid` against
 /// `bigint`, since [`registry::PgType::Enum`]'s whole point is carrying each
 /// type's own identity rather than conflating "enum-ness".

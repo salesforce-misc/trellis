@@ -2771,11 +2771,13 @@ struct ValidatedRelationship {
 ///
 /// In order, returning the first failure:
 ///
-/// 1. **Join columns.** Both `table.column`s exist ([`column_type_in_txn`]),
-///    their types are comparable ([`assert_comparable_types`], ADR-0006's
-///    "type-check the join"), and both are on the join-key allowlist
-///    ([`assert_join_key_type_supported`]): the engine matches join keys as
-///    text.
+/// 1. **Join columns.** Both `table.column`s exist ([`join_column_in_txn`]),
+///    they have the same type, type modifier and collation
+///    ([`assert_joinable_as_is`], ADR-0006's "type-check the join", made
+///    exact by #590), that type is on the join-key allowlist
+///    ([`assert_join_key_type_supported`]), and its collation, if any, is
+///    deterministic ([`assert_deterministic_join_collation`]): the engine
+///    matches join keys as text.
 /// 2. **Each endpoint**, from-side then to-side
 ///    ([`validate_relationship_endpoint`]): intake can key it, its key's
 ///    types are on the key allowlist, and it is `live` if it is one of this
@@ -2805,10 +2807,12 @@ async fn validate_relationship(
     qualified_from: &str,
     qualified_to: &str,
 ) -> Result<ValidatedRelationship, CatalogError> {
-    let from_type = column_type_in_txn(txn, qualified_from, &def.from_table, &def.from_col).await?;
-    let to_type = column_type_in_txn(txn, qualified_to, &def.to_table, &def.to_col).await?;
-    assert_comparable_types(def, &from_type, &to_type)?;
-    assert_join_key_type_supported(txn, def, &from_type, &to_type).await?;
+    let from = join_column_in_txn(txn, qualified_from, &def.from_table, &def.from_col).await?;
+    let to = join_column_in_txn(txn, qualified_to, &def.to_table, &def.to_col).await?;
+    assert_joinable_as_is(def, &from, &to)?;
+    assert_join_key_type_supported(txn, def, &from.pg_type, &to.pg_type).await?;
+    assert_deterministic_join_collation(def, &from, &to)?;
+    let to_type = to.pg_type;
 
     validate_relationship_endpoint(txn, &def.name, RelationshipSide::From, qualified_from).await?;
     validate_relationship_endpoint(txn, &def.name, RelationshipSide::To, qualified_to).await?;
@@ -3754,10 +3758,66 @@ async fn column_type_in_txn(
     display_table: &str,
     column: &str,
 ) -> Result<String, CatalogError> {
+    Ok(join_column_in_txn(txn, query_table, display_table, column)
+        .await?
+        .pg_type)
+}
+
+/// A relationship join column's type and collation as Postgres reports them
+/// (`pg_attribute`, `pg_collation`), for [`assert_joinable_as_is`] and
+/// [`assert_deterministic_join_collation`] (issue #590).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinColumn {
+    /// `format_type(atttypid, atttypmod)`: the type's name with any
+    /// modifier, as the runtime casts join keys to it
+    /// (`staging::apply::key_array_filter`).
+    pg_type: String,
+    /// `atttypid`. A domain has its own OID, distinct from its base type's.
+    type_oid: u32,
+    /// `atttypmod`: `-1` for no modifier, else the encoded length or
+    /// precision (`varchar(50)`, `timestamp(3)`).
+    typmod: i32,
+    /// `attcollation`: `0` for a type that isn't collatable.
+    collation_oid: u32,
+    /// The collation's `collname` (`default` for the database default),
+    /// `None` for a type that isn't collatable.
+    collation: Option<String>,
+    /// `pg_collation.collisdeterministic`; `true` when there is no
+    /// collation.
+    collation_deterministic: bool,
+}
+
+impl JoinColumn {
+    /// The type as an error message shows it, with its collation appended
+    /// when `with_collation` and the type has one.
+    fn describe(&self, with_collation: bool) -> String {
+        match (&self.collation, with_collation) {
+            (Some(collation), true) => format!("{} COLLATE \"{collation}\"", self.pg_type),
+            _ => self.pg_type.clone(),
+        }
+    }
+}
+
+/// [`JoinColumn`] for `table.column`, looked up the way
+/// [`column_type_in_txn`] documents (same `query_table`/`display_table`
+/// split, same [`ValidationError::UnknownRelationshipColumn`] for a table or
+/// column that doesn't exist).
+async fn join_column_in_txn(
+    txn: &tokio_postgres::Transaction<'_>,
+    query_table: &str,
+    display_table: &str,
+    column: &str,
+) -> Result<JoinColumn, CatalogError> {
     let row = txn
         .query_opt(
-            "select pg_catalog.format_type(a.atttypid, a.atttypmod)
+            "select pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    a.atttypid,
+                    a.atttypmod,
+                    a.attcollation,
+                    co.collname::text,
+                    coalesce(co.collisdeterministic, true)
              from pg_attribute a
+             left join pg_catalog.pg_collation co on co.oid = a.attcollation
              where a.attrelid = pg_catalog.to_regclass($1)
                and a.attname = $2
                and a.attnum > 0
@@ -3766,36 +3826,19 @@ async fn column_type_in_txn(
         )
         .await?;
     match row {
-        Some(row) => Ok(row.get(0)),
+        Some(row) => Ok(JoinColumn {
+            pg_type: row.get(0),
+            type_oid: row.get(1),
+            typmod: row.get(2),
+            collation_oid: row.get(3),
+            collation: row.get(4),
+            collation_deterministic: row.get(5),
+        }),
         None => Err(ValidationError::UnknownRelationshipColumn {
             table: display_table.to_string(),
             column: column.to_string(),
         }
         .into()),
-    }
-}
-
-/// Postgres type names that are freely joinable despite not being textually
-/// identical — the common case of an identity primary key (`bigint`) and a
-/// foreign key column declared as a plain `integer`, or a `text`/`character
-/// varying` split between two independently-authored tables. Anything not
-/// named here must match `from_type`/`to_type` exactly to be considered
-/// comparable; see [`assert_comparable_types`].
-///
-/// `pg_type` is [`column_type_in_txn`]'s `format_type(atttypid, atttypmod)`
-/// rendering, which includes any length/precision modifier (`character
-/// varying(255)`, `numeric(10,2)`). The modifier is stripped before bucket
-/// matching — otherwise `varchar(255)` and `varchar(100)`, or `text` and
-/// `varchar(n)`, would fall into the `other` catch-all as two distinct
-/// strings and be wrongly rejected as a type mismatch, even though they're
-/// exactly the kind of join this function exists to allow.
-fn type_family(pg_type: &str) -> Cow<'_, str> {
-    let base = base_type_name(pg_type);
-    match base.as_ref() {
-        "smallint" | "integer" | "bigint" => Cow::Borrowed("integer"),
-        "numeric" | "real" | "double precision" => Cow::Borrowed("numeric"),
-        "text" | "character varying" | "character" => Cow::Borrowed("text"),
-        _ => base,
     }
 }
 
@@ -3805,7 +3848,7 @@ fn type_family(pg_type: &str) -> Cow<'_, str> {
 /// `timestamp(3) without time zone` becomes `timestamp without time zone`.
 ///
 /// That last case is why this is a function rather than the
-/// `split('(').next()` both [`type_family`] and
+/// `split('(').next()` both the old relationship type-family check and
 /// [`is_text_stable_join_key_type`] used before issue #113. Every type name
 /// they had to handle until then carried its modifier as a *suffix*, so
 /// truncating at the first `(` was equivalent. The SQL-standard temporal
@@ -3836,14 +3879,12 @@ fn base_type_name(pg_type: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{head} {tail}"))
 }
 
-/// Postgres type base names (modifier already stripped, as in
-/// [`type_family`]) whose equality is *text-stable* — `a::text = b::text`
+/// Postgres type base names (modifier already stripped by
+/// [`base_type_name`]) whose equality is *text-stable* — `a::text = b::text`
 /// agrees with the type's native typed `=` for every value. This is a
-/// positive allowlist, not [`type_family`]'s equivalence-class bucketing:
-/// [`type_family`] groups `character`/`character varying`/`text` together
-/// (correctly, for comparability) even though `character`'s native `=` is
-/// blank-padding-insensitive while its `::text` rendering is blank-padded,
-/// so a family-based check would wrongly wave it through here.
+/// positive allowlist, and a per-type fact: `character`'s native `=` is
+/// blank-padding-insensitive while its `::text` rendering is blank-padded, so
+/// it is off the list even though `character varying` and `text` are on it.
 ///
 /// Only the join key's *own* type matters for this list, not what it's
 /// compared against, so allowed/rejected status is a per-type fact.
@@ -4186,11 +4227,9 @@ pub(crate) async fn is_enum_type_name(
 /// enum type — [`is_enum_type_name`]) — issue #28 review, hardened
 /// per review of #27/#28 (a numeric-only blocklist missed `character(n)`,
 /// `citext`, and `timestamptz`, which also diverge under the engine's
-/// `::text`-equality join vs. the Postgres oracle's native typed `=`). Checks
-/// both sides rather than relying on [`assert_comparable_types`]'s family
-/// match to stand in for the other: `character` and `character varying`
-/// share a family but only one is on this allowlist, so a from/to pair could
-/// straddle the line.
+/// `::text`-equality join vs. the Postgres oracle's native typed `=`). Runs
+/// after [`assert_joinable_as_is`], so both sides already have one type; it
+/// still checks each side so the error names the from-side column first.
 async fn assert_join_key_type_supported(
     txn: &tokio_postgres::Transaction<'_>,
     def: &RelationshipDef,
@@ -4214,29 +4253,86 @@ async fn assert_join_key_type_supported(
     Ok(())
 }
 
-/// Rejects `def` if `from_type`/`to_type` (both already resolved by
-/// [`column_type_in_txn`]) aren't in the same [`type_family`] — ADR-0006's
-/// "type-check the join" requirement.
-fn assert_comparable_types(
+/// Rejects `def` unless its two join columns have the same type, the same
+/// type modifier and the same collation (issue #590). Trellis never casts a
+/// join key to make two columns meet: the rule is "join columns that Postgres
+/// can compare as-is", and the error says so.
+///
+/// Anything looser fails at runtime or silently joins the wrong rows:
+///
+/// * **Type.** The key lookups (`staging::apply::key_array_filter`) cast one
+///   side's keys to the other side's type. A `bigint` key above 2^31 cast to
+///   `integer` raises 22003 and the key is poisoned. `text` against
+///   `character varying` would survive that cast, but it is still a cast, and
+///   it stops being harmless the moment one side gains a modifier (below).
+///   A domain is its own type (its own `atttypid`): its `CHECK` can reject a
+///   key cast from its base type, so a domain never joins its base type or
+///   another domain over the same base.
+/// * **Modifier.** The same cast carries the modifier, and an explicit cast
+///   to one truncates or rounds instead of failing: a `varchar(255)` key cast
+///   to `varchar(50)` loses its tail, and a `timestamp(6)` key cast to
+///   `timestamp(3)` is rounded, so either could match a different row.
+/// * **Collation.** Two columns with different non-default collations can't
+///   be compared at all without a `COLLATE` clause (42P22 in the oracle's and
+///   backfill's `a.x = b.y`), and a default-against-non-default pair compares
+///   under whichever one Postgres picks. Requiring the same collation leaves
+///   nothing to pick.
+///
+/// Compared by OID and `atttypmod` from `pg_attribute`, not by type name, so
+/// two same-named types in different schemas are two types.
+fn assert_joinable_as_is(
     def: &RelationshipDef,
-    from_type: &str,
-    to_type: &str,
+    from: &JoinColumn,
+    to: &JoinColumn,
 ) -> Result<(), CatalogError> {
-    if type_family(from_type) == type_family(to_type) {
+    if from.type_oid == to.type_oid
+        && from.typmod == to.typmod
+        && from.collation_oid == to.collation_oid
+    {
         return Ok(());
     }
+    let with_collation = from.collation_oid != to.collation_oid;
     Err(
         ValidationError::RelationshipTypeMismatch(Box::new(RelationshipTypeMismatch {
             name: def.name.clone(),
             from_table: def.from_table.clone(),
             from_col: def.from_col.clone(),
-            from_type: from_type.to_string(),
+            from_type: from.describe(with_collation),
             to_table: def.to_table.clone(),
             to_col: def.to_col.clone(),
-            to_type: to_type.to_string(),
+            to_type: to.describe(with_collation),
         }))
         .into(),
     )
+}
+
+/// Rejects `def` if a join column has a nondeterministic collation (issue
+/// #590). Such a collation's `=` treats distinct strings as equal (`'A'` and
+/// `'a'` under a case-insensitive one), while the engine matches join keys by
+/// their exact text, so the engine and Postgres would disagree about which
+/// rows join. Runs after [`assert_joinable_as_is`], so both sides share one
+/// collation; each side is still checked so the error names the from-side
+/// column first.
+fn assert_deterministic_join_collation(
+    def: &RelationshipDef,
+    from: &JoinColumn,
+    to: &JoinColumn,
+) -> Result<(), CatalogError> {
+    for (table, column, join_column) in [
+        (&def.from_table, &def.from_col, from),
+        (&def.to_table, &def.to_col, to),
+    ] {
+        if !join_column.collation_deterministic {
+            return Err(ValidationError::RelationshipNondeterministicCollation {
+                name: def.name.clone(),
+                table: table.clone(),
+                column: column.clone(),
+                collation: join_column.collation.clone().unwrap_or_default(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// [`RelationshipCardinality::ToOne`] iff `to_col` is the sole column of a
@@ -4310,7 +4406,7 @@ async fn to_col_cardinality_in_txn(
 /// this function's caller runs. The reported
 /// [`ValidationError::RelationshipToManyRequiresReplicaIdentity`] still names
 /// `def.to_table` (bare), matching this file's convention elsewhere
-/// (`assert_comparable_types`/`assert_join_key_type_supported`) of reporting
+/// (`assert_joinable_as_is`/`assert_join_key_type_supported`) of reporting
 /// the relationship's own source text, not an internally-resolved identity.
 async fn assert_replica_identity_supports_to_many(
     txn: &tokio_postgres::Transaction<'_>,
@@ -6751,5 +6847,156 @@ mod reported_status_tests {
         ]);
         assert_eq!(reported[&2], Paused);
         assert_eq!(reported[&3], Backfilling);
+    }
+}
+
+/// Issue #590: the pure join-column checks, over hand-built [`JoinColumn`]s
+/// carrying the OIDs Postgres reports (the live `pg_attribute` lookup is
+/// covered in `tests/defs_relationship_catalog.rs`).
+#[cfg(test)]
+mod join_column_tests {
+    use super::*;
+
+    const INT4: u32 = 23;
+    const INT8: u32 = 20;
+    const TEXT: u32 = 25;
+    const VARCHAR: u32 = 1043;
+    const DEFAULT_COLLATION: u32 = 100;
+    const C_COLLATION: u32 = 950;
+
+    fn def() -> RelationshipDef {
+        RelationshipDef {
+            name: "product".to_string(),
+            from_table: "order_line_items".to_string(),
+            from_col: "product_id".to_string(),
+            to_table: "products".to_string(),
+            to_col: "id".to_string(),
+        }
+    }
+
+    fn column(pg_type: &str, type_oid: u32, typmod: i32) -> JoinColumn {
+        JoinColumn {
+            pg_type: pg_type.to_string(),
+            type_oid,
+            typmod,
+            collation_oid: 0,
+            collation: None,
+            collation_deterministic: true,
+        }
+    }
+
+    fn collated(mut column: JoinColumn, oid: u32, name: &str) -> JoinColumn {
+        column.collation_oid = oid;
+        column.collation = Some(name.to_string());
+        column
+    }
+
+    fn mismatch(from: &JoinColumn, to: &JoinColumn) -> (RelationshipTypeMismatch, String) {
+        let err = assert_joinable_as_is(&def(), from, to).unwrap_err();
+        let message = err.to_string();
+        match err {
+            CatalogError::Validate(ValidationError::RelationshipTypeMismatch(mismatch)) => {
+                (*mismatch, message)
+            }
+            other => panic!("expected RelationshipTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_columns_are_joinable() {
+        let int = column("integer", INT4, -1);
+        assert!(assert_joinable_as_is(&def(), &int, &int).is_ok());
+        let text = collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default");
+        assert!(assert_joinable_as_is(&def(), &text, &text).is_ok());
+        let varchar = collated(column("character varying(50)", VARCHAR, 54), 100, "default");
+        assert!(assert_joinable_as_is(&def(), &varchar, &varchar).is_ok());
+    }
+
+    #[test]
+    fn different_integer_widths_are_rejected_naming_both_columns_and_types() {
+        let (mismatch, message) =
+            mismatch(&column("integer", INT4, -1), &column("bigint", INT8, -1));
+        assert_eq!(mismatch.from_type, "integer");
+        assert_eq!(mismatch.to_type, "bigint");
+        assert!(
+            message.contains("order_line_items.product_id (integer)")
+                && message.contains("products.id (bigint)")
+                && message.contains("same type, type modifier and collation"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn text_and_varchar_are_rejected() {
+        let (mismatch, _) = mismatch(
+            &collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default"),
+            &collated(
+                column("character varying", VARCHAR, -1),
+                DEFAULT_COLLATION,
+                "default",
+            ),
+        );
+        assert_eq!(mismatch.from_type, "text");
+        assert_eq!(mismatch.to_type, "character varying");
+    }
+
+    #[test]
+    fn different_type_modifiers_are_rejected() {
+        let (mismatch, _) = mismatch(
+            &collated(column("character varying(50)", VARCHAR, 54), 100, "default"),
+            &collated(
+                column("character varying(255)", VARCHAR, 259),
+                100,
+                "default",
+            ),
+        );
+        assert_eq!(mismatch.from_type, "character varying(50)");
+        assert_eq!(mismatch.to_type, "character varying(255)");
+    }
+
+    #[test]
+    fn a_domain_is_not_its_base_type() {
+        // A domain has its own OID; `format_type` renders its name.
+        let (mismatch, _) = mismatch(
+            &column("product_id", 16_384, -1),
+            &column("integer", INT4, -1),
+        );
+        assert_eq!(mismatch.from_type, "product_id");
+    }
+
+    #[test]
+    fn different_collations_are_rejected_and_the_error_shows_both() {
+        let (mismatch, message) = mismatch(
+            &collated(column("text", TEXT, -1), C_COLLATION, "C"),
+            &collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default"),
+        );
+        assert_eq!(mismatch.from_type, r#"text COLLATE "C""#);
+        assert_eq!(mismatch.to_type, r#"text COLLATE "default""#);
+        assert!(message.contains(r#"(text COLLATE "C")"#), "{message}");
+    }
+
+    #[test]
+    fn a_nondeterministic_collation_is_rejected() {
+        let mut ci = collated(column("text", TEXT, -1), 16_385, "ci");
+        ci.collation_deterministic = false;
+        assert!(assert_joinable_as_is(&def(), &ci, &ci).is_ok());
+        let err = assert_deterministic_join_collation(&def(), &ci, &ci).unwrap_err();
+        match &err {
+            CatalogError::Validate(ValidationError::RelationshipNondeterministicCollation {
+                table,
+                column,
+                collation,
+                ..
+            }) => {
+                assert_eq!(table, "order_line_items");
+                assert_eq!(column, "product_id");
+                assert_eq!(collation, "ci");
+            }
+            other => panic!("expected RelationshipNondeterministicCollation, got {other:?}"),
+        }
+        assert!(err.to_string().contains("nondeterministic"), "{err}");
+
+        let text = collated(column("text", TEXT, -1), DEFAULT_COLLATION, "default");
+        assert!(assert_deterministic_join_collation(&def(), &text, &text).is_ok());
     }
 }

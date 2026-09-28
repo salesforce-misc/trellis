@@ -1207,8 +1207,8 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
     declaring a `GROUP BY` key's column from bare `ValueType` alone can never
     lose precision the way a bare `bit` column declaration can. Two distinct
     enum types are still never comparable as a relationship join, exactly
-    like `uuid` against `bigint` (`assert_comparable_types`'s `type_family`
-    check), pinned live in `trellis/tests/defs_enum.rs`.
+    like `uuid` against `bigint` (`assert_joinable_as_is` requires one type
+    on both sides, #590), pinned live in `trellis/tests/defs_enum.rs`.
   * **`MIN`/`MAX` land, keep the argument's own concrete enum type
     (`pg_typeof`, not assumed), and honor *creation-order* comparison, not
     alphabetical** — `anyenum` has a full btree opclass ordered by
