@@ -12,7 +12,11 @@ name: Elixir release
 #   Hex step needs the HEX_API_KEY repository secret.
 # - Running it by hand (workflow_dispatch) builds the same NIFs and keeps them
 #   as workflow artifacts, then checks the package the way a release would
-#   build it, from source. It creates no release and publishes nothing.
+#   build it, from source. It creates no release and publishes nothing, even
+#   when run from an `elixir-v*` tag: only the `release` job touches the
+#   GitHub release, it runs only on a tag push to salesforce-misc/trellis
+#   (the repository Trellis.Native downloads from), and the checksum and
+#   publish steps run only after it succeeds.
 
 on:
   push:
@@ -85,13 +89,34 @@ jobs:
 
   release:
     # Attaches the NIFs to the tag's GitHub release, creating it if a
-    # previous attempt didn't, so a re-run replaces them.
+    # previous attempt didn't, so a re-run replaces them. A tag push only:
+    # `github.ref_type` alone would also match a manual run started from a
+    # tag.
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'salesforce-misc/trellis'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Refuse to replace the NIFs of a version already on Hex
+        # Its checksum file names the NIFs the release serves now. Rebuilt
+        # ones differ byte for byte, so replacing them ("Re-run all jobs")
+        # would break every install of that version.
+        run: |
+          version="${GITHUB_REF_NAME#elixir-v}"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "https://hex.pm/api/packages/trellis_pg/releases/$version")"
+          case "$status" in
+            404) ;;
+            200)
+              echo "trellis_pg $version is already on Hex; leaving its GitHub release's NIFs alone" >&2
+              exit 1
+              ;;
+            *)
+              echo "couldn't ask hex.pm whether trellis_pg $version is published (HTTP $status)" >&2
+              exit 1
+              ;;
+          esac
+
       - uses: actions/download-artifact@v4
         with:
           pattern: nif-*
@@ -151,8 +176,9 @@ jobs:
         # Without --ignore-unavailable: a target the release doesn't serve
         # fails the run instead of shipping a package that can't install
         # there. 5 is the length of Trellis.Native's `targets` (and of the
-        # build matrix above).
-        if: github.ref_type == 'tag'
+        # build matrix above). Only once `release` has attached them, so
+        # never on a manual run.
+        if: needs.release.result == 'success'
         working-directory: clients/elixir
         run: |
           mix rustler_precompiled.download Trellis.Native --all --print
@@ -167,7 +193,7 @@ jobs:
         run: mix hex.build
 
       - name: Publish to Hex
-        if: github.ref_type == 'tag'
+        if: needs.release.result == 'success'
         working-directory: clients/elixir
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
