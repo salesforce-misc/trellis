@@ -9604,6 +9604,7 @@ async fn drain_segments(
     // session and drops the table with it.
     let started = std::time::Instant::now();
     let mut materialize_time = std::time::Duration::ZERO;
+    let mut read_time = std::time::Duration::ZERO;
     let mut pages = super::page::MaterializedPages::open(pool, share.seg_seq).await?;
     for (start, buckets) in groups {
         let materialize_started = std::time::Instant::now();
@@ -9613,7 +9614,9 @@ async fn drain_segments(
         materialize_time += materialize_started.elapsed();
         let mut after = start;
         loop {
+            let read_started = std::time::Instant::now();
             let page = pages.next_page(after.as_ref(), cap).await?;
+            read_time += read_started.elapsed();
             let step = SegmentStep {
                 seg_seq: share.seg_seq,
                 page: Some(PageClaim {
@@ -9654,6 +9657,7 @@ async fn drain_segments(
         records,
         cap,
         materialize_ms = materialize_time.as_millis() as u64,
+        page_read_ms = read_time.as_millis() as u64,
         total_ms = started.elapsed().as_millis() as u64,
         "paged drain: the share was larger than the drain batch cap"
     );
