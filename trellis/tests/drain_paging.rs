@@ -1129,3 +1129,297 @@ async fn isolation_surfaces_a_lost_claim_without_charging_any_key() {
         .get(0);
     assert_eq!(deaths, 0);
 }
+
+/// The first `n` ids in `1..=20000` whose ring route falls in `bucket` (of
+/// `SEG_BUCKETS`), in route order: what a page walks first.
+async fn ids_in_bucket(client: &Client, bucket: i64, n: i64) -> Vec<i32> {
+    client
+        .query(
+            "select id from generate_series(1, 20000) as id \
+             where (hashtextextended($1 || E'\\x1f' || id::text, 0) & 2147483647) % $2 = $3 \
+             order by hashtextextended($1 || E'\\x1f' || id::text, 0) & 2147483647 \
+             limit $4",
+            &[
+                &format!("{DEFAULT_SCHEMA}.items"),
+                &trellis::staging::claim::SEG_BUCKETS,
+                &bucket,
+                &n,
+            ],
+        )
+        .await
+        .expect("ids in bucket")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+/// The ids of a skewed segment: bucket 0 holds `heavy` keys spread over the
+/// whole route space, bucket 1 holds the 3 lowest-route keys of its own (so a
+/// page walking buckets 0 and 1 as one union runs out of bucket 1 almost at
+/// once), buckets 2 to 6 hold 2 keys each, and bucket 7 holds none.
+async fn skewed_ids(client: &Client, heavy: i64) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    // Every 40th of the first 40 × `heavy` bucket-0 ids: spread, not clustered
+    // at the low end of the route space.
+    let heavy_ids: Vec<i32> = ids_in_bucket(client, 0, heavy * 40)
+        .await
+        .into_iter()
+        .step_by(40)
+        .collect();
+    assert_eq!(heavy_ids.len() as i64, heavy);
+    let light = ids_in_bucket(client, 1, 3).await;
+    let mut rest = Vec::new();
+    for bucket in 2..7 {
+        rest.extend(ids_in_bucket(client, bucket, 2).await);
+    }
+    (heavy_ids, light, rest)
+}
+
+/// Inserts `ids` as [`insert_items`] does, then stages 3 more rounds of
+/// same-value updates, so the segment's ring rows clear `MIN_ROWS_TO_SPLIT`
+/// and it seals into `SEG_BUCKETS` buckets.
+async fn stage_skewed(client: &Client, ids: &[i32]) {
+    insert_items(client, ids).await;
+    for _ in 0..3 {
+        stage(
+            client,
+            "update",
+            ids,
+            |id| Some((id % 7, id)),
+            |id| Some((id % 7, id)),
+        )
+        .await;
+    }
+    assert!(
+        ids.len() as i64 * 4 >= trellis::staging::claim::MIN_ROWS_TO_SPLIT,
+        "enough ring rows to split into buckets"
+    );
+}
+
+/// Hands `seg_seq`'s undrained, unclaimed buckets out by hand: `who` gets
+/// `buckets`, and every other free bucket goes to `"parked"`, so a drain call
+/// by `who` (which claims its share of whatever is free) holds exactly
+/// `buckets`. Claiming first flips the segment `sealed -> draining`, as a real
+/// claim does.
+async fn hold(client: &Client, seg_seq: i64, who: &str, buckets: &[i16]) {
+    claim::claim(client, seg_seq, "setup", 1)
+        .await
+        .expect("claim every free bucket");
+    client
+        .execute(
+            "update seg_claims set claimed_by = case when bucket = any($3::smallint[]) \
+                 then $2 else 'parked' end \
+             where seg_seq = $1 and claimed_by = 'setup'",
+            &[&seg_seq, &who, &buckets],
+        )
+        .await
+        .expect("hand out claims");
+    let held: Vec<i16> = client
+        .query(
+            "select bucket from seg_claims where seg_seq = $1 and claimed_by = $2 order by bucket",
+            &[&seg_seq, &who],
+        )
+        .await
+        .expect("read claims")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(held, buckets, "{who} holds exactly its buckets");
+}
+
+/// Releases `who`'s and the parked claims, as the client loop does on error.
+async fn release_all(client: &Client, seg_seq: i64, who: &[&str]) {
+    for who in who.iter().chain(&["parked"]) {
+        liveness::release(client, seg_seq, who)
+            .await
+            .expect("release");
+    }
+}
+
+async fn cursor_route(client: &Client, seg_seq: i64, bucket: i16) -> Option<i64> {
+    client
+        .query_opt(
+            "select after_route from drain_cursor where seg_seq = $1 and bucket = $2",
+            &[&seg_seq, &bucket],
+        )
+        .await
+        .expect("read cursor")
+        .map(|r| r.get(0))
+}
+
+/// Runs one drain call with a deadline: a page loop that stopped advancing
+/// would hang here rather than finish.
+async fn drain_within(
+    pool: &trellis::Pool,
+    seg_seq: i64,
+    who: &str,
+    cap: usize,
+    hooks: &mut DrainHooks,
+) -> ManyApplyOutcome {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        drain(pool, seg_seq, who, cap, hooks),
+    )
+    .await
+    .expect("the drain finishes: no page loop spins in place")
+    .expect("drain")
+    .expect("drain holds something")
+}
+
+/// One worker holding two buckets of a skewed share, paged as one union: bucket
+/// 0 holds 60 keys and bucket 1 only 3, all at the low end of the route space,
+/// so bucket 1 is exhausted after the first page while bucket 0 runs on. A
+/// first claimant commits two pages and dies; the next resumes from the shared
+/// cursor. Every page advances: the whole union takes at most ⌈63 / 5⌉ pages
+/// across both claimants, and the target matches the oracle.
+#[tokio::test]
+async fn a_worker_paging_two_skewed_buckets_as_one_union_finishes_in_bounded_pages() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let (heavy, light, rest) = skewed_ids(&client, 60).await;
+    let all: Vec<i32> = heavy.iter().chain(&light).chain(&rest).copied().collect();
+    stage_skewed(&client, &all).await;
+    let seg = seal(&mut client).await;
+    let cap = 5;
+
+    hold(&client, seg, "worker-y", &[0, 1]).await;
+    let y = drain_within(
+        &db.pool,
+        seg,
+        "worker-y",
+        cap,
+        &mut DrainHooks {
+            stop_after_pages: Some(2),
+            ..DrainHooks::default()
+        },
+    )
+    .await;
+    assert_eq!(y.pages, 2);
+    let (k0, k1) = (
+        cursor_route(&client, seg, 0).await,
+        cursor_route(&client, seg, 1).await,
+    );
+    assert!(k0.is_some() && k0 == k1, "one union, one shared cursor");
+    liveness::release(&client, seg, "worker-y")
+        .await
+        .expect("worker Y dies and is released");
+
+    // Worker A takes both back (the parked buckets are still parked).
+    claim::claim(&client, seg, "worker-a", 1)
+        .await
+        .expect("worker A claims");
+    let a = drain_within(&db.pool, seg, "worker-a", cap, &mut DrainHooks::default()).await;
+    assert!(
+        y.pages + a.pages <= 63usize.div_ceil(cap),
+        "63 keys at cap {cap} is at most 13 pages across both claimants: Y {y:?}, A {a:?}"
+    );
+    let (_, mask) = segment_state(&client, seg).await;
+    assert_eq!(mask, 0b11, "A's last page completed both buckets");
+
+    release_all(&client, seg, &[]).await;
+    let b = drain_within(&db.pool, seg, "worker-b", cap, &mut DrainHooks::default()).await;
+    assert_eq!(b.segments_drained, vec![(seg, true)]);
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
+
+/// One worker holding three buckets at three different cursors: bucket 7 has
+/// no keys at all, bucket 1's shared cursor is already past its last key, and
+/// bucket 0's cursor is a page further on. The claimant walks each cursor group
+/// in turn: an empty final page for bucket 7, an empty final page for bucket
+/// 1, then bucket 0's remaining pages. Every page advances, the total is at
+/// most ⌈remaining / cap⌉ plus one final page per group, and the target
+/// matches the oracle.
+#[tokio::test]
+async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bounded_pages() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+
+    let (heavy, light, rest) = skewed_ids(&client, 60).await;
+    let all: Vec<i32> = heavy.iter().chain(&light).chain(&rest).copied().collect();
+    stage_skewed(&client, &all).await;
+    let seg = seal(&mut client).await;
+    let cap = 5;
+
+    // Worker Y pages buckets 0 and 1 as one union for two pages (10 keys),
+    // which runs past all 3 of bucket 1's keys, then dies.
+    hold(&client, seg, "worker-y", &[0, 1]).await;
+    let y = drain_within(
+        &db.pool,
+        seg,
+        "worker-y",
+        cap,
+        &mut DrainHooks {
+            stop_after_pages: Some(2),
+            ..DrainHooks::default()
+        },
+    )
+    .await;
+    assert_eq!(y.pages, 2);
+    let k1 = cursor_route(&client, seg, 1)
+        .await
+        .expect("bucket 1's cursor");
+    let light_max: i64 = client
+        .query_one(
+            "select max(hashtextextended($1 || E'\\x1f' || id::text, 0) & 2147483647) \
+             from unnest($2::int4[]) as id",
+            &[&format!("{DEFAULT_SCHEMA}.items"), &light],
+        )
+        .await
+        .expect("bucket 1's last route")
+        .get(0);
+    assert!(
+        light_max <= k1,
+        "bucket 1 is exhausted at its cursor ({light_max} <= {k1})"
+    );
+    release_all(&client, seg, &["worker-y"]).await;
+
+    // Worker Z pages bucket 0 alone for one more page, then dies.
+    hold(&client, seg, "worker-z", &[0]).await;
+    let z = drain_within(
+        &db.pool,
+        seg,
+        "worker-z",
+        cap,
+        &mut DrainHooks {
+            stop_after_pages: Some(1),
+            ..DrainHooks::default()
+        },
+    )
+    .await;
+    assert_eq!(z.pages, 1);
+    let k0 = cursor_route(&client, seg, 0)
+        .await
+        .expect("bucket 0's cursor");
+    assert!(k0 > k1, "bucket 0 moved past the shared cursor");
+    release_all(&client, seg, &["worker-z"]).await;
+
+    // Worker A holds buckets 0, 1 and 7: three cursor groups.
+    hold(&client, seg, "worker-a", &[0, 1, 7]).await;
+    let a = drain_within(&db.pool, seg, "worker-a", cap, &mut DrainHooks::default()).await;
+    let heavy_left: usize = client
+        .query_one(
+            "select count(*) from unnest($1::int4[]) as id \
+             where (hashtextextended($2 || E'\\x1f' || id::text, 0) & 2147483647) > $3",
+            &[&heavy, &format!("{DEFAULT_SCHEMA}.items"), &k0],
+        )
+        .await
+        .expect("bucket 0's keys after its cursor")
+        .get::<_, i64>(0) as usize;
+    assert!(heavy_left > cap, "bucket 0 still has to page");
+    assert!(
+        a.pages <= heavy_left.div_ceil(cap) + 2,
+        "{heavy_left} keys at cap {cap}, plus one empty final page each for buckets 7 and 1: \
+         {a:?}"
+    );
+    let (_, mask) = segment_state(&client, seg).await;
+    assert_eq!(mask, 0b1000_0011, "A completed buckets 0, 1 and 7");
+
+    release_all(&client, seg, &["worker-a"]).await;
+    let b = drain_within(&db.pool, seg, "worker-b", cap, &mut DrainHooks::default()).await;
+    assert_eq!(b.segments_drained, vec![(seg, true)]);
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
