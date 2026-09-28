@@ -27,7 +27,9 @@ defmodule Trellis.MigrationTest do
     end
   end
 
-  # The same, but in the migration's transaction.
+  # The same, but in the migration's transaction. Its define reads a table
+  # committed before the migration runs, which Trellis's own connections
+  # can see, so only the transaction check stops it being applied.
   defmodule DefineOrdersInTransaction do
     use Ecto.Migration
     use Trellis.Migration
@@ -37,7 +39,7 @@ defmodule Trellis.MigrationTest do
         add :total, :integer
       end
 
-      define "TRANSFORM mig_order_totals FROM mig_orders SELECT total AS total"
+      define "TRANSFORM mig_order_totals FROM mig_committed_orders SELECT total AS total"
     end
 
     def down, do: :ok
@@ -125,6 +127,12 @@ defmodule Trellis.MigrationTest do
 
   test "a migration in a transaction raises before Trellis applies anything",
        %{trellis: trellis, pg: pg} do
+    Postgrex.query!(
+      pg,
+      "create table mig_committed_orders (id integer primary key, total integer)",
+      []
+    )
+
     error =
       assert_raise Ecto.MigrationError, fn ->
         Ecto.Migrator.up(TestRepo, 2, DefineOrdersInTransaction, log: false)
@@ -191,6 +199,22 @@ defmodule Trellis.MigrationTest do
       end
 
     assert Exception.message(error) =~ "must define up/0 and down/0 rather than change/0"
+
+    # Ecto only runs a public change/0, so a private helper of that name in
+    # an up/0 and down/0 migration is left alone.
+    assert [{Trellis.MigrationTest.PrivateChange, _}] =
+             Code.compile_quoted(
+               quote do
+                 defmodule Trellis.MigrationTest.PrivateChange do
+                   use Ecto.Migration
+                   use Trellis.Migration
+
+                   def up, do: change()
+                   def down, do: :ok
+                   defp change, do: :ok
+                 end
+               end
+             )
   end
 
   defp table?(pg, name) do

@@ -118,7 +118,8 @@ if Code.ensure_loaded?(Ecto.Migration) do
 
     @doc false
     defmacro __before_compile__(env) do
-      if Module.defines?(env.module, {:change, 0}) do
+      # Only a public change/0: that is what Ecto runs.
+      if Module.defines?(env.module, {:change, 0}, :def) do
         raise CompileError,
           file: env.file,
           line: env.line,
