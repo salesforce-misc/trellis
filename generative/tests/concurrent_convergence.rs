@@ -12,27 +12,44 @@
 //!
 //! [`EngineClient`]: trellis::Client
 //!
-//! # What this is *not*: harness-issued concurrent/out-of-order ops
+//! # Two properties
 //!
-//! This file still applies every op **in the exact order `Program::ops`
-//! generated it**, one at a time, from a single harness "thread" of control
-//! (see [`run_convergence_bursty`]'s own doc comment) — it only changes
-//! *when* the harness calls `quiesce()`, via the burst-batching knob below.
-//! It never reorders, races, or concurrently issues ops against each other
-//! from the harness side.
+//! [`property_convergence_holds_under_the_concurrent_backend`] is the
+//! original D4 tier: `trivial_program`'s small programs, applied **in the
+//! exact order `Program::ops` generated them**, one at a time from one
+//! harness task, with only the quiesce points changed (the burst-batching
+//! knob below). Its programs never come near the engine's split threshold.
 //!
-//! A harness that actually did that — generating and issuing genuinely
-//! concurrent or out-of-order op streams, rather than a serialized stream
-//! against a multi-worker engine underneath — is a real, deliberately
-//! **out-of-scope** follow-up. It is a substantially bigger task than this
-//! file (an interleaving generator/scheduler, not a backend constructor), and
-//! its natural prerequisite already exists on this branch: D2's commutation
-//! machinery (`ops_commute`/`target_key_for`/`commute_groups` in
-//! `generative::generate`, exercised by `tests/order_insensitivity.rs`) is
-//! exactly the "which ops are even safe to reorder relative to each other"
-//! analysis such a scheduler would need before it could issue anything out of
-//! order. Nobody should mistake this file's worker-count/burst widening for
-//! that follow-up having been done.
+//! [`property_hot_keys_converge_under_concurrent_drains`] is the hot-key
+//! tier (issue #557, part 1). It draws `generate::hot_key_case`: a hot table
+//! of 8 to 24 rows taking 1,000 to 2,400 writes, always read by a `GROUP BY`
+//! definition, with rows moving between groups (`Mutate::MoveGroup`) over a
+//! group window that slides up through the run, so groups nobody has used
+//! before keep appearing and existing ones empty and refill inside a burst.
+//! Each burst (500 to 1,000 ops) is split into 2 to 4 lanes
+//! (`generate::concurrent_plan`) and every lane is issued from its own task
+//! on its own connection ([`run_convergence_concurrent`]), so Postgres
+//! commits the burst's ops in whatever order the tasks reach it. Only ops on
+//! the same row, or on a table the program truncates, share a lane:
+//! `concurrent_plan`'s section comment explains why that, and not
+//! `ops_commute`, is the constraint. The engine runs 4 to 8 drain workers
+//! and seals every 20 to 200ms, so a burst seals into several batches, many
+//! of them over the split threshold, and one hot key's changes sit in several
+//! batches at once.
+//!
+//! What the hot-key tier reaches is reported two ways when the property
+//! finishes (the harness's `Drop`): the program-side shapes each case offers
+//! (`Coverage::concurrent_shape_cases`: hot keys, hot groups, split-sized
+//! bursts, new groups, groups that empty and refill), and what the engine
+//! actually did with them, read back through triggers on its own staging
+//! registry (`Coverage::drain`: batches sealed, split, and split batches
+//! claimed by two or more workers). The second is the evidence that batches
+//! really split across workers; the first only says the program gave the
+//! engine the chance.
+//!
+//! Mid-burst catch-up actions (`request_backfill`, resume, to-side
+//! truncate) and planted ordering bugs are #557's parts 2 and 3. A lane is
+//! where part 2 adds its actions (`model::Burst`).
 //!
 //! # The burst-batching knob
 //!
@@ -47,7 +64,7 @@
 //! burst — see its doc comment for the full rationale and the coarser
 //! divergence localization this implies.
 //!
-//! The property below draws a small burst size (1-4) alongside each program:
+//! The original property draws a small burst size (1-4) alongside each program:
 //! `trivial_program`'s typical shape (at most `MAX_TABLES` tables, each with
 //! at most `MAX_SEED_ROWS` seeds and `MAX_MUTATES` mutates —
 //! `generative::generate`'s current constants keep any single table's op
@@ -57,11 +74,12 @@
 //! bloat every *other* property's case count and shrink time for a benefit
 //! only this one property needs — so this property's bursting is exercised
 //! for its own sake (more than one row's change genuinely in flight against
-//! N workers, below the split threshold) and a **separate, dedicated
-//! hand-built pin** below
+//! N workers, below the split threshold). The hot-key tier above is the one
+//! that draws its own, much larger shape to get past the threshold, and the
+//! hand-built pin below
 //! ([`a_batch_that_exceeds_the_split_threshold_converges_across_workers`])
-//! is what actually drives a batch past the split threshold, deterministically
-//! rather than hoping proptest's small default ranges happen to get there.
+//! drives one batch past it deterministically, which is also where the drain
+//! audit the hot-key tier reports through is checked against a known split.
 //!
 //! # Shrink-trust convention
 //!
@@ -107,11 +125,14 @@
 //! why); this file's `HARNESS` is its own, independent `thread_local`, so the
 //! two test binaries never share a cluster or a slot/publication.
 
-use generative::backend::ManualBackend;
+use generative::backend::{ConcurrentBackend, ManualBackend, SPLIT_THRESHOLD_ROWS};
 use generative::generate::{
-    Mutate, build_program, schedule_restart, schedule_scale_out, trivial_program,
+    ConcurrentCase, Mutate, build_program, hot_key_case, schedule_restart, schedule_scale_out,
+    trivial_program,
 };
-use generative::run::{RunError, run_convergence, run_convergence_bursty};
+use generative::run::{
+    RunError, run_convergence, run_convergence_bursty, run_convergence_concurrent,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
@@ -135,6 +156,9 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     cluster: TestCluster,
     coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// The hot-key property's own report (issue #557), kept apart from
+    /// `coverage` so each property's numbers read on their own.
+    hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
 }
 
 impl Drop for Harness {
@@ -142,10 +166,18 @@ impl Drop for Harness {
     /// never a pass/fail gate, and deliberately non-panicking since this can
     /// run during an unwind.
     fn drop(&mut self) {
-        eprintln!(
-            "generative: concurrent_convergence run coverage:\n{}",
-            self.coverage.borrow()
-        );
+        if self.coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence run coverage:\n{}",
+                self.coverage.borrow()
+            );
+        }
+        if self.hot_key_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence hot-key tier coverage:\n{}",
+                self.hot_key_coverage.borrow()
+            );
+        }
     }
 }
 
@@ -154,6 +186,7 @@ thread_local! {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
         cluster: TestCluster::start(),
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
 
@@ -216,6 +249,73 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
     })
 }
 
+/// Runs one hot-key case (issue #557) against a fresh isolated database:
+/// the case's own worker count and seal cadence, its plan's lanes issued
+/// from separate tasks. Records the case's shapes and the engine's drain
+/// audit into the harness's coverage report.
+fn run_hot_key_case(case: &ConcurrentCase) -> Result<(), TestCaseError> {
+    HARNESS.with(|h| {
+        h.hot_key_coverage
+            .borrow_mut()
+            .record_program(&case.program);
+        h.hot_key_coverage
+            .borrow_mut()
+            .record_concurrent_plan(&case.program, &case.plan);
+
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            let mut backend = ManualBackend::connect_with_options(
+                db.dsn(),
+                case.workers,
+                Some(std::time::Duration::from_millis(case.seal_interval_ms)),
+            )
+            .await
+            .expect("connect concurrent backend");
+            let unique = db.name().replace('-', "_");
+            backend.set_slot_and_publication(format!("{unique}_slot"), format!("{unique}_pub"));
+            let pool =
+                Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+
+            let shape = format!(
+                "{} ops, burst_size {}, {} bursts, up to {} lanes, {} workers, seal every {}ms",
+                case.program.ops.len(),
+                case.burst_size,
+                case.plan.bursts.len(),
+                case.plan
+                    .bursts
+                    .iter()
+                    .map(|b| b.lanes.len())
+                    .max()
+                    .unwrap_or(0),
+                case.workers,
+                case.seal_interval_ms,
+            );
+            match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
+                Ok(run) => {
+                    h.hot_key_coverage.borrow_mut().record_drain(&run.drain);
+                    if run.outcome.as_pass() {
+                        Ok(())
+                    } else {
+                        Err(TestCaseError::fail(format!(
+                            "run did not pass ({shape}): {}",
+                            run.outcome
+                        )))
+                    }
+                }
+                Err(RunError::Diverged(d)) => Err(TestCaseError::fail(format!(
+                    "hot-key case diverged in the burst ending at op {} (target {}; {shape}) — \
+                     see this file's module doc comment's shrink-trust convention before \
+                     trusting this as a minimal repro:\n{}",
+                    d.op_index, d.def_target, d.report
+                ))),
+                Err(other) => Err(TestCaseError::fail(format!(
+                    "run error ({shape}): {other:?}"
+                ))),
+            }
+        })
+    })
+}
+
 proptest! {
     #![proptest_config(proptest_config())]
 
@@ -226,6 +326,14 @@ proptest! {
         burst_size in burst_size(),
     ) {
         run_one(&program, burst_size)?;
+    }
+
+    /// Issue #557: the hot-key tier. See the module doc comment's
+    /// "The hot-key tier" section.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_hot_keys_converge_under_concurrent_drains(case in hot_key_case()) {
+        run_hot_key_case(&case)?;
     }
 }
 
@@ -326,11 +434,25 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
     .await
     .expect("connect concurrent backend with widened maintenance interval");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    // Issue #557: the drain audit the hot-key tier reports through, checked
+    // here against a batch whose split is deterministic.
+    backend
+        .start_drain_audit()
+        .await
+        .expect("start the drain audit");
 
     let outcome = run_convergence_bursty(&mut backend, &pool, &program, program.ops.len())
         .await
         .expect("a batch that exceeds the split threshold must still converge");
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let audit = backend.drain_audit().await.expect("read the drain audit");
+    assert!(
+        audit.split >= 1
+            && audit.max_rows_per_batch >= SPLIT_THRESHOLD_ROWS as u64
+            && audit.max_workers_per_batch >= 1,
+        "the drain audit must see the split batch, its row count and its claims: {audit:?}"
+    );
 
     let max_bucket_count = backend
         .max_bucket_count()

@@ -399,6 +399,47 @@ impl NoisePlan {
     }
 }
 
+/// How the concurrent tier (issue #557) issues a [`Program`]'s ops: a
+/// sequence of [`Burst`]s, run one after another. Every burst is checked
+/// against the oracle once, after all of its lanes have finished and the
+/// engine has quiesced; nothing is checked mid-burst.
+///
+/// Built by `crate::generate::concurrent_plan`, which is the one place the
+/// rules for what may share a burst or be split across lanes live.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConcurrentPlan {
+    pub bursts: Vec<Burst>,
+}
+
+/// One burst of a [`ConcurrentPlan`]: `lanes[i]` is the `program.ops`
+/// indices lane `i` applies, in order, from its own harness task and its own
+/// connection, concurrently with every other lane. Across lanes there is no
+/// order at all, so Postgres commits their ops in whatever order the tasks
+/// happen to reach it.
+///
+/// Part 2 of #557 extends a lane with mid-burst catch-up actions; today a
+/// lane is ops only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Burst {
+    pub lanes: Vec<Vec<usize>>,
+}
+
+impl Burst {
+    /// The highest op index in this burst: the op a divergence found after
+    /// it is reported against, as in `crate::run::run_convergence_bursty`.
+    /// `None` for a burst with no ops.
+    pub fn last_op(&self) -> Option<usize> {
+        self.lanes.iter().flatten().copied().max()
+    }
+
+    /// Every op index in this burst, in program order.
+    pub fn ops(&self) -> Vec<usize> {
+        let mut ops: Vec<usize> = self.lanes.iter().flatten().copied().collect();
+        ops.sort_unstable();
+        ops
+    }
+}
+
 /// How a [`DbAdminAction::RestartPostgres`] stops the server before starting
 /// it again (issue #236).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

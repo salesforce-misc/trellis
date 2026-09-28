@@ -1260,3 +1260,143 @@ impl super::Backend for ManualBackend {
         Ok(())
     }
 }
+
+/// A [`ManualBackend`]'s [`super::OpApplier`] (issue #557): its own raw
+/// session, set up exactly like the backend's, and a copy of the installed
+/// tables to render ops against.
+pub struct ManualApplier {
+    raw: tokio_postgres::Client,
+    tables: HashMap<String, Table>,
+}
+
+impl super::OpApplier for ManualApplier {
+    type Error = ManualBackendError;
+
+    /// [`super::Backend::apply`] on this applier's own connection.
+    async fn apply(&mut self, op: &Op) -> Result<u64, ManualBackendError> {
+        sql::apply_op(&mut self.raw, &self.tables, op)
+            .await
+            .map_err(|err| match err {
+                sql::ApplyOpError::UnknownTable(table) => {
+                    ManualBackendError::UnknownTable { table }
+                }
+                sql::ApplyOpError::Db(err) => ManualBackendError::Db(err),
+            })
+    }
+}
+
+/// The drain audit's tables, triggers and trigger functions (issue #557),
+/// created in the instance schema `schema` (already quoted). Two
+/// `AFTER` row triggers on the engine's own staging registry: one on a
+/// segment's `active -> sealed` flip, which records the batch's bucket count
+/// and row count and every `(table, key)` in it, and one on each
+/// `seg_claims` insert, which records which worker claimed which bucket. A
+/// retired segment's registry rows are deleted, so the audit keeps its own
+/// copy. The seal trigger reads the ring slot inside the seal transaction,
+/// so its row count is the one the seal itself decided the bucket count from.
+///
+/// Each seal is tagged with the burst the harness last announced
+/// ([`super::ConcurrentBackend::begin_burst`]). The concurrent runner
+/// quiesces between bursts, so every batch sealed after the announcement
+/// holds that burst's changes.
+fn drain_audit_ddl(schema: &str) -> String {
+    format!(
+        "create table {schema}.generative_audit_burst (burst int not null); \
+         insert into {schema}.generative_audit_burst values (0); \
+         create table {schema}.generative_audit_sealed ( \
+             seg_seq bigint primary key, burst int not null, \
+             bucket_count smallint not null, row_count bigint not null); \
+         create table {schema}.generative_audit_keys ( \
+             seg_seq bigint not null, burst int not null, \
+             src_table text not null, key text not null); \
+         create table {schema}.generative_audit_claims ( \
+             seg_seq bigint not null, bucket smallint not null, claimed_by text not null); \
+         create function {schema}.generative_audit_on_seal() returns trigger \
+         language plpgsql as $audit$ \
+         declare \
+             current_burst int; \
+             ring text := '{schema}.' || quote_ident('seg_' || new.ring_slot); \
+         begin \
+             select burst into current_burst from {schema}.generative_audit_burst; \
+             execute format('insert into {schema}.generative_audit_sealed \
+                 select $1, $2, $3, count(*) from %s', ring) \
+                 using new.seg_seq, current_burst, new.bucket_count; \
+             execute format('insert into {schema}.generative_audit_keys \
+                 select distinct $1, $2, src_table, key from %s', ring) \
+                 using new.seg_seq, current_burst; \
+             return null; \
+         end $audit$; \
+         create trigger generative_audit_on_seal after update of state on {schema}.segments \
+             for each row when (old.state = 'active' and new.state = 'sealed') \
+             execute function {schema}.generative_audit_on_seal(); \
+         create function {schema}.generative_audit_on_claim() returns trigger \
+         language plpgsql as $audit$ \
+         begin \
+             insert into {schema}.generative_audit_claims \
+                 values (new.seg_seq, new.bucket, new.claimed_by); \
+             return null; \
+         end $audit$; \
+         create trigger generative_audit_on_claim after insert on {schema}.seg_claims \
+             for each row execute function {schema}.generative_audit_on_claim();"
+    )
+}
+
+impl super::ConcurrentBackend for ManualBackend {
+    type Applier = ManualApplier;
+
+    async fn applier(&self) -> Result<ManualApplier, ManualBackendError> {
+        Ok(ManualApplier {
+            raw: connect_raw(&self.config).await?,
+            tables: self.tables.clone(),
+        })
+    }
+
+    async fn start_drain_audit(&mut self) -> Result<(), ManualBackendError> {
+        let schema = quote_ident(self.config.schema());
+        self.raw.batch_execute(&drain_audit_ddl(&schema)).await?;
+        Ok(())
+    }
+
+    async fn begin_burst(&mut self, burst: usize) -> Result<(), ManualBackendError> {
+        let burst = i32::try_from(burst).expect("a run has fewer than 2^31 bursts");
+        self.raw
+            .execute("update generative_audit_burst set burst = $1", &[&burst])
+            .await?;
+        Ok(())
+    }
+
+    async fn drain_audit(&mut self) -> Result<super::DrainAudit, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select \
+                   (select count(*) from generative_audit_sealed), \
+                   (select count(*) from generative_audit_sealed where bucket_count > 1), \
+                   (select count(*) from ( \
+                       select s.seg_seq from generative_audit_sealed s \
+                       join generative_audit_claims c using (seg_seq) \
+                       where s.bucket_count > 1 \
+                       group by s.seg_seq \
+                       having count(distinct c.claimed_by) >= 2) split), \
+                   (select coalesce(max(n), 0) from ( \
+                       select count(distinct claimed_by) as n from generative_audit_claims \
+                       group by seg_seq) workers), \
+                   (select coalesce(max(row_count), 0) from generative_audit_sealed), \
+                   (select count(*) from ( \
+                       select 1 from generative_audit_keys \
+                       group by burst, src_table, key \
+                       having count(distinct seg_seq) >= 2) keys)",
+                &[],
+            )
+            .await?;
+        let count = |i: usize| row.get::<_, i64>(i) as u64;
+        Ok(super::DrainAudit {
+            sealed: count(0),
+            split: count(1),
+            split_across_workers: count(2),
+            max_workers_per_batch: count(3),
+            max_rows_per_batch: count(4),
+            keys_in_several_batches: count(5),
+        })
+    }
+}

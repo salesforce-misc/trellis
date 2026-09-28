@@ -77,6 +77,10 @@ pub mod staging {
     /// `converged_through` is the single, non-waiting check behind
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
+    /// `MIN_ROWS_TO_SPLIT` is read, never set: the concurrent tier's coverage
+    /// report (issue #557) counts bursts large enough to seal into a split
+    /// batch, and must follow the threshold if it moves.
+    pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
     pub use crate::staging::converge::converged_through;
     pub use crate::staging::{
         StagingError, await_converged, has_pending, retire_drained_segments, seal_phase1,

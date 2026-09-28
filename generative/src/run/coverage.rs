@@ -15,7 +15,8 @@ use std::fmt;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, TransformDef, ValueType};
 use trellis::dev::defs::registry;
 
-use crate::model::{Cardinality, Op, OpOutcome, Program, Relationship};
+use crate::backend::{DrainAudit, SPLIT_THRESHOLD_ROWS};
+use crate::model::{Cardinality, ConcurrentPlan, Op, OpOutcome, Program, Relationship};
 
 /// Per-run coverage tallies over any number of [`Program`]s. Every field is
 /// keyed on the `&'static str` name of the variant it tallies, not the
@@ -129,6 +130,23 @@ pub struct Coverage {
     /// [`crate::generate::bulk_insert_program`], not just that a small one
     /// occasionally shows up.
     pub max_bulk_insert_rows: usize,
+    /// Bursts recorded by [`Coverage::record_concurrent_plan`] (issue #557).
+    pub concurrent_bursts: usize,
+    /// How many recorded concurrent-tier cases contain at least one burst of
+    /// each [`ConcurrentShape`], keyed by its name (issue #557). Worked out
+    /// from the program and its plan alone, in program order: the lanes of a
+    /// burst race, so the engine sees some interleaving of it, but which
+    /// keys, groups and row counts a burst carries doesn't depend on that.
+    pub concurrent_shape_cases: HashMap<&'static str, usize>,
+    /// Every [`DrainAudit`] recorded by [`Coverage::record_drain`], added up
+    /// (issue #557): what the engine actually sealed and claimed, where
+    /// `concurrent_shape_cases` is only what the program offered it.
+    pub drain: DrainAudit,
+    /// How many recorded runs' drain audits show each of: a split batch
+    /// (`"split"`), a split batch claimed by two or more workers
+    /// (`"split_across_workers"`), and a key sealed into several batches
+    /// within one burst (`"key_in_several_batches"`) (issue #557).
+    pub drain_cases: HashMap<&'static str, usize>,
 }
 
 impl Coverage {
@@ -222,6 +240,31 @@ impl Coverage {
         // Issue #505.
         for key in relationship_path_events(program, &reads) {
             *self.relationship_path_cases.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Tallies one concurrent-tier case's [`ConcurrentShape`]s into
+    /// [`Self::concurrent_shape_cases`], and its bursts into
+    /// [`Self::concurrent_bursts`] (issue #557). Separate from
+    /// [`Self::record_program`], which the harness calls as well.
+    pub fn record_concurrent_plan(&mut self, program: &Program, plan: &ConcurrentPlan) {
+        self.concurrent_bursts += plan.bursts.len();
+        for shape in concurrent_shapes(program, plan) {
+            *self.concurrent_shape_cases.entry(shape.name()).or_insert(0) += 1;
+        }
+    }
+
+    /// Adds one run's [`DrainAudit`] into [`Self::drain`] and
+    /// [`Self::drain_cases`] (issue #557).
+    pub fn record_drain(&mut self, audit: &DrainAudit) {
+        self.drain.add(audit);
+        for (name, reached) in [
+            ("split", audit.split > 0),
+            ("split_across_workers", audit.split_across_workers > 0),
+            ("key_in_several_batches", audit.keys_in_several_batches > 0),
+        ] {
+            let count = self.drain_cases.entry(name).or_insert(0);
+            *count += usize::from(reached);
         }
     }
 
@@ -587,6 +630,200 @@ fn relationship_path_events(
     out
 }
 
+/// A burst shape the concurrent tier exists to reach (issue #557). A case
+/// has a shape when at least one of its bursts does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConcurrentShape {
+    /// The burst is split across two or more lanes, so its ops race.
+    ConcurrentLanes,
+    /// One row is written at least [`HOT_WRITES`] times in the burst.
+    HotKey,
+    /// One aggregate group is written at least [`HOT_WRITES`] times, by two
+    /// or more rows, in the burst: rows the engine may hash to different
+    /// buckets of a split batch, and so drain on different workers.
+    HotGroup,
+    /// The burst carries at least `SPLIT_THRESHOLD_ROWS` source changes and
+    /// no whole-table op (a `TRUNCATE` batch always seals unsplit), so it
+    /// can seal into a split batch if the harness outruns the seal cadence.
+    SplitSized,
+    /// A group that has never had a member gets its first one, after the
+    /// first burst.
+    NewGroup,
+    /// A group loses its last member and gains one again within the burst.
+    GroupRefill,
+}
+
+/// How many writes to one row, or to one group, make it hot
+/// ([`ConcurrentShape::HotKey`], [`ConcurrentShape::HotGroup`]).
+pub const HOT_WRITES: usize = 8;
+
+impl ConcurrentShape {
+    pub const ALL: [ConcurrentShape; 6] = [
+        ConcurrentShape::ConcurrentLanes,
+        ConcurrentShape::HotKey,
+        ConcurrentShape::HotGroup,
+        ConcurrentShape::SplitSized,
+        ConcurrentShape::NewGroup,
+        ConcurrentShape::GroupRefill,
+    ];
+
+    /// The name [`Coverage::concurrent_shape_cases`] keys on.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConcurrentShape::ConcurrentLanes => "concurrent_lanes",
+            ConcurrentShape::HotKey => "hot_key",
+            ConcurrentShape::HotGroup => "hot_group",
+            ConcurrentShape::SplitSized => "split_sized",
+            ConcurrentShape::NewGroup => "new_group",
+            ConcurrentShape::GroupRefill => "group_refill",
+        }
+    }
+}
+
+/// One aggregate group, as [`concurrent_shapes`] tracks it: the source
+/// table, its grouping column, and the group's value (`None` is the `NULL`
+/// group).
+type Group<'a> = (&'a str, &'a str, Option<String>);
+
+/// Replays `program.ops` burst by burst, in program order, and returns every
+/// [`ConcurrentShape`] some burst reaches (issue #557). Groups are those of
+/// every `GROUP BY` definition's single-column key.
+fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<ConcurrentShape> {
+    let mut out = HashSet::new();
+    let pk_cols: HashMap<&str, &str> = program
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t.pk_col.as_str()))
+        .collect();
+    let mut groupings: Vec<(&str, &str)> = Vec::new();
+    for def in &program.defs {
+        if let KeySpace::Aggregate { group_by } = &def.key_space {
+            for key in group_by {
+                let grouping = (def.source.as_str(), key.target_column_name());
+                if !groupings.contains(&grouping) {
+                    groupings.push(grouping);
+                }
+            }
+        }
+    }
+    let value = |row: &SimRow, column: &str| row.get(column).cloned().flatten();
+    let mut state: HashMap<&str, HashMap<String, SimRow>> = HashMap::new();
+    let mut sizes: HashMap<Group<'_>, usize> = HashMap::new();
+    let mut ever: HashSet<Group<'_>> = HashSet::new();
+
+    for (burst_index, burst) in plan.bursts.iter().enumerate() {
+        if burst.lanes.len() >= 2 {
+            out.insert(ConcurrentShape::ConcurrentLanes);
+        }
+        let mut row_writes: HashMap<(&str, String), usize> = HashMap::new();
+        let mut group_writes: HashMap<Group<'_>, (usize, HashSet<String>)> = HashMap::new();
+        let mut emptied: HashSet<Group<'_>> = HashSet::new();
+        let (mut changes, mut whole_table) = (0usize, false);
+
+        for index in burst.ops() {
+            let op = &program.ops[index];
+            let table = op_table_name(op);
+            let Some(pk_col) = pk_cols.get(table) else {
+                continue;
+            };
+            whole_table |= matches!(op, Op::Truncate { .. } | Op::BulkInsert { .. });
+            if matches!(op.expect(), OpOutcome::Succeeds) {
+                changes += match op {
+                    Op::BulkInsert { rows, .. } => rows.len(),
+                    _ => 1,
+                };
+            }
+            // Only the rows `op` can reach are copied: a hot-key case replays
+            // thousands of ops, nearly all of them on one row.
+            let rows = state.entry(table).or_default();
+            let mut pks: Vec<String> = match op {
+                Op::Insert { row, .. } => row
+                    .iter()
+                    .filter(|(c, _)| c == pk_col)
+                    .filter_map(|(_, v)| v.clone())
+                    .collect(),
+                Op::BulkInsert { rows: new_rows, .. } => new_rows
+                    .iter()
+                    .flat_map(|row| row.iter().filter(|(c, _)| c == pk_col))
+                    .filter_map(|(_, v)| v.clone())
+                    .collect(),
+                Op::Update { pk, .. } | Op::Delete { pk, .. } => vec![pk.clone()],
+                Op::Truncate { .. } => rows.keys().cloned().collect(),
+            };
+            pks.sort_unstable();
+            pks.dedup();
+            let before: HashMap<String, SimRow> = pks
+                .iter()
+                .filter_map(|pk| Some((pk.clone(), rows.get(pk)?.clone())))
+                .collect();
+            apply_to_rows(op, pk_col, rows);
+            let after = &state[table];
+
+            for pk in &pks {
+                let (old, new) = (before.get(pk), after.get(pk));
+                let touched = old != new
+                    || (new.is_some() && matches!(op, Op::Update { pk: p, .. } if p == pk));
+                if !touched {
+                    continue;
+                }
+                *row_writes.entry((table, pk.clone())).or_insert(0) += 1;
+                for &(group_table, column) in &groupings {
+                    if group_table != table {
+                        continue;
+                    }
+                    let was = old.map(|row| (table, column, value(row, column)));
+                    let is = new.map(|row| (table, column, value(row, column)));
+                    for group in was
+                        .iter()
+                        .chain(is.iter().filter(|g| Some(*g) != was.as_ref()))
+                    {
+                        let writes = group_writes.entry(group.clone()).or_default();
+                        writes.0 += 1;
+                        writes.1.insert(pk.clone());
+                    }
+                    if was == is {
+                        continue;
+                    }
+                    if let Some(group) = was {
+                        let size = sizes.entry(group.clone()).or_insert(0);
+                        *size = size.saturating_sub(1);
+                        if *size == 0 {
+                            emptied.insert(group);
+                        }
+                    }
+                    if let Some(group) = is {
+                        let size = sizes.entry(group.clone()).or_insert(0);
+                        *size += 1;
+                        if *size == 1 {
+                            if emptied.contains(&group) {
+                                out.insert(ConcurrentShape::GroupRefill);
+                            }
+                            if burst_index > 0 && !ever.contains(&group) {
+                                out.insert(ConcurrentShape::NewGroup);
+                            }
+                            ever.insert(group);
+                        }
+                    }
+                }
+            }
+        }
+
+        if row_writes.values().any(|&n| n >= HOT_WRITES) {
+            out.insert(ConcurrentShape::HotKey);
+        }
+        if group_writes
+            .values()
+            .any(|(n, rows)| *n >= HOT_WRITES && rows.len() >= 2)
+        {
+            out.insert(ConcurrentShape::HotGroup);
+        }
+        if changes >= SPLIT_THRESHOLD_ROWS && !whole_table {
+            out.insert(ConcurrentShape::SplitSized);
+        }
+    }
+    out
+}
+
 fn op_kind(op: &Op) -> &'static str {
     match op {
         Op::Insert { .. } => "Insert",
@@ -747,6 +984,29 @@ impl fmt::Display for Coverage {
         for ((shape, path), count) in paths {
             write!(f, " {shape}:{path}={count}")?;
         }
+        writeln!(f)?;
+        writeln!(f, "concurrent_bursts: {}", self.concurrent_bursts)?;
+        write!(f, "concurrent_shape_cases:")?;
+        for (name, count) in sorted_counts(&self.concurrent_shape_cases) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        let drain = &self.drain;
+        writeln!(
+            f,
+            "drain: sealed={} split={} split_across_workers={} max_workers_per_batch={} \
+             max_rows_per_batch={} keys_in_several_batches={}",
+            drain.sealed,
+            drain.split,
+            drain.split_across_workers,
+            drain.max_workers_per_batch,
+            drain.max_rows_per_batch,
+            drain.keys_in_several_batches
+        )?;
+        write!(f, "drain_cases:")?;
+        for (name, count) in sorted_counts(&self.drain_cases) {
+            write!(f, " {name}={count}")?;
+        }
         writeln!(f)
     }
 }
@@ -755,9 +1015,147 @@ impl fmt::Display for Coverage {
 mod tests {
     use super::*;
     use crate::generate::{
-        DefShape, Mutate, RelFieldKind, RelFieldSpec, TableSpec, build_program,
-        build_program_multi_with_relationships, interleave_tables,
+        AggregateFn, DefShape, Mutate, RelFieldKind, RelFieldSpec, TableSpec, build_program,
+        build_program_multi_with_relationships, build_program_multi_with_shapes, interleave_tables,
     };
+    use crate::model::Burst;
+
+    /// Issue #557: four rows grouped by grain (`0`, `0`, `1`, `1`) under a
+    /// `COUNT(*)` `GROUP BY`. After the seeds, one burst moves both rows of
+    /// group `0` into the never-used group `5` and one back (group `0`
+    /// empties and refills), then writes group `1`'s rows twelve times,
+    /// eight of them to pk 3.
+    fn grouped_program() -> Program {
+        let mut spec = TableSpec::numeric_only(vec![(Some(1), None); 4], Vec::new());
+        spec.grain_values = ["0", "0", "1", "1"]
+            .iter()
+            .map(|g| Some(g.to_string()))
+            .collect();
+        spec.mutates = vec![
+            Mutate::MoveGroup {
+                pk: 1,
+                grain: Some(5),
+            },
+            Mutate::MoveGroup {
+                pk: 2,
+                grain: Some(5),
+            },
+            Mutate::MoveGroup {
+                pk: 1,
+                grain: Some(0),
+            },
+        ];
+        for i in 0..12 {
+            spec.mutates.push(Mutate::Update {
+                pk: if i % 3 == 2 { 4 } else { 3 },
+                c1: Some(i),
+                c2: None,
+            });
+        }
+        build_program_multi_with_shapes(
+            &[spec],
+            &[(
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count],
+                },
+            )],
+        )
+    }
+
+    fn shapes(program: &Program, plan: &ConcurrentPlan) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = concurrent_shapes(program, plan)
+            .into_iter()
+            .map(ConcurrentShape::name)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn a_hot_burst_after_the_seeds_reaches_every_group_shape() {
+        let program = grouped_program();
+        let rest: Vec<usize> = (4..program.ops.len()).collect();
+        let (even, odd) = rest.iter().partition(|&&i| i % 2 == 0);
+        let plan = ConcurrentPlan {
+            bursts: vec![
+                Burst {
+                    lanes: vec![vec![0, 1, 2, 3]],
+                },
+                Burst {
+                    lanes: vec![even, odd],
+                },
+            ],
+        };
+        assert_eq!(
+            shapes(&program, &plan),
+            vec![
+                "concurrent_lanes",
+                "group_refill",
+                "hot_group",
+                "hot_key",
+                "new_group"
+            ]
+        );
+    }
+
+    /// The same ops in one single-lane burst: no race, and a group that
+    /// first appears in the first burst isn't a new-group burst, since the
+    /// seeds' groups appear there too.
+    #[test]
+    fn one_serial_burst_is_neither_concurrent_nor_a_new_group_burst() {
+        let program = grouped_program();
+        let plan = ConcurrentPlan {
+            bursts: vec![Burst {
+                lanes: vec![(0..program.ops.len()).collect()],
+            }],
+        };
+        assert_eq!(
+            shapes(&program, &plan),
+            vec!["group_refill", "hot_group", "hot_key"]
+        );
+    }
+
+    /// A burst of `SPLIT_THRESHOLD_ROWS` inserts is split-sized; a `TRUNCATE`
+    /// in the same burst makes it seal unsplit, so it no longer is.
+    #[test]
+    fn split_sized_needs_enough_changes_and_no_truncate() {
+        let seeds = vec![(Some(1), None); SPLIT_THRESHOLD_ROWS];
+        let one_burst = |program: &Program| ConcurrentPlan {
+            bursts: vec![Burst {
+                lanes: vec![(0..program.ops.len()).collect()],
+            }],
+        };
+        let program = build_program(&seeds, &[]);
+        assert!(shapes(&program, &one_burst(&program)).contains(&"split_sized"));
+        let program = build_program(&seeds[1..], &[]);
+        assert!(!shapes(&program, &one_burst(&program)).contains(&"split_sized"));
+        let program = build_program(&seeds, &[Mutate::Truncate]);
+        assert!(!shapes(&program, &one_burst(&program)).contains(&"split_sized"));
+    }
+
+    #[test]
+    fn record_drain_adds_up_and_counts_cases() {
+        let mut coverage = Coverage::new();
+        let audit = DrainAudit {
+            sealed: 3,
+            split: 1,
+            split_across_workers: 1,
+            max_workers_per_batch: 4,
+            max_rows_per_batch: 300,
+            keys_in_several_batches: 0,
+        };
+        coverage.record_drain(&audit);
+        coverage.record_drain(&DrainAudit {
+            sealed: 2,
+            max_workers_per_batch: 1,
+            ..DrainAudit::default()
+        });
+        assert_eq!(coverage.drain.sealed, 5);
+        assert_eq!(coverage.drain.max_workers_per_batch, 4);
+        assert_eq!(coverage.drain_cases["split_across_workers"], 1);
+        assert_eq!(coverage.drain_cases["key_in_several_batches"], 0);
+    }
 
     /// A from-side row joined to a parent whose `c1` is toggled to `NULL`,
     /// read through a bare to-one enrichment (issue #505).

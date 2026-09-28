@@ -16,7 +16,7 @@ mod manual;
 mod sql;
 mod subprocess;
 
-pub use manual::{ManualBackend, ManualBackendError, await_pool_usable};
+pub use manual::{ManualApplier, ManualBackend, ManualBackendError, await_pool_usable};
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
 use std::collections::BTreeMap;
@@ -90,6 +90,79 @@ pub trait Backend {
     /// per fleet), demonstrating multiple clients can coexist draining the
     /// same ring (improvement-plan task E3).
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Applies ops on a connection of its own (issue #557), so the concurrent
+/// tier can issue several lanes of a burst at once, each from its own task.
+/// Same contract as [`Backend::apply`]: raw source DML, the affected row
+/// count on success, `Err` when the statement itself was rejected.
+pub trait OpApplier: Send + 'static {
+    type Error: std::fmt::Debug + Send;
+
+    fn apply(&mut self, op: &Op) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+}
+
+/// A [`Backend`] the concurrent tier can drive (issue #557): it hands out
+/// independent [`OpApplier`]s, and it can say how its engine actually sealed
+/// and claimed the batches a run produced ([`DrainAudit`]).
+pub trait ConcurrentBackend: Backend {
+    type Applier: OpApplier;
+
+    /// A new applier on its own connection, for tables already installed.
+    fn applier(&self) -> impl Future<Output = Result<Self::Applier, Self::Error>> + Send;
+
+    /// Starts recording every seal and claim from here on, tagged with the
+    /// burst passed to [`ConcurrentBackend::begin_burst`]. Call once, after
+    /// [`Backend::install`].
+    fn start_drain_audit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Tags every batch sealed from now on as belonging to burst `burst`.
+    fn begin_burst(&mut self, burst: usize)
+    -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// What the recording has seen so far.
+    fn drain_audit(&mut self) -> impl Future<Output = Result<DrainAudit, Self::Error>> + Send;
+}
+
+/// The fewest rows a sealed batch needs for the engine to split it into
+/// buckets that several workers can claim (`staging::claim`). Re-exported
+/// here because nothing outside this module may name `trellis::staging` (the
+/// module doc comment); `crate::run::Coverage` reads it.
+pub const SPLIT_THRESHOLD_ROWS: usize = trellis::dev::staging::MIN_ROWS_TO_SPLIT as usize;
+
+/// How the engine sealed and claimed one run's batches (issue #557), read
+/// from triggers on its own `segments` and `seg_claims` rows. This is the
+/// evidence that a run really split batches across workers, as opposed to
+/// merely issuing many ops. Plain counts, so runs add up
+/// ([`DrainAudit::add`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainAudit {
+    /// Batches sealed.
+    pub sealed: u64,
+    /// Sealed batches split into more than one bucket.
+    pub split: u64,
+    /// Split batches whose buckets were claimed by two or more workers.
+    pub split_across_workers: u64,
+    /// The most distinct workers that claimed buckets of one batch.
+    pub max_workers_per_batch: u64,
+    /// The most rows sealed into one batch.
+    pub max_rows_per_batch: u64,
+    /// `(burst, table, key)`s whose changes were sealed into two or more
+    /// batches during the same burst: one key's changes in flight in several
+    /// batches at once.
+    pub keys_in_several_batches: u64,
+}
+
+impl DrainAudit {
+    /// Adds `other`'s counts into this one, keeping the larger maximum.
+    pub fn add(&mut self, other: &DrainAudit) {
+        self.sealed += other.sealed;
+        self.split += other.split;
+        self.split_across_workers += other.split_across_workers;
+        self.max_workers_per_batch = self.max_workers_per_batch.max(other.max_workers_per_batch);
+        self.max_rows_per_batch = self.max_rows_per_batch.max(other.max_rows_per_batch);
+        self.keys_in_several_batches += other.keys_in_several_batches;
+    }
 }
 
 /// Control over the Postgres server itself, as opposed to a database on it

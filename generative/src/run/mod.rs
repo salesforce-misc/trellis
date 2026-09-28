@@ -16,13 +16,15 @@
 //! [`Backend`] trait and an [`trellis::Pool`], so any backend and any source of
 //! programs can reuse it.
 
+mod concurrent;
 mod coverage;
 mod db_admin;
 mod noise;
 mod restore;
 mod two_instance;
 
-pub use coverage::{Coverage, RelPath};
+pub use concurrent::{ConcurrentRun, run_convergence_concurrent};
+pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES, RelPath};
 pub use db_admin::{check_slot_loss_detected, run_convergence_with_db_admin};
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
@@ -339,6 +341,18 @@ async fn apply_and_check_outcome<B: Backend>(
     if let Some(start) = start {
         eprintln!("COST_TIMING apply {}", start.elapsed().as_millis());
     }
+    check_op_outcome(op_index, op, &apply_result)
+}
+
+/// The outcome check [`apply_and_check_outcome`] makes, given what applying
+/// `op` returned: an `Err` is a rejected statement ([`OpOutcome::Fails`]),
+/// `Ok(0)` a source no-op. Shared with the concurrent runner, whose lanes
+/// apply on their own connections.
+fn check_op_outcome<E>(
+    op_index: usize,
+    op: &Op,
+    apply_result: &Result<u64, E>,
+) -> Result<(), RunError> {
     let actual = match apply_result {
         Err(_) => OpOutcome::Fails,
         Ok(0) => OpOutcome::AffectsNoRows,
@@ -424,11 +438,9 @@ async fn quiesce_snapshot_and_check<B: Backend>(
 /// The ops within a burst are still applied strictly in `program.ops`'s own
 /// generated order, one at a time, each one's actual outcome still checked
 /// against [`Op::expect`] via [`apply_and_check_outcome`] — this is **not**
-/// the harness racing/interleaving ops against each other (that's a
-/// deliberately out-of-scope follow-up; see
-/// `generative/tests/concurrent_convergence.rs`'s module doc comment). It is
-/// only a change to *when* `quiesce()` is called, nothing about *what* is
-/// applied or in what order.
+/// the harness racing ops against each other; [`run_convergence_concurrent`]
+/// does that (issue #557). It is only a change to *when* `quiesce()` is
+/// called, nothing about *what* is applied or in what order.
 ///
 /// **Divergence localization is coarser than `run_convergence`'s.** A
 /// divergence found here is only known to have appeared somewhere within the

@@ -9,12 +9,12 @@
 use std::collections::HashSet;
 
 use generative::generate::{
-    Mutate, build_program, bulk_insert_program, checkpoint_plan_for, noise_plan_for,
-    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    table_streams, trivial_program, trivial_program_with,
+    Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan, hot_key_case,
+    noise_plan_for, program_with_client_restart, program_with_mid_stream_def_install,
+    program_with_scale_out, table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
-use generative::run::RelPath;
+use generative::run::{ConcurrentShape, RelPath};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
@@ -1523,4 +1523,57 @@ fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
         "an order-independent failure must shrink to the table-by-table order: only \
          {table_ordered} of {failures} shrunk counterexamples did"
     );
+}
+
+/// Issue #557: the concurrent tier's hot-key cases reach every
+/// [`ConcurrentShape`] in most cases, where the tier's original draw
+/// (`trivial_program` in bursts of 1 to 4 ops, one lane) reaches almost
+/// none. Both tallies are printed, so a run of this test is the before/after
+/// comparison. The floors are loose next to what the strategy draws today
+/// (every shape in nearly every case), so they only catch a shape dropping
+/// out, not ordinary sampling noise.
+#[test]
+fn the_hot_key_tier_draws_every_concurrent_shape() {
+    const SAMPLES: usize = 40;
+    let mut runner = TestRunner::deterministic();
+
+    let mut before = generative::run::Coverage::new();
+    let serial = (trivial_program(), 1..=4usize);
+    for _ in 0..SAMPLES {
+        let (program, burst_size) = serial
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        before.record_concurrent_plan(&program, &concurrent_plan(&program, burst_size, 1));
+    }
+
+    let mut after = generative::run::Coverage::new();
+    let strategy = hot_key_case();
+    for _ in 0..SAMPLES {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        after.record_program(&case.program);
+        after.record_concurrent_plan(&case.program, &case.plan);
+    }
+
+    eprintln!(
+        "concurrent shapes over {SAMPLES} cases, before (trivial_program, bursts of 1-4, one \
+         lane): {:?}\nafter (hot_key_case): {:?}",
+        before.concurrent_shape_cases, after.concurrent_shape_cases
+    );
+    for shape in ConcurrentShape::ALL {
+        let reached = after
+            .concurrent_shape_cases
+            .get(shape.name())
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            reached * 2 >= SAMPLES,
+            "hot_key_case must reach {} in at least half of {SAMPLES} cases, got {reached}: \
+             {after}",
+            shape.name()
+        );
+    }
 }

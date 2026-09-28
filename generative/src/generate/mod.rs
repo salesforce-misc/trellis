@@ -118,7 +118,8 @@
 //! a group changing membership via delete/insert of whole rows is already
 //! the sharpest edge; *migrating* a live row from one group to another via
 //! `Update` is real, separate coverage `trellis/tests/apply_aggregate.rs`
-//! already exercises by hand, not drawn here). `KeySpace::Aggregate.group_by`
+//! already exercises by hand, not drawn by `trivial_program`; issue #557's
+//! concurrent tier draws it as [`Mutate::MoveGroup`]). `KeySpace::Aggregate.group_by`
 //! is always exactly one column (never a composite/multi-column group-by,
 //! which the engine grammar supports but this generator does not draw).
 //! `OneToOne` defs never get a grain passthrough field (unlike the B1
@@ -238,7 +239,10 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, GroupByKey, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 
-use crate::model::{Cardinality, Column, NamePool, Op, OpOutcome, Program, Relationship, Table};
+use crate::model::{
+    Burst, Cardinality, Column, ConcurrentPlan, NamePool, Op, OpOutcome, Program, Relationship,
+    Table,
+};
 
 /// The inclusive upper bound of the calculated-field value domain.
 ///
@@ -291,6 +295,54 @@ pub const MAX_DEFS: usize = 3;
 /// `Delete` mutates has real odds of emptying a group entirely — see the
 /// module doc comment's B4 section.
 pub const GRAIN_MAX: i64 = 2;
+
+/// The concurrent tier's hot-key shape (issue #557): the range of rows its
+/// hot table seeds. Small next to [`HOT_MUTATES`], so every key takes many
+/// writes per burst, but large enough that the rows spread across all of a
+/// split batch's buckets (a row's bucket is a hash of its key).
+pub const HOT_KEYS: std::ops::RangeInclusive<usize> = 8..=24;
+
+/// The hot-key shape's hottest keys: half of its mutates pick a pk from
+/// `1..=HOT_CORE_KEYS`, the other half from every seeded pk.
+pub const HOT_CORE_KEYS: i64 = 3;
+
+/// The range of mutates the hot-key shape draws for its hot table. The top
+/// of the range is bounded by the per-case time: every op is a real
+/// statement, and a burst is checked against the oracle once it settles.
+pub const HOT_MUTATES: std::ops::RangeInclusive<usize> = 1_000..=2_400;
+
+/// The width of the group window [`Mutate::MoveGroup`] draws from: a drawn
+/// grain is `0..=HOT_GRAIN_MAX` above the window's current bottom. Seeds
+/// only use `0..=GRAIN_MAX`, so the groups above it don't exist until a row
+/// moves into one mid-run: the new-group bursts of #389 and #539.
+pub const HOT_GRAIN_MAX: i64 = 7;
+
+/// Every this many mutates, the hot-key shape's group window slides up by
+/// [`HOT_GROUP_SLIDE`], so groups nobody has used before keep appearing all
+/// through a run, in every burst rather than only the first.
+pub const HOT_GROUP_EPOCH: usize = 150;
+
+/// How far the group window slides each [`HOT_GROUP_EPOCH`].
+pub const HOT_GROUP_SLIDE: i64 = 2;
+
+/// The range of ops per burst the hot-key shape draws: at least twice the
+/// engine's split threshold (256 rows in one sealed batch), so a burst can
+/// seal into several batches that are each large enough to split, and small
+/// enough next to [`HOT_MUTATES`] that every case has two bursts or more (a
+/// new group can only appear after the first).
+pub const HOT_BURST_SIZE: std::ops::RangeInclusive<usize> = 500..=1_000;
+
+/// The range of drain workers the hot-key shape runs the engine with: more
+/// than one to split a batch across, and up to its bucket count (8).
+pub const HOT_WORKERS: std::ops::RangeInclusive<usize> = 4..=8;
+
+/// The range of seal cadences, in milliseconds, the hot-key shape runs the
+/// engine with ([`ConcurrentCase::seal_interval_ms`]). Short next to a
+/// burst's issue time, so a burst seals into several batches. How many rows
+/// a batch gets depends on how fast the harness issues, which varies by
+/// machine, so the range is wide: its short end seals many small batches,
+/// its long end fewer that clear the split threshold.
+pub const HOT_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 20..=200;
 
 /// Index, within every generated source table's `columns`, of the
 /// relationship **key** column (issue #34): a `Text` column carrying a real
@@ -454,6 +506,14 @@ pub enum Mutate {
     /// every mutate after a `Truncate` sees an empty table exactly as real
     /// Postgres would.
     Truncate,
+    /// Moves row `pk` into group `grain` by setting its grain column (issue
+    /// #557), and nothing else. The one exception to the B4 scope cut that
+    /// the grain column is seeded once and never updated: only the
+    /// concurrent tier's hot-key strategy draws it (see [`HOT_GRAIN_MAX`]),
+    /// so a group can lose and regain members mid-burst (#389, #539) and a
+    /// group nobody seeded can appear. `trivial_program` never draws it. A
+    /// `pk` naming no live row is a source no-op, exactly like `Update`.
+    MoveGroup { pk: i64, grain: Option<i64> },
 }
 
 /// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
@@ -575,8 +635,9 @@ pub struct TableSpec {
     /// shape every other seeded column here uses — so a hand-built pin can
     /// construct a `None` (SQL `NULL`) grain value directly for a targeted
     /// regression pin, same as the `grain_value` proptest strategy itself now
-    /// draws one on its own. Same length contract as `text_values`. Never
-    /// touched by [`Mutate`] — see the module doc comment's B4 scope cuts.
+    /// draws one on its own. Same length contract as `text_values`. Only
+    /// [`Mutate::MoveGroup`] (issue #557's concurrent tier) touches it — see
+    /// the module doc comment's B4 scope cuts.
     pub grain_values: Vec<Option<String>>,
     /// `rel_fk_values[i]` is the rendered value for seeded primary key
     /// `i + 1`'s relationship **foreign-key** column (issue #34) — the
@@ -698,6 +759,16 @@ fn render_mutate(
                 expect,
             }
         }
+        Mutate::MoveGroup { pk, grain } => Op::Update {
+            table: table_name.clone(),
+            pk: pk.to_string(),
+            changes: vec![(table.columns[6].name.clone(), render(*grain))],
+            expect: if live.contains_key(pk) {
+                OpOutcome::Succeeds
+            } else {
+                OpOutcome::AffectsNoRows
+            },
+        },
         Mutate::Delete { pk } => Op::Delete {
             table: table_name.clone(),
             pk: pk.to_string(),
@@ -2099,6 +2170,116 @@ pub fn interleave_tables(mut program: Program, schedule: &[usize]) -> Program {
     program
 }
 
+// ---------------------------------------------------------------------
+// Issue #557: the concurrent tier's lanes.
+//
+// #505 made each table's op stream the only ordering constraint a program
+// carries across tables. The concurrent tier goes one step further and
+// issues a burst's ops from several harness tasks at once, each on its own
+// connection, so Postgres commits them in no order the harness chooses.
+//
+// What has to stay ordered is narrower than `ops_commute`'s relation.
+// `ops_commute` answers "does reordering these two ops leave the converged
+// target the same", which is what `tests/order_insensitivity.rs` compares
+// two serial runs on. The concurrent tier never compares against a fixed
+// serial order: the oracle recomputes every target from the source as it
+// actually is after the burst. All the harness still has to predict is each
+// op's own outcome (`Op::expect`), and that depends only on earlier ops on
+// the same source row, or on a whole-table op of the same table. So ops on
+// different rows may race even when they feed the same aggregate group. That
+// is exactly the traffic the tier exists to produce: many rows of one hot
+// group written at once, and drained by several workers.
+//
+// A lane key is therefore `(table, pk)`, or the whole table when the
+// program ever issues a whole-table op on it (`Truncate`/`BulkInsert`),
+// since one of those touches every row. Every lane key lives inside one of
+// `table_streams`' streams, so each table's own order is kept too.
+// ---------------------------------------------------------------------
+
+/// The most harness tasks one burst is split across (issue #557).
+pub const MAX_LANES: usize = 4;
+
+/// Splits `program.ops` into bursts of `burst_size` consecutive ops, and
+/// each burst into at most `lanes` lanes that the concurrent tier issues
+/// from separate tasks (issue #557; see the section comment above for which
+/// ops may be split apart). Within a burst, every op on one row (or on one
+/// table, if the program ever truncates or bulk-inserts it) lands in the
+/// same lane, in program order. Distinct keys are dealt to lanes round-robin
+/// in order of first appearance, so the lanes stay balanced and the plan is
+/// a pure function of its arguments: a shrunk case replays the same plan.
+///
+/// # Panics
+///
+/// If `burst_size` or `lanes` is `0`, or `program` schedules anything by op
+/// index (a deferred install, a restart or a scale-out), which the concurrent
+/// runner doesn't support.
+pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> ConcurrentPlan {
+    assert!(
+        burst_size > 0 && lanes > 0,
+        "concurrent_plan: burst_size and lanes must both be at least 1"
+    );
+    assert!(
+        program.def_install_after_op.iter().all(|&at| at == 0)
+            && program.restart_after_ops.is_empty()
+            && program.scale_out_after_ops.is_empty(),
+        "concurrent_plan: the concurrent tier doesn't schedule anything by op index"
+    );
+    let whole_table: std::collections::HashSet<&str> = program
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::Truncate { .. } | Op::BulkInsert { .. }))
+        .map(op_table)
+        .collect();
+    let lane_key = |op: &Op| -> (String, Option<String>) {
+        let table = op_table(op);
+        let pk = if whole_table.contains(table) {
+            None
+        } else {
+            let spec = program
+                .tables
+                .iter()
+                .find(|t| t.name == table)
+                .expect("an op names one of the program's tables");
+            op_pk_value(op, spec)
+        };
+        (table.to_string(), pk)
+    };
+
+    let indices: Vec<usize> = (0..program.ops.len()).collect();
+    let bursts = indices
+        .chunks(burst_size)
+        .map(|chunk| {
+            let mut lane_of: HashMap<(String, Option<String>), usize> = HashMap::new();
+            let mut out = vec![Vec::new(); lanes];
+            for &index in chunk {
+                let key = lane_key(&program.ops[index]);
+                let next = lane_of.len() % lanes;
+                let lane = *lane_of.entry(key).or_insert(next);
+                out[lane].push(index);
+            }
+            out.retain(|lane| !lane.is_empty());
+            Burst { lanes: out }
+        })
+        .collect();
+    ConcurrentPlan { bursts }
+}
+
+/// One concurrent-tier case (issue #557): the program, how it is issued,
+/// and the engine shape it is drained by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcurrentCase {
+    pub program: Program,
+    /// The ops per burst the plan was cut with, kept for the failure report.
+    pub burst_size: usize,
+    pub plan: ConcurrentPlan,
+    /// Application (drain) workers the engine runs.
+    pub workers: usize,
+    /// The engine's maintenance cadence, which is its seal cadence: short
+    /// enough that one burst seals into several batches, so one hot key's
+    /// changes sit in several batches at once.
+    pub seal_interval_ms: u64,
+}
+
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
 /// convenience wrapper for the common "every def is `OneToOne`" case
 /// (improvement-plan task B2, kept at its original `&[usize]`/`&[DerivedShape]`
@@ -3365,6 +3546,184 @@ mod strategy {
         trivial_program_with(true)
     }
 
+    /// One hot-key mutate against `seed_count` seeded rows (issue #557):
+    /// half the draws pick a pk from the first [`HOT_CORE_KEYS`], so a few
+    /// keys are much hotter than the rest. Mostly value updates, with enough
+    /// [`Mutate::MoveGroup`]s, deletes and revivals that groups gain, lose
+    /// and regain members inside one burst. Revivals outweigh deletes two to
+    /// one, so about two thirds of the rows are live at any time and most
+    /// writes land; a revival of a live row is a rejected insert, which is a
+    /// shape worth keeping too. No `Truncate`: it forces its
+    /// whole batch to seal as one bucket and pins its table to one lane,
+    /// which is the opposite of what this shape is for, and the serial tiers
+    /// already draw it. Every pk is a seeded one, so a miss only happens
+    /// after a delete.
+    fn hot_mutate(seed_count: usize) -> BoxedStrategy<Mutate> {
+        let seeds = seed_count as i64;
+        let pk = || prop_oneof![1 => 1..=seeds, 1 => 1..=HOT_CORE_KEYS.min(seeds)];
+        let grain = prop_oneof![
+            VALUE_WEIGHT => (0..=HOT_GRAIN_MAX).prop_map(Some),
+            NULL_WEIGHT => Just(None),
+        ];
+        prop_oneof![
+            6 => (pk(), value(true), value(true))
+                .prop_map(|(pk, c1, c2)| Mutate::Update { pk, c1, c2 }),
+            1 => (pk(), bool_value(true)).prop_map(|(pk, flag)| Mutate::UpdateFlag { pk, flag }),
+            1 => (pk(), 0..=VALUE_MAX).prop_map(|(pk, value)| Mutate::ToggleNull { pk, value }),
+            3 => (pk(), grain).prop_map(|(pk, grain)| Mutate::MoveGroup { pk, grain }),
+            1 => pk().prop_map(|pk| Mutate::Delete { pk }),
+            2 => (pk(), value(true), value(true))
+                .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 }),
+        ]
+        .boxed()
+    }
+
+    /// Slides every [`Mutate::MoveGroup`]'s drawn grain up by
+    /// [`HOT_GROUP_SLIDE`] per [`HOT_GROUP_EPOCH`] mutates before it (issue
+    /// #557), so the group window moves through the run.
+    fn slide_group_window(mut mutates: Vec<Mutate>) -> Vec<Mutate> {
+        for (index, mutate) in mutates.iter_mut().enumerate() {
+            if let Mutate::MoveGroup {
+                grain: Some(grain), ..
+            } = mutate
+            {
+                *grain += (index / HOT_GROUP_EPOCH) as i64 * HOT_GROUP_SLIDE;
+            }
+        }
+        mutates
+    }
+
+    /// [`table_spec`] with the hot-key shape's ranges and [`hot_mutate`]
+    /// (issue #557).
+    fn hot_table_spec(
+        seeds: std::ops::RangeInclusive<usize>,
+        mutates: std::ops::RangeInclusive<usize>,
+    ) -> impl Strategy<Value = TableSpec> {
+        seeds
+            .prop_flat_map(move |seed_count| {
+                (
+                    prop::collection::vec((value(true), value(true)), seed_count),
+                    prop::collection::vec(text_value(true), seed_count),
+                    prop::collection::vec(bool_value(true), seed_count),
+                    prop::collection::vec(uuid_value(true), seed_count),
+                    prop::collection::vec(grain_value(), seed_count),
+                    prop::collection::vec(rel_fk_value(true), seed_count),
+                    prop::collection::vec(hot_mutate(seed_count), mutates.clone()),
+                )
+            })
+            .prop_map(
+                |(
+                    seed_values,
+                    text_values,
+                    bool_values,
+                    uuid_values,
+                    grain_values,
+                    rel_fk_values,
+                    mutates,
+                )| TableSpec {
+                    seed_values,
+                    text_values,
+                    bool_values,
+                    uuid_values,
+                    grain_values,
+                    rel_fk_values,
+                    mutates: slide_group_window(mutates),
+                },
+            )
+    }
+
+    /// The most mutates the hot-key shape's optional second table draws. It
+    /// is there to be a relationship's parent, written now and then while
+    /// the hot table churns, not to be hot itself.
+    const HOT_PARENT_MUTATES: usize = 60;
+
+    /// The concurrent tier's hot-key case (issue #557): a hot table of
+    /// [`HOT_KEYS`] rows taking [`HOT_MUTATES`] writes, always read by a
+    /// `GROUP BY` definition over its grain column, plus up to two more
+    /// drawn definitions. Half the cases add a small second table that
+    /// definitions can reach through a relationship ([`rel_field_spec`]),
+    /// its ops spread evenly through the hot table's (see
+    /// [`spread_schedule`]).
+    ///
+    /// Issued in bursts of [`HOT_BURST_SIZE`] ops over `2..=MAX_LANES`
+    /// lanes ([`concurrent_plan`]), against an engine with [`HOT_WORKERS`]
+    /// drain workers sealing every [`HOT_SEAL_INTERVAL_MS`].
+    pub fn hot_key_case() -> impl Strategy<Value = ConcurrentCase> {
+        (1..=2usize)
+            .prop_flat_map(|table_count| {
+                (
+                    hot_table_spec(HOT_KEYS, HOT_MUTATES),
+                    prop::collection::vec(
+                        hot_table_spec(3..=MAX_SEED_ROWS, 0..=HOT_PARENT_MUTATES),
+                        table_count - 1,
+                    ),
+                    (aggregate_functions(), rel_field_spec(0, table_count, true)),
+                    prop::collection::vec(def_draw(table_count), 0..MAX_DEFS),
+                    HOT_BURST_SIZE,
+                    2..=MAX_LANES,
+                    HOT_WORKERS,
+                    HOT_SEAL_INTERVAL_MS,
+                )
+            })
+            .prop_map(
+                |(hot, others, (functions, hot_rel), extra, burst_size, lanes, workers, seal)| {
+                    let mut tables = vec![hot];
+                    tables.extend(others);
+                    let mut defs = vec![(0, DefShape::Aggregate { functions })];
+                    let mut derived = vec![None];
+                    let mut rel_fields = vec![hot_rel];
+                    for (source, shape, derived_shape, rel_field) in extra {
+                        defs.push((source, shape));
+                        derived.push(derived_shape);
+                        rel_fields.push(rel_field);
+                    }
+                    let program = build_program_multi_with_relationships(
+                        &tables,
+                        &defs,
+                        &derived,
+                        &rel_fields,
+                    );
+                    let schedule = spread_schedule(&program);
+                    let program = interleave_tables(program, &schedule);
+                    let plan = concurrent_plan(&program, burst_size, lanes);
+                    ConcurrentCase {
+                        program,
+                        burst_size,
+                        plan,
+                        workers,
+                        seal_interval_ms: seal,
+                    }
+                },
+            )
+    }
+
+    /// An [`interleave_tables`] schedule that spreads every table's ops
+    /// evenly through the program: each step emits from the table furthest
+    /// behind its own share (issue #557). The hot-key shape uses it rather
+    /// than drawing a schedule, because a drawn one over ~1,000 ops is slow
+    /// to shrink and a burst is issued concurrently anyway.
+    fn spread_schedule(program: &Program) -> Vec<usize> {
+        let totals: Vec<usize> = table_streams(program).iter().map(Vec::len).collect();
+        let mut emitted = vec![0usize; totals.len()];
+        let mut schedule = Vec::with_capacity(program.ops.len());
+        for _ in 0..program.ops.len() {
+            let remaining: Vec<usize> = (0..totals.len())
+                .filter(|&t| emitted[t] < totals[t])
+                .collect();
+            // Smallest fraction emitted, compared without division.
+            let (pick, &table) = remaining
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (emitted[**a] * totals[**b]).cmp(&(emitted[**b] * totals[**a]))
+                })
+                .expect("a table still has ops while steps remain");
+            emitted[table] += 1;
+            schedule.push(pick);
+        }
+        schedule
+    }
+
     /// A single [`NoiseAction`] against [`adversarial_noise_table`]'s shape
     /// (task E1): a small pk domain (so `Update`/`Delete` sometimes land on a
     /// row an earlier `Insert` in the same draw actually seeded, and
@@ -3705,7 +4064,7 @@ mod strategy {
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, noise_plan_for,
+    bulk_insert_program, checkpoint_plan_for, db_admin_plan_for, hot_key_case, noise_plan_for,
     program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
     restore_plan_for, trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
@@ -4505,6 +4864,130 @@ mod tests {
         fn interleaving_after_scheduling_by_op_index_is_a_generator_bug() {
             let program = schedule_restart(three_table_program(), 2);
             interleave_tables(program, &[1]);
+        }
+    }
+
+    /// Issue #557: the concurrent tier's lanes and the hot-key shape's
+    /// group window.
+    mod concurrent_lanes {
+        use super::*;
+
+        /// Every op on one row stays in one lane, in program order; rows are
+        /// dealt round-robin; and each burst covers its slice of the program.
+        #[test]
+        fn a_rows_ops_share_a_lane_and_rows_are_dealt_round_robin() {
+            let program = build_program(
+                &[(Some(1), None), (Some(2), None), (Some(3), None)],
+                &[
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(5),
+                        c2: None,
+                    },
+                    Mutate::Delete { pk: 2 },
+                    Mutate::Update {
+                        pk: 1,
+                        c1: Some(6),
+                        c2: None,
+                    },
+                    Mutate::Update {
+                        pk: 3,
+                        c1: Some(7),
+                        c2: None,
+                    },
+                ],
+            );
+            // ops: [seed 1, seed 2, seed 3, update 1, delete 2, update 1, update 3]
+            let plan = concurrent_plan(&program, 4, 2);
+            assert_eq!(
+                plan.bursts,
+                vec![
+                    // pk 1 -> lane 0, pk 2 -> lane 1, pk 3 -> lane 0.
+                    Burst {
+                        lanes: vec![vec![0, 2, 3], vec![1]],
+                    },
+                    // pk 2 -> lane 0, pk 1 -> lane 1, pk 3 -> lane 0.
+                    Burst {
+                        lanes: vec![vec![4, 6], vec![5]],
+                    },
+                ]
+            );
+        }
+
+        /// A table the program ever truncates is one lane per burst: the
+        /// truncate touches every row, so nothing on that table may race it.
+        /// Other tables still split by row.
+        #[test]
+        fn a_truncated_table_stays_in_one_lane() {
+            let program = build_program_multi(
+                &[
+                    TableSpec::numeric_only(
+                        vec![(Some(1), None), (Some(2), None)],
+                        vec![Mutate::Truncate],
+                    ),
+                    TableSpec::numeric_only(vec![(Some(3), None), (Some(4), None)], Vec::new()),
+                ],
+                &[0],
+            );
+            // ops: [t0 seed 1, t0 seed 2, t0 truncate, t1 seed 1, t1 seed 2]
+            let plan = concurrent_plan(&program, 10, 4);
+            assert_eq!(
+                plan.bursts,
+                vec![Burst {
+                    lanes: vec![vec![0, 1, 2], vec![3], vec![4]],
+                }]
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "doesn't schedule anything by op index")]
+        fn a_program_scheduled_by_op_index_is_refused() {
+            let program = build_program(&[(Some(1), None), (Some(2), None)], &[]);
+            concurrent_plan(&schedule_restart(program, 1), 1, 1);
+        }
+
+        #[cfg(feature = "proptest")]
+        /// The drawn hot-key cases really are hot-key cases: every op is in
+        /// exactly one lane, lanes keep program order, and a `MoveGroup` late
+        /// in the stream can name a group above the first window.
+        #[test]
+        fn hot_key_cases_cover_every_op_and_slide_the_group_window() {
+            use proptest::strategy::{Strategy, ValueTree};
+            use proptest::test_runner::TestRunner;
+
+            let mut runner = TestRunner::deterministic();
+            let mut highest_group = 0;
+            for _ in 0..8 {
+                let case = hot_key_case()
+                    .new_tree(&mut runner)
+                    .expect("a case")
+                    .current();
+                let mut covered: Vec<usize> =
+                    case.plan.bursts.iter().flat_map(|b| b.ops()).collect();
+                covered.sort_unstable();
+                assert!(covered.iter().copied().eq(0..case.program.ops.len()));
+                assert!(
+                    case.plan.bursts.len() >= 2,
+                    "every case has two bursts or more"
+                );
+                for burst in &case.plan.bursts {
+                    assert!(burst.lanes.iter().all(|lane| lane.is_sorted()));
+                }
+                let grain = &case.program.tables[0].columns[6].name;
+                for op in &case.program.ops {
+                    if let Op::Update { changes, .. } = op
+                        && changes[0].0 == *grain
+                        && let Some(value) = &changes[0].1
+                    {
+                        highest_group = highest_group.max(value.parse::<i64>().unwrap());
+                    }
+                }
+            }
+            assert!(
+                highest_group > HOT_GRAIN_MAX + HOT_GROUP_SLIDE,
+                "the group window must slide past its first position: highest group \
+                 {highest_group}"
+            );
         }
     }
 }
