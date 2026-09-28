@@ -130,7 +130,7 @@ Four rules are load-bearing — the same four the write-time merge established:
 
 | Field | Rule | Why |
 |---|---|---|
-| `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties) | the delta's add side `+f(new)` must track the latest image |
+| `new_image` | **last** — post-image of the highest-`lsn` change (`change_id` breaks ties); a latest `delete` wins with a NULL post-image even when it carries no image | the delta's add side `+f(new)` must track the latest image, and a deleted key has none |
 | `old_image` | **first** — pre-image of the lowest-`lsn` change | the state the key was last materialized from; the delta's removal side `−f(old)` |
 | `src_changed` | **OR** | any source contribution makes the record a source change, so downstream propagation fires; dropping the OR reintroduces a mutual-derivation livelock |
 | `origin_lsn` | **LEAST**, unknown (`NULL`) wins | the oldest-origin marker read-your-writes soundness depends on ([07](07-convergence-and-await.md)); an unknown origin gates every token, so it must survive the merge |
@@ -179,9 +179,19 @@ NULL on the other side, while a bare trigger is excluded from both. A key whose
 rows are all image-less folds to both images NULL, which is correct: recompute
 from live source and take a zero delta.
 
+One image-less row does speak to the post-image: an `op = 'delete'` is the
+key's final state within the window, whatever precedes it (ADR-0002, issue
+#620). The post-image arg-extreme therefore ranks every `delete` alongside the
+image-bearing rows, so a latest image-less delete folds `new_image` to NULL
+rather than being skipped for an earlier write's post-image. The pre-image
+arg-extreme is unchanged. The fold also returns `ends_in_delete` for the
+segment merge: a later segment whose only row for a key is an image-less
+delete folds to no image at all, and on images alone it would look like a bare
+trigger and defer to the earlier segment's post-image.
+
 The corollary binds *producers*, not just the fold: within one window, for one
-`(src_table, key)`, an image-bearing row always beats an image-less one — **even
-when the image-less one is newer**. A producer that can stage both shapes for the
+`(src_table, key)`, an image-bearing row always beats an image-less
+non-`delete` one — **even when the image-less one is newer**. A producer that can stage both shapes for the
 same key must therefore pick one. See issue #180's downstream propagation of an
 extinct aggregate group: it stages a real image-bearing delete carrying the
 group's captured pre-delete image, but drops back to an image-less `Recompute`

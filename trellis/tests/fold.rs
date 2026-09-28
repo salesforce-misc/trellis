@@ -1310,3 +1310,77 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     assert_eq!((&only.old_image, &only.new_image), (&None, &None));
     assert!(only.ends_in_delete);
 }
+
+/// Issue #581: the group-key union goes through `jsonb` (`jsonb_agg`, then a
+/// jsonpath flatten, then `#>> '{}'` back to text), so it must hand back
+/// exactly the texts intake staged, not whatever jsonb makes of them. Values
+/// that look like JSON literals, numbers that jsonb would normalize, quotes,
+/// backslashes, control characters, non-ASCII and a long string all survive
+/// byte for byte, the empty string and the string `null` are real values,
+/// and a key whose rows carry no values (no array, or an empty one) folds to
+/// no group key at all.
+#[tokio::test]
+async fn the_group_key_union_returns_every_staged_text_unchanged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let long = "x".repeat(10_000);
+    let first = vec![
+        "null",
+        "",
+        "1.0",
+        "1",
+        "1e3",
+        "true",
+        r#"{"a": 1}"#,
+        "[1, 2]",
+        r#""quoted""#,
+    ];
+    let second = vec![
+        "1.00",
+        r"back\slash",
+        "tab\there",
+        "line\nbreak",
+        "ünïcödé 🎉",
+        long.as_str(),
+        "1.0", // again: the union dedups it
+    ];
+    let row = |key, lsn, group_key| RawRow {
+        key,
+        op: "update",
+        lsn: Some(lsn),
+        old_image: Some(r#"{"v":1}"#),
+        new_image: Some(r#"{"v":2}"#),
+        origin_lsn: Some(lsn),
+        src_changed: true,
+        hop_gen: 0,
+        group_key,
+    };
+    insert_row(&client, "seg_0", &row("edgy", 10, Some(first.clone()))).await;
+    insert_row(&client, "seg_0", &row("edgy", 20, Some(second.clone()))).await;
+    insert_row(&client, "seg_0", &row("edgy", 30, None)).await;
+    insert_row(&client, "seg_0", &row("empty", 10, Some(Vec::new()))).await;
+    insert_row(&client, "seg_0", &row("empty", 20, None)).await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    let mut expected: Vec<String> = first
+        .iter()
+        .chain(second.iter())
+        .map(|v| v.to_string())
+        .collect();
+    expected.sort();
+    expected.dedup();
+    let mut got = find(&folded, "edgy")
+        .group_key
+        .clone()
+        .expect("the key's rows carried values");
+    got.sort();
+    assert_eq!(got, expected);
+    assert_eq!(find(&folded, "empty").group_key, None);
+}
