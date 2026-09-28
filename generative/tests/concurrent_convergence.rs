@@ -970,8 +970,9 @@ const SWEEP_LINE: &str = "plant-sweep\t";
 const KNOWN_MISSES: &[&str] = &["stale_one_to_one_write"];
 const PLANT_SEEDS: u64 = 4;
 /// The sweep fails if the baseline fails more than one case in this many.
-/// The hot-key tier fails about 1 in 100 unplanted on tmpfs (#557 part 3's
-/// PR), and a disk cluster fails most of them.
+/// The hot-key tier fails a few cases in 1,000 unplanted on tmpfs, most of
+/// them seed 3 case 11 (#557 part 3's PR), and a disk cluster fails most of
+/// them.
 const MAX_BASELINE_FAILURE_SHARE: usize = 20;
 const PLANT_CASES: usize = 12;
 
@@ -1038,6 +1039,13 @@ impl SweepCase {
     /// the engine's behavior in it. A planted case that failed with the
     /// plant never firing hit something else, an unplanted divergence, and
     /// says nothing about the plant. For the baseline, whether it failed.
+    ///
+    /// The converse doesn't hold: the baseline passing the same case doesn't
+    /// rule out an unplanted failure in the planted run, since the schedule
+    /// isn't replayed, only the case. So a plant that fires in most cases
+    /// can be credited with the tier's rare unplanted divergences. At the
+    /// tmpfs baseline rate (a few in 1,000) that barely moves a rate, but a
+    /// gate that needs one catch should read the report's failure lines.
     fn caught(&self) -> bool {
         self.failed && (self.fired > 0 || self.plant == "baseline")
     }
