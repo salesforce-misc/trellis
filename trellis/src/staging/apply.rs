@@ -9402,10 +9402,13 @@ impl HeldShare {
     fn filter(&self, buckets: &[i16]) -> fold::BucketFilter {
         // Planted bug (#557): drop claim exclusivity, so a claimer folds every
         // bucket of a split batch, not just its own. See `crate::plant`.
+        // "Split" is judged on the whole share this worker holds, not on
+        // `buckets`: a resumed paged drain passes one cursor group at a
+        // time, a strict subset even when the worker holds every bucket.
         #[cfg(any(test, feature = "test-util"))]
         if crate::plant::fires(
             crate::plant::Plant::ClaimAllBuckets,
-            !buckets.is_empty() && buckets.len() < self.bucket_count as usize,
+            !self.buckets.is_empty() && self.buckets.len() < self.bucket_count as usize,
         ) {
             return fold::BucketFilter::buckets(
                 i64::from(self.bucket_count),
