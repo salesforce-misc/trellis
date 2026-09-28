@@ -538,6 +538,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         row_count: 1,
         has_recompute: false,
         vanished_images: Vec::new(),
+        ends_in_delete: false,
     }];
 
     let result = isolate_and_evict(

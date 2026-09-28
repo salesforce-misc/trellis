@@ -4774,6 +4774,7 @@ mod tests {
             row_count: 1,
             has_recompute: false,
             vanished_images: Vec::new(),
+            ends_in_delete: false,
         }
     }
 

@@ -85,6 +85,8 @@ pub struct FoldedChange {
     pub src_table: String,
     pub key: String,
     /// LAST image-bearing row's post-image, by `(lsn, change_id)` — highest.
+    /// A `delete` ranks here even without an image (issue #620): when one is
+    /// the latest such row this is `None`, and [`Self::ends_in_delete`] says so.
     pub new_image: Option<String>,
     /// FIRST image-bearing row's pre-image, by `(lsn, change_id)` — lowest.
     /// A key born inside the batch (insert-then-update) folds this to
@@ -226,6 +228,19 @@ pub struct FoldedChange {
     /// Only the no-image case carries them, so the wire cost falls on
     /// born-and-died keys alone.
     pub vanished_images: Vec<String>,
+    /// Issue #620 (ADR-0002's fold rule under I8): whether the key's latest
+    /// row that speaks to its state, by `(lsn, change_id)`, is a `delete`.
+    /// An image-less `delete` is such a row: it is the key's final state
+    /// whatever precedes it, so it wins the `new_image` arg-extreme with a
+    /// `NULL` post-image rather than being skipped for an earlier write's.
+    /// Whenever this is `true`, `new_image` is `None`.
+    ///
+    /// The flag exists for [`merge_folded_changes`]: a later segment whose
+    /// only row for a key is an image-less delete folds to a record with no
+    /// image at all, which on images alone looks the same as a bare
+    /// recompute. This is what tells the two apart, so the delete still
+    /// ends the key across segments.
+    pub ends_in_delete: bool,
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
@@ -294,6 +309,7 @@ pub async fn fold(
                 images.dedup();
                 images
             },
+            ends_in_delete: row.get(18),
         })
         .collect())
 }
@@ -363,24 +379,27 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
     // same rescan of `fenced`. Whatever join it picks now, its inner side is
     // the handful of truncate rows.
     //
-    // Issue #133: `group_key` is a real per-key set union, computed
-    // separately from every other column here so it can't perturb them.
-    // `group_keys` unnests each raw row's own `group_key` array (a row with
-    // no array at all coalesces to `array[]`, so it contributes nothing and
-    // drops out of the join) and re-aggregates with `array_agg(distinct
-    // ...)`, which is what actually merges/dedups the union rather than
-    // picking one row's value — the placeholder this replaces used the same
-    // `array_agg(... order by ...) filter (...))[1]` arg-extreme idiom the
-    // image columns use, which is correct for "the value from one specific
-    // row" but wrong for "everything any row touched." Aggregating this in
-    // its own CTE (rather than joining the unnested rows straight into the
-    // outer `group by`) matters: cross-joining `filtered` against
-    // `unnest(group_key)` multiplies a row with an N-element array into N
-    // output rows, which would corrupt every *other* aggregate below
-    // (`min`/`max`/the image arg-extremes) by feeding them duplicated rows.
-    // `group_keys` collapses back to one row per key before it's ever
-    // joined against `filtered`, so the outer query's own row multiplicity
-    // — and therefore every other column's aggregate — is untouched.
+    // Issue #133: `group_key` is a real per-key set union across every raw
+    // row's own `group_key` array, deduplicated with `array_agg(distinct
+    // ...)`, not one row's value picked by the arg-extreme idiom the image
+    // columns use. Issue #581: it is computed inside the one aggregate,
+    // with no join. It used to be a separate `group_keys` CTE (unnest,
+    // re-aggregate per key) joined back to `filtered` on `(src_table, key)`,
+    // and a ring slot refilled after reclaim still carries statistics that
+    // describe it empty, so the planner estimated the window at one row and
+    // planned that join as an unparameterized nested loop: 50,000 × 50,000
+    // join-filter evaluations on a real batch, holding the claim lock for
+    // minutes. With no join there is no plan for stale statistics to get
+    // wrong. The rows' arrays can't be concatenated by `array_agg` (it
+    // builds a rectangular 2-D array and rejects arrays of different
+    // lengths), so `jsonb_agg` collects them per key as a JSON array of
+    // arrays, and a scalar subquery over that one value flattens it with a
+    // single jsonpath (`$[*][*]`, dropping JSON nulls, which is what a NULL
+    // element becomes) and re-aggregates the distinct texts. The subquery
+    // reads only its own key's aggregate, so it is linear in that key's
+    // rows. Unnesting in the main `from` instead would multiply each row by
+    // its array's length and corrupt every other aggregate here (`count`,
+    // `min`/`max`, the arg-extremes).
     //
     // Issues #392 and #486 add two columns without adding a sort or a pass.
     // `has_recompute` is a plain `bool_or`. `vanished_images` repeats the two
@@ -390,6 +409,22 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
     // byte compare, only reached when one key has several inserts or
     // deletes), filtered to insert-shaped and delete-shaped rows so an
     // update, the common row, never feeds them.
+    //
+    // Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is
+    // the key's final state within the window, whatever precedes it. So the
+    // post-image arg-extreme (`last`) ranks image-bearing rows *and* every
+    // `delete`, and an image-less delete that is latest wins it with a NULL
+    // post-image instead of being skipped for an earlier write's (the old
+    // "latest row with any image" rule dropped such deletes under NEW-only
+    // capture). The old-image arg-extreme is unchanged: a delete carries no
+    // pre-state it could contribute there. `last` aggregates `(new_image,
+    // op)` pairs as one 2-D array so `new_image`, `vanished_images` and
+    // `ends_in_delete` share one ordered aggregate (identical aggregate
+    // calls are computed once) rather than sorting each group twice.
+    let last = "(array_agg(array[new_image, op] order by lsn desc, change_id desc) \
+                     filter (where (old_image is not null or new_image is not null \
+                                    or op = 'delete') \
+                               and op <> 'recompute'))";
     format!(
         "with fenced as ({window_sql}), \
          truncates as materialized ( \
@@ -403,19 +438,11 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
                    where t.src_table = f.src_table \
                      and (t.lsn, t.change_id) > (f.lsn, f.change_id) \
                ) \
-         ), \
-         group_keys as ( \
-             select src_table, key, \
-                    array_agg(distinct gk) filter (where gk is not null) as group_key \
-             from filtered, unnest(coalesce(group_key, array[]::text[])) as gk \
-             group by src_table, key \
          ) \
          select \
              filtered.src_table, \
              filtered.key, \
-             (array_agg(new_image order by lsn desc, change_id desc) \
-                 filter (where (old_image is not null or new_image is not null) \
-                           and op <> 'recompute'))[1] as new_image, \
+             {last}[1][1] as new_image, \
              (array_agg(old_image order by lsn asc, change_id asc) \
                  filter (where (old_image is not null or new_image is not null) \
                            and op <> 'recompute'))[1] as old_image, \
@@ -425,7 +452,10 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
              max(lsn) as lsn, \
              case when bool_or(src_changed is not null) then 0 else max(hop_gen) end as hop_gen, \
              min(appended_at) as first_seen, \
-             group_keys.group_key, \
+             (select array_agg(distinct gk.v #>> '{{}}') \
+                from jsonb_path_query( \
+                         jsonb_agg(group_key) filter (where group_key is not null), \
+                         '$[*][*] ? (@ != null)') as gk(v)) as group_key, \
              bool_or(op = 'truncate') as is_truncate, \
              max(relationship_id) filter (where op = 'rel_reverse_deferred') \
                  as relationship_reverse_deferred, \
@@ -437,9 +467,7 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
                                 and op <> 'recompute') as min_image_lsn, \
              count(*) as row_count, \
              bool_or(op = 'recompute') as has_recompute, \
-             case when (array_agg(new_image order by lsn desc, change_id desc) \
-                           filter (where (old_image is not null or new_image is not null) \
-                                     and op <> 'recompute'))[1] is null \
+             case when {last}[1][1] is null \
                    and (array_agg(old_image order by lsn asc, change_id asc) \
                            filter (where (old_image is not null or new_image is not null) \
                                      and op <> 'recompute'))[1] is null \
@@ -450,11 +478,10 @@ fn fold_sql(window_sql: &str, fence_param_count: usize) -> String {
                        max(old_image collate \"C\") \
                            filter (where new_image is null and old_image is not null \
                                      and op <> 'recompute')], null) \
-             end as vanished_images \
+             end as vanished_images, \
+             coalesce({last}[1][2] = 'delete', false) as ends_in_delete \
          from filtered \
-         left join group_keys \
-             on group_keys.src_table = filtered.src_table and group_keys.key = filtered.key \
-         group by filtered.src_table, filtered.key, group_keys.group_key"
+         group by src_table, key"
     )
 }
 
@@ -638,6 +665,9 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         // with neither set contributed no image information at all (a bare
         // recompute trigger folded alone), so it defers entirely to the
         // other side rather than overwriting real evidence with `None`.
+        // An image-less delete (issue #620) speaks to the post-image
+        // without carrying one, so it wins that half too: `later` then
+        // folds to `new_image = None`, the key's final state.
         let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
         let later_has_image = later.old_image.is_some() || later.new_image.is_some();
         (
@@ -646,13 +676,23 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
             } else {
                 later.old_image.clone()
             },
-            if later_has_image {
+            if later_has_image || later.ends_in_delete {
                 later.new_image.clone()
             } else {
                 earlier.new_image.clone()
             },
         )
     };
+    // Whichever side supplied `new_image` also says whether it ended in a
+    // delete. The `relationship_reverse_deferred` branch above never sees a
+    // delete (its rows are `rel_reverse_deferred`), so segment order is
+    // right for this flag there too.
+    let ends_in_delete =
+        if later.old_image.is_some() || later.new_image.is_some() || later.ends_in_delete {
+            later.ends_in_delete
+        } else {
+            earlier.ends_in_delete
+        };
 
     // Issue #486: the same "born and died" loss can happen across segments.
     // An insert sealed into `earlier` and a delete into `later` each fold to
@@ -697,6 +737,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
         row_count: earlier.row_count + later.row_count,
         has_recompute: earlier.has_recompute || later.has_recompute,
         vanished_images,
+        ends_in_delete,
     }
 }
 
@@ -799,6 +840,7 @@ mod merge_tests {
             row_count: 1,
             has_recompute: false,
             vanished_images: Vec::new(),
+            ends_in_delete: false,
         }
     }
 
@@ -863,6 +905,54 @@ mod merge_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].new_image, Some(r#"{"v":2}"#.to_string()));
         assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
+    }
+
+    /// Issue #620: a later segment whose only row for the key is an
+    /// image-less delete folds to a record with no image, like a bare
+    /// recompute, but it is the key's final state. The merge must end the
+    /// key rather than defer to the earlier segment's post-image, and a
+    /// segment after that with no image of its own must not revive it.
+    #[test]
+    fn an_image_less_delete_in_a_later_segment_ends_the_key() {
+        let mut first = base("1");
+        first.old_image = Some(r#"{"v":1}"#.to_string());
+        first.new_image = Some(r#"{"v":2}"#.to_string());
+
+        let mut second = base("1");
+        second.ends_in_delete = true;
+
+        let third = base("1"); // a bare recompute trigger
+
+        let merged = merge_folded_changes(vec![vec![first], vec![second], vec![third]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
+        assert_eq!(merged[0].new_image, None);
+        assert!(merged[0].ends_in_delete);
+        assert!(merged[0].vanished_images.is_empty());
+    }
+
+    /// The same delete followed by a segment that re-inserts the key: the
+    /// re-insert's post-image wins and the key no longer ends deleted. A key
+    /// born in the first segment and deleted image-less in the second keeps
+    /// the image of the group it was born into (#486).
+    #[test]
+    fn an_image_less_delete_is_superseded_by_a_later_write_and_keeps_a_born_keys_image() {
+        let mut deleted = base("1");
+        deleted.ends_in_delete = true;
+        let mut reinserted = base("1");
+        reinserted.new_image = Some(r#"{"v":3}"#.to_string());
+        let merged = merge_folded_changes(vec![vec![deleted], vec![reinserted]]);
+        assert_eq!(merged[0].new_image, Some(r#"{"v":3}"#.to_string()));
+        assert!(!merged[0].ends_in_delete);
+
+        let mut born = base("2");
+        born.new_image = Some(r#"{"v":4}"#.to_string());
+        let mut died = base("2");
+        died.ends_in_delete = true;
+        let merged = merge_folded_changes(vec![vec![born], vec![died]]);
+        assert_eq!((&merged[0].old_image, &merged[0].new_image), (&None, &None));
+        assert!(merged[0].ends_in_delete);
+        assert_eq!(merged[0].vanished_images, vec![r#"{"v":4}"#.to_string()]);
     }
 
     /// A genuine delete (`new_image: None`, `old_image: Some(..)`) in a
@@ -1314,5 +1404,123 @@ mod plan_tests {
                 );
             }
         }
+    }
+
+    /// Issue #581: a ring slot refilled after reclaim still carries
+    /// statistics that describe it empty, so the planner estimates the
+    /// fenced window at one row whatever it holds. The fold used to join a
+    /// separate `group_keys` aggregate back to `filtered` on `(src_table,
+    /// key)`, and with that estimate it planned the join as an unparameterized
+    /// nested loop: 50,000 × 50,000 join-filter evaluations on a real batch,
+    /// holding the claim lock for minutes.
+    ///
+    /// Asserts on the plan shape rather than timing: whatever the statistics
+    /// say, the fold must contain no join over the keys. The one nested loop
+    /// it may plan is the truncate-void anti-join, whose inner side is the
+    /// materialized handful of truncate rows (#492).
+    #[tokio::test]
+    async fn a_refilled_slot_with_stale_statistics_plans_no_nested_loop_over_keys() {
+        const ROWS: i64 = 2_000;
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
+            .await
+            .expect("set search_path");
+
+        // Both slots the fenced window reads (the sealed slot and the next
+        // one) get statistics taken while they held pages but no live rows:
+        // `reltuples = 0` over `relpages > 0`, so the planner's row density
+        // is zero and every scan estimates one row however many pages the
+        // refill adds. That is the state a slot is in when it refills before
+        // anything re-analyzes it.
+        for slot in ["seg_0", "seg_1"] {
+            client
+                .batch_execute(&format!(
+                    "insert into {slot} (src_table, key, op, lsn, src_changed, hop_gen) \
+                     select 'orders', 'old' || g, 'update', '0/1'::pg_lsn, now(), 0 \
+                     from generate_series(1, 1000) g; \
+                     delete from {slot}; \
+                     analyze {slot};"
+                ))
+                .await
+                .expect("leave empty-table statistics on the slot");
+        }
+
+        // The refill: `ROWS` keys, each with two staged rows and a
+        // relationship join key, so the group-key union has real work to do.
+        client
+            .batch_execute(&format!(
+                "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, \
+                                    origin_lsn, src_changed, hop_gen, group_key) \
+                 select 'orders', 'k' || (g % {ROWS}), 'update', \
+                        ('0/' || to_hex(g + 1))::pg_lsn, \
+                        jsonb_build_object('v', g), jsonb_build_object('v', g + 1), \
+                        ('0/' || to_hex(g + 1))::pg_lsn, now(), 0, \
+                        array['p' || (g % 7), 'p' || (g % 5)] \
+                 from generate_series(0, {ROWS} * 2 - 1) g"
+            ))
+            .await
+            .expect("refill the slot");
+
+        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(FOLD_WORK_MEM).await.expect("work_mem");
+        let (window_sql, fence_params) = fenced_window(&txn, outcome.sealed_seg_seq, FOLD_COLUMNS)
+            .await
+            .expect("fenced window");
+        let sql = fold_sql(&window_sql, fence_params.len());
+        let bucket = BucketFilter::all();
+        let mut params: Vec<&(dyn ToSql + Sync)> = fence_params
+            .iter()
+            .map(|p| p as &(dyn ToSql + Sync))
+            .collect();
+        params.push(&bucket.bucket_count);
+        params.push(&bucket.buckets);
+
+        let plan = txn
+            .query(&format!("explain {sql}"), &params)
+            .await
+            .expect("explain the fold")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The precondition: the statistics really are stale, so the planner
+        // really does think the window is (nearly) empty.
+        assert!(
+            plan.lines()
+                .any(|line| line.contains("Seq Scan on seg_0") && line.contains("rows=1 ")),
+            "expected the refilled slot to be estimated at one row:\n{plan}"
+        );
+        for line in plan.lines() {
+            assert!(
+                !line.contains("Nested Loop") || line.contains("Nested Loop Anti Join"),
+                "the fold must plan no nested-loop join other than the truncate-void \
+                 anti-join:\n{plan}"
+            );
+            let join_condition = ["Join Filter", "Hash Cond", "Merge Cond"]
+                .iter()
+                .any(|c| line.contains(c));
+            assert!(
+                !(join_condition && line.contains(".key =")),
+                "the fold must not join the batch back to itself on its keys:\n{plan}"
+            );
+        }
+
+        // And the statement still runs and folds every key.
+        let folded = txn.query(&sql, &params).await.expect("run the fold");
+        assert_eq!(folded.len(), ROWS as usize);
     }
 }

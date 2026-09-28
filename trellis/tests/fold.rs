@@ -337,7 +337,7 @@ async fn group_key_folds_to_the_real_union_of_every_raw_rows_touched_values() {
     // erasure this issue fixes: "3" (and, transiently, "2") are invisible
     // in new_image/old_image but must still survive via group_key.
     assert_eq!(record.new_image, Some(r#"{"post": "5"}"#.to_string()));
-    // Issue #409: joining `group_keys` back in must not multiply the group's
+    // Issue #409: unioning the join values must not multiply the group's
     // rows — one per staged row, however many join values each carried.
     assert_eq!(record.row_count, 4);
 }
@@ -1165,4 +1165,148 @@ async fn a_key_born_and_died_in_the_batch_keeps_the_images_that_name_its_groups(
             "{key} must carry no vanished images"
         );
     }
+}
+
+/// Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is the
+/// key's final state within a fold window, whatever precedes it. Under
+/// NEW-only capture a delete carries no image, and the old "latest row with
+/// any image" rule skipped it for the earlier write's post-image, so the
+/// fold reported a live row for a key its source had deleted (#617 step 4:
+/// 11–12 groups wrong at 1M).
+#[tokio::test]
+async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let row =
+        |key: &'static str, op: &'static str, lsn: u64, old: Option<&'static str>, new| RawRow {
+            key,
+            op,
+            lsn: Some(lsn),
+            old_image: old,
+            new_image: new,
+            origin_lsn: Some(lsn),
+            src_changed: true,
+            hop_gen: 0,
+            group_key: None,
+        };
+    // Updated, then deleted with no image: the delete wins the post-image.
+    insert_row(
+        &client,
+        "seg_0",
+        &row(
+            "updated-then-deleted",
+            "update",
+            10,
+            Some(r#"{"v":1}"#),
+            Some(r#"{"v":2}"#),
+        ),
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &row("updated-then-deleted", "delete", 20, None, None),
+    )
+    .await;
+    // A later recompute is image-less and never speaks to the post-image,
+    // so it doesn't undo the delete.
+    insert_row(
+        &client,
+        "seg_0",
+        &row(
+            "deleted-then-recomputed",
+            "update",
+            10,
+            None,
+            Some(r#"{"v":3}"#),
+        ),
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &row("deleted-then-recomputed", "delete", 20, None, None),
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &RawRow::recompute("deleted-then-recomputed", 0),
+    )
+    .await;
+    // Born and died in the window: no image survives, but the insert's
+    // post-image still names the group it was born into (#486).
+    insert_row(
+        &client,
+        "seg_0",
+        &row("born-then-deleted", "insert", 10, None, Some(r#"{"v":4}"#)),
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &row("born-then-deleted", "delete", 20, None, None),
+    )
+    .await;
+    // Deleted, then re-inserted: the delete is not the final state.
+    insert_row(
+        &client,
+        "seg_0",
+        &row("deleted-then-reinserted", "delete", 10, None, None),
+    )
+    .await;
+    insert_row(
+        &client,
+        "seg_0",
+        &row(
+            "deleted-then-reinserted",
+            "insert",
+            20,
+            None,
+            Some(r#"{"v":5}"#),
+        ),
+    )
+    .await;
+    // Only an image-less delete.
+    insert_row(
+        &client,
+        "seg_0",
+        &row("only-deleted", "delete", 10, None, None),
+    )
+    .await;
+
+    let seg_seq = seal_active_segment(&mut client).await;
+    let txn = client.transaction().await.expect("begin fold txn");
+    let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
+        .await
+        .expect("fold");
+
+    let updated = find(&folded, "updated-then-deleted");
+    assert_eq!(updated.old_image, Some(r#"{"v": 1}"#.to_string()));
+    assert_eq!(
+        updated.new_image, None,
+        "the image-less delete must win the post-image: {updated:?}"
+    );
+    assert!(updated.ends_in_delete);
+    assert_eq!(updated.lsn, Some(PgLsn::from(20)));
+
+    let recomputed = find(&folded, "deleted-then-recomputed");
+    assert_eq!(recomputed.new_image, None, "{recomputed:?}");
+    assert!(recomputed.ends_in_delete);
+    assert!(recomputed.has_recompute);
+
+    let born = find(&folded, "born-then-deleted");
+    assert_eq!((&born.old_image, &born.new_image), (&None, &None));
+    assert!(born.ends_in_delete);
+    assert_eq!(born.vanished_images, vec![r#"{"v": 4}"#.to_string()]);
+
+    let reinserted = find(&folded, "deleted-then-reinserted");
+    assert_eq!(reinserted.new_image, Some(r#"{"v": 5}"#.to_string()));
+    assert!(!reinserted.ends_in_delete);
+
+    let only = find(&folded, "only-deleted");
+    assert_eq!((&only.old_image, &only.new_image), (&None, &None));
+    assert!(only.ends_in_delete);
 }
