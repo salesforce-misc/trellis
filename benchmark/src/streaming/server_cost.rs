@@ -8,9 +8,12 @@
 //!   cluster's process tree, read from `/proc`: the postmaster, every live
 //!   child (backends, walsenders, autovacuum, checkpointer, ...), and, through
 //!   the postmaster's `cutime`/`cstime`, every child it reaped in the window.
-//!   That includes the load generator's own backends, which cost the same per
-//!   row before and after an engine change, so a before/after delta is the
-//!   engine's. Resolution is one clock tick (10 ms) per process.
+//!   That includes the load generator's own backends. They cost the same
+//!   per row before and after a change to the drain, so a before/after delta
+//!   across one is the drain's. Not across a change to capture: trigger
+//!   capture (#622 C5 on) runs inside the generator's backends, and D8's
+//!   NEW-only images change what it costs there. Resolution is one clock
+//!   tick (10 ms) per process.
 //! - **`deadlock detected` lines** in the cluster's `postgres.log` written
 //!   during the window ([`PgLogCursor`]). `pg_stat_database.deadlocks`
 //!   (the scenarios' `deadlocks` key) counts the same events; this is the

@@ -55,7 +55,12 @@
 //!   the last sample the transaction was still open minus the earliest
 //!   `query_start` of such a statement seen in it: from the first observed
 //!   statement that locks target rows to the transaction's last observed
-//!   instant, the span its row locks were held.
+//!   instant, the span its row locks were held. **It includes that first
+//!   statement's own lock wait**: a sorted pre-lock queued behind another
+//!   page already holds the rows it locked before the one it waits on, so
+//!   under contention a hold is part wait. Read it next to the wait columns,
+//!   not as pure hold time. A statement that writes the target outside a
+//!   drain page (build-under-load's backfill chunks) counts as a page too.
 //!
 //! Both ends that come from sampling are up to one [`SAMPLE_INTERVAL`] early,
 //! so an episode reads short by up to 50 ms, and an episode that begins and

@@ -763,7 +763,7 @@ async fn nested_same_key_one_to_one() {
 ///   reads. Neither read sees it, so both of its changes must apply.
 /// - W_between commits between the two reads: it updates key 1 (chunk 1,
 ///   already read: must apply) and key 4 (chunk 2, not yet read: chunk 2's
-///   read sees it, so it must not apply again), and moves key 6 (chunk 2)
+///   read sees it, so it must not count twice), and moves key 6 (chunk 2)
 ///   from group 2 to group 1.
 ///
 /// Chunk 2's worker is frozen after its read while W_in commits and both
@@ -773,6 +773,29 @@ async fn nested_same_key_one_to_one() {
 ///
 /// Both chunks are sealed before W_in writes, because a writer may straddle
 /// only one seal (the seal gate).
+///
+/// On `main` it passes because the aggregate re-derives whole groups live and
+/// the horizon re-derives every later change (`ignore_recompute_horizon`
+/// fails it), not because of a per-chunk basis. Under the ledger (D3, D6) it
+/// fails if a Re-derive marks as seen a change it didn't see:
+///
+/// - `applied_lsn` advanced to the read's position drops both of W_in's
+///   changes, because their trigger `lsn`s precede both reads;
+/// - a basis taken in a statement after the `AfterRederiveRead` hook sees
+///   W_in committed and drops its key-5 change.
+///
+/// It can't see two other mistakes:
+///
+/// - re-applying a change the read already saw (keys 4 and 6): a ledger
+///   Apply sets the entry to its image, so the same image twice moves
+///   nothing;
+/// - a basis taken in a separate statement between the read and the hook,
+///   since nothing commits there.
+///
+/// So D3 keeps the hook directly after its one read-and-snapshot statement,
+/// and adds assertions on the stored entries: W_between visible in chunk 2's
+/// basis and not in chunk 1's, W_in visible in neither, and key 3 (only ever
+/// re-derived) with its `applied_lsn` unchanged by either Re-derive.
 async fn chunked_read_exact_point(flavour: Flavour) {
     let mut d = start(
         flavour,
