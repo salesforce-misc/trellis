@@ -297,6 +297,62 @@ async fn release_is_scoped_to_claimed_by_and_leaves_other_workers_claims_alone()
     assert_eq!(claimed_buckets(&client, seg_seq, "worker-b").await, won_b);
 }
 
+/// Issue #660: the worker loop's release after a failed drain covers every
+/// segment of the batch in one statement and names the `(seg_seq, bucket)`
+/// claims it freed, so the drain-failure log can report them. Scoped to the
+/// claimant exactly like [`liveness::release`].
+#[tokio::test]
+async fn release_segments_frees_and_reports_only_the_claimants_buckets() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let first = seal_one_bucket_batch(&mut client, "k1").await;
+    let second = seal_one_bucket_batch(&mut client, "k2").await;
+    client
+        .execute(
+            "update segments set bucket_count = 8 where seg_seq = any($1)",
+            &[&vec![first, second]],
+        )
+        .await
+        .expect("widen bucket_count so both workers can hold a bucket");
+
+    let mut expected = Vec::new();
+    for seg_seq in [first, second] {
+        let mut won = claim::claim(&client, seg_seq, "worker-a", 2)
+            .await
+            .expect("worker a claim");
+        assert!(!won.is_empty());
+        won.sort_unstable();
+        expected.extend(won.into_iter().map(|bucket| (seg_seq, bucket)));
+    }
+    let won_b = claim::claim(&client, first, "worker-b", 2)
+        .await
+        .expect("worker b claim");
+    assert!(!won_b.is_empty());
+
+    let released = liveness::release_segments(&client, &[first, second], "worker-a")
+        .await
+        .expect("release worker-a");
+    assert_eq!(released, expected, "exactly worker-a's claims, in order");
+    assert!(claimed_buckets(&client, first, "worker-a").await.is_empty());
+    assert!(
+        claimed_buckets(&client, second, "worker-a")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        claimed_buckets(&client, first, "worker-b").await.len(),
+        won_b.len(),
+        "worker-b's claim must be untouched"
+    );
+
+    let released_again = liveness::release_segments(&client, &[first, second], "worker-a")
+        .await
+        .expect("release worker-a again");
+    assert!(released_again.is_empty());
+}
+
 #[tokio::test]
 async fn daemon_opens_no_connection_for_a_claim_that_never_lasts_a_full_interval() {
     let cluster = TestCluster::start();

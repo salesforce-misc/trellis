@@ -1318,6 +1318,111 @@ impl StepFailures {
     }
 }
 
+/// How often [`DrainFailures`] repeats the `warn` for a drain error that
+/// keeps recurring. The occurrences in between log at `debug`.
+const DRAIN_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Issue #660: reports [`app_worker_loop`]'s failed drain calls, which it
+/// used to release and retry without a word. A drain error is worth a
+/// `warn`, but a wedged segment fails the same way on every tick (the
+/// 200ms poll floor by default), and a drain that can't get a connection
+/// fails on every tick too. So each distinct error, by its text, warns the
+/// first time and then at most once per [`DRAIN_FAILURE_WARN_INTERVAL`]
+/// while it keeps recurring, saying how many repeats it collapsed. The
+/// repeats in between log at `debug` with the same fields.
+///
+/// An error that hasn't recurred for a whole interval is forgotten, which
+/// keeps this bounded: its next occurrence warns as a new one would.
+#[derive(Default)]
+struct DrainFailures {
+    /// Each error seen within the last interval, by its display text.
+    recent: std::collections::HashMap<String, RecentDrainFailure>,
+}
+
+struct RecentDrainFailure {
+    /// Occurrences since the last `warn`, each logged at `debug`.
+    collapsed: u64,
+    last_warned: Instant,
+    last_seen: Instant,
+}
+
+impl DrainFailures {
+    /// Logs a drain of `seg_seqs` by `claimant` that failed with `error`,
+    /// after which the worker released the `released` `(seg_seq, bucket)`
+    /// claims.
+    fn failed(
+        &mut self,
+        error: &ApplyError,
+        seg_seqs: &[i64],
+        released: &[(i64, i16)],
+        claimant: &str,
+        now: Instant,
+    ) {
+        self.recent
+            .retain(|_, seen| now.duration_since(seen.last_seen) < DRAIN_FAILURE_WARN_INTERVAL);
+        let class = staging::quarantine::classify(error);
+        let buckets = released_buckets(released);
+        let (recent, first) = match self.recent.entry(error.to_string()) {
+            std::collections::hash_map::Entry::Occupied(seen) => (seen.into_mut(), false),
+            std::collections::hash_map::Entry::Vacant(new) => (
+                new.insert(RecentDrainFailure {
+                    collapsed: 0,
+                    last_warned: now,
+                    last_seen: now,
+                }),
+                true,
+            ),
+        };
+        recent.last_seen = now;
+        if first || now.duration_since(recent.last_warned) >= DRAIN_FAILURE_WARN_INTERVAL {
+            tracing::warn!(
+                error = %error,
+                class = ?class,
+                segments = ?seg_seqs,
+                buckets = %buckets,
+                claimant,
+                collapsed = recent.collapsed,
+                "drain failed; released its claims to retry"
+            );
+            recent.collapsed = 0;
+            recent.last_warned = now;
+        } else {
+            recent.collapsed += 1;
+            tracing::debug!(
+                error = %error,
+                class = ?class,
+                segments = ?seg_seqs,
+                buckets = %buckets,
+                claimant,
+                collapsed = recent.collapsed,
+                "drain failed again"
+            );
+        }
+    }
+}
+
+/// `(seg_seq, bucket)` claims, sorted by segment, as `5:[0,1] 6:[3]`, or
+/// `none` when the drain held no claim by the time it was released.
+fn released_buckets(released: &[(i64, i16)]) -> String {
+    if released.is_empty() {
+        return "none".to_string();
+    }
+    let mut out = String::new();
+    for (i, &(seg_seq, bucket)) in released.iter().enumerate() {
+        if i == 0 || released[i - 1].0 != seg_seq {
+            if i > 0 {
+                out.push_str("] ");
+            }
+            out.push_str(&format!("{seg_seq}:["));
+        } else {
+            out.push(',');
+        }
+        out.push_str(&bucket.to_string());
+    }
+    out.push(']');
+    out
+}
+
 /// Failure modes [`reconcile_source_tables`] composes, purely so its `?`
 /// call sites don't have to hand-unwrap two unrelated error enums
 /// ([`CatalogError`] from the desired-table-set query, [`IntakeError`] from
@@ -1504,9 +1609,10 @@ struct AppWorkerConfig {
 /// On a non-retryable error from [`staging::drain_once`] (anything
 /// `drain_once` itself gave up retrying — a fence miss and a serialization
 /// failure are already retried internally up to its own attempt cap), this
-/// releases the claim immediately (see [`staging::release`]) rather than
-/// leaving it to the reclaim TTL, then deregisters the heartbeat and
-/// continues: one bad batch never crashes the worker. A backfill chunk that
+/// releases the claim immediately (see [`staging::release_segments`]) rather
+/// than leaving it to the reclaim TTL, logs the error (see [`DrainFailures`]),
+/// then deregisters the heartbeat and continues: one bad batch never crashes
+/// the worker. A backfill chunk that
 /// fails to execute is released the same way (see [`drain_backfill_chunks`]),
 /// left for the reclaim-stale sweep or a retry by whichever worker claims it
 /// next.
@@ -1543,6 +1649,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     // `last_seen` must keep advancing on this same cadence for the whole
     // life of the worker, not just once at startup.
     let mut next_worker_heartbeat = Instant::now();
+    let mut drain_failures = DrainFailures::default();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1654,18 +1761,21 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             drain_batch_cap,
         )
         .await;
-        let drain_failed = outcome.is_err();
-        if drain_failed {
+        if let Err(error) = &outcome {
             // Release immediately rather than waiting on the reclaim TTL:
             // `drain_many` has already exhausted its own internal retries
             // by the time it returns an error, so nothing about waiting
             // longer helps, and every tick this worker holds a claim
             // un-refreshed is a tick some other worker can't pick it up.
-            if let Ok(client) = pool.get().await {
-                for &seg_seq in &seg_seqs {
-                    let _ = staging::release(&**client, seg_seq, &claimed_by).await;
-                }
-            }
+            // The release reports the buckets it freed, so the log line
+            // (issue #660) can name them.
+            let released = match pool.get().await {
+                Ok(client) => staging::release_segments(&**client, &seg_seqs, &claimed_by)
+                    .await
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            drain_failures.failed(error, &seg_seqs, &released, &claimed_by, Instant::now());
         }
 
         for &seg_seq in &seg_seqs {
@@ -2738,6 +2848,177 @@ mod maintenance_failure_tests {
             shutdown_tx.send(true).expect("signal shutdown");
         };
         tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
+    }
+}
+
+#[cfg(test)]
+mod drain_failure_tests {
+    //! Issue #660: [`app_worker_loop`] used to release and retry a failed
+    //! drain without logging it.
+
+    use super::intake_supervisor_tests::{CapturedEvent, install_capture};
+    use super::*;
+
+    fn field<'a>(event: &'a CapturedEvent, name: &str) -> &'a str {
+        event
+            .fields
+            .get(name)
+            .map(|v| v.trim_matches('"'))
+            .unwrap_or_else(|| panic!("no `{name}` field on {event:?}"))
+    }
+
+    fn summary(events: &[CapturedEvent]) -> Vec<(tracing::Level, String, String)> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e.level,
+                    field(e, "error").to_string(),
+                    field(e, "collapsed").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn claim_lost() -> ApplyError {
+        ApplyError::ClaimLost
+    }
+
+    fn hop_bound() -> ApplyError {
+        ApplyError::HopBoundExceeded {
+            hop_gen: 9,
+            tables: vec!["public.a".to_string()],
+        }
+    }
+
+    /// The first failure warns once, carrying the error, its quarantine
+    /// class, the segments, the released buckets and the claimant.
+    #[test]
+    fn a_failed_drain_warns_once_with_its_context() {
+        let (_guard, captured) = install_capture();
+        let mut failures = DrainFailures::default();
+
+        failures.failed(
+            &claim_lost(),
+            &[5, 6],
+            &[(5, 0), (5, 3), (6, 1)],
+            "worker-a",
+            Instant::now(),
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            field(event, "message"),
+            "drain failed; released its claims to retry"
+        );
+        assert_eq!(field(event, "error"), claim_lost().to_string());
+        assert_eq!(
+            field(event, "class"),
+            format!("{:?}", staging::quarantine::classify(&claim_lost()))
+        );
+        assert_eq!(field(event, "class"), "Isolate");
+        assert_eq!(field(event, "segments"), "[5, 6]");
+        assert_eq!(field(event, "buckets"), "5:[0,3] 6:[1]");
+        assert_eq!(field(event, "claimant"), "worker-a");
+        assert_eq!(field(event, "collapsed"), "0");
+    }
+
+    /// Repeats of one error inside the interval log at `debug`; the next
+    /// `warn` for it, an interval on, reports how many it collapsed. A
+    /// different error still warns straight away, with its own class.
+    #[test]
+    fn repeats_of_the_same_error_collapse_to_one_warn_per_interval() {
+        let (_guard, captured) = install_capture();
+        let mut failures = DrainFailures::default();
+        let start = Instant::now();
+        let lost = claim_lost().to_string();
+        let hop = hop_bound().to_string();
+
+        for tick in 0..4 {
+            let now = start + Duration::from_millis(200 * tick);
+            failures.failed(&claim_lost(), &[5], &[(5, 0)], "worker-a", now);
+        }
+        failures.failed(
+            &hop_bound(),
+            &[5],
+            &[(5, 0)],
+            "worker-a",
+            start + Duration::from_secs(1),
+        );
+        failures.failed(
+            &claim_lost(),
+            &[5],
+            &[(5, 0)],
+            "worker-a",
+            start + DRAIN_FAILURE_WARN_INTERVAL,
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            summary(&events),
+            vec![
+                (tracing::Level::WARN, lost.clone(), "0".to_string()),
+                (tracing::Level::DEBUG, lost.clone(), "1".to_string()),
+                (tracing::Level::DEBUG, lost.clone(), "2".to_string()),
+                (tracing::Level::DEBUG, lost.clone(), "3".to_string()),
+                (tracing::Level::WARN, hop, "0".to_string()),
+                (tracing::Level::WARN, lost, "3".to_string()),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(field(&events[4], "class"), "Halting");
+    }
+
+    /// An error that hasn't recurred for a whole interval is forgotten, so
+    /// the map stays bounded; its next occurrence warns as a new one.
+    #[test]
+    fn an_error_that_stopped_recurring_is_forgotten() {
+        let (_guard, captured) = install_capture();
+        let mut failures = DrainFailures::default();
+        let start = Instant::now();
+
+        failures.failed(&claim_lost(), &[5], &[], "worker-a", start);
+        failures.failed(
+            &claim_lost(),
+            &[5],
+            &[],
+            "worker-a",
+            start + Duration::from_secs(1),
+        );
+        let later = start + Duration::from_secs(1) + DRAIN_FAILURE_WARN_INTERVAL;
+        failures.failed(&hop_bound(), &[7], &[], "worker-a", later);
+        assert_eq!(failures.recent.len(), 1, "the stale entry was pruned");
+        failures.failed(&claim_lost(), &[5], &[], "worker-a", later);
+
+        let events = captured.0.lock().unwrap().clone();
+        let levels: Vec<_> = summary(&events)
+            .into_iter()
+            .map(|(level, _, collapsed)| (level, collapsed))
+            .collect();
+        assert_eq!(
+            levels,
+            vec![
+                (tracing::Level::WARN, "0".to_string()),
+                (tracing::Level::DEBUG, "1".to_string()),
+                (tracing::Level::WARN, "0".to_string()),
+                (tracing::Level::WARN, "0".to_string()),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(field(&events[0], "buckets"), "none");
+    }
+
+    #[test]
+    fn released_buckets_group_by_segment() {
+        assert_eq!(released_buckets(&[]), "none");
+        assert_eq!(released_buckets(&[(3, 7)]), "3:[7]");
+        assert_eq!(
+            released_buckets(&[(3, 0), (3, 1), (4, 2), (9, 0), (9, 5)]),
+            "3:[0,1] 4:[2] 9:[0,5]"
+        );
     }
 }
 

@@ -86,7 +86,7 @@ pub use apply::{
 pub use claim::{DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, register_drainer};
 pub use error::StagingError;
 pub use liveness::{
-    DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release,
+    DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,
 };
 pub use retire::retire_drained_segments;
 pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};

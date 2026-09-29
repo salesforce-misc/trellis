@@ -64,6 +64,30 @@ pub async fn release(
     Ok(n)
 }
 
+/// [`release`] across every segment in `seg_seqs` in one statement, handing
+/// back the `(seg_seq, bucket)` claims it deleted, ordered. The worker loop
+/// releases this way after a failed drain so its log line can name the
+/// buckets it held when the drain failed (issue #660), which only the drain
+/// itself knew until now.
+pub async fn release_segments(
+    client: &impl GenericClient,
+    seg_seqs: &[i64],
+    claimed_by: &str,
+) -> Result<Vec<(i64, i16)>, StagingError> {
+    let rows = client
+        .query(
+            "with released as ( \
+                 delete from seg_claims \
+                 where seg_seq = any($1) and claimed_by = $2 \
+                 returning seg_seq, bucket \
+             ) \
+             select seg_seq, bucket from released order by seg_seq, bucket",
+            &[&seg_seqs, &claimed_by],
+        )
+        .await?;
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+}
+
 // ---------------------------------------------------------------------
 // Reclaim on TTL
 // ---------------------------------------------------------------------
