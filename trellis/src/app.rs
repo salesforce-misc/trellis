@@ -1087,8 +1087,9 @@ impl Trellis {
     /// every source and runs the maintenance loop that seals what capture
     /// stages and dispatches every new transform's backfill. A fleet with
     /// drain workers but no staging worker passes
-    /// [`Trellis::has_live_drain_workers`] while no new source is captured
-    /// and every new transform sits in [`TransformStatus::WaitingToBackfill`]
+    /// [`Trellis::has_live_drain_workers`] while nothing seals what capture
+    /// stages, so no captured write drains, no new source is captured, and
+    /// every new transform sits in [`TransformStatus::WaitingToBackfill`]
     /// forever. `false` here is that misconfiguration. A healthy fleet
     /// needs both checks to be `true`.
     ///
