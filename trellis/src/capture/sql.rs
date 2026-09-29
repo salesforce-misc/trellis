@@ -236,20 +236,42 @@ pub fn trigger_name(schema: &str, event: CaptureEvent) -> String {
 }
 
 /// Every statement that installs `spec`'s capture in instance schema
-/// `schema`, in order: per event, the function, its comment, the trigger and
-/// `ENABLE ALWAYS` (which keeps capture on for a session in
-/// `session_replication_role = replica`).
+/// `schema`, in order: per event, the function, the revoke of `PUBLIC`'s
+/// `EXECUTE` ([`revoke_ddl`]), its comment, the trigger and `ENABLE ALWAYS`
+/// (which keeps capture on for a session in `session_replication_role =
+/// replica`).
 ///
 /// C3 runs these in one retried transaction under `locks::DdlRetry`, with the
 /// join marker. `CREATE OR REPLACE TRIGGER` needs PostgreSQL 14.
 pub fn install_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String>, CaptureError> {
-    let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 4);
+    let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 5);
     for event in CaptureEvent::ALL {
         statements.push(function_ddl(schema, spec, event)?);
+        statements.push(revoke_ddl(schema, spec, event)?);
         statements.push(comment_ddl(schema, spec, event)?);
         statements.extend(trigger_ddl(schema, spec, event)?);
     }
     Ok(statements)
+}
+
+/// `REVOKE ALL ON FUNCTION … FROM PUBLIC` for `spec`'s `event` capture
+/// function.
+///
+/// A new function is executable by `PUBLIC`. For a `SECURITY DEFINER`
+/// capture function that would let any role with `USAGE` on the instance
+/// schema attach it to a table of its own with `CREATE TRIGGER` and forge
+/// ring rows for the captured table. A trigger fires without an `EXECUTE`
+/// check on the writer, so revoking it costs the application nothing; only
+/// `CREATE TRIGGER` checks it, and the owner keeps it.
+pub fn revoke_ddl(
+    schema: &str,
+    spec: &CaptureSpec,
+    event: CaptureEvent,
+) -> Result<String, CaptureError> {
+    Ok(format!(
+        "revoke all on function {}() from public",
+        qualified_function(schema, spec, event)?
+    ))
 }
 
 /// `CREATE OR REPLACE FUNCTION` for `spec`'s `event` capture function in
@@ -340,15 +362,27 @@ fn qualified_function(
     ))
 }
 
-/// The PL/pgSQL body, from `declare` through `end;`.
+/// The PL/pgSQL body, from `#variable_conflict` through `end;`.
+///
+/// The insert and delete statements name the variables `l` and `ts`
+/// unqualified in a `SELECT … FROM` the transition table, which carries every
+/// column of the captured table. Under PL/pgSQL's default
+/// (`plpgsql.variable_conflict = error`), a captured table with a column named
+/// `l` or `ts` would make every write to it fail with "column reference is
+/// ambiguous", and under a server-wide `use_column` the ring would silently
+/// get that column's value as its `lsn`. `#variable_conflict use_variable`
+/// pins the resolution to the variables. Every column reference in the body
+/// is qualified by its alias, so nothing needs the other resolution.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let mirror = text_expr(&format!(
         "{}.{}",
         quote_ident(schema),
         quote_ident("ring_slot_mirror")
     ));
-    let mut body =
-        String::from("declare\n    slot smallint;\n    l pg_lsn;\n    ts timestamptz;\nbegin\n");
+    let mut body = String::from(
+        "#variable_conflict use_variable\n\
+         declare\n    slot smallint;\n    l pg_lsn;\n    ts timestamptz;\nbegin\n",
+    );
     match event {
         CaptureEvent::Insert | CaptureEvent::Update => body.push_str(&format!(
             "    if not exists (select 1 from {NEW_ROWS}) then\n        return null;\n    end if;\n"
@@ -469,9 +503,14 @@ fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
 
 /// One column's value as intake renders it: the output function's text, or
 /// `NULL`.
+///
+/// The null test is `num_nulls`, not `IS NULL`. On a composite value `IS
+/// NULL` is also true when every field is null, so `ROW(NULL, NULL)` would be
+/// imaged as `NULL` where `pgoutput` sends its text, `(,)`. `num_nulls` asks
+/// only whether the value itself is null, for every type.
 fn value_text(alias: &str, column: &str) -> String {
     let col = format!("{alias}.{}", quote_ident(column));
-    format!("case when {col} is null then null else format('%s', {col}) end")
+    format!("case when num_nulls({col}) = 1 then null else format('%s', {col}) end")
 }
 
 /// `alias`'s image: a JSON object of every image column's text.
@@ -725,6 +764,17 @@ mod tests {
     }
 
     #[test]
+    fn the_body_resolves_a_name_clash_with_a_column_to_the_variable() {
+        for event in CaptureEvent::ALL {
+            let sql = ddl(&spec(), event);
+            let directive = sql
+                .find("\n#variable_conflict use_variable\ndeclare\n")
+                .unwrap_or_else(|| panic!("no #variable_conflict directive in\n{sql}"));
+            assert!(directive < sql.find("begin\n").unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
     fn lsn_and_origin_lsn_are_the_insert_lsn_and_src_changed_is_clock_time() {
         let sql = ddl(&spec(), CaptureEvent::Insert);
         assert!(sql.contains("l := pg_current_wal_insert_lsn();"), "{sql}");
@@ -747,10 +797,14 @@ mod tests {
         let sql = ddl(&spec(), CaptureEvent::Insert);
         assert!(
             sql.contains(
-                "'amount', case when n.\"amount\" is null then null \
+                "'amount', case when num_nulls(n.\"amount\") = 1 then null \
                  else format('%s', n.\"amount\") end"
             ),
             "{sql}"
+        );
+        assert!(
+            !sql.contains(" is null then null"),
+            "`IS NULL` is true for a composite whose fields are all null:\n{sql}"
         );
         assert!(
             !sql.contains("::text,"),
@@ -803,7 +857,7 @@ mod tests {
     fn the_group_key_is_the_distinct_union_of_old_then_new() {
         let update = ddl(&spec(), CaptureEvent::Update);
         assert!(
-            update.contains(", array[case when o.\"customer_id\" is null"),
+            update.contains(", array[case when num_nulls(o.\"customer_id\") = 1"),
             "{update}"
         );
         assert!(
@@ -816,7 +870,7 @@ mod tests {
         );
         let insert = ddl(&spec(), CaptureEvent::Insert);
         assert!(
-            insert.contains("unnest(array[case when n.\"customer_id\" is null"),
+            insert.contains("unnest(array[case when num_nulls(n.\"customer_id\") = 1"),
             "{insert}"
         );
         let plain = ddl(&composite(), CaptureEvent::Update);
@@ -915,7 +969,28 @@ mod tests {
         assert!(delete[0].contains("referencing old table as trellis_old for each statement"));
         let truncate = trigger_ddl("trellis", &spec, CaptureEvent::Truncate).unwrap();
         assert!(truncate[0].contains("after truncate on \"public\".\"orders\" for each statement"));
-        assert_eq!(install_statements("trellis", &spec).unwrap().len(), 16);
+        assert_eq!(install_statements("trellis", &spec).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn public_cannot_execute_a_capture_function() {
+        let spec = spec();
+        let statements = install_statements("trellis", &spec).unwrap();
+        for event in CaptureEvent::ALL {
+            let function = format!(
+                "\"trellis\".\"{}\"()",
+                function_name("public.orders", event).unwrap()
+            );
+            let create = statements
+                .iter()
+                .position(|s| s.starts_with(&format!("create or replace function {function}")))
+                .unwrap_or_else(|| panic!("no create for {event:?}"));
+            assert_eq!(
+                statements[create + 1],
+                format!("revoke all on function {function} from public"),
+                "the revoke follows the create, in the same transaction"
+            );
+        }
     }
 
     #[test]

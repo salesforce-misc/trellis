@@ -6,7 +6,9 @@
 //! Alongside it: a primary-key move, a composite primary key declared out of
 //! physical order whose parts contain the separator bytes, control-character
 //! primary keys, truncate, two relationship `from_col`s feeding `group_key`,
-//! and a to-side table whose image the catalog narrows.
+//! and a to-side table whose image the catalog narrows. `public.ctl` also has
+//! unread columns named `l` and `ts`, the capture function's own variable
+//! names, which must not clash with them.
 //!
 //! Every write runs in an application session whose `DateStyle`, `TimeZone`,
 //! `bytea_output`, `IntervalStyle` and `extra_float_digits` all differ from
@@ -160,7 +162,13 @@ const FAMILIES: &[(&str, &str, &[&str])] = &[
     ("c_iarr", "integer[]", &["'{1,2,NULL}'", "'{}'"]),
     ("c_tarr", "text[]", &[r#"'{"a b","c,d","q\""}'"#]),
     ("c_range", "int4range", &["'[1,10)'", "'empty'"]),
-    ("c_comp", "public.pair", &["ROW(1, 'x y')::public.pair"]),
+    (
+        "c_comp",
+        "public.pair",
+        // `ROW(NULL, NULL)` is not a NULL value (`pgoutput` sends `(,)`),
+        // though `IS NULL` is true of it.
+        &["ROW(1, 'x y')::public.pair", "ROW(NULL, NULL)::public.pair"],
+    ),
     ("c_point", "point", &["'(1.5,2)'"]),
     ("c_money", "money", &["12.34"]),
     ("c_xml", "xml", &[r#"'<a b="1">t</a>'"#]),
@@ -293,7 +301,7 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
          create table public.fam (id integer primary key, fk2 integer, fk integer, {}); \
          create table public.comp (tag text, post integer, weight numeric, note text, \
                                    primary key (post, tag)); \
-         create table public.ctl (k text primary key, v text); \
+         create table public.ctl (k text primary key, v text, l integer, ts text); \
          alter table public.parent replica identity full; \
          alter table public.fam replica identity full; \
          alter table public.comp replica identity full; \
@@ -444,6 +452,23 @@ async fn trigger_capture_stages_what_intake_stages_under_a_foreign_session() {
         .expect("check schema privilege")
         .get(0);
     assert!(!usage, "the writer can't reach the ring on its own");
+    // Nor can it execute a capture function (so it can't attach one to a
+    // table of its own), yet its writes below still fire them.
+    let privileges = pipeline
+        .raw
+        .query_one(
+            "select count(*), \
+                    count(*) filter (where pg_catalog.has_function_privilege($2, p.oid, 'execute')) \
+             from pg_catalog.pg_proc p \
+             join pg_catalog.pg_namespace s on s.oid = p.pronamespace \
+             where s.nspname = $1 and p.proname like 'cap\\_%'",
+            &[&DEFAULT_SCHEMA, &APP_ROLE],
+        )
+        .await
+        .expect("check function privilege");
+    let (functions, executable): (i64, i64) = (privileges.get(0), privileges.get(1));
+    assert_eq!(functions, 4 * specs.len() as i64, "one function per event");
+    assert_eq!(executable, 0, "PUBLIC can't execute a capture function");
 
     let rows = fam_rows();
     let fam_inserts: Vec<String> = (0..rows)
