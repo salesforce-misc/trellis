@@ -386,9 +386,10 @@ pub fn lookup_typed_literal(keyword: &str) -> Option<&'static TypedLiteralSpec> 
 /// operand can appear in.
 ///
 /// Quote-escaping is the same `''` doubling the `Text` arms use. Backslashes
-/// need no escaping: `standard_conforming_strings` has been `on` by default
-/// since Postgres 9.1, so `'\x0102'` is six literal characters — which is
-/// exactly what a canonical `bytea` literal has to be.
+/// need no escaping: `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins
+/// `standard_conforming_strings` to `on` on every session Trellis opens
+/// (issue #672), so `'\x0102'` is six literal characters — which is exactly
+/// what a canonical `bytea` literal has to be.
 pub fn render_sql(value_type: ValueType, text: &str) -> String {
     format!(
         "'{}'::{}",

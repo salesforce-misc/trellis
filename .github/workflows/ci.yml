@@ -87,9 +87,24 @@ jobs:
 
       - name: Generate a non-default locale
         # The lc_monetary pinning tests (issue #672) need a locale whose
-        # `money` rendering differs from `C`'s. The runner image isn't
-        # guaranteed to have one; see testkit/src/locale.rs.
-        run: sudo locale-gen de_DE.UTF-8
+        # `money` rendering differs from `C`'s; see testkit/src/locale.rs.
+        # The ubuntu-24.04 image ships the `locales` package but none of the
+        # locales it generates does (C.utf8 and en_US.utf8 both render
+        # `$1,234.56`).
+        # Ubuntu's locale-gen takes the locale as an argument (no
+        # /etc/locale.gen edit), and Postgres picks it up without a restart.
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/sbin/locale-gen ]; then
+            sudo apt-get update
+            sudo apt-get install -y locales
+          fi
+          sudo locale-gen de_DE.UTF-8
+          if ! locale -a | grep -ix 'de_DE\.utf-\?8' >/dev/null; then
+            echo "::error::de_DE.UTF-8 was not generated; installed locales:"
+            locale -a
+            exit 1
+          fi
 
       - name: Test
         # `--workspace`, generative crate included: every proptest property in

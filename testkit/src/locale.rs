@@ -15,6 +15,9 @@ pub const PINNED_MONEY_TEXT: &str = "$1,234.56";
 /// Locales whose `money` rendering differs from [`PINNED_MONEY_TEXT`], in
 /// the order [`hostile_lc_monetary`] tries them. glibc normalizes the codeset
 /// (`UTF-8` matches an installed `utf8`), so one spelling of each is enough.
+/// Every one has two fraction digits, like `C`: `money` scales its stored
+/// integer by the *writing* session's `frac_digits`, so a zero-digit locale
+/// such as `ja_JP` would change the stored value, not just its spelling.
 const CANDIDATES: &[&str] = &[
     "de_DE.UTF-8",
     "fr_FR.UTF-8",
@@ -22,12 +25,12 @@ const CANDIDATES: &[&str] = &[
     "en_IN.UTF-8",
     "en_IN",
     "en_DK.UTF-8",
-    "ja_JP.UTF-8",
 ];
 
 /// Returns an `lc_monetary` value this server accepts under which
-/// `1234.56::money::text` is *not* [`PINNED_MONEY_TEXT`], leaving `client`'s
-/// own `lc_monetary` reset afterwards.
+/// `1234.56::money::text` is *not* [`PINNED_MONEY_TEXT`] but the stored value
+/// is the same (so a test can write a `money` value under it and read it back
+/// under the pin), leaving `client`'s own `lc_monetary` reset afterwards.
 ///
 /// Panics if the box has none of them installed: a pinning test that
 /// silently skips would pass without proving anything. CI generates
@@ -43,16 +46,19 @@ pub async fn hostile_lc_monetary(client: &tokio_postgres::Client) -> String {
         {
             continue;
         }
-        let rendered: String = client
-            .query_one("select 1234.56::money::text", &[])
+        let row = client
+            .query_one(
+                "select 1234.56::money::text, 1234.56::money::numeric = 1234.56",
+                &[],
+            )
             .await
-            .expect("render money under a candidate lc_monetary")
-            .get(0);
+            .expect("render money under a candidate lc_monetary");
+        let (rendered, same_value): (String, bool) = (row.get(0), row.get(1));
         client
             .batch_execute("reset lc_monetary")
             .await
             .expect("reset lc_monetary");
-        if rendered != PINNED_MONEY_TEXT {
+        if rendered != PINNED_MONEY_TEXT && same_value {
             return (*candidate).to_string();
         }
     }

@@ -324,6 +324,30 @@ impl Pool {
 /// `$1,234.56` a server initialized with `C.UTF-8` (the test clusters,
 /// issue #667) or `en_US.UTF-8` defaults to.
 ///
+/// `money` stores an integer count of the monetary locale's smallest unit,
+/// scaled by its `frac_digits` at *input* time, so under a database whose
+/// `lc_monetary` has `frac_digits` other than 2 (`ja_JP`'s is 0) the text
+/// Trellis stages (`$12.35` for a value the application wrote as `¥1,235`)
+/// is not what the application reads back. It is still a function of the
+/// stored value alone, which is all this constant promises.
+///
+/// # `standard_conforming_strings`, the one *input* setting pinned here
+///
+/// Everything else here pins how a value is *rendered*. This one pins how
+/// SQL text Trellis writes is *parsed*: [`quote_literal`],
+/// [`crate::defs::typed_literal::render_sql`] and every `Expr::StringLiteral`
+/// renderer escape a literal by doubling `'` and nothing else, which is
+/// correct only when `standard_conforming_strings` is `on`. Under `off` a
+/// backslash in an ordinary `'...'` literal starts an escape, so a column
+/// named `a\b` quotes as the `jsonb_build_object` key `a<backspace>`, one
+/// ending in `\` swallows the closing quote, and the canonical `bytea`
+/// literal `'\x0102'` reads as a control character followed by `02`. `on`
+/// has been the server default since Postgres 9.1, but an operator's
+/// `ALTER DATABASE ... SET standard_conforming_strings = off` still reaches
+/// every session that doesn't set it. It sits in this constant (issue #672)
+/// because this is the one list every Trellis session applies; on the
+/// walsender, which parses no SQL literal Trellis writes, it is harmless.
+///
 /// # Output settings deliberately *not* pinned
 ///
 /// The rest of Postgres's locale and formatting settings were audited for
@@ -340,10 +364,12 @@ impl Pool {
 ///   session. Ordering is handled with explicit `collate "C"` and the
 ///   deterministic-collation checks on key columns (issues #590, #638).
 /// * `client_encoding` is fixed to `UTF8` by `tokio-postgres` itself.
-/// * `xmloption`, `xmlbinary`, `timezone_abbreviations` and
-///   `standard_conforming_strings` change how *input* is parsed (or, for
-///   `xmlbinary`, what the `xml*` constructor functions build), not how a
-///   stored value is rendered.
+/// * `xmloption`, `xmlbinary` and `timezone_abbreviations` change how
+///   *input* is parsed (or, for `xmlbinary`, what the `xml*` constructor
+///   functions build), not how a stored value is rendered, and no SQL
+///   Trellis writes depends on them.
+/// * `escape_string_warning` and `backslash_quote` only matter when
+///   `standard_conforming_strings` is `off`, which it never is here.
 ///
 /// [`deterministic_text_output_options`] parses this string back into the
 /// `-c name=value` shape `pgwire_replication::ReplicationConfig::with_options`
@@ -352,7 +378,7 @@ impl Pool {
 /// a second `-c`-shaped list here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
      set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
-     set timezone to 'UTC'; set lc_monetary to 'C'";
+     set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'";
 
 /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], reparsed into the Postgres startup
 /// `options` parameter's `-c name=value -c name2=value2 ...` shape —
@@ -680,9 +706,10 @@ pub(crate) fn quote_ident(ident: &str) -> String {
 
 /// Quotes a plain string as a Postgres string *literal* for safe
 /// interpolation into SQL text — [`quote_ident`]'s counterpart for a value
-/// rather than an identifier (doubling embedded `'` characters, the standard
-/// `standard_conforming_strings = on` escaping every connection this crate
-/// opens already uses).
+/// rather than an identifier (doubling embedded `'` characters, the
+/// `standard_conforming_strings = on` escaping that
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] pins on every connection this crate
+/// opens, so a backslash needs no escaping).
 ///
 /// Issue #248: a column name can't be bound as an ordinary query parameter
 /// (it isn't a value), but it still needs to appear as a `jsonb_build_object`
@@ -802,7 +829,8 @@ mod tests {
         assert_eq!(
             deterministic_text_output_options(),
             "-c datestyle=ISO,\\ YMD -c bytea_output=hex -c extra_float_digits=1 \
-             -c intervalstyle=postgres -c timezone=UTC -c lc_monetary=C"
+             -c intervalstyle=postgres -c timezone=UTC -c lc_monetary=C \
+             -c standard_conforming_strings=on"
         );
     }
 
@@ -821,7 +849,10 @@ mod tests {
             .count();
         let token_count = deterministic_text_output_options().split(" -c ").count();
         assert_eq!(clause_count, token_count);
-        assert_eq!(clause_count, 6, "expected six pinned GUCs as of issue #672");
+        assert_eq!(
+            clause_count, 7,
+            "expected seven pinned GUCs as of issue #672"
+        );
     }
 
     #[test]
@@ -924,6 +955,97 @@ mod tests {
             .await
             .expect("dedicated session setup");
         assert_eq!(render(&dedicated).await, expected, "dedicated");
+    }
+
+    /// Issue #672 review: the SQL Trellis writes escapes a string literal by
+    /// doubling `'` only ([`quote_literal`],
+    /// [`crate::defs::typed_literal::render_sql`]), which assumes
+    /// `standard_conforming_strings = on`. A database default of `off` must
+    /// not reach any session Trellis opens itself: here a column named
+    /// `a\b` would otherwise become the image key `a<backspace>`, one named
+    /// `trail\` would swallow its closing quote, and the canonical `bytea`
+    /// literal `'\x0102'` would read as three other bytes.
+    #[tokio::test]
+    async fn backslashes_in_generated_literals_survive_a_database_default_of_nonstandard_strings() {
+        use crate::defs::ast::ValueType;
+        use crate::defs::pg_type::PgType;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "create table t (id int primary key, \"a\\b\" text, \"trail\\\" text); \
+             insert into t values (1, 'x', 'y'); \
+             alter database {} set standard_conforming_strings to off",
+            quote_ident(db.name())
+        ))
+        .await
+        .expect("seed the table and apply a hostile database default");
+
+        let probe = |columns: &[&str]| {
+            let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+            format!(
+                "select array_agg(e.key || '=' || e.value order by e.key collate \"C\"), \
+                        ({})::text \
+                 from t, jsonb_each_text({}) e",
+                crate::defs::typed_literal::render_sql(ValueType::Other(PgType::Bytea), "\\x0102"),
+                crate::staging::apply::row_as_text_jsonb_sql("t", &columns)
+            )
+        };
+        async fn render(client: &tokio_postgres::Client, sql: &str) -> (Vec<String>, String) {
+            let row = client.query_one(sql, &[]).await.expect("render the probe");
+            (row.get(0), row.get(1))
+        }
+
+        // Control: an unpinned session started after the `ALTER DATABASE`
+        // really does read backslashes as escapes. `trail\` is left out of
+        // this probe because under `off` it doesn't parse at all.
+        let (unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let (keys, bytea) = render(&unpinned, &probe(&["id", "a\\b"])).await;
+        assert_ne!(
+            keys,
+            ["a\\b=x", "id=1"],
+            "hostile default must be in effect"
+        );
+        assert_ne!(bytea, "\\x0102", "hostile default must be in effect");
+
+        let full = probe(&["id", "a\\b", "trail\\"]);
+        let expected = (
+            vec![
+                "a\\b=x".to_string(),
+                "id=1".to_string(),
+                "trail\\=y".to_string(),
+            ],
+            "\\x0102".to_string(),
+        );
+
+        let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let pooled = pool.get().await.expect("pooled connection");
+        assert_eq!(render(&pooled, &full).await, expected, "pooled");
+
+        let unpooled = pool.connect_unpooled().await.expect("unpooled connection");
+        assert_eq!(render(&unpooled, &full).await, expected, "unpooled");
+
+        let (dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        dedicated
+            .batch_execute(&dedicated_session_setup(crate::config::DEFAULT_SCHEMA))
+            .await
+            .expect("dedicated session setup");
+        assert_eq!(render(&dedicated, &full).await, expected, "dedicated");
     }
 
     /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through
