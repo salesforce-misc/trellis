@@ -704,7 +704,9 @@ mod tests {
     #[test]
     fn the_set_clauses_come_from_the_pools_pinned_settings() {
         let clauses = pinned_output_settings();
-        assert_eq!(clauses.len(), 5);
+        // At least the five pinned before #672; the exact list grows with the pool's, and every
+        // clause is checked below, so the count must not pin a merge order with #672.
+        assert!(clauses.len() >= 5, "{clauses:?}");
         let sql = ddl(&spec(), CaptureEvent::Insert);
         for clause in clauses {
             assert!(sql.contains(clause), "missing {clause:?}");
