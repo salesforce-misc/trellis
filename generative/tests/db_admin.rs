@@ -242,6 +242,7 @@ async fn postgres_restarts_with_work_in_flight_converge() {
 /// resuming), and the operator's `RESUME` must rebuild both targets,
 /// including the gap's update, to the oracle.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_dropped_slot_pauses_every_transform_and_resuming_converges() {
     let cluster = TestCluster::start();
     let program = one_to_one_and_aggregate_program();
@@ -255,6 +256,7 @@ async fn a_dropped_slot_pauses_every_transform_and_resuming_converges() {
 /// rather than dropped, which takes #310's other recovery path: the dead
 /// slot is dropped before a fresh one is created.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "#622: deleted in C7/C8"]
 async fn an_invalidated_slot_pauses_every_transform_and_resuming_converges() {
     let cluster = TestCluster::start();
     let program = one_to_one_and_aggregate_program();
@@ -288,6 +290,7 @@ async fn an_invalidated_slot_pauses_every_transform_and_resuming_converges() {
 /// drop the deleted row's 1-1 target row and take it out of its aggregate
 /// group, though no stream ever delivered the delete (issue #330).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_slot_loss_whose_gap_deletes_a_row_converges_after_resume() {
     let cluster = TestCluster::start();
     let program = one_to_one_and_aggregate_program();
@@ -301,6 +304,7 @@ async fn a_slot_loss_whose_gap_deletes_a_row_converges_after_resume() {
 /// empty both targets, the aggregate included, from a source it enumerates
 /// as having no rows at all (issue #330).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_slot_loss_whose_gap_truncates_the_source_converges_after_resume() {
     let cluster = TestCluster::start();
     let mut program = one_to_one_and_aggregate_program();
