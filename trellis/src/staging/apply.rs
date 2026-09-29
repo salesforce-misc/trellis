@@ -1265,7 +1265,7 @@ pub(crate) async fn build_relationship_context(
                     }
                 };
                 by_name.insert(
-                    rel_name,
+                    rel_name.clone(),
                     ToOneRelationship {
                         from_col: from_col.clone(),
                         cardinality: RelationshipCardinality::ToOne,
@@ -1292,7 +1292,13 @@ pub(crate) async fn build_relationship_context(
                         join_keys.iter().cloned().collect();
                     if let Some(old_rows) = old_rows {
                         for old_row in old_rows.iter().flatten() {
-                            if let Some(Some(text)) = old_row.get(&from_col) {
+                            // Issue #677: a to-one's from-side carries
+                            // `REPLICA IDENTITY FULL` (#158), so an old
+                            // image missing `from_col` is `MissingColumn`,
+                            // not a parent silently left un-bumped.
+                            if let Some(text) =
+                                apply_aggregate::required_column(old_row, &from_col, &rel_name)?
+                            {
                                 touched.insert(text.clone());
                             }
                         }
@@ -2106,11 +2112,38 @@ async fn group_by_snapshot_source(
     }))
 }
 
-/// The `to_col` text value off `row`, or `None` if `row` is absent or the
-/// column is (an absent column and a genuine SQL `NULL` are both "no key
-/// here" for join purposes).
-fn relationship_key_text(row: &Option<Row>, to_col: &str) -> Option<String> {
-    row.as_ref().and_then(|r| r.get(to_col)).cloned().flatten()
+/// The `to_col` text value off `row`, or `None` if `row` is absent or its
+/// `to_col` is SQL `NULL` ("no key here" for join purposes). A present `row`
+/// missing `to_col` entirely is [`EvalError::MissingColumn`] against
+/// relationship `rel_name` (issue #677, see
+/// [`apply_aggregate::required_column`]): `row` is the to-side change's own
+/// image, and a to-one relationship's to-side carries `REPLICA IDENTITY
+/// FULL` (and, under trigger capture, `to_col` in its capture set), so the
+/// join key is always part of it.
+fn relationship_key_text(
+    row: &Option<Row>,
+    to_col: &str,
+    rel_name: &str,
+) -> Result<Option<String>, EvalError> {
+    match row {
+        Some(row) => Ok(apply_aggregate::required_column(row, to_col, rel_name)?.cloned()),
+        None => Ok(None),
+    }
+}
+
+/// [`relationship_key_text`] off the old image, falling back to the new one
+/// when the old image is absent or its key is `NULL` — the key a to-one
+/// reverse record's guard state is captured under.
+fn relationship_read_key(
+    old_row: &Option<Row>,
+    new_row: &Option<Row>,
+    to_col: &str,
+    rel_name: &str,
+) -> Result<Option<String>, EvalError> {
+    match relationship_key_text(old_row, to_col, rel_name)? {
+        Some(key) => Ok(Some(key)),
+        None => relationship_key_text(new_row, to_col, rel_name),
+    }
 }
 
 /// The Phase 2 capture behind three of #132's four guards — [`prev_lsn`],
@@ -3027,15 +3060,17 @@ async fn stage_reverse_recompute_fallback(
         }
         for (from_key, from_row) in from_rows {
             if seen_keys.insert(from_key.clone()) {
-                let prior_image = stage_images.then(|| {
-                    fallback_prior_image(
+                let prior_image = if stage_images {
+                    Some(fallback_prior_image(
                         from_row,
                         &shape.name,
                         &shape.group_by_columns,
                         parent_before,
                         &sibling_values,
-                    )
-                });
+                    )?)
+                } else {
+                    None
+                };
                 fallback.push((
                     (
                         shape.from_table.clone(),
@@ -3059,19 +3094,28 @@ async fn stage_reverse_recompute_fallback(
 /// parent — and each sibling's current value (its projection row keyed by
 /// `from_row`'s join key, or `NULL` when it has none), spliced in under
 /// [`apply_aggregate::pre_change_relationship_column`], as JSON text.
+///
+/// `parent_before` is the to-side change's old image, so a present one
+/// missing any of `columns` is [`EvalError::MissingColumn`] (issue #677):
+/// read as `NULL`, it would name the wrong old group. The sibling reads stay
+/// lenient: `from_row` is a live read, and a sibling's `columns` are already
+/// filtered to what its projection holds (see [`group_by_snapshot_source`]).
 fn fallback_prior_image(
     mut from_row: Row,
     rel_name: &str,
     columns: &[String],
     parent_before: Option<&Row>,
     siblings: &[(&GroupBySibling, HashMap<String, Row>)],
-) -> String {
+) -> Result<String, EvalError> {
     let mut pre_change: Vec<(String, Option<String>)> = Vec::new();
     for column in columns {
-        let value = parent_before
-            .and_then(|parent| parent.get(column))
-            .cloned()
-            .flatten();
+        let value = match parent_before {
+            Some(parent) => {
+                apply_aggregate::required_column(parent, column, &format!("{rel_name}.{column}"))?
+                    .cloned()
+            }
+            None => None,
+        };
         pre_change.push((
             apply_aggregate::pre_change_relationship_column(rel_name, column),
             value,
@@ -3092,7 +3136,7 @@ fn fallback_prior_image(
         }
     }
     from_row.extend(pre_change);
-    row_to_json_text(&from_row)
+    Ok(row_to_json_text(&from_row))
 }
 
 /// `sibling`'s projection rows (issue #516, see
@@ -3206,11 +3250,18 @@ async fn truncated_from_side_images(
 /// pass; a parent DELETE has no new-key pass — see this function's one call
 /// site), so the synthetic column is always populated when it's actually
 /// read.
+///
+/// A `parent_row` that is present but missing one of the referenced to-side
+/// columns is [`EvalError::MissingColumn`] against `<rel_name>.<column>`,
+/// not `NULL` (issue #677, see [`apply_aggregate::required_column`]): the
+/// parent image is the to-side change's own image, and every to-side column
+/// a relationship reads is structurally part of it.
 fn augment_row_with_relationship_value(
     from_row: &Row,
+    rel_name: &str,
     synthetic_columns: &[(String, String)],
     parent_row: &Option<Row>,
-) -> Row {
+) -> Result<Row, EvalError> {
     let mut augmented = from_row.clone();
     for (to_col, synthetic) in synthetic_columns {
         // Always insert the synthetic key, even when `parent_row` is
@@ -3224,14 +3275,16 @@ fn augment_row_with_relationship_value(
         // is exactly the same "resolves to `NULL`" shape a genuine SQL
         // `LEFT JOIN` no-match already produces (see `eval.rs`'s
         // `evaluate_with_relationships`/`ToOneRelationship` handling).
-        let value = parent_row
-            .as_ref()
-            .and_then(|row| row.get(to_col))
-            .cloned()
-            .flatten();
+        let value = match parent_row {
+            Some(row) => {
+                apply_aggregate::required_column(row, to_col, &format!("{rel_name}.{to_col}"))?
+                    .cloned()
+            }
+            None => None,
+        };
         augmented.insert(synthetic.clone(), value);
     }
-    augmented
+    Ok(augmented)
 }
 
 /// The settled parent projection's current data columns (excluding the key
@@ -4260,13 +4313,81 @@ mod tests {
                 &columns,
                 Some(&parent),
                 &siblings
-            ),
+            )
+            .unwrap(),
             expected(Some("1"), Some("a"))
         );
         assert_eq!(
-            fallback_prior_image(from_row.clone(), "buyer", &columns, None, &siblings),
+            fallback_prior_image(from_row.clone(), "buyer", &columns, None, &siblings).unwrap(),
             expected(None, None)
         );
+    }
+
+    /// Issue #677: a to-side image missing the relationship's `to_col` is
+    /// `MissingColumn`, not "no key" (which would silently skip the parent's
+    /// reverse propagation). An absent image, or a present `NULL` key, is
+    /// still no key.
+    #[test]
+    fn a_relationship_key_missing_from_a_present_image_raises_missing_column() {
+        let missing: Option<Row> =
+            Some(HashMap::from([("name".to_string(), Some("a".to_string()))]));
+        assert_eq!(
+            relationship_key_text(&missing, "id", "buyer"),
+            Err(EvalError::MissingColumn {
+                field: "buyer".to_string(),
+                column: "id".to_string(),
+            })
+        );
+        let null_key: Option<Row> = Some(HashMap::from([("id".to_string(), None)]));
+        assert_eq!(relationship_key_text(&null_key, "id", "buyer"), Ok(None));
+        assert_eq!(relationship_key_text(&None, "id", "buyer"), Ok(None));
+        let keyed: Option<Row> = Some(HashMap::from([("id".to_string(), Some("1".to_string()))]));
+        assert_eq!(
+            relationship_read_key(&null_key, &keyed, "id", "buyer"),
+            Ok(Some("1".to_string())),
+            "a NULL old key still falls back to the new image's key"
+        );
+        assert!(
+            relationship_read_key(&missing, &keyed, "id", "buyer").is_err(),
+            "an old image missing the key fails rather than falling back"
+        );
+    }
+
+    /// Issue #677: the reverse path reads the relationship's value off the
+    /// parent's own change image, so a present parent image missing a read
+    /// column is `MissingColumn` (in both the delta splice and the fallback's
+    /// prior image). No parent at all is still `NULL`.
+    #[test]
+    fn a_parent_image_missing_a_relationship_column_raises_missing_column() {
+        let from_row: Row = HashMap::from([
+            ("id".to_string(), Some("10".to_string())),
+            ("user_id".to_string(), Some("1".to_string())),
+        ]);
+        let parent: Row = HashMap::from([("id".to_string(), Some("1".to_string()))]);
+        let expected = EvalError::MissingColumn {
+            field: "buyer.name".to_string(),
+            column: "name".to_string(),
+        };
+        let synthetic = [("name".to_string(), "__synthetic_name".to_string())];
+        assert_eq!(
+            augment_row_with_relationship_value(
+                &from_row,
+                "buyer",
+                &synthetic,
+                &Some(parent.clone())
+            ),
+            Err(expected.clone())
+        );
+        let no_parent = augment_row_with_relationship_value(&from_row, "buyer", &synthetic, &None)
+            .expect("no parent resolves to NULL");
+        assert_eq!(no_parent.get("__synthetic_name"), Some(&None));
+
+        let columns = ["name".to_string()];
+        assert_eq!(
+            fallback_prior_image(from_row.clone(), "buyer", &columns, Some(&parent), &[]),
+            Err(expected)
+        );
+        assert!(fallback_prior_image(from_row, "buyer", &columns, None, &[]).is_ok());
     }
 
     /// Issue #344: a basis is compared to the source's current row as jsonb,
@@ -5757,10 +5878,10 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // identity — which is exactly why issue #41 gates that at
         // `create_relationship` (define) time: `REPLICA IDENTITY FULL` or a
         // covering replica-identity index. That gate is creation-time only and
-        // not re-validated per batch, so an operator who later relaxes the
-        // to-side's replica identity would silently degrade reverse recompute
-        // here (the `.unwrap_or(&None)` below cannot tell an absent column from
-        // a genuine NULL — hence the guard must live at define time, not here).
+        // not re-validated per batch. If an operator later relaxes the
+        // to-side's replica identity, a pre-image missing `to_col` fails the
+        // batch with `MissingColumn` below (issue #677) rather than silently
+        // skipping the reverse recompute it should have staged.
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.
@@ -5872,11 +5993,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                                 .or_insert((change.src_changed, change.origin_lsn));
                         }
                     };
-                    if let Some(row) = &rows[i] {
-                        note(row.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
-                    }
-                    if let Some(old) = &old_rows[i] {
-                        note(old.get(&rel.def.to_col).unwrap_or(&None), change.hop_gen);
+                    // Issue #677: a present image missing `to_col` is
+                    // `MissingColumn`, not "no key" — see
+                    // `relationship_key_text`.
+                    for row in [&rows[i], &old_rows[i]] {
+                        let key = relationship_key_text(row, &rel.def.to_col, &rel.def.name)?;
+                        note(&key, change.hop_gen);
                     }
                 }
                 accumulate_from_side_recomputes(
@@ -5955,7 +6077,11 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                         old_rows[i].as_ref()
                     };
                     for row in [rows[i].as_ref(), old_row].into_iter().flatten() {
-                        let Some(Some(join_text)) = row.get(&rel.def.to_col) else {
+                        // Issue #677: absent `to_col` is `MissingColumn`,
+                        // only a `NULL` one is "no key".
+                        let Some(join_text) =
+                            apply_aggregate::required_column(row, &rel.def.to_col, &rel.def.name)?
+                        else {
                             continue;
                         };
                         key_hops
@@ -6011,8 +6137,8 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
                 }
                 let old_row = old_rows[i].clone();
                 let new_row = rows[i].clone();
-                let read_key = relationship_key_text(&old_row, &rel.def.to_col)
-                    .or_else(|| relationship_key_text(&new_row, &rel.def.to_col));
+                let read_key =
+                    relationship_read_key(&old_row, &new_row, &rel.def.to_col, &rel.def.name)?;
                 let capture = capture_reverse_guard_state(
                     pool,
                     &shape.qualified_projection,
@@ -6513,8 +6639,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
             // Defensively skip rather than build a meaningless record.
             continue;
         }
-        let read_key = relationship_key_text(&old_row, &shape.to_col)
-            .or_else(|| relationship_key_text(&new_row, &shape.to_col));
+        let read_key = relationship_read_key(&old_row, &new_row, &shape.to_col, &shape.name)?;
         let capture = capture_reverse_guard_state(
             pool,
             &shape.qualified_projection,
@@ -8265,8 +8390,8 @@ pub(crate) async fn apply_page(
     let mut row_columns_cache: HashMap<String, Vec<String>> = HashMap::new();
     for record in &plan.relationship_reverses {
         let shape = &record.shape;
-        let old_key = relationship_key_text(&record.old_row, &shape.to_col);
-        let new_key = relationship_key_text(&record.new_row, &shape.to_col);
+        let old_key = relationship_key_text(&record.old_row, &shape.to_col, &shape.name)?;
+        let new_key = relationship_key_text(&record.new_row, &shape.to_col, &shape.name)?;
         // Resolved once per record from the batch-wide cache above — every
         // `from_side_rows_for_trigger_txn` call this record makes (via
         // `diff_pass` below and/or `stage_reverse_recompute_fallback`)
@@ -8515,24 +8640,26 @@ pub(crate) async fn apply_page(
                 for (_, from_row) in from_rows {
                     let old_augmented = augment_row_with_relationship_value(
                         &from_row,
+                        &shape.name,
                         &agg_shape.synthetic_columns,
                         old_parent,
-                    );
+                    )?;
                     let new_augmented = augment_row_with_relationship_value(
                         &from_row,
+                        &shape.name,
                         &agg_shape.synthetic_columns,
                         new_parent,
-                    );
+                    )?;
                     let (old_values, old_group_key) = apply_aggregate::derive_group_key(
                         &old_augmented,
                         &agg_shape.group_by_row_columns,
                         &target_plan.group_by_types,
-                    );
+                    )?;
                     let (new_values, new_group_key) = apply_aggregate::derive_group_key(
                         &new_augmented,
                         &agg_shape.group_by_row_columns,
                         &target_plan.group_by_types,
-                    );
+                    )?;
                     let old_contrib = apply_aggregate::row_contribution(
                         &agg_shape.contribution_def,
                         &old_augmented,

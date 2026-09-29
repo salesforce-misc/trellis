@@ -862,17 +862,47 @@ fn canonicalize_group_key_part(value_type: ValueType, text: Option<&str>) -> Opt
     }
 }
 
+/// `column`'s value on `row` when the column is structurally required
+/// there, telling an absent column from a present `NULL` the way the
+/// evaluator does (issue #677): `Ok(None)` is a real SQL `NULL`, and a
+/// column missing from the image is [`eval::EvalError::MissingColumn`]
+/// against `field`. A `GROUP BY` key or a relationship join key read as
+/// `NULL` when absent would silently route the change to the wrong group
+/// or parent. Under trigger capture (#622) images carry only the capture
+/// column set, and an under-capture has to fail loudly instead.
+pub(super) fn required_column<'r>(
+    row: &'r Row,
+    column: &str,
+    field: &str,
+) -> Result<Option<&'r String>, eval::EvalError> {
+    match row.get(column) {
+        Some(value) => Ok(value.as_ref()),
+        None => Err(eval::EvalError::MissingColumn {
+            field: field.to_string(),
+            column: column.to_string(),
+        }),
+    }
+}
+
 /// `pub(super)`: issue #131's reverse-delta apply path derives a live
 /// from-side row's group key the same way this batch-driven caller does.
+///
+/// A `group_by` column absent from `row` is
+/// [`eval::EvalError::MissingColumn`], not the `NULL` group (issue #677,
+/// see [`required_column`]). The error names the column as its own field,
+/// since a plain `GROUP BY` key is the target column of the same name. A
+/// relationship key's synthetic column is never absent here, because
+/// [`augment_row_with_forward_relationships`] (and the reverse path's
+/// `augment_row_with_relationship_value`) always insert it.
 pub(super) fn derive_group_key(
     row: &Row,
     group_by: &[String],
     group_by_types: &[ValueType],
-) -> (Vec<Option<String>>, String) {
+) -> Result<(Vec<Option<String>>, String), eval::EvalError> {
     let values: Vec<Option<String>> = group_by
         .iter()
-        .map(|c| row.get(c).cloned().flatten())
-        .collect();
+        .map(|c| required_column(row, c, c).map(|v| v.cloned()))
+        .collect::<Result<_, _>>()?;
     // One encoding at every arity, exactly what `ddl::pk_key_sql_expr`
     // renders for the aggregate target's own grouping-column identity: the
     // bare value for a single column (issue #103), the U+001F join for a
@@ -895,7 +925,7 @@ pub(super) fn derive_group_key(
             .map(|(v, ty)| canonicalize_group_key_part(*ty, v.as_deref()))
             .map(|v| ddl::encode_key_part(v.as_deref()).into_owned()),
     );
-    (values, text)
+    Ok((values, text))
 }
 
 /// One row's contribution to every field on `def`, keyed by field name, as
@@ -1248,14 +1278,19 @@ fn group_by_row_columns(group_by: &[GroupByKey]) -> Vec<String> {
 /// comment's grain-migration section already establishes for the row's
 /// `GROUP BY` columns generally.
 ///
-/// A from-row whose `from_col` is absent/NULL, or whose join key has no match
-/// in `rel_ctx`'s settled projection, resolves the synthetic column to `None`
+/// A from-row whose `from_col` is NULL, or whose join key has no match in
+/// `rel_ctx`'s settled projection, resolves the synthetic column to `None`
 /// (SQL `NULL`) — the same "no match" LEFT JOIN semantics
 /// [`eval::eval_expr`]'s own `RelationshipPath` arm and
 /// `super::apply::augment_row_with_relationship_value` both already
 /// establish, not a hard error: a synthetic column always exists on the
 /// augmented row, it just has no resolved value for this particular
-/// row/side.
+/// row/side. An *absent* `from_col`, or a matched projection row missing
+/// the read column, is [`eval::EvalError::MissingColumn`] instead, exactly
+/// as that evaluator arm raises it (issue #677, see [`required_column`]).
+/// The error's field is the path's `rel.column` text, since the shape
+/// doesn't know which of the definition's fields (or `GROUP BY` keys) read
+/// it.
 ///
 /// A value `row` carries under [`pre_change_relationship_column`] is taken
 /// as given (issue #516): only a reverse fallback's prior image carries one,
@@ -1270,9 +1305,9 @@ fn augment_row_with_forward_relationships<'a>(
     row: &'a Row,
     rel_ctx: Option<&eval::RelationshipContext>,
     synthetic: &[ForwardRelationshipSynthetic],
-) -> Cow<'a, Row> {
+) -> Result<Cow<'a, Row>, eval::EvalError> {
     if synthetic.is_empty() {
-        return Cow::Borrowed(row);
+        return Ok(Cow::Borrowed(row));
     }
     let ctx = rel_ctx.expect(
         "ForwardRelationshipShape has synthetic columns but no relationship context was \
@@ -1289,16 +1324,20 @@ fn augment_row_with_forward_relationships<'a>(
             augmented.insert(s.synthetic.clone(), value.clone());
             continue;
         }
-        let value = row.get(&s.from_col).cloned().flatten().and_then(|key| {
-            ctx.to_one(&s.rel_name)
-                .and_then(|r| r.to_rows_by_key.get(&key))
-                .and_then(|to_row| to_row.get(&s.to_col))
-                .cloned()
-                .flatten()
-        });
+        let field = format!("{}.{}", s.rel_name, s.to_col);
+        let to_row = match required_column(row, &s.from_col, &field)? {
+            Some(key) => ctx
+                .to_one(&s.rel_name)
+                .and_then(|r| r.to_rows_by_key.get(key)),
+            None => None,
+        };
+        let value = match to_row {
+            Some(to_row) => required_column(to_row, &s.to_col, &field)?.cloned(),
+            None => None,
+        };
         augmented.insert(s.synthetic.clone(), value);
     }
-    Cow::Owned(augmented)
+    Ok(Cow::Owned(augmented))
 }
 
 /// One (already-augmented, see [`augment_row_with_forward_relationships`])
@@ -1400,8 +1439,8 @@ pub(super) fn accumulate_changes(
         // to resolve the same guarded way an ordinary delta's does, not
         // straight off the row (which has no such column).
         for row in &named_rows[i] {
-            let augmented = augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
-            let (values, key) = derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+            let augmented = augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic)?;
+            let (values, key) = derive_group_key(&augmented, &group_by_cols, &plan.group_by_types)?;
             let group = plan.groups.entry(key).or_insert_with(|| {
                 let mut group = GroupPlan::new(values);
                 group.horizon_check_only = true;
@@ -1429,9 +1468,9 @@ pub(super) fn accumulate_changes(
             // Idempotent either way.
             for row in [old_row, new_row].into_iter().flatten() {
                 let augmented =
-                    augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic);
+                    augment_row_with_forward_relationships(row, rel_ctx, &shape.synthetic)?;
                 let (values, key) =
-                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types)?;
                 plan.groups
                     .entry(key)
                     .or_insert_with(|| GroupPlan::new(values))
@@ -1443,9 +1482,9 @@ pub(super) fn accumulate_changes(
         match (old_row, new_row) {
             (None, Some(new_row)) => {
                 let augmented =
-                    augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic);
+                    augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic)?;
                 let (values, key) =
-                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types)?;
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 let group = plan
                     .groups
@@ -1456,9 +1495,9 @@ pub(super) fn accumulate_changes(
             }
             (Some(old_row), None) => {
                 let augmented =
-                    augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic);
+                    augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic)?;
                 let (values, key) =
-                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types);
+                    derive_group_key(&augmented, &group_by_cols, &plan.group_by_types)?;
                 let contrib = forward_row_contribution(&shape, &augmented, regex_cache)?;
                 let group = plan
                     .groups
@@ -1469,13 +1508,13 @@ pub(super) fn accumulate_changes(
             }
             (Some(old_row), Some(new_row)) => {
                 let old_augmented =
-                    augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic);
+                    augment_row_with_forward_relationships(old_row, rel_ctx, &shape.synthetic)?;
                 let new_augmented =
-                    augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic);
+                    augment_row_with_forward_relationships(new_row, rel_ctx, &shape.synthetic)?;
                 let (old_values, old_key) =
-                    derive_group_key(&old_augmented, &group_by_cols, &plan.group_by_types);
+                    derive_group_key(&old_augmented, &group_by_cols, &plan.group_by_types)?;
                 let (new_values, new_key) =
-                    derive_group_key(&new_augmented, &group_by_cols, &plan.group_by_types);
+                    derive_group_key(&new_augmented, &group_by_cols, &plan.group_by_types)?;
                 let old_contrib = forward_row_contribution(&shape, &old_augmented, regex_cache)?;
                 let new_contrib = forward_row_contribution(&shape, &new_augmented, regex_cache)?;
 
@@ -3885,7 +3924,8 @@ mod tests {
             &row(&[("warehouse", Some("w1")), ("sku", Some("a"))]),
             &group_by,
             &[ValueType::Text, ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_eq!(
             values,
             vec![Some("w1".to_string()), Some("a".to_string())],
@@ -3937,7 +3977,8 @@ mod tests {
             &row(&[("warehouse", Some("w1\u{1f}extra")), ("sku", Some("a"))]),
             &group_by,
             &[ValueType::Text, ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_ne!(
             key, "w1\u{1f}extra\u{1f}a",
             "a real separator inside a component must not pass through unescaped"
@@ -3970,7 +4011,8 @@ mod tests {
             &row(&[("warehouse", None), ("sku", Some("\u{1}\u{1f}\u{1e}\u{1}"))]),
             &group_by,
             &[ValueType::Text, ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_eq!(
             ddl::split_pk_key(&pk, "stock_totals", &both)
                 .expect("decodes with both escape layers in play")
@@ -3993,11 +4035,12 @@ mod tests {
             &row(&[("order_id", Some("10"))]),
             &group_by,
             &[ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_eq!(key, "10");
     }
 
-    /// Issue #110: a `NULL`/absent grouping component renders as
+    /// Issue #110: a `NULL` grouping component renders as
     /// [`ddl::NULL_KEY_SENTINEL`], not an empty part, so the encoded key's
     /// arity always equals the `GROUP BY`'s (keeping two different groups
     /// from colliding on one key, as before) *and* the `NULL` component is
@@ -4010,18 +4053,10 @@ mod tests {
             &row(&[("warehouse", None), ("sku", Some("a"))]),
             &group_by,
             &[ValueType::Text, ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_eq!(values, vec![None, Some("a".to_string())]);
         assert_eq!(key, "\u{1}\u{1f}a");
-        let (_, other) = derive_group_key(
-            &row(&[("sku", Some("a"))]),
-            &group_by,
-            &[ValueType::Text, ValueType::Text],
-        );
-        assert_eq!(
-            other, key,
-            "an absent column folds to the same NULL-sentinel part"
-        );
 
         // Distinct from a group whose `warehouse` is a genuine empty string,
         // not NULL — the exact ambiguity issue #110 closes.
@@ -4029,7 +4064,8 @@ mod tests {
             &row(&[("warehouse", Some("")), ("sku", Some("a"))]),
             &group_by,
             &[ValueType::Text, ValueType::Text],
-        );
+        )
+        .unwrap();
         assert_eq!(empty_string_key, "\u{1f}a");
         assert_ne!(
             empty_string_key, key,
@@ -4083,12 +4119,12 @@ mod tests {
     fn derive_group_key_encodes_a_null_single_column_group_distinctly_from_empty_string() {
         let group_by = vec!["sku".to_string()];
         let (values, null_key) =
-            derive_group_key(&row(&[("sku", None)]), &group_by, &[ValueType::Text]);
+            derive_group_key(&row(&[("sku", None)]), &group_by, &[ValueType::Text]).unwrap();
         assert_eq!(values, vec![None]);
         assert_eq!(null_key, "\u{1}");
 
         let (_, empty_key) =
-            derive_group_key(&row(&[("sku", Some(""))]), &group_by, &[ValueType::Text]);
+            derive_group_key(&row(&[("sku", Some(""))]), &group_by, &[ValueType::Text]).unwrap();
         assert_eq!(empty_key, "");
         assert_ne!(null_key, empty_key);
 
@@ -4133,10 +4169,18 @@ mod tests {
     fn derive_group_key_normalizes_every_boolean_spelling_to_the_same_dedup_key() {
         let group_by = vec!["flag".to_string()];
         let types = [ValueType::Boolean];
-        let terse_true = derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types).1;
-        let sql_true = derive_group_key(&row(&[("flag", Some("true"))]), &group_by, &types).1;
-        let terse_false = derive_group_key(&row(&[("flag", Some("f"))]), &group_by, &types).1;
-        let sql_false = derive_group_key(&row(&[("flag", Some("false"))]), &group_by, &types).1;
+        let terse_true = derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types)
+            .unwrap()
+            .1;
+        let sql_true = derive_group_key(&row(&[("flag", Some("true"))]), &group_by, &types)
+            .unwrap()
+            .1;
+        let terse_false = derive_group_key(&row(&[("flag", Some("f"))]), &group_by, &types)
+            .unwrap()
+            .1;
+        let sql_false = derive_group_key(&row(&[("flag", Some("false"))]), &group_by, &types)
+            .unwrap()
+            .1;
         assert_eq!(
             terse_true, sql_true,
             "'t' and 'true' must dedup to the same GroupPlan"
@@ -4152,7 +4196,8 @@ mod tests {
 
         // `values` — what every SQL statement actually binds — is
         // deliberately left untouched; only the dedup `text` is normalized.
-        let (values, _) = derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types);
+        let (values, _) =
+            derive_group_key(&row(&[("flag", Some("t"))]), &group_by, &types).unwrap();
         assert_eq!(values, vec![Some("t".to_string())]);
     }
 
@@ -5035,13 +5080,288 @@ mod tests {
         let mut forward_only = live.clone();
         forward_only.insert(synthetic_name.clone(), Some("a".to_string()));
 
-        let resolved = augment_row_with_forward_relationships(&live, Some(&rel_ctx), &synthetic);
+        let resolved =
+            augment_row_with_forward_relationships(&live, Some(&rel_ctx), &synthetic).unwrap();
         assert_eq!(resolved.get(&synthetic_name), Some(&Some("c".to_string())));
-        let kept = augment_row_with_forward_relationships(&prior, Some(&rel_ctx), &synthetic);
+        let kept =
+            augment_row_with_forward_relationships(&prior, Some(&rel_ctx), &synthetic).unwrap();
         assert_eq!(kept.get(&synthetic_name), Some(&Some("a".to_string())));
         let not_kept =
-            augment_row_with_forward_relationships(&forward_only, Some(&rel_ctx), &synthetic);
+            augment_row_with_forward_relationships(&forward_only, Some(&rel_ctx), &synthetic)
+                .unwrap();
         assert_eq!(not_kept.get(&synthetic_name), Some(&Some("c".to_string())));
+    }
+
+    /// Issue #677: a `GROUP BY` column absent from the image is
+    /// `MissingColumn`, the error the evaluator raises for a missing field,
+    /// not the `NULL` group. A present `NULL` is still the `NULL` group.
+    #[test]
+    fn derive_group_key_raises_missing_column_for_an_absent_group_column() {
+        let group_by = vec!["warehouse".to_string(), "sku".to_string()];
+        let types = [ValueType::Text, ValueType::Text];
+        let err = derive_group_key(&row(&[("warehouse", Some("w1"))]), &group_by, &types)
+            .expect_err("an image missing `sku` must not land in the NULL group");
+        assert_eq!(
+            err,
+            eval::EvalError::MissingColumn {
+                field: "sku".to_string(),
+                column: "sku".to_string(),
+            }
+        );
+
+        let (values, _) = derive_group_key(
+            &row(&[("warehouse", Some("w1")), ("sku", None)]),
+            &group_by,
+            &types,
+        )
+        .expect("a present NULL `sku` is the NULL group, not an error");
+        assert_eq!(values, vec![Some("w1".to_string()), None]);
+    }
+
+    /// `tag_totals` over `post_tags` (`GROUP BY tag, post.author`, summing
+    /// `post.word_count`) with post 1 in the settled projection — issue
+    /// #677's fixture for driving [`accumulate_changes`] with a single image.
+    fn missing_column_fixture() -> (
+        TransformDef,
+        HashMap<String, ValueType>,
+        AggregateTargetPlan,
+        eval::RelationshipContext,
+    ) {
+        use crate::defs::ast::{FieldDef, Predicate};
+        use crate::defs::model::RelationshipCardinality;
+
+        let group_by = vec![
+            GroupByKey::Column("tag".to_string()),
+            GroupByKey::RelationshipPath {
+                rel: "post".to_string(),
+                column: "author".to_string(),
+            },
+        ];
+        let total_words = Expr::FunctionCall {
+            name: "SUM".to_string(),
+            args: vec![Expr::RelationshipPath {
+                rel: "post".to_string(),
+                column: "word_count".to_string(),
+            }],
+        };
+        let def = TransformDef {
+            target: "tag_totals".to_string(),
+            source: "post_tags".to_string(),
+            key_space: KeySpace::Aggregate {
+                group_by: group_by.clone(),
+            },
+            fields: vec![
+                FieldDef {
+                    name: "tag".to_string(),
+                    expr: Expr::Column("tag".to_string()),
+                },
+                FieldDef {
+                    name: "author".to_string(),
+                    expr: Expr::RelationshipPath {
+                        rel: "post".to_string(),
+                        column: "author".to_string(),
+                    },
+                },
+                FieldDef {
+                    name: "total_words".to_string(),
+                    expr: total_words.clone(),
+                },
+            ],
+            predicate: Predicate::True,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        };
+        let source_columns = HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("post".to_string(), ValueType::Numeric),
+            ("tag".to_string(), ValueType::Text),
+        ]);
+        let to_columns = HashMap::from([
+            ("author".to_string(), ValueType::Text),
+            ("word_count".to_string(), ValueType::Numeric),
+        ]);
+        let relationships = HashMap::from([(
+            "post".to_string(),
+            ResolvedRelationship {
+                cardinality: RelationshipCardinality::ToOne,
+                to_table: "posts".to_string(),
+                to_col: "id".to_string(),
+                column_types: to_columns.clone(),
+            },
+        )]);
+        let field_exprs = HashMap::from([("total_words".to_string(), total_words)]);
+        let field_plans = classify_fields(
+            &def,
+            &group_by,
+            &source_columns,
+            &field_exprs,
+            &relationships,
+        )
+        .expect("classify fields");
+        let plan = AggregateTargetPlan::new(
+            &group_by,
+            vec![ValueType::Text, ValueType::Text],
+            field_plans,
+            "post_tags".to_string(),
+            "tag_totals".to_string(),
+            field_exprs,
+            vec![RelJoin {
+                name: "post".to_string(),
+                to_table: "public.posts".to_string(),
+                to_col: "id".to_string(),
+                from_col: "post".to_string(),
+            }],
+        );
+        let rel_ctx = eval::RelationshipContext::new(HashMap::from([(
+            "post".to_string(),
+            eval::ToOneRelationship {
+                from_col: "post".to_string(),
+                cardinality: RelationshipCardinality::ToOne,
+                to_columns,
+                to_rows_by_key: HashMap::from([(
+                    "1".to_string(),
+                    row(&[
+                        ("id", Some("1")),
+                        ("author", Some("ann")),
+                        ("word_count", Some("100")),
+                    ]),
+                )]),
+            },
+        )]));
+        (def, source_columns, plan, rel_ctx)
+    }
+
+    /// Drains one insert carrying `image` into [`missing_column_fixture`]'s
+    /// plan, returning the plan it built or the error it raised. With
+    /// `has_recompute`, the change folded a `recompute`, so its image only
+    /// names the group to re-derive and is never evaluated for a
+    /// contribution.
+    fn accumulate_one_insert(
+        image: Row,
+        rel_ctx: Option<eval::RelationshipContext>,
+        has_recompute: bool,
+    ) -> Result<AggregateTargetPlan, ApplyError> {
+        let (def, source_columns, mut plan, fixture_ctx) = missing_column_fixture();
+        let rel_ctx = rel_ctx.unwrap_or(fixture_ctx);
+        let mut change = insert_change("15");
+        change.has_recompute = has_recompute;
+        accumulate_changes(
+            &mut plan,
+            &def,
+            &[&change],
+            &[Some(image)],
+            &[None],
+            &[Vec::new()],
+            &source_columns,
+            &mut RegexCache::new(),
+            Some(&rel_ctx),
+        )?;
+        Ok(plan)
+    }
+
+    fn missing_column_of(result: Result<AggregateTargetPlan, ApplyError>) -> String {
+        match result {
+            Err(ApplyError::Eval(eval::EvalError::MissingColumn { column, .. })) => column,
+            Err(other) => panic!("expected MissingColumn, got {other}"),
+            Ok(plan) => panic!(
+                "expected MissingColumn, but the change drained into groups {:?}",
+                plan.groups.keys().collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    /// Issue #677's repro, end to end through [`accumulate_changes`]: an
+    /// image missing the `GROUP BY` column fails with `MissingColumn`
+    /// instead of landing in the `tag = NULL` group. The recompute case is
+    /// the one that used to be silent: nothing evaluates that image except
+    /// the group-key read. (On the delta path the `tag` passthrough field's
+    /// own evaluation raised it already.)
+    #[test]
+    fn an_image_missing_the_group_by_column_raises_missing_column() {
+        for has_recompute in [false, true] {
+            let result = accumulate_one_insert(
+                row(&[("id", Some("15")), ("post", Some("1"))]),
+                None,
+                has_recompute,
+            );
+            assert_eq!(
+                missing_column_of(result),
+                "tag",
+                "has_recompute: {has_recompute}"
+            );
+        }
+    }
+
+    /// Issue #677: an image missing a relationship's `from_col` fails with
+    /// `MissingColumn`, as the evaluator's own `RelationshipPath` arm does,
+    /// instead of resolving the relationship's `GROUP BY` key and fields to
+    /// `NULL`.
+    #[test]
+    fn an_image_missing_the_relationship_from_col_raises_missing_column() {
+        for has_recompute in [false, true] {
+            let result = accumulate_one_insert(
+                row(&[("id", Some("15")), ("tag", Some("rust"))]),
+                None,
+                has_recompute,
+            );
+            assert_eq!(
+                missing_column_of(result),
+                "post",
+                "has_recompute: {has_recompute}"
+            );
+        }
+    }
+
+    /// Issue #677: a matched parent row missing the column read through the
+    /// relationship fails the same way, again matching the evaluator.
+    #[test]
+    fn a_parent_row_missing_the_relationship_column_raises_missing_column() {
+        for has_recompute in [false, true] {
+            let rel_ctx = eval::RelationshipContext::new(HashMap::from([(
+                "post".to_string(),
+                eval::ToOneRelationship {
+                    from_col: "post".to_string(),
+                    cardinality: crate::defs::model::RelationshipCardinality::ToOne,
+                    to_columns: HashMap::from([("word_count".to_string(), ValueType::Numeric)]),
+                    to_rows_by_key: HashMap::from([(
+                        "1".to_string(),
+                        row(&[("id", Some("1")), ("word_count", Some("100"))]),
+                    )]),
+                },
+            )]));
+            let result = accumulate_one_insert(
+                row(&[
+                    ("id", Some("15")),
+                    ("post", Some("1")),
+                    ("tag", Some("rust")),
+                ]),
+                Some(rel_ctx),
+                has_recompute,
+            );
+            assert_eq!(
+                missing_column_of(result),
+                "author",
+                "has_recompute: {has_recompute}"
+            );
+        }
+    }
+
+    /// Issue #677's control: present-but-`NULL` group and join-key columns
+    /// are real SQL `NULL`s, so the change lands in the `(NULL, NULL)` group
+    /// (a `NULL` join key never matches a parent).
+    #[test]
+    fn present_null_group_and_join_key_columns_stay_null() {
+        for has_recompute in [false, true] {
+            let plan = accumulate_one_insert(
+                row(&[("id", Some("15")), ("post", None), ("tag", None)]),
+                None,
+                has_recompute,
+            )
+            .expect("present NULLs are not missing columns");
+            let groups: Vec<&GroupPlan> = plan.groups.values().collect();
+            assert_eq!(groups.len(), 1, "has_recompute: {has_recompute}");
+            assert_eq!(groups[0].group_values, vec![None, None]);
+        }
     }
 
     /// A plan with `Sum`, `Avg`, `Count`, and `RecomputeOnly` fields over
