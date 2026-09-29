@@ -177,6 +177,8 @@ struct Snapshot {
     /// Every `waiting_to_backfill` definition: id, qualified source, and the
     /// to-sides of the relationships it reads a column through.
     waiting: Vec<(i64, String, BTreeSet<String>)>,
+    /// Every definition's target: the tables the target-mutation seam feeds.
+    targets: HashSet<String>,
 }
 
 async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, CaptureError> {
@@ -194,6 +196,12 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
             &[&TransformStatus::WaitingToBackfill.as_str()],
         )
         .await?;
+    let targets = txn
+        .query("select target_table from transform_definitions", &[])
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
     txn.commit().await?;
     let mut waiting = Vec::with_capacity(rows.len());
     for row in rows {
@@ -203,7 +211,11 @@ async fn read_snapshot(client: &mut Client, schema: &str) -> Result<Snapshot, Ca
         let to_sides = to_sides_read(&catalog, &source, &def);
         waiting.push((row.get(0), source, to_sides));
     }
-    Ok(Snapshot { catalog, waiting })
+    Ok(Snapshot {
+        catalog,
+        waiting,
+        targets,
+    })
 }
 
 /// The to-side of every relationship declared on `source` that `def` reads
@@ -233,9 +245,13 @@ fn ready_definitions(
     gated: &HashSet<String>,
 ) -> Vec<i64> {
     let desired: HashSet<&String> = desired.iter().collect();
-    // A table not in `desired` is another definition's target (or not read
-    // at all), fed by the seam: nothing to capture.
-    let current = |table: &String| !desired.contains(table) || captured.contains(table);
+    // A table another definition targets is fed by the seam: nothing to
+    // capture. Any other table not in `desired` is read by a definition
+    // registered after the pass read `desired` (which it does before the
+    // snapshot), so nothing captures it yet.
+    let current = |table: &String| {
+        captured.contains(table) || (!desired.contains(table) && snapshot.targets.contains(table))
+    };
     snapshot
         .waiting
         .iter()
@@ -409,6 +425,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            targets: HashSet::new(),
         }
     }
 
@@ -430,9 +447,19 @@ mod tests {
 
     #[test]
     fn a_seam_fed_source_needs_no_capture() {
-        let snap = snapshot(&[(1, "public.target", &[])]);
+        let mut snap = snapshot(&[(1, "public.target", &[])]);
+        snap.targets.insert("public.target".to_string());
         let ready = ready_definitions(&snap, &[], &BTreeSet::new(), &HashSet::new());
         assert_eq!(ready, vec![1]);
+    }
+
+    #[test]
+    fn a_source_missing_from_desired_that_nothing_targets_is_not_seam_fed() {
+        // Registered between the pass's read of `desired` and its snapshot.
+        let snap = snapshot(&[(1, "public.u", &[]), (2, "public.v", &["public.w"])]);
+        let desired = strings(&["public.u"]);
+        let ready = ready_definitions(&snap, &desired, &set(&["public.u"]), &HashSet::new());
+        assert_eq!(ready, vec![1], "neither v nor w is captured yet");
     }
 
     #[test]

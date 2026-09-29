@@ -487,6 +487,57 @@ async fn a_reader_of_a_widened_to_side_waits_for_the_to_sides_gate() {
     assert!(outcome.ready.contains(&tiered), "{outcome:?}");
 }
 
+/// A pass reads the tables to capture (`desired`) before it reads its
+/// catalog snapshot, so a definition registered in between is in the
+/// snapshot's waiting list while its source isn't in `desired` (#622 C5
+/// review). Such a source must not read as seam-fed: nothing captures it
+/// yet, so the definition waits for the next pass.
+#[tokio::test]
+async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.u (id int primary key, a int); \
+         create table public.v (id int primary key, a int);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define tu");
+    let desired = trellis::defs::publication_tables(&db.pool)
+        .await
+        .expect("read the tables to capture");
+    trellis
+        .apply("TRANSFORM tv FROM public.v SELECT a AS a")
+        .await
+        .expect("define tv after the pass read its tables");
+
+    let outcome = reconcile::reconcile(
+        &mut raw,
+        SCHEMA,
+        &desired,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .expect("capture pass");
+    assert_eq!(captured_columns(&raw, "public.v").await, None);
+    assert_eq!(
+        outcome.ready,
+        vec![definition_id(&raw, "tu").await],
+        "tv's source isn't captured yet: {outcome:?}"
+    );
+
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    assert!(
+        outcome.ready.contains(&definition_id(&raw, "tv").await),
+        "the next pass captures v: {outcome:?}"
+    );
+}
+
 /// A partitioned table can't be captured by statement triggers on its
 /// parent (a write aimed at a partition bypasses them, and a partition
 /// attached later has none), so it is refused as a source at define time.
