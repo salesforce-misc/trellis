@@ -766,7 +766,18 @@ struct Probe {
 
 /// Takes a snapshot and reads writer 0's [`PROBE_ROWS`] newest rows, back to
 /// back, until `stop`.
+///
+/// The read is pinned to a backward scan of the primary key. The statement
+/// is prepared while the table is still empty, and the plan cached then (a
+/// sequential scan and a sort) would read the whole table on every probe,
+/// so the probe's cost would grow with the table and swamp the visibility
+/// checks it exists to time.
 async fn probe_until(raw: RawClient, stop: Arc<AtomicBool>) -> Probe {
+    raw.batch_execute(
+        "set enable_seqscan = off; set enable_bitmapscan = off; set enable_sort = off",
+    )
+    .await
+    .expect("pin the probe to an index scan");
     let sql = raw
         .prepare(&format!(
             "select count(*) from (select 1 from public.{SOURCE_TABLE} \
