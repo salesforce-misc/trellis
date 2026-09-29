@@ -24,7 +24,9 @@
 //!   candidate guards against a renamed or dropped read column, as
 //!   benchmark-only rewrites of the installed functions
 //!   ([`exception_variant`], [`column_check_variant`]).
-//!   `trigger+column-check-txn` runs the same check once per transaction
+//!   `trigger+column-check-guard` runs the same check per statement inside
+//!   the empty-statement guard's query ([`column_check_guard_variant`]), and
+//!   `trigger+column-check-txn` runs it once per transaction
 //!   ([`column_check_per_txn_variant`]). None is product code; C6 builds
 //!   whichever Q2 picks.
 //!
@@ -127,11 +129,12 @@ pub enum Variant {
     Trigger,
     TriggerException,
     TriggerColumnCheck,
+    TriggerColumnCheckGuard,
     TriggerColumnCheckPerTxn,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 8] = [
+    pub const ALL: [Variant; 9] = [
         Variant::None,
         Variant::Btree,
         Variant::RegexIndex,
@@ -139,6 +142,7 @@ impl Variant {
         Variant::Trigger,
         Variant::TriggerException,
         Variant::TriggerColumnCheck,
+        Variant::TriggerColumnCheckGuard,
         Variant::TriggerColumnCheckPerTxn,
     ];
 
@@ -151,6 +155,7 @@ impl Variant {
             Variant::Trigger => "trigger",
             Variant::TriggerException => "trigger+exception",
             Variant::TriggerColumnCheck => "trigger+column-check",
+            Variant::TriggerColumnCheckGuard => "trigger+column-check-guard",
             Variant::TriggerColumnCheckPerTxn => "trigger+column-check-txn",
         }
     }
@@ -173,6 +178,7 @@ impl Variant {
             Variant::Trigger
                 | Variant::TriggerException
                 | Variant::TriggerColumnCheck
+                | Variant::TriggerColumnCheckGuard
                 | Variant::TriggerColumnCheckPerTxn
         )
     }
@@ -355,7 +361,8 @@ pub struct CellOptions {
     /// Overrides every shape's [`Shape::default_rows`].
     pub rows: Option<u64>,
     /// How long a `slot` cell waits, after the writers stop, for intake to
-    /// confirm past their last commit.
+    /// stage the catch-up sentinel, which it stages after every row the
+    /// writers committed.
     pub slot_catch_up: Duration,
     pub probe: ProbeMode,
 }
@@ -531,6 +538,45 @@ pub fn column_check_variant(ddl: &str, columns: &[String]) -> String {
     declare_present(&format!("{}{replacement}{}", &ddl[..start], &ddl[end..]))
 }
 
+/// The empty-statement guard's span in `ddl`: `if not exists (select 1
+/// from <transition table>) then return null; end if;`, and the table.
+fn empty_guard(ddl: &str) -> (usize, usize, String) {
+    const OPEN: &str = "    if not exists (select 1 from ";
+    const CLOSE: &str = "    end if;\n";
+    assert_eq!(
+        ddl.matches(OPEN).count(),
+        1,
+        "the capture function no longer has exactly one {OPEN:?}; update the write-tax rewrite"
+    );
+    let start = ddl.find(OPEN).expect("counted above");
+    let table_end = start
+        + ddl[start..]
+            .find(") then\n        return null;\n")
+            .expect("the empty guard returns null");
+    let table = ddl[start + OPEN.len()..table_end].to_string();
+    let end = table_end + ddl[table_end..].find(CLOSE).expect("the guard ends") + CLOSE.len();
+    (start, end, table)
+}
+
+/// Q2(c), with the `pg_attribute` probe riding in the empty-statement
+/// guard's query instead of the mirror read's. The guard is already a query
+/// (its `EXISTS` subquery keeps it off PL/pgSQL's simple-expression path),
+/// so the probe adds a subplan to a query the function runs anyway, and the
+/// mirror read stays a simple expression. An empty statement skips the
+/// probe; a miss returns without capturing, as in [`column_check_variant`].
+pub fn column_check_guard_variant(ddl: &str, columns: &[String]) -> String {
+    let (start, end, table) = empty_guard(ddl);
+    let guard = format!(
+        "    present := case when exists (select 1 from {table})\n        \
+         then {} else -1 end;\n    \
+         if present < 0 then\n        return null;\n    end if;\n    \
+         if present <> {} then\n        return null;\n    end if;\n",
+        column_probe(columns),
+        columns.len(),
+    );
+    declare_present(&format!("{}{guard}{}", &ddl[..start], &ddl[end..]))
+}
+
 /// Q2(c), checked once per transaction: the same probe, run only when a
 /// transaction-local setting keyed by the table doesn't say this transaction
 /// already checked it. The mirror read stays a simple expression.
@@ -586,8 +632,10 @@ fn pg_cpu(postmaster: u32) -> f64 {
         std::fs::read_to_string(format!("/proc/{postmaster}/task/{postmaster}/children"))
             .unwrap_or_default();
     for child in children.split_whitespace() {
-        // A backend that exits between the two reads is in the
-        // postmaster's cutime instead.
+        // A backend that exits after the postmaster's read and before its
+        // own is in neither. The reads sit at the window's edges, where no
+        // cell backend connects or leaves, so that loses a stray autovacuum
+        // worker's CPU at most.
         total += proc_cpu(child, false).unwrap_or(0.0);
     }
     total
@@ -1243,6 +1291,7 @@ async fn set_up_variant(
         Variant::Trigger
         | Variant::TriggerException
         | Variant::TriggerColumnCheck
+        | Variant::TriggerColumnCheckGuard
         | Variant::TriggerColumnCheckPerTxn => {
             let table = format!("public.{SOURCE_TABLE}");
             let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
@@ -1263,6 +1312,9 @@ async fn set_up_variant(
                 let replaced = match variant {
                     Variant::TriggerException => exception_variant(&ddl),
                     Variant::TriggerColumnCheck => column_check_variant(&ddl, spec.columns()),
+                    Variant::TriggerColumnCheckGuard => {
+                        column_check_guard_variant(&ddl, spec.columns())
+                    }
                     Variant::TriggerColumnCheckPerTxn => {
                         column_check_per_txn_variant(&ddl, spec.columns())
                     }
@@ -1400,8 +1452,6 @@ pub async fn run_cell(
     }
     let disk = disk_tier::since(&raw, &disk_before).await;
 
-    // `slot`: wait for intake to confirm past the writers' last commit, so
-    // its CPU and the ring's WAL are counted.
     // `slot`: wait for intake to stage everything the writers committed, so
     // its CPU and the ring's WAL are counted. A sentinel row committed after
     // the writers finish is staged after all of theirs (intake stages in
@@ -1815,6 +1865,37 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_check_probes_in_the_empty_statement_query() {
+        for (event, table) in [
+            (CaptureEvent::Insert, "trellis_new"),
+            (CaptureEvent::Update, "trellis_new"),
+            (CaptureEvent::Delete, "trellis_old"),
+        ] {
+            let before = ddl(event);
+            let after = column_check_guard_variant(&before, spec().columns());
+            assert!(!after.contains("if not exists"), "{after}");
+            let guard = after
+                .find(&format!(
+                    "    present := case when exists (select 1 from {table})"
+                ))
+                .expect("guard");
+            let probe = after.find("pg_catalog.pg_attribute a").expect("probe");
+            let empty = after.find("if present < 0 then").expect("empty return");
+            let miss = after.find("if present <> 2 then").expect("miss return");
+            let read = after
+                .find("    slot := case when")
+                .expect("the mirror read stays a simple expression");
+            assert!(
+                guard < probe && probe < empty && empty < miss && miss < read,
+                "{after}"
+            );
+            assert_eq!(after.matches("pg_catalog.pg_attribute").count(), 1);
+            assert!(after.contains("    present bigint;\nbegin\n"), "{after}");
+            assert!(!after.contains("exception when"), "{after}");
+        }
+    }
+
+    #[test]
     fn the_per_transaction_check_keeps_the_mirror_read_a_simple_expression() {
         let before = ddl(CaptureEvent::Insert);
         let after = column_check_per_txn_variant(&before, spec().columns());
@@ -1845,6 +1926,7 @@ mod tests {
         for event in REWRITTEN_EVENTS {
             exception_variant(&ddl(event));
             column_check_variant(&ddl(event), spec().columns());
+            column_check_guard_variant(&ddl(event), spec().columns());
             column_check_per_txn_variant(&ddl(event), spec().columns());
         }
     }
