@@ -1,0 +1,19 @@
+-- Issue #622 (C3): the capture gate on a backfill marker. See
+-- `trellis::capture::install`, "Widening and the capture gate".
+--
+-- Installing or widening a table's capture triggers changes which columns
+-- the ring's rows for that table carry. A row the old function staged, still
+-- undrained when a new reader starts applying, would reach that reader
+-- without the columns it reads (`EvalError::MissingColumn`). The install or
+-- widen runs under the table's `SHARE ROW EXCLUSIVE` lock, reads
+-- `pg_current_wal_insert_lsn()` once it holds the lock, and records it here
+-- on the marker it parks in the same transaction. Every row the old function
+-- staged has an `origin_lsn` below it, and every row the new one stages has
+-- one above it. The discharge doesn't dispatch the marker's waiting
+-- definitions while a change to the table below the gate is still pending
+-- in the ring or held in `poison_held`.
+--
+-- Null for a marker no install or widen parked. A repeat park keeps the
+-- highest gate (`greatest`), and a park that isn't an install or widen
+-- leaves it as it is.
+alter table pending_backfill add column capture_gate_lsn pg_lsn;

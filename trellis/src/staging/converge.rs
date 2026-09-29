@@ -281,6 +281,53 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
     Ok(row.get(0))
 }
 
+/// Whether some change to `table` that carries an image and whose origin is
+/// at or below `gate` hasn't drained yet: it sits in a ring slot a batch
+/// still has to claim, or is held in `poison_held`. The capture gate a
+/// trigger install or widen sets on its marker (`capture::install`, issue
+/// #622) holds the marker's discharge while this is true, so no row staged
+/// by the replaced capture function reaches a definition that starts
+/// applying from the discharge.
+///
+/// "Pending" is `converged_through`'s: a row is pending while its slot's
+/// segment isn't `drained`, or while it is a phase-gap straggler its
+/// segment's fence can't see. Condition 2's active-slot arm is subsumed here,
+/// since the active segment is never `drained`. A row of unknown origin
+/// (`NULL`) is conservatively old. `recompute` and `truncate` rows carry no
+/// image a reader could miss a column of, so they don't hold the gate.
+///
+/// Scans each slot for `table`'s rows: no index serves `src_table`. It runs
+/// once per discharge pass, and only for a gated marker.
+pub async fn table_changes_pending_through(
+    client: &impl GenericClient,
+    table: &str,
+    gate: PgLsn,
+) -> Result<bool, StagingError> {
+    const IMAGED: &str = "op not in ('recompute', 'truncate')";
+    let arms = per_ring_table(" union all ", |slot, ring| {
+        format!(
+            "select 1 from {ring} r \
+             where r.src_table = $1 and r.{IMAGED} \
+               and (r.origin_lsn is null or r.origin_lsn <= $2) \
+               and exists ( \
+                   select 1 from segments s \
+                   where s.ring_slot = {slot} \
+                     and (s.state <> 'drained' \
+                          or (s.fence_snapshot is not null \
+                              and not pg_visible_in_snapshot(r.row_txid, s.fence_snapshot))) \
+               )"
+        )
+    });
+    let sql = format!(
+        "select exists ({arms} union all \
+             select 1 from poison_held p \
+             where p.src_table = $1 and p.{IMAGED} \
+               and (p.origin_lsn is null or p.origin_lsn <= $2))"
+    );
+    let row = client.query_one(&sql, &[&table, &gate]).await?;
+    Ok(row.get(0))
+}
+
 /// Takes a watermark token: `pg_current_wal_lsn()` on the caller's own
 /// connection. The caller must run this *after* its mutation has committed
 /// — taken any earlier, it would bound the write from below instead of

@@ -13,12 +13,12 @@
 //! - [`columns`] decides which columns a table's triggers image, from the
 //!   catalog (C2).
 //! - [`sql`] generates the functions and triggers for one table (C2).
-//! - Installing them under `locks::DdlRetry`, and reading back what is
-//!   installed, is C3. The staging worker's reconcile pass that calls it is
-//!   C5.
+//! - [`install`] installs, widens, narrows and uninstalls them under
+//!   `locks::DdlRetry`, and reads back what is installed from the catalog
+//!   (C3). The staging worker's reconcile pass that calls it is C5.
 //!
-//! Until C3 and C5 land, nothing at runtime calls this module. The
-//! `tests/capture_parity.rs` gate installs the generated SQL by hand.
+//! Until C5 lands, nothing at runtime calls this module. The tests drive it
+//! by hand.
 //!
 //! # What the images must equal
 //!
@@ -61,12 +61,12 @@
 //! Under OLD+NEW images no image shape fixes this; D's NEW-only apply with a
 //! re-read image does.
 
-// C3 (install) and C5 (reconcile) are the callers. Until they land, only the
-// tests reach this module, and a build without `internals` would flag every
-// item as dead.
+// C5 (reconcile) is the caller. Until it lands, only the tests reach this
+// module, and a build without `internals` would flag every item as dead.
 #![cfg_attr(not(feature = "internals"), allow(dead_code))]
 
 pub mod columns;
+pub mod install;
 pub mod sql;
 
 use std::fmt;
@@ -88,7 +88,12 @@ pub enum CaptureError {
     InvalidTableName(String),
     /// Reading the catalog failed.
     Catalog(crate::defs::catalog::CatalogError),
-    /// A query against `pg_catalog` failed.
+    /// Parking the backfill marker an install or widen commits with failed
+    /// ([`install`]).
+    Marker(crate::intake::IntakeError),
+    /// A catalog read, or the capture DDL, failed. A lock timeout on a user
+    /// table lands here too ([`crate::locks::is_lock_not_available`] tells it
+    /// apart), once [`install`]'s retries stop at their deadline.
     Db(tokio_postgres::Error),
 }
 
@@ -110,7 +115,8 @@ impl fmt::Display for CaptureError {
                 write!(f, "{name:?} is not a schema.table identity")
             }
             CaptureError::Catalog(e) => write!(f, "reading the catalog for capture: {e}"),
-            CaptureError::Db(e) => write!(f, "reading pg_catalog for capture: {e}"),
+            CaptureError::Marker(e) => write!(f, "parking the capture's backfill marker: {e}"),
+            CaptureError::Db(e) => write!(f, "capture DDL or catalog read failed: {e}"),
         }
     }
 }
@@ -119,6 +125,7 @@ impl std::error::Error for CaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CaptureError::Catalog(e) => Some(e),
+            CaptureError::Marker(e) => Some(e),
             CaptureError::Db(e) => Some(e),
             _ => None,
         }
@@ -128,6 +135,12 @@ impl std::error::Error for CaptureError {
 impl From<crate::defs::catalog::CatalogError> for CaptureError {
     fn from(e: crate::defs::catalog::CatalogError) -> Self {
         CaptureError::Catalog(e)
+    }
+}
+
+impl From<crate::intake::IntakeError> for CaptureError {
+    fn from(e: crate::intake::IntakeError) -> Self {
+        CaptureError::Marker(e)
     }
 }
 

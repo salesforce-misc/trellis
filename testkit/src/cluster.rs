@@ -868,6 +868,13 @@ fn spawn_server(
         // keeps them in `$PGDATA/pg_dynshmem`, which both already delete.
         .arg("-c")
         .arg("dynamic_shared_memory_type=mmap")
+        // Postgres's default of 0 refuses `PREPARE TRANSACTION`. Trigger
+        // capture (#622) must stage a prepared transaction's rows into the
+        // batch that claims it once `COMMIT PREPARED` lands, and
+        // `trellis/tests/capture_install.rs` checks that. A few slots cost
+        // a few kilobytes of shared memory.
+        .arg("-c")
+        .arg("max_prepared_transactions=8")
         // Tests that assert on what the server logged (`log_statement =
         // 'all'`, see `trellis/tests/apply.rs`) read the `postgres.log`
         // file the two `Stdio::from` handles below point at. That only

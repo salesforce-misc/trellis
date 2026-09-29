@@ -254,6 +254,72 @@ pub fn install_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String
     Ok(statements)
 }
 
+/// Every statement that replaces `spec`'s capture functions without touching
+/// the triggers, in order: per event, the function, the revoke of `PUBLIC`'s
+/// `EXECUTE` and the comment. A widen or narrow runs these (C3,
+/// `capture::install`); `CREATE OR REPLACE FUNCTION` keeps the function's
+/// owner and privileges, and the revoke is repeated anyway so the statements
+/// stand on their own.
+pub fn function_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String>, CaptureError> {
+    let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 3);
+    for event in CaptureEvent::ALL {
+        statements.push(function_ddl(schema, spec, event)?);
+        statements.push(revoke_ddl(schema, spec, event)?);
+        statements.push(comment_ddl(schema, spec, event)?);
+    }
+    Ok(statements)
+}
+
+/// Every statement that removes `table`'s capture in instance schema
+/// `schema`, in order: the four triggers, then the four functions, each `if
+/// exists`, so a partial install is removed as well. With `table_exists`
+/// false (the application dropped the table, and its triggers with it) only
+/// the functions are dropped.
+pub fn uninstall_statements(
+    schema: &str,
+    table: &str,
+    table_exists: bool,
+) -> Result<Vec<String>, CaptureError> {
+    let quoted = quoted_table(table)?;
+    let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 2);
+    if table_exists {
+        for event in CaptureEvent::ALL {
+            statements.push(format!(
+                "drop trigger if exists {} on {quoted}",
+                quote_ident(&trigger_name(schema, event))
+            ));
+        }
+    }
+    for event in CaptureEvent::ALL {
+        statements.push(format!(
+            "drop function if exists {}()",
+            qualified_function_name(schema, table, event)?
+        ));
+    }
+    Ok(statements)
+}
+
+/// `ALTER FUNCTION … OWNER TO` `owner` for each of `table`'s capture
+/// functions: the functions run as their owner (`SECURITY DEFINER`), which
+/// #622's plan (Q3) makes the role that owns the instance schema, whoever
+/// installs them.
+pub fn owner_statements(
+    schema: &str,
+    table: &str,
+    owner: &str,
+) -> Result<Vec<String>, CaptureError> {
+    CaptureEvent::ALL
+        .iter()
+        .map(|event| {
+            Ok(format!(
+                "alter function {}() owner to {}",
+                qualified_function_name(schema, table, *event)?,
+                quote_ident(owner)
+            ))
+        })
+        .collect()
+}
+
 /// `REVOKE ALL ON FUNCTION … FROM PUBLIC` for `spec`'s `event` capture
 /// function.
 ///
@@ -355,11 +421,27 @@ fn qualified_function(
     spec: &CaptureSpec,
     event: CaptureEvent,
 ) -> Result<String, CaptureError> {
+    qualified_function_name(schema, &spec.table, event)
+}
+
+fn qualified_function_name(
+    schema: &str,
+    table: &str,
+    event: CaptureEvent,
+) -> Result<String, CaptureError> {
     Ok(format!(
         "{}.{}",
         quote_ident(schema),
-        quote_ident(&function_name(&spec.table, event)?)
+        quote_ident(&function_name(table, event)?)
     ))
+}
+
+/// What `pg_proc.prosrc` holds for the function [`function_ddl`] creates:
+/// the text between the dollar quotes. C3's `installed` compares the two to
+/// tell a function this build would generate from one an older generator,
+/// or a hand edit, left behind.
+pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
+    format!("\n{}", function_body(schema, spec, event))
 }
 
 /// The PL/pgSQL body, from `#variable_conflict` through `end;`.
@@ -624,7 +706,7 @@ fn split_table(table: &str) -> Result<(&str, &str), CaptureError> {
     }
 }
 
-fn quoted_table(table: &str) -> Result<String, CaptureError> {
+pub(crate) fn quoted_table(table: &str) -> Result<String, CaptureError> {
     let (schema, name) = split_table(table)?;
     Ok(format!("{}.{}", quote_ident(schema), quote_ident(name)))
 }
@@ -678,6 +760,67 @@ mod tests {
 
     fn ddl(spec: &CaptureSpec, event: CaptureEvent) -> String {
         function_ddl("trellis", spec, event).unwrap()
+    }
+
+    #[test]
+    fn replacing_the_functions_touches_no_trigger_and_keeps_the_revoke() {
+        let statements = function_statements("trellis", &spec()).unwrap();
+        assert_eq!(statements.len(), 12);
+        assert!(
+            statements
+                .iter()
+                .all(|s| !s.starts_with("create or replace trigger")
+                    && !s.starts_with("alter table"))
+        );
+        for event in CaptureEvent::ALL {
+            let function = function_name("public.orders", event).unwrap();
+            let revoke = statements
+                .iter()
+                .position(|s| s.starts_with("revoke") && s.contains(&function))
+                .expect("a revoke per function");
+            assert!(statements[revoke - 1].starts_with("create or replace function"));
+            assert!(statements[revoke - 1].contains(&function));
+        }
+    }
+
+    #[test]
+    fn the_source_is_what_the_function_ddl_quotes() {
+        for event in CaptureEvent::ALL {
+            let ddl = ddl(&spec(), event);
+            let source = function_source("trellis", &spec(), event);
+            let tag = "$trellis_capture$";
+            let quoted = &ddl[ddl.find(tag).unwrap() + tag.len()..ddl.rfind(tag).unwrap()];
+            assert_eq!(quoted, source);
+        }
+    }
+
+    #[test]
+    fn an_uninstall_drops_triggers_before_functions_and_skips_them_for_a_dropped_table() {
+        let statements = uninstall_statements("trellis", "public.orders", true).unwrap();
+        assert_eq!(statements.len(), 8);
+        assert!(statements[..4].iter().all(|s| {
+            s.starts_with("drop trigger if exists \"trellis_capture_")
+                && s.ends_with(" on \"public\".\"orders\"")
+        }));
+        assert!(
+            statements[4..]
+                .iter()
+                .all(|s| s.starts_with("drop function if exists \"trellis\".\"cap_"))
+        );
+        let gone = uninstall_statements("trellis", "public.orders", false).unwrap();
+        assert_eq!(gone, statements[4..]);
+    }
+
+    #[test]
+    fn ownership_goes_to_the_named_role_quoted() {
+        let statements = owner_statements("trellis", "public.orders", "Migrator").unwrap();
+        assert_eq!(statements.len(), 4);
+        assert!(
+            statements
+                .iter()
+                .all(|s| s.starts_with("alter function \"trellis\".\"cap_")
+                    && s.ends_with("() owner to \"Migrator\""))
+        );
     }
 
     #[test]

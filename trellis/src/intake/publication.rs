@@ -645,6 +645,11 @@ struct PendingBackfill {
     /// Whether the discharge refreshes the relationship projections on
     /// `table` ([`request_projection_refresh`], issue #507).
     refresh_projections: bool,
+    /// The capture gate a trigger install or widen set
+    /// (`capture::install`, issue #622): the discharge waits until no change
+    /// to `table` at or below it is still pending
+    /// ([`crate::staging::converge::table_changes_pending_through`]).
+    capture_gate: Option<PgLsn>,
 }
 
 /// Reads every marker, in the order they were parked (issue #457): a pass
@@ -656,7 +661,8 @@ async fn fetch_pending_backfills(
     let rows = client
         .query(
             "select table_name, fence_xid::text::bigint, generation, attempts, \
-                    coalesce(next_attempt_at <= now(), true), refresh_projections \
+                    coalesce(next_attempt_at <= now(), true), refresh_projections, \
+                    capture_gate_lsn \
              from pending_backfill order by generation",
             &[],
         )
@@ -670,6 +676,7 @@ async fn fetch_pending_backfills(
             attempts: r.get(3),
             due: r.get(4),
             refresh_projections: r.get(5),
+            capture_gate: r.get(6),
         })
         .collect())
 }
@@ -1191,6 +1198,27 @@ pub(crate) async fn run_pending_backfills_until(
             tracing::debug!(
                 table = %marker.table,
                 "backfill marker not yet settled; still waiting on the xmin fence"
+            );
+            continue;
+        }
+        if let Some(gate) = marker.capture_gate
+            && crate::staging::converge::table_changes_pending_through(
+                &*client,
+                &marker.table,
+                gate,
+            )
+            .await?
+        {
+            // Issue #622: a definition this discharge dispatches starts
+            // applying at once, and a row the replaced capture function
+            // staged lacks the columns it may read. Those rows drain on their
+            // own, through the definitions already applying, so this only
+            // waits; see `capture::install`, "Widening and the capture gate".
+            tracing::debug!(
+                table = %marker.table,
+                gate = %gate,
+                "backfill marker held by its capture gate: changes staged before the \
+                 capture install or widen haven't drained yet"
             );
             continue;
         }
