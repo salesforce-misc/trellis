@@ -9866,6 +9866,15 @@ async fn drain_batch(
             }
             Err(err) => {
                 let _ = txn.rollback().await;
+                // Issue #670: isolation can run for many probes, each with
+                // its own compute and pooled connection. Holding this page's
+                // plan and connection across it cost about 1.5x the page's
+                // plan in memory, and one pooled connection sitting idle for
+                // the whole isolation, which on a small pool left the probes'
+                // own checkouts waiting on it until they timed out. A retry
+                // recomputes the plan and checks out a connection anyway.
+                drop(client);
+                drop(plan);
                 if let Some(retry_folded) = classify_and_retry(
                     pool,
                     representative_seg_seq,
@@ -10106,6 +10115,24 @@ async fn classify_and_retry(
                         error = %err,
                         "isolation hit its probe limit without pinning the failure on a key; \
                          surfacing the original failure"
+                    );
+                    Err(err)
+                }
+                // Warn: a lock or deadlock storm stopped isolation before it
+                // could look at the batch (issue #670). Surfacing ends this
+                // drain call, so the page is retried on a later drain rather
+                // than isolated again while the storm lasts. Retrying here
+                // instead would hold the claim through up to
+                // `MAX_APPLY_ATTEMPTS` more storms, each as long as
+                // `MAX_CONSECUTIVE_TRANSIENT_PROBES` lock timeouts.
+                quarantine::IsolationOutcome::TransientStorm { probes } => {
+                    tracing::warn!(
+                        seg_seq,
+                        probes,
+                        consecutive_transient = quarantine::MAX_CONSECUTIVE_TRANSIENT_PROBES,
+                        error = %err,
+                        "isolation stopped: its latest probes all hit transient errors; charged \
+                         nothing, surfacing the original failure so a later drain retries the page"
                     );
                     Err(err)
                 }

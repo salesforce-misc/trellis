@@ -583,6 +583,35 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         Some(canonical.as_str())
     );
     assert_eq!(evicted.fields.get("key").map(String::as_str), Some("1"));
+
+    // Issue #670: isolation logs its start and its end, the end naming the
+    // outcome, the keys it pinned, the probes it used and how long it took.
+    let field = |event: &CapturedEvent, name: &str| {
+        event
+            .fields
+            .get(name)
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_else(|| panic!("no `{name}` on {event:?}"))
+    };
+    let started = events
+        .iter()
+        .find(|e| e.message().starts_with("isolating a failed batch"))
+        .unwrap_or_else(|| panic!("no isolation start event: {events:#?}"));
+    assert_eq!(started.level, tracing::Level::INFO);
+    assert_eq!(field(started, "records"), "1");
+    let finished = events
+        .iter()
+        .find(|e| e.message() == "isolation finished")
+        .unwrap_or_else(|| panic!("no isolation end event: {events:#?}"));
+    assert_eq!(finished.level, tracing::Level::INFO);
+    assert_eq!(field(finished, "outcome"), "Evicted");
+    assert_eq!(field(finished, "pinned"), "1");
+    assert_eq!(field(finished, "probes"), "1");
+    assert_eq!(field(finished, "records"), "1");
+    assert_eq!(field(finished, "search"), "complete");
+    field(finished, "elapsed_ms")
+        .parse::<u64>()
+        .expect("elapsed_ms is a number");
 }
 
 /// Issue #614: when isolation pins a failure on a key that is still below the

@@ -126,8 +126,16 @@ pub enum FailureClass {
 /// construction, retried by [`super::apply::drain_once`]'s reload-recompute
 /// loop — which is itself what "once every predecessor has drained" reduces
 /// to when there is no separate signal to wait on.
+///
+/// **The innermost [`ApplyError`] decides (issue #670).** An `ApplyError`
+/// can nest another on its [`std::error::Error::source`] chain, as
+/// `ApplyError::Backfill(BackfillError::Propagation(Box<ApplyError>))` does
+/// when a backfill's downstream propagation fails. The wrapper says only
+/// where the failure surfaced; the innermost says what it is, so a
+/// structural `Ddl(NoPrimaryKey)` is [`FailureClass::Halting`] whether it
+/// arrives bare or wrapped.
 pub fn classify(err: &ApplyError) -> FailureClass {
-    match err {
+    match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
         ApplyError::HopBoundExceeded { .. } => FailureClass::Halting,
         // Both of these mean "this definition can never work against this
@@ -150,6 +158,20 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }
+}
+
+/// The last [`ApplyError`] on `err`'s [`std::error::Error::source`] chain,
+/// `err` itself if it nests none. See [`classify`].
+fn innermost_apply_error(err: &ApplyError) -> &ApplyError {
+    let mut innermost = err;
+    let mut link = std::error::Error::source(err);
+    while let Some(err) = link {
+        if let Some(apply) = err.downcast_ref::<ApplyError>() {
+            innermost = apply;
+        }
+        link = err.source();
+    }
+    innermost
 }
 
 /// Whether `err` is a transient Postgres or pool failure, whichever
@@ -192,6 +214,12 @@ fn is_transient(err: &ApplyError) -> bool {
 /// is `None` for a connection-level failure (never reached the server to get
 /// a SQLSTATE at all), which is exactly the "dropped connection" case doc 05
 /// lists alongside the coded ones.
+///
+/// Plus `53300` (too many connections, issue #670): the server refused a new
+/// connection because `max_connections`, or a role's or database's
+/// connection limit, is full. It arrives on a pool checkout
+/// (`PoolError::Backend`) or an unpooled page session's connect, and says
+/// only that the server is busy, nothing about any record.
 fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool {
     use tokio_postgres::error::SqlState;
     match code {
@@ -200,6 +228,7 @@ fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool
                 || *code == SqlState::T_R_DEADLOCK_DETECTED
                 || *code == SqlState::LOCK_NOT_AVAILABLE
                 || *code == SqlState::QUERY_CANCELED
+                || *code == SqlState::TOO_MANY_CONNECTIONS
         }
         None => true,
     }
@@ -493,6 +522,14 @@ pub enum IsolationOutcome {
     /// which means every part of the batch that could hold a failing key was
     /// probed.
     ProbeLimitReached { probes: usize },
+    /// Isolation stopped after [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] probes in
+    /// a row hit a transient error, without pinning the failure on any key
+    /// (issue #670). Nothing was charged. A lock or deadlock storm says
+    /// nothing about the batch's records, and each probe in it can wait out a
+    /// whole `lock_timeout`, so isolation stops rather than spending the rest
+    /// of [`MAX_ISOLATION_PROBES`] on it; the page is retried on a later
+    /// drain, once the storm may have passed.
+    TransientStorm { probes: usize },
     /// At least one key reproduced the failure alone and was charged a death,
     /// but none reached the threshold, so nothing was evicted. Every entry in
     /// `charged` is below the threshold.
@@ -572,6 +609,28 @@ fn partition_by_threshold(
 /// again on the batch's next failed drain.
 pub const MAX_ISOLATION_PROBES: usize = 256;
 
+/// How many probes in a row may hit a transient error before one
+/// [`isolate_and_evict`] call stops (issue #670), ending
+/// [`IsolationOutcome::TransientStorm`] unless it already pinned a key.
+///
+/// A probe that hits a lock timeout has waited a whole
+/// [`crate::locks::LOCK_TIMEOUT`] (120 s) first. Before this limit, a lock
+/// storm could run all [`MAX_ISOLATION_PROBES`] probes into it, about 8.5
+/// hours on one page. Three bounds it at 6 minutes, the same three lock
+/// timeouts a page's own lock-timeout retries get (`apply`'s
+/// `LOCK_RETRY_BUDGET`), after which the drain surfaces the failure and the
+/// page is retried later. A deadlock or serialization failure fails fast, so
+/// the bound only matters for lock waits. Three in a row is also rare
+/// enough outside a storm not to cut a healthy isolation short: an isolated
+/// transient is followed by a clean or failing probe that resets the count.
+///
+/// One record whose every run hits a transient error (a target row held
+/// locked by a long transaction) also stops the search, since bisection
+/// probes that record's shrinking runs one after another. That costs nothing:
+/// the page's own apply waits on the same record, so the page can't commit
+/// until the lock goes, however much of it isolation evicted.
+pub const MAX_CONSECUTIVE_TRANSIENT_PROBES: usize = 3;
+
 /// What one isolation probe of a run of records showed (issue #655).
 #[derive(Debug)]
 enum ProbeVerdict<E> {
@@ -581,10 +640,14 @@ enum ProbeVerdict<E> {
     /// something in it fails, alone or together with others in the run.
     Failed(E),
     /// The run failed in a way that says nothing about its records: a
-    /// transient error, or a version fence miss. For a run of several records
-    /// that means "look closer", the same as [`Self::Failed`]; for a single
-    /// record it means "not reproduced", as it always has.
+    /// version fence miss. For a run of several records that means "look
+    /// closer", the same as [`Self::Failed`]; for a single record it means
+    /// "not reproduced", as it always has.
     Unknown,
+    /// The run hit a transient error: handled exactly as [`Self::Unknown`],
+    /// except that [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] of these in a row stop
+    /// the search (issue #670).
+    Transient,
 }
 
 /// What a [`Bisector`] found.
@@ -597,6 +660,9 @@ struct Bisection<E> {
     probes: usize,
     /// Whether it stopped at the probe limit with runs still unprobed.
     exhausted: bool,
+    /// Whether it stopped after [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] probes
+    /// in a row hit a transient error, with runs still unprobed.
+    transient_storm: bool,
 }
 
 /// One entry on a [`Bisector`]'s stack of work still to do.
@@ -670,6 +736,9 @@ struct Bisector<E> {
     /// Where a dead end's single-record probes start, modulo its length.
     dead_end_offset: usize,
     max_probes: usize,
+    /// How many of the latest probes in a row were
+    /// [`ProbeVerdict::Transient`].
+    consecutive_transient: usize,
     found: Bisection<E>,
 }
 
@@ -681,10 +750,12 @@ impl<E> Bisector<E> {
             current_half_of: None,
             dead_end_offset,
             max_probes,
+            consecutive_transient: 0,
             found: Bisection {
                 failing: Vec::new(),
                 probes: 0,
                 exhausted: false,
+                transient_storm: false,
             },
         };
         match n {
@@ -722,9 +793,14 @@ impl<E> Bisector<E> {
     }
 
     /// The next run to probe, counted as a probe, or `None` once the search
-    /// is done or has hit the probe limit.
+    /// is done, has hit the probe limit, or has seen
+    /// [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] transient probes in a row.
     fn next_run(&mut self) -> Option<Range<usize>> {
         if self.pending.is_empty() {
+            return None;
+        }
+        if self.consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT_PROBES {
+            self.found.transient_storm = true;
             return None;
         }
         if self.found.probes == self.max_probes {
@@ -755,6 +831,11 @@ impl<E> Bisector<E> {
     /// What probing `run` (the last [`Self::next_run`]) showed.
     fn record(&mut self, run: Range<usize>, verdict: ProbeVerdict<E>) {
         let half_of = self.current_half_of.take();
+        if matches!(verdict, ProbeVerdict::Transient) {
+            self.consecutive_transient += 1;
+        } else {
+            self.consecutive_transient = 0;
+        }
         match verdict {
             ProbeVerdict::Clean => {
                 if let Some(index) = half_of {
@@ -769,9 +850,9 @@ impl<E> Bisector<E> {
             ProbeVerdict::Failed(err) if run.len() == 1 => {
                 self.found.failing.push((run.start, err))
             }
-            ProbeVerdict::Unknown if run.len() == 1 => {}
+            ProbeVerdict::Unknown | ProbeVerdict::Transient if run.len() == 1 => {}
             ProbeVerdict::Failed(_) => self.split(run, true),
-            ProbeVerdict::Unknown => self.split(run, false),
+            ProbeVerdict::Unknown | ProbeVerdict::Transient => self.split(run, false),
         }
     }
 
@@ -889,8 +970,15 @@ async fn probe_records(
 /// may hold a failing key; for a single record it is not a reproduction and
 /// charges nothing, as before. Probing smaller runs is also what gives a probe
 /// that hit lock contention or a statement timeout its best chance of an
-/// answer. A persistently failing database ends at the probe limit (or
-/// propagates as `Err` once checking out a connection fails).
+/// answer. A database that keeps failing transiently stops the search after
+/// [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] such probes in a row (issue #670),
+/// or propagates as `Err` once checking out a connection fails.
+///
+/// **Logged at start and end (issue #670)**, with the batch's record count
+/// and, at the end, the probes used, the outcome, how many keys it pinned,
+/// whether the search ran to completion, and the time it took. Isolation
+/// holds the page's buckets for as long as it runs, so its cost is worth
+/// seeing on every call, not only when it fails.
 ///
 /// `folded`'s truncates and deferred relationship reverses are never probed.
 ///
@@ -902,6 +990,8 @@ async fn probe_records(
 ///   holds, unmodified).
 /// - `Ok(ProbeLimitReached { .. })` if the probe limit stopped isolation
 ///   before it pinned any key; handled as `NothingReproduced` is.
+/// - `Ok(TransientStorm { .. })` if [`MAX_CONSECUTIVE_TRANSIENT_PROBES`]
+///   probes in a row hit a transient error before it pinned any key.
 /// - `Ok(ChargedBelowThreshold { .. })` if keys reproduced and were charged
 ///   but none reached `threshold`; the caller surfaces the original failure,
 ///   exactly as for `NothingReproduced`, but can say which keys it pinned.
@@ -940,7 +1030,135 @@ pub async fn isolate_and_evict(
     if threshold == 0 {
         return Ok(IsolationOutcome::FuseDisabled);
     }
+    let started = std::time::Instant::now();
+    tracing::info!(
+        seg_seq,
+        records = folded.len(),
+        "isolating a failed batch: probing its records for the keys that fail alone"
+    );
+    let mut stats = IsolationStats::default();
+    let result = isolate_and_evict_probing(
+        pool,
+        seg_seq,
+        claimed_by,
+        wake_channel,
+        folded,
+        threshold,
+        &mut stats,
+    )
+    .await;
+    log_isolation_finished(seg_seq, folded.len(), &stats, &result, started.elapsed());
+    result
+}
 
+/// What one [`isolate_and_evict`] call's probing did, for its end-of-call
+/// log line: filled in as it goes, so a call that stops on an error still
+/// reports the probes it spent.
+#[derive(Debug, Default)]
+struct IsolationStats {
+    probes: usize,
+    /// Why the search stopped short, or `None` if it ran to completion.
+    stopped: Option<IsolationStop>,
+}
+
+/// Why a [`Bisector`] search stopped with runs still unprobed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsolationStop {
+    ProbeLimit,
+    TransientStorm,
+}
+
+impl IsolationOutcome {
+    /// This outcome's name, for a log field.
+    fn label(&self) -> &'static str {
+        match self {
+            IsolationOutcome::FuseDisabled => "FuseDisabled",
+            IsolationOutcome::NothingReproduced => "NothingReproduced",
+            IsolationOutcome::ProbeLimitReached { .. } => "ProbeLimitReached",
+            IsolationOutcome::TransientStorm { .. } => "TransientStorm",
+            IsolationOutcome::ChargedBelowThreshold { .. } => "ChargedBelowThreshold",
+            IsolationOutcome::Evicted { .. } => "Evicted",
+        }
+    }
+}
+
+/// [`isolate_and_evict`]'s end-of-call log line (issue #670). `records` is
+/// the batch's record count; `pinned` counts the keys it charged, evicted
+/// or not. `info`, or `warn` when the search stopped short or on an error:
+/// either leaves part of the batch unprobed.
+fn log_isolation_finished(
+    seg_seq: i64,
+    records: usize,
+    stats: &IsolationStats,
+    result: &Result<IsolationOutcome, ApplyError>,
+    elapsed: std::time::Duration,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let probes = stats.probes;
+    let search = match stats.stopped {
+        None => "complete",
+        Some(IsolationStop::ProbeLimit) => "stopped at the probe limit",
+        Some(IsolationStop::TransientStorm) => "stopped on consecutive transient errors",
+    };
+    match result {
+        Ok(outcome) => {
+            let pinned = match outcome {
+                IsolationOutcome::ChargedBelowThreshold { charged } => charged.len(),
+                IsolationOutcome::Evicted {
+                    retry_folded,
+                    charged,
+                } => records.saturating_sub(retry_folded.len()) + charged.len(),
+                _ => 0,
+            };
+            let outcome = outcome.label();
+            if stats.stopped.is_some() {
+                tracing::warn!(
+                    seg_seq,
+                    records,
+                    probes,
+                    outcome,
+                    pinned,
+                    search,
+                    elapsed_ms,
+                    "isolation finished without probing the whole batch; keys it did not reach \
+                     are not charged this drain"
+                );
+            } else {
+                tracing::info!(
+                    seg_seq,
+                    records,
+                    probes,
+                    outcome,
+                    pinned,
+                    search,
+                    elapsed_ms,
+                    "isolation finished"
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
+            seg_seq,
+            records,
+            probes,
+            outcome = "error",
+            search,
+            elapsed_ms,
+            error = %err,
+            "isolation stopped on an error"
+        ),
+    }
+}
+
+/// [`isolate_and_evict`] past its fuse check and start-of-call log.
+async fn isolate_and_evict_probing(
+    pool: &Pool,
+    seg_seq: i64,
+    claimed_by: &str,
+    wake_channel: &str,
+    folded: &[FoldedChange],
+    threshold: i32,
+    stats: &mut IsolationStats,
+) -> Result<IsolationOutcome, ApplyError> {
     // Issue #283: every counter/marker write below lands under the *canonical*
     // (qualified, where resolvable) identity of the ring row's `src_table`,
     // never the raw spelling — resolved once per distinct source table here and
@@ -986,6 +1204,7 @@ pub async fn isolate_and_evict(
         random_dead_end_offset(),
     );
     while let Some(run) = bisector.next_run() {
+        stats.probes += 1;
         let records = &candidates[run.clone()];
         let Some(err) = probe_records(pool, seg_seq, claimed_by, wake_channel, records).await?
         else {
@@ -1042,29 +1261,19 @@ pub async fn isolate_and_evict(
                 }
                 ProbeVerdict::Failed(err)
             }
-            FailureClass::Transient | FailureClass::VersionFenceMiss => ProbeVerdict::Unknown,
+            FailureClass::Transient => ProbeVerdict::Transient,
+            FailureClass::VersionFenceMiss => ProbeVerdict::Unknown,
         };
         bisector.record(run, verdict);
     }
     let bisection = bisector.finish();
-
-    tracing::debug!(
-        seg_seq,
-        records = candidates.len(),
-        probes = bisection.probes,
-        reproduced = bisection.failing.len(),
-        "isolation probes finished"
-    );
-    if bisection.exhausted {
-        tracing::warn!(
-            seg_seq,
-            records = candidates.len(),
-            probes = bisection.probes,
-            reproduced = bisection.failing.len(),
-            "isolation stopped at its probe limit; records it did not reach are not charged \
-             this drain"
-        );
-    }
+    stats.stopped = if bisection.transient_storm {
+        Some(IsolationStop::TransientStorm)
+    } else if bisection.exhausted {
+        Some(IsolationStop::ProbeLimit)
+    } else {
+        None
+    };
 
     let mut poisoned: Vec<PoisonedProbe> = Vec::with_capacity(bisection.failing.len());
     for (index, err) in bisection.failing {
@@ -1078,12 +1287,14 @@ pub async fn isolate_and_evict(
     }
 
     if poisoned.is_empty() {
-        return Ok(if bisection.exhausted {
-            IsolationOutcome::ProbeLimitReached {
+        return Ok(match stats.stopped {
+            Some(IsolationStop::TransientStorm) => IsolationOutcome::TransientStorm {
                 probes: bisection.probes,
-            }
-        } else {
-            IsolationOutcome::NothingReproduced
+            },
+            Some(IsolationStop::ProbeLimit) => IsolationOutcome::ProbeLimitReached {
+                probes: bisection.probes,
+            },
+            None => IsolationOutcome::NothingReproduced,
         });
     }
 
@@ -3102,14 +3313,17 @@ mod unit_tests {
         assert!(found.exhausted);
     }
 
-    /// A transient error says nothing about the run. Bisection looks inside a
-    /// run that hit one rather than skipping a half that may hold a failing
-    /// record, and never blames a single record for one.
+    /// A transient error or a fence miss says nothing about the run.
+    /// Bisection looks inside a run that hit one rather than skipping a half
+    /// that may hold a failing record, and never blames a single record for
+    /// one.
     #[test]
     fn bisect_looks_inside_a_transient_run_and_never_blames_a_record_for_it() {
         let n = 1000;
-        // Record 100 makes every run holding it hit a transient error; 900
-        // fails alone, and so does 150, which shares 100's half.
+        // Record 100 makes every run holding it miss the fence; 900 fails
+        // alone, and so does 150, which shares 100's half. (A record that
+        // makes every run holding it hit a *transient* error stops the
+        // search instead: see `bisect_stops_after_consecutive_transient_probes`.)
         let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
             if run.contains(&900) || run.contains(&150) {
                 ProbeVerdict::Failed(())
@@ -3121,15 +3335,288 @@ mod unit_tests {
         });
         assert_eq!(failing_indexes(&found), vec![150, 900]);
         assert!(!found.exhausted);
+        assert!(!found.transient_storm);
 
-        // A run that hits a transient error on every probe is searched down
-        // to single records, none of which is blamed.
+        // A run that misses the fence on every probe is searched down to
+        // single records, none of which is blamed. Fence misses don't count
+        // toward the transient stop.
         let found = bisect_with(8, MAX_ISOLATION_PROBES, |_| ProbeVerdict::Unknown);
         assert!(found.failing.is_empty());
         assert_eq!(
             found.probes, 14,
             "every run of a full binary tree over 8 but the root"
         );
+        assert!(!found.transient_storm);
+    }
+
+    /// A pool whose every checkout fails with a connection error (no
+    /// SQLSTATE: transient), without any I/O until then: the socket
+    /// directory doesn't exist.
+    fn unreachable_pool() -> Pool {
+        let config = crate::config::Config::from_dsn(
+            "host=/nonexistent/trellis-issue-670 port=1 user=nobody dbname=nothing".to_string(),
+        )
+        .expect("valid dsn");
+        Pool::new(&config).expect("a lazy pool")
+    }
+
+    fn folded_key(key: &str) -> FoldedChange {
+        FoldedChange {
+            src_table: "public.orders".to_string(),
+            key: key.to_string(),
+            new_image: Some(format!(r#"{{"id": {key}}}"#)),
+            old_image: None,
+            src_changed: Some(std::time::SystemTime::UNIX_EPOCH),
+            origin_lsn: None,
+            lsn: None,
+            min_image_lsn: None,
+            hop_gen: 0,
+            first_seen: std::time::SystemTime::UNIX_EPOCH,
+            group_key: None,
+            is_truncate: false,
+            relationship_reverse_deferred: None,
+            retry_count: 0,
+            prior_image: None,
+            row_count: 1,
+            has_recompute: false,
+            vanished_images: Vec::new(),
+            ends_in_delete: false,
+        }
+    }
+
+    fn event_field<'a>(
+        event: &'a crate::client::intake_supervisor_tests::CapturedEvent,
+        name: &str,
+    ) -> &'a str {
+        event
+            .fields
+            .get(name)
+            .map(|v| v.trim_matches('"'))
+            .unwrap_or_else(|| panic!("no `{name}` field on {event:?}"))
+    }
+
+    /// Issue #670: isolation logs its start, with the batch's record count,
+    /// and its end, with the probes it used, its outcome, the keys it
+    /// pinned, whether the search completed, and how long it took. It also
+    /// shows the transient stop end to end: every probe's compute fails to
+    /// get a connection (transient), so isolation stops after
+    /// [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] probes rather than all
+    /// [`MAX_ISOLATION_PROBES`], and says so.
+    #[tokio::test]
+    async fn isolation_logs_its_start_and_end_and_stops_on_a_transient_storm() {
+        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let pool = unreachable_pool();
+        let folded: Vec<FoldedChange> = (1..=64).map(|k| folded_key(&k.to_string())).collect();
+
+        let outcome = isolate_and_evict(
+            &pool,
+            7,
+            "worker-a",
+            "wake",
+            &folded,
+            DEFAULT_DEATH_THRESHOLD,
+        )
+        .await
+        .expect("a transient storm is an outcome, not an error");
+        assert!(
+            matches!(
+                outcome,
+                IsolationOutcome::TransientStorm {
+                    probes: MAX_CONSECUTIVE_TRANSIENT_PROBES
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        let isolation: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.fields
+                    .get("message")
+                    .is_some_and(|m| m.contains("isolat"))
+            })
+            .collect();
+        assert_eq!(isolation.len(), 2, "{events:?}");
+        let (start, end) = (isolation[0], isolation[1]);
+        assert_eq!(start.level, tracing::Level::INFO);
+        assert_eq!(
+            event_field(start, "message"),
+            "isolating a failed batch: probing its records for the keys that fail alone"
+        );
+        assert_eq!(event_field(start, "seg_seq"), "7");
+        assert_eq!(event_field(start, "records"), "64");
+
+        assert_eq!(end.level, tracing::Level::WARN, "the search stopped short");
+        assert_eq!(event_field(end, "seg_seq"), "7");
+        assert_eq!(event_field(end, "records"), "64");
+        assert_eq!(
+            event_field(end, "probes"),
+            MAX_CONSECUTIVE_TRANSIENT_PROBES.to_string()
+        );
+        assert_eq!(event_field(end, "outcome"), "TransientStorm");
+        assert_eq!(event_field(end, "pinned"), "0");
+        assert_eq!(
+            event_field(end, "search"),
+            "stopped on consecutive transient errors"
+        );
+        event_field(end, "elapsed_ms")
+            .parse::<u64>()
+            .expect("elapsed_ms is a number");
+    }
+
+    /// Issue #670: the end-of-isolation line for a search that ran to
+    /// completion is `info` and counts every key it pinned, evicted or only
+    /// charged; one that stopped on an error is `warn` with the error.
+    #[test]
+    fn isolation_end_log_counts_pinned_keys_and_reports_errors() {
+        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let complete = IsolationStats {
+            probes: 20,
+            stopped: None,
+        };
+        let charged = ChargedKey {
+            src_table: "public.orders".to_string(),
+            key: "3".to_string(),
+            deaths: 1,
+        };
+        // Ten records, two evicted, one more charged below the threshold.
+        let evicted = IsolationOutcome::Evicted {
+            retry_folded: (1..=8).map(|k| folded_key(&k.to_string())).collect(),
+            charged: vec![charged.clone()],
+        };
+        log_isolation_finished(
+            7,
+            10,
+            &complete,
+            &Ok(evicted),
+            std::time::Duration::from_millis(1500),
+        );
+        log_isolation_finished(
+            7,
+            10,
+            &complete,
+            &Ok(IsolationOutcome::ChargedBelowThreshold {
+                charged: vec![charged],
+            }),
+            std::time::Duration::from_millis(5),
+        );
+        log_isolation_finished(
+            7,
+            10,
+            &IsolationStats {
+                probes: 4,
+                stopped: None,
+            },
+            &Err(ApplyError::ClaimLost),
+            std::time::Duration::from_millis(5),
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        let summary: Vec<_> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.level,
+                    event_field(e, "outcome").to_string(),
+                    e.fields.get("pinned").cloned(),
+                    event_field(e, "probes").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    tracing::Level::INFO,
+                    "Evicted".to_string(),
+                    Some("3".to_string()),
+                    "20".to_string()
+                ),
+                (
+                    tracing::Level::INFO,
+                    "ChargedBelowThreshold".to_string(),
+                    Some("1".to_string()),
+                    "20".to_string()
+                ),
+                (
+                    tracing::Level::WARN,
+                    "error".to_string(),
+                    None,
+                    "4".to_string()
+                ),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(event_field(&events[0], "elapsed_ms"), "1500");
+        assert_eq!(event_field(&events[0], "search"), "complete");
+        assert_eq!(
+            event_field(&events[2], "error"),
+            ApplyError::ClaimLost.to_string()
+        );
+    }
+
+    /// Issue #670: a lock or deadlock storm used to split on every transient
+    /// probe and run all [`MAX_ISOLATION_PROBES`], each able to wait out a
+    /// whole `lock_timeout`. [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] in a row
+    /// stop the search, keeping what it already pinned.
+    #[test]
+    fn bisect_stops_after_consecutive_transient_probes() {
+        // Every probe transient: it stops after the limit, pinning nothing.
+        let found = bisect_with(100_000, MAX_ISOLATION_PROBES, |_| ProbeVerdict::Transient);
+        assert_eq!(found.probes, MAX_CONSECUTIVE_TRANSIENT_PROBES);
+        assert!(found.transient_storm);
+        assert!(!found.exhausted);
+        assert!(found.failing.is_empty());
+
+        // A storm that starts once record 0 is pinned keeps it.
+        let n = 1024;
+        let probes = std::cell::Cell::new(0usize);
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
+            probes.set(probes.get() + 1);
+            if probes.get() <= halvings(n) {
+                fails_alone(&[0])(run)
+            } else {
+                ProbeVerdict::Transient
+            }
+        });
+        assert_eq!(failing_indexes(&found), vec![0]);
+        assert_eq!(found.probes, halvings(n) + MAX_CONSECUTIVE_TRANSIENT_PROBES);
+        assert!(found.transient_storm);
+
+        // One record whose every run hits a transient error (a target row
+        // held locked) stops the search too: descending into it probes its
+        // runs one after another. The page can't commit while that lasts
+        // anyway, so a later drain loses nothing by isolating then.
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
+            if run.contains(&900) {
+                ProbeVerdict::Failed(())
+            } else if run.contains(&100) {
+                ProbeVerdict::Transient
+            } else {
+                ProbeVerdict::Clean
+            }
+        });
+        assert!(found.transient_storm);
+        assert!(found.failing.is_empty());
+
+        // Transients between clean or failing probes are not a storm: the
+        // search runs to completion.
+        let probes = std::cell::Cell::new(0usize);
+        let found = bisect_with(n, MAX_ISOLATION_PROBES, |run| {
+            probes.set(probes.get() + 1);
+            if probes
+                .get()
+                .is_multiple_of(MAX_CONSECUTIVE_TRANSIENT_PROBES)
+            {
+                ProbeVerdict::Transient
+            } else {
+                fails_alone(&[700])(run)
+            }
+        });
+        assert!(!found.transient_storm);
+        assert!(!found.exhausted);
+        assert!(found.probes > 2 * halvings(n), "{found:?}");
     }
 
     /// The probe limit stops the search, keeping what it pinned so far. Depth
@@ -3376,6 +3863,7 @@ mod unit_tests {
             SqlState::T_R_DEADLOCK_DETECTED,
             SqlState::LOCK_NOT_AVAILABLE,
             SqlState::QUERY_CANCELED,
+            SqlState::TOO_MANY_CONNECTIONS,
         ] {
             assert!(is_transient_sqlstate(Some(&code)), "{}", code.code());
         }
@@ -3402,6 +3890,124 @@ mod unit_tests {
         assert_eq!(classify(&closed), FailureClass::Isolate);
         let config = ApplyError::Pool(crate::error::Error::Config("bad dsn".to_string()));
         assert_eq!(classify(&config), FailureClass::Isolate);
+    }
+
+    /// Issue #670: a structural halting diagnosis is `Halting` however deeply
+    /// another `ApplyError` wraps it. A backfill's downstream propagation
+    /// reports it as `Backfill(Propagation(Box<ApplyError>))`, which used to
+    /// be `Isolate`: isolation would have charged, and eventually evicted,
+    /// every key on the source for a failure none of them caused.
+    #[test]
+    fn classify_decides_a_wrapped_apply_error_by_the_innermost_one() {
+        use crate::defs::backfill::BackfillError;
+        let wrap =
+            |inner: ApplyError| ApplyError::Backfill(BackfillError::Propagation(Box::new(inner)));
+        let no_pk = || {
+            ApplyError::Ddl(DdlError::NoPrimaryKey {
+                source_table: "public.events".to_string(),
+            })
+        };
+        let unsupported_pk = || {
+            ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType {
+                source_table: "public.events".to_string(),
+                column: "occurred_at".to_string(),
+                pg_type: "timestamp with time zone".to_string(),
+            })
+        };
+        let hop_bound = || ApplyError::HopBoundExceeded {
+            hop_gen: 40,
+            tables: vec!["t".to_string()],
+        };
+        let cases = [
+            (
+                "Propagation(NoPrimaryKey)",
+                wrap(no_pk()),
+                FailureClass::Halting,
+            ),
+            (
+                "Propagation(UnsupportedPrimaryKeyType)",
+                wrap(unsupported_pk()),
+                FailureClass::Halting,
+            ),
+            (
+                "Propagation(Propagation(NoPrimaryKey))",
+                wrap(wrap(no_pk())),
+                FailureClass::Halting,
+            ),
+            (
+                "Propagation(HopBoundExceeded)",
+                wrap(hop_bound()),
+                FailureClass::Halting,
+            ),
+            (
+                "Propagation(VersionFenceMiss)",
+                wrap(ApplyError::VersionFenceMiss {
+                    src_table: "orders".to_string(),
+                }),
+                FailureClass::VersionFenceMiss,
+            ),
+            (
+                "Propagation(Db)",
+                wrap(ApplyError::Db(uncoded_pg_error())),
+                FailureClass::Transient,
+            ),
+            (
+                "Propagation(ClaimLost)",
+                wrap(ApplyError::ClaimLost),
+                FailureClass::Isolate,
+            ),
+        ];
+        for (name, err, class) in cases {
+            assert_eq!(classify(&err), class, "{name}");
+        }
+    }
+
+    /// Issue #670: `53300` (too many connections) is the server refusing a
+    /// connection, not anything a record did. It reaches the drain as a pool
+    /// checkout's `PoolError::Backend`, and used to classify `Isolate`. This
+    /// takes the real error from a real checkout, against a role whose
+    /// connection limit is zero (superusers are exempt from connection
+    /// limits, so the test role isn't one).
+    #[tokio::test]
+    async fn classify_treats_too_many_connections_on_a_pool_checkout_as_transient() {
+        use tokio_postgres::error::SqlState;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        // Roles are cluster-wide; one per database keeps tests apart.
+        let role = format!("no_connections_{}", db.name().replace('-', "_"));
+        let raw = connect_raw(&db).await;
+        raw.batch_execute(&format!("create role {role} login connection limit 0"))
+            .await
+            .expect("create a role that may not connect");
+
+        let dsn = db.dsn().replace("user=postgres", &format!("user={role}"));
+        assert_ne!(dsn, db.dsn(), "the test dsn names its user");
+        let config = crate::config::Config::from_dsn(dsn).expect("valid dsn");
+        let pool = Pool::new(&config).expect("build a pool");
+        let err = ApplyError::from(pool.get().await.expect_err("the role may not connect"));
+
+        let pg = {
+            let mut link: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+            loop {
+                let err = link.expect("a Postgres error on the chain");
+                if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+                    break pg;
+                }
+                link = err.source();
+            }
+        };
+        assert_eq!(pg.code(), Some(&SqlState::TOO_MANY_CONNECTIONS), "{err:?}");
+        assert!(
+            matches!(
+                &err,
+                ApplyError::Pool(crate::error::Error::Pool(
+                    deadpool_postgres::PoolError::Backend(_)
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(classify(&err), FailureClass::Transient);
     }
 
     /// The routing tests above only see uncoded errors, so they can't tell

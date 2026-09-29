@@ -2312,7 +2312,7 @@ mod wake_listener_tests {
 }
 
 #[cfg(test)]
-mod intake_supervisor_tests {
+pub(crate) mod intake_supervisor_tests {
     //! Issue #325: intake's terminal outcome must never vanish silently.
     //! These drive [`supervise_intake`] with a fake attempt closure (no
     //! Postgres), capturing `tracing` events on the test thread.
@@ -2327,13 +2327,13 @@ mod intake_supervisor_tests {
     use super::*;
 
     #[derive(Debug, Clone)]
-    pub(super) struct CapturedEvent {
-        pub(super) level: tracing::Level,
-        pub(super) fields: HashMap<String, String>,
+    pub(crate) struct CapturedEvent {
+        pub(crate) level: tracing::Level,
+        pub(crate) fields: HashMap<String, String>,
     }
 
     #[derive(Clone, Default)]
-    pub(super) struct Captured(pub(super) Arc<Mutex<Vec<CapturedEvent>>>);
+    pub(crate) struct Captured(pub(crate) Arc<Mutex<Vec<CapturedEvent>>>);
 
     struct FieldVisitor(HashMap<String, String>);
 
@@ -2367,7 +2367,7 @@ mod intake_supervisor_tests {
     /// test's capture was the only one live, silently dropping that test's
     /// events. A permanently live no-op dispatcher keeps two registered, so
     /// interest is always computed over every live dispatcher.
-    pub(super) fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
+    pub(crate) fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
         static KEEP_INTEREST_GLOBAL: LazyLock<tracing::Dispatch> =
             LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         LazyLock::force(&KEEP_INTEREST_GLOBAL);

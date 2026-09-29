@@ -1636,6 +1636,51 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
 }
 
+/// Issue #670: a page whose apply fails hands its pooled connection back
+/// before isolating, so isolation's probes can check one out even from a
+/// one-connection pool. The page used to hold its connection (and plan)
+/// through the whole isolation: every probe's checkout waited out the pool's
+/// wait timeout, and the failing key was never pinned.
+#[tokio::test]
+async fn isolation_can_check_out_the_connection_its_failed_page_held() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_copy(&db, &client).await;
+    // Key 13 fails in Phase 3, alone and in any run holding it.
+    client
+        .batch_execute("alter table item_copy add constraint not_13 check (id <> 13)")
+        .await
+        .expect("add the failing check");
+    let config = trellis::Config::from_dsn(db.dsn().to_string())
+        .expect("valid dsn")
+        .with_pool_max_size(1)
+        .expect("pool size")
+        .with_pool_wait_timeout(Duration::from_secs(2));
+    let pool = trellis::Pool::new(&config).expect("one-connection pool");
+
+    stage_copy_keys(&client, &(1..=20).collect::<Vec<_>>()).await;
+    let seg = seal(&mut client).await;
+    let result = drain(&pool, seg, "worker", 100, &mut DrainHooks::default()).await;
+    let err = result.expect_err("key 13 fails the page");
+    assert!(err.to_string().contains("not_13"), "{err}");
+
+    let deaths: Vec<(String, i32)> = client
+        .query("select key, deaths from key_deaths", &[])
+        .await
+        .expect("read key deaths")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        deaths.len(),
+        1,
+        "isolation pinned the failing key: {deaths:?}"
+    );
+    assert!(deaths[0].0.contains("13"), "{deaths:?}");
+    assert_eq!(deaths[0].1, 1, "{deaths:?}");
+}
+
 // ---------------------------------------------------------------------
 // Lock timeouts (issue #621, ADR-0002 I7)
 // ---------------------------------------------------------------------
