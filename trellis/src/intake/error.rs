@@ -243,7 +243,10 @@ impl std::error::Error for IntakeError {
             IntakeError::Decode(err) => Some(err),
             IntakeError::Io(err) => Some(err),
             IntakeError::Catalog(err) => Some(err),
-            IntakeError::Propagation(err) => Some(err),
+            // The `ApplyError` itself, not its `Box`: a `Box<ApplyError>` as
+            // the source would hide the `ApplyError` from `downcast_ref`, and
+            // from `quarantine::classify`'s innermost-error rule with it.
+            IntakeError::Propagation(err) => Some(err.as_ref()),
             IntakeError::Transport(_)
             | IntakeError::ReplicaIdentityRequired { .. }
             | IntakeError::MissingKeyValue { .. }

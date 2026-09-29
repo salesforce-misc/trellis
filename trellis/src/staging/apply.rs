@@ -5332,6 +5332,51 @@ mod tests {
         );
         txn.rollback().await.expect("rollback");
     }
+
+    /// Issue #670 review: `classify` decides by the innermost `ApplyError`,
+    /// which for a lost claim is `Isolate`, so `classify_and_retry`'s lost
+    /// claim early return has to see through a wrapper too. Otherwise a
+    /// wrapped `ClaimLost` would be isolated, and every key in the page
+    /// charged a death for a claim nobody's key lost. The pool is never
+    /// reached: isolation's first step would be its start log line.
+    #[tokio::test]
+    async fn classify_and_retry_never_isolates_a_wrapped_lost_claim() {
+        let (_guard, captured) = crate::client::intake_supervisor_tests::install_capture();
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(
+                "host=/nonexistent/trellis-issue-670 port=1 user=nobody dbname=nothing".to_string(),
+            )
+            .expect("valid dsn"),
+        )
+        .expect("a lazy pool");
+        let wrapped = ApplyError::Backfill(crate::defs::backfill::BackfillError::Propagation(
+            Box::new(ApplyError::ClaimLost),
+        ));
+
+        let result = classify_and_retry(
+            &pool,
+            7,
+            "worker-a",
+            "wake",
+            &[],
+            &mut 1,
+            &mut FenceMissBackoff::new(),
+            &mut TransientRetry::new(),
+            wrapped,
+        )
+        .await;
+        let err = result.expect_err("a lost claim surfaces");
+        assert!(quarantine::is_claim_lost(&err), "{err:?}");
+
+        let events = captured.0.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e
+                .fields
+                .get("message")
+                .is_some_and(|m| m.contains("isolat"))),
+            "a lost claim is never isolated: {events:?}"
+        );
+    }
 }
 
 /// Phase 2's output: an in-memory plan Phase 3 applies inside one
@@ -9929,8 +9974,9 @@ async fn classify_and_retry(
     // this call can get it back. Isolating it would probe every record under
     // the same lost claim, reproduce `ClaimLost` for each, and charge every
     // key in the page a death. Surface it: the caller releases, and whoever
-    // holds the buckets now resumes from the last committed cursor.
-    if matches!(err, ApplyError::ClaimLost) {
+    // holds the buckets now resumes from the last committed cursor. Bare or
+    // wrapped (issue #670), as `classify` decides by the innermost error.
+    if quarantine::is_claim_lost(&err) {
         return Err(err);
     }
     match quarantine::classify(&err) {

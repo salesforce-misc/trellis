@@ -174,6 +174,17 @@ fn innermost_apply_error(err: &ApplyError) -> &ApplyError {
     innermost
 }
 
+/// Whether `err` is a lost claim, bare or wrapped in another [`ApplyError`]:
+/// decided by the innermost one, as [`classify`] decides the class. A lost
+/// claim classifies [`FailureClass::Isolate`], so both callers that must
+/// never isolate one (`apply::classify_and_retry` and [`isolate_and_evict`]'s
+/// probe loop) check this first. If they matched only a bare `ClaimLost`, a
+/// wrapped one would be isolated and every key in the page charged a death
+/// for it. (Nothing in the drain wraps a `ClaimLost` today.)
+pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
+    matches!(innermost_apply_error(err), ApplyError::ClaimLost)
+}
+
 /// Whether `err` is a transient Postgres or pool failure, whichever
 /// [`ApplyError`] variant wraps it (issue #653). The drain reaches the same
 /// deadlock or dropped connection through `ApplyError::Db`, through a nested
@@ -1217,7 +1228,7 @@ async fn isolate_and_evict_probing(
         // surface it, as `apply::classify_and_retry` does for a page's own
         // `ClaimLost`: whoever holds the buckets now re-drains the page, and
         // a genuinely failing key is charged then.
-        if matches!(err, ApplyError::ClaimLost) {
+        if is_claim_lost(&err) {
             return Err(err);
         }
         let verdict = match classify(&err) {
@@ -3892,6 +3903,29 @@ mod unit_tests {
         assert_eq!(classify(&config), FailureClass::Isolate);
     }
 
+    /// Issue #670 review: a lost claim is recognised through any wrapper, the
+    /// same innermost-error rule `classify` uses, via either type that nests
+    /// an `ApplyError`.
+    #[test]
+    fn is_claim_lost_sees_through_wrapping_apply_errors() {
+        use crate::defs::backfill::BackfillError;
+        use crate::intake::IntakeError;
+        let backfill =
+            |inner: ApplyError| ApplyError::Backfill(BackfillError::Propagation(Box::new(inner)));
+        let intake =
+            |inner: ApplyError| ApplyError::Intake(IntakeError::Propagation(Box::new(inner)));
+        assert!(is_claim_lost(&ApplyError::ClaimLost));
+        assert!(is_claim_lost(&backfill(ApplyError::ClaimLost)));
+        assert!(is_claim_lost(&intake(ApplyError::ClaimLost)));
+        assert!(is_claim_lost(&intake(backfill(ApplyError::ClaimLost))));
+        let fence_miss = || ApplyError::VersionFenceMiss {
+            src_table: "orders".to_string(),
+        };
+        assert!(!is_claim_lost(&fence_miss()));
+        assert!(!is_claim_lost(&backfill(fence_miss())));
+        assert!(!is_claim_lost(&ApplyError::Db(uncoded_pg_error())));
+    }
+
     /// Issue #670: a structural halting diagnosis is `Halting` however deeply
     /// another `ApplyError` wraps it. A backfill's downstream propagation
     /// reports it as `Backfill(Propagation(Box<ApplyError>))`, which used to
@@ -3932,6 +3966,11 @@ mod unit_tests {
             (
                 "Propagation(Propagation(NoPrimaryKey))",
                 wrap(wrap(no_pk())),
+                FailureClass::Halting,
+            ),
+            (
+                "Intake(Propagation(NoPrimaryKey))",
+                ApplyError::Intake(crate::intake::IntakeError::Propagation(Box::new(no_pk()))),
                 FailureClass::Halting,
             ),
             (
