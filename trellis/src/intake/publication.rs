@@ -1323,6 +1323,13 @@ pub(crate) async fn run_pending_backfills_for(
         .await
         {
             Ok(Discharge::Committed) => {}
+            Ok(Discharge::AwaitingCapture) => {
+                tracing::debug!(
+                    table = %marker.table,
+                    "backfill marker held: an ALTER TRANSFORM field reads a column the table's \
+                     capture doesn't image yet"
+                );
+            }
             Ok(Discharge::Deferred { horizon }) => {
                 tracing::debug!(
                     table = %marker.table,
@@ -1414,6 +1421,134 @@ enum Discharge {
     /// Intake had not staged through `horizon` in time, so the transaction
     /// rolled back and the marker stays.
     Deferred { horizon: PgLsn },
+    /// An `ALTER TRANSFORM` field on the table is still paused awaiting a
+    /// capture that images its columns ([`release_columns_awaiting_capture`]),
+    /// so the transaction rolled back and the marker stays for a later pass.
+    AwaitingCapture,
+}
+
+/// Unpauses the `ALTER TRANSFORM` fields on definitions sourced from `table`
+/// that wait for a capture imaging the columns they read
+/// (`column_status.awaiting_capture`, issue #622; see
+/// `defs::catalog::alter_transform`'s "The capture widen"), if it now does.
+/// `false` means some still wait, and the discharge must not go on: its
+/// enumeration re-derives every row, which must happen with them unpaused.
+///
+/// Called by the discharge of `table`'s marker, which has already waited
+/// for the marker's capture gate, so every row a narrower capture function
+/// staged has drained. The staging worker is the only process that changes
+/// capture, and it runs this discharge after its own capture pass, so the
+/// installed capture read here can't change before this commits. It covers
+/// the fields when:
+///
+/// - `table` is another definition's target, fed by the target-mutation
+///   seam rather than captured;
+/// - nothing is installed on it: no row lacking a column can exist, and the
+///   install, from a catalog read after this edit, images them all;
+/// - or its installed functions are current and image every source column
+///   each such definition reads.
+///
+/// The pauses go only where the edit still owns them (issue #309's rule, as
+/// in `alter_transform`); every other one just stops waiting.
+async fn release_columns_awaiting_capture(
+    txn: &Transaction<'_>,
+    table: &str,
+) -> Result<bool, IntakeError> {
+    let awaiting: BTreeSet<String> = txn
+        .query(
+            "select distinct transform_table from column_status where awaiting_capture",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if awaiting.is_empty() {
+        return Ok(true);
+    }
+    // `column_status` names a transform as its definition does (the
+    // definition's own `target`), not by the qualified `target_table`.
+    let mut targets = Vec::new();
+    let mut read = BTreeSet::new();
+    for row in txn
+        .query(
+            "select target_table, definition_text from transform_definitions \
+             where source_table = $1",
+            &[&table],
+        )
+        .await?
+    {
+        let target_table: &str = row.get(0);
+        let def = crate::defs::parse(row.get::<_, &str>(1))
+            .map_err(crate::defs::catalog::CatalogError::from)?;
+        let bare = target_table
+            .split_once('.')
+            .map_or(target_table, |(_, t)| t);
+        let named = [def.target.as_str(), bare]
+            .into_iter()
+            .find(|name| awaiting.contains(*name));
+        if let Some(name) = named {
+            targets.push(name.to_string());
+            read.extend(crate::defs::oracle::referenced_source_columns(&def));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(true);
+    }
+    if !capture_images(txn, table, &read).await? {
+        return Ok(false);
+    }
+    txn.execute(
+        "delete from column_status s \
+         where s.awaiting_capture and s.transform_table = any($1) \
+           and not s.local_fuse \
+           and not exists ( \
+               select 1 from column_pause_cascades c \
+               where c.downstream_transform = s.transform_table \
+                 and c.downstream_column = s.column_name)",
+        &[&targets],
+    )
+    .await?;
+    txn.execute(
+        "update column_status set awaiting_capture = false \
+         where awaiting_capture and transform_table = any($1)",
+        &[&targets],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Whether every row staged for `table` from now on carries `columns`
+/// ([`release_columns_awaiting_capture`]'s three cases).
+async fn capture_images(
+    client: &impl GenericClient,
+    table: &str,
+    columns: &BTreeSet<String>,
+) -> Result<bool, IntakeError> {
+    use crate::capture::{CaptureError, install::Installed};
+
+    if crate::defs::catalog::is_definition_target(client, table).await? {
+        return Ok(true);
+    }
+    let schema: String = client
+        .query_one("select pg_catalog.current_schema()::text", &[])
+        .await?
+        .get(0);
+    let installed = crate::capture::install::installed(client, &schema, table)
+        .await
+        .map_err(|err| match err {
+            CaptureError::Db(err) => IntakeError::Db(err),
+            CaptureError::Catalog(err) => err.into(),
+            CaptureError::Marker(err) => err,
+            other => IntakeError::InvalidTableName(other.to_string()),
+        })?;
+    Ok(match installed {
+        Installed::Absent => true,
+        Installed::Partial { .. } => false,
+        Installed::Complete { spec, current } => {
+            current && columns.iter().all(|c| spec.columns().contains(c))
+        }
+    })
 }
 
 /// The build [`discharge_marker`] dispatches for one `waiting_to_backfill`
@@ -1518,6 +1653,10 @@ async fn discharge_marker(
         .collect();
 
     let txn = client.transaction().await?;
+    if !release_columns_awaiting_capture(&txn, &marker.table).await? {
+        txn.rollback().await?;
+        return Ok(Discharge::AwaitingCapture);
+    }
     // Issues #330, #485, #436: the targets whose unbacked rows this discharge
     // deletes, judged on its read's snapshot; see "Dropping what the source
     // no longer backs" above.

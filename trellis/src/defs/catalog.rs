@@ -1482,6 +1482,23 @@ pub(crate) async fn is_definition_target(
 /// way [`super::lifecycle::drop_transform`]'s own use of it is): a dropped
 /// field refuses, naming the specific reader, iff some other definition's
 /// field or `GROUP BY` key resolves to exactly this `(target, field)` pair.
+///
+/// **The capture widen (issue #622).** An edited field can read a source
+/// column the old formula didn't, which the source's capture triggers may
+/// not image yet. The staging worker widens them in the background, not on
+/// this call's path, once it can take the table's lock, and a row the old
+/// capture function staged lacks the column: evaluating the field over it
+/// fails with `MissingColumn` and quarantines the key. So such an edit
+/// leaves its own pauses in place when its backfill ends, marked
+/// `column_status.awaiting_capture`, and parks its catch-up as usual. That
+/// marker's discharge clears them once the installed capture images every
+/// column the definition reads, and it waits for the widen's capture gate
+/// first, so every row the old function staged has drained through the
+/// paused field by then (`intake::publication`'s
+/// `release_columns_awaiting_capture`). The enumeration the same discharge
+/// stages re-derives every row with the field unpaused. An edit that reads
+/// only columns the definition already read unpauses at once, as before:
+/// those columns have been imaged since the definition was dispatched.
 pub async fn alter_transform(
     pool: &Pool,
     alter: &AlterTransform,
@@ -1865,17 +1882,32 @@ pub async fn alter_transform(
         // it), and an upstream pause cascading onto it records an edge in
         // `column_pause_cascades`. Either way the row now belongs to that
         // other reason, and its `RESUME` is what recovers the column.
+        //
+        // **The capture widen (issue #622).** A field reading a source column
+        // the old formula didn't read can't unpause here: see "The capture
+        // widen" in this function's doc comment. Its pause is marked
+        // `awaiting_capture` instead, and the catch-up marker's discharge
+        // clears it.
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
+        let awaits_capture = reads_new_source_columns(&current.def, &merged)
+            && !is_definition_target(&*txn, &current.source_table).await?;
+        let release = if awaits_capture {
+            "update column_status s set awaiting_capture = true"
+        } else {
+            "delete from column_status s"
+        };
         for field in &self_paused {
             txn.execute(
-                "delete from column_status s \
-                 where s.transform_table = $1 and s.column_name = $2 \
-                   and not s.local_fuse \
-                   and not exists ( \
-                       select 1 from column_pause_cascades c \
-                       where c.downstream_transform = s.transform_table \
-                         and c.downstream_column = s.column_name)",
+                &format!(
+                    "{release} \
+                     where s.transform_table = $1 and s.column_name = $2 \
+                       and not s.local_fuse \
+                       and not exists ( \
+                           select 1 from column_pause_cascades c \
+                           where c.downstream_transform = s.transform_table \
+                             and c.downstream_column = s.column_name)"
+                ),
                 &[&alter.target, field],
             )
             .await?;
@@ -1901,6 +1933,17 @@ pub async fn alter_transform(
         dropped,
         altered,
     })
+}
+
+/// Whether `edited` reads a source column `original` doesn't (issue #622):
+/// one the source's capture triggers may not image yet. A column `original`
+/// already read has been imaged since the definition was dispatched, since no
+/// capture narrows away a column a registered definition reads.
+fn reads_new_source_columns(original: &TransformDef, edited: &TransformDef) -> bool {
+    let before = super::oracle::referenced_source_columns(original);
+    super::oracle::referenced_source_columns(edited)
+        .iter()
+        .any(|column| !before.contains(column))
 }
 
 /// [`alter_transform`]'s output: the edited definition's new state, plus

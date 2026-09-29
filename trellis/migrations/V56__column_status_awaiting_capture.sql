@@ -1,0 +1,15 @@
+-- Issue #622 (C5 review): an `ALTER TRANSFORM` field whose formula reads a
+-- source column the capture triggers don't image yet stays paused until they
+-- do. See `defs::catalog::alter_transform`, "The capture widen".
+--
+-- `apply` only registers the edit. The staging worker widens the source's
+-- capture in the background, once it can take the table's lock, and a row
+-- the old capture function staged lacks the new column: evaluating the new
+-- field over it fails with `MissingColumn` and quarantines the key. So the
+-- edit's own pause (the column-granularity pause it already takes while its
+-- backfill runs) isn't cleared when the backfill ends. It is marked here
+-- instead, and the discharge of the source's catch-up marker clears it once
+-- the installed capture images every column the definition reads. That
+-- marker's discharge also waits for the widen's capture gate, so every row
+-- the old function staged has drained by then.
+alter table column_status add column awaiting_capture boolean not null default false;

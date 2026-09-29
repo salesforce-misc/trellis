@@ -116,6 +116,17 @@ The pass hands the discharge the list of definitions it found ready, from the
 same catalog snapshot it built the column sets from, so a definition
 registered after the pass read the catalog waits for the next pass.
 
+An `ALTER TRANSFORM` field is the same problem for a definition that is
+already applying. The edit pauses the fields it adds or changes while its
+backfill runs. When a field reads a source column the definition didn't read
+before, that pause stays when the backfill ends (`column_status
+.awaiting_capture`). The edit's catch-up marker then waits: its discharge
+unpauses the field only once the installed capture images the column, and
+only after the widen's gate, so every row the old function staged has drained
+past the paused field. The same discharge's enumeration re-derives every row
+with the field unpaused. A field that reads only columns the definition
+already read unpauses when the backfill ends, as before.
+
 ## Order
 
 Per-key order is `(lsn, change_id)`. A second writer of a key runs its

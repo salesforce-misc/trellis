@@ -1221,12 +1221,28 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
         assert_eq!(n, 0, "{table} must not outlive the dropped column");
     }
 
-    // Re-adding the same name starts clean and live.
+    // Re-adding the same name starts clean and live. It reads `b`, which the
+    // definition stopped reading at the DROP, so the staging worker may have
+    // narrowed `b` out of the source's capture meanwhile: the field stays
+    // paused (its own pause, nothing inherited) until the capture images `b`
+    // again and the edit's catch-up unpauses it (issue #622).
     trellis
         .apply("ALTER TRANSFORM order_calc ADD b AS b")
         .await
         .expect("re-add the field");
-    assert_eq!(column_pause_state(&raw, "order_calc", "b").await, None);
+    assert!(
+        matches!(
+            column_pause_state(&raw, "order_calc", "b").await,
+            None | Some((false, 0))
+        ),
+        "no pause outlives the dropped column"
+    );
+    poll_until(
+        Duration::from_secs(30),
+        "the re-added field goes live once its capture images `b`",
+        async || column_pause_state(&raw, "order_calc", "b").await.is_none(),
+    )
+    .await;
 
     trellis.shutdown().await.expect("shutdown");
 }

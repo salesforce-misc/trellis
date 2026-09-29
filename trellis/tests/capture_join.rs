@@ -829,3 +829,153 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
 
     client.shutdown().await.expect("shutdown");
 }
+
+/// Seals and drains through the engine's own apply path until nothing is
+/// pending anywhere in the ring: the hand-driven stand-in for a running
+/// client's maintenance loop and drain workers (as in `alter_transform.rs`).
+async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+    use trellis::staging::{StagedWatermark, apply, has_pending, retire_drained_segments, seal};
+    let watermark = StagedWatermark::saturated();
+    for _ in 0..16 {
+        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_join_wake")
+            .await
+            .expect("seal phase 2");
+        while apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "capture_join_test",
+            1,
+            "trellis_capture_join_test",
+            &watermark,
+        )
+        .await
+        .expect("drain_once")
+        .is_some()
+        {}
+        retire_drained_segments(client)
+            .await
+            .expect("retire drained segments");
+        if !has_pending(client).await.expect("has_pending") {
+            return;
+        }
+    }
+    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
+}
+
+/// Whether `tu.b2`'s pause waits for a capture that images its column.
+async fn b2_awaits_capture(raw: &Client) -> bool {
+    raw.query_one(
+        "select exists (select 1 from column_status \
+         where transform_table = 'tu' and column_name = 'b2' and awaiting_capture)",
+        &[],
+    )
+    .await
+    .expect("read column_status")
+    .get(0)
+}
+
+/// `ALTER TRANSFORM ... ADD` of a field on a source column the capture
+/// doesn't image yet (#622 C5 review). The edit is `apply`'s, so it only
+/// registers: the widen that images the new column is the staging worker's,
+/// in the background, and here an open writer keeps it from landing. A row
+/// written meanwhile runs the old capture body, so its image lacks the
+/// column. The new field must stay paused until the widen has landed and
+/// every row the old body staged has drained (the widen's capture gate), or
+/// that row fails with `MissingColumn` and its key is quarantined. The
+/// edit's catch-up marker is what unpauses it, so its discharge must hold
+/// while the capture doesn't image the column.
+///
+/// A running client takes the definition live; the rest is stepped by hand.
+#[tokio::test]
+async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.u (id int primary key, a int, b int); \
+         insert into public.u select g, g, 10 * g from generate_series(1, 3) g;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+    let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
+    eventually(Duration::from_secs(30), "tu goes live", || async {
+        status(&raw, "tu").await == TransformStatus::Live
+    })
+    .await;
+    client.shutdown().await.expect("shutdown");
+    let mut ring = connect(db.dsn()).await;
+    drain_to_quiescence(&db.pool, &mut ring).await;
+
+    let holder = hold_table(db.dsn(), "public.u").await;
+    trellis
+        .apply("ALTER TRANSFORM tu ADD b AS b2")
+        .await
+        .expect("alter: apply never waits on the table");
+    assert!(
+        b2_awaits_capture(&raw).await,
+        "b2 stays paused until its capture covers it"
+    );
+
+    // A pass: the widen waits out the holder, and the edit's catch-up
+    // marker's discharge holds, so b2 stays paused.
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        captured_columns(&raw, "public.u").await,
+        Some(vec!["a".to_string(), "id".to_string()]),
+        "the widen waits out the open writer"
+    );
+    assert!(
+        b2_awaits_capture(&raw).await,
+        "the discharge holds while b isn't imaged"
+    );
+    assert_eq!(status(&raw, "tu").await, TransformStatus::CatchingUp);
+
+    // A write the old capture body images without b drains with b2 paused.
+    raw.batch_execute("update public.u set b = 100 where id = 1")
+        .await
+        .expect("write");
+    drain_to_quiescence(&db.pool, &mut ring).await;
+
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+    for _ in 0..5 {
+        full_pass(&mut raw, &db.pool).await;
+        drain_to_quiescence(&db.pool, &mut ring).await;
+        if status(&raw, "tu").await == TransformStatus::Live {
+            break;
+        }
+    }
+    assert_eq!(status(&raw, "tu").await, TransformStatus::Live);
+    assert!(
+        captured_columns(&raw, "public.u")
+            .await
+            .expect("captured")
+            .contains(&"b".to_string())
+    );
+
+    let (poisoned, failed, wrong, paused): (i64, i64, i64, i64) = {
+        let row = raw
+            .query_one(
+                "select (select count(*) from poison), \
+                        (select count(*) from column_failures), \
+                        (select count(*) from public.tu t join public.u s using (id) \
+                         where t.b2 is distinct from s.b or t.a is distinct from s.a), \
+                        (select count(*) from column_status)",
+                &[],
+            )
+            .await
+            .expect("read the outcome");
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    };
+    assert_eq!((poisoned, failed), (0, 0), "no row met the old images");
+    assert_eq!(wrong, 0, "the target equals the source");
+    assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
+}
