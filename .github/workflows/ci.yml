@@ -85,6 +85,12 @@ jobs:
           echo "using PostgreSQL server binaries from: $pg_bin"
           echo "$pg_bin" >> "$GITHUB_PATH"
 
+      - name: Generate a non-default locale
+        # The lc_monetary pinning tests (issue #672) need a locale whose
+        # `money` rendering differs from `C`'s. The runner image isn't
+        # guaranteed to have one; see testkit/src/locale.rs.
+        run: sudo locale-gen de_DE.UTF-8
+
       - name: Test
         # `--workspace`, generative crate included: every proptest property in
         # generative/ is `#[ignore]`d (enforced by generative/tests/meta.rs),

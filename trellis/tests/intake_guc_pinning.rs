@@ -5,8 +5,8 @@
 //! # The hazard this closes
 //!
 //! `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins `DateStyle`/`bytea_output`/
-//! `extra_float_digits`/`IntervalStyle`/`TimeZone` on every pooled
-//! connection, via `pool::session_bootstrap`. Before issue #246,
+//! `extra_float_digits`/`IntervalStyle`/`TimeZone`/`lc_monetary` on every
+//! pooled connection, via `pool::session_bootstrap`. Before issue #246,
 //! `pgwire_replication::ReplicationConfig` (v0.4) had no way to send a
 //! startup `options` parameter at all, so the **walsender** — the backend
 //! that actually renders a changed row's text during logical decoding —
@@ -31,7 +31,9 @@
 //! issue #113 investigated and declined to pin specifically *because* the
 //! walsender couldn't be pinned at the time (see `trellis::temporal`'s
 //! module doc, and `docs/type-support.md`) — this test's `tstz` column is
-//! the direct, live closure of that finding.
+//! the direct, live closure of that finding. `lc_monetary` (issue #672) is
+//! the latest: its `m money` column renders `$1,234.56` on both sides even
+//! though the database default would spell it in another currency.
 //!
 //! # Why the comparison is meaningful
 //!
@@ -99,7 +101,9 @@ async fn seed_progress_at_slot(client: &Client, slot: &str) {
 /// rendering, which the unpinned-connection control below verifies directly
 /// (matching
 /// `a_hostile_database_level_output_guc_does_not_change_what_the_engine_reads`'s
-/// own "prove the scenario is real" step).
+/// own "prove the scenario is real" step). `lc_monetary` isn't listed: it
+/// needs a locale the box has installed, so the test picks one at run time
+/// with `testkit::locale::hostile_lc_monetary`.
 const HOSTILE_DATABASE_GUC_CLAUSES: &[&str] = &[
     "datestyle to 'SQL, MDY'",
     "bytea_output to 'escape'",
@@ -121,7 +125,13 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
     // clause per statement, unlike a session's `;`-joined `SET`s.
     {
         let setup = connect_raw(db.dsn()).await;
-        for clause in HOSTILE_DATABASE_GUC_CLAUSES {
+        let hostile_lc_monetary = testkit::locale::hostile_lc_monetary(&setup).await;
+        let lc_monetary_clause = format!("lc_monetary to '{hostile_lc_monetary}'");
+        for clause in HOSTILE_DATABASE_GUC_CLAUSES
+            .iter()
+            .copied()
+            .chain([lc_monetary_clause.as_str()])
+        {
             setup
                 .batch_execute(&format!("alter database \"{}\" set {clause}", db.name()))
                 .await
@@ -144,13 +154,20 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
                         ('\\xdeadbeef'::bytea)::text, \
                         (0.1::double precision + 0.2::double precision)::text, \
                         ('1 year 2 mons 3 days 04:05:06'::interval)::text, \
-                        ('2024-06-15 12:00:00+00'::timestamptz)::text",
+                        ('2024-06-15 12:00:00+00'::timestamptz)::text, \
+                        (1234.56::money)::text",
                 &[],
             )
             .await
             .expect("render on an unpinned session");
-        let (d, b, f, iv, tstz): (String, String, String, String, String) =
-            (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+        let (d, b, f, iv, tstz, m): (String, String, String, String, String, String) = (
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            row.get(5),
+        );
         assert_eq!(d, "01/02/2024", "hostile datestyle must be in effect");
         assert!(
             !b.starts_with("\\x"),
@@ -165,6 +182,11 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
             tstz, "2024-06-15 12:00:00+00",
             "hostile timezone must be in effect, got {tstz}"
         );
+        assert_ne!(
+            m,
+            testkit::locale::PINNED_MONEY_TEXT,
+            "hostile lc_monetary must be in effect"
+        );
     }
 
     let setup = connect_raw(db.dsn()).await;
@@ -176,7 +198,8 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
                  b bytea, \
                  f double precision, \
                  iv interval, \
-                 tstz timestamptz \
+                 tstz timestamptz, \
+                 m money \
              ); \
              create publication intake_pub for table widgets;",
         )
@@ -199,10 +222,11 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
     // is unambiguous regardless.
     setup
         .execute(
-            "insert into widgets (id, d, b, f, iv, tstz) values \
+            "insert into widgets (id, d, b, f, iv, tstz, m) values \
              (1, '2024-01-02', '\\xdeadbeef', \
               0.1::double precision + 0.2::double precision, \
-              '1 year 2 mons 3 days 04:05:06', '2024-06-15 12:00:00+00')",
+              '1 year 2 mons 3 days 04:05:06', '2024-06-15 12:00:00+00', \
+              1234.56::numeric)",
             &[],
         )
         .await
@@ -241,7 +265,7 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         let row = observer
             .query_opt(
                 "select new_image ->> 'd', new_image ->> 'b', new_image ->> 'f', \
-                        new_image ->> 'iv', new_image ->> 'tstz' \
+                        new_image ->> 'iv', new_image ->> 'tstz', new_image ->> 'm' \
                  from seg_0 where src_table = $1",
                 &[&format!("{DEFAULT_SCHEMA}.widgets")],
             )
@@ -256,7 +280,8 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let (walsender_d, walsender_b, walsender_f, walsender_iv, walsender_tstz): (
+    let (walsender_d, walsender_b, walsender_f, walsender_iv, walsender_tstz, walsender_m): (
+        String,
         String,
         String,
         String,
@@ -268,6 +293,7 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         staged.get(2),
         staged.get(3),
         staged.get(4),
+        staged.get(5),
     );
 
     // Build a *fresh* pool rather than reusing `db.pool` — `db.pool` was
@@ -280,17 +306,26 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
     let pooled = pool.get().await.expect("pooled connection");
     let pool_row = pooled
         .query_one(
-            "select d::text, b::text, f::text, iv::text, tstz::text from widgets where id = 1",
+            "select d::text, b::text, f::text, iv::text, tstz::text, m::text \
+             from widgets where id = 1",
             &[],
         )
         .await
         .expect("read the same row through the pool");
-    let (pool_d, pool_b, pool_f, pool_iv, pool_tstz): (String, String, String, String, String) = (
+    let (pool_d, pool_b, pool_f, pool_iv, pool_tstz, pool_m): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = (
         pool_row.get(0),
         pool_row.get(1),
         pool_row.get(2),
         pool_row.get(3),
         pool_row.get(4),
+        pool_row.get(5),
     );
 
     // The headline assertion: the walsender's own decoded text (staged via
@@ -307,6 +342,7 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
         walsender_tstz, pool_tstz,
         "timestamptz — the walsender/pool TimeZone gap issue #246 closes"
     );
+    assert_eq!(walsender_m, pool_m, "money — lc_monetary, issue #672");
 
     // And, since the point of pinning is to match the *canonical* Trellis
     // spelling (not merely "whatever the pool happens to render"), pin the
@@ -317,4 +353,5 @@ async fn walsender_decoded_text_matches_pool_rendered_text_under_hostile_databas
     assert_eq!(pool_f, "0.30000000000000004");
     assert_eq!(pool_iv, "1 year 2 mons 3 days 04:05:06");
     assert_eq!(pool_tstz, "2024-06-15 12:00:00+00");
+    assert_eq!(pool_m, testkit::locale::PINNED_MONEY_TEXT);
 }

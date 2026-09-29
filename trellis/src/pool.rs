@@ -314,6 +314,37 @@ impl Pool {
 /// instant exactly the way `DateStyle` makes `date_out` a bijection on the
 /// day number.
 ///
+/// `lc_monetary` joined for issue #672. `cash_out` spells a `money` value
+/// in the session's monetary locale: `1234.56::money` is `$1,234.56` under
+/// `C`, `£1,234.56` under `en_GB.UTF-8` and `kr.1.234,56` under
+/// `en_DK.UTF-8`, and `cash_in` reads input under the same locale. A
+/// `money` column is a passthrough value (`docs/type-support.md`), so an
+/// operator's `ALTER DATABASE ... SET lc_monetary` used to change its
+/// staged text. `'C'` is the value every libc has, and it renders the same
+/// `$1,234.56` a server initialized with `C.UTF-8` (the test clusters,
+/// issue #667) or `en_US.UTF-8` defaults to.
+///
+/// # Output settings deliberately *not* pinned
+///
+/// The rest of Postgres's locale and formatting settings were audited for
+/// issue #672. None of them changes what a type's output function (the
+/// `::text` cast, `pgoutput`'s decoding, `to_jsonb`) prints:
+///
+/// * `lc_numeric` and `lc_time` only feed `to_char`'s locale patterns (`D`,
+///   `G`, `L`, the `TM` prefix). `numeric_out`, `float8out` and the
+///   date/time output functions ignore them. Trellis never calls `to_char`,
+///   and its grammar can't express it.
+/// * `lc_messages` changes error message text only. Trellis classifies
+///   errors by SQLSTATE, never by message.
+/// * `lc_collate`/`lc_ctype` are fixed per database, not settable per
+///   session. Ordering is handled with explicit `collate "C"` and the
+///   deterministic-collation checks on key columns (issues #590, #638).
+/// * `client_encoding` is fixed to `UTF8` by `tokio-postgres` itself.
+/// * `xmloption`, `xmlbinary`, `timezone_abbreviations` and
+///   `standard_conforming_strings` change how *input* is parsed (or, for
+///   `xmlbinary`, what the `xml*` constructor functions build), not how a
+///   stored value is rendered.
+///
 /// [`deterministic_text_output_options`] parses this string back into the
 /// `-c name=value` shape `pgwire_replication::ReplicationConfig::with_options`
 /// expects, so both forms come from one source of truth — see that
@@ -321,7 +352,7 @@ impl Pool {
 /// a second `-c`-shaped list here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
      set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
-     set timezone to 'UTC'";
+     set timezone to 'UTC'; set lc_monetary to 'C'";
 
 /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], reparsed into the Postgres startup
 /// `options` parameter's `-c name=value -c name2=value2 ...` shape —
@@ -771,7 +802,7 @@ mod tests {
         assert_eq!(
             deterministic_text_output_options(),
             "-c datestyle=ISO,\\ YMD -c bytea_output=hex -c extra_float_digits=1 \
-             -c intervalstyle=postgres -c timezone=UTC"
+             -c intervalstyle=postgres -c timezone=UTC -c lc_monetary=C"
         );
     }
 
@@ -790,10 +821,7 @@ mod tests {
             .count();
         let token_count = deterministic_text_output_options().split(" -c ").count();
         assert_eq!(clause_count, token_count);
-        assert_eq!(
-            clause_count, 5,
-            "expected five pinned GUCs as of issue #246"
-        );
+        assert_eq!(clause_count, 6, "expected six pinned GUCs as of issue #672");
     }
 
     #[test]
@@ -829,6 +857,73 @@ mod tests {
                 .expect_err("the DSN doesn't parse");
             crate::config::malformed_dsn_fixtures::assert_no_password_fragment(dsn, &err);
         }
+    }
+
+    /// Issue #672: `money` renders the same on every kind of session Trellis
+    /// opens itself (pooled, unpooled, dedicated) even when the database's
+    /// own `lc_monetary` default says otherwise. The walsender, the fourth
+    /// kind, is covered with the other pins in `tests/intake_guc_pinning.rs`.
+    #[tokio::test]
+    async fn money_renders_the_same_on_every_session_kind_under_a_hostile_lc_monetary() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (raw, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let hostile = testkit::locale::hostile_lc_monetary(&raw).await;
+        raw.batch_execute(&format!(
+            "alter database {} set lc_monetary to '{hostile}'",
+            quote_ident(db.name())
+        ))
+        .await
+        .expect("apply hostile database lc_monetary");
+
+        const PROBE: &str = "select 1234.56::money::text, (-1234.56)::money::text";
+        let expected = (
+            testkit::locale::PINNED_MONEY_TEXT.to_string(),
+            "-$1,234.56".to_string(),
+        );
+        async fn render(client: &tokio_postgres::Client) -> (String, String) {
+            let row = client.query_one(PROBE, &[]).await.expect("render money");
+            (row.get(0), row.get(1))
+        }
+
+        // Control: a session started after the `ALTER DATABASE` that pins
+        // nothing sees the hostile locale, or this test proves nothing.
+        let (unpinned, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect unpinned");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        assert_ne!(
+            render(&unpinned).await,
+            expected,
+            "hostile lc_monetary {hostile} must be in effect"
+        );
+
+        // A fresh pool: `db.pool` may hold connections opened before the
+        // `ALTER DATABASE`.
+        let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let pooled = pool.get().await.expect("pooled connection");
+        assert_eq!(render(&pooled).await, expected, "pooled");
+
+        let unpooled = pool.connect_unpooled().await.expect("unpooled connection");
+        assert_eq!(render(&unpooled).await, expected, "unpooled");
+
+        let (dedicated, connection) = connect_dedicated(db.dsn()).await.expect("dedicated");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        dedicated
+            .batch_execute(&dedicated_session_setup(crate::config::DEFAULT_SCHEMA))
+            .await
+            .expect("dedicated session setup");
+        assert_eq!(render(&dedicated).await, expected, "dedicated");
     }
 
     /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through

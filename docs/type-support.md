@@ -125,7 +125,7 @@ per-type capability, so it's omitted from the aggregate cells.
 | range types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | deferred |
 | composite / row types | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | — | deferred |
 | geometric (`point`…) | ✅ | ⚠️ | ❌ | ❌ | ⚠️ | ❌ | niche; deep-defer |
-| `money` | ⚠️ locale text | ❌ | ❌ | ❌ | ❌ | ❌ | I/O is `STABLE` (`lc_monetary`); use `numeric` |
+| `money` | ⚠️ locale text | ❌ | ❌ | ❌ | ❌ | ❌ | I/O is `STABLE` (`lc_monetary`, pinned to `C` since #672); use `numeric` |
 | `json` | ✅ | ❌ | ❌ | ❌ | ⚠️ passthrough | ⚠️ | no `=` operator; prefer `jsonb` |
 | `xml` `tsvector` `tsquery` | ✅ | ❌ | ❌ | ❌ | ⚠️ passthrough | ❌ | no useful immutable `=`/ordering |
 
@@ -136,7 +136,10 @@ inputs. `pg_proc.provolatile` is the ground truth — several intuitions are wro
 
 * **`money`** — comparison (`cash_eq`/`cash_cmp`) *is* immutable, but text I/O
   (`cash_out`) is `STABLE` (`lc_monetary`), so the CDC-decoded text is
-  locale-dependent. Excluded; use `numeric`.
+  locale-dependent. Issue #672 pins `lc_monetary` to `'C'` in
+  `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`, so a passthrough `money` column now
+  renders the same (`$1,234.56`) on every connection Trellis opens, walsender
+  included. It stays excluded from the key and computed roles; use `numeric`.
 * **`json`** — has *no* `=` operator; can never be a key. `jsonb` can.
 * **`text`/`varchar`/`char`** — Postgres marks these comparisons IMMUTABLE
   despite collation-sensitivity. Our own bar is a **deterministic collation** (or
