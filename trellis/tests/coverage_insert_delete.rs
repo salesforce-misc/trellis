@@ -15,11 +15,12 @@
 //! build.
 //!
 //! The build is held with event triggers on advisory locks the test holds, at
-//! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2):
-//! the one dropping the ledger's key (before the source read) and the one
-//! adding it back (after the read, before the target write). Both run in the
-//! ledger's transaction, which has an xid by then (its `truncate`), but the
-//! test seals nothing while the build is held.
+//! the two `ALTER TABLE`s around the aggregate build's ledger load (#623 D2),
+//! told apart by their text: the one dropping the ledger's key (before the
+//! source read) and the one adding it back (after the read, before the target
+//! write). The second has no xid when the trigger fires. The first runs in the
+//! load's transaction, which has one by then (its `truncate`), but the test
+//! seals nothing while the build is held there.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -88,9 +89,11 @@ async fn install_build_holds(client: &Client) {
         .batch_execute(&format!(
             "create function hold_direct_build() returns event_trigger \
              language plpgsql as $$ \
-             declare held bigint := case when current_query() ilike '%drop constraint%' \
-                                         then {BEFORE_READ} else {AFTER_READ} end; \
+             declare held bigint := case \
+                 when current_query() ilike '%drop constraint%' then {BEFORE_READ} \
+                 when current_query() ilike '%add primary key%' then {AFTER_READ} end; \
              begin \
+               if held is null then return; end if; \
                perform pg_advisory_lock(held); \
                perform pg_advisory_unlock(held); \
              end $$; \

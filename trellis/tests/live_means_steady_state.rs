@@ -103,13 +103,13 @@ async fn converge(trellis: &Trellis) {
         .expect("await_converged");
 }
 
-/// Blocks a direct build's `ALTER TABLE` after its read on advisory lock
-/// `key` until the test releases it. A relationship 1-1 build reads each
-/// table into temp staging with `CREATE TEMP TABLE ... AS SELECT` and then
-/// `ALTER`s it to add its key; an aggregate build reads the source into its
-/// ledger with the ledger's key dropped (an `ALTER` before the read, which
-/// this lets through) and then `ALTER`s the ledger to add it back (#623 D2).
-/// Held there, the build has read the source and written no target row. The
+/// Blocks a direct build's `ALTER TABLE … add primary key` after its read on
+/// advisory lock `key` until the test releases it. A relationship 1-1 build
+/// reads each table into temp staging with `CREATE TEMP TABLE ... AS SELECT`
+/// and then adds its key; an aggregate build reads the source into its ledger
+/// with the ledger's key dropped and then adds it back (#623 D2). Every other
+/// `ALTER TABLE` (the key drop before the read, a capture install) goes
+/// through. Held there, the build has read the source and written no target row. The
 /// `ALTER` is held at `ddl_command_start`, before it has an xid, so the ring
 /// keeps sealing and draining around it.
 async fn hold_direct_builds(raw: &Client, key: i64) {
@@ -117,7 +117,7 @@ async fn hold_direct_builds(raw: &Client, key: i64) {
         "create function hold_direct_build() returns event_trigger \
          language plpgsql as $$ \
          begin \
-           if current_query() not ilike '%drop constraint%' then \
+           if current_query() ilike '%add primary key%' then \
              perform pg_advisory_lock({key}); \
              perform pg_advisory_unlock({key}); \
            end if; \

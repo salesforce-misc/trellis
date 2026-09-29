@@ -22,8 +22,8 @@
 //! target equal to the source.
 //!
 //! The aggregate build is held with event triggers on advisory locks the
-//! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2):
-//! the one dropping the ledger's key (before the source read) and the one
+//! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2),
+//! told apart by their text: the one dropping the ledger's key (before the source read) and the one
 //! adding it back (after the read, before the target write). The second has
 //! no xid when the trigger fires, so the build held there doesn't hold back
 //! the seal gate; the first runs in the load's transaction, and the tests
@@ -97,9 +97,11 @@ async fn install_build_holds(client: &Client) {
         .batch_execute(&format!(
             "create function hold_direct_build() returns event_trigger \
              language plpgsql as $$ \
-             declare held bigint := case when current_query() ilike '%drop constraint%' \
-                                         then {BEFORE_READ} else {AFTER_READ} end; \
+             declare held bigint := case \
+                 when current_query() ilike '%drop constraint%' then {BEFORE_READ} \
+                 when current_query() ilike '%add primary key%' then {AFTER_READ} end; \
              begin \
+               if held is null then return; end if; \
                perform pg_advisory_lock(held); \
                perform pg_advisory_unlock(held); \
              end $$; \
