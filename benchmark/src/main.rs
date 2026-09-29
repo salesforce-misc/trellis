@@ -190,11 +190,19 @@ const RELATIONSHIP_AGGREGATE_CEILING: Duration = Duration::from_secs(10);
 
 fn main() {
     // Opt-in engine logs for debugging a probe: TRELLIS_BENCH_LOG=warn (or a
-    // full EnvFilter directive) writes tracing output to stderr.
-    if let Ok(filter) = std::env::var("TRELLIS_BENCH_LOG") {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
+    // full EnvFilter directive) writes tracing output to stderr. The engine
+    // warning counter (`lock_timeout_warnings` in the scenarios' JSON) is
+    // always on.
+    {
+        use tracing_subscriber::prelude::*;
+        let stderr = std::env::var("TRELLIS_BENCH_LOG").ok().map(|filter| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::EnvFilter::new(filter))
+        });
+        tracing_subscriber::registry()
+            .with(streaming::scrape::engine_log_counter())
+            .with(stderr)
             .init();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();

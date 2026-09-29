@@ -32,7 +32,14 @@
 //! - the writers' commit latency during the build and overall, and whether
 //!   they kept `--write-rate`;
 //! - the window's [`disk_tier`](super::disk_tier) columns (WAL MB/s and
-//!   total, fsyncs/s, checkpoint buffers), deadlocks and rollbacks;
+//!   total, fsyncs/s, checkpoint buffers), deadlocks and rollbacks, and its
+//!   [`server_cost`](super::server_cost) columns (Postgres CPU, `deadlock
+//!   detected` lines, lock-timeout warnings, ledger bytes); per-row columns
+//!   divide by the rows folded in the window, the `--rows` the build read
+//!   plus the writer statements that changed a row;
+//! - lock waits and page lock holds by statement class
+//!   ([`contention`](super::contention)), sampled over the same window. The
+//!   build's own writes to the target count as group upserts;
 //! - the oldest client `xmin` held from define to the writers' stop, and the
 //!   oldest open transaction;
 //! - peak process RSS ([`process_memory`](super::process_memory)): overall,
@@ -62,13 +69,16 @@ use tokio_postgres::Client as RawClient;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::numeric_columns;
-use crate::streaming::contention;
+use crate::streaming::contention::{self, ContentionSummary};
 use crate::streaming::disk_tier::{self, LatencyHistogram, json_ms};
 use crate::streaming::load::GENERATOR_UNDERSHOOT_TOLERANCE;
 use crate::streaming::process_memory::{self, RssSampler, RssSummary};
+use crate::streaming::server_cost::{self, ServerCost};
 use crate::streaming::tuning::EngineTuning;
 
 const SOURCE: &str = "agg_src";
+/// The definition's target table (its bare name).
+const TARGET: &str = "agg_totals";
 const LOAD_BATCH_ROWS: u64 = 1_000_000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
 const MONITOR_POLL: Duration = Duration::from_millis(100);
@@ -170,6 +180,10 @@ pub struct BuildUnderLoadResult {
     pub deadlocks: i64,
     pub xact_rollbacks: i64,
     pub disk: disk_tier::DiskTier,
+    /// Same window as `disk`; see the module doc.
+    pub server: ServerCost,
+    /// Same window as `disk`, from writer start to convergence.
+    pub contention: ContentionSummary,
     pub memory: RssSummary,
     /// The oldest backend `xmin` seen from define to the writers' stop, as an
     /// age in transaction ids, and the longest time one `xmin` value stayed
@@ -312,10 +326,11 @@ impl BuildUnderLoadResult {
              \"kept_target_rate\":{},\"writes_issued\":{{{}}},\"writes_noop\":{},\
              \"writer_errors\":{},\"writer_lat_p50_ms\":{},\"writer_lat_p99_ms\":{},\
              \"writer_lat_build_p50_ms\":{},\"writer_lat_build_p99_ms\":{},\
-             \"deadlocks\":{},\"xact_rollbacks\":{},\"wal_bytes\":{},{},{},\
+             \"deadlocks\":{},\"xact_rollbacks\":{},\"wal_bytes\":{},\
+             \"folded_rows\":{},\"wal_bytes_per_row\":{:.1},{},{},{},{},\
              \"peak_xmin_age_xids\":{},\"peak_xmin_hold_secs\":{:.3},\
              \"peak_xmin_holder\":\"{}\",\"peak_xact_secs\":{:.3},\"peak_xact_query\":\"{}\",\
-             \"source_bytes\":{},\"target_bytes\":{}}}",
+             \"source_bytes\":{},\"target_bytes\":{},\"contention\":{}}}",
             scenario,
             self.cfg.rows,
             self.cfg.groups,
@@ -352,7 +367,11 @@ impl BuildUnderLoadResult {
             self.deadlocks,
             self.xact_rollbacks,
             self.disk.wal_bytes,
+            self.folded_rows(),
+            self.disk.wal_bytes as f64 / self.folded_rows().max(1) as f64,
             self.disk.json_fields(),
+            self.server.json_fields(self.folded_rows(), self.cfg.rows),
+            self.contention.lock_json_fields(),
             self.memory.json_fields(),
             self.peak_xmin_age_xids,
             self.peak_xmin_hold_secs,
@@ -361,7 +380,14 @@ impl BuildUnderLoadResult {
             disk_tier::json_escape(&self.peak_xact_query),
             self.source_bytes,
             self.target_bytes,
+            self.contention.to_json(),
         )
+    }
+
+    /// Source rows the engine folded in the measured window: the `--rows`
+    /// the build read, plus every writer statement that changed a row.
+    pub fn folded_rows(&self) -> u64 {
+        self.cfg.rows + self.writes.total().saturating_sub(self.writes.noop)
     }
 
     pub fn human(&self) -> String {
@@ -370,7 +396,7 @@ impl BuildUnderLoadResult {
             "build-under-load: {} rows / {} groups, loaded at {:.0} rows/s; build {:.1}s over {} \
              chunks (first done {}), live after {:.1}s; converged {} (tail {}, engine settled {}, {} oracle checks of {}), oracle_ok={} \
              ({} mismatched); writers {:.0}/{} stmt/s (kept={}), commit p50/p99 {}/{} ms \
-             overall, {}/{} ms during build; {}; {}",
+             overall, {}/{} ms during build; {}; {}; page lock hold p99 {} ms, wait p99 {} ms; {}",
             self.cfg.rows,
             self.cfg.groups,
             self.load_rows_per_sec,
@@ -403,6 +429,9 @@ impl BuildUnderLoadResult {
             json_ms(w.latency_build.quantile_ms(0.5)),
             json_ms(w.latency_build.quantile_ms(0.99)),
             self.disk.human(),
+            self.server.human(self.folded_rows()),
+            json_ms(self.contention.page_lock_holds.p99_ms),
+            json_ms(self.contention.page_lock_waits.p99_ms),
             self.memory.human(),
         )
     }
@@ -793,7 +822,19 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let client = trellis::Client::start(db.dsn(), tuning.client_options()).expect("client start");
 
     let disk_start = disk_tier::sample(&sampler).await;
+    let server_start = server_cost::start(&cluster);
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
+    let contention_stop = Arc::new(AtomicBool::new(false));
+    let contention_task = {
+        let (dsn, stop) = (db.dsn().to_string(), contention_stop.clone());
+        tokio::spawn(async move {
+            let raw = connect_raw(&dsn).await;
+            contention::sample_while(&raw, SOURCE, TARGET, Instant::now(), || {
+                !stop.load(Ordering::Relaxed)
+            })
+            .await
+        })
+    };
     let shared = Arc::new(WriterShared {
         start: Instant::now(),
         rate: cfg.write_rate,
@@ -816,7 +857,7 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
 
     let columns = numeric_columns(&["id", "grp", "amt"]);
     let source_text = format!(
-        "TRANSFORM agg_totals FROM public.{SOURCE} GROUP BY grp \
+        "TRANSFORM {TARGET} FROM public.{SOURCE} GROUP BY grp \
          SELECT grp AS grp, SUM(amt) AS total, COUNT(*) AS n"
     );
     let xmin_stop = Arc::new(AtomicBool::new(false));
@@ -904,7 +945,10 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         }
         tokio::time::sleep(CONVERGE_POLL).await;
     }
+    contention_stop.store(true, Ordering::Relaxed);
     let disk = disk_tier::since(&sampler, &disk_start).await;
+    let server = server_start.finish(&sampler).await;
+    let contention = contention_task.await.expect("contention sampler");
     memory.end_phase("converge");
     let (source_bytes, target_bytes) = relation_sizes(&raw, &terminal).await;
     let (deadlocks_after, rollbacks_after) = contention::deadlocks_and_rollbacks(&sampler).await;
@@ -953,6 +997,8 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
         deadlocks: deadlocks_after - deadlocks_before,
         xact_rollbacks: rollbacks_after - rollbacks_before,
         disk,
+        server,
+        contention,
         memory,
         peak_xmin_age_xids: xmin.peak_age,
         peak_xmin_hold_secs: xmin.peak_hold,

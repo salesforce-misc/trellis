@@ -49,6 +49,7 @@ use crate::streaming::scrape::{
     CHANGES_APPLIED_METRIC, END_TO_END_LATENCY_METRIC, HistogramSnapshot, LE_MAX, LE_P50, LE_P99,
     T1_BOUNDS, counter_value, scrape,
 };
+use crate::streaming::server_cost::{self, ServerCost};
 use crate::streaming::throughput::Offer;
 use crate::streaming::tuning::EngineTuning;
 
@@ -151,6 +152,15 @@ pub struct FoldInResult {
     /// #629) carries its own I/O context.
     pub disk: disk_tier::DiskTier,
     pub wal_bytes_per_row: f64,
+    /// Source rows the target folded in over the same window as `disk` and
+    /// `server` (its `sum(row_count)` at the end minus at the start): the
+    /// denominator of `pg_cpu_us_per_folded_row`.
+    pub folded_rows_in_window: u64,
+    /// [`server_cost`] columns over the same window as `disk`: Postgres CPU
+    /// (JSON `pg_cpu_us_per_folded_row`), `deadlock detected` log lines, the
+    /// engine's lock-timeout warnings, ledger bytes per source row. The lock
+    /// hold/wait columns come from `contention` (#623 D1).
+    pub server: ServerCost,
 }
 
 impl FoldInResult {
@@ -166,6 +176,7 @@ impl FoldInResult {
              \"e2e_max_bucket_frac\":{:.4},\"oracle_ok\":{},\"oracle_groups\":{},\
              \"oracle_mismatched_groups\":{},\"deadlocks\":{},\"xact_rollbacks\":{},\
              \"wal_bytes\":{},\"wal_bytes_per_row\":{:.1},{},\
+             \"folded_rows_in_window\":{},{},{},\
              \"contention\":{}}}",
             scenario,
             self.fold_in_ratio,
@@ -201,6 +212,10 @@ impl FoldInResult {
             self.disk.wal_bytes,
             self.wal_bytes_per_row,
             self.disk.json_fields(),
+            self.folded_rows_in_window,
+            self.server
+                .json_fields(self.folded_rows_in_window, self.rows_issued + 1),
+            self.contention.lock_json_fields(),
             self.contention.to_json(),
         )
     }
@@ -335,6 +350,8 @@ pub async fn run_probe(
     };
     let (deadlocks_before, rollbacks_before) = contention::deadlocks_and_rollbacks(&sampler).await;
     let disk_start = disk_tier::sample(&sampler).await;
+    let server_start = server_cost::start(&cluster);
+    let folded_before = folded_rows(&raw, &terminal).await;
     let offer_start = Instant::now();
     let (raw_ref, terminal_ref) = (&raw, terminal.as_str());
     let (load, fold_samples, contention) = tokio::join!(
@@ -348,6 +365,7 @@ pub async fn run_probe(
         contention::sample(
             &sampler,
             SOURCE_TABLE,
+            terminal_ref,
             offer_start + offer.duration.mul_f64(rate::SETTLE_FRACTION),
             offer_start + offer.duration,
         ),
@@ -387,6 +405,8 @@ pub async fn run_probe(
     }
     let drained = drained_after.is_some();
     let disk = disk_tier::since(&sampler, &disk_start).await;
+    let folded_after = folded_rows(&raw, &terminal).await;
+    let server = server_start.finish(&sampler).await;
 
     let after = scrape();
     let changes_now = counter_value(&after, CHANGES_APPLIED_METRIC, &terminal);
@@ -438,6 +458,8 @@ pub async fn run_probe(
         xact_rollbacks: rollbacks_after - rollbacks_before,
         wal_bytes_per_row: disk.wal_bytes as f64 / load.rows_issued.max(1) as f64,
         disk,
+        folded_rows_in_window: (folded_after - folded_before).max(0) as u64,
+        server,
     }
 }
 

@@ -50,7 +50,8 @@
 //! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3), and issue
 //!   #277's group-count x drain-worker contention grid over the same probe.
 //! - [`contention`]: `pg_stat_activity` sampling that attributes engine
-//!   backend time to row-lock waits vs everything else (#277).
+//!   backend time to row-lock waits vs everything else (#277), and per-episode
+//!   lock wait and page lock hold times by statement class (#623 D1).
 //! - [`write_tax`]: what capturing a table costs the application writing to
 //!   it, per capture variant and transaction shape (#565 E1, #622 C4).
 //! - [`capture_ceiling`]: rows/s reaching the ring as writers are added,
@@ -64,6 +65,8 @@
 //!   storage, and a fixed-size commit-latency histogram.
 //! - [`process_memory`]: in-process `VmRSS` sampling (peak, per phase,
 //!   `VmHWM`, the cgroup's `memory.peak`).
+//! - [`server_cost`]: Postgres CPU, `deadlock detected` log lines, the
+//!   engine's lock-timeout warnings and ledger bytes over a window (#623 D1).
 
 pub mod build_under_load;
 pub mod capture_ceiling;
@@ -79,6 +82,7 @@ pub mod load;
 pub mod process_memory;
 pub mod rate;
 pub mod scrape;
+pub mod server_cost;
 pub mod throughput;
 pub mod tuning;
 pub mod write_tax;

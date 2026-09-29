@@ -11,8 +11,8 @@ use crate::streaming::rate::{human_rate, restaged_in_window};
 use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
-    build_under_load, capture_ceiling, fold_in, generator_reach, hop_latency, idle_cost, load,
-    throughput,
+    build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
+    load, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -597,6 +597,19 @@ fn report_contention(result: &fold_in::FoldInResult) {
     for (class, statement, mean) in &c.top_statements {
         eprintln!("    {mean:>6.2} {:<11} {statement}", class.label());
     }
+    eprintln!(
+        "    page lock hold p50/p99/max {}/{}/{} ms over {} page txns; page lock wait \
+         p50/p99/max {}/{}/{} ms over {} waits; {}",
+        disk_tier::json_ms(c.page_lock_holds.p50_ms),
+        disk_tier::json_ms(c.page_lock_holds.p99_ms),
+        disk_tier::json_ms(c.page_lock_holds.max_ms),
+        c.page_lock_holds.count,
+        disk_tier::json_ms(c.page_lock_waits.p50_ms),
+        disk_tier::json_ms(c.page_lock_waits.p99_ms),
+        disk_tier::json_ms(c.page_lock_waits.max_ms),
+        c.page_lock_waits.count,
+        result.server.human(result.folded_rows_in_window),
+    );
 }
 
 /// Prints one JSON line per aggregate probe, flags oracle failures, and
@@ -1007,6 +1020,8 @@ mod tests {
             xact_rollbacks: 0,
             disk: Default::default(),
             wal_bytes_per_row: 0.0,
+            folded_rows_in_window: rows_issued,
+            server: Default::default(),
         }
     }
 

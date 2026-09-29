@@ -23,8 +23,21 @@
 //! that window's own contribution. Every series read here is cumulative
 //! (Prometheus convention: bucket counts and `_count`/`_total` only increase),
 //! so the subtraction is exact, not an approximation.
+//!
+//! **Engine log lines.** Some engine signals exist only as `tracing` events,
+//! not metrics: the drain's `drain page waited out its lock_timeout` warning
+//! (ADR-0002 I7, #621) is one. [`engine_log_counter`] is a `tracing` layer
+//! the benchmark binary always installs (`main.rs`), filtered to `WARN` and
+//! above, that counts those lines as they are emitted; [`lock_timeout_warnings`]
+//! reads the process-wide count, which a scenario diffs across its window like
+//! every other series here. It counts the formatted line, so it matches
+//! exactly what `TRELLIS_BENCH_LOG=warn` would print.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::LevelFilter;
 
 /// `trellis_end_to_end_latency_seconds` — source commit to terminal apply,
 /// the histogram T1 is stated against.
@@ -301,9 +314,67 @@ impl T1Evaluation {
     }
 }
 
+/// The engine's warning when a drain page's lock wait hits `lock_timeout`
+/// and the page rolls back to retry (`staging::apply`, ADR-0002 I7).
+pub const LOCK_TIMEOUT_WARNING: &str = "drain page waited out its lock_timeout";
+
+static LOCK_TIMEOUT_WARNINGS: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`LOCK_TIMEOUT_WARNING`] lines the engine has emitted in this
+/// process so far. Cumulative: diff it across a window. Always `0` unless
+/// [`engine_log_counter`] is installed.
+pub fn lock_timeout_warnings() -> u64 {
+    LOCK_TIMEOUT_WARNINGS.load(Ordering::Relaxed)
+}
+
+/// Counts the [`LOCK_TIMEOUT_WARNING`]s in the formatted lines written to it.
+/// `fmt` formats each event into one buffer and writes it with one
+/// `write_all`, so a line is never split across two calls.
+struct WarningCounter;
+
+impl std::io::Write for WarningCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = count_lock_timeout_warnings(&String::from_utf8_lossy(buf));
+        if n > 0 {
+            LOCK_TIMEOUT_WARNINGS.fetch_add(n, Ordering::Relaxed);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn count_lock_timeout_warnings(text: &str) -> u64 {
+    text.matches(LOCK_TIMEOUT_WARNING).count() as u64
+}
+
+/// A `tracing` layer that counts the engine's [`LOCK_TIMEOUT_WARNING`] lines
+/// ([`lock_timeout_warnings`]). Filtered to `WARN` and above on its own, so
+/// installing it leaves every `debug!`/`info!` callsite disabled: the engine
+/// pays for nothing it didn't before but formatting its (rare) warnings.
+pub fn engine_log_counter() -> impl Layer<tracing_subscriber::Registry> + Send + Sync {
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(|| WarningCounter)
+        .with_filter(LevelFilter::WARN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_lock_timeout_warning_lines() {
+        let line = "WARN trellis::staging::apply: drain page waited out its lock_timeout; \
+                    rolled back seg_seq=4 delay_ms=12\n";
+        assert_eq!(count_lock_timeout_warnings(line), 1);
+        assert_eq!(
+            count_lock_timeout_warnings("WARN lock timeout retries exhausted"),
+            0
+        );
+    }
 
     const SAMPLE: &str = "\
 trellis_end_to_end_latency_seconds_bucket{transform=\"t\",le=\"0.25\"} 5\n\
