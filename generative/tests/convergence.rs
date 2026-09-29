@@ -347,6 +347,62 @@ async fn the_harness_detects_a_corrupted_target() {
     );
 }
 
+/// [`check_program`] reports every diverging target, in definition order, not
+/// just the first (#671): a plant sweep attributes a failure by the targets it
+/// diverged in, so a divergence earlier in definition order must not hide a
+/// later one. Three definitions share one source; the first and last targets
+/// are corrupted and the middle one is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_harness_reports_every_corrupted_target_in_definition_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let program = build_program_multi(
+        &[TableSpec::numeric_only(
+            vec![(Some(10), Some(1)), (Some(20), Some(2))],
+            Vec::new(),
+        )],
+        &[0, 0, 0],
+    );
+    assert_eq!(program.defs.len(), 3);
+    let pk_col = program.tables[0].pk_col.clone();
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let outcome = run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("program must converge before we corrupt it");
+    assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    let client = pool.get().await.expect("pool connection");
+    for def in [&program.defs[0], &program.defs[2]] {
+        let qualified = qualified_target_table("public", def);
+        client
+            .execute(
+                &format!("update {qualified} set \"total\" = 999 where \"{pk_col}\" = 1"),
+                &[],
+            )
+            .await
+            .expect("corrupt target");
+    }
+
+    let snapshot = backend.snapshot().await.expect("snapshot after corruption");
+    let found = check_program(&pool, &program, &snapshot)
+        .await
+        .expect("oracle check must run");
+    let targets: Vec<&str> = found.iter().map(|(target, _)| target.as_str()).collect();
+    assert_eq!(
+        targets,
+        [
+            program.defs[0].target.as_str(),
+            program.defs[2].target.as_str()
+        ],
+        "both corrupted targets, in definition order, and not the untouched one"
+    );
+}
+
 /// Closes the issue #6 gap: a program whose mutate stream includes a
 /// [`Mutate::DuplicateInsert`] — a second `INSERT` at an already-seeded pk,
 /// rejected by the source table's real primary-key constraint. Unlike the
