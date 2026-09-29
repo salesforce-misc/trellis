@@ -99,6 +99,12 @@ pub async fn reconcile(
 ) -> Result<PassOutcome, CaptureError> {
     let snapshot = read_snapshot(client, schema).await?;
     let installed = installed_tables(&*client, schema).await?;
+    let database: String = client
+        .query_one("select pg_catalog.current_database()::text", &[])
+        .await?
+        .get(0);
+    let instance = instance_key(&database, schema);
+    let instance = instance.as_str();
     let mut outcome = PassOutcome::default();
 
     for table in desired {
@@ -114,12 +120,12 @@ pub async fn reconcile(
                 if action != CaptureAction::Unchanged {
                     tracing::info!(table = %table, action = ?action, "capture reconciled");
                 }
-                forget_wait(schema, table);
+                forget_wait(instance, table);
                 outcome.captured.insert(table.clone());
             }
             Ok(Progress::Waiting(wait)) => {
-                let wait = remember_wait(schema, *wait);
-                report(schema, table, wait.operation.as_str(), || {
+                let wait = remember_wait(instance, *wait);
+                report(instance, table, wait.operation.as_str(), || {
                     tracing::info!(table = %table, "{wait}; retrying next pass");
                 });
                 outcome.waiting.push(wait);
@@ -135,11 +141,11 @@ pub async fn reconcile(
                 if removed {
                     tracing::info!(table = %table, "capture uninstalled: nothing reads the table");
                 }
-                forget_wait(schema, table);
+                forget_wait(instance, table);
             }
             Ok(Progress::Waiting(wait)) => {
-                let wait = remember_wait(schema, *wait);
-                report(schema, table, wait.operation.as_str(), || {
+                let wait = remember_wait(instance, *wait);
+                report(instance, table, wait.operation.as_str(), || {
                     tracing::info!(table = %table, "{wait}; retrying next pass");
                 });
                 outcome.waiting.push(wait);
@@ -150,11 +156,11 @@ pub async fn reconcile(
 
     // A table that is neither read nor installed any more can't be waited on.
     let known: HashSet<&String> = desired.iter().chain(installed.iter()).collect();
-    forget_waits_except(schema, &known);
+    forget_waits_except(instance, &known);
 
     for (table, err) in &outcome.failed {
         let text = err.to_string();
-        report(schema, table, &text, || {
+        report(instance, table, &text, || {
             tracing::warn!(table = %table, error = %err, "capture of a source table failed; retrying next pass");
         });
     }
@@ -298,7 +304,7 @@ pub async fn installed_tables(
 // ---------------------------------------------------------------------
 
 /// The latest [`LockWait`] of each table whose capture operation is still
-/// waiting, keyed by instance schema and table. In memory only (#622 plan
+/// waiting, keyed by instance (database and schema) and table. In memory only (#622 plan
 /// Q9: it describes other sessions, so nothing can re-derive it, and it
 /// stays out of the schema): a staging worker in another process reports
 /// its waits in its own log only.
@@ -311,9 +317,9 @@ fn with_waits<T>(f: impl FnOnce(&mut HashMap<(String, String), LockWait>) -> T) 
 
 /// Records `wait`, keeping the first pass's `waiting_since` while the same
 /// operation keeps waiting, and returns what it recorded.
-fn remember_wait(schema: &str, mut wait: LockWait) -> LockWait {
+fn remember_wait(instance: &str, mut wait: LockWait) -> LockWait {
     with_waits(|waits| {
-        let key = (schema.to_string(), wait.table.clone());
+        let key = (instance.to_string(), wait.table.clone());
         if let Some(previous) = waits.get(&key)
             && previous.operation == wait.operation
         {
@@ -324,9 +330,9 @@ fn remember_wait(schema: &str, mut wait: LockWait) -> LockWait {
     })
 }
 
-fn forget_wait(schema: &str, table: &str) {
-    with_waits(|waits| waits.remove(&(schema.to_string(), table.to_string())));
-    with_reports(|reports| reports.remove(&(schema.to_string(), table.to_string())));
+fn forget_wait(instance: &str, table: &str) {
+    with_waits(|waits| waits.remove(&(instance.to_string(), table.to_string())));
+    with_reports(|reports| reports.remove(&(instance.to_string(), table.to_string())));
 }
 
 /// How often [`report`] repeats a table's unchanged wait or failure at its
@@ -348,8 +354,8 @@ fn with_reports<T>(f: impl FnOnce(&mut Reports) -> T) -> T {
 /// (`what`) changed, or once [`REPORT_INTERVAL`] has passed since it last
 /// ran; otherwise logs `what` at `debug`. Cleared when the table's capture
 /// lands.
-fn report(schema: &str, table: &str, what: &str, log: impl FnOnce()) {
-    let key = (schema.to_string(), table.to_string());
+fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
+    let key = (instance.to_string(), table.to_string());
     let due = with_reports(|reports| {
         let due = reports
             .get(&key)
@@ -366,16 +372,24 @@ fn report(schema: &str, table: &str, what: &str, log: impl FnOnce()) {
     }
 }
 
-fn forget_waits_except(schema: &str, known: &HashSet<&String>) {
-    with_waits(|waits| waits.retain(|(s, table), _| s != schema || known.contains(table)));
-    with_reports(|reports| reports.retain(|(s, table), _| s != schema || known.contains(table)));
+fn forget_waits_except(instance: &str, known: &HashSet<&String>) {
+    with_waits(|waits| waits.retain(|(i, table), _| i != instance || known.contains(table)));
+    with_reports(|reports| reports.retain(|(i, table), _| i != instance || known.contains(table)));
 }
 
-/// The latest lock wait of `table`'s capture in instance `schema`, if its
-/// install, widen or uninstall is still waiting for the table lock as of the
-/// staging worker's last pass in this process.
-pub fn lock_wait(schema: &str, table: &str) -> Option<LockWait> {
-    with_waits(|waits| waits.get(&(schema.to_string(), table.to_string())).cloned())
+/// The latest lock wait of `table`'s capture in the instance with schema
+/// `schema` in database `database`, if its install, widen or uninstall is
+/// still waiting for the table lock as of the staging worker's last pass in
+/// this process.
+pub fn lock_wait(database: &str, schema: &str, table: &str) -> Option<LockWait> {
+    let key = (instance_key(database, schema), table.to_string());
+    with_waits(|waits| waits.get(&key).cloned())
+}
+
+/// The registry's key for one instance: its database and schema. Two
+/// instances in one process can share a schema name in different databases.
+fn instance_key(database: &str, schema: &str) -> String {
+    format!("{database}\u{1f}{schema}")
 }
 
 #[cfg(test)]

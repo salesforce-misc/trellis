@@ -635,6 +635,10 @@ impl Trellis {
         source_table: &str,
     ) -> Result<Option<CaptureWait>, TrellisError> {
         let schema = self.config.schema();
+        let database: String = client
+            .query_one("select pg_catalog.current_database()::text", &[])
+            .await?
+            .get(0);
         let mut tables = vec![source_table.to_string()];
         tables.extend(
             client
@@ -649,7 +653,7 @@ impl Trellis {
         );
         Ok(tables
             .iter()
-            .find_map(|table| crate::capture::reconcile::lock_wait(schema, table))
+            .find_map(|table| crate::capture::reconcile::lock_wait(&database, schema, table))
             .map(|wait| CaptureWait::from(&wait)))
     }
 
