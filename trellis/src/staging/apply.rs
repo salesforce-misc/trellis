@@ -7635,6 +7635,14 @@ async fn apply_target(
     // Issue #344: settle every change whose source row moved on since Phase
     // 2 against the current row, before locking or writing anything.
     let reconciled = reconcile_with_source(txn, target, plan).await?;
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRederiveRead,
+        &plan.qualified_target,
+    )
+    .await?;
     // Planted bug (#557): #344, apply every change as computed even when its
     // source row moved on. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -8271,6 +8279,16 @@ pub(crate) async fn apply_page(
     // 3. Ordered pre-lock + upsert/delete, per target table, each under
     // issue #344's per-key ordering lock (taken for every target up front).
     lock_one_to_one_keys(txn, &plan.targets).await?;
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    for target_plan in plan.targets.values() {
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterEntryLock,
+            &target_plan.qualified_target,
+        )
+        .await?;
+    }
     let mut restaged: Vec<Restage> = Vec::new();
     for (target, target_plan) in &plan.targets {
         let (written, deleted, restage) =
@@ -9043,6 +9061,17 @@ pub(crate) async fn apply_page(
     // with `test-util` — see that function's doc comment.
     #[cfg(any(test, feature = "test-util"))]
     pause_before_commit_for_tests().await;
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    for target in plan
+        .targets
+        .values()
+        .map(|t| &t.qualified_target)
+        .chain(plan.aggregate_targets.values().map(|t| &t.target))
+    {
+        super::interleave::pause_at(txn, super::interleave::PausePoint::BeforeCommit, target)
+            .await?;
+    }
 
     let span = tracing::Span::current();
     span.record("keys_written", keys_written);

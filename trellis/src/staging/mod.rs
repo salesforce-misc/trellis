@@ -57,6 +57,8 @@ pub mod claim;
 pub mod converge;
 pub mod error;
 pub mod fold;
+#[cfg(any(test, feature = "test-util"))]
+pub mod interleave;
 pub mod liveness;
 pub(crate) mod page;
 pub mod quarantine;

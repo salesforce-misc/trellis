@@ -3623,6 +3623,9 @@ pub(super) async fn apply_aggregate_target(
         &null_patterns(&prelock_arrays),
     );
     let locked = txn.query(&prelock_sql, &prelock_params).await?;
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(txn, super::interleave::PausePoint::AfterEntryLock, target).await?;
     let mut prior_images: HashMap<&str, String> = HashMap::new();
     // Every group with a target row, mapped to that row's horizon.
     let mut row_horizons: HashMap<&str, Option<PgLsn>> = HashMap::new();
@@ -3692,6 +3695,14 @@ pub(super) async fn apply_aggregate_target(
         .collect();
     if !forced.is_empty() {
         let (w, d) = apply_forced_groups_bulk(txn, target, plan, &forced).await?;
+        // Test-only pause point (#623 D1). See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::AfterRederiveRead,
+            target,
+        )
+        .await?;
         // `w` holds exactly the survivors, so anything short of every forced
         // group is one the bulk recompute found empty.
         found_extinct |= w.len() < forced.len();
@@ -3776,6 +3787,11 @@ pub(super) async fn apply_aggregate_target(
             }));
         }
     }
+
+    // Test-only pause point (#623 D1). See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(txn, super::interleave::PausePoint::AfterGroupUpsert, target)
+        .await?;
 
     // Issue #321: a live read (the forced path's bulk recompute, or
     // `probe_group_exists`) that found a group empty discarded this batch's

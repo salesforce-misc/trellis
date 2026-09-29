@@ -102,6 +102,13 @@ pub mod capture {
     pub use crate::capture::sql::{CaptureEvent, CaptureSpec, function_ddl};
 }
 
+/// Test-only pause points inside a drain page's transaction (#623 D1), for
+/// a harness that freezes one worker between two steps. See
+/// `crate::staging::interleave`'s module doc.
+pub mod interleave {
+    pub use crate::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
+}
+
 /// Planted ordering bugs (issue #557 part 3). A harness reads which plant
 /// this process runs with and how often it fired; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
