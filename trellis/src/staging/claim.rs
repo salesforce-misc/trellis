@@ -4,7 +4,7 @@
 //!
 //! Scope: this module decides how many buckets a batch gets
 //! ([`SEG_BUCKETS`]/[`MIN_ROWS_TO_SPLIT`], applied by
-//! `super::seal::seal_phase1`), tracks live workers as the share
+//! `super::seal::seal_phase2`), tracks live workers as the share
 //! denominator ([`register_drainer`]/[`count_live_drainers`]), and lets a
 //! worker claim a share of a batch's free buckets ([`claim`]) with the
 //! `sealed -> draining` flip committing in the same statement. It does
@@ -42,7 +42,7 @@ const _: () = assert!(
     "SEG_BUCKETS must fit issue #11's planned int8 drained-bucket bit-mask"
 );
 
-/// The minimum row count (measured over the active slot, at seal time) a
+/// The minimum row count (measured over the fenced window, at seal time) a
 /// batch needs to be split into [`SEG_BUCKETS`] buckets; anything smaller
 /// seals to a single bucket — today's pre-#14 unsplit behaviour, exactly.
 pub const MIN_ROWS_TO_SPLIT: i64 = 256;

@@ -1308,12 +1308,13 @@ impl super::OpApplier for ManualApplier {
 /// The drain audit's tables, triggers and trigger functions (issue #557),
 /// created in the instance schema `schema` (already quoted). Two
 /// `AFTER` row triggers on the engine's own staging registry: one on a
-/// segment's `active -> sealed` flip, which records the batch's bucket count
-/// and row count and every `(table, key)` in it, and one on each
+/// segment's fence being published, which records the batch's bucket count
+/// and row count and every `(table, key)` in its slot, and one on each
 /// `seg_claims` insert, which records which worker claimed which bucket. A
 /// retired segment's registry rows are deleted, so the audit keeps its own
-/// copy. The seal trigger reads the ring slot inside the seal transaction,
-/// so its row count is the one the seal itself decided the bucket count from.
+/// copy. The seal decides the bucket count and row count in the statement
+/// that publishes the fence (issue #598), so the trigger records the
+/// registry's own values.
 ///
 /// Each seal is tagged with the burst the harness last announced
 /// ([`super::ConcurrentBackend::begin_burst`]). The concurrent runner
@@ -1338,16 +1339,15 @@ fn drain_audit_ddl(schema: &str) -> String {
              ring text := '{schema}.' || quote_ident('seg_' || new.ring_slot); \
          begin \
              select burst into current_burst from {schema}.generative_audit_burst; \
-             execute format('insert into {schema}.generative_audit_sealed \
-                 select $1, $2, $3, count(*) from %s', ring) \
-                 using new.seg_seq, current_burst, new.bucket_count; \
+             insert into {schema}.generative_audit_sealed \
+                 values (new.seg_seq, current_burst, new.bucket_count, new.row_count); \
              execute format('insert into {schema}.generative_audit_keys \
                  select distinct $1, $2, src_table, key from %s', ring) \
                  using new.seg_seq, current_burst; \
              return null; \
          end $audit$; \
-         create trigger generative_audit_on_seal after update of state on {schema}.segments \
-             for each row when (old.state = 'active' and new.state = 'sealed') \
+         create trigger generative_audit_on_seal after update of fence_snapshot on {schema}.segments \
+             for each row when (old.fence_snapshot is null and new.fence_snapshot is not null) \
              execute function {schema}.generative_audit_on_seal(); \
          create function {schema}.generative_audit_on_claim() returns trigger \
          language plpgsql as $audit$ \

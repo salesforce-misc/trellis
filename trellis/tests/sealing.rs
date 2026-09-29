@@ -1035,6 +1035,150 @@ async fn a_truncate_bearing_batch_seals_single_bucket_with_has_truncate_set() {
     );
 }
 
+/// A truncate row, as `trellis::staging::append` would stage one from
+/// intake.
+fn truncate_change() -> StagedChange {
+    StagedChange::Truncate {
+        src_table: "orders".to_string(),
+        lsn: None,
+        origin_lsn: None,
+        src_changed: None,
+    }
+}
+
+/// Appends enough committed rows through the real `append` to clear
+/// `MIN_ROWS_TO_SPLIT` on their own, so a batch holding them would split
+/// into `SEG_BUCKETS` buckets unless a truncate forces one.
+async fn append_past_the_split_threshold(client: &mut Client, prefix: &str) -> i64 {
+    let rows = trellis::staging::MIN_ROWS_TO_SPLIT * 2;
+    let changes: Vec<StagedChange> = (0..rows)
+        .map(|i| recompute(&format!("{prefix}-{i}")))
+        .collect();
+    let txn = client.transaction().await.expect("begin bulk append");
+    trellis::staging::append(&txn, &changes)
+        .await
+        .expect("bulk append");
+    txn.commit().await.expect("commit bulk append");
+    rows
+}
+
+/// `(bucket_count, has_truncate, row_count)` for `seg_seq`.
+async fn seal_decisions(client: &Client, seg_seq: i64) -> (i16, bool, i64) {
+    let row = client
+        .query_one(
+            "select bucket_count, has_truncate, row_count from segments where seg_seq = $1",
+            &[&seg_seq],
+        )
+        .await
+        .expect("read segment row");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// Issue #598, first case: a writer resolves segment 1's slot, phase 1
+/// flips the pointer, and only then does the writer append a truncate and
+/// commit, before phase 2 captures `S_1`. The truncate is visible in `S_1`,
+/// so it is in batch 1. The truncate barrier must see it: batch 1 carries
+/// `has_truncate` and seals single-bucket, even though its slot held enough
+/// rows to split when phase 1 flipped.
+#[tokio::test]
+async fn a_truncate_committed_between_the_flip_and_the_fence_reaches_the_barrier() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    let bulk = append_past_the_split_threshold(&mut sealer, "bulk").await;
+
+    // The straddler resolves slot 0 and takes its xid before the flip.
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    trellis::staging::append(&writer_txn, &[recompute("straddler")])
+        .await
+        .expect("append before the flip");
+
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    assert_eq!(outcome.sealed_seg_seq, 1);
+
+    // Still before phase 2's mirror set, so the truncate lands in slot 0 too.
+    trellis::staging::append(&writer_txn, &[truncate_change()])
+        .await
+        .expect("append the truncate after the flip");
+    writer_txn.commit().await.expect("commit writer");
+    assert_eq!(ring_table_of(&sealer, TRUNCATE_SENTINEL_KEY).await, "seg_0");
+
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    assert_claimed_exactly_once(&sealer, &[1], TRUNCATE_SENTINEL_KEY).await;
+    let (bucket_count, has_truncate, row_count) = seal_decisions(&sealer, 1).await;
+    assert!(has_truncate, "batch 1 holds the truncate, so has_truncate");
+    assert_eq!(
+        bucket_count, 1,
+        "a truncate-bearing batch seals single-bucket"
+    );
+    assert_eq!(
+        row_count,
+        bulk + 2,
+        "row_count counts the fenced window, straddler rows included"
+    );
+}
+
+/// Issue #598, second case: the writer is still open when phase 2 captures
+/// `S_1`, so its truncate in slot 0 is invisible in `S_1` and batch 2 claims
+/// it through its predecessor half. Batch 2's own slot holds enough rows to
+/// split and no truncate of its own; the barrier must still see the
+/// predecessor-half truncate, so batch 2 carries `has_truncate` and seals
+/// single-bucket, and batch 1 does not.
+#[tokio::test]
+async fn a_truncate_claimed_through_the_predecessor_half_reaches_the_barrier() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    append_committed(&mut sealer, "batch-1").await;
+
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    trellis::staging::append(&writer_txn, &[truncate_change()])
+        .await
+        .expect("append the truncate before the seal");
+
+    assert_eq!(seal_both_phases(&mut sealer).await, 1);
+
+    // Commits after `S_1`: in `S_1`'s in-progress list, so batch 2's.
+    writer_txn.commit().await.expect("commit writer");
+    assert_eq!(ring_table_of(&sealer, TRUNCATE_SENTINEL_KEY).await, "seg_0");
+
+    let bulk = append_past_the_split_threshold(&mut sealer, "batch-2").await;
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+
+    assert_claimed_exactly_once(&sealer, &[1, 2], TRUNCATE_SENTINEL_KEY).await;
+    let rows_2 = seal::fenced_rows(&sealer, 2).await.expect("fenced rows 2");
+    assert!(
+        rows_2.contains(&row_identity(&sealer, TRUNCATE_SENTINEL_KEY).await),
+        "batch 2 claims the truncate through its predecessor half"
+    );
+
+    let (bucket_count_1, has_truncate_1, row_count_1) = seal_decisions(&sealer, 1).await;
+    assert!(!has_truncate_1, "batch 1 never sees the truncate");
+    assert_eq!((bucket_count_1, row_count_1), (1, 1));
+
+    let (bucket_count_2, has_truncate_2, row_count_2) = seal_decisions(&sealer, 2).await;
+    assert!(
+        has_truncate_2,
+        "batch 2 holds the truncate through its predecessor half, so has_truncate"
+    );
+    assert_eq!(
+        bucket_count_2, 1,
+        "a truncate-bearing batch seals single-bucket"
+    );
+    assert_eq!(
+        row_count_2,
+        bulk + 1,
+        "row_count counts both halves of the fenced window"
+    );
+}
+
 /// Issue #271: a seal actually completing is the one transition that makes
 /// a segment claimable, so `seal_phase2` now `pg_notify`s `wake_channel` the
 /// instant it publishes the fence. Mirrors
@@ -1172,5 +1316,51 @@ async fn seal_notify_does_not_fire_on_a_raced_no_op_seal_phase2() {
             .await
             .is_err(),
         "a no-op seal_phase2 call must not send a second notify"
+    );
+}
+
+/// Issue #598: a segment's `has_truncate`, `row_count` and `bucket_count`
+/// are column defaults until phase 2 publishes its fence, so
+/// `next_claimable_segments` must not hand out a segment before then.
+/// Here segment 2 holds a truncate that phase 1 flipped past. Returned
+/// unfenced, it would read as an ordinary empty batch and be coalesced
+/// behind segment 1, and a drain that found it fenced by claim time would
+/// apply the truncate in the same pass as its predecessor.
+#[tokio::test]
+async fn next_claimable_segments_skips_a_segment_whose_fence_is_not_published() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    append_committed(&mut sealer, "batch-1").await;
+    assert_eq!(seal_both_phases(&mut sealer).await, 1);
+
+    let txn = sealer.transaction().await.expect("begin truncate");
+    trellis::staging::append(&txn, &[truncate_change()])
+        .await
+        .expect("append the truncate");
+    txn.commit().await.expect("commit truncate");
+
+    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    assert_eq!(outcome.sealed_seg_seq, 2);
+
+    let before = trellis::staging::apply::next_claimable_segments(&sealer, 1_000_000)
+        .await
+        .expect("next claimable before the fence");
+    assert_eq!(before, vec![1], "an unfenced segment is not claimable");
+
+    seal::seal_phase2(&sealer, 2, "wake")
+        .await
+        .expect("seal phase 2");
+    let (bucket_count, has_truncate, row_count) = seal_decisions(&sealer, 2).await;
+    assert_eq!((bucket_count, has_truncate, row_count), (1, true, 1));
+
+    let after = trellis::staging::apply::next_claimable_segments(&sealer, 1_000_000)
+        .await
+        .expect("next claimable after the fence");
+    assert_eq!(
+        after,
+        vec![1],
+        "the fenced truncate-bearing segment is a barrier, never coalesced"
     );
 }

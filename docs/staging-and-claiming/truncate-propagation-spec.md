@@ -28,14 +28,31 @@ truncate is a **two-directional drain barrier**:
 
 Enforcement:
 
-1. **Single bucket.** A batch with any `op='truncate'` row seals with
-   `bucket_count = 1`, so one worker drains the whole-keyspace `DELETE` + any
-   same-batch post-truncate writes as one atomic Phase-3 txn.
+1. **Single bucket.** A batch whose fenced window holds any `op='truncate'`
+   row seals with `bucket_count = 1`, so one worker drains the whole-keyspace
+   `DELETE` + any same-batch post-truncate writes. A batch over the drain cap
+   pages, but the sentinel sorts first and the bucket's cursor orders the pages,
+   so the clear still lands first.
 2. **Barrier in `next_claimable_segment`.** `has_truncate` is recorded on the
    `segments` registry at seal. Let `B` = min `seg_seq` among undrained
    truncate-bearing segments; a worker may be handed segment `s` only when
    `s <= B`. Since the query returns the lowest undrained `s`, `B` is handed out
    only after every `s < B` drains — both directions from one clause.
+
+**Both flags are decided over the fenced window, when the fence is published**
+([03](03-sealing-and-the-fence.md), "The batch is sized when its fence is
+published"). A truncate row belongs to whichever batch's fenced window holds it,
+and that can be a batch the flip never saw it in:
+
+- a writer that resolved slot *k* before the flip and commits its truncate after
+  the flip but before `S_k` puts it in batch *k*;
+- a writer still open at `S_k` puts it in batch *k+1*, through the predecessor
+  half of the both-slots read.
+
+So `has_truncate` and `bucket_count` are computed over both halves of the window,
+in the same statement that publishes `S_k`, and `next_claimable_segment` only
+hands out fenced segments. Deciding them from the slot at the flip let a
+straddling truncate escape the barrier (#598).
 
 Truncates are rare; fully serializing the drain around one is the right
 correctness/throughput trade.

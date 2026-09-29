@@ -16,7 +16,6 @@
 
 use std::time::Duration;
 
-#[cfg(any(test, feature = "internals"))]
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
@@ -118,6 +117,12 @@ async fn seal_gate_blocked(
 /// `xmax` trap: capturing `S_k` before this commits can miss the highest
 /// live xid at commit time).
 ///
+/// Nor does it size the batch. `bucket_count`, `has_truncate` and
+/// `row_count` keep their column defaults here and are decided by
+/// [`seal_phase2`] over the fenced window (issue #598): a writer that
+/// resolved this slot before the flip can still commit into it after this
+/// transaction does, so the slot's contents at the flip are not the batch.
+///
 /// Returns [`StagingError::RingFull`] or [`StagingError::SealGateBlocked`]
 /// from the guards, or [`StagingError::Raced`] if another worker's flip won
 /// first — all three are for the caller to retry/back off on, not to
@@ -140,60 +145,14 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
         return Err(StagingError::SealGateBlocked);
     }
 
-    // The bucket count (issue #14, docs/.../04-claiming-and-the-fold.md,
-    // "Partitioning a batch across workers") is decided here, once, from
-    // this row count and configuration alone — never from the live-worker
-    // registry, which would make an immutable, safety-critical partition
-    // swing with whichever workers happened to be registered at this
-    // instant. Counting the about-to-be-sealed slot in the same transaction
-    // as the flip is what pins `bucket_count` from the moment the batch is
-    // sealed: no other writer can still be appending into it by the time
-    // this transaction commits (the active pointer already moved), so the
-    // count taken here is the batch's true, final row count. Issue #620: it
-    // is stored as `segments.row_count` too, so a drain can tell from it
-    // whether its share fits `ClientOptions::drain_batch_cap` or must page.
-    let table = ring_table_name(ring_slot)?;
-    let row_count: i64 = txn
-        .query_one(&format!("select count(*) from {table}"), &[])
-        .await?
-        .get(0);
-    // The truncate barrier (issue #60, "The ordering hazard"): a batch
-    // containing any `op = 'truncate'` row must seal single-bucket, so the
-    // whole-keyspace clear and any same-batch post-truncate writes are
-    // drained by one bucket's claimant — never split across workers, which
-    // could apply a post-truncate insert on one worker before another
-    // worker's clear runs on the same target. (Issue #620: a batch over the
-    // drain cap pages, so the clear and the writes can commit in different
-    // Phase-3 transactions, but the sentinel sorts first and the bucket's
-    // cursor orders the pages, so the clear still lands first.) Checked in the same
-    // transaction as the row count above and the flip below, for the same
-    // reason `bucket_count` itself is: nothing can still be appending into
-    // this slot once this transaction commits, so this is the batch's true,
-    // final answer, not a snapshot that could go stale.
-    let has_truncate: bool = txn
-        .query_one(
-            &format!("select exists (select 1 from {table} where op = 'truncate')"),
-            &[],
-        )
-        .await?
-        .get(0);
-    let bucket_count: i16 = if has_truncate {
-        1
-    } else if row_count >= MIN_ROWS_TO_SPLIT {
-        SEG_BUCKETS as i16
-    } else {
-        1
-    };
-
     debug_assert!(SegmentState::Active.can_transition_to(SegmentState::Sealed));
     let sealed = txn
         .query_opt(
             "update segments \
-               set state = 'sealed', sealed_at = now(), seal_step1 = pg_current_xact_id(), \
-                   bucket_count = $2, has_truncate = $3, row_count = $4 \
+               set state = 'sealed', sealed_at = now(), seal_step1 = pg_current_xact_id() \
              where seg_seq = $1 and state = 'active' \
              returning seg_seq",
-            &[&active_seq, &bucket_count, &has_truncate, &row_count],
+            &[&active_seq],
         )
         .await?;
     if sealed.is_none() {
@@ -242,6 +201,32 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// set, then the `xmax`-trap fix (`SELECT pg_current_xact_id()`, in
 /// **autocommit**, immediately before the snapshot), then capturing and
 /// publishing `fence_snapshot`.
+///
+/// **The publishing statement also sizes the batch** (issue #598). It counts
+/// the fenced window, both halves ([`fenced_window`]'s own-slot rows visible
+/// in `S_k` plus the predecessor-slot rows visible in `S_k` and not in
+/// `S_{k-1}`), and writes `row_count`, `has_truncate` and `bucket_count`
+/// alongside `fence_snapshot`:
+///
+/// - Every row in that window committed before `S_k` was taken, so the count
+///   is final. Counting the slot at the flip, as phase 1 once did, missed a
+///   straddler that resolved the slot before the flip and committed after it,
+///   including one committing a truncate. It also never looked at the
+///   predecessor half, where a straddler still open at `S_{k-1}` lands.
+/// - The truncate barrier (issue #60, `truncate-propagation-spec.md`) needs
+///   `has_truncate` on every batch whose window holds a truncate row, and
+///   such a batch seals single-bucket so one claimant runs the clear and the
+///   same-batch post-truncate writes. A batch over the drain cap pages, but
+///   the sentinel sorts first and the bucket's cursor orders the pages, so
+///   the clear still lands first.
+/// - `bucket_count` comes from the row count and configuration alone, never
+///   from the live-worker registry, which would make an immutable,
+///   safety-critical partition swing with whoever happened to be registered.
+/// - A claim can't read any of the three before the fence exists: the drain
+///   checks the fence before it claims, and `next_claimable_segments` skips
+///   unfenced segments. One statement publishes all four, so whoever sees the
+///   fence sees the final sizing. A raced call publishes nothing, so the
+///   winner's fence and sizing always agree.
 ///
 /// **The mirror set comes first** (issue #595). Ring writers resolve their
 /// slot from `ring_slot_mirror` ([`append::active_ring_slot`]), not from
@@ -328,17 +313,47 @@ pub async fn seal_phase2(
         .query_one("select pg_current_snapshot()::text", &[])
         .await?
         .get(0);
-    client
-        .execute(
-            "with published as ( \
-                 update segments set fence_snapshot = $1::text::pg_snapshot \
-                 where seg_seq = $2 and state = 'sealed' and fence_snapshot is null \
-                 returning seg_seq \
-             ) \
-             select pg_notify($3, '') from published",
-            &[&fence, &seg_seq, &wake_channel],
+    let Some(row) = client
+        .query_opt(
+            "select ring_slot from segments where seg_seq = $1",
+            &[&seg_seq],
         )
-        .await?;
+        .await?
+    else {
+        return Ok(());
+    };
+    let ring_slot: i16 = row.get(0);
+    let (window, params) = window_over_fence(client, seg_seq, ring_slot, fence, "op").await?;
+    let seg_seq_param = params.len() + 1;
+    let channel_param = params.len() + 2;
+    let sql = format!(
+        "with batch as ({window}), \
+         decided as ( \
+             select count(*) as row_count, \
+                    coalesce(bool_or(op = 'truncate'), false) as has_truncate \
+             from batch \
+         ), \
+         published as ( \
+             update segments s \
+                set fence_snapshot = $1::text::pg_snapshot, \
+                    row_count = d.row_count, \
+                    has_truncate = d.has_truncate, \
+                    bucket_count = (case \
+                        when d.has_truncate then 1 \
+                        when d.row_count >= {MIN_ROWS_TO_SPLIT} then {SEG_BUCKETS} \
+                        else 1 end)::smallint \
+               from decided d \
+              where s.seg_seq = ${seg_seq_param} and s.state = 'sealed' \
+                and s.fence_snapshot is null \
+              returning s.seg_seq \
+         ) \
+         select pg_notify(${channel_param}, '') from published"
+    );
+    let mut param_refs: Vec<&(dyn ToSql + Sync)> =
+        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+    param_refs.push(&seg_seq);
+    param_refs.push(&wake_channel);
+    client.execute(&sql, &param_refs).await?;
     Ok(())
 }
 
@@ -567,6 +582,20 @@ pub(crate) async fn fenced_window(
     let ring_slot: i16 = row.get(0);
     let fence: Option<String> = row.get(1);
     let fence = fence.ok_or(StagingError::UnfencedSealedSegment { seg_seq })?;
+    window_over_fence(client, seg_seq, ring_slot, fence, columns).await
+}
+
+/// [`fenced_window`] over a fence the caller already holds: `fence` is
+/// batch `seg_seq`'s `S_k`, whether read back from `segments` or, in
+/// [`seal_phase2`], just captured and not yet published. `ring_slot` is the
+/// batch's own slot.
+async fn window_over_fence(
+    client: &impl GenericClient,
+    seg_seq: i64,
+    ring_slot: i16,
+    fence: String,
+    columns: &str,
+) -> Result<(String, Vec<String>), StagingError> {
     let table = ring_table_name(ring_slot)?;
 
     let mut sql = format!(

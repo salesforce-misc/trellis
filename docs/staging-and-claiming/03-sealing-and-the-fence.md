@@ -89,18 +89,16 @@ version.
 **Phase 1** (one transaction):
 1. check the guards (below);
 2. stamp `seal_step1 = txid_current()`;
-3. finalize the segment's summary band from a single aggregate over its now-frozen
-   table;
-4. fill the **predecessor's** `seal_step2` with this flip's xid;
-5. allocate the next `seg_seq` into the next slot as `active`;
-6. flip the pointer — last;
-7. `COMMIT`.
+3. fill the **predecessor's** `seal_step2` with this flip's xid;
+4. allocate the next `seg_seq` into the next slot as `active`;
+5. flip the pointer — last;
+6. `COMMIT`.
 
 **Phase 2** (separate autocommit statements, after the flip has committed and is
 visible):
 1. set the pointer's mirror to the new slot (below);
 2. bump the xid horizon (the `xmax` trap, below);
-3. capture and record `seal_snapshot = S_k`.
+3. capture `S_k`, then publish it and **size the batch in one statement** (below).
 
 **`seal_snapshot` must never be taken inside the flip transaction.** Taken after
 the flip commits, no writer holding an old-pointer read can have an xid at or
@@ -186,6 +184,46 @@ loss. A raced phase 2 matches zero rows — a **benign no-op**.
 
 > **Invariant:** `seal_snapshot` is written exactly once and never inside the flip
 > transaction — a published fence, and a mutable one is corruption.
+
+### The batch is sized when its fence is published
+
+A batch's sizing is three registry columns: `row_count`, `has_truncate` (the
+truncate barrier, [truncate-propagation-spec.md](truncate-propagation-spec.md))
+and `bucket_count` (the partition, [04](04-claiming-and-the-fold.md)). All three
+describe the batch's **contents**, and those are fixed by `S_k` plus the
+predecessor half of the both-slots read, not by what the slot held at the flip.
+The flip does not stop appends: a straddler that resolved slot *k* before the
+flip commits into it afterwards (#598). If it commits before `S_k` its rows are
+batch *k*'s; if it is still open at `S_k` they are batch *k+1*'s, through the
+predecessor half. Sizing at the flip missed both, so a truncate could escape
+`has_truncate` and a truncate-bearing batch could seal multi-bucket.
+
+So the statement that publishes `S_k` also sizes the batch, over the fenced
+window, both halves:
+
+```sql
+WITH batch AS (<fenced window of batch k, under the S_k being published>),
+decided AS (SELECT count(*) AS row_count,
+                   coalesce(bool_or(op = 'truncate'), false) AS has_truncate
+            FROM batch)
+UPDATE segments SET seal_snapshot = S_k,
+       row_count = decided.row_count, has_truncate = decided.has_truncate,
+       bucket_count = CASE WHEN decided.has_truncate THEN 1
+                           WHEN decided.row_count >= MIN_ROWS_TO_SPLIT THEN SEG_BUCKETS
+                           ELSE 1 END
+FROM decided
+WHERE seg_seq = k AND state = 'sealed' AND seal_snapshot IS NULL;
+```
+
+Every row in the window committed before `S_k` was taken, so the answer is final.
+Nothing reads the sizing before the fence exists: a drain checks the fence before
+it claims, and `next_claimable_segments` skips unfenced segments. Because one
+statement writes the fence and the sizing, whoever sees one sees the other, and a
+raced phase 2 writes neither. `bucket_count` comes from the row count and
+configuration alone, never from the live-worker registry.
+
+> **Invariant:** a batch's `row_count`, `has_truncate` and `bucket_count` are
+> decided over its fenced window, in the statement that publishes its fence.
 
 ## The two guards — both are backpressure, never overwrite
 

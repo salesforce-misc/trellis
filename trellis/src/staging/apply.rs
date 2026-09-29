@@ -7844,7 +7844,7 @@ async fn clear_target(
 /// 2. **Truncate clears** (issue #60), one plain `DELETE FROM <target>` per
 ///    [`ApplyPlan::clears`] entry, run *before* that target's own ordered
 ///    pre-lock + upsert/delete below: a truncate-bearing batch always seals
-///    with `bucket_count = 1` (`seal::seal_phase1`) and is drained under
+///    with `bucket_count = 1` (`seal::seal_phase2`) and is drained under
 ///    `next_claimable_segment`'s barrier (no predecessor or successor
 ///    segment concurrently draining the same target), so within this one
 ///    transaction "clear, then write" is exactly what makes a same-batch
@@ -10034,6 +10034,13 @@ async fn classify_and_retry(
 /// that strictly — a worker could still be mid-drain on an earlier segment
 /// while this returns a later one.
 ///
+/// Only fenced segments come back. The seal decides a batch's
+/// `has_truncate`, `row_count` and `bucket_count` in the statement that
+/// publishes its fence (issue #598), so before that they are column defaults,
+/// not the batch's. A segment returned here unfenced could be fenced by the
+/// time its caller claims it, with a truncate this query never saw, and be
+/// coalesced behind a predecessor the barrier says must drain first.
+///
 /// The one exception is the truncate barrier (issue #60): a truncate is
 /// whole-keyspace, but drains are per-bucket, parallel, and — per the
 /// paragraph above — explicitly *not* ordered, so a truncate is a
@@ -10042,7 +10049,7 @@ async fn classify_and_retry(
 /// survive); successors must not drain first (else a later batch's
 /// post-truncate insert would be wiped when the truncate's clear runs). Let
 /// `B` be the lowest `seg_seq` among undrained truncate-bearing segments
-/// (`segments.has_truncate`, set at seal time — see `seal::seal_phase1`);
+/// (`segments.has_truncate`, decided with the fence — see `seal::seal_phase2`);
 /// this query never returns a segment past `B`. Because this query always
 /// returns the *lowest* eligible `seg_seq`, `B` itself is only ever handed
 /// out once every segment below it has drained — one clause gives both
@@ -10066,9 +10073,9 @@ pub async fn next_claimable_segment(
 /// hold all of it, this worker coalesces what follows instead of idling).
 /// [`drain_many`] then claims in order and stops at the first share that
 /// must page, so an oversized segment still drains alone. Row counts are
-/// ring rows, never fewer than the folded records they produce, so a
-/// coalesced batch's shares fit the cap by construction (up to the late rows
-/// the direct fold's guard exists for).
+/// ring rows over the whole fenced window (issue #598), never fewer than the
+/// folded records they produce, so a coalesced batch's shares fit the cap by
+/// construction.
 ///
 /// Runs the exact same barrier-respecting query [`next_claimable_segment`]
 /// does (see its doc comment for the truncate barrier `B`). The only
@@ -10094,6 +10101,7 @@ pub async fn next_claimable_segments(
         .query(
             "select seg_seq, has_truncate, row_count from segments \
              where state in ('sealed', 'draining') \
+               and fence_snapshot is not null \
                and drained_mask <> ((1::bigint << bucket_count) - 1) \
                and seg_seq <= coalesce( \
                    (select min(seg_seq) from segments \

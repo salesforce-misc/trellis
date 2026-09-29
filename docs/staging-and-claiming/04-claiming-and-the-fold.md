@@ -260,10 +260,12 @@ and a sealer starved by a slow drain lets the active segment grow at the write
 rate. The cap counts **folded records**, not ring rows: that is what the worker
 holds, and capping rows would cut a 1000:1 fold into pages of 100 records.
 
-**Picking the path.** The seal stores the row count it already takes as
-`segments.row_count`. A share estimated at `row_count / bucket_count × buckets
-held` that fits the cap folds whole, as it always did, with a `limit cap + 1`
-guard (the fenced window can hold a predecessor's late rows the count never saw).
+**Picking the path.** The seal stores the row count of the batch's fenced window,
+both halves, as `segments.row_count` ([03](03-sealing-and-the-fence.md), "The
+batch is sized when its fence is published"). A share estimated at `row_count /
+bucket_count × buckets held` that fits the cap folds whole, as it always did, with
+a `limit cap + 1` guard (the estimate assumes routes spread evenly across
+buckets).
 A share over the cap, a tripped guard, or a bucket with a cursor from an earlier
 claimant pages instead. Segments coalesce into one drain only while their row
 counts sum under the cap, so a segment over the cap drains alone.

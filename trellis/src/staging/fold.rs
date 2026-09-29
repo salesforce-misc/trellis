@@ -282,8 +282,8 @@ pub async fn fold(
 /// [`fold`] with a `limit`: at most `limit` records, in no particular order
 /// (issue #620). The direct fold's guard: a drain whose share should fit the
 /// cap by the seal's row count folds with `limit cap + 1`, and a full result
-/// means the estimate was wrong (the fenced window can hold a predecessor's
-/// late rows the count never saw), so the drain pages instead.
+/// means the estimate was wrong (it assumes routes spread evenly across
+/// buckets, and a share's routes can bunch), so the drain pages instead.
 pub(crate) async fn fold_limited(
     txn: &Transaction<'_>,
     seg_seq: i64,
@@ -580,7 +580,7 @@ fn fold_sql(
     // truncate sentinel's own key (the sentinel) could in principle route to
     // a different bucket than the keys it voids, though in practice every
     // truncate-bearing batch seals with `bucket_count = 1` (see
-    // `seal::seal_phase1`), making that moot today.
+    // `seal::seal_phase2`), making that moot today.
     //
     // Issue #492: the anti-join reads `truncates`, a `materialized` CTE of
     // just the batch's truncate rows (almost always none, at most a few),
