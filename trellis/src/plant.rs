@@ -65,7 +65,7 @@ pub const PLANT_ENV: &str = "TRELLIS_TEST_PLANT";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Plant {
     /// Claim exclusivity (the drain's bucket filter,
-    /// `staging::apply::HeldShare::filter`): every claimer of a split batch
+    /// `staging::claim::HeldShare::filter`): every claimer of a split batch
     /// folds *all* of its buckets instead of the ones it won, so two workers
     /// apply the same rows. Found by #557 part 1's review.
     ClaimAllBuckets,
