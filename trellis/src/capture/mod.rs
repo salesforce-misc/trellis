@@ -91,9 +91,9 @@ pub enum CaptureError {
     /// Parking the backfill marker an install or widen commits with failed
     /// ([`install`]).
     Marker(crate::intake::IntakeError),
-    /// A catalog read, or the capture DDL, failed. A lock timeout on a user
-    /// table lands here too ([`crate::locks::is_lock_not_available`] tells it
-    /// apart), once [`install`]'s retries stop at their deadline.
+    /// A catalog read, or the capture DDL, failed. A lock timeout on the
+    /// table doesn't land here: once [`install`]'s retries stop at their
+    /// deadline, the operation returns [`install::Progress::Waiting`].
     Db(tokio_postgres::Error),
 }
 

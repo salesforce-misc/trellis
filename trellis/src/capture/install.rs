@@ -703,7 +703,7 @@ async fn attempt(
 }
 
 /// The role that owns instance schema `schema`, when the session's role
-/// isn't it: the functions are handed to it (see "Who owns the functions").
+/// isn't it: the functions are handed to it (see "The Trellis role").
 async fn foreign_schema_owner(
     client: &impl GenericClient,
     schema: &str,
@@ -775,8 +775,11 @@ pub struct LockWait {
     /// When the blockers were read (Postgres's `clock_timestamp()`).
     pub observed_at: SystemTime,
     /// Every other session holding, or queued for, a lock on the table that
-    /// conflicts with `lock_mode`, in pid order. Empty if they all let go
-    /// between the last attempt and the read.
+    /// conflicts with `lock_mode`, in pid order, prepared transactions last.
+    /// One entry per lock mode, so a session holding two conflicting modes
+    /// (an insert, then `SHARE UPDATE EXCLUSIVE`) or holding one and queued
+    /// for another appears twice. Empty if they all let go between the last
+    /// attempt and the read.
     pub blockers: Vec<Blocker>,
 }
 
@@ -811,8 +814,8 @@ impl std::fmt::Display for LockWait {
     }
 }
 
-/// One session holding, or queued for, a lock that conflicts with the one a
-/// capture operation asks for.
+/// One session's hold on, or queued request for, a lock mode that conflicts
+/// with the one a capture operation asks for (a `pg_locks` row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocker {
     /// `None` for a prepared transaction, which has no backend.
