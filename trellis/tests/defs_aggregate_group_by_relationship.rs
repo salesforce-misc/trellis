@@ -349,6 +349,44 @@ async fn aggregate_over_a_relationship_group_by_key_backfills_to_the_oracle() {
         totals.get(&(some("db"), some("alice"))),
         Some(&(some("2"), some("100")))
     );
+
+    // #623 D2: the build read each row, relationship resolved, into the
+    // ledger, and every group is its entries' sums.
+    let entries: Vec<[Option<String>; 4]> = client
+        .query(
+            "select __from_key, tag, author, __arg0::text from author_tag_totals__ledger \
+             order by __from_key",
+            &[],
+        )
+        .await
+        .expect("read the ledger")
+        .into_iter()
+        .map(|r| [r.get(0), r.get(1), r.get(2), r.get(3)])
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            [some("10"), some("rust"), some("alice"), some("100")],
+            [some("11"), some("rust"), some("bob"), some("250")],
+            [some("12"), some("db"), some("alice"), some("100")],
+            [some("13"), some("rust"), None, None],
+            [some("14"), some("db"), some("alice"), None],
+        ]
+    );
+    let mismatched: i64 = client
+        .query_one(
+            "with l as (select tag, author, count(*) as n, sum(__arg0) as words, count(*) as m \
+                        from author_tag_totals__ledger group by tag, author), \
+                  t as (select tag, author, post_count, total_words, __trellis_members \
+                        from author_tag_totals) \
+             select count(*) from ((select * from l except select * from t) \
+                                   union all (select * from t except select * from l)) d",
+            &[],
+        )
+        .await
+        .expect("compare the ledger with the groups")
+        .get(0);
+    assert_eq!(mismatched, 0, "the groups are the ledger's sums");
 }
 
 /// Forward propagation: a new `post_tags` row resolves its own group through

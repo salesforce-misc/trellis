@@ -35,6 +35,7 @@ pub mod ddl;
 pub mod error;
 pub mod eval;
 pub mod invertibility;
+pub mod ledger;
 mod lexer;
 pub mod lifecycle;
 pub mod model;

@@ -22,10 +22,12 @@
 //! target equal to the source.
 //!
 //! The aggregate build is held with event triggers on advisory locks the
-//! test holds: one at the build's first `DROP TABLE` (before the source
-//! read) and one at its `ALTER TABLE` (after the read, before the target
-//! write). Neither statement has an xid when the trigger fires, so the held
-//! build doesn't hold back the seal gate. The chunked 1-1 test drives
+//! test holds, at the two `ALTER TABLE`s around its ledger load (#623 D2):
+//! the one dropping the ledger's key (before the source read) and the one
+//! adding it back (after the read, before the target write). The second has
+//! no xid when the trigger fires, so the build held there doesn't hold back
+//! the seal gate; the first runs in the load's transaction, and the tests
+//! seal nothing while it's held. The chunked 1-1 test drives
 //! `claim_chunks` / `run_claimed_chunk` / `finish_chunk` by hand.
 
 use std::collections::HashMap;
@@ -88,21 +90,21 @@ async fn discharge_markers(pool: &trellis::Pool, client: &mut Client) {
     drain_to_quiescence(pool, client).await;
 }
 
-/// Parks the build's `DROP TABLE` on [`BEFORE_READ`] and its `ALTER TABLE`
-/// on [`AFTER_READ`].
+/// Parks the build's ledger-key drop on [`BEFORE_READ`] and its re-add on
+/// [`AFTER_READ`].
 async fn install_build_holds(client: &Client) {
     client
         .batch_execute(&format!(
             "create function hold_direct_build() returns event_trigger \
              language plpgsql as $$ \
-             declare held bigint := case tg_tag when 'DROP TABLE' then {BEFORE_READ} \
-                                                  else {AFTER_READ} end; \
+             declare held bigint := case when current_query() ilike '%drop constraint%' \
+                                         then {BEFORE_READ} else {AFTER_READ} end; \
              begin \
                perform pg_advisory_lock(held); \
                perform pg_advisory_unlock(held); \
              end $$; \
              create event trigger hold_direct_build on ddl_command_start \
-               when tag in ('DROP TABLE', 'ALTER TABLE') execute function hold_direct_build()"
+               when tag in ('ALTER TABLE') execute function hold_direct_build()"
         ))
         .await
         .expect("install the build-hold event trigger");

@@ -119,6 +119,15 @@ pub enum ValidationError {
     /// must live on a separate neighbor table — writing them back onto the
     /// source would feed our own WAL into ingestion (see `docs/data-flow.md`).
     TargetEqualsSource { table: String },
+    /// The target's name ends with [`super::ledger::LEDGER_SUFFIX`], which
+    /// names every target's ledger table (#623 D2): this target would be
+    /// another target's ledger.
+    ReservedTargetSuffix { target: String },
+    /// The target's name is longer than [`super::ledger::MAX_TARGET_NAME_LEN`]
+    /// bytes, so its ledger's name (the target's plus
+    /// [`super::ledger::LEDGER_SUFFIX`]) would pass Postgres's 63-byte
+    /// identifier limit and be silently truncated.
+    TargetNameTooLong { target: String, max: usize },
     /// An operator was applied to an operand of the wrong [`ValueType`] —
     /// e.g. `+` given a `Text` operand (issue #63: `+` stays Numeric-only,
     /// no implicit string concatenation).
@@ -707,6 +716,19 @@ impl fmt::Display for ValidationError {
                 "target table '{table}' is the same as the source table; calculated \
                  columns must live on a separate neighbor table"
             ),
+            ValidationError::ReservedTargetSuffix { target } => write!(
+                f,
+                "target name '{target}' ends with '{}', which Trellis reserves for the \
+                 ledger table it keeps beside every target; choose a name that doesn't",
+                super::ledger::LEDGER_SUFFIX
+            ),
+            ValidationError::TargetNameTooLong { target, max } => write!(
+                f,
+                "target name '{target}' is longer than {max} bytes; Trellis keeps a ledger \
+                 table beside every target named '<target>{}', and Postgres identifiers are \
+                 limited to 63 bytes",
+                super::ledger::LEDGER_SUFFIX
+            ),
             ValidationError::TypeMismatch {
                 field,
                 expected,
@@ -1040,6 +1062,19 @@ pub fn validate(
     if def.target == def.source {
         return Err(ValidationError::TargetEqualsSource {
             table: def.target.clone(),
+        });
+    }
+
+    // #623 D2: every target has a ledger named `<target>__ledger` beside it.
+    if def.target.ends_with(super::ledger::LEDGER_SUFFIX) {
+        return Err(ValidationError::ReservedTargetSuffix {
+            target: def.target.clone(),
+        });
+    }
+    if def.target.len() > super::ledger::MAX_TARGET_NAME_LEN {
+        return Err(ValidationError::TargetNameTooLong {
+            target: def.target.clone(),
+            max: super::ledger::MAX_TARGET_NAME_LEN,
         });
     }
 
@@ -1859,6 +1894,26 @@ pub(crate) fn infer_field_types(
         }
     }
     Ok(types)
+}
+
+/// The type of `expr`, a self-contained expression over the source row (no
+/// reference to another calculated field: a substituted field expression, or
+/// a part of one). The ledger types its contribution columns with it (#623
+/// D2): each is one aggregate call's argument.
+pub(crate) fn infer_expr_type(
+    expr: &Expr,
+    source_columns: &HashMap<String, ValueType>,
+    relationships: &HashMap<String, ResolvedRelationship>,
+) -> Result<ValueType, ValidationError> {
+    infer_expr(
+        expr,
+        "",
+        source_columns,
+        relationships,
+        &HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
 }
 
 fn infer_field(
@@ -4003,6 +4058,48 @@ mod tests {
             );
             assert!(err.to_string().contains("reserves"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_target_named_like_a_ledger_or_too_long_for_one_is_rejected() {
+        // #623 D2: `t__ledger` is `t`'s ledger, and a name past 55 bytes gives
+        // a ledger name Postgres would truncate.
+        let columns = numeric_columns(&["g", "x"]);
+        let err = validate(
+            &parsed("TRANSFORM t__ledger FROM s GROUP BY g SELECT COUNT(*) AS n"),
+            &columns,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::ReservedTargetSuffix {
+                target: "t__ledger".to_string()
+            }
+        );
+        assert!(err.to_string().contains("__ledger"), "{err}");
+
+        let longest = "t".repeat(crate::defs::ledger::MAX_TARGET_NAME_LEN);
+        assert_eq!(
+            validate(
+                &parsed(&format!("TRANSFORM {longest} FROM s SELECT x AS y")),
+                &columns,
+                &HashMap::new(),
+            ),
+            Ok(())
+        );
+        let too_long = format!("{longest}t");
+        assert_eq!(
+            validate(
+                &parsed(&format!("TRANSFORM {too_long} FROM s SELECT x AS y")),
+                &columns,
+                &HashMap::new(),
+            ),
+            Err(ValidationError::TargetNameTooLong {
+                target: too_long,
+                max: 55
+            })
+        );
     }
 
     #[test]

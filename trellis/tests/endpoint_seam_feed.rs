@@ -647,12 +647,16 @@ async fn an_aggregate_target_endpoint_is_fed_by_the_seam_null_group_included() {
     let staged = staged_rows(&raw, "public.region_totals").await;
     // The hidden recompute horizon is a WAL position the build and the
     // forced re-derivations stamp (#321, #419), not part of what this pins.
+    // Nor is the member count, which only the build writes until apply
+    // maintains it (#623 D3).
     let horizon =
         regex::Regex::new(r#""__trellis_recompute_lsn": ("[^"]*"|null)"#).expect("valid regex");
+    let members = regex::Regex::new(r#""__trellis_members": "[0-9]*", "#).expect("valid regex");
     let image = |image: &Option<String>| {
         image.as_deref().map(|image| {
+            let image = members.replace(image, "");
             horizon
-                .replace(image, r#""__trellis_recompute_lsn": <lsn>"#)
+                .replace(&image, r#""__trellis_recompute_lsn": <lsn>"#)
                 .into_owned()
         })
     };

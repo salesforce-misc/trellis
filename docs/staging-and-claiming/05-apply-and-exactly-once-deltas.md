@@ -275,6 +275,43 @@ inline enumeration (#418): every ring capture runs in the backfill discharge,
 behind the #312 wait
 ([data-flow](../data-flow.md#capturing-a-tables-existing-rows)).
 
+### The ledger (apply reads it from #623 D3)
+
+ADR-0002 replaces the horizon with a per-key ledger. Today the ledger is only
+written: apply neither reads nor maintains it, so it goes stale after a target's
+first change. This section describes what exists so far.
+
+Every target has one, `<target>__ledger` in the target's schema, created in the
+registration transaction and dropped with the target (`defs::ledger`). It holds
+one entry per source key (`__from_key`, in the ring's `key` encoding) with the
+ordering state apply will judge a change against:
+
+- `__applied_lsn` and `__applied_seg`: the `lsn` and ring segment of the last
+  change applied to the entry. A Re-derive leaves `__applied_lsn` alone
+  (#623 Q1). `__applied_seg` is the tombstone GC watermark (#623 Q7).
+- `__basis`: the `pg_current_snapshot()` of the read that last wrote the entry,
+  taken in the same statement as that read (I1). A change whose transaction is
+  visible in it is already counted.
+- `__tombstone`: whether the key's last applied change deleted it.
+
+An aggregate target's entries also hold:
+
+- the row's `GROUP BY` values, typed as the target's;
+- `__member`;
+- one column per distinct aggregate argument (`__arg0`, …), holding the
+  argument's value, with the argument's collation when it is text;
+- `__join_key` for a relationship-fed target (written from D5).
+
+Every group row is then a pure function of its live members' entries: `SUM(x)`
+is `sum(__argN)` over them, its hidden count `count(__argN)`, `COUNT(*)` the
+entry count, and so on. The group row carries that count as `__trellis_members`.
+A 1-1 target's ledger holds only the key and the ordering state, because the
+target row holds the values.
+
+The one-pass aggregate build writes the ledger. It empties it, reads the source
+into it in one statement whose snapshot becomes every entry's basis, and then
+writes the group rows as a `GROUP BY` over it. The 1-1 build writes no entries.
+
 ## What this replaced
 
 The old, mutable-worklist design needed two extra mechanisms, both now gone:

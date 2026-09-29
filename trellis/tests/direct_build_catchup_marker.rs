@@ -116,22 +116,27 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
         .collect()
 }
 
-/// Installs an event trigger that parks any `ALTER TABLE` on advisory lock
-/// [`HOLD_LOCK`] until the test releases it. Both builds read each table once,
-/// into a temp staging table (`CREATE TEMP TABLE ... AS SELECT`), then
-/// `ALTER` that staging table to add its key before any target write. The
-/// read has committed by then, and the `ALTER` is held at
-/// `ddl_command_start`, before it has an xid, so the held build doesn't hold
-/// back the seal gate: the ring keeps sealing and draining around it, as it
-/// does between a real build's autocommit statements.
+/// Installs an event trigger that parks a direct build's `ALTER TABLE` after
+/// its read on advisory lock [`HOLD_LOCK`] until the test releases it. A
+/// relationship 1-1 build reads each table once, into a temp staging table
+/// (`CREATE TEMP TABLE ... AS SELECT`), then `ALTER`s that staging table to
+/// add its key before any target write. An aggregate build reads the source
+/// into its ledger with the ledger's key dropped (an `ALTER` before the
+/// read, which this lets through), then `ALTER`s the ledger to add the key
+/// back before any target write (#623 D2). The read has committed by then,
+/// and the `ALTER` is held at `ddl_command_start`, before it has an xid, so
+/// the held build doesn't hold back the seal gate: the ring keeps sealing and
+/// draining around it, as it does between a real build's statements.
 async fn install_build_hold(client: &Client) {
     client
         .batch_execute(&format!(
             "create function hold_direct_build() returns event_trigger \
              language plpgsql as $$ \
              begin \
-               perform pg_advisory_lock({HOLD_LOCK}); \
-               perform pg_advisory_unlock({HOLD_LOCK}); \
+               if current_query() not ilike '%drop constraint%' then \
+                 perform pg_advisory_lock({HOLD_LOCK}); \
+                 perform pg_advisory_unlock({HOLD_LOCK}); \
+               end if; \
              end $$; \
              create event trigger hold_direct_build on ddl_command_start \
                when tag in ('ALTER TABLE') execute function hold_direct_build()"
@@ -843,7 +848,8 @@ async fn a_superseded_job_reaching_its_writes_after_the_rebuild_went_live_writes
             "create function hold_direct_build() returns event_trigger \
              language plpgsql as $$ \
              begin \
-               if exists (select 1 from public.hold_armed) then \
+               if exists (select 1 from public.hold_armed) \
+                  and current_query() not ilike '%drop constraint%' then \
                  perform pg_advisory_lock({HOLD_LOCK}); \
                  perform pg_advisory_unlock({HOLD_LOCK}); \
                end if; \

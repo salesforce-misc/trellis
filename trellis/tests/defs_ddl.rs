@@ -705,6 +705,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
             ("total_words".to_string(), "numeric".to_string()),
             ("__total_words_count".to_string(), "bigint".to_string()),
             ("__trellis_recompute_lsn".to_string(), "pg_lsn".to_string()),
+            ("__trellis_members".to_string(), "bigint".to_string()),
         ]
     );
 
@@ -792,6 +793,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
             ("total_amount".to_string(), "numeric".to_string()),
             ("__total_amount_count".to_string(), "bigint".to_string()),
             ("__trellis_recompute_lsn".to_string(), "pg_lsn".to_string()),
+            ("__trellis_members".to_string(), "bigint".to_string()),
         ],
         "a SUM field gets a hidden running-count partial alongside its visible column \
          (issue #11 review fix: SUM needs to distinguish \"sum of nothing\" from \"sum \
@@ -940,6 +942,7 @@ async fn aggregate_columns_sharing_an_argument_share_one_count_column() {
             ("avg_amount".to_string(), "numeric".to_string()),
             ("__avg_amount_sum".to_string(), "numeric".to_string()),
             ("__trellis_recompute_lsn".to_string(), "pg_lsn".to_string()),
+            ("__trellis_members".to_string(), "bigint".to_string()),
         ],
         "total_amount (SUM(amount)) and avg_amount (AVG(amount)) aggregate the same \
          argument, so only ONE shared count column should be created — named after \
@@ -1032,6 +1035,7 @@ async fn aggregate_columns_over_different_arguments_keep_separate_count_columns(
             ("total_bytes".to_string(), "numeric".to_string()),
             ("__total_bytes_count".to_string(), "bigint".to_string()),
             ("__trellis_recompute_lsn".to_string(), "pg_lsn".to_string()),
+            ("__trellis_members".to_string(), "bigint".to_string()),
         ],
         "total_words and total_bytes sum different source columns, so each keeps its \
          own count column even though issue #48's naive request would have merged them \

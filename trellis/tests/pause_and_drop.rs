@@ -581,6 +581,22 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
             > 0,
         "precondition: the target was built"
     );
+    // #623 D2: the build wrote the target's ledger, one entry per source row,
+    // and stamped the target's extinct horizon.
+    assert_eq!(
+        count(
+            &raw,
+            &format!("select count(*) from {DEFAULT_TARGET_SCHEMA}.order_rollup__ledger")
+        )
+        .await,
+        6,
+        "precondition: the build wrote the ledger"
+    );
+    let horizons = format!(
+        "select count(*) from aggregate_extinct_horizon \
+         where target_table = '{DEFAULT_TARGET_SCHEMA}.order_rollup'"
+    );
+    assert_eq!(count(&raw, &horizons).await, 1, "precondition: a horizon");
 
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
@@ -590,6 +606,15 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         .apply("DROP TRANSFORM order_rollup")
         .await
         .expect("drop a paused definition");
+    assert!(
+        !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup__ledger").await,
+        "the drop takes the target's ledger with it"
+    );
+    assert_eq!(
+        count(&raw, &horizons).await,
+        0,
+        "and its extinct horizon, which a later target of the same name would inherit"
+    );
 
     assert_eq!(
         persisted_status(&raw, "order_rollup").await,
@@ -664,6 +689,17 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
         .await,
         0,
         "the new target is built from the source as it is now"
+    );
+    // #623 D2: the drop took the old ledger, so registering again could
+    // create a new, empty one (a 1-1 build writes none).
+    assert_eq!(
+        count(
+            &raw,
+            &format!("select count(*) from {DEFAULT_TARGET_SCHEMA}.order_doubles__ledger")
+        )
+        .await,
+        0,
+        "the new target has a ledger of its own"
     );
 }
 

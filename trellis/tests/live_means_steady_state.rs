@@ -103,19 +103,24 @@ async fn converge(trellis: &Trellis) {
         .expect("await_converged");
 }
 
-/// Blocks any `ALTER TABLE` on advisory lock `key` until the test releases
-/// it. A direct build reads each table into temp staging with `CREATE TEMP
-/// TABLE ... AS SELECT` and then `ALTER`s it to add its key before writing
-/// the target: held there, the build has read the source and written
-/// nothing. The `ALTER` is held at `ddl_command_start`, before it has an
-/// xid, so the ring keeps sealing and draining around it.
+/// Blocks a direct build's `ALTER TABLE` after its read on advisory lock
+/// `key` until the test releases it. A relationship 1-1 build reads each
+/// table into temp staging with `CREATE TEMP TABLE ... AS SELECT` and then
+/// `ALTER`s it to add its key; an aggregate build reads the source into its
+/// ledger with the ledger's key dropped (an `ALTER` before the read, which
+/// this lets through) and then `ALTER`s the ledger to add it back (#623 D2).
+/// Held there, the build has read the source and written no target row. The
+/// `ALTER` is held at `ddl_command_start`, before it has an xid, so the ring
+/// keeps sealing and draining around it.
 async fn hold_direct_builds(raw: &Client, key: i64) {
     raw.batch_execute(&format!(
         "create function hold_direct_build() returns event_trigger \
          language plpgsql as $$ \
          begin \
-           perform pg_advisory_lock({key}); \
-           perform pg_advisory_unlock({key}); \
+           if current_query() not ilike '%drop constraint%' then \
+             perform pg_advisory_lock({key}); \
+             perform pg_advisory_unlock({key}); \
+           end if; \
          end $$; \
          create event trigger hold_direct_build on ddl_command_start \
            when tag in ('ALTER TABLE') execute function hold_direct_build()"

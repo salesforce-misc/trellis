@@ -2553,24 +2553,32 @@ async fn create_target_in_txn(
     qualified_target: &str,
     ddl: &str,
 ) -> Result<(), CatalogError> {
-    let already_exists = || CatalogError::TargetTableExists {
-        table: qualified_target.to_string(),
+    let already_exists = |taken: &str| CatalogError::TargetTableExists {
+        table: if taken == table {
+            qualified_target.to_string()
+        } else {
+            format!("{schema}.{taken}")
+        },
     };
-    let exists: bool = txn
-        .query_one(
-            "select exists (select 1 from pg_catalog.pg_class c \
+    // `ddl` also creates the target's ledger (#623 D2), which Trellis owns
+    // just the same, so its name has to be free too.
+    let ledger = super::ledger::ledger_table_name(table);
+    let taken: Option<String> = txn
+        .query_opt(
+            "select c.relname::text from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             where n.nspname = $1 and c.relname = $2)",
-            &[&schema, &table],
+             where n.nspname = $1 and c.relname = any($2) \
+             order by c.relname = $3 desc limit 1",
+            &[&schema, &[table, ledger.as_str()].as_slice(), &table],
         )
         .await?
-        .get(0);
-    if exists {
-        return Err(already_exists());
+        .map(|row| row.get(0));
+    if let Some(taken) = taken {
+        return Err(already_exists(&taken));
     }
     match txn.batch_execute(ddl).await {
         Ok(()) => Ok(()),
-        Err(err) if is_relation_name_taken(&err) => Err(already_exists()),
+        Err(err) if is_relation_name_taken(&err) => Err(already_exists(table)),
         Err(err) => Err(CatalogError::Ddl(err.into())),
     }
 }
@@ -3684,7 +3692,7 @@ async fn reject_fields_named_after_primary_key(
 /// [`resolve_graph_identity`] itself, the same pooled two-step resolution
 /// `staging::apply::compute`'s `qualified_schema_node_key` already reuses,
 /// rather than re-implementing the fallback a third time.
-async fn resolve_source_for_install(
+pub(crate) async fn resolve_source_for_install(
     pool: &Pool,
     def: &TransformDef,
 ) -> Result<String, CatalogError> {

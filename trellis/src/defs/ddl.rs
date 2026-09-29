@@ -1242,8 +1242,8 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// inserting the relationship's own row, in the same transaction — see
 /// `catalog::ensure_relationship_projection_in_txn`), so it's the natural
 /// disambiguator. Matches this crate's existing `_trellis_backfill_*` naming
-/// for its own other generated tables ([`super::backfill::STAGE_TABLE`],
-/// [`super::backfill::REL_STAGE_TABLE_PREFIX`]).
+/// for its own other generated tables
+/// ([`super::backfill::REL_STAGE_TABLE_PREFIX`]).
 ///
 /// Unique only within one catalog: every instance numbers its relationships
 /// from 1, so another instance in the same database has its own
@@ -1350,6 +1350,14 @@ pub(crate) const PROJECTION_LSN_COLUMN: &str = "__trellis_lsn";
 /// that `defs::pg_type` doesn't recognize, so a definition chained off an
 /// aggregate target never sees it as a readable source column.
 pub(crate) const RECOMPUTE_LSN_COLUMN: &str = "__trellis_recompute_lsn";
+
+/// The hidden member count on every aggregate group row (#623 D2): how many
+/// of the target's ledger entries are live members of the group
+/// ([`super::ledger`]). The build writes it from the ledger. Apply doesn't
+/// maintain it yet (a group the delta path creates starts at the column's
+/// default of 0), and nothing reads it until #623 part D3, which deletes a
+/// group when it reaches 0.
+pub(crate) const MEMBERS_COLUMN: &str = "__trellis_members";
 
 /// The read-side counterpart to [`qualified_target_table`] (issue #76,
 /// ADR-0007): quotes an already-qualified `"schema.table"` name — as read
@@ -1559,6 +1567,10 @@ pub(crate) async fn target_table_ddl(
     let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     sql.push_str(&format!(", primary key ({})", pk_names.join(", ")));
     sql.push(')');
+    // #623 D2: the target's ledger, created with it.
+    sql.push_str(&super::ledger::one_to_one_ledger_ddl(
+        &super::ledger::qualified_ledger_table(target_schema, &def.target),
+    ));
     Ok(sql)
 }
 
@@ -1813,26 +1825,26 @@ pub(crate) async fn aggregate_target_table_ddl(
         "create table {} (",
         qualified_target_table(target_schema, def)
     );
+    // Issue #137: a `GroupByKey::RelationshipPath` key's type is its
+    // to-side column's, resolved via the same `relationships` map issue
+    // #94's field typing already reuses above — a plain column keeps
+    // reading straight from `source_columns`, unchanged.
+    let group_by_value_type = |key: &GroupByKey| match key {
+        GroupByKey::Column(column) => source_columns
+            .get(column)
+            .copied()
+            .unwrap_or(ValueType::Numeric),
+        GroupByKey::RelationshipPath { rel, column } => relationships
+            .get(rel)
+            .and_then(|r| r.column_types.get(column))
+            .copied()
+            .unwrap_or(ValueType::Numeric),
+    };
     for (i, key) in group_by.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        // Issue #137: a `GroupByKey::RelationshipPath` key's type is its
-        // to-side column's, resolved via the same `relationships` map issue
-        // #94's field typing already reuses above — a plain column keeps
-        // reading straight from `source_columns`, unchanged.
-        let value_type = match key {
-            GroupByKey::Column(column) => source_columns
-                .get(column)
-                .copied()
-                .unwrap_or(ValueType::Numeric),
-            GroupByKey::RelationshipPath { rel, column } => relationships
-                .get(rel)
-                .and_then(|r| r.column_types.get(column))
-                .copied()
-                .unwrap_or(ValueType::Numeric),
-        };
-        let pg_type = pg_type_name(value_type);
+        let pg_type = pg_type_name(group_by_value_type(key));
         sql.push_str(&format!(
             "{} {}",
             quote_ident(key.target_column_name()),
@@ -1884,6 +1896,10 @@ pub(crate) async fn aggregate_target_table_ddl(
         }
     }
     sql.push_str(&format!(", {} pg_lsn", quote_ident(RECOMPUTE_LSN_COLUMN)));
+    sql.push_str(&format!(
+        ", {} bigint not null default 0",
+        quote_ident(MEMBERS_COLUMN)
+    ));
     let pk_columns: Vec<String> = group_by
         .iter()
         .map(|k| quote_ident(k.target_column_name()))
@@ -1893,7 +1909,102 @@ pub(crate) async fn aggregate_target_table_ddl(
         pk_columns.join(", ")
     ));
     sql.push(')');
+
+    // #623 D2: the target's ledger, created with it. Its `GROUP BY` columns
+    // are typed as the target's, and each contribution column as its
+    // argument.
+    let group_columns: Vec<super::ledger::LedgerColumn> = group_by
+        .iter()
+        .map(|key| super::ledger::LedgerColumn {
+            name: key.target_column_name().to_string(),
+            pg_type: pg_type_name(group_by_value_type(key)).into_owned(),
+            collation: None,
+        })
+        .collect();
+    let contributions = super::ledger::contributions(&def.fields, group_by, &substituted);
+    let contribution_types = contributions
+        .iter()
+        .map(|c| super::validate::infer_expr_type(&c.arg, source_columns, &relationships))
+        .collect::<Result<Vec<_>, _>>()?;
+    let collations =
+        contribution_collations(pool, def, &contributions, &contribution_types).await?;
+    let contribution_columns: Vec<super::ledger::LedgerColumn> = contributions
+        .iter()
+        .zip(&contribution_types)
+        .zip(collations)
+        .map(|((c, value_type), collation)| super::ledger::LedgerColumn {
+            name: c.column.clone(),
+            pg_type: pg_type_name(*value_type).into_owned(),
+            collation,
+        })
+        .collect();
+    sql.push_str(&super::ledger::aggregate_ledger_ddl(
+        &super::ledger::qualified_ledger_table(target_schema, &def.target),
+        &group_columns,
+        &contribution_columns,
+        !super::eval::relationship_references(def).is_empty(),
+    ));
     Ok(sql)
+}
+
+/// The collation each text-typed contribution's argument has over the
+/// source, for its ledger column (`None` for every other type, and for the
+/// database default). Without it a text column's `MIN`/`MAX` over the ledger
+/// would order by the database's default collation instead of the source
+/// column's. Read off the live expression with `pg_collation_for`, so an
+/// argument that derives its collation (`lower(label)`) gets it too.
+///
+/// Queries only when some contribution is text. A source that doesn't
+/// resolve (a test fixture rendering DDL before creating its source) gets
+/// the default everywhere.
+async fn contribution_collations(
+    pool: &Pool,
+    def: &TransformDef,
+    contributions: &[super::ledger::Contribution],
+    types: &[ValueType],
+) -> Result<Vec<Option<String>>, DdlError> {
+    let mut collations = vec![None; contributions.len()];
+    let text: Vec<usize> = (0..types.len())
+        .filter(|&i| types[i] == ValueType::Text)
+        .collect();
+    if text.is_empty() {
+        return Ok(collations);
+    }
+    let source_table = match super::catalog::resolve_source_for_install(pool, def).await {
+        Ok(source) => source,
+        Err(super::catalog::CatalogError::SourceTableNotFound(_)) => return Ok(collations),
+        Err(err) => return Err(map_resolve_error(err)),
+    };
+    let scan = super::backfill::SourceScan::resolve(pool, def, &source_table).await?;
+    let probes: Vec<String> = text
+        .iter()
+        .map(|&i| {
+            format!(
+                "pg_catalog.pg_collation_for({})::text",
+                scan.render(&contributions[i].arg)
+            )
+        })
+        .collect();
+    // One row whatever the source holds: every source column reads NULL,
+    // which `pg_collation_for` doesn't look at.
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            &format!(
+                "select {} from {} right join (select) as __trellis_one on false",
+                probes.join(", "),
+                scan.relation_sql()
+            ),
+            &[],
+        )
+        .await?;
+    for (probe, &i) in text.iter().enumerate() {
+        collations[i] = row
+            .get::<_, Option<String>>(probe)
+            .filter(|collation| collation != "\"default\"");
+    }
+    Ok(collations)
 }
 
 #[cfg(test)]

@@ -103,14 +103,6 @@ const BACKFILL_CHUNK_ROWS: i64 = 50_000;
 /// of how many groups the source has in total.
 const BACKFILL_CHUNK_GROUPS: i64 = 10_000;
 
-/// Connection-scoped staging table the aggregate build materializes its
-/// single-pass `GROUP BY` into before chunk-writing to the target. A fixed name
-/// is safe: the build holds one pooled connection for its whole duration (so no
-/// two aggregate builds share this name concurrently — concurrent builds get
-/// distinct connections/sessions), and it is dropped both before creation
-/// (crash-leftover on a reused pooled connection) and after the writes.
-const STAGE_TABLE: &str = "_trellis_backfill_agg_staging";
-
 /// Why a direct backfill could not run.
 #[derive(Debug)]
 pub enum BackfillError {
@@ -1337,47 +1329,139 @@ pub(crate) async fn check_direct_build(
     Ok(())
 }
 
-/// The aggregate build: aggregate the whole source in a **single** full-table
-/// scan into a temporary staging table, then chunk the *writes* from that small
-/// (group-count-sized) staging table into the target by group-key range. See
-/// the module docs for why overwrite-by-group-key rather than additive-by-PK.
+/// The aggregate build's read of the source: the source, `LEFT JOIN`ed to
+/// each **to-one** relationship's to-side that a field or `GROUP BY` key reads
+/// (issue #94), so a relationship path resolves per source row before
+/// anything groups it — the `LEFT JOIN … GROUP BY` the oracle
+/// (`oracle::render_aggregate_relationship_select_sql`) renders. A to-many
+/// path would be a nested aggregation, which the validator rejects; a stored
+/// definition that somehow carries one falls back to the ring
+/// ([`BackfillError::Unsupported`]) rather than emitting SQL with different
+/// semantics. Also the ledger DDL's collation probe
+/// (`ddl::aggregate_target_table_ddl`), which reads the same expressions.
+pub(crate) struct SourceScan {
+    /// The quoted, schema-qualified source.
+    source: String,
+    /// One `left join` per referenced to-one relationship.
+    joins_sql: String,
+    has_joins: bool,
+}
+
+impl SourceScan {
+    pub(crate) async fn resolve(
+        pool: &Pool,
+        def: &TransformDef,
+        source_table: &str,
+    ) -> Result<Self, BackfillError> {
+        let source = ddl::qualified_source_table(source_table);
+        let rel_joins = resolve_to_one_joins(pool, def, source_table).await?;
+        // Issue #372: each to-side is joined by its recorded schema, never
+        // re-resolved through this session's `search_path`.
+        let to_tables: Vec<String> = rel_joins
+            .iter()
+            .map(|(_, reldef)| reldef.qualified_to_table())
+            .collect();
+        let joins_sql = super::oracle::to_one_join_clauses(
+            rel_joins
+                .iter()
+                .zip(&to_tables)
+                .map(|((rel, reldef), to_table)| {
+                    (
+                        rel.as_str(),
+                        to_table.as_str(),
+                        reldef.def.to_col.as_str(),
+                        reldef.def.from_col.as_str(),
+                    )
+                }),
+            &source,
+        );
+        Ok(Self {
+            source,
+            joins_sql,
+            has_joins: !rel_joins.is_empty(),
+        })
+    }
+
+    /// The `from` clause's text.
+    pub(crate) fn relation_sql(&self) -> String {
+        format!("{}{}", self.source, self.joins_sql)
+    }
+
+    /// `expr` rendered against [`Self::relation_sql`]. With a join in play every
+    /// source column must be qualified, or a to-side column of the same name
+    /// makes the reference ambiguous. Without one it renders bare, exactly as
+    /// a relationship-free aggregate always has.
+    pub(crate) fn render(&self, expr: &Expr) -> String {
+        if self.has_joins {
+            super::oracle::render_to_one_rel_expr_sql(expr, &self.source)
+        } else {
+            render_expr_sql(expr)
+        }
+    }
+
+    /// The source row's ring key, qualified the same way as [`Self::render`].
+    fn key_sql(&self, pk: &[PrimaryKeyColumn]) -> String {
+        ddl::pk_key_sql_expr(pk, self.has_joins.then_some(self.source.as_str()))
+    }
+}
+
+/// The aggregate build (#623 D2, ADR-0002): read the whole source **once**
+/// into the target's ledger, one entry per source row, then write the group
+/// rows as a `GROUP BY` over the ledger, chunked by group-key range. See the
+/// module docs for why overwrite-by-group-key rather than additive-by-PK.
 ///
-/// # Why single-pass-then-chunked-write (issue #63 M3 review)
+/// # The ledger write
 ///
-/// An earlier shape chunked by group-key range directly over the *source*: each
-/// chunk ran `INSERT … SELECT … FROM source WHERE (<group_cols>) > lo AND
-/// (<group_cols>) <= hi GROUP BY …`. The source has no index on the group-key
-/// columns (only its PK — an index on the GROUP BY columns was tried and
-/// abandoned as ineffective, ADR 0005 / commit e001d8a), so every chunk did a
-/// full sequential scan of the entire source filtered to one key range. With
-/// `C` chunks that is `O(C × source_size)` total scan work — the exact
-/// "rescan-the-whole-table-per-chunk" pathology M1/M2 fixed elsewhere in #63,
-/// reappearing here. At 1M distinct groups (100 chunks) it projected to ~12.5s,
-/// ~200x the ~60ms single-pass `GROUP BY` floor.
+/// One statement, `insert into <ledger> select <key>, <group keys>,
+/// <contributions>, pg_current_snapshot() from <source>`, in one transaction
+/// that first empties the ledger (the build is the rebuild, so whatever an
+/// earlier build or apply left there goes). Each entry records:
 ///
-/// This design instead scans the source exactly **once** to materialize the
-/// aggregate into a staging table (the `CREATE TEMP TABLE … AS SELECT … GROUP
-/// BY` below — one seq scan, the ~60ms floor), and every subsequent read is of
-/// that staging table, which is *group-count*-sized, not *source*-sized. A
-/// primary key on the staging table's group columns turns each chunk's
-/// range-write into a cheap index range scan rather than a staging seq scan, so
-/// total scan work is `O(source_size)` for the one aggregation pass plus
-/// `O(group_count)` for the writes — never `O(C × source_size)`.
+/// - its source key, encoded as the ring's `key`;
+/// - its `GROUP BY` values, typed as the target's;
+/// - one value per aggregate argument ([`super::ledger::contributions`]);
+/// - its **basis**, the snapshot of the statement that read the row (ADR-0002
+///   I1). It is taken in the same statement as the read, so it is the exact
+///   point the read saw: a change whose transaction is visible in it is
+///   counted in the entry, and one that isn't, isn't. `applied_lsn` stays
+///   null, as a Re-derive leaves it (#623 Q1).
+///
+/// The same statement records the WAL insert position after its snapshot, the
+/// recompute horizon every group row gets (below).
+///
+/// # The group writes
+///
+/// Every field is its own expression over the ledger instead of the source
+/// ([`super::ledger::over_ledger`]): `SUM(x)` is `sum(<x's column>)` over the
+/// group's live member entries, and so on. Each field kind writes the same
+/// columns the incremental bulk path (`apply_forced_groups_bulk`) does, so a
+/// directly-built target matches a ring-built one, plus `__trellis_members`,
+/// the group's member count ([`ddl::MEMBERS_COLUMN`]).
 ///
 /// Non-`NULL` group keys are partitioned into `(prev, hi]` ranges over the
-/// ordered distinct group tuples in staging, which cover every non-`NULL` group
-/// exactly once. A group whose key has a `NULL` component **is** built — issue
-/// #128 keys the target's `GROUP BY` columns with `UNIQUE NULLS NOT DISTINCT`
-/// rather than a bare `PRIMARY KEY`, precisely so such a row can exist — but a
+/// ordered distinct group tuples in the ledger, which cover every non-`NULL`
+/// group exactly once; each range is one `INSERT … SELECT … GROUP BY … ON
+/// CONFLICT DO UPDATE`, an index range scan of the ledger's partial `GROUP BY`
+/// index. So the source is scanned once, and the group writes read each
+/// ledger entry once, never `O(chunks × source)` (issue #63 M3's review found
+/// chunking by group-key range directly over the source did exactly that,
+/// ~200x the single-pass floor at 1M groups).
+///
+/// A group whose key has a `NULL` component **is** built — issue #128 keys
+/// the target's `GROUP BY` columns with `UNIQUE NULLS NOT DISTINCT` — but a
 /// `NULL` component makes Postgres's row-value comparison operators
 /// (`<`/`<=`/`>`) return `NULL` rather than `true`/`false` (three-valued
 /// logic), which would silently drop that row from every range-chunked
-/// write's `WHERE` clause. So NULL-keyed groups are excluded only from this
-/// range-chunking scheme, not from the single-pass staging aggregation
-/// itself, and are written afterward in one unchunked pass instead (see the
-/// `group_key_not_null`/final `insert_for` call below) — matched through the
-/// target's `NULLS NOT DISTINCT` constraint, which needs no row-value
-/// comparison at all.
+/// write's `WHERE` clause. So NULL-keyed groups are excluded only from the
+/// range chunking and written afterward in one unchunked pass, matched
+/// through the target's `NULLS NOT DISTINCT` constraint, which needs no
+/// row-value comparison at all.
+///
+/// # Nothing reads the ledger yet
+///
+/// Apply doesn't maintain the ledger (#623 D3 is its first reader), so it is
+/// exact only until the definition's first change. The group rows still carry
+/// issue #419's recompute horizon for today's apply path.
 async fn backfill_aggregate(
     pool: &Pool,
     def: &TransformDef,
@@ -1390,54 +1474,14 @@ async fn backfill_aggregate(
     // Substitute any cross-field-alias reference (e.g. `double_total = total +
     // total` where `total` is itself a field) with a deep copy of the
     // referenced field's expression tree, so every field's expression is
-    // self-contained before `classify_field`/`render_expr_sql` see it — see
+    // self-contained before `classify_field`/`contributions` see it — see
     // [`substituted_field_exprs`]. A cyclic alias chain falls back to the ring.
     let substituted = substituted_field_exprs(def)?;
 
-    let source = ddl::qualified_source_table(source_table);
     let target = qualified_target_table(target_schema, def);
-
-    // Issue #94: an aggregate field may fold a *to-one* relationship path
-    // (`SUM(post.word_count)`). Each referenced relationship becomes a LEFT
-    // JOIN of its to-side table (aliased by the relationship's name) onto the
-    // single source scan below, so the path resolves per source row *before*
-    // the GROUP BY folds it — exactly the `LEFT JOIN … GROUP BY` the oracle
-    // (`oracle::render_aggregate_relationship_select_sql`) renders. A to-many
-    // path here would be a nested aggregation, which the validator rejects; a
-    // stored definition that somehow carries one falls back to the ring rather
-    // than emitting SQL with different semantics.
-    let rel_joins = resolve_to_one_joins(pool, def, source_table).await?;
-    // Issue #372: each to-side is joined by its recorded schema, never
-    // re-resolved through this session's `search_path`.
-    let to_tables: Vec<String> = rel_joins
-        .iter()
-        .map(|(_, reldef)| reldef.qualified_to_table())
-        .collect();
-    let joins_sql = super::oracle::to_one_join_clauses(
-        rel_joins
-            .iter()
-            .zip(&to_tables)
-            .map(|((rel, reldef), to_table)| {
-                (
-                    rel.as_str(),
-                    to_table.as_str(),
-                    reldef.def.to_col.as_str(),
-                    reldef.def.from_col.as_str(),
-                )
-            }),
-        &source,
-    );
-    // With a join in play every source column must be qualified, or a to-side
-    // column of the same name makes the reference ambiguous. Without one,
-    // render exactly as before so a relationship-free aggregate's SQL is
-    // byte-identical to what it has always been.
-    let render_field = |expr: &Expr| -> String {
-        if rel_joins.is_empty() {
-            render_expr_sql(expr)
-        } else {
-            super::oracle::render_to_one_rel_expr_sql(expr, &source)
-        }
-    };
+    let ledger = super::ledger::qualified_ledger_table(target_schema, &def.target);
+    let scan = SourceScan::resolve(pool, def, source_table).await?;
+    let pk = source_primary_key(pool, source_table).await?;
 
     // Issue #137: a `GROUP BY` key's type comes from the to-side column
     // `relationships` reports for a relationship path, or `source_columns`
@@ -1486,25 +1530,54 @@ async fn backfill_aggregate(
         .iter()
         .map(|k| quote_ident(k.target_column_name()))
         .collect();
-    // `render_field` already qualifies a plain column against `source` (or
-    // leaves it bare when there's no join) and resolves a relationship path
-    // against its own join alias — reused here rather than re-deriving the
-    // same qualification rules for `GROUP BY` keys.
-    let group_refs: Vec<String> = group_by
-        .iter()
-        .map(|k| render_field(&k.as_expr()))
-        .collect();
     let group_casts: Vec<std::borrow::Cow<'static, str>> = group_by
         .iter()
         .map(|k| ddl::pg_type_name(group_by_value_type(k)))
         .collect();
+    let contributions = super::ledger::contributions(&def.fields, group_by, &substituted);
 
-    // Build the INSERT column list and, for each, the aggregate SELECT
-    // expression that computes it from the source — mirroring
+    // The ledger write: one entry per source row. `member`, `tombstone`,
+    // `applied_lsn`, `applied_seg` and `join_key` take their defaults (a
+    // member, live, never applied, no join key until #623 D5).
+    let mut ledger_cols = vec![quote_ident(super::ledger::KEY_COLUMN)];
+    let mut ledger_exprs = vec![scan.key_sql(&pk)];
+    for key in group_by {
+        ledger_cols.push(quote_ident(key.target_column_name()));
+        ledger_exprs.push(scan.render(&key.as_expr()));
+    }
+    for contribution in &contributions {
+        ledger_cols.push(quote_ident(&contribution.column));
+        ledger_exprs.push(scan.render(&contribution.arg));
+    }
+    ledger_cols.push(quote_ident(super::ledger::BASIS_COLUMN));
+    ledger_exprs.push("__trellis_read.basis".to_string());
+    // Issue #419: the build is a live read of the source, so each group row
+    // records its recompute horizon exactly as the forced path's re-derivation
+    // does (issue #321, [`ddl::RECOMPUTE_LSN_COLUMN`]). The build runs after
+    // its source joined the publication, so a commit it read is streamed too,
+    // and that commit's delta can drain after the definition goes live. The
+    // position is read in the ledger statement, after its snapshot is taken,
+    // so every commit that statement saw ends at or below it, and such a delta
+    // re-derives its group instead of counting the commit a second time.
+    let ledger_sql = format!(
+        "with __trellis_read as materialized ( \
+             select pg_catalog.pg_current_snapshot() as basis, \
+                    pg_catalog.pg_current_wal_insert_lsn() as horizon \
+         ), __trellis_entries as ( \
+             insert into {ledger} ({}) \
+             select {} from {} cross join __trellis_read \
+         ) \
+         select horizon::text from __trellis_read",
+        ledger_cols.join(", "),
+        ledger_exprs.join(", "),
+        scan.relation_sql(),
+    );
+
+    // Build the group-row INSERT column list and, for each, the aggregate
+    // expression over the ledger that computes it — mirroring
     // `apply_forced_groups_bulk`'s per-field-kind construction (issue #63 M3
     // concern #3) so a directly-built target is byte-identical to a ring-built
-    // one. Group-key columns come first; every column is a stable target column
-    // name, so it doubles as the staging table's column name.
+    // one. Group-key columns come first.
     // Derived from the substituted view (not raw `def.fields`) so a field that
     // only resolves to a bare `SUM`/`AVG` call *after* alias substitution
     // (e.g. `total2 = total` where `total = SUM(amount)`) gets a count-column
@@ -1527,81 +1600,67 @@ async fn backfill_aggregate(
         }
     }));
     let mut insert_cols: Vec<String> = group_idents.clone();
-    let mut stage_exprs: Vec<String> = group_refs.clone();
+    let mut group_exprs: Vec<String> = group_idents.clone();
     // Issue #48: two fields (e.g. `SUM(amount)`/`AVG(amount)`) can share one
     // hidden count column (`count_cols`) — track which shared names have
-    // already been emitted into this staging table's column list, so a
-    // second field sharing a column never emits a duplicate, which both
-    // `CREATE TEMP TABLE ... AS SELECT` and the later `ON CONFLICT DO
-    // UPDATE` reject.
-    let mut emitted_count_cols: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // already been emitted into the column list, so a second field sharing a
+    // column never emits a duplicate, which the `ON CONFLICT DO UPDATE`
+    // rejects.
+    let mut emitted_count_cols: HashSet<String> = HashSet::new();
     for field in &def.fields {
         if group_by_contains(group_by, &field.name) {
             continue;
         }
         let col = quote_ident(&field.name);
         let expr = &substituted[&field.name];
+        let over_ledger = super::ledger::over_ledger(expr, &contributions, group_by);
         match classify_field(expr, field_value_type(&field.name)) {
             FieldKind::Sum => {
-                let arg = render_field(agg_arg_expr(expr));
+                let arg = render_expr_sql(agg_arg_expr(&over_ledger));
                 insert_cols.push(col);
-                stage_exprs.push(format!("sum({arg})"));
+                group_exprs.push(format!("sum({arg})"));
                 let count_col_name = count_cols[&field.name].clone();
                 if emitted_count_cols.insert(count_col_name.clone()) {
                     insert_cols.push(quote_ident(&count_col_name));
-                    stage_exprs.push(format!("count({arg})"));
+                    group_exprs.push(format!("count({arg})"));
                 }
             }
             FieldKind::Avg => {
-                let arg = render_field(agg_arg_expr(expr));
+                let arg = render_expr_sql(agg_arg_expr(&over_ledger));
                 let sum_col = avg_sum_column(&field.name);
                 let count_col_name = count_cols[&field.name].clone();
                 insert_cols.push(quote_ident(&sum_col));
-                stage_exprs.push(format!("sum({arg})"));
+                group_exprs.push(format!("sum({arg})"));
                 if emitted_count_cols.insert(count_col_name.clone()) {
                     insert_cols.push(quote_ident(&count_col_name));
-                    stage_exprs.push(format!("count({arg})"));
+                    group_exprs.push(format!("count({arg})"));
                 }
                 insert_cols.push(col);
-                stage_exprs.push(format!(
+                group_exprs.push(format!(
                     "case when count({arg}) = 0 then null \
                      else sum({arg}) / count({arg})::numeric end"
                 ));
             }
             FieldKind::Count => {
-                // Issue #120: `COUNT(<expr>)` renders `count(<expr>)`;
-                // `COUNT(*)` (empty `args`) still renders bare `count(*)`.
-                // No cast needed either way — Postgres's own `count()`
-                // already returns `bigint`, matching this field's declared
-                // `Integer(Int8)` type (`registry::AGGREGATE_FUNCTION_SPECS`'s
-                // `COUNT` row).
+                // Issue #120: `COUNT(<expr>)` renders `count(<its column>)`;
+                // `COUNT(*)` still renders bare `count(*)`, counting the
+                // group's member entries. No cast needed either way —
+                // Postgres's own `count()` already returns `bigint`, matching
+                // this field's declared `Integer(Int8)` type
+                // (`registry::AGGREGATE_FUNCTION_SPECS`'s `COUNT` row).
                 insert_cols.push(col);
-                let count_sql = match expr {
-                    Expr::FunctionCall { args, .. } if !args.is_empty() => {
-                        format!("count({})", render_field(&args[0]))
-                    }
-                    _ => "count(*)".to_string(),
-                };
-                stage_exprs.push(count_sql);
+                group_exprs.push(render_expr_sql(&over_ledger));
             }
             FieldKind::RecomputeOnly => {
                 insert_cols.push(col);
-                stage_exprs.push(format!("({})", render_field(expr)));
+                group_exprs.push(format!("({})", render_expr_sql(&over_ledger)));
             }
         }
     }
-    // Issue #419: the build is a live `GROUP BY` read of the source, so each
-    // group row records its recompute horizon exactly as the forced path's
-    // re-derivation does (issue #321, [`ddl::RECOMPUTE_LSN_COLUMN`]). The
-    // build runs after its source joined the publication, so a commit it read
-    // is streamed too, and that commit's delta can drain after the definition
-    // goes live. The function is evaluated while the staging statement runs,
-    // after its snapshot is taken, so every commit that statement saw ends at
-    // or below it, and such a delta re-derives its group instead of counting
-    // the commit a second time.
+    insert_cols.push(quote_ident(ddl::MEMBERS_COLUMN));
+    group_exprs.push("count(*)".to_string());
+    // Last, and its value appended once the ledger statement has read it.
     insert_cols.push(quote_ident(ddl::RECOMPUTE_LSN_COLUMN));
-    stage_exprs.push("pg_current_wal_insert_lsn()".to_string());
 
     let arity = group_idents.len();
     let update_sets: Vec<String> = insert_cols
@@ -1609,81 +1668,80 @@ async fn backfill_aggregate(
         .skip(arity)
         .map(|c| format!("{c} = excluded.{c}"))
         .collect();
-    debug_assert!(!update_sets.is_empty());
 
     let insert_cols_sql = insert_cols.join(", ");
-    // `group_by_sql` runs against the *source* (possibly joined, hence
-    // qualified); `group_tuple`/`conflict_sql`/`group_key_not_null`/the
-    // boundary query all run against the staging table or the target, whose
-    // columns are the bare target column names.
-    let group_by_sql = group_refs.join(", ");
     let group_tuple = group_idents.join(", ");
-    let conflict_sql = group_idents.join(", ");
     let update_sets_sql = update_sets.join(", ");
-    // Issue #128: a source grouping column can itself be NULL — `GROUP BY`
-    // folds every NULL in a column into one group, same as any other value —
-    // so this can no longer be used to *filter* the staging build (that
-    // silently dropped every NULL-keyed group). It still names the subset of
-    // groups the row-value range-chunking below can safely handle: a NULL
-    // component makes Postgres's row-comparison operators (`<`, `<=`, `>`)
-    // return NULL rather than `true`/`false` (SQL three-valued logic), which
-    // would silently exclude that row from every chunk's `WHERE` — the same
-    // drop, just moved from staging-build time to write time. NULL-keyed
-    // groups are therefore written in one unchunked pass after the loop
-    // instead, where `ON CONFLICT` matches them through the target's
-    // NULLS-NOT-DISTINCT unique constraint rather than a row comparison.
+    // The entries a group row is the sum of: its live members, which is also
+    // the predicate of the ledger's partial `GROUP BY` index.
+    let live = format!(
+        "{} and not {}",
+        quote_ident(super::ledger::MEMBER_COLUMN),
+        quote_ident(super::ledger::TOMBSTONE_COLUMN)
+    );
+    // Issue #128: a grouping column can itself be NULL — `GROUP BY` folds
+    // every NULL in a column into one group, same as any other value — so
+    // this is not a filter on what gets built. It names the subset of groups
+    // the row-value range-chunking below can safely handle (see this
+    // function's doc comment).
     let group_key_not_null = group_idents
         .iter()
         .map(|c| format!("{c} is not null"))
         .collect::<Vec<_>>()
         .join(" and ");
-    // Each staging column aliased to its target column name, so the staging
-    // table's columns line up with `insert_cols` for a plain SELECT on write.
-    let stage_select_sql = insert_cols
-        .iter()
-        .zip(&stage_exprs)
-        .map(|(col, expr)| format!("{expr} as {col}"))
-        .collect::<Vec<_>>()
-        .join(", ");
 
     let mut client = pool.get().await?;
 
-    // Single full-table scan: aggregate the whole source — NULL-keyed groups
-    // included — into a connection-scoped staging table. This is the ~60ms
-    // `GROUP BY` floor and the *only* pass over the source. The staging table
-    // has one row per group. Drop first in case a crashed prior backfill on
-    // this pooled connection left one behind; drop again at the end so it
-    // doesn't leak back into the pool.
-    client
-        .batch_execute(&format!("drop table if exists {STAGE_TABLE}"))
-        .await?;
-    client
-        .execute(
-            &format!(
-                "create temp table {STAGE_TABLE} as \
-                 select {stage_select_sql} from {source}{joins_sql} \
-                 group by {group_by_sql}"
-            ),
-            &[],
-        )
-        .await?;
-    // A unique key on the group columns (not a bare `PRIMARY KEY`, which
-    // would reject the NULL-keyed group's row the same way the target's own
-    // pre-#128 `PRIMARY KEY` did) makes each chunk's range-write below an
-    // index range scan of the staging table rather than a full staging scan
-    // — the group tuple is unique in the aggregated result, so it is a valid
-    // key either way.
-    client
-        .batch_execute(&format!(
-            "alter table {STAGE_TABLE} add unique nulls not distinct ({group_tuple})"
-        ))
-        .await?;
+    // The ledger write, emptying the ledger first, in one transaction that
+    // holds the fence like every other write the build makes.
+    let horizon: String = {
+        let txn = client.transaction().await?;
+        if let Some(fence) = fence
+            && !fence.hold(&*txn).await?
+        {
+            return Err(BackfillError::Superseded);
+        }
+        let horizon = load_emptied_ledger(&txn, &ledger, &ledger_sql).await?;
+        txn.commit().await?;
+        horizon
+    };
+    // The ledger's key and indexes, dropped for the load, built again in a
+    // transaction of their own. Its first statement starts before it takes an
+    // xid, so the build paused there (a test's hook point) doesn't hold back
+    // the seal gate. It isn't fenced: the indexes are the same whichever
+    // build adds them. The ledger always has all of them or none (the load
+    // drops them together, and this adds them together), so a key that's
+    // already there (42P16) means another build has added them all since this
+    // one's load, over whatever the latest load left.
+    let rebuild = format!(
+        "alter table {ledger} add primary key ({}){}",
+        quote_ident(super::ledger::KEY_COLUMN),
+        super::ledger::aggregate_ledger_index_ddl(
+            &ledger,
+            &group_idents,
+            !super::eval::relationship_references(def).is_empty(),
+        ),
+    );
+    {
+        let txn = client.transaction().await?;
+        match txn.batch_execute(&rebuild).await {
+            Ok(()) => txn.commit().await?,
+            Err(err)
+                if err.code()
+                    == Some(&tokio_postgres::error::SqlState::INVALID_TABLE_DEFINITION) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    // An LSN Postgres itself rendered (`X/Y`), so it's inlined as a literal
+    // rather than bound, keeping `$1..` for the range bounds.
+    let group_exprs_sql = format!("{}, '{horizon}'::pg_lsn", group_exprs.join(", "));
 
-    let insert_for = |where_clause: &str| {
+    let insert_for = |condition: &str| {
         format!(
             "insert into {target} ({insert_cols_sql}) \
-             select {insert_cols_sql} from {STAGE_TABLE}{where_clause} \
-             on conflict ({conflict_sql}) do update set {update_sets_sql}"
+             select {group_exprs_sql} from {ledger} where {live} and {condition} \
+             group by {group_tuple} \
+             on conflict ({group_tuple}) do update set {update_sets_sql}"
         )
     };
 
@@ -1698,7 +1756,8 @@ async fn backfill_aggregate(
     let boundary_sql = format!(
         "select {boundary_select_text} from ( \
              select {group_tuple}, row_number() over (order by {group_tuple}) as rn \
-             from {STAGE_TABLE} where {group_key_not_null} \
+             from (select distinct {group_tuple} from {ledger} \
+                   where {live} and {group_key_not_null}) as groups \
          ) x where x.rn % {BACKFILL_CHUNK_GROUPS} = 0 order by {group_tuple}"
     );
     let boundary_rows = client.query(&boundary_sql, &[]).await?;
@@ -1717,25 +1776,24 @@ async fn backfill_aggregate(
     // groups (see above), so every component is `Some`, but `Option<String>` is
     // what the row getter yields, so unwrap defensively.
     let tuple_cmp = |op: &str, start: usize| -> String {
-        let lhs = group_tuple.clone();
         let rhs = (0..arity)
             .map(|i| format!("${}::text::{}", start + i, group_casts[i]))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("({lhs}) {op} ({rhs})")
+        format!("({group_tuple}) {op} ({rhs})")
     };
 
     let mut prev: Option<Vec<Option<String>>> = None;
     for hi in &boundaries {
-        let where_clause = match &prev {
-            None => format!(" where {group_key_not_null} and {}", tuple_cmp("<=", 1)),
+        let condition = match &prev {
+            None => format!("{group_key_not_null} and {}", tuple_cmp("<=", 1)),
             Some(_) => format!(
-                " where {group_key_not_null} and {} and {}",
+                "{group_key_not_null} and {} and {}",
                 tuple_cmp(">", 1),
                 tuple_cmp("<=", arity + 1),
             ),
         };
-        let sql = insert_for(&where_clause);
+        let sql = insert_for(&condition);
         let mut params: Vec<String> = Vec::new();
         if let Some(prev) = &prev {
             params.extend(prev.iter().map(|v| v.clone().unwrap_or_default()));
@@ -1753,17 +1811,17 @@ async fn backfill_aggregate(
 
     // Final open-ended range above the last boundary — or, when there were no
     // boundaries at all (non-NULL-keyed group count <= BACKFILL_CHUNK_GROUPS),
-    // the single range covering every non-NULL-keyed group in staging.
-    let (clause, params): (String, Vec<String>) = match &prev {
-        None => (format!(" where {group_key_not_null}"), Vec::new()),
+    // the single range covering every non-NULL-keyed group.
+    let (condition, params): (String, Vec<String>) = match &prev {
+        None => (group_key_not_null.clone(), Vec::new()),
         Some(prev) => (
-            format!(" where {group_key_not_null} and {}", tuple_cmp(">", 1)),
+            format!("{group_key_not_null} and {}", tuple_cmp(">", 1)),
             prev.iter().map(|v| v.clone().unwrap_or_default()).collect(),
         ),
     };
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|p| p as _).collect();
-    let sql = insert_for(&clause);
+    let sql = insert_for(&condition);
     write_fenced(&mut client, fence, async |client| {
         client.execute(&sql, &param_refs).await?;
         Ok(())
@@ -1777,27 +1835,70 @@ async fn backfill_aggregate(
     // conflict-arbiter matching needs no row-value comparison at all. NULL
     // keys are expected to be a small minority of groups, so skipping the
     // chunking optimization for them costs little.
-    let sql = insert_for(&format!(" where not ({group_key_not_null})"));
+    let sql = insert_for(&format!("not ({group_key_not_null})"));
     write_fenced(&mut client, fence, async |client| {
         client.execute(&sql, &[]).await?;
         Ok(())
     })
     .await?;
 
-    // Return the staging table to a clean slate before the connection goes back
-    // to the pool.
-    client
-        .batch_execute(&format!("drop table if exists {STAGE_TABLE}"))
-        .await?;
-
     Ok(())
+}
+
+/// Empties the aggregate build's `ledger` (quoted) and runs `load`, the
+/// statement that fills it and returns the recompute horizon, on `txn`.
+///
+/// The load runs with the ledger's key and indexes dropped, which the caller
+/// builds again afterward from the ledger's own DDL
+/// (`ledger::aggregate_ledger_index_ddl`): one sorted build of each is more
+/// than twice as fast as maintaining them row by row through a source-sized
+/// insert (1M rows: 1.35 s against 3.1 s). Whatever exists is dropped, so a
+/// build that failed before rebuilding them leaves nothing for the next to
+/// trip over. The `truncate` takes the ledger's `ACCESS EXCLUSIVE` lock
+/// first, and a caller that sees an error rolls it all back.
+async fn load_emptied_ledger(
+    txn: &tokio_postgres::Transaction<'_>,
+    ledger: &str,
+    load: &str,
+) -> Result<String, BackfillError> {
+    txn.batch_execute(&format!("truncate {ledger}")).await?;
+    let mut drop: Vec<String> = txn
+        .query(
+            "select conname::text from pg_catalog.pg_constraint \
+             where conrelid = $1::text::regclass and contype = 'p'",
+            &[&ledger],
+        )
+        .await?
+        .into_iter()
+        .map(|row| {
+            format!(
+                "alter table {ledger} drop constraint {}",
+                quote_ident(&row.get::<_, String>(0))
+            )
+        })
+        .collect();
+    drop.extend(
+        txn.query(
+            "select indexrelid::regclass::text from pg_catalog.pg_index \
+             where indrelid = $1::text::regclass and not indisprimary",
+            &[&ledger],
+        )
+        .await?
+        .into_iter()
+        .map(|row| format!("drop index {}", row.get::<_, String>(0))),
+    );
+    if !drop.is_empty() {
+        txn.batch_execute(&drop.join("; ")).await?;
+    }
+    Ok(txn.query_one(load, &[]).await?.get(0))
 }
 
 /// Prefix for the connection-scoped staging tables the relationship build
 /// materializes one per referenced to-many relationship. Safe as a fixed name
-/// for the same reason [`STAGE_TABLE`] is: the build holds one pooled
-/// connection for its whole duration and drops each table before creating it
-/// (crash leftover) and after the writes.
+/// because each is a temp table (private to its session) and the build holds
+/// one pooled connection for its whole duration, so no two builds share a
+/// session; it drops each table before creating it (crash leftover on a reused
+/// pooled connection) and after the writes.
 const REL_STAGE_TABLE_PREFIX: &str = "_trellis_backfill_rel_staging_";
 
 /// A distinct to-many-aggregate leaf: `agg(rel.column)` — an aggregate
