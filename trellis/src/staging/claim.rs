@@ -19,7 +19,6 @@ use std::time::Duration;
 use tokio_postgres::GenericClient;
 
 use super::error::StagingError;
-#[cfg(any(test, feature = "internals"))]
 use super::fold::BucketFilter;
 
 /// How many buckets a batch that clears [`MIN_ROWS_TO_SPLIT`] is split
@@ -178,34 +177,86 @@ pub async fn claim(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// Builds the [`BucketFilter`] for the buckets `claimed_by` actually holds
-/// on `seg_seq`, read from `seg_claims` — never recomputed (doc 04: "Which
-/// buckets a worker holds is read from the claims table, never
-/// recomputed") — paired with the batch's own fixed `bucket_count`.
-#[cfg(any(test, feature = "internals"))]
-pub async fn owned_bucket_filter(
+/// The buckets one worker holds on one segment after its claim, with what
+/// the drain needs to choose its path. Read by [`held_share`]; every fold
+/// filter a drain uses comes from [`HeldShare::filter`].
+pub struct HeldShare {
+    pub(crate) seg_seq: i64,
+    pub(crate) bucket_count: i16,
+    pub(crate) buckets: Vec<i16>,
+    /// `segments.row_count` over `bucket_count`, times the buckets held: the
+    /// share's ring rows if routes spread evenly. Rows, not records, so it
+    /// over-counts a share whose keys repeat.
+    pub(crate) estimated_rows: i64,
+    /// Whether any held bucket has a `drain_cursor` row: an earlier claimant
+    /// committed pages of it, so this drain resumes rather than starts.
+    pub(crate) has_cursor: bool,
+}
+
+/// Reads the buckets `claimed_by` holds on `seg_seq` from `seg_claims` —
+/// never recomputed (doc 04: "Which buckets a worker holds is read from the
+/// claims table, never recomputed") — with the batch's own fixed
+/// `bucket_count`.
+pub async fn held_share(
     client: &impl GenericClient,
     seg_seq: i64,
     claimed_by: &str,
-) -> Result<BucketFilter, StagingError> {
-    let bucket_count: i16 = client
+) -> Result<HeldShare, StagingError> {
+    let row = client
         .query_one(
-            "select bucket_count from segments where seg_seq = $1",
-            &[&seg_seq],
-        )
-        .await?
-        .get(0);
-    let buckets: Vec<i64> = client
-        .query(
-            "select bucket from seg_claims where seg_seq = $1 and claimed_by = $2",
+            "select s.bucket_count, s.row_count, \
+                    array(select bucket from seg_claims \
+                          where seg_seq = $1 and claimed_by = $2 order by bucket), \
+                    exists (select 1 from drain_cursor c join seg_claims k \
+                              on k.seg_seq = c.seg_seq and k.bucket = c.bucket \
+                            where c.seg_seq = $1 and k.claimed_by = $2) \
+             from segments s where s.seg_seq = $1",
             &[&seg_seq, &claimed_by],
         )
-        .await?
-        .into_iter()
-        .map(|row| {
-            let bucket: i16 = row.get(0);
-            bucket as i64
-        })
-        .collect();
-    Ok(BucketFilter::buckets(bucket_count as i64, buckets))
+        .await?;
+    let bucket_count: i16 = row.get(0);
+    let row_count: i64 = row.get(1);
+    let buckets: Vec<i16> = row.get(2);
+    let has_cursor: bool = row.get(3);
+    let estimated_rows = row_count * buckets.len() as i64 / i64::from(bucket_count.max(1));
+    Ok(HeldShare {
+        seg_seq,
+        bucket_count,
+        buckets,
+        estimated_rows,
+        has_cursor,
+    })
+}
+
+impl HeldShare {
+    /// Every bucket this worker holds on the segment, ascending.
+    #[cfg(any(test, feature = "internals"))]
+    pub fn buckets(&self) -> &[i16] {
+        &self.buckets
+    }
+
+    /// The fold filter for `buckets`, a subset of [`Self::buckets`] (all of
+    /// them, or one cursor group of a resumed paged drain), over the batch's
+    /// `bucket_count`.
+    pub fn filter(&self, buckets: &[i16]) -> BucketFilter {
+        // Planted bug (#557): drop claim exclusivity, so a claimer folds every
+        // bucket of a split batch, not just its own. See `crate::plant`.
+        // "Split" is judged on the whole share this worker holds, not on
+        // `buckets`: a resumed paged drain passes one cursor group at a
+        // time, a strict subset even when the worker holds every bucket.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(
+            crate::plant::Plant::ClaimAllBuckets,
+            !self.buckets.is_empty() && self.buckets.len() < self.bucket_count as usize,
+        ) {
+            return BucketFilter::buckets(
+                i64::from(self.bucket_count),
+                (0..i64::from(self.bucket_count)).collect(),
+            );
+        }
+        BucketFilter::buckets(
+            i64::from(self.bucket_count),
+            buckets.iter().map(|&b| i64::from(b)).collect(),
+        )
+    }
 }

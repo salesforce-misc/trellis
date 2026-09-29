@@ -158,12 +158,8 @@ impl<B: Backend> InstanceRun<'_, B> {
         let checked = check_program(self.pool, self.program, &snapshot)
             .await
             .map_err(|e| self.tag(RunError::Oracle(e)))?;
-        if let Some((def_target, report)) = checked {
-            return Err(self.tag(RunError::Diverged(Divergence {
-                op_index,
-                def_target,
-                report,
-            })));
+        if let Some(divergence) = Divergence::from_checked(op_index, checked) {
+            return Err(self.tag(RunError::Diverged(divergence)));
         }
         Ok(())
     }

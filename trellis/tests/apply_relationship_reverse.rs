@@ -263,9 +263,10 @@ async fn claim_fold_compute(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str
     claim::claim(&*txn, seg_seq, claimed_by, 1)
         .await
         .expect("claim");
-    let filter = claim::owned_bucket_filter(&*txn, seg_seq, claimed_by)
+    let share = claim::held_share(&*txn, seg_seq, claimed_by)
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
     apply::compute(pool, &folded).await.expect("compute")

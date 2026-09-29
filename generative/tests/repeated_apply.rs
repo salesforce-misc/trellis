@@ -142,7 +142,7 @@ async fn two_distinct_updates_to_the_same_row_back_to_back_still_converge() {
         .await
         .expect("oracle check must run");
     assert!(
-        divergence.is_none(),
+        divergence.is_empty(),
         "two back-to-back Updates to the same row must not leave the target diverged from the \
          real (net-of-both, not dropped-or-double-counted) source state: {divergence:?}"
     );
@@ -200,7 +200,7 @@ async fn the_same_delete_applied_twice_in_a_row_still_converges() {
         .await
         .expect("oracle check must run");
     assert!(
-        divergence.is_none(),
+        divergence.is_empty(),
         "repeating an already-applied Delete must not leave the target diverged: {divergence:?}"
     );
 }

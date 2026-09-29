@@ -268,7 +268,7 @@ async fn truncate_on_a_nonempty_tracked_table_converges_and_a_post_truncate_inse
         .await
         .expect("oracle check must run");
     assert!(
-        checked.is_none(),
+        checked.is_empty(),
         "post-truncate insert must still converge onto the target: {checked:?}"
     );
 }

@@ -146,13 +146,17 @@ async fn wait_until_pending(backend: &ManualBackend, timeout: Duration) {
 async fn assert_converges(pool: &Pool, program: &Program, backend: &mut ManualBackend) {
     backend.quiesce().await.expect("quiesce");
     let snapshot = backend.snapshot().await.expect("snapshot");
-    if let Some((target, report)) = check_program(pool, program, &snapshot)
+    let diverged = check_program(pool, program, &snapshot)
         .await
-        .expect("oracle check")
-    {
+        .expect("oracle check");
+    if !diverged.is_empty() {
+        let reports: Vec<String> = diverged
+            .iter()
+            .map(|(target, report)| format!("target {target:?}:\n{report}"))
+            .collect();
         panic!(
-            "relationship interleaving scenario diverged on target {target:?}:\n{report}\n\
-             program: {program:#?}"
+            "relationship interleaving scenario diverged on {}\nprogram: {program:#?}",
+            reports.join("\n")
         );
     }
 }

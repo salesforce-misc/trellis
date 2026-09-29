@@ -95,12 +95,10 @@ pub async fn run_convergence_with_noise(
             .map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
 
         let checked = check_program(pool, program, &snapshot).await;
-        if let Some((def_target, report)) = checked.map_err(RunError::Oracle)? {
-            return Err(RunError::Diverged(Divergence {
-                op_index,
-                def_target,
-                report,
-            }));
+        if let Some(divergence) =
+            Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?)
+        {
+            return Err(RunError::Diverged(divergence));
         }
 
         // Fires *after* op_index's own full cycle (position `op_index + 1`),

@@ -185,16 +185,13 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
             restored: restored_sources,
         });
     }
-    if let Some((def_target, report)) =
+    if let Some(divergence) = Divergence::from_checked(
+        k,
         check_defs(&restored_pool, program, &program.defs, &snapshot)
             .await
-            .map_err(RunError::Oracle)?
-    {
-        return Err(RunError::Diverged(Divergence {
-            op_index: k,
-            def_target,
-            report,
-        }));
+            .map_err(RunError::Oracle)?,
+    ) {
+        return Err(RunError::Diverged(divergence));
     }
 
     // The replay of `k+1..n`.

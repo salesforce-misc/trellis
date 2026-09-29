@@ -350,7 +350,7 @@ async fn restart_then_scale_out_are_independently_usable_against_a_live_backend(
         .await
         .expect("oracle check must run");
     assert!(
-        diverged.is_none(),
+        diverged.is_empty(),
         "post-restart/scale-out update must still converge onto the target: {diverged:?}"
     );
 }
@@ -450,7 +450,7 @@ async fn restarting_the_primary_client_back_to_back_never_races_the_advisory_loc
         .await
         .expect("oracle check must run");
     assert!(
-        diverged.is_none(),
+        diverged.is_empty(),
         "post-restart-loop update must still converge onto the target: {diverged:?}"
     );
 }

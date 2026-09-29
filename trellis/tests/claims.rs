@@ -460,7 +460,7 @@ async fn drainer_registration_is_the_share_denominator_floored_at_one() {
 }
 
 #[tokio::test]
-async fn owned_bucket_filter_reads_the_claims_table_rather_than_recomputing() {
+async fn held_share_reads_the_claims_table_rather_than_recomputing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -480,9 +480,13 @@ async fn owned_bucket_filter_reads_the_claims_table_rather_than_recomputing() {
         .expect("claim");
     assert!(!won.is_empty());
 
-    let filter = claim::owned_bucket_filter(&client, seg_seq, "me")
+    let share = claim::held_share(&client, seg_seq, "me")
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let mut won_sorted = won.clone();
+    won_sorted.sort_unstable();
+    assert_eq!(share.buckets(), won_sorted, "the share is what `claim` won");
+    let filter = share.filter(share.buckets());
     // The one key routes to exactly one bucket, which is either in `won`
     // or not; either way the fold must agree with what `seg_claims` says
     // "me" holds. Read before opening the fold transaction below, since

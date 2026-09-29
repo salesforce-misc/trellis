@@ -1157,9 +1157,10 @@ async fn a_stale_relationship_enriched_write_is_restaged_rather_than_applied() {
     claim::claim(&*txn, seg1, "slow_worker", 1)
         .await
         .expect("claim");
-    let filter = claim::owned_bucket_filter(&*txn, seg1, "slow_worker")
+    let share = claim::held_share(&*txn, seg1, "slow_worker")
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg1, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
     let stale_plan = apply::compute(&db.pool, &folded).await.expect("compute");

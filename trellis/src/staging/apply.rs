@@ -47,6 +47,7 @@ use crate::pool::{Pool, quote_ident, quote_literal};
 use super::append::{self, StagedChange};
 use super::apply_aggregate::{self, AggregateTargetPlan};
 use super::claim;
+use super::claim::{HeldShare, held_share};
 use super::converge;
 use super::error::StagingError;
 use super::fold::{self, FoldedChange, earliest_origin};
@@ -4528,9 +4529,10 @@ mod tests {
         claim::claim(&*txn, seg_seq, "worker", 1)
             .await
             .expect("claim");
-        let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+        let share = claim::held_share(&*txn, seg_seq, "worker")
             .await
-            .expect("owned_bucket_filter");
+            .expect("held_share");
+        let filter = share.filter(share.buckets());
         let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
         txn.commit().await.expect("commit phase 1");
         assert_eq!(folded.len(), 1, "three rows for one key fold to one change");
@@ -9404,76 +9406,6 @@ pub async fn drain_many_with_hooks(
         hooks,
     )
     .await
-}
-
-/// The buckets this worker holds on one segment after Phase 1, with what the
-/// drain needs to choose its path.
-struct HeldShare {
-    seg_seq: i64,
-    bucket_count: i16,
-    buckets: Vec<i16>,
-    /// `segments.row_count` over `bucket_count`, times the buckets held: the
-    /// share's ring rows if routes spread evenly. Rows, not records, so it
-    /// over-counts a share whose keys repeat.
-    estimated_rows: i64,
-    /// Whether any held bucket has a `drain_cursor` row: an earlier claimant
-    /// committed pages of it, so this drain resumes rather than starts.
-    has_cursor: bool,
-}
-
-async fn held_share(
-    client: &impl GenericClient,
-    seg_seq: i64,
-    claimed_by: &str,
-) -> Result<HeldShare, ApplyError> {
-    let row = client
-        .query_one(
-            "select s.bucket_count, s.row_count, \
-                    array(select bucket from seg_claims \
-                          where seg_seq = $1 and claimed_by = $2 order by bucket), \
-                    exists (select 1 from drain_cursor c join seg_claims k \
-                              on k.seg_seq = c.seg_seq and k.bucket = c.bucket \
-                            where c.seg_seq = $1 and k.claimed_by = $2) \
-             from segments s where s.seg_seq = $1",
-            &[&seg_seq, &claimed_by],
-        )
-        .await?;
-    let bucket_count: i16 = row.get(0);
-    let row_count: i64 = row.get(1);
-    let buckets: Vec<i16> = row.get(2);
-    let has_cursor: bool = row.get(3);
-    let estimated_rows = row_count * buckets.len() as i64 / i64::from(bucket_count.max(1));
-    Ok(HeldShare {
-        seg_seq,
-        bucket_count,
-        buckets,
-        estimated_rows,
-        has_cursor,
-    })
-}
-
-impl HeldShare {
-    fn filter(&self, buckets: &[i16]) -> fold::BucketFilter {
-        // Planted bug (#557): drop claim exclusivity, so a claimer folds every
-        // bucket of a split batch, not just its own. See `crate::plant`.
-        // "Split" is judged on the whole share this worker holds, not on
-        // `buckets`: a resumed paged drain passes one cursor group at a
-        // time, a strict subset even when the worker holds every bucket.
-        #[cfg(any(test, feature = "test-util"))]
-        if crate::plant::fires(
-            crate::plant::Plant::ClaimAllBuckets,
-            !self.buckets.is_empty() && self.buckets.len() < self.bucket_count as usize,
-        ) {
-            return fold::BucketFilter::buckets(
-                i64::from(self.bucket_count),
-                (0..i64::from(self.bucket_count)).collect(),
-            );
-        }
-        fold::BucketFilter::buckets(
-            i64::from(self.bucket_count),
-            buckets.iter().map(|&b| i64::from(b)).collect(),
-        )
-    }
 }
 
 impl ManyApplyOutcome {

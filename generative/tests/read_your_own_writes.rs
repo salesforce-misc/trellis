@@ -158,7 +158,7 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
         .await
         .expect("oracle check must run");
     assert!(
-        divergence.is_none(),
+        divergence.is_empty(),
         "after a real quiesce, the target must have fully caught up: {divergence:?}"
     );
 }
@@ -268,7 +268,7 @@ async fn awaiting_after_a_write_to_a_related_row_makes_the_enrichment_visible() 
         .await
         .expect("oracle check must run");
     assert!(
-        divergence.is_none(),
+        divergence.is_empty(),
         "after quiesce, every relationship-enriched target must match the oracle: {divergence:?}"
     );
 }

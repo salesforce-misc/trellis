@@ -130,7 +130,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .await
         .expect("oracle check must run mid-pause");
     assert!(
-        mid_crash_diverged.is_some(),
+        !mid_crash_diverged.is_empty(),
         "the paused Phase 3 batch must still have real, uncommitted work in it — if the system \
          already matches the model here, the SIGKILL below destroys nothing and the final \
          convergence assertion passes vacuously"
@@ -177,7 +177,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
         .await
         .expect("oracle check must run");
     assert!(
-        diverged.is_none(),
+        diverged.is_empty(),
         "post-SIGKILL redrive must converge onto exactly the same state an uninterrupted drain \
          would have reached — both the target write and the relationship projection advance \
          redone together, or the batch wasn't atomic: {diverged:?}"

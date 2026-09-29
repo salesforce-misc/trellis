@@ -398,10 +398,12 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
                     }
                 }
                 Err(RunError::Diverged(d)) => Err(TestCaseError::fail(format!(
-                    "concurrent convergence diverged after op {} (target {}), burst_size {burst_size} \
-                     — see this file's module doc comment's shrink-trust convention before trusting \
-                     this as a minimal repro:\n{}",
-                    d.op_index, d.def_target, d.report
+                    "concurrent convergence diverged after op {} (targets {}), burst_size \
+                     {burst_size} — see this file's module doc comment's shrink-trust convention \
+                     before trusting this as a minimal repro:\n{}",
+                    d.op_index,
+                    d.targets().collect::<Vec<_>>().join(", "),
+                    divergence_reports(&d)
                 ))),
                 Err(other) => Err(TestCaseError::fail(format!(
                     "run error (burst_size {burst_size}): {other:?}"
@@ -414,10 +416,20 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
 /// Why a concurrent-tier case failed.
 #[derive(Debug)]
 struct CaseFailure {
-    /// The target that diverged from the oracle, when the case failed by
-    /// diverging rather than by erroring.
-    target: Option<String>,
+    /// Every target that diverged from the oracle (#671: all of them, not
+    /// just the first, so the sweep can attribute a failure to a plant even
+    /// when an unplanted divergence shows up in the same check). Empty when
+    /// the case failed by erroring rather than by diverging.
+    targets: Vec<String>,
     message: String,
+}
+
+/// Every diverging target's report, each headed by its target.
+fn divergence_reports(d: &generative::run::Divergence) -> String {
+    d.all()
+        .map(|(target, report)| format!("target {target}:\n{report}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl From<CaseFailure> for TestCaseError {
@@ -482,22 +494,24 @@ fn run_concurrent_case(
                         Ok(())
                     } else {
                         Err(CaseFailure {
-                            target: None,
+                            targets: Vec::new(),
                             message: format!("run did not pass ({shape}): {}", run.outcome),
                         })
                     }
                 }
                 Err(RunError::Diverged(d)) => Err(CaseFailure {
                     message: format!(
-                        "concurrent case diverged in the burst ending at op {} (target {}; \
+                        "concurrent case diverged in the burst ending at op {} (targets {}; \
                          {shape}) — see this file's module doc comment's shrink-trust \
                          convention before trusting this as a minimal repro:\n{}",
-                        d.op_index, d.def_target, d.report
+                        d.op_index,
+                        d.targets().collect::<Vec<_>>().join(", "),
+                        divergence_reports(&d)
                     ),
-                    target: Some(d.def_target),
+                    targets: d.targets().map(str::to_string).collect(),
                 }),
                 Err(other) => Err(CaseFailure {
-                    target: None,
+                    targets: Vec::new(),
                     message: format!("run error ({shape}): {other:?}"),
                 }),
             }
@@ -972,7 +986,7 @@ async fn group_moves_converge_on_disk() {
                      another quiesce later)",
                     d.op_index,
                     rows.join(";"),
-                    if later.is_some() {
+                    if !later.is_empty() {
                         "still wrong"
                     } else {
                         "corrected"
@@ -1460,6 +1474,39 @@ fn plant_reaches(plant: &str, key_space: &trellis::dev::defs::ast::KeySpace) -> 
     }
 }
 
+/// Whether `plant` can have caused a failure that diverged in targets with
+/// these key spaces (`None` for a target the program doesn't define, which is
+/// given the benefit of the doubt): any one of them it writes is enough
+/// (#671). A failure with no diverging target at all (an error or a quiesce
+/// timeout) is reachable too.
+fn divergence_reachable<'a>(
+    plant: &str,
+    key_spaces: impl IntoIterator<Item = Option<&'a trellis::dev::defs::ast::KeySpace>>,
+) -> bool {
+    let mut key_spaces = key_spaces.into_iter().peekable();
+    key_spaces.peek().is_none()
+        || key_spaces.any(|key_space| key_space.is_none_or(|ks| plant_reaches(plant, ks)))
+}
+
+#[test]
+fn a_plants_divergence_is_credited_behind_an_unplanted_one() {
+    use trellis::dev::defs::ast::KeySpace;
+    let group_by = KeySpace::Aggregate {
+        group_by: Vec::new(),
+    };
+    let one_to_one = KeySpace::OneToOne;
+    let plant = "stale_one_to_one_write";
+    // An unplanted `GROUP BY` divergence first in definition order must not
+    // hide the plant's own 1-1 divergence behind it.
+    assert!(divergence_reachable(
+        plant,
+        [Some(&group_by), Some(&one_to_one)].into_iter()
+    ));
+    assert!(!divergence_reachable(plant, [Some(&group_by)].into_iter()));
+    assert!(divergence_reachable(plant, std::iter::empty()));
+    assert!(divergence_reachable(plant, [None].into_iter()));
+}
+
 /// Seed `seed`'s first `cases` cases of `strategy`. The same seed draws the
 /// same cases in every process, which is what lets a sweep judge each plant
 /// against an unplanted baseline over exactly the cases the plant ran.
@@ -1496,9 +1543,10 @@ struct SweepCase {
     failed: bool,
     /// How many times the plant changed the engine's behavior in this case.
     fired: u64,
-    /// Whether the plant can have caused the failure: the case failed in a
-    /// target the plant writes ([`plant_reaches`]), or failed without
-    /// diverging (an error or a quiesce timeout). `true` for a pass.
+    /// Whether the plant can have caused the failure: any of the targets the
+    /// case diverged in is one the plant writes ([`plant_reaches`]), or the
+    /// case failed without diverging (an error or a quiesce timeout). `true`
+    /// for a pass.
     reachable: bool,
     secs: f64,
     reason: String,
@@ -1585,16 +1633,17 @@ fn run_plant_sweep_cases() {
             let started = std::time::Instant::now();
             let result = run_concurrent_case(case, |h| &h.plant_coverage);
             let reachable = match &result {
-                Err(CaseFailure {
-                    target: Some(target),
-                    ..
-                }) => case
-                    .program
-                    .defs
-                    .iter()
-                    .find(|def| def.target == *target)
-                    .is_none_or(|def| plant_reaches(plant, &def.key_space)),
-                _ => true,
+                Err(CaseFailure { targets, .. }) => divergence_reachable(
+                    plant,
+                    targets.iter().map(|target| {
+                        case.program
+                            .defs
+                            .iter()
+                            .find(|def| def.target == *target)
+                            .map(|def| &def.key_space)
+                    }),
+                ),
+                Ok(()) => true,
             };
             let reason = match &result {
                 Ok(()) => String::new(),

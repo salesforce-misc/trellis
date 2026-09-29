@@ -332,7 +332,9 @@ async fn the_harness_detects_a_corrupted_target() {
         .await
         .expect("oracle check must run");
 
-    let (target, report) = found.expect("the harness must detect the corrupted target");
+    let [(target, report)]: [_; 1] = found
+        .try_into()
+        .expect("the harness must detect the corrupted target, and only it");
     assert_eq!(target, def.target);
     assert_eq!(
         report.target_vs_sql.len(),

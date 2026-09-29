@@ -569,43 +569,6 @@ impl TestCluster {
         db
     }
 
-    /// Like [`TestCluster::create_isolated_database`], but the database's
-    /// default collation is the ICU locale `icu_locale` (e.g. `"en-US"`)
-    /// rather than whatever `initdb` inherited from the environment. A test
-    /// whose point is that some comparison does *not* fall back to the
-    /// default collation needs a default that differs from `"C"`, and the
-    /// environment can't be relied on for one: GitHub's Ubuntu runners set
-    /// `LANG=C.UTF-8`, which orders text byte-wise, just like `"C"`.
-    ///
-    /// Returns `Err` with `createdb`'s complaint when the server can't make
-    /// the database: built without ICU, or a cluster whose encoding ICU
-    /// doesn't support (`SQL_ASCII`, which `initdb` picks under `LANG=C`).
-    pub async fn create_isolated_database_with_icu_collation(
-        &self,
-        icu_locale: &str,
-    ) -> Result<TestDatabase, String> {
-        let name = format!("trellis_test_{}", unique_suffix());
-        let output = Command::new("createdb")
-            .arg("-h")
-            .arg(&self.socket_dir)
-            .arg("-p")
-            .arg(self.port.to_string())
-            .arg("-U")
-            .arg("postgres")
-            .arg("--template=template0")
-            .arg("--locale-provider=icu")
-            .arg(format!("--icu-locale={icu_locale}"))
-            .arg(&name)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run createdb: {e}"));
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        let db = self.test_database(name);
-        Self::migrate(&db).await;
-        Ok(db)
-    }
-
     /// A handle, with its own pool, on the already-created database `name`,
     /// which the handle's `Drop` drops.
     fn test_database(&self, name: String) -> TestDatabase {

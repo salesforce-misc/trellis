@@ -107,16 +107,52 @@ pub fn classify_stand_up<T, E: fmt::Debug>(result: Result<T, E>) -> Result<T, Ou
 }
 
 /// A per-op convergence divergence: the op whose settled state disagreed with
-/// the oracle, which definition's target it was, and the localized
+/// the oracle, which definitions' targets it was, and each one's localized
 /// [`ThreeWayReport`].
 #[derive(Debug)]
 pub struct Divergence {
     /// Index into `program.ops` of the op after which the divergence was
     /// observed.
     pub op_index: usize,
-    /// The diverging definition's target table.
+    /// The first diverging definition's target table, in definition order.
     pub def_target: String,
-    pub report: ThreeWayReport,
+    /// Boxed so [`RunError`] stays small enough to return by value.
+    pub report: Box<ThreeWayReport>,
+    /// Every other definition whose target diverged at the same check, in
+    /// definition order (#671): a sweep attributing a failure to a planted
+    /// bug needs every diverging target, not just the first, or an unplanted
+    /// divergence earlier in definition order hides the plant's own.
+    pub also_diverged: Vec<(String, ThreeWayReport)>,
+}
+
+impl Divergence {
+    /// The divergence [`check_defs`]' result describes at `op_index`, or
+    /// `None` if every target converged.
+    pub fn from_checked(op_index: usize, checked: Vec<(String, ThreeWayReport)>) -> Option<Self> {
+        let mut checked = checked.into_iter();
+        let (def_target, report) = checked.next()?;
+        Some(Divergence {
+            op_index,
+            def_target,
+            report: Box::new(report),
+            also_diverged: checked.collect(),
+        })
+    }
+
+    /// Every diverging target and its report, the first one included, in
+    /// definition order.
+    pub fn all(&self) -> impl Iterator<Item = (&str, &ThreeWayReport)> {
+        std::iter::once((self.def_target.as_str(), &*self.report)).chain(
+            self.also_diverged
+                .iter()
+                .map(|(target, report)| (target.as_str(), report)),
+        )
+    }
+
+    /// Every diverging target, the first one included, in definition order.
+    pub fn targets(&self) -> impl Iterator<Item = &str> {
+        self.all().map(|(target, _)| target)
+    }
 }
 
 /// Why a convergence run stopped. Backend and oracle errors are rendered to
@@ -416,12 +452,9 @@ async fn quiesce_snapshot_and_check<B: Backend>(
     if let Some(start) = start {
         eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
     }
-    if let Some((def_target, report)) = checked.map_err(RunError::Oracle)? {
-        return Err(RunError::Diverged(Divergence {
-            op_index,
-            def_target,
-            report,
-        }));
+    if let Some(divergence) = Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?)
+    {
+        return Err(RunError::Diverged(divergence));
     }
     Ok(())
 }
@@ -506,8 +539,8 @@ pub async fn run_convergence_bursty<B: Backend>(
 }
 
 /// Runs the three-way oracle check for every definition in `program` against
-/// `snapshot`, returning the first `(target, report)` that diverged, or `None`
-/// if all converged.
+/// `snapshot`, returning every `(target, report)` that diverged, in
+/// definition order — empty if all converged.
 ///
 /// Exposed (not just used by [`run_convergence`]) so a red/control test can
 /// feed it a deliberately corrupted snapshot and confirm the harness reports
@@ -523,22 +556,26 @@ pub async fn check_program(
     pool: &Pool,
     program: &Program,
     snapshot: &Snapshot,
-) -> Result<Option<(String, ThreeWayReport)>, String> {
+) -> Result<Vec<(String, ThreeWayReport)>, String> {
     check_defs(pool, program, &program.defs, snapshot).await
 }
 
 /// [`check_program`]'s general form (improvement-plan task E2): runs the
 /// three-way oracle check for every definition in `defs` (not necessarily all
 /// of `program.defs` — see [`run_convergence`]'s use of this for a partially-
-/// installed program) against `snapshot`, returning the first `(target,
-/// report)` that diverged, or `None` if all converged. `program` is still
-/// needed for its `tables` (to resolve each definition's source schema).
+/// installed program) against `snapshot`, returning every `(target, report)`
+/// that diverged, in definition order — empty if all converged. It checks
+/// every definition rather than stopping at the first divergence (#671), so a
+/// caller attributing a failure sees each target that went wrong. `program`
+/// is still needed for its `tables` (to resolve each definition's source
+/// schema).
 pub async fn check_defs(
     pool: &Pool,
     program: &Program,
     defs: &[TransformDef],
     snapshot: &Snapshot,
-) -> Result<Option<(String, ThreeWayReport)>, String> {
+) -> Result<Vec<(String, ThreeWayReport)>, String> {
+    let mut diverged = Vec::new();
     for def in defs {
         let source = program
             .tables
@@ -567,10 +604,10 @@ pub async fn check_defs(
             .await
             .map_err(|e| format!("{e:?}"))?;
         if report.diverged() {
-            return Ok(Some((def.target.clone(), report)));
+            diverged.push((def.target.clone(), report));
         }
     }
-    Ok(None)
+    Ok(diverged)
 }
 
 #[cfg(test)]

@@ -128,7 +128,7 @@ pub use apply::{
     drain_once,
 };
 #[cfg(any(test, feature = "internals"))]
-pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS, owned_bucket_filter};
+pub use claim::{MIN_ROWS_TO_SPLIT, SEG_BUCKETS};
 #[cfg(any(test, feature = "internals"))]
 pub use converge::{converged_through, pending_count};
 #[cfg(any(test, feature = "internals"))]

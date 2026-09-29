@@ -682,9 +682,10 @@ async fn an_aggregate_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
     claim::claim(&*txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
-    let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+    let share = claim::held_share(&*txn, seg_seq, "worker")
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
     assert!(!folded.is_empty());
@@ -784,9 +785,10 @@ async fn a_definition_change_on_an_aggregate_only_source_trips_the_version_fence
     claim::claim(&*txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
-    let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+    let share = claim::held_share(&*txn, seg_seq, "worker")
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
 
@@ -874,9 +876,10 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_aggregate_
     claim::claim(&*txn, seg_seq, "worker", 1)
         .await
         .expect("claim");
-    let filter = claim::owned_bucket_filter(&*txn, seg_seq, "worker")
+    let share = claim::held_share(&*txn, seg_seq, "worker")
         .await
-        .expect("owned_bucket_filter");
+        .expect("held_share");
+    let filter = share.filter(share.buckets());
     let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
     txn.commit().await.expect("commit phase 1");
 
