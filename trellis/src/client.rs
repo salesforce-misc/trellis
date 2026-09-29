@@ -1331,12 +1331,26 @@ const DRAIN_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// while it keeps recurring, saying how many repeats it collapsed. The
 /// repeats in between log at `debug` with the same fields.
 ///
+/// "By its text" means its first line (see [`drain_failure_key`]): a
+/// Postgres error's `DETAIL`/`HINT` lines can differ on every occurrence
+/// (a deadlock names the backend pids involved), and keying on them would
+/// warn every time. The logged `error` field is always the full text.
+///
 /// An error that hasn't recurred for a whole interval is forgotten, which
 /// keeps this bounded: its next occurrence warns as a new one would.
 #[derive(Default)]
 struct DrainFailures {
-    /// Each error seen within the last interval, by its display text.
+    /// Each error seen within the last interval, by [`drain_failure_key`].
     recent: std::collections::HashMap<String, RecentDrainFailure>,
+}
+
+/// The part of a drain error's text that [`DrainFailures`] collapses
+/// repeats by: its first line. Every error that nests a Postgres error
+/// (`crate::error::write_pg_error`) ends its first line with the server's
+/// `severity: message`, and tokio-postgres puts `DETAIL` and `HINT` on the
+/// lines after it.
+fn drain_failure_key(text: &str) -> &str {
+    text.split('\n').next().unwrap_or(text)
 }
 
 struct RecentDrainFailure {
@@ -1349,20 +1363,26 @@ struct RecentDrainFailure {
 impl DrainFailures {
     /// Logs a drain of `seg_seqs` by `claimant` that failed with `error`,
     /// after which the worker released the `released` `(seg_seq, bucket)`
-    /// claims.
+    /// claims, or failed to release them with the `Err` text.
     fn failed(
         &mut self,
         error: &ApplyError,
         seg_seqs: &[i64],
-        released: &[(i64, i16)],
+        released: &Result<Vec<(i64, i16)>, String>,
         claimant: &str,
         now: Instant,
     ) {
         self.recent
             .retain(|_, seen| now.duration_since(seen.last_seen) < DRAIN_FAILURE_WARN_INTERVAL);
         let class = staging::quarantine::classify(error);
-        let buckets = released_buckets(released);
-        let (recent, first) = match self.recent.entry(error.to_string()) {
+        let buckets = match released {
+            Ok(released) => released_buckets(released),
+            // The claims stay until the reclaim sweep takes them. `none`
+            // would claim the drain held nothing.
+            Err(err) => format!("unknown; release failed: {err}"),
+        };
+        let text = error.to_string();
+        let (recent, first) = match self.recent.entry(drain_failure_key(&text).to_string()) {
             std::collections::hash_map::Entry::Occupied(seen) => (seen.into_mut(), false),
             std::collections::hash_map::Entry::Vacant(new) => (
                 new.insert(RecentDrainFailure {
@@ -1376,7 +1396,7 @@ impl DrainFailures {
         recent.last_seen = now;
         if first || now.duration_since(recent.last_warned) >= DRAIN_FAILURE_WARN_INTERVAL {
             tracing::warn!(
-                error = %error,
+                error = %text,
                 class = ?class,
                 segments = ?seg_seqs,
                 buckets = %buckets,
@@ -1389,7 +1409,7 @@ impl DrainFailures {
         } else {
             recent.collapsed += 1;
             tracing::debug!(
-                error = %error,
+                error = %text,
                 class = ?class,
                 segments = ?seg_seqs,
                 buckets = %buckets,
@@ -1772,8 +1792,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             let released = match pool.get().await {
                 Ok(client) => staging::release_segments(&**client, &seg_seqs, &claimed_by)
                     .await
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
             };
             drain_failures.failed(error, &seg_seqs, &released, &claimed_by, Instant::now());
         }
@@ -2901,7 +2921,7 @@ mod drain_failure_tests {
         failures.failed(
             &claim_lost(),
             &[5, 6],
-            &[(5, 0), (5, 3), (6, 1)],
+            &Ok(vec![(5, 0), (5, 3), (6, 1)]),
             "worker-a",
             Instant::now(),
         );
@@ -2939,19 +2959,19 @@ mod drain_failure_tests {
 
         for tick in 0..4 {
             let now = start + Duration::from_millis(200 * tick);
-            failures.failed(&claim_lost(), &[5], &[(5, 0)], "worker-a", now);
+            failures.failed(&claim_lost(), &[5], &Ok(vec![(5, 0)]), "worker-a", now);
         }
         failures.failed(
             &hop_bound(),
             &[5],
-            &[(5, 0)],
+            &Ok(vec![(5, 0)]),
             "worker-a",
             start + Duration::from_secs(1),
         );
         failures.failed(
             &claim_lost(),
             &[5],
-            &[(5, 0)],
+            &Ok(vec![(5, 0)]),
             "worker-a",
             start + DRAIN_FAILURE_WARN_INTERVAL,
         );
@@ -2980,18 +3000,18 @@ mod drain_failure_tests {
         let mut failures = DrainFailures::default();
         let start = Instant::now();
 
-        failures.failed(&claim_lost(), &[5], &[], "worker-a", start);
+        failures.failed(&claim_lost(), &[5], &Ok(vec![]), "worker-a", start);
         failures.failed(
             &claim_lost(),
             &[5],
-            &[],
+            &Ok(vec![]),
             "worker-a",
             start + Duration::from_secs(1),
         );
         let later = start + Duration::from_secs(1) + DRAIN_FAILURE_WARN_INTERVAL;
-        failures.failed(&hop_bound(), &[7], &[], "worker-a", later);
+        failures.failed(&hop_bound(), &[7], &Ok(vec![]), "worker-a", later);
         assert_eq!(failures.recent.len(), 1, "the stale entry was pruned");
-        failures.failed(&claim_lost(), &[5], &[], "worker-a", later);
+        failures.failed(&claim_lost(), &[5], &Ok(vec![]), "worker-a", later);
 
         let events = captured.0.lock().unwrap().clone();
         let levels: Vec<_> = summary(&events)
@@ -3009,6 +3029,66 @@ mod drain_failure_tests {
             "{events:?}"
         );
         assert_eq!(field(&events[0], "buckets"), "none");
+    }
+
+    /// A Postgres error's `DETAIL` can change on every occurrence (a
+    /// deadlock names the pids involved). Repeats that differ only there
+    /// still collapse, and each log line keeps the full text.
+    #[test]
+    fn repeats_differing_only_in_detail_still_collapse() {
+        let (_guard, captured) = install_capture();
+        let mut failures = DrainFailures::default();
+        let start = Instant::now();
+        let deadlock = |pids: &str| {
+            ApplyError::Pool(crate::error::Error::Config(format!(
+                "ERROR: deadlock detected\nDETAIL: Process {pids}."
+            )))
+        };
+
+        let first = deadlock("101 waits for 202");
+        let second = deadlock("303 waits for 404");
+        failures.failed(&first, &[5], &Ok(vec![(5, 0)]), "worker-a", start);
+        failures.failed(
+            &second,
+            &[5],
+            &Ok(vec![(5, 0)]),
+            "worker-a",
+            start + Duration::from_millis(200),
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            summary(&events),
+            vec![
+                (tracing::Level::WARN, first.to_string(), "0".to_string()),
+                (tracing::Level::DEBUG, second.to_string(), "1".to_string()),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(failures.recent.len(), 1);
+    }
+
+    /// When the release itself fails the claims are still held (until the
+    /// reclaim sweep), so the log must not report `none`.
+    #[test]
+    fn a_failed_release_is_reported_not_shown_as_no_buckets() {
+        let (_guard, captured) = install_capture();
+        let mut failures = DrainFailures::default();
+
+        failures.failed(
+            &claim_lost(),
+            &[5],
+            &Err("pool timed out".to_string()),
+            "worker-a",
+            Instant::now(),
+        );
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            field(&events[0], "buckets"),
+            "unknown; release failed: pool timed out"
+        );
     }
 
     #[test]
