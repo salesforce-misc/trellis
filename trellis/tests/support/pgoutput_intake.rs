@@ -298,6 +298,8 @@ impl Pipeline {
 
     /// Runs `sql`, which must select two columns, and returns them as a
     /// `first -> second` map of their text forms.
+    // `capture_parity.rs` reads the ring itself.
+    #[allow(dead_code)]
     pub async fn rows(&self, sql: &str) -> HashMap<String, Option<String>> {
         self.raw
             .query(sql, &[])

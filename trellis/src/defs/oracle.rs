@@ -12,7 +12,8 @@
 #[cfg(any(test, feature = "test-util"))]
 use std::collections::BTreeSet;
 #[cfg(any(test, feature = "test-util"))]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(any(test, feature = "test-util"))]
 use std::fmt;
 
@@ -20,9 +21,9 @@ use std::fmt;
 use crate::pool::Pool;
 use crate::pool::quote_ident;
 
-use super::ast::{Expr, Operator};
+use super::ast::{Expr, Operator, TransformDef};
 #[cfg(any(test, feature = "test-util"))]
-use super::ast::{GroupByKey, KeySpace, RelationshipDef, TransformDef, ValueType};
+use super::ast::{GroupByKey, KeySpace, RelationshipDef, ValueType};
 #[cfg(any(test, feature = "test-util"))]
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 #[cfg(any(test, feature = "test-util"))]
@@ -368,8 +369,13 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 /// invokes `recompute`/`recompute_aggregate` against a `TransformDef` that
 /// hasn't been through `validate()`, thread `source_columns` through here
 /// too and add the same guard.
-#[cfg(any(test, feature = "test-util"))]
-fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
+///
+/// Issue #622 (C2): `crate::capture::columns` also calls this, to decide which
+/// columns a table's capture trigger images. It runs against persisted
+/// definitions only, which `validate()` has already accepted, so the same
+/// invariant covers it. It leaves out `GROUP BY` keys and relationship
+/// columns; that caller adds them.
+pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
     let mut columns = HashSet::new();
@@ -379,7 +385,6 @@ fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     columns
 }
 
-#[cfg(any(test, feature = "test-util"))]
 fn collect_columns(
     expr: &Expr,
     field_name: &str,

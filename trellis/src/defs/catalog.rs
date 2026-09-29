@@ -3240,6 +3240,40 @@ pub(crate) async fn relationships_from_table_in(
     rows.iter().map(relationship_from_row).collect()
 }
 
+/// Issue #622 (C2): every registered definition, as its qualified
+/// `source_table` and parsed text, plus every relationship. This is the whole
+/// input `crate::capture::columns` needs to decide which columns a table's
+/// capture trigger images.
+///
+/// Definitions in every status count. A table is captured from the moment
+/// something registers a reader of it, before that reader builds, and a
+/// paused or quarantined reader still needs its columns when it resumes.
+pub(crate) async fn capture_readers(
+    client: &impl GenericClient,
+) -> Result<(Vec<(String, TransformDef)>, Vec<RelationshipDefinition>), CatalogError> {
+    let definitions = client
+        .query(
+            "select source_table, definition_text from transform_definitions order by id",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| Ok((row.get(0), parse(row.get(1))?)))
+        .collect::<Result<Vec<_>, CatalogError>>()?;
+    let relationships = client
+        .query(
+            &format!(
+                "select {RELATIONSHIP_READ_COLUMNS} from relationship_definitions order by id"
+            ),
+            &[],
+        )
+        .await?
+        .iter()
+        .map(relationship_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((definitions, relationships))
+}
+
 /// Resolves every relationship a definition's calculated fields reference
 /// (issue #40) into the [`ResolvedRelationship`] map [`super::validate`] needs
 /// to enforce ADR-0006's reference-time cardinality and type rules. The

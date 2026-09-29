@@ -97,6 +97,12 @@ pub mod pool;
 // compilation units and so cannot see `pub(crate)` — see `Cargo.toml`. It is
 // not the ADR's sanctioned exception, and it is not API; see `dev` below for
 // the sibling crates' curated, equally uncommitted surface.
+// `capture` (issue #622) generates the statement triggers that append
+// source changes to the ring inside the writer's transaction (ADR-0002).
+#[cfg(not(feature = "internals"))]
+pub(crate) mod capture;
+#[cfg(feature = "internals")]
+pub mod capture;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod defs;
 #[cfg(feature = "internals")]
