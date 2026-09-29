@@ -77,10 +77,11 @@ impl std::error::Error for DecodeError {}
 
 /// One column's value in a decoded tuple.
 ///
-/// [`ColumnValue::Unchanged`] only appears in an `Update`'s *old* tuple, for
-/// a TOASTed column Postgres didn't re-send because it didn't change — the
-/// classic logical-decoding footgun. Intake omits the column rather than
-/// guessing; the apply half re-reads current source state if it needs it.
+/// [`ColumnValue::Unchanged`] only appears in an `Update`'s *new* tuple, for
+/// an out-of-line TOASTed column Postgres didn't re-send because it didn't
+/// change — the classic logical-decoding footgun. Intake fills it in from
+/// the old tuple where that carries it (`fill_unchanged_from_old`), and
+/// otherwise omits the column rather than guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnValue {
     Null,

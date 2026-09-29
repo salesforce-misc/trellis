@@ -2117,9 +2117,11 @@ async fn group_by_snapshot_source(
 /// missing `to_col` entirely is [`EvalError::MissingColumn`] against
 /// relationship `rel_name` (issue #677, see
 /// [`apply_aggregate::required_column`]): `row` is the to-side change's own
-/// image, and a to-one relationship's to-side carries `REPLICA IDENTITY
-/// FULL` (and, under trigger capture, `to_col` in its capture set), so the
-/// join key is always part of it.
+/// image, and the join key is always part of it. A to-one's to-side carries
+/// `REPLICA IDENTITY FULL`, a to-many's carries `FULL` or a replica-identity
+/// index covering `to_col` (under trigger capture, `to_col` is in its
+/// capture set), and intake fills an unchanged TOASTed `to_col` in from the
+/// old tuple.
 fn relationship_key_text(
     row: &Option<Row>,
     to_col: &str,
@@ -5878,10 +5880,12 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
         // identity — which is exactly why issue #41 gates that at
         // `create_relationship` (define) time: `REPLICA IDENTITY FULL` or a
         // covering replica-identity index. That gate is creation-time only and
-        // not re-validated per batch. If an operator later relaxes the
-        // to-side's replica identity, a pre-image missing `to_col` fails the
-        // batch with `MissingColumn` below (issue #677) rather than silently
-        // skipping the reverse recompute it should have staged.
+        // not re-validated per batch, and relaxing it later is *not* caught
+        // here: `pgoutput`'s key-only pre-image still sends every column,
+        // with the non-key ones as placeholder `NULL`s, so `to_col` reads as
+        // a genuine `NULL` ("no key") and the reverse recompute is silently
+        // skipped. What is caught (issue #677) is an image with no `to_col`
+        // at all, which is `MissingColumn` below.
         // Then resolve, with one live lookup, the from-side keys whose
         // `from_col` matches, and stage each as an image-less recompute at the
         // triggering change's `hop_gen + 1`.

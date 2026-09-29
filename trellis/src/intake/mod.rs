@@ -36,6 +36,7 @@ pub use replica_identity::{
     ResolvedPlan, SourceGuarantee, require_replica_identity_full, required_source_guarantees,
 };
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio_postgres::Transaction;
@@ -355,8 +356,10 @@ async fn primary_key_columns(
 /// Renders one tuple as a JSON object `{"column": value}` — hand-built text,
 /// no JSON library dependency (see `staging::append`). A
 /// [`ColumnValue::Unchanged`] column (an untouched TOASTed value `pgoutput`
-/// didn't resend) is *omitted* entirely, not written as `null`; the apply
-/// half re-reads current source state for it.
+/// didn't resend, and [`fill_unchanged_from_old`] couldn't recover) is
+/// *omitted* entirely, not written as `null`. Nothing re-reads it: an apply
+/// read of an omitted column is `MissingColumn`, which fails loudly rather
+/// than reading it as `NULL`.
 fn tuple_to_json(relation: &Relation, tuple: &[ColumnValue]) -> String {
     let mut fields = Vec::with_capacity(tuple.len());
     for (name, value) in pgoutput::named_columns(relation, tuple) {
@@ -369,6 +372,50 @@ fn tuple_to_json(relation: &Relation, tuple: &[ColumnValue]) -> String {
         }
     }
     format!("{{{}}}", fields.join(","))
+}
+
+/// An `Update`'s new tuple with each [`ColumnValue::Unchanged`] column filled
+/// in from the old tuple, where the old tuple carries it.
+///
+/// `pgoutput` doesn't resend an unchanged, out-of-line TOASTed value in an
+/// `Update`'s new tuple. The old tuple has it whenever Postgres logged one
+/// for that column: a full (`'O'`, `REPLICA IDENTITY FULL`) old tuple has
+/// every column, and a key-only (`'K'`) one has the replica-identity columns
+/// (Postgres logs it whenever one of them is stored out of line). Both are
+/// detoasted. The value is unchanged by definition, so the old value *is*
+/// the new one.
+///
+/// Without this, every apply read of such a column would see it missing
+/// from the new image (issue #677's review): a field or `GROUP BY` read
+/// raises `MissingColumn`, and a relationship join key missing from a
+/// parent's new image resolves to "no parent". A column the old tuple
+/// doesn't carry (a non-key column of a key-only tuple, whose value there is
+/// a placeholder `NULL`) stays `Unchanged`, and so omitted.
+fn fill_unchanged_from_old<'a>(
+    relation: &Relation,
+    old: Option<&(bool, Vec<ColumnValue>)>,
+    new: &'a [ColumnValue],
+) -> Cow<'a, [ColumnValue]> {
+    let Some((key_only, old)) = old else {
+        return Cow::Borrowed(new);
+    };
+    if !new.contains(&ColumnValue::Unchanged) {
+        return Cow::Borrowed(new);
+    }
+    let mut filled = new.to_vec();
+    for (i, value) in filled.iter_mut().enumerate() {
+        if *value != ColumnValue::Unchanged {
+            continue;
+        }
+        let carried = !key_only || relation.columns.get(i).is_some_and(|c| c.is_key);
+        match old.get(i) {
+            Some(prior @ (ColumnValue::Text(_) | ColumnValue::Null)) if carried => {
+                *value = prior.clone();
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(filled)
 }
 
 /// A minimal, dependency-free JSON string-literal encoder (quote, backslash,
@@ -1118,6 +1165,7 @@ impl Intake {
             } => {
                 let relation = self.relations.get(relation_id)?;
                 let old_tuple = old.as_ref().map(|(_, tuple)| tuple.as_slice());
+                let new = fill_unchanged_from_old(relation, old.as_ref(), &new);
                 let group_key_cols = self.group_key_columns.columns_for(relation).await?;
                 let pk = self.primary_keys.get(&relation_id).map(Vec::as_slice);
                 self.buffer.push(
@@ -1731,6 +1779,57 @@ mod tests {
             ColumnValue::Unchanged,
         ];
         assert_eq!(tuple_to_json(&r, &tuple), r#"{"id":"1","payload":null}"#);
+    }
+
+    /// Issue #677's review: an unchanged TOASTed column (`Unchanged` in the
+    /// new tuple) takes its value from a full old tuple, so the new image
+    /// carries it rather than omitting it.
+    #[test]
+    fn a_full_old_tuple_fills_an_unchanged_toasted_column() {
+        let r = relation(vec![("id", true), ("body", true), ("n", true)]);
+        let old = (
+            false,
+            vec![
+                ColumnValue::Text("1".into()),
+                ColumnValue::Text("big".into()),
+                ColumnValue::Text("1".into()),
+            ],
+        );
+        let new = vec![
+            ColumnValue::Text("1".into()),
+            ColumnValue::Unchanged,
+            ColumnValue::Text("2".into()),
+        ];
+        let filled = fill_unchanged_from_old(&r, Some(&old), &new);
+        assert_eq!(
+            tuple_to_json(&r, &filled),
+            r#"{"id":"1","body":"big","n":"2"}"#
+        );
+    }
+
+    /// A key-only old tuple carries only the replica-identity columns; its
+    /// other columns are placeholder `NULL`s and must not be copied over an
+    /// `Unchanged` value. With no old tuple at all the column stays omitted.
+    #[test]
+    fn a_key_only_old_tuple_fills_only_its_key_columns() {
+        let r = relation(vec![("id", true), ("body", false), ("n", false)]);
+        let old = (
+            true,
+            vec![
+                ColumnValue::Text("big-key".into()),
+                ColumnValue::Null,
+                ColumnValue::Null,
+            ],
+        );
+        let new = vec![
+            ColumnValue::Unchanged,
+            ColumnValue::Unchanged,
+            ColumnValue::Text("2".into()),
+        ];
+        let filled = fill_unchanged_from_old(&r, Some(&old), &new);
+        assert_eq!(tuple_to_json(&r, &filled), r#"{"id":"big-key","n":"2"}"#);
+        let unfilled = fill_unchanged_from_old(&r, None, &new);
+        assert_eq!(tuple_to_json(&r, &unfilled), r#"{"n":"2"}"#);
     }
 
     #[test]
