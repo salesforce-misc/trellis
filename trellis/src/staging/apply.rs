@@ -28,6 +28,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_postgres::types::{PgLsn, ToSql};
 use tokio_postgres::{GenericClient, Transaction};
@@ -9166,6 +9167,54 @@ pub struct ManyApplyOutcome {
 /// definition churn), rather than retrying forever.
 const MAX_APPLY_ATTEMPTS: u32 = 5;
 
+/// How long one page keeps retrying lock timeouts (ADR-0002 I7, issue #621)
+/// before [`drain_batch`] surfaces the last one and the worker releases the
+/// claim. Each retry holds no transaction; the bound is on how long a worker
+/// sits on one page (and how long shutdown can wait for it), not on any
+/// snapshot. Three [`crate::locks::LOCK_TIMEOUT`]s: a page gets a few
+/// retries before it gives up, however long the timeout is.
+const LOCK_RETRY_BUDGET: Duration = crate::locks::LOCK_TIMEOUT.saturating_mul(3);
+
+/// The first wait after a page's transaction hits `lock_timeout`.
+const LOCK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+
+/// The longest wait between two of a page's retries after a transient
+/// failure.
+const TRANSIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// [`drain_batch`]'s state for retrying transient failures (issue #621):
+/// a backoff that doubles on each consecutive transient failure, and when
+/// the page's first lock timeout happened, for [`LOCK_RETRY_BUDGET`].
+#[derive(Debug, Default)]
+struct TransientRetry {
+    /// The delay the next transient failure waits, once one has happened.
+    next: Option<Duration>,
+    /// When this page first hit `lock_timeout`.
+    first_lock_timeout: Option<std::time::Instant>,
+}
+
+impl TransientRetry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The wait before the next retry: [`LOCK_RETRY_INITIAL_DELAY`], then
+    /// doubling to [`TRANSIENT_RETRY_MAX_DELAY`].
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next.unwrap_or(LOCK_RETRY_INITIAL_DELAY);
+        self.next = Some((delay * 2).min(TRANSIENT_RETRY_MAX_DELAY));
+        delay
+    }
+
+    /// How long ago this page first hit `lock_timeout`, starting the clock
+    /// if this is the first time.
+    fn lock_waited(&mut self) -> Duration {
+        self.first_lock_timeout
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+    }
+}
+
 /// [`crate::client::ClientOptions::drain_batch_cap`]'s default: the most
 /// folded records one drain batch holds at once (issue #620, ADR-0002). A
 /// worker's peak memory is about this many changes' worth, whatever size the
@@ -9741,6 +9790,7 @@ async fn drain_batch(
     let representative_seg_seq = steps[0].seg_seq;
 
     let mut backoff = FenceMissBackoff::new();
+    let mut transient = TransientRetry::new();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -9780,8 +9830,9 @@ async fn drain_batch(
                     claimed_by,
                     wake_channel,
                     &folded,
-                    attempt,
+                    &mut attempt,
                     &mut backoff,
+                    &mut transient,
                     err,
                 )
                 .await?
@@ -9821,8 +9872,9 @@ async fn drain_batch(
                     claimed_by,
                     wake_channel,
                     &folded,
-                    attempt,
+                    &mut attempt,
                     &mut backoff,
+                    &mut transient,
                     err,
                 )
                 .await?
@@ -9858,10 +9910,12 @@ async fn classify_and_retry(
     claimed_by: &str,
     wake_channel: &str,
     folded: &[FoldedChange],
-    attempt: u32,
+    attempts: &mut u32,
     backoff: &mut FenceMissBackoff,
+    transient: &mut TransientRetry,
     err: ApplyError,
 ) -> Result<Option<Vec<FoldedChange>>, ApplyError> {
+    let attempt = *attempts;
     // Issue #620 A2a: a lost claim is nobody's key's fault, and nothing in
     // this call can get it back. Isolating it would probe every record under
     // the same lost claim, reproduce `ClaimLost` for each, and charge every
@@ -9891,10 +9945,41 @@ async fn classify_and_retry(
             }
             Ok(None)
         }
-        // Transient (lock contention, serialization failure, dropped
-        // connection, statement timeout): retry, charge nothing, no backoff
-        // — `FenceMissBackoff`'s escalating schedule is reserved for
-        // consecutive fence misses specifically (doc 06).
+        // A lock wait that hit `lock_timeout` (ADR-0002 I7, issue #621):
+        // the page's transaction has rolled back, so it holds no snapshot
+        // and no locks while it waits here. Back off and retry, keeping the
+        // claim (the heartbeat daemon keeps it fresh), for up to
+        // `LOCK_RETRY_BUDGET` rather than `MAX_APPLY_ATTEMPTS`: whoever holds
+        // the lock may hold it for many timeouts, and releasing the claim
+        // only hands the same wait to the next claimant.
+        quarantine::FailureClass::Transient if crate::locks::is_lock_not_available(&err) => {
+            let waited = transient.lock_waited();
+            if waited >= LOCK_RETRY_BUDGET {
+                tracing::warn!(
+                    seg_seq,
+                    waited_ms = waited.as_millis() as u64,
+                    error = %err,
+                    "lock timeout retries exhausted; surfacing the failure"
+                );
+                return Err(err);
+            }
+            let delay = transient.next_delay();
+            tracing::warn!(
+                seg_seq,
+                delay_ms = delay.as_millis() as u64,
+                "drain page waited out its lock_timeout; rolled back, retrying outside the \
+                 transaction"
+            );
+            tokio::time::sleep(delay).await;
+            // A lock timeout isn't an attempt at the page: it never ran
+            // far enough to fail on its own account.
+            *attempts -= 1;
+            Ok(None)
+        }
+        // Transient (serialization failure, deadlock, dropped connection,
+        // statement timeout): retry, charge nothing, backing off on
+        // consecutive transient failures (issue #621) on a schedule of its
+        // own, so a fence miss between two doesn't reset it.
         quarantine::FailureClass::Transient => {
             if attempt >= MAX_APPLY_ATTEMPTS {
                 tracing::warn!(
@@ -9905,7 +9990,17 @@ async fn classify_and_retry(
                 );
                 return Err(err);
             }
-            tracing::debug!(seg_seq, attempt, error = %err, "transient apply failure; retrying");
+            let delay = transient.next_delay();
+            tracing::debug!(
+                seg_seq,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                error = %err,
+                "transient apply failure; retrying"
+            );
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             Ok(None)
         }
         // Halting schema diagnosis: never quarantine, propagate loudly

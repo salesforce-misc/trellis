@@ -382,6 +382,75 @@ residual serialization failures (`40001`/`40P01`) is the whole deadlock story.
 > UPDATE` pre-lock CTE gets pruned and locks nothing. Force it with a `count(*)`
 > guard in the outer query — this is an easy bug to ship and a silent one.
 
+### No lock wait holds a snapshot open (ADR-0002 I7)
+
+A consistent order stops deadlocks; it doesn't bound a wait. A drain page
+queued behind a lock holds its transaction, and with it its snapshot, its
+transaction id and every lock it took before, for as long as the holder
+does. Vacuum can't pass it, and the sealer's gate, which waits out every
+transaction running when the last fence was taken, refuses every seal
+meanwhile. In #617 a drain batch's ledger insert waited 1 h 50 min behind
+chunk transactions: the open transaction pinned the slot's `restart_lsn`,
+`pg_wal` reached 190 GB, and the sealer was refused for the whole wait
+([#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160)).
+
+**The rule.** Every lock wait in a Trellis transaction is bounded by
+`lock_timeout`, and on `55P03` the transaction rolls back and the work is
+retried with backoff from outside any transaction.
+
+- **The bound is on the session.** Every connection Trellis opens, pooled or
+  dedicated, caps its `lock_timeout` at `locks::LOCK_TIMEOUT` when it
+  connects (a shorter setting it was given is kept). That bounds the explicit
+  lock statements (the pre-locks above, `FOR SHARE` on the version fence,
+  advisory stripe locks, DDL) and the implicit waits nobody writes down: an
+  `INSERT ... ON CONFLICT` waiting on another transaction's uncommitted key
+  (#617's wait), an `UPDATE` of a row another transaction holds. A setting
+  per transaction would cover only the transactions someone remembered.
+- **The cap is two minutes, for now.** The invariant is that the wait is
+  bounded, not that it is short: two minutes is 55 times shorter than #617's
+  wait. It is sized for the aggregate group pre-lock above, which queues
+  drain pages that touch the same groups one behind another. In `bench
+  fold-in-ratio` at ratio 10 (40k groups, every page touching most of them)
+  the longest page transaction, its wait included, was 89 s, when eight
+  ~28k-record pages queued together, and 100k-record pages ran 47 s. A 5 s
+  cap fired 75 times there, and each retry lost its place in the queue. The
+  value is interim: #623 removes the group pre-lock, and with it the reason
+  a Trellis transaction waits this long on another.
+- **A drain keeps its claim across the retry.** A page whose transaction
+  times out is classified transient; the drain backs off (50 ms, doubling to
+  1 s) and retries the page, recomputing it, while the heartbeat keeps its
+  claim fresh. A lock timeout doesn't count against the five attempts other
+  transient failures get: the drain retries it for up to three timeouts, then
+  surfaces it, and the worker releases the claim like any drain failure.
+- **Everywhere else** the caller is already a retry loop: the claim, the
+  sealer and the chunk paths fail the step and their loop tries again next
+  tick. A catalog call from the application (alter, pause, drop, resume)
+  returns the error.
+
+### DDL on a user table never blocks a writer (ADR-0002 I6)
+
+A DDL statement waiting for a lock on a user table sits in that table's lock
+queue, and every later lock request that conflicts with it queues behind it.
+For a lock that conflicts with `ROW EXCLUSIVE` (`CREATE TRIGGER`'s `SHARE ROW
+EXCLUSIVE`, #622) that is every application writer, for as long as whatever
+the DDL waits on stays open. In #565 E7 a bare `CREATE TRIGGER` stalled
+every writer for 25 s behind one open transaction; with a 50 ms
+`lock_timeout` retried every 200 ms the worst writer wait was 52 ms
+([E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
+
+**The rule.** DDL on a user table runs under `locks::USER_TABLE_DDL_LOCK_TIMEOUT`
+(50 ms), one attempt per `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms),
+each attempt its own transaction, until it lands (`locks::DdlRetry`). Today
+that is `ALTER PUBLICATION ... ADD/DROP TABLE` in `reconcile_publication`.
+Its `SHARE UPDATE EXCLUSIVE` doesn't conflict with writers, so writers never
+queued behind it, but it still waited with a snapshot open behind anything
+holding that lock (a manual `VACUUM`, `CREATE INDEX CONCURRENTLY`, an
+`ALTER TABLE`). From #622 it is `CREATE`/`DROP TRIGGER`, which does conflict
+with writers. The maintenance loop, the only sealer, retries for at most a
+second per reconcile pass and leaves the change to the next pass; startup
+retries until it lands. The retire path's `TRUNCATE` is the older precedent:
+it takes its lock `NOWAIT` and skips the slot until the next tick.
+
 ## Downstream propagation, and why it terminates
 
 Step 4 stages the keys whose derived values depend on what just changed —
@@ -433,7 +502,7 @@ key, or a schema error into a silently parked one. The classification:
 
 | Class | Examples | Treatment |
 |---|---|---|
-| **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry; **charge nothing to any key** — a transient failure is not attributable |
+| **Transient** | serialization/deadlock (`40001`/`40P01`), lock-not-available, statement timeout, dropped connection | retry with backoff; **charge nothing to any key** — a transient failure is not attributable. A lock timeout retries for up to three `lock_timeout`s with the claim held rather than five attempts ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)) |
 | **Version fence miss** | a definition changed mid-drain | reload the schema and retry; back off on *consecutive* misses only |
 | **Halting schema diagnosis** | a tripped hop bound (a real cross-table value cycle); a relationship endpoint that is not a source column | **propagate loudly**; never quarantine. Quarantining would convert a loud, actionable error into a key that blocks reads forever |
 | **Ordering artefact** | a delta guard tripped while a lower-numbered batch is still outstanding | self-heals; charge only once every predecessor has drained |
@@ -476,3 +545,10 @@ identical from outside otherwise.
    ([the recompute horizon](#aggregate-groups-the-recompute-horizon)). See the
    classification table under
    [the basis check](#absolute-writes-do-not-commute-the-basis-check).
+8. **No Trellis transaction waits for a lock longer than `lock_timeout`**, and a
+   timed-out transaction is retried from outside any transaction, never
+   waited out inside one. Every connection caps the setting when it connects
+   ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)).
+9. **DDL on a user table runs under a 50 ms `lock_timeout` in a retry loop**, one
+   attempt per 200 ms, so no application writer queues behind it for longer
+   than that ([I6](#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)).

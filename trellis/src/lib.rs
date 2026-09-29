@@ -109,6 +109,13 @@ pub mod intake;
 pub(crate) mod staging;
 #[cfg(feature = "internals")]
 pub mod staging;
+// `locks` (issue #621) holds the lock discipline every tier-3 module shares
+// (ADR-0002 invariants I6 and I7): the session `lock_timeout` bound and the
+// user-table DDL retry loop.
+#[cfg(not(feature = "internals"))]
+pub(crate) mod locks;
+#[cfg(feature = "internals")]
+pub mod locks;
 // `temporal` (issue #113) sits with tier 3 rather than beside `float`/
 // `integer` in tier 2 for one concrete reason: its public signatures name
 // `defs::pg_type::PgType`, which is itself crate-private above. The temporal

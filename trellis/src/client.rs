@@ -1232,6 +1232,10 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     }
 }
 
+/// How long one [`reconcile_source_tables`] pass retries its `ALTER
+/// PUBLICATION` while a table it adds or drops is locked (issue #621).
+const RECONCILE_DDL_BUDGET: Duration = Duration::from_secs(1);
+
 /// Whether [`maintenance_loop`] may run its next reconcile pass early, as
 /// soon as `intake::publication::discharge_wanted` finds a fresh marker
 /// (issue #476), given how long its last pass took.
@@ -1540,7 +1544,23 @@ async fn reconcile_source_tables(
 ) -> Result<(), ReconcileError> {
     let desired = defs::publication_tables(pool).await?;
 
-    intake::publication::reconcile_publication(client, publication, &desired).await?;
+    // The maintenance loop is the only sealer, so it waits at most
+    // `RECONCILE_DDL_BUDGET` for the `ALTER PUBLICATION` to find its tables
+    // free (ADR-0002 I6, issue #621), then leaves the change for the next
+    // pass, which comes one `reconcile_interval` later.
+    let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
+    match intake::publication::reconcile_publication_until(
+        client,
+        publication,
+        &desired,
+        Some(deadline),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(err) if crate::locks::is_lock_not_available(&err) => {}
+        Err(err) => return Err(err.into()),
+    }
     // The markers whose discharge failed are already logged and backed off on
     // their own rows (issue #407). Only a failure of the pass itself errors,
     // and costs this connection a reconnect.

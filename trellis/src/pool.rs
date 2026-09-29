@@ -386,9 +386,11 @@ pub(crate) fn deterministic_text_output_options() -> String {
 /// (so unqualified reads/writes against a transform target table resolve
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
-/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] and the
+/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], the
 /// server-side TCP keepalives ([`tcp_keepalive_gucs`], without the user
-/// timeout: see [`DeadPeerDetection::KeepalivesOnly`]). Beyond those, this
+/// timeout: see [`DeadPeerDetection::KeepalivesOnly`]) and the session's
+/// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
+/// I7). Beyond those, this
 /// is the seam intake will use to enforce `synchronous_commit = on`.
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
@@ -397,10 +399,11 @@ async fn session_bootstrap(
 ) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute(&format!(
-            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}",
+            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}; {}",
             quote_ident(schema),
             quote_ident(target_schema),
-            tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly)
+            tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
+            crate::locks::session_lock_timeout_sql()
         ))
         .await
 }
@@ -623,13 +626,15 @@ pub(crate) async fn connect_dedicated(
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
 /// pooled one: `search_path` pinned to `schema` then `public`,
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], and [`tcp_keepalive_gucs`] with the
-/// user timeout.
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`tcp_keepalive_gucs`] with the
+/// user timeout, and the `lock_timeout` cap
+/// ([`crate::locks::session_lock_timeout_sql`]).
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
     format!(
-        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}",
+        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {}; {}",
         quote_ident(schema),
-        tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout)
+        tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
+        crate::locks::session_lock_timeout_sql()
     )
 }
 

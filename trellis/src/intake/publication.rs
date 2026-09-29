@@ -110,7 +110,43 @@ async fn current_publication_tables(
 /// as long as [`super::Intake`] runs), and the singleton lock it holds is
 /// session-scoped — a second `ProducerSession::connect` call while intake is
 /// running would simply fail to acquire it.
+///
+/// **User-table DDL (ADR-0002 I6, issue #621).** `ALTER PUBLICATION` locks
+/// each table it adds or drops (`SHARE UPDATE EXCLUSIVE`), so each attempt
+/// runs under [`crate::locks::USER_TABLE_DDL_LOCK_TIMEOUT`] and is retried
+/// by [`crate::locks::DdlRetry`] until it lands; see
+/// [`reconcile_publication_until`] for a caller that can't wait that long.
 pub async fn reconcile_publication(
+    client: &mut tokio_postgres::Client,
+    publication: &str,
+    desired_tables: &[String],
+) -> Result<(), IntakeError> {
+    reconcile_publication_until(client, publication, desired_tables, None).await
+}
+
+/// [`reconcile_publication`], retrying a lock timeout only until `deadline`
+/// (`None`: until it lands). Past the deadline it returns the last attempt's
+/// `lock_not_available` error, having changed nothing
+/// ([`crate::locks::is_lock_not_available`] tells it apart): the maintenance
+/// loop, the only sealer, gives up on the pass rather than stop sealing.
+pub async fn reconcile_publication_until(
+    client: &mut tokio_postgres::Client,
+    publication: &str,
+    desired_tables: &[String],
+    deadline: Option<std::time::Instant>,
+) -> Result<(), IntakeError> {
+    let mut retry = crate::locks::DdlRetry::new("alter publication", deadline);
+    loop {
+        match reconcile_publication_once(client, publication, desired_tables).await {
+            Err(err) if retry.again(&err).await => continue,
+            other => return other,
+        }
+    }
+}
+
+/// One attempt of [`reconcile_publication`]: one transaction, under the
+/// user-table DDL `lock_timeout`.
+async fn reconcile_publication_once(
     client: &mut tokio_postgres::Client,
     publication: &str,
     desired_tables: &[String],
@@ -125,6 +161,7 @@ pub async fn reconcile_publication(
     let to_drop: Vec<&String> = current.iter().filter(|t| !desired.contains(t)).collect();
 
     let txn = client.transaction().await?;
+    let session_lock_timeout = crate::locks::begin_user_table_ddl(&txn).await?;
     for table in &to_drop {
         let (schema, name) = split_qualified(table)?;
         txn.execute(
@@ -151,6 +188,7 @@ pub async fn reconcile_publication(
         )
         .await?;
     }
+    crate::locks::end_user_table_ddl(&txn, &session_lock_timeout).await?;
     // In the *same* transaction as the ADDs, so each marker is exactly as
     // durable as its join. Its fence is taken later, by the discharge that
     // first reads the committed marker (issue #431, [`park_marker`]). A table

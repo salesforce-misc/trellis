@@ -1635,3 +1635,139 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     assert_eq!(pooled_session(&pool).await, (backend, false));
     assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
 }
+
+// ---------------------------------------------------------------------
+// Lock timeouts (issue #621, ADR-0002 I7)
+// ---------------------------------------------------------------------
+
+/// The `lock_timeout` the impatient pool below gives each of its sessions.
+const SHORT_LOCK_TIMEOUT_MS: u64 = 200;
+
+/// Every backend other than `except` that is waiting for a heavyweight lock,
+/// as `(pid, xact_start as text, seconds its transaction has been open)`.
+async fn lock_waiters(client: &Client, except: i32) -> Vec<(i32, String, f64)> {
+    client
+        .query(
+            "select pid, xact_start::text, \
+                    extract(epoch from clock_timestamp() - xact_start)::float8 \
+             from pg_stat_activity \
+             where wait_event_type = 'Lock' and pid <> $1 and datname = current_database()",
+            &[&except],
+        )
+        .await
+        .expect("read pg_stat_activity")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// I7: a drain page that needs a lock someone else holds waits for it only
+/// `lock_timeout` long inside its transaction. The transaction rolls back,
+/// the drain backs off outside any transaction with its claim kept, and
+/// retries. So while the lock is held no drain transaction stays open much
+/// past the timeout, and the sealer, whose gate waits out every transaction
+/// running when the last fence was taken, still seals. Once the lock is
+/// released the same drain call applies the batch.
+///
+/// The holder takes a table lock, which assigns no transaction id, so it
+/// doesn't hold the seal gate itself: only a drain transaction still open
+/// from before the last seal could.
+#[tokio::test]
+async fn a_drain_waits_out_a_held_lock_outside_its_transaction() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    setup_aggregate(&db, &client).await;
+    let impatient = trellis::Pool::new(
+        &trellis::config::Config::from_dsn(format!(
+            "{} options='-c lock_timeout={SHORT_LOCK_TIMEOUT_MS}'",
+            db.dsn()
+        ))
+        .expect("valid dsn"),
+    )
+    .expect("pool");
+
+    let ids: Vec<i32> = (1..=50).collect();
+    insert_items(&client, &ids).await;
+    let seg = seal(&mut client).await;
+
+    let holder = connect_raw(db.dsn()).await;
+    let holder_pid: i32 = holder
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("holder pid")
+        .get(0);
+    holder
+        .batch_execute("begin; lock table grp_totals in exclusive mode")
+        .await
+        .expect("hold the target's lock");
+
+    let task_pool = impatient.clone();
+    let drainer = tokio::spawn(async move {
+        drain(&task_pool, seg, "worker", 1000, &mut DrainHooks::default()).await
+    });
+
+    // Watch the drain's transactions for a while, sealing meanwhile. The
+    // first seal's fence is taken while a drain transaction may be open;
+    // the second seal's gate waits on that transaction, so it only passes
+    // because the transaction ended.
+    let hold = Duration::from_secs(3);
+    let started = std::time::Instant::now();
+    let mut transactions: std::collections::HashSet<(i32, String)> = Default::default();
+    let mut longest = 0f64;
+    let mut sealed = Vec::new();
+    let mut next = 10_000;
+    while started.elapsed() < hold {
+        for (pid, xact_start, open_secs) in lock_waiters(&client, holder_pid).await {
+            transactions.insert((pid, xact_start));
+            longest = longest.max(open_secs);
+        }
+        if sealed.len() < 2 && !transactions.is_empty() {
+            next += 1;
+            insert_items(&client, &[next]).await;
+            if let Some(outcome) = trellis::staging::seal_if_active_nonempty(&mut client, WAKE)
+                .await
+                .expect("seal")
+            {
+                sealed.push(outcome.sealed_seg_seq);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        sealed.len(),
+        2,
+        "the sealer must keep sealing while the drain waits: {sealed:?}"
+    );
+    assert!(
+        !drainer.is_finished(),
+        "the drain keeps retrying while the lock is held"
+    );
+    assert!(
+        transactions.len() >= 2,
+        "the drain must roll back and retry in a fresh transaction, saw {transactions:?}"
+    );
+    // The timeout plus generous slack for a loaded box, and far below the
+    // 3 s the lock was held.
+    assert!(
+        longest < 1.5,
+        "a drain transaction stayed open waiting {longest:.3}s, lock_timeout is \
+         {SHORT_LOCK_TIMEOUT_MS}ms"
+    );
+
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("release the lock");
+    let outcome = tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("the drain finishes once the lock is released")
+        .expect("drain task")
+        .expect("drain")
+        .expect("drain claims something");
+    assert_eq!(outcome.segments_drained, vec![(seg, true)]);
+    for &later in &sealed {
+        drain_all(&db.pool, later, 1000).await;
+    }
+    assert_eq!(read_totals(&client).await, oracle_totals(&client).await);
+}
