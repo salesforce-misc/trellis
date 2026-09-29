@@ -1764,13 +1764,14 @@ mod plan_tests {
     /// key)` byte-wise, and the resume's `after` bound (in the materialize,
     /// over ring rows), the page read's `after` bound and its `order by`
     /// must all agree on that order. Each pair here collides on `route`, and
-    /// the database's own collation (the test cluster's locale) orders it the
-    /// other way round from `"C"`: `'B6445' < 'a11890'` byte-wise, `'a11890'
-    /// < 'B6445'` under `en_US`. Walking the share one key per page and
-    /// re-materializing from every cursor, as a reclaim before each page
-    /// would, must still see every key exactly once. Any of the three
-    /// comparisons falling back to the default collation skips or repeats
-    /// the second key of a pair.
+    /// the database's default collation (ICU `en-US`, set explicitly: the
+    /// environment's locale can be `C.UTF-8`, which orders like `"C"`)
+    /// orders it the other way round from `"C"`: `'B6445' < 'a11890'`
+    /// byte-wise, `'a11890' < 'B6445'` under `en-US`. Walking the share one
+    /// key per page and re-materializing from every cursor, as a reclaim
+    /// before each page would, must still see every key exactly once. Any of
+    /// the three comparisons falling back to the default collation skips or
+    /// repeats the second key of a pair.
     #[tokio::test]
     async fn resuming_between_keys_that_share_a_route_skips_and_repeats_nothing() {
         // `hashtextextended('orders' || E'\x1f' || key, 0) & 2147483647`
@@ -1781,7 +1782,16 @@ mod plan_tests {
             ("a22170", "B23932"),
         ];
         let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
+        let db = match cluster
+            .create_isolated_database_with_icu_collation("en-US")
+            .await
+        {
+            Ok(db) => db,
+            Err(reason) => {
+                eprintln!("skipping: this server can't create an ICU database: {reason}");
+                return;
+            }
+        };
         let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
             .await
             .expect("connect");
