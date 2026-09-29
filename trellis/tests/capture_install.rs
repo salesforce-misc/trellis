@@ -411,6 +411,13 @@ async fn a_partial_install_is_reported_and_repaired() {
             .expect("reconcile"),
         CaptureAction::Widen
     );
+    // The replaced body reads back as current, so the repair doesn't repeat.
+    assert_eq!(
+        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec_of_t(&["a"]), None)
+            .await
+            .expect("reconcile"),
+        CaptureAction::Unchanged
+    );
     client
         .batch_execute("insert into public.t values ('repaired', 1, 1)")
         .await
@@ -652,6 +659,45 @@ async fn a_serializable_writer_is_captured_into_a_batch_that_claims_it() {
     a_snapshot_isolation_writer_is_claimed_exactly_once(IsolationLevel::Serializable).await;
 }
 
+/// A role without `pg_read_all_stats` can't see another role's backend in
+/// `pg_stat_activity`: the blocker report calls it `unknown`, not a prepared
+/// transaction (it has a pid), and it is never a cancel candidate.
+#[tokio::test]
+async fn a_blocker_this_role_cant_see_is_unknown_not_prepared() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let observer = connect(db.dsn()).await;
+    observer
+        .batch_execute(
+            "create table public.t (id text primary key, a int, b int); \
+             do $$ begin create role capture_install_unprivileged; \
+             exception when duplicate_object then null; end $$",
+        )
+        .await
+        .expect("create public.t and an unprivileged role");
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; insert into public.t values ('held', 1, 1)")
+        .await
+        .expect("an open write");
+    let holder_pid = backend_pid(&holder).await;
+
+    observer
+        .batch_execute("set role capture_install_unprivileged")
+        .await
+        .expect("set role");
+    let blockers = install::blockers(&observer, "public.t", &["RowExclusiveLock"])
+        .await
+        .expect("read blockers");
+    let held = blockers
+        .iter()
+        .find(|b| b.pid == Some(holder_pid))
+        .unwrap_or_else(|| panic!("the holder is a blocker: {blockers:?}"));
+    assert_eq!(held.backend_type, "unknown", "{held:?}");
+    assert!(!held.cancellable());
+    holder.batch_execute("commit").await.expect("commit");
+}
+
 /// A prepared transaction that wrote through the trigger before a seal and
 /// commits after it: its xid is in progress in the seal's fence, so its row
 /// belongs to the next batch's predecessor half, and that batch claims it
@@ -867,6 +913,94 @@ async fn a_widen_waits_out_a_writer_running_the_old_function() {
         CaptureAction::Narrow
     );
     holder.batch_execute("commit").await.expect("commit");
+}
+
+/// The gate is read once the widen holds the table lock, not when its
+/// attempt starts. A writer open since before the attempt writes again and
+/// commits while that attempt waits for the lock: it ran the old function
+/// after the attempt began, and its row must still be below the gate. Read
+/// before `LOCK TABLE`, the gate would precede that row, and the row would
+/// reach the new reader without the new column.
+///
+/// The writer's second insert doesn't queue behind the waiting widen: its
+/// transaction already holds `ROW EXCLUSIVE`. The test waits for an attempt
+/// that has only just started waiting, so the insert and commit land inside
+/// that attempt's 50 ms. On a box too loaded for that, the widen lands on a
+/// later attempt and the test still passes; it only stops catching the
+/// mis-ordering.
+#[tokio::test]
+async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    install_t(&mut client).await;
+    client
+        .batch_execute("delete from pending_backfill")
+        .await
+        .expect("clear the join marker");
+
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin; insert into public.t values ('w1', 1, 1)")
+        .await
+        .expect("an open write");
+
+    let mut ddl = connect(db.dsn()).await;
+    let ddl_pid = backend_pid(&ddl).await;
+    let wide = spec_of_t(&["a", "b"]);
+    let widen =
+        tokio::spawn(
+            async move { install::reconcile(&mut ddl, DEFAULT_SCHEMA, &wide, None).await },
+        );
+
+    // An attempt that began waiting for the table lock within the last few
+    // milliseconds.
+    let waiting_since = Instant::now();
+    loop {
+        let fresh: bool = client
+            .query_one(
+                "select exists (select 1 from pg_locks \
+                 where pid = $1 and not granted \
+                   and relation = 'public.t'::regclass \
+                   and clock_timestamp() - waitstart < interval '10 ms')",
+                &[&ddl_pid],
+            )
+            .await
+            .expect("read pg_locks")
+            .get(0);
+        if fresh {
+            break;
+        }
+        assert!(
+            waiting_since.elapsed() < Duration::from_secs(10),
+            "the widen never waited for the table lock"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    holder
+        .batch_execute("insert into public.t values ('w2', 1, 1); commit")
+        .await
+        .expect("write again and commit while the widen waits");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), widen)
+            .await
+            .expect("the widen lands once the write commits")
+            .expect("widen task")
+            .expect("widen"),
+        CaptureAction::Widen
+    );
+
+    let gate = capture_gate(&client, "public.t")
+        .await
+        .expect("the widen parks a gated marker");
+    for key in ["w1", "w2"] {
+        let rows = ring_rows(&client, key).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].2.expect("origin") < gate,
+            "{key}, staged by the old function, is below the gate"
+        );
+    }
 }
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded

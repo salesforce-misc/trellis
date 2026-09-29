@@ -49,7 +49,11 @@
 //! may signal an autovacuum worker (superuser on PostgreSQL 17 and earlier,
 //! `pg_signal_autovacuum_worker` from 18). Where Postgres refuses, it logs
 //! that once and the retries wait the vacuum out. An application backend is
-//! never cancelled.
+//! never cancelled. The worker must also be visible to the role in
+//! `pg_stat_activity` (superuser or `pg_read_all_stats`): to any other role
+//! it reads as an `unknown` blocker and is left alone. The cancelling
+//! statement checks the pid, its lock and its query again
+//! ([`cancel_autovacuum`]), so a pid reused since the read is never hit.
 //!
 //! # The join fence
 //!
@@ -96,6 +100,35 @@
 //! staged by the old body is left for the new reader to meet: a drained row
 //! is never applied again, and a released or re-staged one keeps its origin,
 //! so it would have held the gate.
+//!
+//! Why "below" holds for every old-body row: a statement that fires a
+//! capture function holds `ROW EXCLUSIVE` on the table (`ACCESS EXCLUSIVE`
+//! for a `TRUNCATE`) from before the trigger runs until its transaction
+//! ends, and a prepared transaction keeps it until `COMMIT PREPARED`. A
+//! subtransaction that rolls back releases its lock, but the rows it staged
+//! roll back with it. So once the widen holds `SHARE ROW EXCLUSIVE`, every
+//! statement that ran the old body has read its insert position and
+//! committed or aborted, and the insert position only moves forward. Other
+//! tables' WAL only moves the gate later, which old rows are still below.
+//! The gate must be read *after* `LOCK TABLE`: read at the start of the
+//! attempt, a writer already holding the table could stage and commit an
+//! old-body row while the attempt waits (the test
+//! `a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate`).
+//!
+//! **The gate only holds definitions sourced from the gated table.** The
+//! discharge dispatches a marker's `waiting_to_backfill` definitions whose
+//! `source_table` is the marker's table. A widen of a relationship's to-side
+//! `T` for a new definition sourced from the from-side `U` (it reads a new
+//! column of `T` through the relationship) gates `T`'s marker, but the new
+//! definition waits on `U`'s marker, which no gate holds. A pre-widen `T` row
+//! then reaches it through the reverse path, and a deferred reverse
+//! (`rel_reverse_deferred`, staged under a synthetic `src_table`) carrying
+//! `T`'s old images isn't counted by
+//! [`crate::staging::converge::table_changes_pending_through`] either. C5
+//! must close this before it wires widening to to-side columns: for example,
+//! by gating the marker of every table a waiting reader of `T` is sourced
+//! from on `T`'s pending changes, counting deferred reverses whose
+//! relationship's to-side is `T`.
 //!
 //! Why not the alternatives:
 //!
@@ -634,7 +667,9 @@ pub struct Blocker {
     /// `None` for a prepared transaction, which has no backend.
     pub pid: Option<i32>,
     /// `pg_stat_activity.backend_type`: `client backend`, `autovacuum
-    /// worker`, …, or `prepared transaction`.
+    /// worker`, …; `prepared transaction` for one; or `unknown` for a
+    /// backend this role may not see (another role's, without
+    /// `pg_read_all_stats`), whose query reads `<insufficient privilege>`.
     pub backend_type: String,
     /// `pg_stat_activity.query`, as far as this role may see it.
     pub query: String,
@@ -646,8 +681,12 @@ impl Blocker {
     /// Whether a capture operation cancels this blocker: only an autovacuum
     /// worker, and not one preventing wraparound, which would only start
     /// again (and which Postgres's own deadlock check never cancels either).
+    /// [`cancel_autovacuum`] checks the same again, in the statement that
+    /// cancels it.
     pub fn cancellable(&self) -> bool {
-        self.backend_type == "autovacuum worker" && !self.query.contains("to prevent wraparound")
+        self.backend_type == "autovacuum worker"
+            && self.query.starts_with("autovacuum: ")
+            && !self.query.contains("(to prevent wraparound)")
     }
 }
 
@@ -671,7 +710,9 @@ pub async fn blockers(
 ) -> Result<Vec<Blocker>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select l.pid, coalesce(a.backend_type, 'prepared transaction'), \
+            "select l.pid, \
+                    case when l.pid is null then 'prepared transaction' \
+                         else coalesce(a.backend_type, 'unknown') end, \
                     coalesce(a.query, ''), l.mode \
              from pg_catalog.pg_locks l \
              left join pg_catalog.pg_stat_activity a on a.pid = l.pid \
@@ -693,6 +734,46 @@ pub async fn blockers(
             mode: row.get(3),
         })
         .collect())
+}
+
+/// Cancels `pid` if, as this statement reads it, it is still an autovacuum
+/// worker that isn't preventing wraparound and still holds a lock on `table`
+/// that conflicts with `conflicts`. Returns `None`, having signalled
+/// nothing, if it isn't, and otherwise `pg_cancel_backend`'s result.
+///
+/// Checking in the statement that cancels, rather than trusting the
+/// [`blockers`] read a round trip earlier, keeps a pid the worker released
+/// in between, and an application backend then given it, from being
+/// cancelled. The wraparound check reads the worker's `query`, which
+/// Postgres cuts to `track_activity_query_size` bytes: a text that may have
+/// been cut (within a multibyte character of the limit) could have lost its
+/// `(to prevent wraparound)`, so it isn't cancelled.
+async fn cancel_autovacuum(
+    client: &impl GenericClient,
+    pid: i32,
+    table: &str,
+    conflicts: &[&str],
+) -> Result<Option<bool>, tokio_postgres::Error> {
+    Ok(client
+        .query_opt(
+            "select pg_catalog.pg_cancel_backend(a.pid) \
+             from pg_catalog.pg_stat_activity a \
+             where a.pid = $1 \
+               and a.backend_type = 'autovacuum worker' \
+               and a.query like 'autovacuum: %' \
+               and a.query not like '%(to prevent wraparound)%' \
+               and pg_catalog.octet_length(a.query) + 4 < ( \
+                   select setting::int from pg_catalog.pg_settings \
+                   where name = 'track_activity_query_size') \
+               and exists ( \
+                   select 1 from pg_catalog.pg_locks l \
+                   where l.pid = a.pid and l.locktype = 'relation' and l.granted \
+                     and l.relation = pg_catalog.to_regclass($2) \
+                     and l.mode = any($3))",
+            &[&pid, &crate::defs::ddl::regclass_arg(table), &conflicts],
+        )
+        .await?
+        .map(|row| row.get(0)))
 }
 
 /// Reports, and where allowed cancels, what keeps a capture operation from
@@ -754,12 +835,9 @@ impl Blockers {
         }
         for blocker in found.iter().filter(|b| b.cancellable()) {
             let Some(pid) = blocker.pid else { continue };
-            match client
-                .query_one("select pg_catalog.pg_cancel_backend($1)", &[&pid])
-                .await
-            {
-                Ok(row) => {
-                    let signalled: bool = row.get(0);
+            match cancel_autovacuum(client, pid, table, conflicts).await {
+                Ok(None) => {}
+                Ok(Some(signalled)) => {
                     tracing::info!(
                         what = self.what,
                         table,
@@ -893,6 +971,15 @@ mod tests {
     fn only_an_ordinary_autovacuum_is_cancelled() {
         assert!(blocker("autovacuum worker", "autovacuum: VACUUM public.orders").cancellable());
         assert!(blocker("autovacuum worker", "autovacuum: ANALYZE public.orders").cancellable());
+        assert!(
+            !blocker(
+                "autovacuum worker",
+                "autovacuum: VACUUM ANALYZE public.orders (to prevent wraparound)"
+            )
+            .cancellable()
+        );
+        // A backend this role may not see is never cancelled.
+        assert!(!blocker("unknown", "<insufficient privilege>").cancellable());
         assert!(
             !blocker(
                 "autovacuum worker",
