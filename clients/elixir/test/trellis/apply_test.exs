@@ -3,7 +3,7 @@ defmodule Trellis.ApplyTest do
   # the flattened result each one returns, plus the reads and operational
   # calls that sit alongside it.
   #
-  # Shares the suite's one database and takes the replication slot, so it
+  # Shares the suite's one database and runs its one staging worker, so it
   # doesn't run concurrently with the other integration tests.
   use ExUnit.Case, async: false
 

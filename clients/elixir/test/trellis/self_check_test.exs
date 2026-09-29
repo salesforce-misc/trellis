@@ -3,7 +3,7 @@ defmodule Trellis.SelfCheckTest do
   # page through it, then corrupt one target cell behind the engine's back
   # and see the audit name it.
   #
-  # Shares the suite's one database and takes the replication slot, so it
+  # Shares the suite's one database and runs its one staging worker, so it
   # doesn't run concurrently with the other integration tests.
   use ExUnit.Case, async: false
 

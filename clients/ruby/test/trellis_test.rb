@@ -11,8 +11,8 @@ class TrellisTest < Minitest::Test
   #
   # Something has to run the staging worker and drain threads or the
   # definition never leaves :waiting_to_backfill. Here that's the test's own
-  # handle: this process is the whole fleet. The staging worker's
-  # replication slot is cluster-wide (#588), so tests that run it take turns:
+  # handle: this process is the whole fleet. A Trellis schema has one
+  # staging worker at a time, so tests that run it take turns:
   # Minitest runs them one at a time, and teardown shuts each one down.
   def test_a_defined_transform_goes_live_and_keeps_its_target_converged
     pg = TestCluster.pg

@@ -142,6 +142,13 @@ a step in phase two (after the connect with the staging worker and drain
 threads) only if it needs a live definition. Then run both suites: the
 fixture only shows parity when both of them pass.
 
+Between the two, a short phase runs the staging worker with no drain threads,
+for steps that need a write captured but never drained (an `await_converged`
+or `self_check` that times out). The staging worker installs capture in a
+first pass that finishes before `connect` returns, so a write made in phase
+one isn't captured at all: the build covers it by reading the source, and it
+holds no token back.
+
 In phase two, mind what runs after a step returns. `ALTER`, `RESUME` and
 `request_backfill` park a re-read of the transform's source, which rewrites
 every target that source feeds, some time later, and `await_converged`

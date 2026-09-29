@@ -130,8 +130,9 @@ defmodule Trellis do
   - `:schema`: the schema Trellis keeps its own tables in. Default `"trellis"`.
   - `:target_schema`: the schema a bare target table name is created in.
     Default `"public"`.
-  - `:staging`: whether this connection runs the staging worker (change
-    capture from the source tables). Exactly one connection in a fleet should.
+  - `:staging`: whether this connection runs the staging worker, which
+    installs change capture on the source tables and starts each new
+    transform's backfill. Exactly one connection in a fleet should.
     Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
@@ -461,8 +462,8 @@ defmodule Trellis do
   def has_live_drain_workers!(trellis), do: bang(has_live_drain_workers(trellis))
 
   @doc """
-  Whether the staging worker (change capture) is alive anywhere in the
-  fleet. The other half of the health check.
+  Whether the staging worker (which installs change capture and starts
+  backfills) is alive anywhere in the fleet. The other half of the health check.
   """
   @spec has_live_staging_worker(trellis()) :: {:ok, boolean()} | {:error, Error.t()}
   def has_live_staging_worker(trellis) when is_trellis(trellis),

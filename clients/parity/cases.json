@@ -206,10 +206,15 @@
     },
     {"op": "relationships", "expect": {"list": []}},
 
-    {"about": "A write to a defined source, which nothing drains yet: the token below has work outstanding however changes are captured (#556).", "op": "sql", "args": ["insert into parity_scratch_src (id, price) values (1, 1)"]},
-    {"op": "watermark_token", "save": "idle_token", "expect": "string"},
-    {"about": "Nothing runs the staging worker yet, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
+    {"op": "shutdown", "expect": null},
+
+    {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},
+    {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
+    {"op": "has_live_drain_workers", "expect": {"eq": false}},
+    {"about": "A captured write to a defined source: the token below has work outstanding (#556).", "op": "sql", "args": ["insert into parity_scratch_src (id, price) values (1, 1)"]},
+    {"op": "watermark_token", "save": "idle_token", "expect": "string"},
+    {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
     {"about": "Likewise the audit: it gives up waiting rather than failing.", "op": "self_check", "args": ["parity_prices"], "opts": {"limit": 10, "timeout_ms": 0}, "expect": {"record": "SelfCheckReport", "fields": {"target": {"eq": "parity_prices"}, "outcome": {"word": "not_caught_up"}, "divergences": {"list": []}, "rows_compared": {"eq": 0}, "next_after": null}}},
     {"op": "shutdown", "expect": null},
 

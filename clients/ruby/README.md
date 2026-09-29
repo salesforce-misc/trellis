@@ -105,7 +105,7 @@ Trellis.shutdown
 | `url:` | required | a libpq connection string or URL |
 | `schema:` | `"trellis"` | the schema Trellis keeps its own tables in |
 | `target_schema:` | `"public"` | where a bare target table name is created |
-| `staging:` | `false` | run the staging worker (change capture) here |
+| `staging:` | `false` | run the staging worker (installs change capture, starts backfills) here |
 | `drain_threads:` | `0` | threads applying staged changes to the targets |
 | `worker_threads:` | `2` | the Rust runtime's threads, invisible to Ruby's own sizing |
 

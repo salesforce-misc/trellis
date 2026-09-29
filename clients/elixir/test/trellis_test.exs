@@ -1,6 +1,6 @@
 defmodule TrellisTest do
-  # Shares the suite's one database, and the slice test owns its replication
-  # slot, so these don't run concurrently.
+  # Shares the suite's one database, and the slice test runs its one staging
+  # worker, so these don't run concurrently.
   use ExUnit.Case, async: false
 
   import Trellis.Eventually
@@ -22,7 +22,7 @@ defmodule TrellisTest do
   # Something has to run the staging worker and drain threads or the
   # definition never leaves :waiting_to_backfill. Here that is the test's own
   # handle: this BEAM is the whole fleet, so it is the one process that
-  # should own the replication slot, and a second handle to do the draining
+  # should run the staging worker, and a second handle to do the draining
   # would be a second handle in one OS process, which ADR-0010 decision 3
   # rules out. `setup_all` migrated first because the staging worker reads
   # the catalog as it starts.

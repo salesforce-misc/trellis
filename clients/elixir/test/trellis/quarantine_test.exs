@@ -4,7 +4,7 @@ defmodule Trellis.QuarantineTest do
   # to end through real source rows: poison a column, read it back every way
   # the API offers, resume it with a statement, and see it clear.
   #
-  # Shares the suite's one database and takes the replication slot, so it
+  # Shares the suite's one database and runs its one staging worker, so it
   # doesn't run concurrently with the other integration tests.
   use ExUnit.Case, async: false
 

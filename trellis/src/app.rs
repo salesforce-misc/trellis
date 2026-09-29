@@ -1083,11 +1083,12 @@ impl Trellis {
     /// #428) — [`Trellis::has_live_drain_workers`]'s counterpart, and meant
     /// to sit behind the same timer-driven health check.
     ///
-    /// **What this detects.** The staging worker captures source changes
-    /// and runs the maintenance loop that dispatches every new transform's
-    /// backfill. A fleet with drain workers but no staging worker passes
-    /// [`Trellis::has_live_drain_workers`] while no change is captured and
-    /// every new transform sits in [`TransformStatus::WaitingToBackfill`]
+    /// **What this detects.** The staging worker installs change capture on
+    /// every source and runs the maintenance loop that seals what capture
+    /// stages and dispatches every new transform's backfill. A fleet with
+    /// drain workers but no staging worker passes
+    /// [`Trellis::has_live_drain_workers`] while no new source is captured
+    /// and every new transform sits in [`TransformStatus::WaitingToBackfill`]
     /// forever. `false` here is that misconfiguration. A healthy fleet
     /// needs both checks to be `true`.
     ///

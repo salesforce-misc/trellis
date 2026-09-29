@@ -100,8 +100,9 @@ module Trellis
     #   ("host=... dbname=...") or URL. Nothing is read from the environment.
     # - schema: the schema Trellis keeps its own tables in.
     # - target_schema: the schema a bare target table name is created in.
-    # - staging: whether this process runs the staging worker (change
-    #   capture). Exactly one process in a fleet should.
+    # - staging: whether this process runs the staging worker, which installs
+    #   change capture on the source tables and starts each new transform's
+    #   backfill. Exactly one process in a fleet should.
     # - drain_threads: how many threads apply staged changes to the targets.
     #   Some process must run at least one, or no definition reaches :live.
     # - worker_threads: the Rust runtime's worker threads, invisible to
@@ -280,8 +281,8 @@ module Trellis
       handle.has_live_drain_workers
     end
 
-    # Whether the staging worker (change capture) is alive anywhere in the
-    # fleet. The other half of the health check.
+    # Whether the staging worker (which installs change capture and starts
+    # backfills) is alive anywhere in the fleet. The other half of the health check.
     def has_live_staging_worker?
       handle.has_live_staging_worker
     end
