@@ -18,8 +18,9 @@
 //!    running at once, or other tests in the same binary, never see it.
 //! 3. When the page reaches the point for that target, the hook sends a
 //!    [`Reached`] naming its backend and then blocks on
-//!    `pg_advisory_xact_lock_shared(key)` inside the page transaction. The
-//!    test learns the worker is frozen from the channel, not by polling.
+//!    `pg_advisory_xact_lock_shared(key)` inside the page transaction, with
+//!    the session's `lock_timeout` lifted for that one wait. The test learns
+//!    the worker is frozen from the channel, not by polling.
 //! 4. The test releases its session lock. The page carries on.
 //!
 //! Each arming fires once. A page that never reaches its point (the step
@@ -150,10 +151,22 @@ pub(crate) async fn pause_at<C: GenericClient>(
     else {
         return Ok(());
     };
-    let backend_pid: i32 = client
-        .query_one("select pg_backend_pid()", &[])
-        .await?
-        .get(0);
+    // The page's session caps every lock wait at `locks::LOCK_TIMEOUT` (I7),
+    // and the pause is a lock wait. Capped, a pause the test held past it
+    // would roll the page back with `55P03`, the drain would retry the page
+    // with the arming already spent, and the test would carry on against an
+    // interleaving it never forced, and could pass. So the pause's own wait
+    // is uncapped, and the page gets its setting back for everything after.
+    let row = client
+        .query_one(
+            "select pg_backend_pid(), current_setting('lock_timeout')",
+            &[],
+        )
+        .await?;
+    let (backend_pid, lock_timeout): (i32, String) = (row.get(0), row.get(1));
+    client
+        .execute("select set_config('lock_timeout', '0', true)", &[])
+        .await?;
     let _ = arming.reached.send(Reached { point, backend_pid });
     client
         .execute(
@@ -161,5 +174,62 @@ pub(crate) async fn pause_at<C: GenericClient>(
             &[&arming.lock_key],
         )
         .await?;
+    client
+        .execute(
+            "select set_config('lock_timeout', $1, true)",
+            &[&lock_timeout],
+        )
+        .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A pause outlasts the page's `lock_timeout`, and the page gets that
+    /// timeout back once released.
+    #[tokio::test]
+    async fn a_pause_is_not_cut_short_by_the_page_lock_timeout() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let gate = db.pool.get().await.expect("gate connection");
+        gate.execute("select pg_advisory_lock(623)", &[])
+            .await
+            .expect("take the pause lock");
+
+        let scope = PauseScope::new();
+        let reached = scope.arm(PausePoint::BeforeCommit, "public.t", 623);
+        let pool = db.pool.clone();
+        let page = tokio::spawn(with_scope(scope, async move {
+            let mut client = pool.get().await.expect("page connection");
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute("set local lock_timeout = 50")
+                .await
+                .expect("a short page lock_timeout");
+            pause_at(&*txn, PausePoint::BeforeCommit, "public.t").await?;
+            let after: String = txn
+                .query_one("select current_setting('lock_timeout')", &[])
+                .await?
+                .get(0);
+            txn.commit().await?;
+            Ok::<_, tokio_postgres::Error>(after)
+        }));
+
+        reached.await.expect("the page reached its pause");
+        // Well past the page's 50 ms: capped, the pause would have failed
+        // with `55P03` and the page would have finished by now.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!page.is_finished(), "the page is still paused");
+        gate.execute("select pg_advisory_unlock(623)", &[])
+            .await
+            .expect("release the pause lock");
+        let after = page
+            .await
+            .expect("page task")
+            .expect("the pause ended by release, not by lock_timeout");
+        assert_eq!(after, "50ms", "the page's lock_timeout is back");
+    }
 }
