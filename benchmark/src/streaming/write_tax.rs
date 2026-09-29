@@ -23,8 +23,10 @@
 //! - `trigger+exception` and `trigger+column-check`: open question Q2's two
 //!   candidate guards against a renamed or dropped read column, as
 //!   benchmark-only rewrites of the installed functions
-//!   ([`exception_variant`], [`column_check_variant`]). Neither is product
-//!   code; C6 builds whichever Q2 picks.
+//!   ([`exception_variant`], [`column_check_variant`]).
+//!   `trigger+column-check-txn` runs the same check once per transaction
+//!   ([`column_check_per_txn_variant`]). None is product code; C6 builds
+//!   whichever Q2 picks.
 //!
 //! Shapes ([`Shape::parse`]):
 //!
@@ -125,10 +127,11 @@ pub enum Variant {
     Trigger,
     TriggerException,
     TriggerColumnCheck,
+    TriggerColumnCheckPerTxn,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 7] = [
+    pub const ALL: [Variant; 8] = [
         Variant::None,
         Variant::Btree,
         Variant::RegexIndex,
@@ -136,6 +139,7 @@ impl Variant {
         Variant::Trigger,
         Variant::TriggerException,
         Variant::TriggerColumnCheck,
+        Variant::TriggerColumnCheckPerTxn,
     ];
 
     pub fn name(self) -> &'static str {
@@ -147,6 +151,7 @@ impl Variant {
             Variant::Trigger => "trigger",
             Variant::TriggerException => "trigger+exception",
             Variant::TriggerColumnCheck => "trigger+column-check",
+            Variant::TriggerColumnCheckPerTxn => "trigger+column-check-txn",
         }
     }
 
@@ -165,7 +170,10 @@ impl Variant {
     fn is_trigger(self) -> bool {
         matches!(
             self,
-            Variant::Trigger | Variant::TriggerException | Variant::TriggerColumnCheck
+            Variant::Trigger
+                | Variant::TriggerException
+                | Variant::TriggerColumnCheck
+                | Variant::TriggerColumnCheckPerTxn
         )
     }
 
@@ -464,12 +472,24 @@ pub fn exception_variant(ddl: &str) -> String {
     )
 }
 
-/// Q2(c): one `pg_attribute` probe for the capture columns, folded into the
-/// statement that reads the mirror (so #597's single expression still
-/// assigns the xid and reads the slot). On a miss the function returns
-/// without capturing; C6 would stage a `schema_changed` marker there. The
-/// benchmark never takes that branch, so it measures only the probe.
-pub fn column_check_variant(ddl: &str, columns: &[String]) -> String {
+/// The `pg_attribute` probe Q2(c) runs: how many of `columns` `tg_relid`
+/// still has.
+fn column_probe(columns: &[String]) -> String {
+    let names: Vec<String> = columns
+        .iter()
+        .map(|c| format!("'{}'", c.replace('\'', "''")))
+        .collect();
+    format!(
+        "(select count(*) from pg_catalog.pg_attribute a\n          \
+         where a.attrelid = tg_relid and a.attnum > 0 and not a.attisdropped\n            \
+         and a.attname = any (array[{}]::name[]))",
+        names.join(", ")
+    )
+}
+
+/// The mirror-read statement's span in `ddl`: `slot := <case>;`, and the
+/// case expression.
+fn mirror_read(ddl: &str) -> (usize, usize, String) {
     let start = ddl
         .find("    slot := case when")
         .expect("the capture function assigns slot from the mirror read");
@@ -479,27 +499,62 @@ pub fn column_check_variant(ddl: &str, columns: &[String]) -> String {
             .expect("the mirror read ends its case")
         + " end;\n".len();
     let expr = ddl[start + "    slot := ".len()..end - ";\n".len()].to_string();
-    let names: Vec<String> = columns
-        .iter()
-        .map(|c| format!("'{}'", c.replace('\'', "''")))
-        .collect();
-    let replacement = format!(
-        "    select {expr},\n        \
-         (select count(*) from pg_catalog.pg_attribute a\n          \
-         where a.attrelid = tg_relid and a.attnum > 0 and not a.attisdropped\n            \
-         and a.attname = any (array[{}]::name[]))\n      \
-         into slot, present;\n    \
-         if present <> {} then\n        \
-         return null;\n    end if;\n",
-        names.join(", "),
-        columns.len(),
-    );
-    let ddl = format!("{}{replacement}{}", &ddl[..start], &ddl[end..]);
+    (start, end, expr)
+}
+
+fn declare_present(ddl: &str) -> String {
     replace_once(
-        &ddl,
+        ddl,
         "    ts timestamptz;\nbegin\n",
         "    ts timestamptz;\n    present bigint;\nbegin\n",
     )
+}
+
+/// Q2(c): one `pg_attribute` probe for the capture columns, folded into the
+/// statement that reads the mirror (so #597's single expression still
+/// assigns the xid and reads the slot). On a miss the function returns
+/// without capturing; C6 would stage a `schema_changed` marker there. The
+/// benchmark never takes that branch, so it measures only the probe.
+///
+/// Folding the probe in turns the mirror read from a PL/pgSQL simple
+/// expression, which skips the executor, into a query.
+pub fn column_check_variant(ddl: &str, columns: &[String]) -> String {
+    let (start, end, expr) = mirror_read(ddl);
+    let replacement = format!(
+        "    select {expr},\n        {}\n      \
+         into slot, present;\n    \
+         if present <> {} then\n        \
+         return null;\n    end if;\n",
+        column_probe(columns),
+        columns.len(),
+    );
+    declare_present(&format!("{}{replacement}{}", &ddl[..start], &ddl[end..]))
+}
+
+/// Q2(c), checked once per transaction: the same probe, run only when a
+/// transaction-local setting keyed by the table doesn't say this transaction
+/// already checked it. The mirror read stays a simple expression.
+///
+/// Sound only because `RENAME`/`DROP COLUMN` take `ACCESS EXCLUSIVE`, which
+/// waits for every transaction already holding the table's `ROW EXCLUSIVE`.
+/// Once a transaction has written the table, only that transaction can change
+/// its columns before it commits. A transaction that writes, renames a read
+/// column and writes again would reach the stale images and fail, where
+/// [`column_check_variant`] wouldn't.
+pub fn column_check_per_txn_variant(ddl: &str, columns: &[String]) -> String {
+    let (_, end, _) = mirror_read(ddl);
+    let check = format!(
+        "    if pg_catalog.current_setting('trellis.capture_checked_' || tg_relid, true)\n        \
+         is distinct from 'on' then\n        \
+         select {} into present;\n        \
+         if present <> {} then\n            \
+         return null;\n        end if;\n        \
+         perform pg_catalog.set_config('trellis.capture_checked_' || tg_relid, 'on', true);\n    \
+         end if;\n",
+        column_probe(columns),
+        columns.len(),
+    );
+    declare_present(&format!("{}{check}{}", &ddl[..end], &ddl[end..]))
 }
 
 // --- Measurement helpers ----------------------------------------------------
@@ -1170,7 +1225,10 @@ async fn set_up_variant(
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some(client)
         }
-        Variant::Trigger | Variant::TriggerException | Variant::TriggerColumnCheck => {
+        Variant::Trigger
+        | Variant::TriggerException
+        | Variant::TriggerColumnCheck
+        | Variant::TriggerColumnCheckPerTxn => {
             let table = format!("public.{SOURCE_TABLE}");
             let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
                 .await
@@ -1190,6 +1248,9 @@ async fn set_up_variant(
                 let replaced = match variant {
                     Variant::TriggerException => exception_variant(&ddl),
                     Variant::TriggerColumnCheck => column_check_variant(&ddl, spec.columns()),
+                    Variant::TriggerColumnCheckPerTxn => {
+                        column_check_per_txn_variant(&ddl, spec.columns())
+                    }
                     _ => continue,
                 };
                 raw.batch_execute(&replaced).await.unwrap_or_else(|e| {
@@ -1723,10 +1784,37 @@ mod tests {
     }
 
     #[test]
+    fn the_per_transaction_check_keeps_the_mirror_read_a_simple_expression() {
+        let before = ddl(CaptureEvent::Insert);
+        let after = column_check_per_txn_variant(&before, spec().columns());
+        let read = after
+            .find("    slot := case when")
+            .expect("mirror read kept");
+        let check = after
+            .find("current_setting('trellis.capture_checked_' || tg_relid, true)")
+            .expect("per-transaction guard");
+        let probe = after.find("pg_catalog.pg_attribute a").expect("probe");
+        let mark = after
+            .find("set_config('trellis.capture_checked_' || tg_relid, 'on', true)")
+            .expect("marks the transaction checked");
+        let capture = after.find("    case slot\n").expect("capture");
+        assert!(
+            read < check && check < probe && probe < mark && mark < capture,
+            "{after}"
+        );
+        assert!(after.contains("if present <> 2 then"), "{after}");
+        assert!(
+            !after.contains("exception when"),
+            "no subtransaction: {after}"
+        );
+    }
+
+    #[test]
     fn every_rewritten_event_has_the_text_the_rewrites_expect() {
         for event in REWRITTEN_EVENTS {
             exception_variant(&ddl(event));
             column_check_variant(&ddl(event), spec().columns());
+            column_check_per_txn_variant(&ddl(event), spec().columns());
         }
     }
 
