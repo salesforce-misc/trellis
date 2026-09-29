@@ -123,6 +123,7 @@ async fn rollup_total(raw: &Client, target: &str) -> i64 {
 ///    normal fresh-backfill semantics: the rebuilt target includes both the
 ///    rows written while the slot was gone and the rows written afterwards.
 #[tokio::test]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_lost_slot_pauses_fed_transforms_and_resume_rebuilds_them() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;

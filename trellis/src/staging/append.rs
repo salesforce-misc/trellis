@@ -181,6 +181,8 @@ pub enum StagedChange {
     /// commit's position, matching [`StagedChange::Cdc`] — a truncate always
     /// originates directly from the source, it is never a re-propagated
     /// downstream change.
+    // Only intake used this; C8 deletes it (issue #622).
+    #[allow(dead_code)]
     Truncate {
         src_table: String,
         lsn: Option<PgLsn>,
@@ -265,6 +267,8 @@ impl StagedChange {
     /// The source table this change targets, regardless of variant — used by
     /// intake's hard-cap error (issue #8) to name which tables an oversized
     /// transaction touched.
+    // Only intake used this; C8 deletes it (issue #622).
+    #[allow(dead_code)]
     pub fn src_table(&self) -> &str {
         match self {
             StagedChange::Cdc { src_table, .. } => src_table,

@@ -10,8 +10,9 @@
 //! - `trigger`: the writers' own rate, since each ring row commits with its
 //!   source row. The cell checks the ring holds exactly the rows written.
 //! - `slot`: every row over the writers' window plus intake's catch-up, the
-//!   rate the ring actually received (E1's "staged rows/s"). While intake
-//!   exists, this is the comparison for the trigger.
+//!   rate the ring actually received (E1's "staged rows/s"). The client
+//!   stopped running intake in #622 C5, so this no longer works; C7 deletes
+//!   it. C4's baseline holds its numbers.
 //! - `none`: `null`; its `rows_per_sec` is the writers' ceiling with no
 //!   capture at all.
 //!
@@ -24,7 +25,9 @@ use crate::streaming::write_tax::{self, CellOptions, CellResult, Shape, Variant}
 
 pub const DEFAULT_WRITERS: &[usize] = &[1, 4, 8, 16, 32];
 pub const DEFAULT_ROWS_PER_COMMIT: usize = 1000;
-pub const DEFAULT_VARIANTS: &[Variant] = &[Variant::None, Variant::Slot, Variant::Trigger];
+/// `slot` isn't among them: the client stopped running intake in #622 C5, so
+/// it stages nothing, and C7 deletes it.
+pub const DEFAULT_VARIANTS: &[Variant] = &[Variant::None, Variant::Trigger];
 
 /// One shape per writer count.
 pub fn shapes(rows_per_commit: usize, writers: &[usize]) -> Vec<Shape> {

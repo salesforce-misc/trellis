@@ -36,26 +36,6 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
-    client
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-            &[&slot, &PgLsn::from(confirmed_lsn)],
-        )
-        .await
-        .expect("seed replication_progress");
-}
-
-async fn advance_progress(client: &Client, slot: &str, confirmed_lsn: u64) {
-    client
-        .execute(
-            "update replication_progress set confirmed_lsn = $2 where slot_name = $1",
-            &[&slot, &PgLsn::from(confirmed_lsn)],
-        )
-        .await
-        .expect("advance replication_progress");
-}
-
 /// Inserts a bare recompute row with an explicit `origin_lsn` (recompute's
 /// own type, `StagedChange::Recompute`, never carries one — this reaches
 /// past the type to set it directly, the way `fold.rs`'s `RawRow` does for
@@ -92,28 +72,15 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
 }
 
 #[tokio::test]
-async fn never_false_converged_until_progress_active_and_sealed_all_clear() {
+async fn never_false_converged_until_active_and_sealed_all_clear() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
     let token = PgLsn::from(50);
 
-    // Nothing staged at all yet, and no progress row: condition 1 alone
-    // must block.
-    seed_progress(&client, "slot1", 10).await;
-    assert!(
-        !converge::converged_through(&client, token)
-            .await
-            .expect("converged_through"),
-        "confirmed_lsn (10) has not reached the token (50) yet"
-    );
-
-    // Advance progress past the token, but stage a row into the active
-    // segment first — condition 2 (the active tail) must still block even
-    // though condition 1 now clears.
+    // A row in the active segment: condition 2 (the active tail) blocks.
     insert_with_origin(&client, "seg_0", "k1", Some(20)).await;
-    advance_progress(&client, "slot1", 100).await;
     assert!(
         !converge::converged_through(&client, token)
             .await
@@ -132,33 +99,30 @@ async fn never_false_converged_until_progress_active_and_sealed_all_clear() {
         "the sealed slot still holds the pending row; condition 3 must catch it"
     );
 
-    // Only once the segment is marked drained (standing in for #14/#15's
-    // apply-and-mark, not built yet) does the row stop gating.
+    // Only once the segment is marked drained does the row stop gating.
     set_segment_state(&client, sealed_seg_seq, "drained").await;
     assert!(
         converge::converged_through(&client, token)
             .await
             .expect("converged_through"),
-        "progress, the (now-empty) active tail, and the drained slot should all clear"
+        "the (now-empty) active tail and the drained slot should both clear"
     );
 }
 
+/// Issue #622 C5: trigger capture writes a change's ring rows in the
+/// writer's own transaction, so there is no intake progress to wait for. An
+/// empty ring converges with no `replication_progress` row at all (it used to
+/// fail closed on the missing row, condition 1).
 #[tokio::test]
-async fn missing_progress_row_reads_as_not_converged() {
+async fn an_empty_ring_converges_with_no_progress_row() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    // No replication_progress row seeded at all, and nothing staged.
-    // Conditions 2/3 vacuously hold (nothing pending anywhere), but
-    // condition 1 must still fail closed on the missing row.
     let converged = converge::converged_through(&client, PgLsn::from(0))
         .await
         .expect("converged_through");
-    assert!(
-        !converged,
-        "a missing replication_progress row must never read as converged"
-    );
+    assert!(converged, "nothing is pending anywhere");
 }
 
 /// The band would lie, the slot does not: this simulates a row that landed
@@ -173,8 +137,6 @@ async fn the_band_would_lie_the_slot_does_not() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
-
-    seed_progress(&client, "slot1", 1000).await;
 
     // A row with a comfortably high origin, present before the seal — if a
     // band existed, this is the only row it would have summarized.
@@ -226,8 +188,6 @@ async fn a_drained_slots_unfenced_straggler_still_gates_convergence() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
-
-    seed_progress(&client, "slot1", 1000).await;
 
     // Nothing in the active segment yet; seal it as-is, capturing S_1 over
     // an empty slot.
@@ -283,7 +243,6 @@ async fn a_part_drained_batch_reports_its_whole_slot_pending() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
     let sealed_seg_seq = seal_active_segment(&mut client).await;
 
@@ -316,8 +275,6 @@ async fn zero_origin_and_null_origin_rows_gate_any_token() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
-
-    seed_progress(&client, "slot1", 1_000_000).await;
 
     // `origin_lsn = '0/0'` — "unknown, conservatively old" per the doc.
     insert_with_origin(&client, "seg_0", "zero-origin", Some(0)).await;
@@ -421,7 +378,6 @@ async fn await_converged_returns_once_the_predicate_flips_true() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
     let sealed_seg_seq = seal_active_segment(&mut client).await;
 
@@ -449,7 +405,6 @@ async fn await_converged_times_out_with_a_named_error() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
     seal_active_segment(&mut client).await;
     // Deliberately never mark the segment drained — convergence can never
@@ -511,7 +466,6 @@ async fn await_converged_times_out_while_a_poll_blocks_on_a_lock() {
 
     // Nothing pending, progress past the token: the only thing standing
     // between this token and `converged` is the lock.
-    seed_progress(&client, "slot1", 1000).await;
     let token = PgLsn::from(50);
 
     lock_poison_held(&holder).await;
@@ -570,7 +524,6 @@ async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
     let client = connect_raw(db.dsn()).await;
     let holder = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     let token = PgLsn::from(50);
     client
         .batch_execute("set statement_timeout = '100ms'")
@@ -614,7 +567,6 @@ async fn await_converged_with_a_spent_budget_still_checks_once() {
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     let token = PgLsn::from(50);
     for _ in 0..20 {
         converge::await_converged(&client, token, Duration::ZERO)
@@ -633,7 +585,6 @@ async fn await_converged_with_a_spent_budget_rides_out_a_brief_lock() {
     let client = connect_raw(db.dsn()).await;
     let holder = connect_raw(db.dsn()).await;
 
-    seed_progress(&client, "slot1", 1000).await;
     let token = PgLsn::from(50);
 
     lock_poison_held(&holder).await;

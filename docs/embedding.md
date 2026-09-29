@@ -13,11 +13,11 @@ A Trellis-embedding fleet typically runs two kinds of process against the
 same database:
 
 * **Web and migration processes** — define transforms, read `status()`, run
-  migrations. These connect at `drain_threads: 0`: no background CDC intake,
-  no drain workers. Cheap to run in every web dyno/pod without each one
+  migrations. These connect at `drain_threads: 0`: no staging worker, no
+  drain workers. Cheap to run in every web dyno/pod without each one
   competing to drain the same work.
-* **One dedicated worker process** — runs the live pipeline: CDC intake +
-  ring maintenance (`staging: true`) and one or more drain workers
+* **One dedicated worker process** — runs the live pipeline: capture
+  install + ring maintenance (`staging: true`) and one or more drain workers
   (`drain_threads: N`) that actually apply staged changes into target
   tables.
 
@@ -80,11 +80,35 @@ A third option, `worker_threads`, is unrelated to either: it sizes the
 runtime a `BlockingTrellis` or binding handle owns. The bindings default it to
 2; Rust's `TrellisOptions` leaves it at one thread per core unless you set it.
 
-Rust's `TrellisOptions` also takes a `publication` name, for a fleet whose
-staging worker runs a publication other than the default `trellis_pub`. Set
-it on every handle in that fleet, not only the staging one, because
-`request_backfill` checks a table's membership in the handle's own
-publication. The bindings don't expose it yet.
+Rust's `TrellisOptions` still has a `publication` field. It is ignored: the
+staging worker captures changes with triggers, not a publication (#622), and
+the field goes in a later release.
+
+### What the staging worker needs from the database
+
+The staging worker captures each source table's changes with statement
+triggers that write into Trellis's staging ring in the application's own
+transaction (#622; [stage 1](staging-and-claiming/01-capture-by-triggers.md)).
+So:
+
+* **No `wal_level = logical`, no `REPLICATION` role attribute, no replication
+  slot.** Nothing reads the WAL.
+* **Ownership of every source table**, or membership in the role that owns
+  it. The worker installs the triggers with `ENABLE ALWAYS`, which only the
+  owner may run. (Publishing a table needed ownership too.)
+* **The role that owns the Trellis schema** owns the capture functions, which
+  run `SECURITY DEFINER`, so application roles writing a source table need no
+  privilege on Trellis's schema.
+* **Nothing cancels a lock holder.** Installing or widening a table's triggers
+  needs a brief table lock. The worker tries it for at most 50 ms at a time, so
+  your writers never queue behind it for longer, and retries every reconcile
+  pass while a long transaction or an autovacuum holds the table. Meanwhile the
+  transform stays `waiting_to_backfill`, and `status()` reports what it waits
+  on (`capture_wait`, in Rust).
+
+A database used by a Trellis build from before #622 may still have a
+`trellis_slot` replication slot that nothing consumes any more, which pins WAL
+until the disk fills. Drop it once: `select pg_drop_replication_slot('trellis_slot')`.
 
 ```rust
 // A web process: define transforms, never drains anything.
@@ -99,12 +123,12 @@ refuses a transform whose target already exists as any table or view. It
 doesn't read the source table's rows and doesn't touch the replication
 publication or slot, so it takes the same time against an empty table as
 against a billion-row one. The dedicated worker does
-the rest in the background: it publishes the source, reads its existing rows,
+the rest in the background: it installs capture triggers on the source, reads its existing rows,
 builds the target, catches it up with whatever changed while it was
 building, and flips the transform to `live`
 ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
-So a web process needs no publication ownership or replication privileges; only
-the worker does. It does need to create tables: each target table in the target
+So a web process needs no ownership of the source tables; only the worker
+does. It does need to create tables: each target table in the target
 schema, and, for a to-one relationship, the relationship's projection in the
 instance schema, where Trellis keeps its own state. A transform that reads a
 parent column the projection doesn't carry yet adds it there, so the process
@@ -114,7 +138,7 @@ Code that needs the target populated polls `status()` until the transform is
 `live` ([Poll to `live`, don't wait](#poll-to-live-dont-wait)).
 
 Dropping a transform is the same: `DROP` removes catalog rows and nothing else,
-and the worker takes the source out of the publication on its next reconcile
+and the worker uninstalls the source's capture triggers on its next reconcile
 pass once nothing reads it (#427). The worker also doesn't need any transforms
 registered before it starts; it picks up each one on the pass after `apply`
 registers it.
@@ -210,17 +234,16 @@ same window, no separate cleanup pass required. See
 `trellis::staging::worker_registry`'s doc comment for the full mechanism.
 
 `has_live_drain_workers` counts drain workers only, so a fleet whose drain
-workers run but whose staging worker doesn't passes it while no change is
-captured and every new transform stays in `WaitingToBackfill`.
+workers run but whose staging worker doesn't passes it while nothing is
+sealed and every new transform stays in `WaitingToBackfill`.
 `has_live_staging_worker` (issue #428) is the check for that half: it asks
-whether some connection holds this instance's producer singleton, the
-session-scoped advisory lock the staging worker's intake holds for as long as
-it streams. It needs no heartbeat, since Postgres frees the lock the moment a
-crashed worker's connection closes. It also reads `false` while a failed
-intake waits to restart, when nothing is captured either. That wait starts at
-a second and doubles to a minute while intake keeps failing, so a single
-dropped connection reads `false` for about a second: page on it staying
-`false` across a few checks, not on one reading.
+whether some connection holds this instance's staging-worker singleton, the
+session-scoped advisory lock the staging worker's maintenance loop holds on
+its own connection for as long as it runs. It needs no heartbeat, since
+Postgres frees the lock the moment a crashed worker's connection closes. It
+also reads `false` for the tick or so the loop takes to reconnect after a
+failed step, so page on it staying `false` across a few checks, not on one
+reading.
 
 **These are liveness checks, not backlog checks.** `true` means the worker is
 alive; it says nothing about whether it is keeping up. Use

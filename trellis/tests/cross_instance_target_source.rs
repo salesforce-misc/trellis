@@ -389,14 +389,13 @@ async fn a_relationship_endpoint_intake_cant_key_is_rejected() {
     assert!(b_publishes(&b, "stores_copy").await, "{desired:?}");
 }
 
-/// The rule is about the table, not its owner, so a plain source table intake
-/// can't key is held to it too. Each rejected shape here used to be accepted,
-/// then fail at runtime once published: with no primary key under `FULL`,
-/// intake stops on the first change (`MissingKeyValue`); under `NOTHING`,
-/// Postgres refuses the table's own updates. `source_primary_key`'s unique-index
-/// fallback (issue #128) admits the first, so only this check catches it.
-/// `REPLICA IDENTITY USING INDEX` is keyed by pgoutput's own flags and stays
-/// accepted.
+/// The rule is about the table, not its owner, so a plain source table the
+/// capture triggers can't key is held to it too (issue #622 C5): every ring
+/// row is keyed by the primary key, so a table without one is refused whatever
+/// its replica identity (a unique index under `FULL`, or `REPLICA IDENTITY
+/// USING INDEX`), and so is a partitioned table, which statement triggers on
+/// its parent would capture only partially. A plain table with a primary key
+/// is keyed whatever its replica identity, `NOTHING` included.
 #[tokio::test]
 async fn a_plain_source_is_held_to_the_same_keying_rule() {
     let cluster = TestCluster::start();
@@ -409,23 +408,20 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
          alter table public.pk_nothing replica identity nothing; \
          create table public.using_index (code text not null, amount integer); \
          create unique index using_index_code on public.using_index (code); \
-         alter table public.using_index replica identity using index using_index_code",
+         alter table public.using_index replica identity using index using_index_code; \
+         create table public.parted (code text not null, amount integer, primary key (code)) \
+             partition by list (code); \
+         create table public.parted_a partition of public.parted for values in ('a')",
     )
     .await
     .expect("create plain sources");
     let coded = columns(&[("code", ValueType::Text), ("amount", ValueType::Numeric)]);
 
-    for (source, cols) in [
-        ("full_no_pk", &coded),
-        (
-            "pk_nothing",
-            &columns(&[("id", ValueType::Numeric), ("amount", ValueType::Numeric)]),
-        ),
-    ] {
+    for source in ["full_no_pk", "using_index", "parted"] {
         let result = install_definition(
             &db.pool,
             &format!("TRANSFORM {source}_copy FROM {source} SELECT amount AS amount_copy"),
-            cols,
+            &coded,
             "public",
         )
         .await;
@@ -439,10 +435,10 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
 
     install_definition(
         &db.pool,
-        "TRANSFORM using_index_copy FROM using_index SELECT amount AS amount_copy",
-        &coded,
+        "TRANSFORM pk_nothing_copy FROM pk_nothing SELECT amount AS amount_copy",
+        &columns(&[("id", ValueType::Numeric), ("amount", ValueType::Numeric)]),
         "public",
     )
     .await
-    .expect("a REPLICA IDENTITY USING INDEX source is keyed");
+    .expect("a source with a primary key is keyed under any replica identity");
 }

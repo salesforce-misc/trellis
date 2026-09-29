@@ -15,10 +15,10 @@
 //! - [`sql`] generates the functions and triggers for one table (C2).
 //! - [`install`] installs, widens, narrows and uninstalls them under
 //!   `locks::DdlRetry`, and reads back what is installed from the catalog
-//!   (C3). The staging worker's reconcile pass that calls it is C5.
-//!
-//! Until C5 lands, nothing at runtime calls this module. The tests drive it
-//! by hand.
+//!   (C3).
+//! - [`reconcile`] is the staging worker's pass that calls it for every
+//!   table, and decides which waiting definitions a discharge may dispatch
+//!   (C5).
 //!
 //! # What the images must equal
 //!
@@ -61,12 +61,13 @@
 //! Under OLD+NEW images no image shape fixes this; D's NEW-only apply with a
 //! re-read image does.
 
-// C5 (reconcile) is the caller. Until it lands, only the tests reach this
-// module, and a build without `internals` would flag every item as dead.
+// A few items (the parity helpers, the spec accessors) only the tests reach,
+// and a build without `internals` would flag them as dead.
 #![cfg_attr(not(feature = "internals"), allow(dead_code))]
 
 pub mod columns;
 pub mod install;
+pub mod reconcile;
 pub mod sql;
 
 use std::fmt;

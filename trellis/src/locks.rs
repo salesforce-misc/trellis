@@ -62,11 +62,11 @@ pub const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
 /// The per-attempt `lock_timeout` for DDL on a user table whose lock
 /// conflicts with writers' `ROW EXCLUSIVE` (I6): `CREATE`/`DROP TRIGGER`
 /// (#622). See [`DdlRetry`].
-// No production caller until #622; the tests and `internals` use it.
-#[allow(dead_code)]
 pub const USER_TABLE_DDL_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The least [`share_update_exclusive_ddl_timeout`] returns.
+// Only the publication's reconcile used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 const SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR: Duration = Duration::from_secs(2);
 
 /// The per-attempt `lock_timeout` for DDL on a user table that takes `SHARE
@@ -91,6 +91,8 @@ const SHARE_UPDATE_EXCLUSIVE_DDL_FLOOR: Duration = Duration::from_secs(2);
 /// or stronger requests (a manual `VACUUM`, `CREATE INDEX`, other DDL), for
 /// at most this long. An anti-wraparound autovacuum is never cancelled; the
 /// retry waits that one out.
+// Only the publication's reconcile used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub fn share_update_exclusive_ddl_timeout(deadlock_timeout: Duration) -> Duration {
     deadlock_timeout
         .saturating_mul(2)
@@ -101,6 +103,8 @@ pub fn share_update_exclusive_ddl_timeout(deadlock_timeout: Duration) -> Duratio
 /// [`share_update_exclusive_ddl_timeout`] for `client`'s session, reading its
 /// `deadlock_timeout`: the deadlock check runs in the waiting backend, on that
 /// backend's own setting.
+// Only the publication's reconcile used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub async fn read_share_update_exclusive_ddl_timeout(
     client: &impl tokio_postgres::GenericClient,
 ) -> Result<Duration, tokio_postgres::Error> {
@@ -154,6 +158,8 @@ pub async fn set_local_lock_timeout(
 /// [`end_user_table_ddl`] to put back. Only the DDL runs under the attempt's
 /// timeout, so the rest of the transaction (catalog rows another Trellis
 /// transaction may hold for a moment) keeps the session's.
+// Only the publication's reconcile used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub async fn begin_user_table_ddl(
     txn: &impl tokio_postgres::GenericClient,
     timeout: Duration,
@@ -168,6 +174,8 @@ pub async fn begin_user_table_ddl(
 
 /// Ends the stretch [`begin_user_table_ddl`] started, restoring `previous`
 /// for the rest of the transaction.
+// Only the publication's reconcile used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub async fn end_user_table_ddl(
     txn: &impl tokio_postgres::GenericClient,
     previous: &str,

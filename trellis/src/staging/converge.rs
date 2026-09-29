@@ -69,12 +69,12 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// doc's "The predicate" section for why splitting this into separate
 /// queries reintroduces the race it's built to close.
 ///
-/// - **Condition 1** — `confirmed_lsn >= token` from `replication_progress`.
-///   A **missing** row (or no rows at all) reads as NOT converged: the
-///   `coalesce(..., false)` around the comparison is what makes absence
-///   fail closed rather than vacuously succeed. `min(confirmed_lsn)` rather
-///   than a single row so a caller running against more than one slot's
-///   progress row can't have one lagging slot hidden behind another.
+/// - **No condition 1 any more** (issue #622 C5). Intake's confirmed
+///   position (`replication_progress.confirmed_lsn >= token`) was the first
+///   condition while a replication stream staged the ring. Trigger capture
+///   writes a change's ring rows in the writer's own transaction, so every
+///   commit at or below `token` already has its rows in the ring, with an
+///   `origin_lsn` below its commit, and conditions 2–4 see them.
 /// - **Condition 2** — the active batch's ring table holds no row with
 ///   `origin_lsn <= token`. The active `ring_slot` is resolved from
 ///   `segment_pointer` in this same statement (so a concurrent seal can't
@@ -219,8 +219,7 @@ fn converged_sql(token: &str) -> String {
 
     format!(
         "select \
-             coalesce((select min(confirmed_lsn) from replication_progress) >= {token}, false) \
-             and not ({condition2}) \
+             not ({condition2}) \
              and not exists ({condition3}) \
              and not exists ({condition4})"
     )
@@ -296,6 +295,12 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// (`NULL`) is conservatively old. `recompute` and `truncate` rows carry no
 /// image a reader could miss a column of, so they don't hold the gate.
 ///
+/// A deferred relationship reverse (`rel_reverse_deferred`) carries its
+/// to-side's images under a synthetic `src_table`, so one whose relationship's
+/// to-side is `table` counts as a change to `table` too (issue #622 C5: a
+/// widen of a to-side must not let a deferred reverse carrying the old
+/// images through). Such rows never reach `poison_held`.
+///
 /// Scans each slot for `table`'s rows: no index serves `src_table`. It runs
 /// once per discharge pass, and only for a gated marker.
 pub async fn table_changes_pending_through(
@@ -307,7 +312,10 @@ pub async fn table_changes_pending_through(
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \
-             where r.src_table = $1 and r.{IMAGED} \
+             where (r.src_table = $1 and r.{IMAGED} \
+                    or r.op = 'rel_reverse_deferred' and r.relationship_id in ( \
+                        select rd.id from relationship_definitions rd \
+                        where rd.to_schema || '.' || rd.to_table = $1)) \
                and (r.origin_lsn is null or r.origin_lsn <= $2) \
                and exists ( \
                    select 1 from segments s \
@@ -339,45 +347,17 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
     Ok(row.get(0))
 }
 
-/// The prefix of the logical decoding message a waiter writes to ask intake
-/// to confirm through its position (issue #452).
-///
-/// [`converged_through`]'s first condition needs intake's confirmed position
-/// at or past the token. Intake confirms through each transaction it
-/// stages, but WAL after the caller's commit that carries no published change
-/// (the engine's own bookkeeping, a write to an unpublished table, another
-/// instance's writes) gives it nothing to confirm with except a keepalive,
-/// which arrives and persists only every ~10s. The message is decoded by
-/// every slot in the database right after everything committed before it, so
-/// intake confirms through it at once instead.
+/// The prefix of the logical decoding message intake confirmed through at
+/// once (issue #452). Nothing writes it since trigger capture replaced intake
+/// (issue #622 C5); C8 deletes it with intake.
+#[allow(dead_code)]
 pub(crate) const CONVERGE_MESSAGE_PREFIX: &str = "trellis.converge";
-
-/// Writes a [`CONVERGE_MESSAGE_PREFIX`] message: non-transactional, so it is
-/// in the WAL (and decoded) whatever becomes of an enclosing transaction.
-/// Every position read before this call is at or before the message.
-pub(crate) async fn request_intake_confirm(
-    client: &impl GenericClient,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            "select pg_logical_emit_message(false, $1::text, ''::text)",
-            &[&CONVERGE_MESSAGE_PREFIX],
-        )
-        .await?;
-    Ok(())
-}
 
 /// Polls [`converged_through`] until it reports `true` or `timeout` is
 /// exhausted. Backoff starts at 5ms and doubles to a 250ms ceiling
 /// (monotonic — never resets within one call), which keeps the poll cheap
 /// for a token that clears quickly without hammering the database on a
 /// token that takes a while.
-///
-/// If the first check fails while intake's confirmed position is still
-/// behind `token`, writes one [`CONVERGE_MESSAGE_PREFIX`] message so intake
-/// confirms past the token as soon as it reaches it, rather than on its next
-/// keepalive (issue #452). A wait that is already satisfied, or blocked only
-/// on draining, writes nothing.
 ///
 /// `timeout` bounds the whole call, including a poll that blocks (on a lock,
 /// say) rather than returning (issue #596): each poll runs under a
@@ -411,22 +391,12 @@ pub async fn await_converged(
     // `PgLsn`'s `Display` is Postgres's own `X/Y` hex form: nothing to escape.
     let token_literal = format!("'{token}'::pg_lsn");
     let converged = converged_sql(&token_literal);
-    let request_confirm = format!(
-        "select pg_logical_emit_message(false, '{CONVERGE_MESSAGE_PREFIX}', '') \
-         where coalesce((select min(confirmed_lsn) from replication_progress) \
-                        < {token_literal}, false)"
-    );
     let mut backoff = INITIAL_BACKOFF;
-    let mut requested = false;
     loop {
         let rows = poll_within_deadline(client, &wait, &converged).await?;
         // Anything but a `true` reads as "not yet": fails closed, never early.
         if rows.last().and_then(|row| row.get(0)) == Some("t") {
             return Ok(());
-        }
-        if !requested {
-            requested = true;
-            poll_within_deadline(client, &wait, &request_confirm).await?;
         }
         let waited = started.elapsed();
         if waited >= timeout {

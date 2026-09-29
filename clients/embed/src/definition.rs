@@ -247,6 +247,7 @@ mod tests {
         let status = DefinitionStatus {
             status: TransformStatus::Live,
             backfill_failure: None,
+            capture_wait: None,
         };
 
         assert_eq!(
@@ -268,6 +269,7 @@ mod tests {
                 last_error: "permission denied for table orders".to_string(),
                 next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
+            capture_wait: None,
         };
 
         assert_eq!(

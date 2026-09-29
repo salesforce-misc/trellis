@@ -414,6 +414,8 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// be mangled by `pg_split_opts`'s own backslash-as-escape-character rule.
 /// None of today's values contain a backslash, so this is a latent gap, not
 /// a live bug — worth fixing if that ever changes.
+// Only intake used this; C8 deletes it (issue #622).
+#[allow(dead_code)]
 pub(crate) fn deterministic_text_output_options() -> String {
     DETERMINISTIC_TEXT_OUTPUT_GUCS
         .split(';')

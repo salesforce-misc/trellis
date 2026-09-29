@@ -287,7 +287,7 @@ a row committed during that wait would be neither read nor streamed (#393).
 - **No transform is `live` when `apply` returns.** Poll `Trellis::status` until
   it is ([embedding — Poll to `live`](embedding.md#poll-to-live-dont-wait)),
   then take `Trellis::watermark_token` and `await_converged` on it.
-  `await_converged` checks the ring and intake's progress, never a
+  `await_converged` checks the ring, never a
   definition's status, so on its own it doesn't wait for a build that hasn't
   started. After `live` it covers everything: `live` waits for a chunked or
   direct build's go-live catch-up (the definition reports `catching_up` until
@@ -297,19 +297,18 @@ a row committed during that wait would be neither read nor streamed (#393).
   live without its maintenance loop. Chunked and direct builds also need drain threads
   ([embedding — Who runs what](embedding.md#who-runs-what),
   [the silent-stall hazard](embedding.md#the-silent-stall-hazard-issue-144)).
-- **Only the staging worker needs publication and replication privileges.** A
-  process that only registers transforms needs catalog access and the right to
-  create target tables, and so does one that drops them: a `DROP` only removes
-  catalog rows, and the staging worker's reconcile pass shrinks the
-  publication, up to one `reconcile_interval` (5s by default) later
-  ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md#the-publication-shrinks-by-reconciliation),
-  #427). Until then the dropped table's changes are still staged, and apply
-  skips them because nothing reads the table. One that declares a to-one
-  relationship also needs to create a table in the instance schema, where the
-  relationship's projection lives (the same right `migrate` already uses
-  there), and one that applies a transform reading a parent column the
-  projection doesn't carry yet must own the projection, since it adds that
-  column.
+- **Only the staging worker needs to own the source tables.** It installs
+  their capture triggers (#622), which needs ownership. A process that only
+  registers transforms needs catalog access and the right to create target
+  tables, and so does one that drops them: a `DROP` only removes catalog rows,
+  and the staging worker's reconcile pass uninstalls the capture, up to one
+  `reconcile_interval` (5s by default) later (#427). Until then the dropped
+  table's changes are still staged, and apply skips them because nothing
+  reads the table. One that declares a to-one relationship also needs to
+  create a table in the instance schema, where the relationship's projection
+  lives (the same right `migrate` already uses there), and one that applies a
+  transform reading a parent column the projection doesn't carry yet must own
+  the projection, since it adds that column.
 
 ## Staging and batching
 

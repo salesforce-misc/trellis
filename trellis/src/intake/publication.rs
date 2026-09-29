@@ -253,6 +253,64 @@ pub(crate) async fn park_registration_markers(
     Ok(())
 }
 
+/// Parks a `pending_backfill` marker on the source of every definition in
+/// `ready` that is still `waiting_to_backfill` and whose source has no marker
+/// yet: the trigger-capture form of [`park_registration_markers`] (issue
+/// #622 C5). `ready` is what the staging worker's reconcile pass found
+/// dispatchable ([`crate::capture::reconcile`]): every table the definition
+/// reads is captured by triggers that image the columns it needs, or is
+/// another definition's target, fed by the target-mutation seam. A
+/// definition whose capture is still waiting for a lock is left without a
+/// marker, so no discharge can dispatch it before its capture covers it.
+pub async fn park_ready_registration_markers(
+    client: &impl GenericClient,
+    ready: &[i64],
+) -> Result<(), IntakeError> {
+    let tables: Vec<String> = client
+        .query(
+            "select distinct d.source_table from transform_definitions d \
+             where d.id = any($2) and d.status = $1 \
+               and not exists ( \
+                   select 1 from pending_backfill pb where pb.table_name = d.source_table \
+               ) \
+             order by 1",
+            &[&TransformStatus::WaitingToBackfill.as_str(), &ready],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    for table in tables {
+        park_marker(client, &table).await?;
+    }
+    Ok(())
+}
+
+/// Parks the marker a capture widen of `table` commits with (issue #622,
+/// `capture::install`'s "Widening and the capture gate"), and, when `table`
+/// is a relationship's to-side, asks its discharge to refresh the settled
+/// projections on it ([`request_projection_refresh`]).
+///
+/// The refresh is what makes a to-side widen safe for a projection. A
+/// definition that reads a new to-side column through a to-one relationship
+/// widens the projection and back-fills the column from the live table when
+/// it registers, but until the widen lands the capture function images rows
+/// without that column, and applying such a row's image writes the column as
+/// `NULL` into the projection. The widen's marker holds its discharge until
+/// every row staged before the widen has drained (its capture gate), so the
+/// refresh runs after the last of them and re-reads the column from the
+/// table.
+pub(crate) async fn park_widen_marker(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(), IntakeError> {
+    park_marker(client, table).await?;
+    if is_relationship_to_side(client, table).await? {
+        request_projection_refresh(client, &[table.to_string()]).await?;
+    }
+    Ok(())
+}
+
 /// Parks a catch-up marker for `definition_id`'s *target* table when
 /// something reads it (issue #315), moving each reader that is `live` to
 /// `catching_up` until the marker is discharged (issue #476). Called wherever
@@ -1148,6 +1206,36 @@ pub(crate) async fn run_pending_backfills_until(
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<FailedDischarge>, IntakeError> {
+    run_pending_backfills_for(
+        client,
+        wake_channel,
+        watermark,
+        catch_up_timeout,
+        stop,
+        None,
+    )
+    .await
+}
+
+/// [`run_pending_backfills_until`], dispatching only the `waiting_to_backfill`
+/// definitions in `ready` (every one, with `None`).
+///
+/// The staging worker's pass (issue #622 C5) passes the definitions whose
+/// capture its reconcile just brought current
+/// ([`crate::capture::reconcile`]): every table they read has triggers
+/// imaging every column they need. A definition registered after the pass
+/// read the catalog, or one whose table's install or widen is still waiting
+/// for a lock, stays `waiting_to_backfill` even when a marker on its source
+/// discharges; the reconcile pass that brings its capture current parks it a
+/// marker of its own ([`park_ready_registration_markers`]).
+pub(crate) async fn run_pending_backfills_for(
+    client: &mut tokio_postgres::Client,
+    wake_channel: &str,
+    watermark: &StagedWatermark,
+    catch_up_timeout: Duration,
+    stop: &(dyn Fn() -> bool + Sync),
+    ready: Option<&[i64]>,
+) -> Result<Vec<FailedDischarge>, IntakeError> {
     let mut pending = fetch_pending_backfills(client).await?;
     tracing::Span::current().record("pending", pending.len());
     if pending.is_empty() {
@@ -1230,6 +1318,7 @@ pub(crate) async fn run_pending_backfills_until(
             watermark,
             intake_timeout,
             stop,
+            ready,
         )
         .await
         {
@@ -1348,6 +1437,7 @@ enum Build {
 async fn plan_waiting_builds(
     client: &tokio_postgres::Client,
     table: &str,
+    ready: Option<&[i64]>,
 ) -> Result<Vec<(i64, Build)>, IntakeError> {
     use crate::defs::ast::KeySpace;
     use crate::defs::backfill::{self, BackfillError};
@@ -1356,8 +1446,10 @@ async fn plan_waiting_builds(
     let rows = client
         .query(
             "select id, definition_text from transform_definitions \
-             where source_table = $1 and status = $2 order by id",
-            &[&table, &TransformStatus::WaitingToBackfill.as_str()],
+             where source_table = $1 and status = $2 \
+               and ($3::bigint[] is null or id = any($3)) \
+             order by id",
+            &[&table, &TransformStatus::WaitingToBackfill.as_str(), &ready],
         )
         .await?;
     let mut builds = Vec::with_capacity(rows.len());
@@ -1409,8 +1501,9 @@ async fn discharge_marker(
     watermark: &StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
+    ready: Option<&[i64]>,
 ) -> Result<Discharge, IntakeError> {
-    let builds = plan_waiting_builds(client, &marker.table).await?;
+    let builds = plan_waiting_builds(client, &marker.table, ready).await?;
     let waiting: Vec<i64> = builds.iter().map(|(id, _)| *id).collect();
     // Definitions whose build reads the table itself, in the background.
     let background: Vec<i64> = builds
@@ -1453,9 +1546,6 @@ async fn discharge_marker(
             .query_one("select pg_current_wal_insert_lsn()", &[])
             .await?
             .get(0);
-        // On a quiet stream nothing else would carry intake past `horizon`
-        // until its next keepalive (issue #452).
-        crate::staging::converge::request_intake_confirm(&txn).await?;
         if !intake_caught_up(watermark, horizon, catch_up_timeout, stop).await {
             txn.rollback().await?;
             return Ok(Discharge::Deferred { horizon });

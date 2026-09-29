@@ -157,9 +157,9 @@ pub(crate) mod plant;
 
 // --- Tier 1: the facade ---------------------------------------------------
 pub use app::{
-    Applied, BackfillFailure, DefinitionStatus, DefinitionSummary, PoisonEntry, PoisonSample,
-    QuarantineEntry, QuarantineState, QuarantineTarget, RelationshipSummary, Trellis, TrellisError,
-    TrellisOptions,
+    Applied, BackfillFailure, CaptureWait, DefinitionStatus, DefinitionSummary, PoisonEntry,
+    PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget, RelationshipSummary, Trellis,
+    TrellisError, TrellisOptions,
 };
 pub use blocking::BlockingTrellis;
 pub use client::{Client, ClientError, ClientOptions};

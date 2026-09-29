@@ -21,20 +21,17 @@ A caller reads its own writes without waiting for global idleness:
 
 Taken *after* the write commits, the token bounds that write's position from above.
 The engine's workers do the work; the caller only waits — no client-driven drain loop.
-If intake hasn't confirmed through the token when the wait starts, the waiter writes
-one `trellis.converge` logical message so intake confirms past the token as soon as
-it gets there, rather than on its next keepalive
-([01](01-intake-and-lsn-confirmation.md#the-quiet-stream-problem)).
+Capture triggers write a change's ring rows in the writer's own transaction
+([01](01-capture-by-triggers.md)), so every commit at or below the token is already
+in the ring when the token is read, and the waiter writes nothing.
 
 ## The predicate
 
 `converged_through(token)` is **one statement**, so every condition is evaluated
-against one committed snapshot. True iff all four hold:
+against one committed snapshot. True iff all three hold (a fourth, "intake has
+durably staged past the token", went with intake in #622 C5: a trigger-captured
+change's rows commit with it, below its commit position):
 
-1. **intake has durably staged past the token** — `confirmed_lsn >= token`
-   ([01](01-intake-and-lsn-confirmation.md)). But `confirmed_lsn` leads applied
-   state — it can read a slot as converged while work is still unfolded. Gate on
-   the pending work itself, never on `confirmed_lsn` alone;
 2. **the active batch's table holds no row with `origin_lsn <= token`** — the
    active tail. The pointer resolves in the same statement, so a concurrent seal
    cannot slip between resolve and scan;
@@ -49,7 +46,8 @@ can only make it older — while the ordinary position GREATEST-advances. Downst
 propagation carries the *minimum* trigger origin to the dependent it stages; `0`
 means "unknown, conservatively old", and so does a `NULL` origin, which wins the
 LEAST-merge rather than losing it. Intake stamps each row with its commit's own
-position; only rows with genuinely unknown origin (a backfill enumeration, a write
+position (a capture trigger, the insert position when it runs, below the
+commit); only rows with genuinely unknown origin (a backfill enumeration, a write
 made outside a drain) stay `NULL` (issue #469).
 
 > **Invariant (await soundness):** every un-reflected effect of a commit at

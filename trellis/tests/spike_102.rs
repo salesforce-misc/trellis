@@ -6,8 +6,8 @@
 //! the preconditions issue #102's proposed "image-aware reverse delta" design
 //! depends on. Nothing here changes engine behavior.
 //!
-//! * `spike_a_*` — is the linchpin true? Does the real logical-replication
-//!   stream deliver both the old and the new parent image on an
+//! * `spike_a_*` — is the linchpin true? Does real capture (the capture
+//!   triggers since #622 C5) deliver both the old and the new parent image on an
 //!   `UPDATE posts SET author = ...`, and does the reverse path enumerate the
 //!   affected from-side rows?
 //! * `spike_a2_*` — can a from-side change be drained in a *strictly earlier*
@@ -186,7 +186,7 @@ async fn ring_rows(
 // =====================================================================
 
 #[tokio::test]
-async fn spike_a_real_replication_delivers_both_parent_images_on_an_author_change() {
+async fn spike_a_capture_delivers_both_parent_images_on_an_author_change() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -199,24 +199,15 @@ async fn spike_a_real_replication_delivers_both_parent_images_on_an_author_chang
     .expect("seed");
     install(&db.pool, &post_tags_columns()).await;
 
-    // Staging-only: intake stages real CDC into the ring, but nothing drains
-    // it, so the raw staged rows survive for inspection.
+    // Staging-only: the capture triggers stage real changes into the ring
+    // (issue #622 C5), but nothing drains it, so the raw staged rows survive
+    // for inspection. `start` returns once setup has installed the triggers.
     let options = ClientOptions {
         staging_worker: true,
         application_threads: 0,
         ..Default::default()
     };
     let _client = TrellisClient::start(db.dsn(), options).expect("client start");
-
-    // Give intake time to reconcile the publication and create the slot
-    // before producing the change we want captured.
-    poll_until(Duration::from_secs(30), "slot never appeared", async || {
-        raw.query_one("select count(*) from pg_replication_slots", &[])
-            .await
-            .map(|r| r.get::<_, i64>(0) > 0)
-            .unwrap_or(false)
-    })
-    .await;
 
     raw.execute(
         "update posts set author = 'ada2', word_count = 111 where id = 1",
@@ -252,13 +243,11 @@ async fn spike_a_real_replication_delivers_both_parent_images_on_an_author_chang
 
     let old = upd.4.as_deref().expect("old image present");
     let new = upd.5.as_deref().expect("new image present");
+    // Trigger capture (issue #622) images only the columns some reader
+    // needs: nothing reads `author`, so it is in neither image.
     assert!(
-        old.contains("ada") && !old.contains("ada2"),
-        "old image must carry the PRE-change author: {old}"
-    );
-    assert!(
-        new.contains("ada2"),
-        "new image must carry the post-change author: {new}"
+        !old.contains("author") && !new.contains("author"),
+        "an unread column isn't imaged: {old} / {new}"
     );
     assert!(
         old.contains("100"),
@@ -268,9 +257,7 @@ async fn spike_a_real_replication_delivers_both_parent_images_on_an_author_chang
         new.contains("111"),
         "new image must carry the post-change word_count: {new}"
     );
-    // Issue #56: REPLICA IDENTITY FULL marks every column is_key in pgoutput,
-    // but intake overrides that with the real primary key, so the staged key
-    // is still just the PK.
+    // The staged key is the primary key, not every column.
     assert_eq!(
         upd.2, "1",
         "staged key is the primary key, not every column"

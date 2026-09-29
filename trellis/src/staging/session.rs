@@ -168,6 +168,8 @@ impl ProducerSession {
     /// Starts a transaction on this session's connection, for callers that
     /// need to compose [`super::append::append`] with other statements
     /// atomically.
+    // Only intake used this; C8 deletes it (issue #622).
+    #[allow(dead_code)]
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, StagingError> {
         Ok(self.client.transaction().await?)
     }

@@ -1,7 +1,7 @@
 //! The Client runtime (issue #11's runtime increment): the one thing an
-//! embedder starts to get a live Trellis pipeline — publication/slot setup,
-//! CDC intake, ring maintenance (seal/recover/reclaim), and N application
-//! workers draining sealed batches into target tables.
+//! embedder starts to get a live Trellis pipeline — capture-trigger
+//! installation (issue #622), ring maintenance (seal/recover/reclaim), and N
+//! application workers draining sealed batches into target tables.
 //!
 //! [`Client::start`] spawns one dedicated `std::thread` owning its own
 //! `tokio` runtime; everything else described above runs as tasks inside
@@ -12,22 +12,24 @@
 //!
 //! Two independent knobs, per the constructor contract:
 //!
-//! - `staging_worker: bool` — whether this client also owns CDC intake and
-//!   ring maintenance. Exactly one client in a fleet should set this; every
+//! - `staging_worker: bool` — whether this client also owns capture
+//!   installation and ring maintenance. Exactly one client in a fleet should set this; every
 //!   other client (any number of them, across any number of processes) sets
 //!   only `application_threads`.
 //! - `application_threads: usize` — how many app-worker tasks this client
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
 //!
-//! **Which tables to publish** (issue #427, ADR-0016): the staging worker
-//! derives them from the catalog alone ([`defs::publication_tables`]), at
-//! startup and on every reconcile pass. There is no caller-supplied list: a
-//! table joins the publication once a registered definition reads it and
-//! leaves once none does, and the staging worker is the only process that
-//! changes the publication, including after a `DROP`. A staging worker may
-//! start with an empty catalog; it publishes nothing until something is
-//! registered.
+//! **Which tables to capture** (issue #427, ADR-0016, issue #622): the
+//! staging worker derives them from the catalog alone
+//! ([`defs::publication_tables`]), at startup and on every reconcile pass
+//! ([`capture::reconcile`]). There is no caller-supplied list: a table's
+//! capture triggers are installed once a registered definition reads it and
+//! uninstalled once none does, and the staging worker is the only process
+//! that changes them, including after a `DROP`. A staging worker may start
+//! with an empty catalog; it captures nothing until something is registered.
+//! Changes are staged by the triggers in the writers' own transactions;
+//! nothing reads the WAL.
 //!
 //! **Wake channel**: [`ClientOptions::wake_channel`] is the one Postgres
 //! `LISTEN/NOTIFY` channel intake's linchpin (`stage_and_advance`), the
@@ -46,6 +48,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_postgres::config::Host;
 
+use crate::capture::{self, CaptureError};
 use crate::config::Config;
 use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
@@ -68,17 +71,18 @@ use crate::staging::{
 /// two the constructor contract calls out.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
-    /// Whether this client owns CDC intake and ring maintenance
+    /// Whether this client owns capture installation and ring maintenance
     /// (seal/recover/reclaim). Exactly one client in a fleet should set
     /// this.
     pub staging_worker: bool,
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
     pub application_threads: usize,
-    /// The logical replication slot name intake owns.
+    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
+    /// removes it.
     pub slot: String,
-    /// The publication name intake reconciles membership against. Created
-    /// (empty) if it doesn't already exist.
+    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
+    /// removes it.
     pub publication: String,
     /// The `LISTEN/NOTIFY` channel shared by intake's linchpin, backfill
     /// discharge, apply's downstream propagation, and every idle app-worker
@@ -115,10 +119,11 @@ pub struct ClientOptions {
     /// The window [`staging::count_live_drainers`] uses to size a claim's
     /// share of a batch's buckets.
     pub drainer_window: Duration,
-    /// Intake's txn-buffer spill threshold (bytes) — see
-    /// [`intake::spill::TxnBuffer`].
+    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
+    /// removes it.
     pub spill_threshold: usize,
-    /// Intake's txn-buffer hard cap (bytes).
+    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
+    /// removes it.
     pub hard_cap: usize,
     /// The out-of-band heartbeat daemon's tick interval and idle-exit
     /// timeout, one per app-worker task. The same interval also paces each
@@ -130,17 +135,8 @@ pub struct ClientOptions {
     /// delivery, and the only wake source while the listener connection is
     /// down: the worker reopens it in the background with backoff).
     pub poll_interval: Duration,
-    /// Issue #274 (epic #269): batches several source transactions into one
-    /// ring transaction instead of one ring transaction per source commit —
-    /// #266's B4 found the un-grouped path walls at ~17k rows/sec at the
-    /// one-row-per-commit shape closest to real application traffic.
-    /// Defaults to `Some(GroupCommitConfig::default())` (1,000 rows / 5 ms) —
-    /// this is the shipped, default-on behavior. `None` is an explicit
-    /// escape hatch back to the original one-ring-transaction-per-source-commit
-    /// path, kept for callers who need every source commit to land as its
-    /// own ring transaction (e.g. to bound worst-case per-row latency more
-    /// tightly than the batch's `max_delay`, at the cost of this option's
-    /// whole point). See [`intake::GroupCommitConfig`]'s own doc comment.
+    /// Ignored since trigger capture replaced intake (issue #622 C5); C8
+    /// removes it.
     pub group_commit: Option<intake::GroupCommitConfig>,
     /// The most folded records one drain batch holds at once (issue #620,
     /// ADR-0002): a segment share larger than this drains in pages of at most
@@ -518,88 +514,30 @@ async fn run(
         }
     };
 
-    if options.staging_worker
-        && let Err(err) = setup_staging(&dsn, &config, &options, &pool).await
-    {
-        let _ = ready_tx.send(Err(err));
-        return;
-    }
-
-    // Issue #132, epic #127, guard (a): one shared in-process
-    // "staged-through" watermark, constructed here — before
-    // `intake::Intake::connect` below, per that issue's own wiring note —
-    // and cloned into both the intake task (which advances it) and every
-    // app-worker task's `AppWorkerConfig` below (which reads it, via the
-    // drain path's `check_reverse_guards`).
-    //
-    // **Known limitation, worth flagging explicitly**: this only advances
-    // for real when `options.staging_worker` is set on *this* client — an
-    // `Arc<AtomicU64>` is inherently process-local. A fleet topology where
-    // `application_threads > 0` clients run in a *different* process from
-    // the one `staging_worker: true` client (a legal, documented topology —
-    // see this module's own doc comment), a drain-only client's watermark
-    // here never advances past its `StagedWatermark::new()` starting point
-    // (LSN 0), so guard (a) fails closed for every relationship reverse
-    // record such a worker ever processes, falling back to the
-    // image-less-recompute stopgap every time rather than ever taking the
-    // true-delta fast path. That's always *safe* (guard (a) failing closed
-    // never corrupts anything — see `StagedWatermark::new`'s own doc
-    // comment), just needlessly conservative for that specific multi-process
-    // topology; propagating a cross-process watermark (e.g. by polling
-    // `replication_progress` somehow without reintroducing the 10-second
-    // sawtooth this issue's own §5 measured as wrong) is out of scope here.
-    let watermark = staging::StagedWatermark::new();
-
-    let mut intake_task = None;
-    let mut maintenance_task = None;
+    let mut staging_session = None;
     if options.staging_worker {
-        let intake_config = match build_intake_config(&dsn, &config, &options) {
-            Ok(cfg) => cfg,
+        match setup_staging(&dsn, &config, &pool).await {
+            Ok(session) => staging_session = Some(session),
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
                 return;
             }
-        };
-        let intake =
-            match intake::Intake::connect(&intake_config, watermark.clone(), pool.clone()).await {
-                Ok(intake) => intake,
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err.into()));
-                    return;
-                }
-            };
-        // Intake's replication consumer has no built-in cancellation, but
-        // it's crash-safe and resumable (acked LSNs are durable, and a
-        // fresh `Intake::connect` resumes from the last confirmed
-        // position), so it's safe to `.abort()` outright on shutdown rather
-        // than needing a cooperative exit path. The same property lets
-        // `supervise_intake` restart it after it stops (issue #325).
-        let mut connected = Some(intake);
-        let intake_watermark = watermark.clone();
-        let intake_pool = pool.clone();
-        intake_task = Some(tokio::spawn(async move {
-            let slot = intake_config.slot.clone();
-            supervise_intake(&slot, INTAKE_RESTART_BACKOFF, move || {
-                let connected = connected.take();
-                let config = intake_config.clone();
-                let watermark = intake_watermark.clone();
-                let pool = intake_pool.clone();
-                async move {
-                    let mut intake = match connected {
-                        Some(intake) => intake,
-                        None => intake::Intake::connect(&config, watermark, pool).await?,
-                    };
-                    intake.run().await
-                }
-            })
-            .await;
-        }));
+        }
+    }
 
+    // Issue #132's guard (a) reads this "staged-through" watermark. Trigger
+    // capture (issue #622 C5) stages every change in its writer's own
+    // transaction, so every commit a snapshot can see is already in the ring:
+    // the watermark is always caught up, in every process of a fleet.
+    let watermark = staging::StagedWatermark::saturated();
+
+    let mut maintenance_task = None;
+    if let Some(session) = staging_session {
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
             pool: pool.clone(),
-            publication: options.publication.clone(),
+            session,
             wake_channel: options.wake_channel.clone(),
             interval: options.maintenance_interval,
             reclaim_ttl: options.reclaim_ttl,
@@ -667,9 +605,6 @@ async fn run(
     // signal here too, then join everything.
     let _ = shutdown_rx.changed().await;
 
-    if let Some(task) = intake_task {
-        task.abort();
-    }
     if let Some(task) = maintenance_task {
         let _ = task.await;
     }
@@ -693,6 +628,8 @@ async fn run(
 }
 
 /// [`supervise_intake`]'s production backoff: 1s doubling to a 60s cap.
+// Intake no longer runs (issue #622 C5); C8 deletes this with it.
+#[allow(dead_code)]
 const INTAKE_RESTART_BACKOFF: RestartBackoff =
     RestartBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
@@ -700,6 +637,7 @@ const INTAKE_RESTART_BACKOFF: RestartBackoff =
 /// that stayed up for at least `max` counts as healthy, so the streak (and
 /// the delay) resets: a transient blip hours after the last one retries
 /// after `initial`, not after whatever a long-past streak escalated to.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct RestartBackoff {
     initial: Duration,
@@ -707,6 +645,7 @@ struct RestartBackoff {
     current: Duration,
 }
 
+#[allow(dead_code)]
 impl RestartBackoff {
     const fn new(initial: Duration, max: Duration) -> Self {
         Self {
@@ -795,6 +734,7 @@ impl RestartBackoff {
 /// `staging_worker` client that took the lock over is the other
 /// possibility; it reads `0` while this one climbs, so a fleet that
 /// deliberately runs one aggregates with `min by (slot)`.
+#[allow(dead_code)]
 async fn supervise_intake<A, Fut>(slot: &str, mut backoff: RestartBackoff, mut attempt: A)
 where
     A: FnMut() -> Fut,
@@ -901,112 +841,54 @@ fn uniqueish_id() -> String {
 }
 
 // ---------------------------------------------------------------------
-// Staging setup: publication + slot
+// Staging setup: the staging-worker singleton and the first capture pass
 // ---------------------------------------------------------------------
 
-/// Reconciles the publication's membership against the tables the catalog
-/// says to publish ([`defs::publication_tables`], the same set every
-/// [`reconcile_source_tables`] pass derives), then creates the slot if it is
-/// fresh (no `replication_progress` row yet), parking a backfill marker on
-/// every one of those tables
-/// ([`intake::publication::create_slot_and_park_markers`]). An empty catalog
-/// is fine: the publication and slot start empty, and the maintenance loop
-/// adds each table once something registered reads it. For an
-/// existing slot, first recovers from that slot's loss if it has been lost
-/// ([`intake::slot_loss::pause_if_slot_lost`], issue #310). Either way, every
-/// backfill marker is left for the maintenance loop (issue #312; see the
-/// comment in the body). Not safe to call concurrently with
-/// another client's own staging setup against the same slot — callers are
-/// expected to run exactly one staging worker per fleet, per this module's
-/// doc comment.
+/// Takes the staging-worker singleton and runs one capture reconcile pass
+/// ([`capture::reconcile::reconcile`], issue #622 C5), parking a marker for
+/// every definition the pass finds ready. The maintenance loop's first pass
+/// discharges them.
 ///
-/// Uses a dedicated [`ProducerSession`] (not the pool): the session guards
-/// (`synchronous_commit`, the producer singleton advisory lock) are
-/// connection-scoped, and this function's session is released before
-/// [`intake::Intake::connect`] opens its own — two `ProducerSession`s (or a
-/// `ProducerSession` and `Intake::connect`'s internal one) held
-/// concurrently on the same database would collide on that lock.
+/// Returns the [`ProducerSession`] that holds the singleton. The
+/// maintenance loop runs every step on it, and re-takes the singleton when it
+/// reconnects, so the lock is held for as long as the staging worker runs and
+/// `liveness::has_live_staging_worker` reads it from `pg_locks`. A second
+/// staging worker for the same instance fails here with
+/// [`StagingError::ProducerAlreadyRunning`].
+///
+/// A table whose capture can't be installed yet (a lock held on it, a
+/// missing primary key) doesn't fail the start: the pass logs it, and every
+/// maintenance pass tries again.
 async fn setup_staging(
     dsn: &str,
     config: &Config,
-    options: &ClientOptions,
     pool: &Pool,
-) -> Result<(), ClientError> {
-    let tables = defs::publication_tables(pool).await?;
+) -> Result<ProducerSession, ClientError> {
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
-
-    ensure_publication_exists(session.client(), &options.publication).await?;
-    intake::publication::reconcile_publication(session.client_mut(), &options.publication, &tables)
-        .await?;
-
-    let has_progress: bool = session
-        .client()
-        .query_one(
-            "select exists(select 1 from replication_progress where slot_name = $1)",
-            &[&options.slot],
-        )
-        .await?
-        .get(0);
-
-    if has_progress {
-        // Issue #310: a slot this instance confirmed work against may be gone
-        // (retention-cap invalidation, a pre-PG-17 failover, a restore of the
-        // source database). Checked here, before anything else runs against
-        // it, so a lost slot pauses every transform it fed and recreates
-        // itself instead of `Intake::connect` refusing to start — see
-        // `intake::slot_loss`. Nothing resumes until an operator says so.
-        intake::slot_loss::pause_if_slot_lost(
-            &mut session,
-            pool,
-            &options.slot,
-            &options.publication,
-        )
-        .await?;
-        // An existing slot's pending backfill markers are deliberately *not*
-        // discharged here. Intake isn't running yet, so an enumeration now
-        // would stage `Recompute` rows ahead of the CDC it is about to
-        // replay for changes that enumeration already saw, and an aggregate
-        // would count those changes twice (issue #312). The maintenance
-        // loop's first pass, which runs as soon as intake is up, discharges
-        // them behind `run_pending_backfills`'s wait for intake instead.
-    } else {
-        // Issue #417: reads nothing. For the same reason as above, the
-        // markers this parks are discharged by the maintenance loop once
-        // intake is running.
-        intake::publication::create_slot_and_park_markers(&mut session, &options.slot, &tables)
-            .await?;
-    }
-
-    // Release the producer singleton on the server before `Intake::connect`
-    // takes it on its own connection. Dropping the session would free it
-    // only once the backend noticed the closed socket, which can be after
-    // `Intake::connect`'s `pg_try_advisory_lock` has already failed.
-    session.release().await?;
-    Ok(())
+    let tables = defs::publication_tables(pool).await?;
+    let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
+    let outcome =
+        capture::reconcile::reconcile(session.client_mut(), config.schema(), &tables, deadline)
+            .await
+            .map_err(capture_pass_error)?;
+    intake::publication::park_ready_registration_markers(session.client(), &outcome.ready).await?;
+    Ok(session)
 }
 
-/// `reconcile_publication` only ever alters an existing publication's
-/// membership — it never creates one (see its own doc comment) — so this is
-/// the one place that does, if `publication` doesn't already exist.
-async fn ensure_publication_exists(
-    client: &tokio_postgres::Client,
-    publication: &str,
-) -> Result<(), tokio_postgres::Error> {
-    let exists: bool = client
-        .query_one(
-            "select exists(select 1 from pg_publication where pubname = $1)",
-            &[&publication],
-        )
-        .await?
-        .get(0);
-    if !exists {
-        client
-            .batch_execute(&format!("create publication {}", quote_ident(publication)))
-            .await?;
+/// The [`ClientError`] for a capture pass that couldn't run at all. Only
+/// reading the catalog fails a pass; a table's own failure is in its outcome.
+fn capture_pass_error(err: CaptureError) -> ClientError {
+    match err {
+        CaptureError::Catalog(err) => ClientError::Catalog(err),
+        CaptureError::Db(err) => ClientError::Db(err),
+        CaptureError::Marker(err) => ClientError::Intake(err),
+        // Not raised by a pass as a whole.
+        other => ClientError::Config(crate::error::Error::Config(other.to_string())),
     }
-    Ok(())
 }
 
+// Intake no longer runs (issue #622 C5); C8 deletes this with it.
+#[allow(dead_code)]
 /// Decomposes `dsn` into the discrete host/port/user/password/database
 /// fields [`IntakeConfig`] needs for its *replication* connection (the
 /// `pgwire_replication` transport takes these fields directly, not a DSN
@@ -1064,14 +946,16 @@ struct MaintenanceConfig {
     dsn: String,
     schema: String,
     pool: Pool,
-    publication: String,
+    /// The staging-worker singleton [`setup_staging`] took; the loop's own
+    /// connection.
+    session: ProducerSession,
     wake_channel: String,
     interval: Duration,
     reclaim_ttl: Duration,
     reconcile_interval: Duration,
-    /// Intake's staged-through watermark, which a backfill enumeration waits
-    /// on before staging (issue #312; see
-    /// [`intake::publication::run_pending_backfills`]).
+    /// The staged-through watermark a backfill enumeration waits on before
+    /// staging (issue #312). Always caught up under trigger capture (issue
+    /// #622 C5), so the wait is a no-op; the discharge's fence wait stays.
     watermark: staging::StagedWatermark,
     /// [`BACKFILL_CATCH_UP_TIMEOUT`] outside tests.
     backfill_catch_up_timeout: Duration,
@@ -1086,13 +970,18 @@ struct MaintenanceConfig {
 /// operations that must not be duplicated across every client in a fleet.
 ///
 /// Holds one dedicated connection across ticks (reconnecting lazily on
-/// error) rather than opening a fresh one every tick.
+/// error) rather than opening a fresh one every tick. That connection is a
+/// [`ProducerSession`]: it holds the staging-worker singleton (issue #622
+/// C5), and a reconnect takes it again. While another session holds it (this
+/// worker's previous backend, until the server notices it is gone, or another
+/// staging worker that took over), the reconnect fails and is retried every
+/// tick.
 async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let MaintenanceConfig {
         dsn,
         schema,
         pool,
-        publication,
+        session,
         wake_channel,
         interval,
         reclaim_ttl,
@@ -1102,32 +991,30 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     } = config;
 
     let seal_config = SealConfig::default();
-    let mut client: Option<tokio_postgres::Client> = None;
+    let mut session: Option<ProducerSession> = Some(session);
     let mut failures = StepFailures::default();
     // Due immediately on the very first tick rather than waiting a full
     // `reconcile_interval` after startup — `setup_staging` already ran one
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
-    // Issue #310: due immediately too, so a restart with transforms still
-    // paused by an earlier slot loss names them right away rather than a
-    // minute in.
-    let mut next_slot_loss_reminder = Instant::now();
     // Issue #476: whether a fresh marker may pull the next reconcile pass
     // forward. See [`early_pass_allowed`].
     let mut early_pass = true;
 
     loop {
         if *shutdown_rx.borrow() {
+            release_singleton(session).await;
             return;
         }
 
-        if client.is_none() {
-            let connected = connect_plain(&dsn, &schema).await;
-            client = failures.check("connect", connected).ok();
+        if session.is_none() {
+            let connected = ProducerSession::connect(&dsn, &schema).await;
+            session = failures.check("connect", connected).ok();
         }
 
-        if let Some(c) = client.as_mut() {
+        if let Some(held) = session.as_mut() {
+            let c = held.client_mut();
             let sealed = staging::seal_if_active_nonempty(c, &wake_channel).await;
             let mut failed = failures.check("seal", sealed).is_err();
             if !failed {
@@ -1172,14 +1059,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     }
                 }
             }
-            if !failed && Instant::now() >= next_slot_loss_reminder {
-                // Best-effort like the gauge above: a failed read skips one
-                // reminder, and the next is at most a minute away.
-                let reminded = intake::slot_loss::log_slot_loss_reminder(&*c).await;
-                let _ = failures.check("slot_loss_reminder", reminded);
-                next_slot_loss_reminder =
-                    Instant::now() + intake::slot_loss::SLOT_LOSS_REMINDER_INTERVAL;
-            }
             if !failed && early_pass && Instant::now() < next_reconcile {
                 // Issue #476: a marker nothing has fenced yet (a finished
                 // build's go-live catch-up, say) is discharged on this tick,
@@ -1192,18 +1071,16 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
             }
             if !failed && Instant::now() >= next_reconcile {
-                // A backfill enumeration can sit waiting for intake to catch
-                // up (issue #312), and intake is the first task shutdown
-                // stops. The wait therefore watches the shutdown signal
-                // itself and gives up by rolling the discharge back, leaving
-                // its definitions `waiting_to_backfill` for the next start
-                // (see `run_pending_backfills_until`).
+                // A discharge can sit waiting for a fresh fence to settle
+                // (issue #431). The wait watches the shutdown signal itself
+                // and gives up by leaving the marker for the next start (see
+                // `run_pending_backfills_until`).
                 let shutting_down = || *shutdown_rx.borrow();
                 let started = Instant::now();
                 let reconciled = reconcile_source_tables(
                     c,
                     &pool,
-                    &publication,
+                    &schema,
                     &wake_channel,
                     &watermark,
                     backfill_catch_up_timeout,
@@ -1220,26 +1097,67 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // Drop and reconnect next tick rather than spin on a wedged
                 // connection; every one of these operations is naturally
                 // idempotent/retriable, so skipping a tick costs nothing but
-                // latency.
-                client = None;
+                // latency. The singleton is released first where the
+                // connection still works, so the reconnect can take it again
+                // at once.
+                release_singleton(session.take()).await;
             }
         }
 
         tokio::select! {
-            _ = shutdown_rx.changed() => return,
+            _ = shutdown_rx.changed() => {
+                release_singleton(session).await;
+                return;
+            }
             _ = tokio::time::sleep(interval) => {}
         }
     }
 }
 
-/// How long one [`reconcile_source_tables`] pass retries its `ALTER
-/// PUBLICATION` while a table it adds or drops is locked (issue #621). The
-/// first attempt always runs, and a further one only if it could end within
-/// the budget. An attempt waits up to
-/// `locks::share_update_exclusive_ddl_timeout` (2 s at the default
-/// `deadlock_timeout`), longer than this, so a pass makes exactly one
-/// attempt. One is enough to cancel a blocking autovacuum, and it holds up
-/// the sealer for at most that one attempt per `reconcile_interval`.
+/// One staging-worker reconcile pass, exactly as the maintenance loop runs it
+/// ([`reconcile_source_tables`]), for tests that step the staging worker by
+/// hand (issue #622 C5). The error is the pass's, as text.
+#[cfg(feature = "internals")]
+pub async fn reconcile_pass(
+    client: &mut tokio_postgres::Client,
+    pool: &Pool,
+    schema: &str,
+    wake_channel: &str,
+    catch_up_timeout: Duration,
+) -> Result<(), String> {
+    reconcile_source_tables(
+        client,
+        pool,
+        schema,
+        wake_channel,
+        &staging::StagedWatermark::saturated(),
+        catch_up_timeout,
+        &|| false,
+    )
+    .await
+    .map_err(|err| err.to_string())
+}
+
+/// Releases the staging-worker singleton on the server, if `session` holds
+/// it and its connection still works, so the next session to ask for it (a
+/// reconnect, a restarted client) gets it at once instead of waiting for the
+/// server to notice the dropped connection.
+async fn release_singleton(session: Option<ProducerSession>) {
+    if let Some(held) = session
+        && !held.client().is_closed()
+    {
+        let _ = held.release().await;
+    }
+}
+
+/// How long one [`reconcile_source_tables`] pass spends retrying capture
+/// installs, widens and uninstalls on tables whose lock is held (ADR-0002
+/// I6, issue #622 C5). Each attempt waits at most
+/// `locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for the table, so no
+/// application writer queues behind one for longer. The first attempt on
+/// each table always runs, so one blocked table can't starve another. The
+/// maintenance loop is the only sealer, so this is also about the longest a
+/// pass holds up sealing on locks.
 const RECONCILE_DDL_BUDGET: Duration = Duration::from_secs(1);
 
 /// Whether [`maintenance_loop`] may run its next reconcile pass early, as
@@ -1470,6 +1388,7 @@ fn released_buckets(released: &[(i64, i16)]) -> String {
 enum ReconcileError {
     Catalog(CatalogError),
     Intake(IntakeError),
+    Capture(CaptureError),
 }
 
 impl fmt::Display for ReconcileError {
@@ -1477,7 +1396,14 @@ impl fmt::Display for ReconcileError {
         match self {
             ReconcileError::Catalog(err) => write!(f, "{err}"),
             ReconcileError::Intake(err) => write!(f, "{err}"),
+            ReconcileError::Capture(err) => write!(f, "{err}"),
         }
+    }
+}
+
+impl From<CaptureError> for ReconcileError {
+    fn from(err: CaptureError) -> Self {
+        ReconcileError::Capture(err)
     }
 }
 
@@ -1493,99 +1419,68 @@ impl From<IntakeError> for ReconcileError {
     }
 }
 
-/// How long one discharge pass lets a backfill enumeration wait for intake
-/// to stage through the enumeration's snapshot before deferring it to the
-/// next pass (issue #312; see [`intake::publication::run_pending_backfills`]).
-/// Intake normally trails the source by milliseconds. The wait only runs this
-/// long when intake is replaying a backlog. The same bound applies to the
-/// pass's wait for the fences it just took to settle (issue #431), which runs
-/// this long only while a long transaction is open. The maintenance loop does
-/// no sealing while either waits, so this is also the longest seal stall one
-/// pass can add: a deferral ends the pass, and a fence wait that runs out
-/// leaves the pass's intake waits no time, so neither stall is repeated.
-/// The value is a judgement call, not a measured bound. While intake stays
-/// further behind than this, markers keep deferring and their definitions
-/// stay `waiting_to_backfill`.
+/// How long one discharge pass waits for the fences it just took to settle
+/// (issue #431) before leaving their markers for a later pass. It runs this
+/// long only while a long transaction is open elsewhere in the cluster. The
+/// maintenance loop does no sealing meanwhile, so this is also the longest
+/// seal stall one pass can add. (It also bounds the discharge's wait for
+/// intake, issue #312, which trigger capture makes a no-op, issue #622 C5.)
+/// The value is a judgement call, not a measured bound.
 const BACKFILL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Issue #14: re-derives the desired source-table set from the catalog
-/// ([`defs::publication_tables`]), then reconciles the publication and
-/// discharges any resulting backfill against that set, re-run periodically
-/// so a transform registered against a new table while this client is
-/// already running is picked up without a restart. [`setup_staging`]
-/// reconciles once at startup but leaves the discharge to this function's
-/// first run, once intake is up.
+/// ([`defs::publication_tables`]), brings every table's capture triggers to
+/// it ([`capture::reconcile::reconcile`], issue #622 C5), parks a marker for
+/// every newly registered definition whose capture is now current, and
+/// discharges the pending markers. Re-run periodically, so a transform
+/// registered while this client runs is picked up without a restart.
 ///
-/// Issue #427, ADR-0016: the catalog is the only input. Nothing else keeps a
-/// table published, so a table leaves the publication on the first pass
-/// after its last reader is dropped, and this is the only place that happens:
-/// a `DROP` removes catalog rows and nothing more. (A startup copy of the set
-/// used to be unioned in as a permanent floor, which re-added a table
-/// registered before the worker started on every pass after its drop.)
+/// Issue #427, ADR-0016: the catalog is the only input. A table's capture is
+/// uninstalled on the first pass after its last reader is dropped, and this
+/// is the only place that happens: a `DROP` removes catalog rows and nothing
+/// more.
 ///
-/// Issue #75, ADR-0007: [`defs::all_source_tables`] returns each table's own
-/// actual, already-persisted qualified identity — this used to instead
-/// return bare suffixes and re-qualify every one of them against one assumed
-/// schema (`Config::target_schema`), which was simply wrong for a source
-/// living anywhere else (including, since issue #76, a definition's own
-/// explicit `FROM <schema>.<source>`): it would either publish/backfill a
-/// same-named decoy in the assumed schema instead of the real table, or fail
-/// outright if no such decoy existed. No re-qualification happens here
-/// anymore — every table `all_source_tables` returns is inserted into
-/// `desired` exactly as given.
+/// The capture pass runs before the discharge, on the same connection, so a
+/// definition is never dispatched before the install or widen its columns
+/// need (see `capture::install`'s "Widening and the capture gate"). The
+/// discharge dispatches only the definitions the pass found ready.
 ///
-/// Takes a plain `&mut tokio_postgres::Client`, not a [`ProducerSession`]:
-/// see [`intake::publication::reconcile_publication`]'s doc comment for why
-/// a fresh `ProducerSession` isn't available here (intake's own session
-/// holds the producer singleton for the client's whole lifetime).
-#[allow(clippy::too_many_arguments)]
+/// The pass gives locked tables [`RECONCILE_DDL_BUDGET`] in all, then leaves
+/// them for the next pass, which comes one `reconcile_interval` later. The
+/// discharge's wait for intake is a no-op (`watermark` is always caught up
+/// under trigger capture); its fence wait stays, because a marker on a
+/// seam-fed table still needs it (#622 plan finding 1).
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
-    publication: &str,
+    schema: &str,
     wake_channel: &str,
     watermark: &staging::StagedWatermark,
     catch_up_timeout: Duration,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), ReconcileError> {
     let desired = defs::publication_tables(pool).await?;
-
-    // The maintenance loop is the only sealer, so it gives the `ALTER
-    // PUBLICATION` one attempt per pass (`RECONCILE_DDL_BUDGET`) to find its
-    // tables free (ADR-0002 I6, issue #621), then leaves the change for the
-    // next pass, which comes one `reconcile_interval` later.
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
-    match intake::publication::reconcile_publication_until(
-        client,
-        publication,
-        &desired,
-        Some(deadline),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(err) if crate::locks::is_lock_not_available(&err) => {}
-        Err(err) => return Err(err.into()),
-    }
+    let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
+    intake::publication::park_ready_registration_markers(&*client, &outcome.ready).await?;
     // The markers whose discharge failed are already logged and backed off on
     // their own rows (issue #407). Only a failure of the pass itself errors,
     // and costs this connection a reconnect.
-    intake::publication::run_pending_backfills_until(
+    intake::publication::run_pending_backfills_for(
         client,
         wake_channel,
         watermark,
         catch_up_timeout,
         stop,
+        Some(&outcome.ready),
     )
     .await?;
     Ok(())
 }
 
 /// Opens a standalone `tokio_postgres` connection with `search_path`
-/// pinned, for callers (the maintenance loop, the wake listener) that need
-/// a concrete `tokio_postgres::Client` rather than a pooled one —
-/// mirroring [`ProducerSession::connect`]'s own connection setup, minus the
-/// session guards ProducerSession enforces (this isn't a producer).
+/// pinned, for the tests that need a concrete `tokio_postgres::Client`.
+#[cfg(test)]
 async fn connect_plain(
     dsn: &str,
     schema: &str,
@@ -2872,7 +2767,9 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: "no_trellis_here".to_string(),
             pool,
-            publication: "test_pub".to_string(),
+            session: ProducerSession::connect(db.dsn(), "no_trellis_here")
+                .await
+                .expect("take the staging-worker singleton"),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             reclaim_ttl: Duration::from_secs(30),
@@ -3444,37 +3341,27 @@ mod backfill_shutdown_tests {
         TransformStatus::from_persisted(&text).expect("known status")
     }
 
-    /// Issue #312 review: shutting down while a backfill enumeration waits
-    /// for intake must leave its definition `waiting_to_backfill` with its
-    /// marker intact, since only `waiting_to_backfill` definitions are ever
-    /// dispatched again. The catch-up timeout here is far longer than the
-    /// test waits for shutdown, so only the shutdown signal can end the wait.
-    /// A doubling alias chain too large for the direct build to inline, so
-    /// it's `Unsupported` there and built by the ring (which waits for
-    /// intake).
+    /// Issue #312 review, restated for trigger capture (issue #622 C5):
+    /// shutting down while a discharge waits must leave its definition
+    /// `waiting_to_backfill` with its marker intact, since only
+    /// `waiting_to_backfill` definitions are ever dispatched again. The wait
+    /// is now the fresh fence's (issue #431), pinned by a transaction left
+    /// open; the catch-up timeout is far longer than the test waits for
+    /// shutdown, so only the shutdown signal can end it.
     #[tokio::test]
     async fn shutdown_during_a_backfill_wait_returns_the_definition_to_waiting() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let mut raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
+        let raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
             .await
             .expect("connect");
         raw.batch_execute(
             "create table public.s (id bigint primary key, a numeric); \
-             alter table public.s replica identity full; \
-             insert into public.s (id, a) select g, g from generate_series(1, 5) g; \
-             create publication test_pub;",
+             insert into public.s (id, a) select g, g from generate_series(1, 5) g;",
         )
         .await
-        .expect("seed source table and publication");
+        .expect("seed source table");
 
-        // An open transaction pins the marker's fence, so the definition
-        // defers to `waiting_to_backfill` instead of enumerating inline.
-        let straggler = testkit::crash::OpenTransaction::begin(db.dsn()).await;
-        straggler.execute("select txid_current()").await;
-        intake::publication::reconcile_publication(&mut raw, "test_pub", &["public.s".to_string()])
-            .await
-            .expect("reconcile leaves an unsettled marker");
         // `testkit`'s pool is the published crate's `Pool`, a different type
         // from this `--lib` build's own, so build one from the same DSN.
         let pool = crate::pool::Pool::new(
@@ -3485,56 +3372,58 @@ mod backfill_shutdown_tests {
             ("id".to_string(), ValueType::Numeric),
             ("a".to_string(), ValueType::Numeric),
         ]);
-        let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
-            .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
-            .collect();
         crate::defs::install_definition(
             &pool,
-            &format!("TRANSFORM t FROM s SELECT {}", chain.join(", ")),
+            "TRANSFORM t FROM s SELECT a + 1 AS f",
             &columns,
             "public",
         )
         .await
-        .expect("install_definition defers");
+        .expect("register");
         assert_eq!(status_of(&raw).await, TransformStatus::WaitingToBackfill);
-        straggler.commit().await;
+
+        // An open transaction pins the fence the first pass takes on the
+        // join marker its capture install parks.
+        let straggler = testkit::crash::OpenTransaction::begin(db.dsn()).await;
+        straggler.execute("select txid_current()").await;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = MaintenanceConfig {
             dsn: db.dsn().to_string(),
             schema: DEFAULT_SCHEMA.to_string(),
             pool,
-            publication: "test_pub".to_string(),
+            session: ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
+                .await
+                .expect("take the staging-worker singleton"),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(50),
             reclaim_ttl: Duration::from_secs(30),
             reconcile_interval: Duration::from_secs(3600),
-            // Intake never runs, so the enumeration waits on this forever.
-            watermark: staging::StagedWatermark::new(),
+            watermark: staging::StagedWatermark::saturated(),
             backfill_catch_up_timeout: Duration::from_secs(600),
         };
         let task = tokio::spawn(maintenance_loop(config, shutdown_rx));
 
-        // The first pass declares the enumeration cursor over `public.s`,
-        // then waits on intake: an event (its lock on the table), not a
+        // The first pass installs capture, parks the join marker and fences
+        // it, then waits on the fence: an event (the recorded fence), not a
         // convergence budget. The bound only turns a hang into a failure.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let enumerating: bool = raw
+            let fenced: bool = raw
                 .query_one(
-                    "select exists(select 1 from pg_locks \
-                     where relation = 'public.s'::regclass and pid <> pg_backend_pid())",
+                    "select exists(select 1 from pending_backfill \
+                     where table_name = 'public.s' and fence_xid is not null)",
                     &[],
                 )
                 .await
-                .expect("read pg_locks")
+                .expect("read the marker")
                 .get(0);
-            if enumerating {
+            if fenced {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "the first maintenance pass never started the enumeration"
+                "the first maintenance pass never fenced the join marker"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3545,6 +3434,7 @@ mod backfill_shutdown_tests {
             .await
             .expect("the maintenance loop must stop promptly on shutdown")
             .expect("maintenance task");
+        straggler.commit().await;
 
         assert_eq!(
             status_of(&raw).await,
@@ -3565,15 +3455,15 @@ mod backfill_shutdown_tests {
 
 #[cfg(test)]
 mod reconcile_tests {
-    //! Issue #427, ADR-0016: the staging worker's reconcile pass is the only
-    //! thing that changes the publication, and the catalog is its only source
-    //! of truth for what to publish. These call [`reconcile_source_tables`]
-    //! directly rather than waiting on a running client (#297).
+    //! Issue #427, ADR-0016, restated for trigger capture (issue #622 C5):
+    //! the staging worker's reconcile pass is the only thing that installs
+    //! or uninstalls capture, and the catalog is its only source of truth for
+    //! what to capture. These call [`reconcile_source_tables`] directly
+    //! rather than waiting on a running client (#297).
     use super::*;
+    use crate::capture::install::{Installed, installed};
     use crate::config::DEFAULT_SCHEMA;
     use crate::defs::ast::ValueType;
-
-    const PUBLICATION: &str = "test_pub";
 
     struct Fixture {
         raw: tokio_postgres::Client,
@@ -3582,45 +3472,54 @@ mod reconcile_tests {
         _cluster: testkit::TestCluster,
     }
 
-    /// `public.s`, already published (as the worker's startup reconcile
-    /// left it), with one registered definition per name in `readers`.
+    /// `public.s`, with one registered definition per name in `readers`,
+    /// captured by a first pass (as the worker's startup reconcile leaves
+    /// it) when there is any.
     async fn fixture(readers: &[&str]) -> Fixture {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let raw = connect_plain(db.dsn(), DEFAULT_SCHEMA)
             .await
             .expect("connect");
-        raw.batch_execute(&format!(
+        raw.batch_execute(
             "create table public.s (id bigint primary key, a numeric); \
-             insert into public.s (id, a) select g, g from generate_series(1, 5) g; \
-             create publication {PUBLICATION} for table public.s;"
-        ))
+             insert into public.s (id, a) select g, g from generate_series(1, 5) g;",
+        )
         .await
-        .expect("seed a published source table");
+        .expect("seed a source table");
         // `testkit`'s pool is the published crate's `Pool`, a different type
         // from this `--lib` build's own, so build one from the same DSN.
         let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("valid config"))
             .expect("build a same-crate pool");
-        let columns = std::collections::HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
         for reader in readers {
-            defs::install_definition(
-                &pool,
-                &format!("TRANSFORM {reader} FROM s SELECT a + 1 AS f"),
-                &columns,
-                "public",
-            )
-            .await
-            .expect("register a reader of `s`");
+            register(&pool, reader).await;
         }
-        Fixture {
+        let mut f = Fixture {
             raw,
             pool,
             _db: db,
             _cluster: cluster,
+        };
+        if !readers.is_empty() {
+            reconcile_pass(&mut f).await;
+            assert!(is_captured(&f.raw).await, "the first pass captures `s`");
         }
+        f
+    }
+
+    async fn register(pool: &Pool, reader: &str) {
+        let columns = std::collections::HashMap::from([
+            ("id".to_string(), ValueType::Numeric),
+            ("a".to_string(), ValueType::Numeric),
+        ]);
+        defs::install_definition(
+            pool,
+            &format!("TRANSFORM {reader} FROM s SELECT a + 1 AS f"),
+            &columns,
+            "public",
+        )
+        .await
+        .expect("register a reader of `s`");
     }
 
     async fn drop_reader(pool: &Pool, target: &str) {
@@ -3634,15 +3533,15 @@ mod reconcile_tests {
     }
 
     /// One pass of the staging worker's reconcile, as the maintenance loop
-    /// runs it. Intake never runs here, so a marker's discharge could only
-    /// wait out the catch-up timeout: keep it short.
+    /// runs it. A freshly fenced marker settles at once here (nothing else
+    /// runs in the database), so the timeout only bounds a surprise.
     async fn reconcile_pass(f: &mut Fixture) {
         reconcile_source_tables(
             &mut f.raw,
             &f.pool,
-            PUBLICATION,
+            DEFAULT_SCHEMA,
             "wake",
-            &staging::StagedWatermark::new(),
+            &staging::StagedWatermark::saturated(),
             Duration::from_millis(200),
             &|| false,
         )
@@ -3650,15 +3549,15 @@ mod reconcile_tests {
         .expect("reconcile pass");
     }
 
-    async fn is_published(raw: &tokio_postgres::Client) -> bool {
-        raw.query_one(
-            "select exists(select 1 from pg_publication_tables \
-             where pubname = $1 and schemaname = 'public' and tablename = 's')",
-            &[&PUBLICATION],
-        )
-        .await
-        .expect("read publication membership")
-        .get(0)
+    async fn is_captured(raw: &tokio_postgres::Client) -> bool {
+        match installed(raw, DEFAULT_SCHEMA, "public.s")
+            .await
+            .expect("read the capture")
+        {
+            Installed::Complete { current, .. } => current,
+            Installed::Absent => false,
+            partial => panic!("a pass leaves no partial install: {partial:?}"),
+        }
     }
 
     async fn marker_count(raw: &tokio_postgres::Client) -> i64 {
@@ -3671,27 +3570,25 @@ mod reconcile_tests {
         .get(0)
     }
 
-    /// The table was registered (and published) before the worker started.
-    /// The facade used to hand the worker a startup copy of the publication
-    /// set, which every pass unioned back in, so after the drop the table was
-    /// re-added (with a fresh marker) on every pass until a restart. Dropping
-    /// its last reader must take it out of the publication on the next pass
-    /// and keep it out.
+    /// The table was registered (and captured) before the worker started.
+    /// Dropping its last reader must uninstall its capture on the next pass
+    /// and keep it uninstalled (issue #427's shape: a startup copy of the set
+    /// once re-added a dropped table on every pass).
     #[tokio::test]
-    async fn a_pass_after_the_last_reader_drops_unpublishes_the_table_for_good() {
+    async fn a_pass_after_the_last_reader_drops_uninstalls_the_capture_for_good() {
         let mut f = fixture(&["t"]).await;
         drop_reader(&f.pool, "t").await;
 
         reconcile_pass(&mut f).await;
         assert!(
-            !is_published(&f.raw).await,
-            "the pass removes a table nothing reads any more"
+            !is_captured(&f.raw).await,
+            "the pass uninstalls a table nothing reads any more"
         );
 
         reconcile_pass(&mut f).await;
         assert!(
-            !is_published(&f.raw).await,
-            "a later pass must not add it back"
+            !is_captured(&f.raw).await,
+            "a later pass must not install it again"
         );
         assert_eq!(
             marker_count(&f.raw).await,
@@ -3701,55 +3598,38 @@ mod reconcile_tests {
     }
 
     #[tokio::test]
-    async fn a_table_with_a_remaining_reader_stays_published() {
+    async fn a_table_with_a_remaining_reader_stays_captured() {
         let mut f = fixture(&["t", "u"]).await;
         drop_reader(&f.pool, "t").await;
 
         reconcile_pass(&mut f).await;
         assert!(
-            is_published(&f.raw).await,
-            "`u` still reads `s`, so it stays published"
+            is_captured(&f.raw).await,
+            "`u` still reads `s`, so it stays captured"
         );
     }
 
-    /// Issue #427: a staging worker may start with nothing registered, so its
-    /// publication starts empty. The pass after the first registration must
-    /// add the table and leave the registration with a capture (a marker, or
+    /// Issue #427: a staging worker may start with nothing registered, so it
+    /// captures nothing. The pass after the first registration must install
+    /// the table's capture and leave the registration with a marker (or
     /// already dispatched by the same pass's discharge), not stranded
     /// `waiting_to_backfill` with nothing to discharge it.
     #[tokio::test]
-    async fn a_first_registration_after_an_empty_start_joins_the_publication() {
+    async fn a_first_registration_after_an_empty_start_installs_capture() {
         let mut f = fixture(&[]).await;
-        f.raw
-            .batch_execute(&format!(
-                "alter publication {PUBLICATION} drop table public.s"
-            ))
-            .await
-            .expect("start from an empty publication");
 
         reconcile_pass(&mut f).await;
         assert!(
-            !is_published(&f.raw).await,
-            "nothing reads `s` yet, so the pass leaves it out"
+            !is_captured(&f.raw).await,
+            "nothing reads `s` yet, so the pass leaves it alone"
         );
 
-        let columns = std::collections::HashMap::from([
-            ("id".to_string(), ValueType::Numeric),
-            ("a".to_string(), ValueType::Numeric),
-        ]);
-        defs::install_definition(
-            &f.pool,
-            "TRANSFORM t FROM s SELECT a + 1 AS f",
-            &columns,
-            "public",
-        )
-        .await
-        .expect("register the first reader");
+        register(&f.pool, "t").await;
 
         reconcile_pass(&mut f).await;
         assert!(
-            is_published(&f.raw).await,
-            "the pass after the first registration publishes its source"
+            is_captured(&f.raw).await,
+            "the pass after the first registration captures its source"
         );
         let status: String = f
             .raw

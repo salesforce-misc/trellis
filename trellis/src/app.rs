@@ -151,13 +151,8 @@ pub struct TrellisOptions {
     /// [`TrellisError::BlockingSpawn`], since a runtime with no worker
     /// threads couldn't run anything anyway.
     pub worker_threads: Option<usize>,
-    /// The publication this connection's staging worker reconciles, and the
-    /// one [`Trellis::request_backfill`] checks a table's membership in.
-    /// `None` (the default) is [`ClientOptions`]' own default publication.
-    ///
-    /// Set it on every connection in a fleet whose staging worker runs a
-    /// non-default publication, including one that runs no background work
-    /// of its own and only calls `request_backfill` (issue #641).
+    /// Ignored: the staging worker captures changes by triggers, not through
+    /// a publication (issue #622). C8 removes it.
     pub publication: Option<String>,
 }
 
@@ -169,10 +164,6 @@ pub struct TrellisOptions {
 pub struct Trellis {
     config: Config,
     pool: Pool,
-    /// The publication resolved from [`TrellisOptions::publication`]: the
-    /// one the background client (if any) runs, and the one
-    /// [`Trellis::request_backfill`] checks.
-    publication: String,
     /// `Some` iff `options.staging || options.drain_threads > 0` — the live
     /// pipeline this connection started.
     client: Option<Client>,
@@ -184,25 +175,20 @@ impl Trellis {
     ///
     /// With the default options nothing background runs — the returned handle
     /// is purely for defining transforms/relationships and inspecting the
-    /// catalog. With `staging` set, CDC intake + ring maintenance start, and
-    /// the staging worker publishes whatever tables the registered
-    /// definitions read (none yet is fine); with a non-zero `drain_threads`,
+    /// catalog. With `staging` set, the staging worker starts: it installs
+    /// capture triggers on whatever tables the registered definitions read
+    /// (none yet is fine) and runs ring maintenance; with a non-zero `drain_threads`,
     /// that many application workers start.
     pub async fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let pool = Pool::new(&config)?;
-        let publication = options
-            .publication
-            .clone()
-            .unwrap_or_else(|| ClientOptions::default().publication);
         let client = if options.staging || options.drain_threads > 0 {
-            Some(Self::start_client(&config, &options, &publication)?)
+            Some(Self::start_client(&config, &options)?)
         } else {
             None
         };
         Ok(Self {
             config,
             pool,
-            publication,
             client,
         })
     }
@@ -607,7 +593,7 @@ impl Trellis {
             .await?;
         let row = txn
             .query_opt(
-                "select d.status, d.id, \
+                "select d.status, d.id, d.source_table, \
                         pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                         pb.last_error as backfill_last_error, \
                         pb.next_attempt_at as backfill_next_attempt_at \
@@ -619,18 +605,52 @@ impl Trellis {
             )
             .await?;
         let mut status = None;
+        let mut capture_wait = None;
         if let Some(row) = &row {
             let status_text: String = row.get(0);
             let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                 panic!("transform_definitions.status held unrecognized value '{status_text}'")
             });
             status = Some(reported_status(&*txn, row.get(1), stored).await?);
+            if stored == TransformStatus::WaitingToBackfill {
+                capture_wait = self.capture_wait(&*txn, row.get(2)).await?;
+            }
         }
         txn.commit().await?;
         Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
             status,
             backfill_failure: backfill_failure(&row),
+            capture_wait,
         }))
+    }
+
+    /// The capture lock wait, if any, holding up a `waiting_to_backfill`
+    /// definition sourced from `source_table` (issue #622 C5): the latest
+    /// [`crate::capture::install::LockWait`] this process's staging worker
+    /// recorded for the source, or for the to-side of a relationship declared
+    /// on it. Only a staging worker running in this process is seen.
+    async fn capture_wait(
+        &self,
+        client: &impl tokio_postgres::GenericClient,
+        source_table: &str,
+    ) -> Result<Option<CaptureWait>, TrellisError> {
+        let schema = self.config.schema();
+        let mut tables = vec![source_table.to_string()];
+        tables.extend(
+            client
+                .query(
+                    "select to_schema || '.' || to_table from relationship_definitions \
+                     where from_schema || '.' || from_table = $1 order by id",
+                    &[&source_table],
+                )
+                .await?
+                .into_iter()
+                .map(|row| row.get::<_, String>(0)),
+        );
+        Ok(tables
+            .iter()
+            .find_map(|table| crate::capture::reconcile::lock_wait(schema, table))
+            .map(|wait| CaptureWait::from(&wait)))
     }
 
     /// Every registered relationship declaration, oldest first.
@@ -674,12 +694,16 @@ impl Trellis {
     /// target, say), refreshes the settled projections of a relationship
     /// whose to-side the table is, and flips the readers back `live`.
     ///
-    /// Only valid for a table that's already a member of this connection's
-    /// publication ([`TrellisOptions::publication`]): a
-    /// never-published table is backfilled in full on first contact by the
-    /// running staging worker, so this is refused there
-    /// ([`TrellisError::TableNotPublished`]). The running staging worker
-    /// discharges the marker.
+    /// Only valid for a table the staging worker captures: one some
+    /// registered definition reads, directly or through a relationship, and
+    /// isn't one of this instance's own targets (issue #622; the set its
+    /// reconcile pass installs capture triggers on). Any other table is
+    /// refused ([`TrellisError::TableNotCaptured`]): nothing reads it, and a
+    /// table's first reader backfills it in full anyway. The check is the
+    /// catalog's, not the triggers': a marker parked before the staging
+    /// worker's install lands is harmless, since the table has no applying
+    /// reader yet and the discharge dispatches no definition whose capture
+    /// isn't current. The running staging worker discharges the marker.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         let mut client = self.pool.get().await?;
         let schema_rows = client
@@ -695,20 +719,11 @@ impl Trellis {
             .get(0);
         let qualified = format!("{schema}.{source_table}");
 
-        let publication = &self.publication;
-        let already_published: bool = client
-            .query_one(
-                "select exists(select 1 from pg_publication_tables \
-                 where pubname = $1 and schemaname = $2 and tablename = $3)",
-                &[&publication, &schema, &source_table],
-            )
+        let captured = crate::defs::publication_tables(&self.pool)
             .await?
-            .get(0);
-        if !already_published {
-            return Err(TrellisError::TableNotPublished {
-                table: qualified,
-                publication: publication.clone(),
-            });
+            .contains(&qualified);
+        if !captured {
+            return Err(TrellisError::TableNotCaptured { table: qualified });
         }
 
         // A failure to park is a plain `Db` error.
@@ -1072,14 +1087,15 @@ impl Trellis {
     /// forever. `false` here is that misconfiguration. A healthy fleet
     /// needs both checks to be `true`.
     ///
-    /// **"Running" means holding the producer singleton**, the
-    /// session-scoped advisory lock the staging worker's intake holds on its
-    /// own connection for as long as it streams (see
+    /// **"Running" means holding the staging-worker singleton**, the
+    /// session-scoped advisory lock the staging worker's maintenance loop
+    /// holds on its own connection for as long as it runs (see
     /// `staging::ProducerSession`). One `pg_locks` read, no
     /// heartbeat: a crashed worker's connection closes and Postgres frees
-    /// the lock with it. It also reads `false` while a failed intake waits
-    /// to restart (up to a minute between attempts), during which nothing
-    /// is captured either.
+    /// the lock with it. It also reads `false` for the tick or so the loop
+    /// takes to reconnect after a failed step. Changes are captured by
+    /// triggers in the application's own transactions meanwhile (issue #622),
+    /// but nothing seals or dispatches a backfill.
     pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
         let client = self.pool.get().await?;
         Ok(crate::staging::session::producer_is_running(&**client, self.config.schema()).await?)
@@ -1138,14 +1154,10 @@ impl Trellis {
     /// that's later, since every poll gets at least that long (issue #596).
     /// So even a zero `timeout` makes one real check.
     ///
-    /// `token` is `pg_current_wal_lsn()`, which normally sits *ahead* of the
-    /// caller's own commit: any unrelated WAL (another backend, a write to an
-    /// unpublished table, the engine's own bookkeeping) advances it, and none
-    /// of it gives intake a change to confirm. When intake is behind the
-    /// token, this writes one `trellis.converge` logical decoding message
-    /// (`pg_logical_emit_message`, executable by `PUBLIC` by default), which
-    /// intake confirms through as soon as it decodes it, so a quiet stream
-    /// converges as fast as a busy one (issue #452).
+    /// Capture triggers write a change's ring rows in the writer's own
+    /// transaction (issue #622), so every commit at or below `token` is
+    /// already in the ring when the token is read: this waits only for the
+    /// ring rows at or below it to drain, and writes nothing.
     ///
     /// This waits for captured changes only. It doesn't read definition
     /// status or backfill progress: a definition that isn't
@@ -1214,15 +1226,10 @@ impl Trellis {
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. The staging worker reads the tables to publish from the
     /// catalog itself (issue #427), so an empty catalog is fine.
-    fn start_client(
-        config: &Config,
-        options: &TrellisOptions,
-        publication: &str,
-    ) -> Result<Client, TrellisError> {
+    fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
         let client_options = ClientOptions {
             staging_worker: options.staging,
             application_threads: options.drain_threads,
-            publication: publication.to_string(),
             ..Default::default()
         };
         // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
@@ -1389,6 +1396,53 @@ pub struct DefinitionStatus {
     /// named in [`BackfillFailure::last_error`], not on the discharge's turn.
     /// It clears once the discharge succeeds or the table is parked again.
     pub backfill_failure: Option<BackfillFailure>,
+    /// Set while the definition is `waiting_to_backfill` because the staging
+    /// worker can't yet take the lock it needs to install or widen the
+    /// capture triggers on its source, or on the to-side of a relationship
+    /// declared on it (issue #622). In memory only: reported when the
+    /// staging worker runs in this process.
+    pub capture_wait: Option<CaptureWait>,
+}
+
+/// What a `waiting_to_backfill` definition's capture is waiting on (issue
+/// #622 C5): the staging worker's install or widen of the capture triggers
+/// on a table the definition reads couldn't take the table's lock, because
+/// another session holds or is queued for a conflicting one. Nothing
+/// cancels that session (an autovacuum included), so the definition waits
+/// until it lets go; this names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureWait {
+    /// The qualified table whose lock the capture operation waits for.
+    pub table: String,
+    /// `install`, `widen` or `uninstall`.
+    pub operation: String,
+    /// The lock mode it asks for, as `pg_locks` spells it.
+    pub lock_mode: String,
+    /// When the staging worker first found the table locked.
+    pub waiting_since: SystemTime,
+    /// When it last read who holds the lock.
+    pub observed_at: SystemTime,
+    /// One line per session holding or queued for a conflicting lock: its
+    /// pid (or prepared transaction), backend type (`autovacuum worker`,
+    /// say), lock mode, for how long, and the start of its query.
+    pub blockers: Vec<String>,
+}
+
+impl From<&crate::capture::install::LockWait> for CaptureWait {
+    fn from(wait: &crate::capture::install::LockWait) -> Self {
+        CaptureWait {
+            table: wait.table.clone(),
+            operation: wait.operation.as_str().to_string(),
+            lock_mode: wait.lock_mode.clone(),
+            waiting_since: wait.waiting_since,
+            observed_at: wait.observed_at,
+            blockers: wait
+                .blockers
+                .iter()
+                .map(|blocker| blocker.describe(wait.observed_at))
+                .collect(),
+        }
+    }
 }
 
 /// The retry state of a source table's backfill marker whose discharge has
@@ -1718,9 +1772,10 @@ pub enum TrellisError {
     Db(tokio_postgres::Error),
     /// A named source table doesn't resolve on the connection's search path.
     SourceTableNotFound(String),
-    /// [`Trellis::request_backfill`] was asked to backfill a table that isn't
-    /// a member of the publication yet.
-    TableNotPublished { table: String, publication: String },
+    /// [`Trellis::request_backfill`] was asked to backfill a table no
+    /// registered definition reads, so the staging worker doesn't capture it
+    /// (issue #622).
+    TableNotCaptured { table: String },
     /// [`crate::blocking::BlockingTrellis::connect`]'s background thread
     /// failed to spawn.
     BlockingSpawn(std::io::Error),
@@ -1790,7 +1845,7 @@ impl TrellisError {
             // A backfill request against an unpublished table is a rejected
             // call given the connection's current state — same category as
             // any other invalid-configuration error.
-            TrellisError::TableNotPublished { .. } => ErrorCode::Validation,
+            TrellisError::TableNotCaptured { .. } => ErrorCode::Validation,
             TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
             // Same category as `ClientError`'s equivalent thread-lifecycle
             // variants — an embedder can't do anything about these beyond
@@ -1824,10 +1879,10 @@ impl std::fmt::Display for TrellisError {
             TrellisError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
-            TrellisError::TableNotPublished { table, publication } => write!(
+            TrellisError::TableNotCaptured { table } => write!(
                 f,
-                "\"{table}\" isn't in publication \"{publication}\" yet; run with staging enabled \
-                 and it will be backfilled automatically on first contact"
+                "\"{table}\" isn't captured: no registered transform reads it, and a table's \
+                 first reader backfills it automatically"
             ),
             TrellisError::BlockingSpawn(err) => {
                 write!(f, "failed to spawn BlockingTrellis's runtime thread: {err}")
@@ -1877,7 +1932,7 @@ impl std::error::Error for TrellisError {
             TrellisError::Engine(err) => Some(err),
             TrellisError::Db(err) => Some(err),
             TrellisError::SourceTableNotFound(_)
-            | TrellisError::TableNotPublished { .. }
+            | TrellisError::TableNotCaptured { .. }
             | TrellisError::BlockingThreadExitedBeforeReady
             | TrellisError::BlockingThreadGone
             | TrellisError::CalledFromAsyncContext => None,

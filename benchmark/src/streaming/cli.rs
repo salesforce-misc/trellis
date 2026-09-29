@@ -492,7 +492,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
         }
 
         "write-tax" => {
-            let variants = variants(args, &write_tax::Variant::ALL);
+            let variants = variants(args, &write_tax::DEFAULT_VARIANTS);
             let shapes: Vec<Shape> = match flag(args, "--shapes") {
                 Some(raw) => raw.split(',').map(Shape::parse).collect(),
                 None => write_tax::DEFAULT_SHAPES

@@ -81,6 +81,8 @@ impl StagedWatermark {
     /// no-op, so an out-of-order call (there shouldn't be one; intake is
     /// single-threaded over its own advances) can never regress the
     /// barrier.
+    // Only intake used this; C8 deletes it (issue #622).
+    #[allow(dead_code)]
     pub fn advance(&self, lsn: PgLsn) {
         self.0.fetch_max(u64::from(lsn), Ordering::Relaxed);
     }

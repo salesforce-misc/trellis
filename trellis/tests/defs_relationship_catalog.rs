@@ -555,6 +555,7 @@ async fn a_to_many_to_side_with_default_replica_identity_is_rejected() {
 /// keying guard catches it first: intake can't key a table with no replica
 /// identity at all, whatever the relationship's cardinality.
 #[tokio::test]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_to_many_to_side_with_replica_identity_nothing_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -621,6 +622,7 @@ async fn a_to_many_to_side_with_replica_identity_full_is_accepted() {
 /// *multi-column* unique index that includes the join column: cardinality
 /// stays `ToMany` (the column isn't unique alone) yet the index covers it.
 #[tokio::test]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_to_many_to_side_with_covering_replica_identity_index_is_accepted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -651,6 +653,7 @@ async fn a_to_many_to_side_with_covering_replica_identity_index_is_accepted() {
 /// identity index does NOT cover the join column — the pre-image would carry
 /// the index's columns but not the join key.
 #[tokio::test]
+#[ignore = "#622: deleted in C7/C8"]
 async fn a_to_many_to_side_with_non_covering_replica_identity_index_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -2343,16 +2346,13 @@ async fn a_rejected_relationship_leaves_no_catalog_rows() {
     );
 }
 
-/// Issue #429 review: a table left on `REPLICA IDENTITY USING INDEX` after
-/// its index was dropped is one Postgres treats as `NOTHING`: pgoutput flags
-/// no key column, so intake stops on its first change (`MissingKeyValue`),
-/// and Postgres refuses its updates and deletes once it is published.
-/// `relreplident` still reads `'i'`, which intake's keying check used to take
-/// on trust. Rejected as unkeyed on its side, whether or not the table also
-/// has a primary key (with none, the key lookup used to be what noticed, as
-/// a target-table DDL error).
+/// Issues #375/#429, restated for trigger capture (issue #622 C5): capture
+/// keys every ring row by the primary key, so an endpoint without one is
+/// rejected as unkeyed on its side, whatever its replica identity (here a
+/// `USING INDEX` identity, and one whose index was since dropped), and
+/// whatever the relationship's cardinality.
 #[tokio::test]
-async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unkeyed() {
+async fn an_endpoint_without_a_primary_key_is_rejected_as_unkeyed() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
@@ -2362,14 +2362,11 @@ async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unk
              create unique index orders_id on orders (id); \
              alter table orders replica identity using index orders_id; \
              drop index orders_id; \
-             create table customers (id integer primary key, code integer not null); \
-             create unique index customers_code on customers (code); \
-             alter table customers replica identity using index customers_code; \
-             drop index customers_code; \
+             create table customers (id integer not null, code integer not null); \
+             create unique index customers_id on customers (id); \
+             alter table customers replica identity using index customers_id; \
              create table regions (id integer primary key); \
-             alter table regions replica identity full; \
-             create table visits (id integer primary key, customer integer); \
-             alter table visits replica identity full",
+             create table visits (id integer primary key, customer integer)",
         )
         .await
         .expect("create tables");
@@ -2380,8 +2377,7 @@ async fn an_endpoint_whose_replica_identity_index_was_dropped_is_rejected_as_unk
             RelationshipSide::From,
             "trellis.orders",
         ),
-        // To-many, so nothing else asks the from-side for a replica
-        // identity: before the review fix this one was accepted.
+        // To-many, so nothing else asks the from-side for a key.
         (
             "RELATIONSHIP visits FROM customers.id TO visits.customer",
             RelationshipSide::From,

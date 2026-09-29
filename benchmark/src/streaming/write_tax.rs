@@ -14,12 +14,15 @@
 //!   btree, or ADR-0002 A7's comparator, an expression index on
 //!   `regexp_count(val::text, '[13579]')`. They put the capture numbers next to
 //!   costs application engineers already accept.
-//! - `slot`: today's path. A `trellis::Client` with the staging worker and no
-//!   application threads, so the walsender and intake stage every row and
-//!   nothing drains. Only while intake exists (C8 deletes it).
+//! - `slot`: the path before #622 C5. A `trellis::Client` with the staging
+//!   worker and no application threads, so the walsender and intake staged
+//!   every row and nothing drained. The client stopped running intake in C5,
+//!   so this variant no longer works and isn't in [`DEFAULT_VARIANTS`]; C7
+//!   deletes it. C4's baseline (`local_docs/bench/622-baseline.md`) holds its
+//!   numbers.
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
-//!   from the catalog the way C5's reconcile will.
+//!   from the catalog the way the staging worker's reconcile does.
 //! - `trigger+exception` and `trigger+column-check`: open question Q2's two
 //!   candidate guards against a renamed or dropped read column, as
 //!   benchmark-only rewrites of the installed functions
@@ -132,6 +135,18 @@ pub enum Variant {
     TriggerColumnCheckGuard,
     TriggerColumnCheckPerTxn,
 }
+
+/// Every variant but `slot` (see the module doc).
+pub const DEFAULT_VARIANTS: [Variant; 8] = [
+    Variant::None,
+    Variant::Btree,
+    Variant::RegexIndex,
+    Variant::Trigger,
+    Variant::TriggerException,
+    Variant::TriggerColumnCheck,
+    Variant::TriggerColumnCheckGuard,
+    Variant::TriggerColumnCheckPerTxn,
+];
 
 impl Variant {
     pub const ALL: [Variant; 9] = [

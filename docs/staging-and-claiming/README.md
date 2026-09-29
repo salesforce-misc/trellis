@@ -73,7 +73,7 @@ Each numbered step has its own document:
 
 | # | Stage | Document | The guarantee it owns |
 |---|---|---|---|
-| ① ② | Logical replication → staging, and the acknowledgment | [01-intake-and-lsn-confirmation.md](01-intake-and-lsn-confirmation.md) | The cursor never advances past work that is not durably staged. |
+| ① ② | Capture by triggers → staging | [01-capture-by-triggers.md](01-capture-by-triggers.md) | A change's ring rows commit in the writer's own transaction. |
 | — | The staging area's physical shape | [02-the-staging-ring.md](02-the-staging-ring.md) | Producers never block each other, and no hot-path row is ever updated. |
 | ③ | Sealing: making a batch immutable | [03-sealing-and-the-fence.md](03-sealing-and-the-fence.md) | Every staged row belongs to exactly one batch — none in two, none in zero. |
 | ④ | Claiming and the claim-time fold | [04-claiming-and-the-fold.md](04-claiming-and-the-fold.md) | Parallel workers partition a batch without a lock, and a key's changes collapse losslessly. |
@@ -111,7 +111,7 @@ high-volume ones be append-only and vacuum-free.
 
 ## Reading order
 
-[01](01-intake-and-lsn-confirmation.md) → [02](02-the-staging-ring.md) →
+[01](01-capture-by-triggers.md) → [02](02-the-staging-ring.md) →
 [03](03-sealing-and-the-fence.md) in order — the fence in 03 needs the append
 discipline in 02. [04](04-claiming-and-the-fold.md) and
 [05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair.
