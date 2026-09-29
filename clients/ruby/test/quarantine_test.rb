@@ -26,8 +26,15 @@ class QuarantineTest < Minitest::Test
     await_status("doubled_ledger")
     assert_equal [], Trellis.quarantined
 
+    # One statement, so all five rows land in one batch and its isolation
+    # pass charges the column once per row. Split across batches, the first
+    # row's batch fails alone on each drain cycle, and the row-level fuse
+    # (also five) evicts the key before the column fuse can trip: a
+    # poisoned key no public call releases, which wedges convergence for
+    # every test after this one (#588).
     ids = (1..COLUMN_DEATH_THRESHOLD).to_a
-    ids.each { |id| pg.exec_params("insert into ledger (id, n) values ($1, 2000000000)", [id]) }
+    pg.exec_params("insert into ledger (id, n) select id, 2000000000 from generate_series(1, $1::int) id",
+                   [COLUMN_DEATH_THRESHOLD])
 
     paused = eventually_value("doubled_ledger.doubled to pause",
                               ->(entry) { entry.state == :paused }) do

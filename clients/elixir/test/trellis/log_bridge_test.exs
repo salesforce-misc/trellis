@@ -35,15 +35,22 @@ defmodule Trellis.LogBridgeTest do
     log_a_line(trellis, "no_such_transform_one")
     :ok = LogBridge.flush()
 
-    assert_receive {:logged,
-                    %{
-                      level: :info,
-                      msg: {:string, message},
-                      meta: %{domain: [:elixir, :trellis], target: "trellis::defs::lifecycle"}
-                    }}
+    assert %{
+             level: :info,
+             meta: %{domain: [:elixir, :trellis], target: "trellis::defs::lifecycle"}
+           } = receive_line("drop is a no-op; no such definition transform=no_such_transform_one")
+  end
 
-    assert IO.chardata_to_string(message) ==
-             "drop is a no-op; no such definition transform=no_such_transform_one"
+  # The bridge forwards asynchronously, so lines an earlier test's engine
+  # logged can still be queued when the handler goes on, and `flush/0` hands
+  # them over first. Skips to the event carrying `text`.
+  defp receive_line(text) do
+    receive do
+      {:logged, %{msg: {:string, message}} = event} ->
+        if IO.chardata_to_string(message) == text, do: event, else: receive_line(text)
+    after
+      1_000 -> flunk("#{inspect(text)} was never logged")
+    end
   end
 
   test "lines logged while the bridge is down are forwarded once it restarts", %{

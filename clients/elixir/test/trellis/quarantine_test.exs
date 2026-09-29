@@ -41,11 +41,19 @@ defmodule Trellis.QuarantineTest do
     await_live(trellis, "doubled_ledger")
     assert Trellis.quarantined!(trellis) == []
 
+    # One statement, so all five rows land in one batch and its isolation
+    # pass charges the column once per row. Split across batches, the first
+    # row's batch fails alone on each drain cycle, and the row-level fuse
+    # (also five) evicts the key before the column fuse can trip: a
+    # poisoned key no public call releases, which wedges convergence for
+    # every test after this one (#588).
     ids = Enum.to_list(1..@column_death_threshold)
 
-    for id <- ids do
-      Postgrex.query!(pg, "insert into ledger (id, n) values ($1, 2000000000)", [id])
-    end
+    Postgrex.query!(
+      pg,
+      "insert into ledger (id, n) select id, 2000000000 from unnest($1::int[]) id",
+      [ids]
+    )
 
     paused =
       eventually("doubled_ledger.doubled to pause", fn ->
