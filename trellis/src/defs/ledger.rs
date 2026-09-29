@@ -26,7 +26,8 @@
 
 use std::collections::HashMap;
 
-use super::ast::{Expr, FieldDef, GroupByKey, group_by_contains};
+use super::ast::{Expr, FieldDef, GroupByKey, ValueType, group_by_contains};
+use super::pg_type::PgType;
 use super::registry::lookup_aggregate_function;
 use crate::pool::quote_ident;
 
@@ -137,6 +138,21 @@ pub(crate) fn contributions(
         }
     }
     out
+}
+
+/// The column type of a contribution whose argument has type `value_type`:
+/// the argument's own type, except that fixed-length `bit` is declared `bit
+/// varying`. A bare `bit` column is `bit(1)`, which rejects every wider
+/// argument value (`bit string length 3 does not match type bit(1)`), while
+/// `bit varying` holds any width, and `BIT_AND`/`BIT_OR`/`COUNT` over it give
+/// what they give over the `bit(n)` source column. It is the trap the
+/// registry's `BIT_AND`/`BIT_OR` result type widens around.
+pub(crate) fn contribution_pg_type(value_type: ValueType) -> String {
+    let declared = match value_type {
+        ValueType::Other(PgType::Bit) => ValueType::Other(PgType::VarBit),
+        other => other,
+    };
+    super::ddl::pg_type_name(declared).into_owned()
 }
 
 /// An aggregate call with one argument: a leaf whose argument becomes a

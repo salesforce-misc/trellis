@@ -243,6 +243,75 @@ async fn a_rebuild_replaces_the_ledger() {
     assert_ne!(first_basis, second_basis, "the rebuild's read is a new one");
 }
 
+/// A build that loaded the ledger but failed before its second transaction
+/// rebuilt the key and indexes leaves a ledger with neither. The next build
+/// loads that ledger and gives it back its key and its `GROUP BY` index, so
+/// it never has one without the other.
+#[tokio::test]
+async fn a_rebuild_after_a_build_that_stopped_between_its_transactions_restores_the_keys() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, g bigint, a numeric); \
+             alter table s replica identity full; \
+             insert into s select i, i % 3, i from generate_series(1, 30) i",
+        )
+        .await
+        .expect("seed source");
+    let src = "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total";
+    let cols = HashMap::from([
+        ("g".to_string(), ValueType::Numeric),
+        ("a".to_string(), ValueType::Numeric),
+    ]);
+    build(&db, src, &cols).await;
+    let indexes = "select string_agg(case when i.indisprimary then 'pkey' \
+                       else pg_get_expr(i.indpred, i.indrelid) end, ' | ' order by i.indisprimary desc) \
+                   from pg_index i where i.indrelid = 't__ledger'::regclass";
+    let built = rows(&client, indexes).await;
+    assert_eq!(
+        built,
+        vec![vec![Some(
+            "pkey | (__member AND (NOT __tombstone))".to_string()
+        )]],
+    );
+
+    // What the load's transaction leaves when the rebuild after it never
+    // commits: every entry, and no key or index.
+    let group_index: String = client
+        .query_one(
+            "select indexrelid::regclass::text from pg_index \
+             where indrelid = 't__ledger'::regclass and not indisprimary",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .batch_execute(&format!(
+            "alter table t__ledger drop constraint t__ledger_pkey; drop index {group_index}; \
+             update s set a = 0 where id = 1"
+        ))
+        .await
+        .expect("strip the ledger's key and index");
+    let def = parse(src).expect("parse");
+    backfill_definition(&db.pool, &def, "public", &def.source, &cols)
+        .await
+        .expect("rebuild");
+
+    assert_eq!(rows(&client, indexes).await, built);
+    assert_eq!(
+        rows(
+            &client,
+            "select count(*)::text, (select __arg0::text from t__ledger where __from_key = '1') \
+             from t__ledger"
+        )
+        .await,
+        vec![vec![Some("30".to_string()), Some("0".to_string())]],
+    );
+}
+
 /// A text argument's ledger column carries the collation the argument has
 /// over the source, so `MIN`/`MAX` over the ledger order it the same way. The
 /// test clusters' default collation is ICU `en-US`, which sorts `a` before
@@ -288,5 +357,57 @@ async fn a_text_contribution_keeps_its_arguments_collation() {
     assert_eq!(
         rows(&client, "select lo, hi from t").await,
         vec![vec![Some("B".to_string()), Some("a".to_string())]],
+    );
+}
+
+/// A fixed-length `bit(n)` argument's ledger column is `bit varying`: a bare
+/// `bit` column is `bit(1)`, which rejects the load's first wider value.
+#[tokio::test]
+async fn a_fixed_length_bit_contribution_holds_its_full_width() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    client
+        .batch_execute(
+            "create table s (id bigint primary key, g bigint, b bit(3)); \
+             alter table s replica identity full; \
+             insert into s values (1, 1, B'101'), (2, 1, B'111'), (3, 2, null)",
+        )
+        .await
+        .expect("seed source");
+    build(
+        &db,
+        "TRANSFORM t FROM s GROUP BY g SELECT BIT_AND(b) AS all_bits, BIT_OR(b) AS any_bits, \
+         COUNT(b) AS n",
+        &HashMap::from([
+            ("g".to_string(), ValueType::Numeric),
+            (
+                "b".to_string(),
+                ValueType::Other(trellis::defs::pg_type::PgType::Bit),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        rows(
+            &client,
+            "select g::text, all_bits::text, any_bits::text, n::text from t order by g"
+        )
+        .await,
+        rows(
+            &client,
+            "select g::text, bit_and(b)::text, bit_or(b)::text, count(b)::text \
+             from s group by g order by g"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "select __arg0::text from t__ledger where __from_key = '1'"
+        )
+        .await,
+        vec![vec![Some("101".to_string())]],
     );
 }

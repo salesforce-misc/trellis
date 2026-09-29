@@ -1934,7 +1934,7 @@ pub(crate) async fn aggregate_target_table_ddl(
         .zip(collations)
         .map(|((c, value_type), collation)| super::ledger::LedgerColumn {
             name: c.column.clone(),
-            pg_type: pg_type_name(*value_type).into_owned(),
+            pg_type: super::ledger::contribution_pg_type(*value_type),
             collation,
         })
         .collect();
