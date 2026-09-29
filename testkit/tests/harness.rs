@@ -129,6 +129,43 @@ async fn isolated_databases_do_not_bleed_into_each_other() {
     assert_eq!(rows_b, vec![(1, "from-b".to_string())]);
 }
 
+/// Issue #665: every test database collates the same on every machine,
+/// whatever `LANG` the test runs under. `C.UTF-8` with UTF8 is what GitHub's
+/// ubuntu runners gave by default; before the pin this box's `en_US.UTF-8`
+/// leaked in and a test's `ORDER BY` could pass here and fail on CI. UTF8
+/// also means ICU collations can be created (they can't under `SQL_ASCII`).
+#[tokio::test]
+async fn test_databases_have_a_pinned_locale_and_encoding() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("get connection");
+    let row = client
+        .query_one(
+            "select datcollate, datctype, pg_encoding_to_char(encoding) \
+             from pg_database where datname = current_database()",
+            &[],
+        )
+        .await
+        .expect("read the database's locale");
+    let (collate, ctype, encoding): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!(
+        (collate.as_str(), ctype.as_str(), encoding.as_str()),
+        ("C.UTF-8", "C.UTF-8", "UTF8")
+    );
+
+    // The point of the pin: the default collation orders by code point, so
+    // an uppercase letter sorts before every lowercase one ('B' < 'a'), where
+    // `en_US` would put 'a' first.
+    let order: Vec<String> = client
+        .query("select v from (values ('a'), ('B')) t(v) order by v", &[])
+        .await
+        .expect("order under the default collation")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(order, ["B", "a"]);
+}
+
 /// `dropdb --force` refuses a database whose logical slot is still being
 /// streamed from, which is what a case whose client hasn't finished shutting
 /// down leaves. Dropping the handle must still remove the database and the

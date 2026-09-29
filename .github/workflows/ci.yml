@@ -101,7 +101,11 @@ jobs:
         # naming it here adds only the benchmark crate to the build.
         # generative's `engine_subprocess` binary needs no flag: the same
         # dev-dependency satisfies its `required-features`.
-        run: cargo test --workspace --features benchmark/engine-access
+        #
+        # `--no-fail-fast` so one failing test binary doesn't stop the rest
+        # from running, and one run shows every failure, as `verify` does
+        # locally (issue #665).
+        run: cargo test --workspace --features benchmark/engine-access --no-fail-fast
 
       - name: Prune target/ to third-party dependencies
         # A cold build is ~5.6GB, nearly all of it this workspace's own test

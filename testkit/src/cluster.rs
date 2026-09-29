@@ -298,14 +298,7 @@ impl TestCluster {
                 // A failed `initdb` can leave a partial data dir it would then
                 // refuse to reuse, so clear it before each attempt.
                 let _ = fs::remove_dir_all(&data_dir);
-                let mut cmd = Command::new("initdb");
-                cmd.arg("-D")
-                    .arg(&data_dir)
-                    .arg("-U")
-                    .arg("postgres")
-                    .arg("--auth=trust")
-                    .arg("--no-sync");
-                cmd
+                initdb_command(&data_dir)
             },
             "initdb",
         );
@@ -1202,6 +1195,29 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// The `initdb` every test cluster is made with.
+///
+/// The locale and encoding are pinned rather than taken from `LANG`, so a
+/// test database collates the same on every machine (issue #665). Without
+/// the pin this box's `en_US.UTF-8` gave linguistic ordering while GitHub's
+/// ubuntu runners (`C.UTF-8`) gave bytewise ordering, and a test could pass
+/// here and fail on CI. `C.UTF-8` matches CI: its collation is code-point
+/// order (bytewise for UTF-8), and UTF8 lets ICU collations be created, so a
+/// test *about* linguistic ordering asks for one explicitly instead of
+/// inheriting it from the host.
+fn initdb_command(data_dir: &Path) -> Command {
+    let mut cmd = Command::new("initdb");
+    cmd.arg("-D")
+        .arg(data_dir)
+        .arg("-U")
+        .arg("postgres")
+        .arg("--auth=trust")
+        .arg("--no-sync")
+        .arg("--locale=C.UTF-8")
+        .arg("--encoding=UTF8");
+    cmd
+}
+
 /// Like [`run_to_completion`] but retries on failure with linear backoff,
 /// re-building the command each attempt (so a per-attempt reset — e.g.
 /// clearing a partial data dir — can live in the closure). Panics with the
@@ -1568,14 +1584,7 @@ mod tests {
             run_with_retries(
                 || {
                     let _ = fs::remove_dir_all(&data_dir);
-                    let mut cmd = Command::new("initdb");
-                    cmd.arg("-D")
-                        .arg(&data_dir)
-                        .arg("-U")
-                        .arg("postgres")
-                        .arg("--auth=trust")
-                        .arg("--no-sync");
-                    cmd
+                    initdb_command(&data_dir)
                 },
                 "initdb",
             );

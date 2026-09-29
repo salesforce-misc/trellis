@@ -18,10 +18,10 @@ use trellis::defs::{
     alter_transform, create_relationship, install_definition, parse_statement,
 };
 
-/// Only ICU provides nondeterministic collations. A server built without ICU,
-/// or a cluster whose encoding ICU doesn't support (`SQL_ASCII`, which
-/// `initdb` picks under `LANG=C`), refuses the `CREATE COLLATION` with
-/// `0A000`, and this returns `false` so the caller skips (the same pattern as
+/// Only ICU provides nondeterministic collations. The testkit pins every
+/// cluster to UTF8 (#665), which ICU supports, so only a server built without
+/// ICU refuses the `CREATE COLLATION` (with `0A000`); this returns `false`
+/// then so the caller skips (the same pattern as
 /// `defs_relationship_catalog.rs`'s nondeterministic join-column test).
 async fn create_case_insensitive_collation(pool: &trellis::pool::Pool) -> bool {
     let client = pool.get().await.expect("get connection");

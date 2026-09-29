@@ -842,11 +842,11 @@ async fn join_columns_with_different_collations_are_rejected() {
 /// share it. Its `=` matches `'A'` to `'a'`; the engine's exact-text key
 /// match doesn't.
 ///
-/// Only ICU provides nondeterministic collations. A server built without ICU,
-/// or a cluster whose encoding ICU doesn't support (`SQL_ASCII`, which
-/// `initdb` picks under `LANG=C`), refuses the `CREATE COLLATION` with
-/// `0A000`; the test skips then, and the pure check is still covered by
-/// `defs::catalog`'s `join_column_tests`.
+/// Only ICU provides nondeterministic collations. The testkit pins every
+/// cluster to UTF8 (#665), which ICU supports, so only a server built without
+/// ICU refuses the `CREATE COLLATION` (with `0A000`); the test skips then,
+/// and the pure check is still covered by `defs::catalog`'s
+/// `join_column_tests`.
 #[tokio::test]
 async fn a_nondeterministic_collation_join_column_is_rejected() {
     let cluster = TestCluster::start();
