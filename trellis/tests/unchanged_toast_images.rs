@@ -180,3 +180,75 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     }
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// Issue #677's note for #622 C5: the case intake could never fix. A 1:1
+/// source *without* `REPLICA IDENTITY FULL` whose definition reads a TOASTed
+/// column: pgoutput left the unchanged column out of an `UPDATE`'s new tuple
+/// and there was no old tuple to fill it from, so the key was poisoned.
+/// Trigger capture reads the transition table, which carries the whole row
+/// detoasted, so the update converges.
+#[tokio::test]
+async fn an_unchanged_toasted_column_of_a_default_identity_source_converges() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(&format!(
+        "create table docs (id bigint primary key, body text, n int); \
+         alter table docs alter column body set storage external; \
+         insert into docs values (1, {b}, 1), (2, 'short', 2);",
+        b = big(3),
+    ))
+    .await
+    .expect("seed");
+
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect running trellis");
+    trellis
+        .apply("TRANSFORM doc_view FROM docs SELECT body AS body, n AS n")
+        .await
+        .expect("define");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while trellis
+        .status("doc_view")
+        .await
+        .expect("status")
+        .is_none_or(|s| s.status != trellis::TransformStatus::Live)
+    {
+        assert!(Instant::now() < deadline, "doc_view never went live");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    raw.batch_execute("update docs set n = n + 10 where id = 1")
+        .await
+        .expect("an update leaving the TOASTed body unchanged");
+    let token = trellis.watermark_token().await.expect("watermark_token");
+    trellis
+        .await_converged(token, Duration::from_secs(60))
+        .await
+        .expect("the update must converge, not poison its key");
+
+    let poisoned: i64 = raw
+        .query_one("select count(*) from trellis.poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(poisoned, 0);
+    assert_eq!(
+        symmetric_difference(
+            &raw,
+            "select id, md5(body), n from doc_view",
+            "select id, md5(body), n from docs",
+        )
+        .await,
+        0
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
