@@ -314,12 +314,21 @@ impl Driver {
             .collect()
     }
 
-    /// Number of `deadlock detected` errors the server has logged so far.
-    pub fn deadlocks_logged(&self) -> usize {
-        std::fs::read_to_string(self.cluster.root().join("postgres.log"))
-            .unwrap_or_default()
-            .matches("deadlock detected")
-            .count()
+    /// Every `deadlock detected` error the server has logged so far, each
+    /// with the lines after it (the `DETAIL` naming the processes and their
+    /// statements, the `CONTEXT`, the `STATEMENT`), so a failing assertion
+    /// shows which statements formed the cycle.
+    pub fn deadlocks_logged(&self) -> Vec<String> {
+        const REPORT_LINES: usize = 10;
+        let log =
+            std::fs::read_to_string(self.cluster.root().join("postgres.log")).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("deadlock detected"))
+            .map(|(at, _)| lines[at..(at + REPORT_LINES).min(lines.len())].join("\n"))
+            .collect()
     }
 
     /// Releases `drain`'s pause at `point` once it has been reached.
