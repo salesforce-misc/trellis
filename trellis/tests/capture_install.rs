@@ -1,6 +1,6 @@
 //! Installing, widening, narrowing and uninstalling trigger capture (#622
-//! C3), driven by hand: `trellis::capture::install` is not wired into the
-//! staging worker yet (C5).
+//! C3), driven by hand. The staging worker's reconcile pass that calls
+//! `trellis::capture::install` (C5) is `capture_join.rs`'s subject.
 //!
 //! Every test here steps the pieces itself (the seal's phases, the drain, the
 //! discharge) and holds a writer open where it needs one. None waits for
@@ -20,8 +20,9 @@
 //! - The widening gap: a widen waits out a writer running the old function,
 //!   and a new reader isn't dispatched until the rows the old function staged
 //!   have drained, so none of them reaches it without the column it reads.
-//! - Install is idempotent, uninstall leaves nothing behind, and a partial
-//!   install is repaired.
+//! - Install is idempotent, uninstall leaves nothing behind, a partial
+//!   install is repaired, and a read racing installs never sees a partial
+//!   one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -352,6 +353,59 @@ async fn an_uninstall_leaves_nothing_behind() {
             .await
             .expect("installed"),
         Installed::Absent
+    );
+}
+
+/// A read of what is installed that races installs and uninstalls sees
+/// each one whole or not at all (#622 C5 review): the four events are read
+/// in one statement, so a commit can't land between them and leave a
+/// spurious [`Installed::Partial`]. Read one statement per event, this saw a
+/// partial install on about a third of its reads.
+#[tokio::test]
+async fn a_read_racing_installs_and_uninstalls_never_sees_a_partial_install() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    let spec = install_t(&mut client).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        let reader = connect(db.dsn()).await;
+        tokio::spawn(async move {
+            let (mut partial, mut reads) = (Vec::new(), 0);
+            while !stop.load(Ordering::Relaxed) {
+                if let Installed::Partial { faults } =
+                    install::installed(&reader, DEFAULT_SCHEMA, "public.t")
+                        .await
+                        .expect("installed")
+                {
+                    partial.push(faults);
+                }
+                reads += 1;
+            }
+            (partial, reads)
+        })
+    };
+    for _ in 0..100 {
+        landed(
+            install::uninstall(&mut client, DEFAULT_SCHEMA, "public.t", None)
+                .await
+                .expect("uninstall"),
+        );
+        landed(
+            install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("install"),
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (partial, reads) = reader.await.expect("reader");
+    assert!(reads > 0);
+    assert!(
+        partial.is_empty(),
+        "{} of {reads} reads saw a partial install, first: {:?}",
+        partial.len(),
+        partial.first()
     );
 }
 

@@ -297,50 +297,64 @@ fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
 /// Reads what instance `schema` has installed for `table` (an unquoted
 /// `schema.table` identity) from `pg_trigger`, `pg_proc` and the functions'
 /// comments.
+///
+/// One statement reads all four events, so a read racing an install or
+/// uninstall sees it either whole or not at all, never a spurious
+/// [`Installed::Partial`].
 pub async fn installed(
     client: &impl GenericClient,
     schema: &str,
     table: &str,
 ) -> Result<Installed, CaptureError> {
     let regclass = crate::defs::ddl::regclass_arg(table);
+    let mut functions = Vec::with_capacity(CaptureEvent::ALL.len());
+    let mut triggers = Vec::with_capacity(CaptureEvent::ALL.len());
+    for event in CaptureEvent::ALL {
+        functions.push(sql::function_name(table, event)?);
+        triggers.push(sql::trigger_name(schema, event));
+    }
+    // A comment this generator didn't write reads as no spec, rather than
+    // failing the cast.
+    let rows = client
+        .query(
+            "select p.oid is not null, p.prosrc, \
+                    c.j ->> 'table', c.j ->> 'event', \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
+                    t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid \
+             from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
+             left join pg_catalog.pg_proc p \
+               on p.proname = e.function and p.pronargs = 0 \
+              and p.pronamespace = ( \
+                  select oid from pg_catalog.pg_namespace where nspname = $1) \
+             left join lateral ( \
+                 select case when d.description like '{\"trellis_capture\":1,%' \
+                             then d.description::jsonb end as j \
+                 from pg_catalog.pg_description d \
+                 where d.objoid = p.oid \
+                   and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                   and d.objsubid = 0) c on true \
+             left join pg_catalog.pg_trigger t \
+               on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = e.trigger \
+              and not t.tgisinternal \
+             order by e.ord",
+            &[&schema, &functions, &regclass, &triggers],
+        )
+        .await?;
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
     let mut specs = Vec::new();
-    for event in CaptureEvent::ALL {
-        let function = sql::function_name(table, event)?;
-        let trigger = sql::trigger_name(schema, event);
-        // A comment this generator didn't write reads as no spec, rather
-        // than failing the cast.
-        let row = client
-            .query_one(
-                "select p.oid is not null, p.prosrc, \
-                        c.j ->> 'table', c.j ->> 'event', \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
-                        case when c.j is not null then array( \
-                            select pg_catalog.jsonb_array_elements_text(c.j -> 'group_key')) end, \
-                        t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid \
-                 from (select 1) one \
-                 left join pg_catalog.pg_proc p \
-                   on p.proname = $2 and p.pronargs = 0 \
-                  and p.pronamespace = ( \
-                      select oid from pg_catalog.pg_namespace where nspname = $1) \
-                 left join lateral ( \
-                     select case when d.description like '{\"trellis_capture\":1,%' \
-                                 then d.description::jsonb end as j \
-                     from pg_catalog.pg_description d \
-                     where d.objoid = p.oid \
-                       and d.classoid = 'pg_catalog.pg_proc'::pg_catalog.regclass \
-                       and d.objsubid = 0) c on true \
-                 left join pg_catalog.pg_trigger t \
-                   on t.tgrelid = pg_catalog.to_regclass($3) and t.tgname = $4 \
-                  and not t.tgisinternal",
-                &[&schema, &function, &regclass, &trigger],
-            )
-            .await?;
+    for (((event, function), trigger), row) in CaptureEvent::ALL
+        .into_iter()
+        .zip(&functions)
+        .zip(&triggers)
+        .zip(&rows)
+    {
         let has_function: bool = row.get(0);
         let has_trigger: bool = row.get(7);
         present |= has_function || has_trigger;

@@ -655,13 +655,9 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         Duration::from_secs(30),
         "the capture is uninstalled",
         // Read while the worker may be committing the uninstall: `installed`
-        // reads each event in its own statement, so it can straddle it.
-        || async {
-            installed(&raw, SCHEMA, "public.u")
-                .await
-                .expect("read the capture")
-                == Installed::Absent
-        },
+        // reads every event in one statement, so it never sees half of it
+        // (`captured_columns` fails on a partial install).
+        || async { captured_columns(&raw, "public.u").await.is_none() },
     )
     .await;
     stop.store(true, Ordering::Relaxed);
