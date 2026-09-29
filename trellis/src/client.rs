@@ -991,6 +991,20 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     } = config;
 
     let seal_config = SealConfig::default();
+    // The capture pass keeps its lock waits in memory under the instance's
+    // database and schema; the loop forgets them when it stops.
+    let database: Option<String> = session
+        .client()
+        .query_one("select pg_catalog.current_database()::text", &[])
+        .await
+        .ok()
+        .map(|row| row.get(0));
+    let stop = async |session: Option<ProducerSession>| {
+        if let Some(database) = &database {
+            capture::reconcile::forget_instance(database, &schema);
+        }
+        release_singleton(session).await;
+    };
     let mut session: Option<ProducerSession> = Some(session);
     let mut failures = StepFailures::default();
     // Due immediately on the very first tick rather than waiting a full
@@ -1004,7 +1018,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     loop {
         if *shutdown_rx.borrow() {
-            release_singleton(session).await;
+            stop(session).await;
             return;
         }
 
@@ -1106,7 +1120,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                release_singleton(session).await;
+                stop(session).await;
                 return;
             }
             _ = tokio::time::sleep(interval) => {}

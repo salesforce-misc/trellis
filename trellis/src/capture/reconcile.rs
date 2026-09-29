@@ -111,6 +111,8 @@ pub async fn reconcile(
         let spec = match capture_spec(&*client, &snapshot.catalog, table).await {
             Ok(spec) => spec,
             Err(err) => {
+                // No longer waiting for a lock, whatever it did last pass.
+                forget_lock_wait(instance, table);
                 outcome.failed.push((table.clone(), err));
                 continue;
             }
@@ -130,7 +132,10 @@ pub async fn reconcile(
                 });
                 outcome.waiting.push(wait);
             }
-            Err(err) => outcome.failed.push((table.clone(), err)),
+            Err(err) => {
+                forget_lock_wait(instance, table);
+                outcome.failed.push((table.clone(), err));
+            }
         }
     }
 
@@ -150,7 +155,10 @@ pub async fn reconcile(
                 });
                 outcome.waiting.push(wait);
             }
-            Err(err) => outcome.failed.push((table.clone(), err)),
+            Err(err) => {
+                forget_lock_wait(instance, table);
+                outcome.failed.push((table.clone(), err));
+            }
         }
     }
 
@@ -388,6 +396,22 @@ fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
     }
 }
 
+/// Forgets `table`'s lock wait only, keeping what [`report`] last logged for
+/// it: a table that failed for another reason is no longer waiting for a
+/// lock, but its failure is still rate-limited.
+fn forget_lock_wait(instance: &str, table: &str) {
+    with_waits(|waits| waits.remove(&(instance.to_string(), table.to_string())));
+}
+
+/// Forgets every wait and report of the instance with schema `schema` in
+/// database `database`: its staging worker in this process stopped, so
+/// nothing here keeps them current any more.
+pub fn forget_instance(database: &str, schema: &str) {
+    let instance = instance_key(database, schema);
+    with_waits(|waits| waits.retain(|(i, _), _| *i != instance));
+    with_reports(|reports| reports.retain(|(i, _), _| *i != instance));
+}
+
 fn forget_waits_except(instance: &str, known: &HashSet<&String>) {
     with_waits(|waits| waits.retain(|(i, table), _| i != instance || known.contains(table)));
     with_reports(|reports| reports.retain(|(i, table), _| i != instance || known.contains(table)));
@@ -435,6 +459,29 @@ mod tests {
 
     fn strings(tables: &[&str]) -> Vec<String> {
         tables.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn wait_on(table: &str) -> LockWait {
+        LockWait {
+            table: table.to_string(),
+            operation: install::LockingOperation::Install,
+            lock_mode: "ShareRowExclusiveLock".to_string(),
+            waiting_since: std::time::SystemTime::now(),
+            observed_at: std::time::SystemTime::now(),
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_stopped_instance_forgets_its_waits_and_no_other() {
+        // Names no other test uses: the registry is process-global.
+        let (stopped, other) = ("db_forget_a", "db_forget_b");
+        remember_wait(&instance_key(stopped, "s"), wait_on("public.t"));
+        remember_wait(&instance_key(other, "s"), wait_on("public.t"));
+        forget_instance(stopped, "s");
+        assert_eq!(lock_wait(stopped, "s", "public.t"), None);
+        assert!(lock_wait(other, "s", "public.t").is_some());
+        forget_instance(other, "s");
     }
 
     #[test]

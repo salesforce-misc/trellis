@@ -538,6 +538,49 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
     );
 }
 
+/// The in-memory lock wait `status().capture_wait` reports goes once the
+/// table stops waiting for its lock, including when its capture then fails
+/// for another reason (#622 C5 review): a read column dropped here.
+#[tokio::test]
+async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.u (id int primary key, a int)")
+        .await
+        .expect("seed");
+    let database: String = raw
+        .query_one("select current_database()::text", &[])
+        .await
+        .expect("database")
+        .get(0);
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+
+    let holder = hold_table(db.dsn(), "public.u").await;
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
+    assert!(reconcile::lock_wait(&database, SCHEMA, "public.u").is_some());
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+
+    raw.batch_execute("alter table public.u drop column a")
+        .await
+        .expect("drop the read column");
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+    assert_eq!(
+        reconcile::lock_wait(&database, SCHEMA, "public.u"),
+        None,
+        "the table fails now; it no longer waits for a lock"
+    );
+}
+
 /// A partitioned table can't be captured by statement triggers on its
 /// parent (a write aimed at a partition bypasses them, and a partition
 /// attached later has none), so it is refused as a source at define time.
