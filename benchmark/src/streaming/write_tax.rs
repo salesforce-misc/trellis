@@ -1303,7 +1303,9 @@ async fn set_up_variant(
             assert!(
                 trellis::dev::capture::install(raw, DEFAULT_SCHEMA, &spec, None)
                     .await
-                    .expect("install the capture triggers"),
+                    .expect("install the capture triggers")
+                    .done()
+                    .expect("nothing else holds the benchmark's source table"),
                 "a fresh table's install changes something"
             );
             for event in REWRITTEN_EVENTS {
