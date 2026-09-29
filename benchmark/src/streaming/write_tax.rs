@@ -1152,6 +1152,15 @@ impl CellResult {
     }
 }
 
+/// The rows/s `slot` staged over `span` (the writers' window plus the
+/// catch-up), from the ring's count once the catch-up ended. The sentinel is
+/// staged last, so it is in the count only when intake caught up; a cell that
+/// hit the cap reports what intake staged, not what the writers offered.
+pub fn slot_staged_rows_per_sec(ring_rows: i64, caught_up: bool, span: f64) -> f64 {
+    let staged = if caught_up { ring_rows - 1 } else { ring_rows };
+    staged.max(0) as f64 / span
+}
+
 /// The head control's numbers a cell is compared with.
 #[derive(Debug, Clone, Copy)]
 pub struct Control {
@@ -1457,7 +1466,8 @@ pub async fn run_cell(
     let capture_rows_per_sec = if variant.is_trigger() {
         Some(rows_per_sec)
     } else if variant == Variant::Slot {
-        slot_catch_up_secs.map(|c| writes.rows as f64 / (secs + c))
+        slot_catch_up_secs
+            .map(|c| slot_staged_rows_per_sec(ring_rows, slot_caught_up == Some(true), secs + c))
     } else {
         None
     };
@@ -1734,6 +1744,15 @@ mod tests {
         assert_eq!(share, Some(0.5));
         assert_eq!(extra, Some(16.5));
         assert_eq!(against_control(None, 1.0, 1.0), (None, None));
+    }
+
+    #[test]
+    fn slot_reports_what_it_staged_not_what_was_offered() {
+        // Caught up: every row plus the sentinel.
+        assert_eq!(slot_staged_rows_per_sec(1_001, true, 10.0), 100.0);
+        // Hit the cap with none of a big COPY staged (#565 E1's 10M-row case).
+        assert_eq!(slot_staged_rows_per_sec(0, false, 180.0), 0.0);
+        assert_eq!(slot_staged_rows_per_sec(500, false, 5.0), 100.0);
     }
 
     #[test]
