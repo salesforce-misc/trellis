@@ -754,7 +754,13 @@ impl Samples {
     }
 }
 
-async fn sample_until(raw: RawClient, exclude: Vec<i32>, stop: Arc<AtomicBool>) -> Samples {
+/// Samples until `stop`, then hands the connection back: the caller reads
+/// its backend's CPU before letting it go.
+async fn sample_until(
+    raw: RawClient,
+    exclude: Vec<i32>,
+    stop: Arc<AtomicBool>,
+) -> (Samples, RawClient) {
     let has_subxact: bool = raw
         .query_one(
             "select to_regprocedure('pg_stat_get_backend_subxact(integer)') is not null",
@@ -808,7 +814,7 @@ async fn sample_until(raw: RawClient, exclude: Vec<i32>, stop: Arc<AtomicBool>) 
         out.samples += 1;
         tokio::time::sleep(SAMPLE_INTERVAL).await;
     }
-    out
+    (out, raw)
 }
 
 /// The snapshot probe's record.
@@ -827,7 +833,7 @@ struct Probe {
 /// sequential scan and a sort) would read the whole table on every probe,
 /// so the probe's cost would grow with the table and swamp the visibility
 /// checks it exists to time.
-async fn probe_until(raw: RawClient, stop: Arc<AtomicBool>) -> Probe {
+async fn probe_until(raw: RawClient, stop: Arc<AtomicBool>) -> (Probe, RawClient) {
     raw.batch_execute(
         "set enable_seqscan = off; set enable_bitmapscan = off; set enable_sort = off",
     )
@@ -852,7 +858,7 @@ async fn probe_until(raw: RawClient, stop: Arc<AtomicBool>) -> Probe {
         out.queries += 1;
     }
     out.elapsed = start.elapsed();
-    out
+    (out, raw)
 }
 
 // --- Writers ----------------------------------------------------------------
@@ -1366,10 +1372,16 @@ pub async fn run_cell(
     };
 
     stop.store(true, Ordering::Relaxed);
-    let samples = sampling.await.expect("sampler panicked");
-    let probe = match probing {
-        Some(task) => Some(task.await.expect("probe panicked")),
-        None => None,
+    // The harness's connections stay open until their backends' CPU is
+    // read below: a backend that exits hands its CPU to the postmaster's
+    // `cutime`, where it can no longer be told apart from the cell's.
+    let (samples, _sampler) = sampling.await.expect("sampler panicked");
+    let (probe, _probe) = match probing {
+        Some(task) => {
+            let (probe, raw) = task.await.expect("probe panicked");
+            (Some(probe), Some(raw))
+        }
+        None => (None, None),
     };
     if let Some(holder) = holder {
         holder
