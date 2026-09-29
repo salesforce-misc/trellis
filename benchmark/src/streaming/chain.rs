@@ -162,8 +162,8 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
 /// Polls until no `pending_backfill` marker is left, or panics at `deadline`.
 ///
 /// For a scenario whose transform never goes live, so [`wait_for_live`] has
-/// nothing to wait for: [`crate::streaming::intake_ceiling`] runs no drain
-/// threads, so its transform's build never runs. Its source's join marker is
+/// nothing to wait for: [`crate::streaming::write_tax`]'s `slot` variant runs
+/// no drain threads, so its transform's build never runs. Its source's join marker is
 /// still discharged by the staging worker, and waiting for that while the
 /// source is empty keeps the discharge out of the measurement window. A
 /// scenario that waits for `live` needs no such wait: a definition reports

@@ -57,7 +57,7 @@ impl GeneratorReachResult {
 
 /// Runs the generator flat out for `duration` and reports what it achieved.
 /// The source table has the same `(id bigint primary key, val numeric)`
-/// shape the chain and intake-ceiling scenarios write to, so the per-row
+/// shape the chain and write-tax scenarios write to, so the per-row
 /// insert cost matches theirs.
 pub async fn run(
     connections: usize,

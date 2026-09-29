@@ -51,8 +51,10 @@
 //!   #277's group-count x drain-worker contention grid over the same probe.
 //! - [`contention`]: `pg_stat_activity` sampling that attributes engine
 //!   backend time to row-lock waits vs everything else (#277).
-//! - [`intake_ceiling`]: CDC decode + ring append alone, the ceiling every
-//!   other throughput number sits under.
+//! - [`write_tax`]: what capturing a table costs the application writing to
+//!   it, per capture variant and transaction shape (#565 E1, #622 C4).
+//! - [`capture_ceiling`]: rows/s reaching the ring as writers are added,
+//!   with nothing draining (#565 E2, #622 C4). It replaced `intake-ceiling`.
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
 //! - [`build_under_load`]: a large aggregate build under a paced mixed write
@@ -64,6 +66,7 @@
 //!   `VmHWM`, the cgroup's `memory.peak`).
 
 pub mod build_under_load;
+pub mod capture_ceiling;
 pub mod chain;
 pub mod cli;
 pub mod contention;
@@ -72,10 +75,10 @@ pub mod fold_in;
 pub mod generator_reach;
 pub mod hop_latency;
 pub mod idle_cost;
-pub mod intake_ceiling;
 pub mod load;
 pub mod process_memory;
 pub mod rate;
 pub mod scrape;
 pub mod throughput;
 pub mod tuning;
+pub mod write_tax;

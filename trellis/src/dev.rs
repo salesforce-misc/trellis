@@ -88,6 +88,20 @@ pub mod staging {
     };
 }
 
+/// Trigger capture (#622), for `benchmark`'s `write-tax` and
+/// `capture-ceiling` (#622 C4): the write-path benchmark installs the capture
+/// triggers through the real installer, with nothing draining, before C5
+/// wires the installer into the staging worker. It also replaces the
+/// installed functions with benchmark-only variants built from
+/// [`capture::function_ddl`]'s text, to measure what open question Q2's
+/// schema-change guards would cost.
+pub mod capture {
+    pub use crate::capture::CaptureError;
+    pub use crate::capture::columns::{capture_spec, load_catalog};
+    pub use crate::capture::install::install;
+    pub use crate::capture::sql::{CaptureEvent, CaptureSpec, function_ddl};
+}
+
 /// Planted ordering bugs (issue #557 part 3). A harness reads which plant
 /// this process runs with and how often it fired; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.

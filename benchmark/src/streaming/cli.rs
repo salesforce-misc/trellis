@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use crate::streaming::rate::{human_rate, restaged_in_window};
 use crate::streaming::tuning::EngineTuning;
+use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
-    build_under_load, fold_in, generator_reach, hop_latency, idle_cost, intake_ceiling, load,
+    build_under_load, capture_ceiling, fold_in, generator_reach, hop_latency, idle_cost, load,
     throughput,
 };
 
@@ -22,7 +23,8 @@ pub const SCENARIOS: &[&str] = &[
     "transaction-shape",
     "fold-in-ratio",
     "group-contention",
-    "intake-ceiling",
+    "write-tax",
+    "capture-ceiling",
     "idle-cost",
     "generator-reach",
     "build-under-load",
@@ -72,13 +74,9 @@ const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(120);
 /// #268's 1000:1 (400 groups at 400k rows/sec) by two decades either side.
 const CONTENTION_DEFAULT_GROUPS: &[usize] = &[10, 100, 400, 4_000, 40_000];
 
-const INTAKE_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
-/// Short, because at max rate the generator writes millions of rows/sec that
-/// nothing drains, into a cluster on `$TMPDIR` (see [`intake_ceiling`]'s
-/// "mind the volume"): 20s at 1,000 rows/commit exhausted the dev box's 16GB
-/// tmpfs. 5s still spans many seal/group-commit cycles.
-const INTAKE_DEFAULT_DURATION: Duration = Duration::from_secs(5);
-const INTAKE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
+/// Repetitions per cell for `write-tax` and `capture-ceiling`: the plan asks
+/// for at least three, interleaved (#622 C4).
+const WRITE_TAX_DEFAULT_REPS: usize = 3;
 
 /// Idle cost's defaults: 8 drain threads (#269's own "staging worker + 8 drain
 /// threads" wording), a 10 s warmup so start-of-day work never pollutes the
@@ -88,6 +86,7 @@ const INTAKE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 const IDLE_DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const IDLE_DEFAULT_DURATION: Duration = Duration::from_secs(60);
 
+const REACH_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
 const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 
 /// `build-under-load`'s knobs (see [`build_under_load`]'s module doc for the
@@ -264,6 +263,52 @@ fn throughput_tuning(args: &[String]) -> EngineTuning {
             ..Default::default()
         },
     )
+}
+
+/// `--variants a,b,…` by name ([`Variant::parse`]), or `default`.
+fn variants(args: &[String], default: &[Variant]) -> Vec<Variant> {
+    match flag(args, "--variants") {
+        Some(raw) => raw.split(',').map(Variant::parse).collect(),
+        None => default.to_vec(),
+    }
+}
+
+fn reps(args: &[String]) -> usize {
+    let reps = number(args, "--reps")
+        .map(|v| v as usize)
+        .unwrap_or(WRITE_TAX_DEFAULT_REPS);
+    assert!(reps >= 1, "--reps must be at least 1");
+    reps
+}
+
+/// The flags every `write-tax`/`capture-ceiling` cell shares, over
+/// [`CellOptions::default`]: `--max-secs`, `--rows`, `--copy-rows`,
+/// `--slot-catch-up-secs` and `--snapshot-probe off|orm|all`.
+fn cell_options(args: &[String]) -> CellOptions {
+    let default = CellOptions::default();
+    CellOptions {
+        max_window: secs(args, "--max-secs").unwrap_or(default.max_window),
+        copy_rows: number(args, "--copy-rows")
+            .map(|v| v as u64)
+            .unwrap_or(default.copy_rows),
+        rows: number(args, "--rows").map(|v| v as u64).or(default.rows),
+        slot_catch_up: secs(args, "--slot-catch-up-secs").unwrap_or(default.slot_catch_up),
+        probe: flag(args, "--snapshot-probe")
+            .map(ProbeMode::parse)
+            .unwrap_or(default.probe),
+    }
+}
+
+/// The runtime `write-tax` and `capture-ceiling` run their writers on. Its
+/// threads are named `bench-writer`, so a `slot` cell can tell the Trellis
+/// engine's threads (tokio's default names) from the load's when it counts
+/// the engine's CPU.
+fn writer_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("bench-writer")
+        .build()
+        .expect("build the writer runtime")
 }
 
 /// Runs `name` if it is one of [`SCENARIOS`], returning `Some(true)` when
@@ -446,72 +491,45 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(result.oracle_ok && result.writes.errors == 0)
         }
 
-        "intake-ceiling" => {
-            let connections = connections(args).unwrap_or(load::DEFAULT_CONNECTIONS);
+        "write-tax" => {
+            let variants = variants(args, &write_tax::Variant::ALL);
+            let shapes: Vec<Shape> = match flag(args, "--shapes") {
+                Some(raw) => raw.split(',').map(Shape::parse).collect(),
+                None => write_tax::DEFAULT_SHAPES
+                    .iter()
+                    .map(|s| Shape::parse(s))
+                    .collect(),
+            };
+            let reps = reps(args);
+            let opts = cell_options(args);
+            let results = writer_runtime().block_on(write_tax::run_matrix(
+                "write-tax",
+                &variants,
+                &shapes,
+                reps,
+                &opts,
+            ));
+            eprintln!("{}", write_tax::summary(&results));
+            Some(results.iter().all(|r| r.ring_ok))
+        }
+
+        "capture-ceiling" => {
+            let variants = variants(args, capture_ceiling::DEFAULT_VARIANTS);
+            let writers = usize_list(args, "--writers", capture_ceiling::DEFAULT_WRITERS);
             let rows_per_commit = number(args, "--rows-per-commit")
                 .map(|v| v as usize)
-                .unwrap_or(INTAKE_DEFAULT_ROWS_PER_COMMIT);
-            let duration = secs(args, "--duration-secs").unwrap_or(INTAKE_DEFAULT_DURATION);
-            let grace = secs(args, "--grace-secs").unwrap_or(INTAKE_DEFAULT_GRACE);
-            // Issue #274: defaults to stock (`ClientOptions::default()`'s own
-            // now-grouped behavior) — `--group-commit off` measures the
-            // un-grouped escape hatch instead, for an A/B at the same
-            // `rows_per_commit`.
-            let group_commit = group_commit(args, Some(trellis::GroupCommitConfig::default()));
-
-            // `--rate <rows/sec>` paces the generator instead of running it
-            // flat out — enough to exceed the ceiling without writing (and
-            // storing) everything the generator could.
-            let pace = number(args, "--rate").map_or(load::Pace::Max, load::Pace::RowsPerSec);
-
-            let result = runtime().block_on(intake_ceiling::run(
-                load::ParallelLoad {
-                    connections,
-                    rows_per_commit,
-                    duration,
-                    groups: None,
-                    pace,
-                },
-                grace,
-                group_commit,
+                .unwrap_or(capture_ceiling::DEFAULT_ROWS_PER_COMMIT);
+            let reps = reps(args);
+            let opts = cell_options(args);
+            let results = writer_runtime().block_on(capture_ceiling::run(
+                &variants,
+                rows_per_commit,
+                &writers,
+                reps,
+                &opts,
             ));
-            println!("{}", result.to_json());
-            if result.generator_bound {
-                eprintln!(
-                    "GENERATOR-BOUND: intake appended everything offered while it was offered \
-                     ({:.0} rows/sec from {} connections) — a floor on intake, not its ceiling; \
-                     raise --connections",
-                    result.append_achieved_rows_per_sec, result.connections
-                );
-            } else if result.intake_kept_pace {
-                eprintln!(
-                    "intake kept pace with the full {:.0} rows/sec offered — its ceiling is above \
-                     that; raise --rate",
-                    result.offered_achieved_rows_per_sec
-                );
-            } else {
-                eprintln!(
-                    "intake ceiling: {:.0} rows/sec appended under {:.0} rows/sec offered",
-                    result.append_achieved_rows_per_sec, result.offered_achieved_rows_per_sec
-                );
-                if result.target_rows_per_sec.is_none() {
-                    eprintln!(
-                        "  (flat out, the generator competes with intake for the same Postgres \
-                         and depresses this; re-run with --rate a little above it, e.g. --rate \
-                         {:.0}, for the ceiling itself)",
-                        result.append_achieved_rows_per_sec * 1.5
-                    );
-                }
-            }
-            if result.append_backlog > 0 {
-                eprintln!(
-                    "intake never drained within the grace period ({} of {} rows appended, {} \
-                     behind) — the window's append rate stands, but retry with a longer \
-                     --grace-secs to confirm every row arrives",
-                    result.ring_rows_appended, result.rows_offered, result.append_backlog
-                );
-            }
-            Some(true)
+            eprintln!("{}", write_tax::summary(&results));
+            Some(results.iter().all(|r| r.ring_ok))
         }
 
         "idle-cost" => {
@@ -535,7 +553,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let connections = connections(args).unwrap_or(load::DEFAULT_CONNECTIONS);
             let rows_per_commit = number(args, "--rows-per-commit")
                 .map(|v| v as usize)
-                .unwrap_or(INTAKE_DEFAULT_ROWS_PER_COMMIT);
+                .unwrap_or(REACH_DEFAULT_ROWS_PER_COMMIT);
             let duration = secs(args, "--duration-secs").unwrap_or(REACH_DEFAULT_DURATION);
 
             let result =
@@ -905,7 +923,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "--connections must be at least 1")]
     fn zero_connections_is_rejected() {
-        connections(&argv(&["intake-ceiling", "--connections", "0"]));
+        connections(&argv(&["generator-reach", "--connections", "0"]));
     }
 
     fn fit(rows_per_sec: f64) -> crate::streaming::rate::InWindowRate {
@@ -1210,6 +1228,52 @@ mod tests {
         assert_eq!(c.post_live, Duration::from_secs(5));
         assert_eq!(c.grace, Duration::from_secs(60));
         assert_eq!(c.progress, None);
+    }
+
+    #[test]
+    fn write_tax_flags_parse_over_the_cell_defaults() {
+        let opts = cell_options(&argv(&["write-tax"]));
+        let default = CellOptions::default();
+        assert_eq!(opts.max_window, default.max_window);
+        assert_eq!(opts.rows, None);
+        assert_eq!(opts.probe, ProbeMode::Orm);
+        assert_eq!(reps(&argv(&["write-tax"])), WRITE_TAX_DEFAULT_REPS);
+
+        let args = argv(&[
+            "write-tax",
+            "--max-secs",
+            "10",
+            "--rows",
+            "5000",
+            "--copy-rows",
+            "10000000",
+            "--slot-catch-up-secs",
+            "60",
+            "--snapshot-probe",
+            "all",
+            "--reps",
+            "1",
+            "--variants",
+            "none,trigger+exception",
+        ]);
+        let opts = cell_options(&args);
+        assert_eq!(opts.max_window, Duration::from_secs(10));
+        assert_eq!(opts.rows, Some(5000));
+        assert_eq!(opts.copy_rows, 10_000_000);
+        assert_eq!(opts.slot_catch_up, Duration::from_secs(60));
+        assert_eq!(opts.probe, ProbeMode::All);
+        assert_eq!(reps(&args), 1);
+        assert_eq!(
+            variants(&args, &Variant::ALL),
+            [Variant::None, Variant::TriggerException]
+        );
+        assert_eq!(
+            variants(
+                &argv(&["capture-ceiling"]),
+                capture_ceiling::DEFAULT_VARIANTS
+            ),
+            capture_ceiling::DEFAULT_VARIANTS
+        );
     }
 
     #[test]

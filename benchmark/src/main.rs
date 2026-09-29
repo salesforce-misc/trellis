@@ -39,9 +39,10 @@
 //! # issue #277: fold rate and lock-wait attribution by group count x drain workers
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 10,100,400,4000,40000
 //! cargo run -p benchmark --features engine-access --release -- group-contention --groups 400 --threads 1,2,4,8,16
-//! # the ceiling every throughput number sits under, and V-IDLE
-//! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1000 --duration-secs 5
-//! cargo run -p benchmark --features engine-access --release -- intake-ceiling --rows-per-commit 1 --rate 300000
+//! # the write-path tax and the capture ceiling (#622 C4; #565 E1/E2), and V-IDLE
+//! cargo run -p benchmark --features engine-access --release -- write-tax --shapes 1x1,1000x16,orm100x1 --reps 3
+//! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger,trigger+exception --shapes orm100x16+hold
+//! cargo run -p benchmark --features engine-access --release -- capture-ceiling --writers 1,4,8,16,32
 //! cargo run -p benchmark --features engine-access --release -- idle-cost --application-threads 8 --duration-secs 60
 //! # the load generator's own reach, no engine running (issue #276)
 //! cargo run -p benchmark --features engine-access --release -- generator-reach --connections 8 --rows-per-commit 1
@@ -55,7 +56,9 @@
 //! generator ([`streaming::load::run_parallel_load`]): `--connections <n>`
 //! writers (default [`streaming::load::DEFAULT_CONNECTIONS`]) paced on one
 //! shared schedule at the scenario's target, or flat out for
-//! `intake-ceiling`/`generator-reach` (`intake-ceiling --rate` paces it).
+//! `generator-reach`. `write-tax` and `capture-ceiling` have writers of their
+//! own ([`streaming::write_tax`]): a fixed number of transactions per writer
+//! shape, cut off at `--max-secs`.
 //! Every result carrying a target reports `generator_bound`
 //! ([`streaming::load::generator_bound`]): true when the achieved rate
 //! materially undershot the target while the engine kept up, i.e. the row
@@ -101,9 +104,9 @@
 //! forces paging, and `TRELLIS_BENCH_LOG=trellis::staging::apply=info` logs
 //! each paged drain's page count) —
 //! [`streaming::tuning::EngineTuning`], which is also where a later child of
-//! #269 adds a knob of its own. `intake-ceiling` takes its own
-//! `--group-commit` directly (it is deliberately not built from
-//! `EngineTuning` — see [`streaming::intake_ceiling`]'s module doc comment).
+//! #269 adds a knob of its own. `write-tax` and `capture-ceiling` take
+//! none of them: nothing drains in either, and their `slot` variant runs a
+//! stock client with no application threads.
 //! Each prints one JSON line per measurement
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal

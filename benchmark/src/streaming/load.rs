@@ -243,8 +243,7 @@ pub const DEFAULT_CONNECTIONS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pace {
     /// Unpaced: every connection issues back-to-back commits for the whole
-    /// window. The intake ceiling's mode, and the way to find the generator's
-    /// own reach.
+    /// window: how `generator-reach` finds the generator's own reach.
     Max,
     /// Offer this many rows/sec in aggregate, across every connection, on one
     /// shared schedule: commit `k` is due at `k * rows_per_commit / rate`
