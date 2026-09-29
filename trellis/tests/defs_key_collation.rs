@@ -18,28 +18,19 @@ use trellis::defs::{
     alter_transform, create_relationship, install_definition, parse_statement,
 };
 
-/// Only ICU provides nondeterministic collations. The testkit pins every
-/// cluster to UTF8 (#665), which ICU supports, so only a server built without
-/// ICU refuses the `CREATE COLLATION` (with `0A000`); this returns `false`
-/// then so the caller skips (the same pattern as
-/// `defs_relationship_catalog.rs`'s nondeterministic join-column test).
-async fn create_case_insensitive_collation(pool: &trellis::pool::Pool) -> bool {
-    let client = pool.get().await.expect("get connection");
-    match client
+/// Only ICU provides nondeterministic collations. Every test cluster's
+/// default collation is ICU `en-US` (#665), so a server without ICU can't run
+/// these tests at all; a refusal here is a real failure, not a skip.
+async fn create_case_insensitive_collation(pool: &trellis::pool::Pool) {
+    pool.get()
+        .await
+        .expect("get connection")
         .batch_execute(
             "create collation case_insensitive \
              (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
         )
         .await
-    {
-        Ok(()) => true,
-        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED) => {
-            let reason = err.as_db_error().map(|db| db.message().to_string());
-            eprintln!("skipping: this server can't create an ICU collation: {reason:?}");
-            false
-        }
-        Err(err) => panic!("create a nondeterministic ICU collation: {err:?}"),
-    }
+        .expect("create a nondeterministic ICU collation");
 }
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
@@ -107,9 +98,7 @@ async fn assert_no_target(pool: &trellis::pool::Pool, target: &str) {
 async fn a_source_key_with_a_nondeterministic_collation_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table codes (code text collate case_insensitive primary key, n integer)",
@@ -133,9 +122,7 @@ async fn a_source_key_with_a_nondeterministic_collation_is_refused() {
 async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table sales (id bigint primary key, region text collate case_insensitive, \
@@ -166,9 +153,7 @@ async fn a_group_by_column_with_a_nondeterministic_collation_is_refused() {
 async fn a_group_by_relationship_path_with_a_nondeterministic_collation_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table posts (id bigint primary key, author text collate case_insensitive); \
@@ -206,9 +191,7 @@ async fn a_group_by_relationship_path_with_a_nondeterministic_collation_is_refus
 async fn a_relationship_endpoint_key_with_a_nondeterministic_collation_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table order_line_items \
@@ -315,9 +298,7 @@ fn assert_text_function_refused(
 async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table posts (id bigint primary key, author text collate case_insensitive); \
@@ -389,9 +370,7 @@ async fn substring_and_regex_functions_on_a_nondeterministic_column_are_refused(
 async fn altering_in_a_substring_search_on_a_nondeterministic_column_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    if !create_case_insensitive_collation(&db.pool).await {
-        return;
-    }
+    create_case_insensitive_collation(&db.pool).await;
     batch(
         &db.pool,
         "create table notes (id bigint primary key, title text collate case_insensitive)",

@@ -1195,16 +1195,21 @@ fn process_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// The `initdb` every test cluster is made with.
+/// The `initdb` every test (and benchmark) cluster is made with.
 ///
-/// The locale and encoding are pinned rather than taken from `LANG`, so a
-/// test database collates the same on every machine (issue #665). Without
-/// the pin this box's `en_US.UTF-8` gave linguistic ordering while GitHub's
-/// ubuntu runners (`C.UTF-8`) gave bytewise ordering, and a test could pass
-/// here and fail on CI. `C.UTF-8` matches CI: its collation is code-point
-/// order (bytewise for UTF-8), and UTF8 lets ICU collations be created, so a
-/// test *about* linguistic ordering asks for one explicitly instead of
-/// inheriting it from the host.
+/// The collation is pinned rather than taken from `LANG`, so a test database
+/// orders text the same on every machine (issue #665). Unpinned, this box's
+/// `en_US.UTF-8` gave linguistic ordering while GitHub's ubuntu runners
+/// (`C.UTF-8`) gave bytewise ordering, and a test could pass here and fail on
+/// CI.
+///
+/// The default collation is ICU `en-US`: ICU sorts the same everywhere
+/// (libc locales don't), a query that forgets `collate "C"` where it needs
+/// bytewise order fails in every test rather than only on some machines, and
+/// benchmarks pay the collation cost a production database would. UTF8 is
+/// what ICU needs. `initdb` still wants a libc locale for `lc_ctype` and
+/// `lc_collate`; `C.UTF-8` is present on every glibc since 2.35 and is what
+/// CI's runners default to.
 fn initdb_command(data_dir: &Path) -> Command {
     let mut cmd = Command::new("initdb");
     cmd.arg("-D")
@@ -1213,8 +1218,10 @@ fn initdb_command(data_dir: &Path) -> Command {
         .arg("postgres")
         .arg("--auth=trust")
         .arg("--no-sync")
+        .arg("--encoding=UTF8")
         .arg("--locale=C.UTF-8")
-        .arg("--encoding=UTF8");
+        .arg("--locale-provider=icu")
+        .arg("--icu-locale=en-US");
     cmd
 }
 

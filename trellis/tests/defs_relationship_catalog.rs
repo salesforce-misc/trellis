@@ -842,30 +842,20 @@ async fn join_columns_with_different_collations_are_rejected() {
 /// share it. Its `=` matches `'A'` to `'a'`; the engine's exact-text key
 /// match doesn't.
 ///
-/// Only ICU provides nondeterministic collations. The testkit pins every
-/// cluster to UTF8 (#665), which ICU supports, so only a server built without
-/// ICU refuses the `CREATE COLLATION` (with `0A000`); the test skips then,
-/// and the pure check is still covered by `defs::catalog`'s
-/// `join_column_tests`.
+/// Only ICU provides nondeterministic collations; every test cluster's
+/// default collation is ICU `en-US` (#665), so the server always has it.
 #[tokio::test]
 async fn a_nondeterministic_collation_join_column_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("get connection");
-    if let Err(err) = client
+    client
         .batch_execute(
             "create collation case_insensitive \
              (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
         )
         .await
-    {
-        if err.code() == Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED) {
-            let reason = err.as_db_error().map(|db| db.message().to_string());
-            eprintln!("skipping: this server can't create an ICU collation: {reason:?}");
-            return;
-        }
-        panic!("create a nondeterministic ICU collation: {err:?}");
-    }
+        .expect("create a nondeterministic ICU collation");
     drop(client);
     let err = declare_over_join_columns(
         &db.pool,
