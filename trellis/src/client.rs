@@ -1233,7 +1233,13 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 }
 
 /// How long one [`reconcile_source_tables`] pass retries its `ALTER
-/// PUBLICATION` while a table it adds or drops is locked (issue #621).
+/// PUBLICATION` while a table it adds or drops is locked (issue #621). The
+/// first attempt always runs, and a further one only if it could end within
+/// the budget. An attempt waits up to
+/// `locks::share_update_exclusive_ddl_timeout` (2 s at the default
+/// `deadlock_timeout`), longer than this, so a pass makes exactly one
+/// attempt. One is enough to cancel a blocking autovacuum, and it holds up
+/// the sealer for at most that one attempt per `reconcile_interval`.
 const RECONCILE_DDL_BUDGET: Duration = Duration::from_secs(1);
 
 /// Whether [`maintenance_loop`] may run its next reconcile pass early, as
@@ -1544,10 +1550,10 @@ async fn reconcile_source_tables(
 ) -> Result<(), ReconcileError> {
     let desired = defs::publication_tables(pool).await?;
 
-    // The maintenance loop is the only sealer, so it waits at most
-    // `RECONCILE_DDL_BUDGET` for the `ALTER PUBLICATION` to find its tables
-    // free (ADR-0002 I6, issue #621), then leaves the change for the next
-    // pass, which comes one `reconcile_interval` later.
+    // The maintenance loop is the only sealer, so it gives the `ALTER
+    // PUBLICATION` one attempt per pass (`RECONCILE_DDL_BUDGET`) to find its
+    // tables free (ADR-0002 I6, issue #621), then leaves the change for the
+    // next pass, which comes one `reconcile_interval` later.
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     match intake::publication::reconcile_publication_until(
         client,

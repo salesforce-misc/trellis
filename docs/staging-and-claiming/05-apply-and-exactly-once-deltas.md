@@ -438,18 +438,40 @@ every writer for 25 s behind one open transaction; with a 50 ms
 `lock_timeout` retried every 200 ms the worst writer wait was 52 ms
 ([E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
 
-**The rule.** DDL on a user table runs under `locks::USER_TABLE_DDL_LOCK_TIMEOUT`
-(50 ms), one attempt per `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms),
-each attempt its own transaction, until it lands (`locks::DdlRetry`). Today
-that is `ALTER PUBLICATION ... ADD/DROP TABLE` in `reconcile_publication`.
-Its `SHARE UPDATE EXCLUSIVE` doesn't conflict with writers, so writers never
-queued behind it, but it still waited with a snapshot open behind anything
-holding that lock (a manual `VACUUM`, `CREATE INDEX CONCURRENTLY`, an
-`ALTER TABLE`). From #622 it is `CREATE`/`DROP TRIGGER`, which does conflict
-with writers. The maintenance loop, the only sealer, retries for at most a
-second per reconcile pass and leaves the change to the next pass; startup
-retries until it lands. The retire path's `TRUNCATE` is the older precedent:
-it takes its lock `NOWAIT` and skips the slot until the next tick.
+**The rule.** DDL on a user table runs in a retry loop (`locks::DdlRetry`),
+each attempt its own transaction under a short per-attempt `lock_timeout`, one
+attempt per `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms), until it lands.
+The per-attempt timeout depends on the lock the DDL takes:
+
+- **A lock writers queue behind** (`CREATE`/`DROP TRIGGER`'s `SHARE ROW
+  EXCLUSIVE`, from #622): `locks::USER_TABLE_DDL_LOCK_TIMEOUT`, 50 ms, E7's
+  shape.
+- **`SHARE UPDATE EXCLUSIVE`** (`ALTER PUBLICATION ... ADD/DROP TABLE` in
+  `reconcile_publication`, today's only user-table DDL): writers don't
+  conflict with it, so they never queue behind it, and I6 doesn't bound it.
+  Only I7's rule applies: it mustn't wait with a snapshot open for a long
+  time behind whatever holds the table (a manual `VACUUM`, `CREATE INDEX
+  CONCURRENTLY`, an `ALTER TABLE`, an autovacuum). Its per-attempt timeout
+  is `locks::share_update_exclusive_ddl_timeout`: twice the session's
+  `deadlock_timeout`, at least 2 s, at most `LOCK_TIMEOUT`. It must outwait
+  `deadlock_timeout` because that is when a waiter runs the deadlock check,
+  and the check is what cancels an autovacuum that blocks it. With a 50 ms
+  timeout the check never runs. On Postgres 17, with a throttled autovacuum
+  on the table, every 50 ms `ALTER PUBLICATION` attempt timed out, so the
+  join would have waited out the whole vacuum, hours on a large table. A
+  2 s attempt had the vacuum cancelled and landed in 1.0 s. An
+  anti-wraparound autovacuum is never cancelled; the loop waits that one out.
+
+The maintenance loop, the only sealer, makes one attempt per reconcile pass
+and leaves the change to the next pass; startup retries until it lands. The
+retire path's `TRUNCATE` is the older precedent: it takes its lock `NOWAIT`
+and skips the slot until the next tick.
+
+**Open for #622.** `CREATE`/`DROP TRIGGER` conflict with `SHARE UPDATE
+EXCLUSIVE` too, so an autovacuum blocks them in the same way. Their 50 ms
+timeout can't outwait `deadlock_timeout` without queueing writers for that
+long, so a trigger join on a table under a long autovacuum waits the vacuum
+out.
 
 ## Downstream propagation, and why it terminates
 
@@ -549,6 +571,9 @@ identical from outside otherwise.
    timed-out transaction is retried from outside any transaction, never
    waited out inside one. Every connection caps the setting when it connects
    ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)).
-9. **DDL on a user table runs under a 50 ms `lock_timeout` in a retry loop**, one
-   attempt per 200 ms, so no application writer queues behind it for longer
-   than that ([I6](#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)).
+9. **DDL on a user table runs in a retry loop of short transactions**, one
+   attempt per 200 ms. DDL writers queue behind runs under a 50 ms
+   `lock_timeout`, so no application writer queues behind it for longer than
+   that. `SHARE UPDATE EXCLUSIVE` DDL, which writers don't queue behind, waits
+   past `deadlock_timeout` so a blocking autovacuum is cancelled
+   ([I6](#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)).
