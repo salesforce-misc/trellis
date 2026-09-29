@@ -154,8 +154,9 @@ What it does there is one append.
   `format('%s', col)` under the five output settings Trellis pins
   (`DETERMINISTIC_TEXT_OUTPUT_GUCS`) as `SET` clauses on the function, carries
   a `WHEN` clause that skips an update touching no read column, is
-  `SECURITY DEFINER` owned by a dedicated capture role with a pinned
-  `search_path`, is `ENABLE ALWAYS`, and reads the active slot
+  `SECURITY DEFINER` owned by the Trellis role (the one role that owns
+  Trellis's schema and performs every Trellis operation; #622 plan Q3) with
+  a pinned `search_path`, is `ENABLE ALWAYS`, and reads the active slot
   schema-qualified through the sequence mirror
   ([The seal fence](#the-seal-fence-under-application-writers)). *Evidence:*
   [E3](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119):
@@ -168,9 +169,10 @@ What it does there is one append.
   read columns costs +30 µs. NEW-only is exact because the ledger holds the
   old side ([trigger amendment](https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5847674780)).
   [E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)
-  for the privilege model: the capture role needs `TRIGGER` on each source,
-  which the owner grants once; the application needs nothing on Trellis's
-  schema.
+  for the privilege model: the application needs nothing on Trellis's
+  schema. The Trellis role must own each source table or be a member of its
+  owning role, because `ENABLE ALWAYS` needs ownership, not just `TRIGGER`
+  (#622 plan finding 3). It needs no superuser.
 - **Must (I6):** `CREATE TRIGGER` and `DROP TRIGGER` run under a short
   `lock_timeout` in a retry loop, one attempt per interval, until they land.
   *Evidence:* [E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119).
@@ -198,7 +200,7 @@ What it does there is one append.
 - **Must:** the self-check audit
   ([ADR-0013](0013-self-check-production-recompute-audit.md)) verifies from
   `pg_trigger` that every captured table's three triggers exist, are owned by
-  the capture role and are enabled, and reports a missing or disabled one
+  the Trellis role and are enabled, and reports a missing or disabled one
   before any recompute comparison. Replica-mode sessions are covered by
   `ENABLE ALWAYS`; an owner who disables or drops the trigger by name is
   documented as uncaptured until the audit runs. *Evidence:*

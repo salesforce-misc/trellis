@@ -12,6 +12,9 @@
 //! - A3's primitive: an install and an uninstall wait out a writer that stays
 //!   open, and no other writer queues behind them for longer than one
 //!   attempt's lock timeout.
+//! - The waiting report (#622 plan Q1): an install that runs out of its
+//!   deadline names the session holding the table and one queued for it,
+//!   and the next pass lands once they let go. Nothing is cancelled.
 //! - A6's trigger-fed half: a `TRUNCATE` whose writer straddles a seal
 //!   reaches the single-bucket barrier.
 //! - The widening gap: a widen waits out a writer running the old function,
@@ -29,12 +32,12 @@ use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::capture::columns::{capture_spec, load_catalog};
-use trellis::capture::install::{self, CaptureAction, Installed};
+use trellis::capture::install::{self, CaptureAction, Installed, LockingOperation, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, function_name, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{TransformStatus, ValueType, install_definition};
 use trellis::intake::publication;
-use trellis::locks::{USER_TABLE_DDL_LOCK_TIMEOUT, is_lock_not_available};
+use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::{
     MIN_ROWS_TO_SPLIT, StagedWatermark, TRUNCATE_SENTINEL_KEY, apply, has_pending,
@@ -72,6 +75,14 @@ async fn backend_pid(client: &Client) -> i32 {
         .get(0)
 }
 
+/// A pass run without a deadline always lands.
+fn landed<T>(progress: Progress<T>) -> T {
+    match progress {
+        Progress::Done(value) => value,
+        Progress::Waiting(wait) => panic!("an operation without a deadline landed: {wait}"),
+    }
+}
+
 /// `public.t`'s spec: key `id`, imaging `columns` too.
 fn spec_of_t(columns: &[&str]) -> CaptureSpec {
     CaptureSpec::new(
@@ -92,9 +103,11 @@ async fn install_t(client: &mut Client) -> CaptureSpec {
         .expect("create public.t");
     let spec = spec_of_t(&["a"]);
     assert!(
-        install::install(client, DEFAULT_SCHEMA, &spec, None)
-            .await
-            .expect("install"),
+        landed(
+            install::install(client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("install")
+        ),
         "a fresh install changes something"
     );
     spec
@@ -239,15 +252,19 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
         .expect("read generation")
         .get(0);
     assert!(
-        !install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
-            .await
-            .expect("repeat install"),
+        !landed(
+            install::install(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("repeat install")
+        ),
         "a repeat install reports no change"
     );
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
-            .await
-            .expect("reconcile"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("reconcile")
+        ),
         CaptureAction::Unchanged
     );
     assert_eq!(catalog_versions(&client).await, versions);
@@ -269,11 +286,11 @@ async fn an_uninstall_leaves_nothing_behind() {
     let mut client = connect(db.dsn()).await;
     install_t(&mut client).await;
 
-    assert!(
+    assert!(landed(
         install::uninstall(&mut client, DEFAULT_SCHEMA, "public.t", None)
             .await
             .expect("uninstall")
-    );
+    ));
     assert_eq!(
         install::installed(&client, DEFAULT_SCHEMA, "public.t")
             .await
@@ -304,9 +321,11 @@ async fn an_uninstall_leaves_nothing_behind() {
         .expect("write after the uninstall");
     assert!(ring_rows(&client, "after").await.is_empty());
     assert!(
-        !install::uninstall(&mut client, DEFAULT_SCHEMA, "public.t", None)
-            .await
-            .expect("repeat uninstall"),
+        !landed(
+            install::uninstall(&mut client, DEFAULT_SCHEMA, "public.t", None)
+                .await
+                .expect("repeat uninstall")
+        ),
         "a repeat uninstall reports no change"
     );
 
@@ -323,11 +342,11 @@ async fn an_uninstall_leaves_nothing_behind() {
             .expect("installed"),
         Installed::Partial { .. }
     ));
-    assert!(
+    assert!(landed(
         install::uninstall(&mut client, DEFAULT_SCHEMA, "public.gone", None)
             .await
             .expect("uninstall a dropped table's capture")
-    );
+    ));
     assert_eq!(
         install::installed(&client, DEFAULT_SCHEMA, "public.gone")
             .await
@@ -343,9 +362,11 @@ async fn install_t_named(client: &mut Client, table: &str) -> CaptureSpec {
         .expect("create table");
     let spec = CaptureSpec::new(table, vec!["id".to_string()], Vec::new(), Vec::new())
         .expect("valid spec");
-    install::install(client, DEFAULT_SCHEMA, &spec, None)
-        .await
-        .expect("install");
+    landed(
+        install::install(client, DEFAULT_SCHEMA, &spec, None)
+            .await
+            .expect("install"),
+    );
     spec
 }
 
@@ -373,9 +394,11 @@ async fn a_partial_install_is_reported_and_repaired() {
     assert!(faults[0].contains("not ENABLE ALWAYS"), "{faults:?}");
 
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
-            .await
-            .expect("reconcile"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("reconcile")
+        ),
         CaptureAction::Install
     );
     assert_eq!(
@@ -406,16 +429,20 @@ async fn a_partial_install_is_reported_and_repaired() {
     };
     assert!(!current, "a hand-edited body isn't current");
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec_of_t(&["a"]), None)
-            .await
-            .expect("reconcile"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec_of_t(&["a"]), None)
+                .await
+                .expect("reconcile")
+        ),
         CaptureAction::Widen
     );
     // The replaced body reads back as current, so the repair doesn't repeat.
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &spec_of_t(&["a"]), None)
-            .await
-            .expect("reconcile"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec_of_t(&["a"]), None)
+                .await
+                .expect("reconcile")
+        ),
         CaptureAction::Unchanged
     );
     client
@@ -483,22 +510,20 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
         let stop = Arc::new(AtomicBool::new(false));
         let writing = spawn_writer(writer, step, stop.clone());
 
-        // With a deadline, the DDL stops retrying and reports the timeout.
+        // With a deadline, the DDL stops retrying and reports who it waits on.
         let mut ddl = connect(db.dsn()).await;
         let deadline = Some(Instant::now() + Duration::from_millis(600));
         let before = install::installed(&observer, DEFAULT_SCHEMA, "public.t")
             .await
             .expect("installed");
-        let err = match step {
-            "install" => install::install(&mut ddl, DEFAULT_SCHEMA, &spec, deadline)
-                .await
-                .map(|_| ()),
-            _ => install::uninstall(&mut ddl, DEFAULT_SCHEMA, "public.t", deadline)
-                .await
-                .map(|_| ()),
+        let progress = match step {
+            "install" => install::install(&mut ddl, DEFAULT_SCHEMA, &spec, deadline).await,
+            _ => install::uninstall(&mut ddl, DEFAULT_SCHEMA, "public.t", deadline).await,
         }
-        .expect_err("the open write holds the table past the deadline");
-        assert!(is_lock_not_available(&err), "{step}: {err}");
+        .unwrap_or_else(|e| panic!("{step}: {e}"));
+        let Progress::Waiting(wait) = progress else {
+            panic!("{step}: the open write holds the table past the deadline: {progress:?}");
+        };
         assert_eq!(
             install::installed(&observer, DEFAULT_SCHEMA, "public.t")
                 .await
@@ -506,16 +531,11 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
             before,
             "{step} past its deadline changed nothing"
         );
-
-        // The holder shows up as the blocker, and isn't cancelled.
-        let blockers = install::blockers(&observer, "public.t", &["RowExclusiveLock"])
-            .await
-            .expect("read blockers");
         assert!(
-            blockers
+            wait.blockers
                 .iter()
                 .any(|b| b.pid == Some(holder_pid) && b.backend_type == "client backend"),
-            "{blockers:?}"
+            "{step}: {wait}"
         );
 
         // Without one, it waits the write out.
@@ -563,6 +583,131 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
             _ => assert_eq!(now, Installed::Absent),
         }
     }
+}
+
+/// The waiting report (#622 plan Q1): an install whose deadline passes while
+/// another session holds the table returns, having changed nothing, a
+/// [`install::LockWait`] naming that session, and one queued behind it; the
+/// next bounded pass after both let go installs.
+#[tokio::test]
+async fn a_bounded_install_reports_who_holds_the_table_then_lands_once_released() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let observer = connect(db.dsn()).await;
+    observer
+        .batch_execute("create table public.t (id text primary key, a int, b int)")
+        .await
+        .expect("create public.t");
+    let holder = connect(db.dsn()).await;
+    let holder_pid = backend_pid(&holder).await;
+    holder
+        .batch_execute(
+            "begin; lock table public.t in row exclusive mode; \
+             select 'capture_install_holder'",
+        )
+        .await
+        .expect("hold the table");
+
+    // A second session queued behind the holder blocks the install too.
+    let queued = connect(db.dsn()).await;
+    let queued_pid = backend_pid(&queued).await;
+    let queued_task = tokio::spawn(async move {
+        queued
+            .batch_execute("begin; lock table public.t in exclusive mode; commit")
+            .await
+    });
+    let queue_began = Instant::now();
+    loop {
+        let waiting: bool = observer
+            .query_one(
+                "select exists (select 1 from pg_locks where pid = $1 and not granted)",
+                &[&queued_pid],
+            )
+            .await
+            .expect("read pg_locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            queue_began.elapsed() < Duration::from_secs(10),
+            "the second session never queued for the table"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let spec = spec_of_t(&["a"]);
+    let mut ddl = connect(db.dsn()).await;
+    let pass = || Some(Instant::now() + Duration::from_millis(300));
+    let progress = install::install(&mut ddl, DEFAULT_SCHEMA, &spec, pass())
+        .await
+        .expect("install");
+    let Progress::Waiting(wait) = progress else {
+        panic!("the held table keeps the install waiting: {progress:?}");
+    };
+    eprintln!("{wait}");
+    assert_eq!(wait.table, "public.t");
+    assert_eq!(wait.operation, LockingOperation::Install);
+    assert_eq!(wait.lock_mode, "ShareRowExclusiveLock");
+    assert!(
+        wait.waited() >= USER_TABLE_DDL_LOCK_TIMEOUT,
+        "at least one attempt timed out: {wait}"
+    );
+    let held = wait
+        .blockers
+        .iter()
+        .find(|b| b.pid == Some(holder_pid))
+        .unwrap_or_else(|| panic!("the holder is named: {wait}"));
+    assert_eq!(
+        (held.backend_type.as_str(), held.mode.as_str(), held.granted),
+        ("client backend", "RowExclusiveLock", true),
+        "{held:?}"
+    );
+    assert!(held.query.contains("capture_install_holder"), "{held:?}");
+    assert!(
+        held.since.is_some_and(|since| since <= wait.waiting_since),
+        "the holder's transaction began before the install waited: {held:?}"
+    );
+    let queued = wait
+        .blockers
+        .iter()
+        .find(|b| b.pid == Some(queued_pid))
+        .unwrap_or_else(|| panic!("the queued session is named: {wait}"));
+    assert_eq!(
+        (queued.mode.as_str(), queued.granted),
+        ("ExclusiveLock", false),
+        "{queued:?}"
+    );
+    assert!(queued.since.is_some(), "{queued:?}");
+    assert_eq!(
+        install::installed(&observer, DEFAULT_SCHEMA, "public.t")
+            .await
+            .expect("installed"),
+        Installed::Absent,
+        "an install past its deadline changed nothing"
+    );
+
+    holder.batch_execute("commit").await.expect("release");
+    queued_task
+        .await
+        .expect("queued task")
+        .expect("the queued lock lands once the holder commits");
+    assert_eq!(
+        install::install(&mut ddl, DEFAULT_SCHEMA, &spec, pass())
+            .await
+            .expect("install"),
+        Progress::Done(true),
+        "the next pass lands once nothing holds the table"
+    );
+    assert_eq!(
+        install::installed(&observer, DEFAULT_SCHEMA, "public.t")
+            .await
+            .expect("installed"),
+        Installed::Complete {
+            spec,
+            current: true
+        }
+    );
 }
 
 /// Seals both phases and returns the sealed batch.
@@ -661,7 +806,7 @@ async fn a_serializable_writer_is_captured_into_a_batch_that_claims_it() {
 
 /// A role without `pg_read_all_stats` can't see another role's backend in
 /// `pg_stat_activity`: the blocker report calls it `unknown`, not a prepared
-/// transaction (it has a pid), and it is never a cancel candidate.
+/// transaction (it has a pid), with no transaction start and no query.
 #[tokio::test]
 async fn a_blocker_this_role_cant_see_is_unknown_not_prepared() {
     let cluster = TestCluster::start();
@@ -694,7 +839,11 @@ async fn a_blocker_this_role_cant_see_is_unknown_not_prepared() {
         .find(|b| b.pid == Some(holder_pid))
         .unwrap_or_else(|| panic!("the holder is a blocker: {blockers:?}"));
     assert_eq!(held.backend_type, "unknown", "{held:?}");
-    assert!(!held.cancellable());
+    assert_eq!(
+        (held.since, held.query.as_str()),
+        (None, "<insufficient privilege>"),
+        "{held:?}"
+    );
     holder.batch_execute("commit").await.expect("commit");
 }
 
@@ -703,7 +852,7 @@ async fn a_blocker_this_role_cant_see_is_unknown_not_prepared() {
 /// belongs to the next batch's predecessor half, and that batch claims it
 /// once `COMMIT PREPARED` lands (the #565 spike's `prepared_probe`). Until
 /// then it holds the table like any open writer, and the blocker report
-/// names it even though it has no backend.
+/// names it by its gid even though it has no backend.
 #[tokio::test]
 async fn a_prepared_transaction_straddling_a_seal_is_claimed_once_committed() {
     let cluster = TestCluster::start();
@@ -731,9 +880,10 @@ async fn a_prepared_transaction_straddling_a_seal_is_claimed_once_committed() {
         .await
         .expect("read blockers");
     assert!(
-        blockers
-            .iter()
-            .any(|b| b.pid.is_none() && b.backend_type == "prepared transaction"),
+        blockers.iter().any(|b| b.pid.is_none()
+            && b.backend_type == "prepared transaction"
+            && b.prepared_gid.as_deref() == Some("capture_install_prepared")
+            && b.since.is_some()),
         "{blockers:?}"
     );
 
@@ -851,7 +1001,7 @@ async fn a_widen_waits_out_a_writer_running_the_old_function() {
             .expect("the widen lands once the write commits")
             .expect("widen task")
             .expect("widen"),
-        CaptureAction::Widen
+        Progress::Done(CaptureAction::Widen)
     );
     client
         .batch_execute("insert into public.t values ('w3', 1, 1)")
@@ -910,7 +1060,7 @@ async fn a_widen_waits_out_a_writer_running_the_old_function() {
         .await
         .expect("a narrow doesn't wait for the open write")
         .expect("narrow"),
-        CaptureAction::Narrow
+        Progress::Done(CaptureAction::Narrow)
     );
     holder.batch_execute("commit").await.expect("commit");
 }
@@ -987,7 +1137,7 @@ async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
             .expect("the widen lands once the write commits")
             .expect("widen task")
             .expect("widen"),
-        CaptureAction::Widen
+        Progress::Done(CaptureAction::Widen)
     );
 
     let gate = capture_gate(&client, "public.t")
@@ -1094,9 +1244,11 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     let narrow = catalog_spec(&client, "public.sales").await;
     assert_eq!(narrow.columns(), ["id", "sku"]);
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &narrow, None)
-            .await
-            .expect("install"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &narrow, None)
+                .await
+                .expect("install")
+        ),
         CaptureAction::Install
     );
     publication::settle_registrations(&db.pool).await;
@@ -1126,9 +1278,11 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     let wide = catalog_spec(&client, "public.sales").await;
     assert_eq!(wide.columns(), ["amount", "id", "sku"]);
     assert_eq!(
-        install::reconcile(&mut client, DEFAULT_SCHEMA, &wide, None)
-            .await
-            .expect("widen"),
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &wide, None)
+                .await
+                .expect("widen")
+        ),
         CaptureAction::Widen
     );
     let gate = capture_gate(&client, "public.sales")

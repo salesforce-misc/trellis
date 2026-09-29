@@ -10,10 +10,10 @@
 //! # What every function does
 //!
 //! - **It runs as its owner.** Each function is `SECURITY DEFINER`, so the
-//!   application's role needs no privilege on Trellis's schema. It is owned
-//!   by whichever role creates it, which C3 makes the role that owns the
-//!   Trellis schema (#622 plan Q3). A dedicated least-privilege capture role
-//!   is deferred.
+//!   application's role needs no privilege on Trellis's schema. Its owner is
+//!   the one Trellis role, which owns the Trellis schema and does every
+//!   other Trellis operation too (#622 plan Q3; see [`super::install`]'s
+//!   "The Trellis role").
 //! - **It doesn't trust the writer's session.** `search_path` is pinned to
 //!   `pg_catalog, pg_temp`, and every ring and mirror reference is
 //!   schema-qualified. The five output settings Trellis pins everywhere

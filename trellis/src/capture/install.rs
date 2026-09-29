@@ -26,7 +26,8 @@
 //! behind it. So each attempt is one short transaction whose table lock waits
 //! at most [`USER_TABLE_DDL_LOCK_TIMEOUT`] (50 ms), and
 //! [`crate::locks::DdlRetry`] retries it until it lands or, with a deadline,
-//! until the next attempt couldn't end by it. The attempt parks its marker
+//! until the next attempt couldn't end by it (see "Waiting, never
+//! cancelling" for what it returns then). The attempt parks its marker
 //! *before* it asks for the table lock, under the session's `lock_timeout`:
 //! the marker's row locks are Trellis's own, and waiting for one of them
 //! while holding the table lock would queue the application's writers behind
@@ -38,22 +39,33 @@
 //! queues readers of the table for up to 50 ms. A late drop only costs
 //! capture writes nobody reads, so it retries the same way.
 //!
-//! **A blocking autovacuum (#622 plan Q1, provisional).** Postgres cancels
-//! an autovacuum that holds a lock a waiter wants only once the waiter runs
-//! its deadlock check, after `deadlock_timeout` (1 s by default). A 50 ms
-//! attempt never gets that far, so the join would wait out the whole vacuum.
-//! After a timed-out attempt, [`Blockers`] reads who holds a conflicting
-//! lock on the table and logs them, pid and query, at most every five
-//! seconds. If one is an autovacuum worker that isn't preventing wraparound,
-//! it cancels it with `pg_cancel_backend`, which works only where the role
-//! may signal an autovacuum worker (superuser on PostgreSQL 17 and earlier,
-//! `pg_signal_autovacuum_worker` from 18). Where Postgres refuses, it logs
-//! that once and the retries wait the vacuum out. An application backend is
-//! never cancelled. The worker must also be visible to the role in
-//! `pg_stat_activity` (superuser or `pg_read_all_stats`): to any other role
-//! it reads as an `unknown` blocker and is left alone. The cancelling
-//! statement checks the pid, its lock and its query again
-//! ([`cancel_autovacuum`]), so a pid reused since the read is never hit.
+//! # Waiting, never cancelling (#622 plan Q1)
+//!
+//! Every lock holder is waited out, an autovacuum included: nothing here
+//! cancels or terminates a backend. (Postgres itself cancels an autovacuum
+//! that holds a lock a waiter wants, but only from the waiter's deadlock
+//! check after `deadlock_timeout`, 1 s by default, which a 50 ms attempt
+//! never reaches. So an install on a table under a long vacuum waits the
+//! whole vacuum out.)
+//!
+//! Waiting is kept off `apply`'s path: defining a transform only registers
+//! it, and C5's background reconcile does the install. So a wait has to be
+//! visible some other way, and that is the [`LockWait`] report. The
+//! `deadline` an operation takes bounds one pass. When the retries run out
+//! of it, the operation returns [`Progress::Waiting`], having changed
+//! nothing, with the table, the operation, the lock it asks for, when the
+//! pass began waiting, and every session that holds or is queued for a
+//! conflicting lock ([`Blocker`]: its pid, or a prepared transaction's gid;
+//! its backend type; its lock mode; since when; and the start of its query).
+//! C5 retries on its next pass and surfaces the report in a definition's
+//! detailed status (Q5). Without a deadline an operation waits until it
+//! lands. While it retries, it logs the blockers at most every five seconds.
+//!
+//! `pg_stat_activity` shows another role's backend only to a superuser or a
+//! member of `pg_read_all_stats`. To any other role such a blocker reads as
+//! `unknown`, with no transaction start and `<insufficient privilege>` for
+//! its query. Its pid, lock mode, and (for a queued request) how long it has
+//! waited still show.
 //!
 //! # The join fence
 //!
@@ -178,17 +190,35 @@
 //! also compares each function's source with what this build generates, so
 //! a function an older generator left behind is replaced.
 //!
-//! # Who owns the functions
+//! Nothing else this module writes is installed state. The capture gate
+//! belongs to a pending marker and goes with it. A [`LockWait`] is returned,
+//! not stored: it describes other sessions, so nothing can re-derive it
+//! from the defined transforms, and C5 may persist it for the detailed
+//! status (Q9).
 //!
-//! The role that owns the instance schema (#622 plan Q3, provisional): the
-//! migration role, which already owns the ring the functions write to. The
-//! functions are `SECURITY DEFINER`, so they run as that role whoever writes
-//! the table. An install by another role (it must be a member of the owning
-//! role) hands the functions over with `ALTER FUNCTION … OWNER TO`. The
-//! installing role must own the captured table, as `ENABLE ALWAYS TRIGGER`
-//! requires (#622 plan finding 3).
+//! # The Trellis role (#622 plan Q3)
+//!
+//! One role does everything Trellis does: it owns the instance schema and
+//! the ring, runs the migrations and the staging worker, and installs and
+//! owns the capture functions. There is no separate capture role. What that
+//! role needs:
+//!
+//! - **On each captured table, ownership or membership in the owning
+//!   role.** `CREATE TRIGGER` needs the `TRIGGER` privilege, but `ALTER TABLE
+//!   … ENABLE ALWAYS TRIGGER` needs ownership (#622 plan finding 3), and
+//!   membership in the owner counts as ownership.
+//! - **No superuser.** Nothing here signals a backend, and reading the
+//!   blockers needs no privilege (`pg_read_all_stats` only makes other
+//!   roles' blockers less `unknown`).
+//!
+//! The functions are `SECURITY DEFINER`, so they run as their owner, the
+//! Trellis role, whichever application role writes the table, and the
+//! application needs no privilege on Trellis's schema. A session that isn't
+//! the schema's owner itself but a member of it (a login role granted the
+//! Trellis role, say) hands the functions to the owner with `ALTER FUNCTION
+//! … OWNER TO` in the same transaction.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, GenericClient};
@@ -389,32 +419,63 @@ fn recorded_spec(
     CaptureSpec::new(table, key?, columns?, group_key?).ok()
 }
 
+/// How far one pass of a locking operation got: it landed, or it ran out of
+/// its deadline waiting for the table lock and changed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum Progress<T> {
+    /// The operation landed (or had nothing to do), with its result.
+    Done(T),
+    /// The deadline passed while the table lock was held against it. Nothing
+    /// changed. The report says who holds it (see "Waiting, never
+    /// cancelling").
+    Waiting(Box<LockWait>),
+}
+
+impl<T> Progress<T> {
+    /// The result, if the operation landed.
+    pub fn done(self) -> Option<T> {
+        match self {
+            Progress::Done(value) => Some(value),
+            Progress::Waiting(_) => None,
+        }
+    }
+
+    /// The same progress, with `f` applied to a landed result.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Progress<U> {
+        match self {
+            Progress::Done(value) => Progress::Done(f(value)),
+            Progress::Waiting(wait) => Progress::Waiting(wait),
+        }
+    }
+}
+
 /// Brings `desired.table()`'s capture to `desired` ([`plan`]) and returns
 /// what it did. `deadline` bounds the retries of a locked table, as
-/// [`DdlRetry::new`]'s does: past it, the lock timeout comes back as the
-/// error and nothing has changed.
+/// [`DdlRetry::new`]'s does: past it, the result is [`Progress::Waiting`]
+/// and nothing has changed.
 pub async fn reconcile(
     client: &mut Client,
     schema: &str,
     desired: &CaptureSpec,
     deadline: Option<Instant>,
-) -> Result<CaptureAction, CaptureError> {
+) -> Result<Progress<CaptureAction>, CaptureError> {
     let action = plan(
         &installed(&*client, schema, desired.table()).await?,
         desired,
     );
-    match action {
-        CaptureAction::Unchanged => {}
+    let progress = match action {
+        CaptureAction::Unchanged => Progress::Done(()),
         CaptureAction::Install => run(client, schema, Op::Install(desired), deadline).await?,
         CaptureAction::Widen => run(client, schema, Op::Widen(desired), deadline).await?,
-        CaptureAction::Narrow => narrow(client, schema, desired).await?,
-    }
-    Ok(action)
+        CaptureAction::Narrow => Progress::Done(narrow(client, schema, desired).await?),
+    };
+    Ok(progress.map(|()| action))
 }
 
 /// Installs `spec`'s capture, and parks the table's join marker, in one
 /// transaction under the table's `SHARE ROW EXCLUSIVE` lock, retried as the
-/// module doc describes. Returns `false`, having done nothing, when `spec` is
+/// module doc describes. Lands `false`, having done nothing, when `spec` is
 /// already installed and current: a repeat install takes no lock and parks
 /// no marker.
 pub async fn install(
@@ -422,12 +483,13 @@ pub async fn install(
     schema: &str,
     spec: &CaptureSpec,
     deadline: Option<Instant>,
-) -> Result<bool, CaptureError> {
+) -> Result<Progress<bool>, CaptureError> {
     if plan(&installed(&*client, schema, spec.table()).await?, spec) == CaptureAction::Unchanged {
-        return Ok(false);
+        return Ok(Progress::Done(false));
     }
-    run(client, schema, Op::Install(spec), deadline).await?;
-    Ok(true)
+    Ok(run(client, schema, Op::Install(spec), deadline)
+        .await?
+        .map(|()| true))
 }
 
 /// Replaces an installed table's capture functions with `spec`'s under the
@@ -439,7 +501,7 @@ pub async fn widen(
     schema: &str,
     spec: &CaptureSpec,
     deadline: Option<Instant>,
-) -> Result<(), CaptureError> {
+) -> Result<Progress<()>, CaptureError> {
     run(client, schema, Op::Widen(spec), deadline).await
 }
 
@@ -468,19 +530,20 @@ pub async fn narrow(
 /// Drops `table`'s capture triggers and functions, in one transaction under
 /// the table's `ACCESS EXCLUSIVE` lock (`DROP TRIGGER`'s), retried as the
 /// module doc describes. A table the application already dropped takes its
-/// triggers with it, so only the functions go. Returns `false`, having done
+/// triggers with it, so only the functions go. Lands `false`, having done
 /// nothing, when nothing is installed.
 pub async fn uninstall(
     client: &mut Client,
     schema: &str,
     table: &str,
     deadline: Option<Instant>,
-) -> Result<bool, CaptureError> {
+) -> Result<Progress<bool>, CaptureError> {
     if installed(&*client, schema, table).await? == Installed::Absent {
-        return Ok(false);
+        return Ok(Progress::Done(false));
     }
-    run(client, schema, Op::Uninstall(table), deadline).await?;
-    Ok(true)
+    Ok(run(client, schema, Op::Uninstall(table), deadline)
+        .await?
+        .map(|()| true))
 }
 
 /// One of the operations that lock the table, for [`run`].
@@ -499,11 +562,11 @@ impl Op<'_> {
         }
     }
 
-    fn what(&self) -> &'static str {
+    fn operation(&self) -> LockingOperation {
         match self {
-            Op::Install(_) => "capture install",
-            Op::Widen(_) => "capture widen",
-            Op::Uninstall(_) => "capture uninstall",
+            Op::Install(_) => LockingOperation::Install,
+            Op::Widen(_) => LockingOperation::Widen,
+            Op::Uninstall(_) => LockingOperation::Uninstall,
         }
     }
 
@@ -538,27 +601,32 @@ impl Op<'_> {
 
 /// Runs `op` in attempts of one transaction each, under
 /// [`USER_TABLE_DDL_LOCK_TIMEOUT`], until one lands or `deadline` stops the
-/// retries (see [`DdlRetry`]). After each timed-out attempt, [`Blockers`]
-/// reports who holds the table and cancels a blocking autovacuum where it
-/// may.
+/// retries (see [`DdlRetry`]). After a timed-out attempt it logs who holds
+/// the table ([`BlockerLog`]), and once `deadline` stops the retries it
+/// reads them afresh for the [`LockWait`] it returns.
 async fn run(
     client: &mut Client,
     schema: &str,
     op: Op<'_>,
     deadline: Option<Instant>,
-) -> Result<(), CaptureError> {
-    let mut retry = DdlRetry::new(op.what(), USER_TABLE_DDL_LOCK_TIMEOUT, deadline);
-    let mut blockers = Blockers::new(op.what());
+) -> Result<Progress<()>, CaptureError> {
+    let operation = op.operation();
+    let started = Instant::now();
+    let mut retry = DdlRetry::new(operation.what(), USER_TABLE_DDL_LOCK_TIMEOUT, deadline);
+    let mut log = BlockerLog::new(operation);
     loop {
         match attempt(client, schema, op, retry.lock_timeout()).await {
             Err(err) if locks::is_lock_not_available(&err) => {
-                blockers.inspect(&*client, op.table(), op.lock().1).await;
                 if retry.again(&err).await {
+                    log.after_timeout(&*client, op, started).await;
                     continue;
                 }
-                return Err(err);
+                let wait = lock_wait(&*client, op, started).await?;
+                log.at_deadline(&wait);
+                return Ok(Progress::Waiting(Box::new(wait)));
             }
-            other => return other,
+            Err(err) => return Err(err),
+            Ok(()) => return Ok(Progress::Done(())),
         }
     }
 }
@@ -652,214 +720,288 @@ async fn foreign_schema_owner(
     Ok(row.and_then(|row| row.get(0)))
 }
 
-/// How often [`Blockers::inspect`] reads `pg_locks` while an operation keeps
-/// timing out, and how often it logs what it read.
-const BLOCKER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const BLOCKER_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// The longest query text a [`Blocker`] carries, in characters.
+const BLOCKER_QUERY_CHARS: i32 = 200;
 
-/// The longest query text a blocker's log line carries.
-const BLOCKER_QUERY_CHARS: usize = 200;
+/// A capture operation that takes the table lock, as a [`LockWait`] names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockingOperation {
+    Install,
+    Widen,
+    Uninstall,
+}
 
-/// One session holding a lock that conflicts with the one a capture
-/// operation waits for.
+impl LockingOperation {
+    /// `install`, `widen` or `uninstall`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockingOperation::Install => "install",
+            LockingOperation::Widen => "widen",
+            LockingOperation::Uninstall => "uninstall",
+        }
+    }
+
+    /// The lock the operation takes on the table, as `pg_locks` spells it.
+    pub fn lock_mode(self) -> &'static str {
+        match self {
+            LockingOperation::Install | LockingOperation::Widen => "ShareRowExclusiveLock",
+            LockingOperation::Uninstall => "AccessExclusiveLock",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            LockingOperation::Install => "capture install",
+            LockingOperation::Widen => "capture widen",
+            LockingOperation::Uninstall => "capture uninstall",
+        }
+    }
+}
+
+/// What a capture operation that ran out of its deadline was waiting for
+/// (see "Waiting, never cancelling"). Every field is plain data (text,
+/// integers, timestamps and a three-way enum), so C5 can store one as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockWait {
+    /// The table the operation locks, as its spec names it.
+    pub table: String,
+    pub operation: LockingOperation,
+    /// The lock the operation asks for, as `pg_locks` spells it
+    /// (`ShareRowExclusiveLock`, `AccessExclusiveLock`).
+    pub lock_mode: String,
+    /// When this pass began waiting: its first attempt. A caller that
+    /// retries in passes keeps the first pass's value.
+    pub waiting_since: SystemTime,
+    /// When the blockers were read (Postgres's `clock_timestamp()`).
+    pub observed_at: SystemTime,
+    /// Every other session holding, or queued for, a lock on the table that
+    /// conflicts with `lock_mode`, in pid order. Empty if they all let go
+    /// between the last attempt and the read.
+    pub blockers: Vec<Blocker>,
+}
+
+impl LockWait {
+    /// How long this pass waited, up to [`Self::observed_at`].
+    pub fn waited(&self) -> Duration {
+        self.observed_at
+            .duration_since(self.waiting_since)
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for LockWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "capture {} on {} waiting {:.1?} for {}",
+            self.operation.as_str(),
+            self.table,
+            self.waited(),
+            self.lock_mode,
+        )?;
+        if self.blockers.is_empty() {
+            return write!(f, "; no conflicting lock is held now");
+        }
+        write!(f, ", held against it by")?;
+        for (i, blocker) in self.blockers.iter().enumerate() {
+            let sep = if i == 0 { " " } else { "; " };
+            write!(f, "{sep}{}", blocker.describe(self.observed_at))?;
+        }
+        Ok(())
+    }
+}
+
+/// One session holding, or queued for, a lock that conflicts with the one a
+/// capture operation asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocker {
     /// `None` for a prepared transaction, which has no backend.
     pub pid: Option<i32>,
+    /// A prepared transaction's `gid`; `None` for a backend.
+    pub prepared_gid: Option<String>,
     /// `pg_stat_activity.backend_type`: `client backend`, `autovacuum
     /// worker`, …; `prepared transaction` for one; or `unknown` for a
     /// backend this role may not see (another role's, without
     /// `pg_read_all_stats`), whose query reads `<insufficient privilege>`.
     pub backend_type: String,
-    /// `pg_stat_activity.query`, as far as this role may see it.
-    pub query: String,
-    /// The lock mode it holds, as `pg_locks` spells it.
+    /// The lock mode it holds or asks for, as `pg_locks` spells it.
     pub mode: String,
+    /// Whether it holds the lock (`true`) or is queued for it ahead of the
+    /// next attempt (`false`).
+    pub granted: bool,
+    /// For a queued request, when it began waiting (`pg_locks.waitstart`).
+    /// For a holder, when its transaction began, or a prepared
+    /// transaction was prepared: it has held the lock at most since then.
+    /// `None` where this role may not see it.
+    pub since: Option<SystemTime>,
+    /// The first 200 characters of `pg_stat_activity.query`, as far as this
+    /// role may see it; empty for a prepared transaction.
+    pub query: String,
 }
 
 impl Blocker {
-    /// Whether a capture operation cancels this blocker: only an autovacuum
-    /// worker, and not one preventing wraparound, which would only start
-    /// again (and which Postgres's own deadlock check never cancels either).
-    /// [`cancel_autovacuum`] checks the same again, in the statement that
-    /// cancels it.
-    pub fn cancellable(&self) -> bool {
-        self.backend_type == "autovacuum worker"
-            && self.query.starts_with("autovacuum: ")
-            && !self.query.contains("(to prevent wraparound)")
-    }
-}
-
-impl std::fmt::Display for Blocker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.pid {
-            Some(pid) => write!(f, "pid {pid}")?,
-            None => write!(f, "no pid")?,
+    /// One line for a log or a status, with how long it has held or waited
+    /// as of `at`.
+    pub fn describe(&self, at: SystemTime) -> String {
+        let who = match (self.pid, &self.prepared_gid) {
+            (Some(pid), _) => format!("pid {pid}"),
+            (None, Some(gid)) => format!("prepared transaction {gid:?}"),
+            (None, None) => "no pid".to_string(),
+        };
+        let state = if self.granted { "holds" } else { "waits for" };
+        let age = match self.since {
+            Some(since) => format!(" for {:.1?}", at.duration_since(since).unwrap_or_default()),
+            None => String::new(),
+        };
+        let mut line = format!("{who} ({}, {state} {}{age})", self.backend_type, self.mode);
+        if !self.query.is_empty() {
+            line.push_str(": ");
+            line.push_str(&self.query);
         }
-        let query: String = self.query.chars().take(BLOCKER_QUERY_CHARS).collect();
-        write!(f, " ({}, {}): {query}", self.backend_type, self.mode)
+        line
     }
 }
 
-/// Who holds a lock on `table` that conflicts with `conflicts` (lock modes as
-/// `pg_locks` spells them), other than this session.
+/// Who, other than this session, holds or is queued for a lock on `table`
+/// that conflicts with `conflicts` (lock modes as `pg_locks` spells them).
 pub async fn blockers(
     client: &impl GenericClient,
     table: &str,
     conflicts: &[&str],
 ) -> Result<Vec<Blocker>, tokio_postgres::Error> {
+    // A prepared transaction's locks have no pid. Its own `transactionid`
+    // lock shares their `virtualtransaction` and names the xid that
+    // `pg_prepared_xacts` lists its gid under.
     Ok(client
         .query(
-            "select l.pid, \
+            "select l.pid, p.gid, \
                     case when l.pid is null then 'prepared transaction' \
                          else coalesce(a.backend_type, 'unknown') end, \
-                    coalesce(a.query, ''), l.mode \
+                    l.mode, l.granted, \
+                    case when not l.granted then l.waitstart \
+                         when l.pid is null then p.prepared \
+                         else a.xact_start end, \
+                    coalesce(pg_catalog.left(a.query, $3), '') \
              from pg_catalog.pg_locks l \
              left join pg_catalog.pg_stat_activity a on a.pid = l.pid \
-             where l.locktype = 'relation' and l.granted \
+             left join lateral ( \
+                 select p.gid, p.prepared \
+                 from pg_catalog.pg_locks x \
+                 join pg_catalog.pg_prepared_xacts p on p.transaction = x.transactionid \
+                 where x.pid is null and x.locktype = 'transactionid' \
+                   and x.virtualtransaction = l.virtualtransaction \
+                 limit 1) p on l.pid is null \
+             where l.locktype = 'relation' \
                and l.database = (select oid from pg_catalog.pg_database \
                                  where datname = pg_catalog.current_database()) \
                and l.relation = pg_catalog.to_regclass($1) \
                and l.pid is distinct from pg_catalog.pg_backend_pid() \
                and l.mode = any($2) \
-             order by l.pid",
-            &[&crate::defs::ddl::regclass_arg(table), &conflicts],
+             order by l.pid, p.gid, l.mode",
+            &[
+                &crate::defs::ddl::regclass_arg(table),
+                &conflicts,
+                &BLOCKER_QUERY_CHARS,
+            ],
         )
         .await?
         .into_iter()
         .map(|row| Blocker {
             pid: row.get(0),
-            backend_type: row.get(1),
-            query: row.get(2),
+            prepared_gid: row.get(1),
+            backend_type: row.get(2),
             mode: row.get(3),
+            granted: row.get(4),
+            since: row.get(5),
+            query: row.get(6),
         })
         .collect())
 }
 
-/// Cancels `pid` if, as this statement reads it, it is still an autovacuum
-/// worker that isn't preventing wraparound and still holds a lock on `table`
-/// that conflicts with `conflicts`. Returns `None`, having signalled
-/// nothing, if it isn't, and otherwise `pg_cancel_backend`'s result.
-///
-/// Checking in the statement that cancels, rather than trusting the
-/// [`blockers`] read a round trip earlier, keeps a pid the worker released
-/// in between, and an application backend then given it, from being
-/// cancelled. The wraparound check reads the worker's `query`, which
-/// Postgres cuts to `track_activity_query_size` bytes: a text that may have
-/// been cut (within a multibyte character of the limit) could have lost its
-/// `(to prevent wraparound)`, so it isn't cancelled.
-async fn cancel_autovacuum(
+/// Reads the [`LockWait`] for `op`, waiting since `started`.
+async fn lock_wait(
     client: &impl GenericClient,
-    pid: i32,
-    table: &str,
-    conflicts: &[&str],
-) -> Result<Option<bool>, tokio_postgres::Error> {
-    Ok(client
-        .query_opt(
-            "select pg_catalog.pg_cancel_backend(a.pid) \
-             from pg_catalog.pg_stat_activity a \
-             where a.pid = $1 \
-               and a.backend_type = 'autovacuum worker' \
-               and a.query like 'autovacuum: %' \
-               and a.query not like '%(to prevent wraparound)%' \
-               and pg_catalog.octet_length(a.query) + 4 < ( \
-                   select setting::int from pg_catalog.pg_settings \
-                   where name = 'track_activity_query_size') \
-               and exists ( \
-                   select 1 from pg_catalog.pg_locks l \
-                   where l.pid = a.pid and l.locktype = 'relation' and l.granted \
-                     and l.relation = pg_catalog.to_regclass($2) \
-                     and l.mode = any($3))",
-            &[&pid, &crate::defs::ddl::regclass_arg(table), &conflicts],
-        )
+    op: Op<'_>,
+    started: Instant,
+) -> Result<LockWait, tokio_postgres::Error> {
+    let conflicts = op.lock().1;
+    let observed_at: SystemTime = client
+        .query_one("select pg_catalog.clock_timestamp()", &[])
         .await?
-        .map(|row| row.get(0)))
+        .get(0);
+    let blockers = blockers(client, op.table(), conflicts).await?;
+    Ok(LockWait {
+        table: op.table().to_string(),
+        operation: op.operation(),
+        lock_mode: op.operation().lock_mode().to_string(),
+        waiting_since: observed_at
+            .checked_sub(started.elapsed())
+            .unwrap_or(observed_at),
+        observed_at,
+        blockers,
+    })
 }
 
-/// Reports, and where allowed cancels, what keeps a capture operation from
-/// its table lock (see the module doc's "A blocking autovacuum").
-struct Blockers {
-    what: &'static str,
-    last_checked: Option<Instant>,
+/// Logs what keeps a capture operation from its table lock, at most once
+/// per [`BLOCKER_LOG_INTERVAL`] of one call. (A caller that runs passes with
+/// short deadlines gets a line per pass; C5 rate-limits those.)
+struct BlockerLog {
+    operation: LockingOperation,
     last_logged: Option<Instant>,
-    /// Set once Postgres refused to cancel an autovacuum worker for this
-    /// role: it won't allow it on a later attempt either.
-    cancel_refused: bool,
 }
 
-impl Blockers {
-    fn new(what: &'static str) -> Self {
+/// How often [`BlockerLog`] logs the blockers of an operation that keeps
+/// timing out.
+const BLOCKER_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+impl BlockerLog {
+    fn new(operation: LockingOperation) -> Self {
         Self {
-            what,
-            last_checked: None,
+            operation,
             last_logged: None,
-            cancel_refused: false,
         }
     }
 
-    /// After a timed-out attempt: reads the blockers (at most once per
-    /// [`BLOCKER_CHECK_INTERVAL`]), logs them (at most once per
-    /// [`BLOCKER_LOG_INTERVAL`]), and cancels each cancellable one. A failure
-    /// here is logged and otherwise ignored: the retry goes on either way.
-    async fn inspect(&mut self, client: &impl GenericClient, table: &str, conflicts: &[&str]) {
+    /// Whether a line is due, and if so, marks one logged now.
+    fn due(&mut self) -> bool {
         let now = Instant::now();
         if self
-            .last_checked
-            .is_some_and(|checked| now.duration_since(checked) < BLOCKER_CHECK_INTERVAL)
-        {
-            return;
-        }
-        self.last_checked = Some(now);
-        let found = match blockers(client, table, conflicts).await {
-            Ok(found) => found,
-            Err(error) => {
-                tracing::debug!(what = self.what, table, %error, "reading lock blockers failed");
-                return;
-            }
-        };
-        if self
             .last_logged
-            .is_none_or(|logged| now.duration_since(logged) >= BLOCKER_LOG_INTERVAL)
+            .is_some_and(|logged| now.duration_since(logged) < BLOCKER_LOG_INTERVAL)
         {
-            self.last_logged = Some(now);
-            let listed: Vec<String> = found.iter().map(Blocker::to_string).collect();
-            tracing::info!(
-                what = self.what,
-                table,
-                blockers = ?listed,
-                "capture DDL waiting for a table lock these sessions hold"
-            );
+            return false;
         }
-        if self.cancel_refused {
+        self.last_logged = Some(now);
+        true
+    }
+
+    /// After a timed-out attempt that will be retried: reads and logs the
+    /// blockers if a line is due. A failed read is logged and otherwise
+    /// ignored: the retry goes on either way.
+    async fn after_timeout(&mut self, client: &impl GenericClient, op: Op<'_>, started: Instant) {
+        if !self.due() {
             return;
         }
-        for blocker in found.iter().filter(|b| b.cancellable()) {
-            let Some(pid) = blocker.pid else { continue };
-            match cancel_autovacuum(client, pid, table, conflicts).await {
-                Ok(None) => {}
-                Ok(Some(signalled)) => {
-                    tracing::info!(
-                        what = self.what,
-                        table,
-                        pid,
-                        signalled,
-                        "cancelled an autovacuum worker holding the table capture needs"
-                    );
-                }
-                Err(error) => {
-                    self.cancel_refused = true;
-                    tracing::info!(
-                        what = self.what,
-                        table,
-                        pid,
-                        %error,
-                        "can't cancel the autovacuum worker holding the table capture needs; \
-                         waiting it out"
-                    );
-                    return;
-                }
-            }
+        match lock_wait(client, op, started).await {
+            Ok(wait) => self.log(&wait, "retrying"),
+            Err(error) => tracing::debug!(
+                what = self.operation.what(),
+                table = op.table(),
+                %error,
+                "reading lock blockers failed"
+            ),
         }
+    }
+
+    /// Once the deadline stops the retries: logs `wait` if a line is due.
+    fn at_deadline(&mut self, wait: &LockWait) {
+        if self.due() {
+            self.log(wait, "leaving it for the next pass");
+        }
+    }
+
+    fn log(&self, wait: &LockWait, next: &str) {
+        tracing::info!(what = self.operation.what(), table = %wait.table, "{wait}; {next}");
     }
 }
 
@@ -961,49 +1103,79 @@ mod tests {
     fn blocker(backend_type: &str, query: &str) -> Blocker {
         Blocker {
             pid: Some(42),
+            prepared_gid: None,
             backend_type: backend_type.to_string(),
-            query: query.to_string(),
             mode: "ShareUpdateExclusiveLock".to_string(),
+            granted: true,
+            since: None,
+            query: query.to_string(),
         }
     }
 
     #[test]
-    fn only_an_ordinary_autovacuum_is_cancelled() {
-        assert!(blocker("autovacuum worker", "autovacuum: VACUUM public.orders").cancellable());
-        assert!(blocker("autovacuum worker", "autovacuum: ANALYZE public.orders").cancellable());
-        assert!(
-            !blocker(
-                "autovacuum worker",
-                "autovacuum: VACUUM ANALYZE public.orders (to prevent wraparound)"
-            )
-            .cancellable()
+    fn a_blocker_names_its_pid_or_gid_and_how_long_it_has_held() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let vacuum = Blocker {
+            since: Some(at - Duration::from_millis(2_500)),
+            ..blocker("autovacuum worker", "autovacuum: VACUUM public.orders")
+        };
+        assert_eq!(
+            vacuum.describe(at),
+            "pid 42 (autovacuum worker, holds ShareUpdateExclusiveLock for 2.5s): \
+             autovacuum: VACUUM public.orders"
         );
-        // A backend this role may not see is never cancelled.
-        assert!(!blocker("unknown", "<insufficient privilege>").cancellable());
-        assert!(
-            !blocker(
-                "autovacuum worker",
-                "autovacuum: VACUUM public.orders (to prevent wraparound)"
-            )
-            .cancellable()
-        );
-        assert!(!blocker("client backend", "vacuum public.orders").cancellable());
-        assert!(!blocker("prepared transaction", "").cancellable());
-    }
-
-    #[test]
-    fn a_blocker_names_its_pid_and_query() {
-        let long = format!("insert into orders {}", "x".repeat(500));
-        let shown = blocker("client backend", &long).to_string();
-        assert!(shown.starts_with("pid 42 (client backend, ShareUpdateExclusiveLock): insert"));
-        assert!(shown.len() < 300, "{shown}");
         let prepared = Blocker {
             pid: None,
+            prepared_gid: Some("tx-1".to_string()),
+            mode: "RowExclusiveLock".to_string(),
             ..blocker("prepared transaction", "")
         };
         assert_eq!(
-            prepared.to_string(),
-            "no pid (prepared transaction, ShareUpdateExclusiveLock): "
+            prepared.describe(at),
+            "prepared transaction \"tx-1\" (prepared transaction, holds RowExclusiveLock)"
+        );
+        let queued = Blocker {
+            granted: false,
+            mode: "AccessExclusiveLock".to_string(),
+            since: Some(at - Duration::from_secs(1)),
+            ..blocker("unknown", "")
+        };
+        assert_eq!(
+            queued.describe(at),
+            "pid 42 (unknown, waits for AccessExclusiveLock for 1.0s)"
+        );
+    }
+
+    #[test]
+    fn a_lock_wait_says_what_waits_how_long_and_on_whom() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut wait = LockWait {
+            table: "public.orders".to_string(),
+            operation: LockingOperation::Install,
+            lock_mode: LockingOperation::Install.lock_mode().to_string(),
+            waiting_since: at - Duration::from_millis(300),
+            observed_at: at,
+            blockers: vec![
+                blocker("client backend", "update orders set a = 1"),
+                Blocker {
+                    pid: Some(43),
+                    ..blocker("autovacuum worker", "autovacuum: VACUUM public.orders")
+                },
+            ],
+        };
+        assert_eq!(wait.waited(), Duration::from_millis(300));
+        assert_eq!(
+            wait.to_string(),
+            "capture install on public.orders waiting 300.0ms for ShareRowExclusiveLock, \
+             held against it by pid 42 (client backend, holds ShareUpdateExclusiveLock): \
+             update orders set a = 1; pid 43 (autovacuum worker, holds \
+             ShareUpdateExclusiveLock): autovacuum: VACUUM public.orders"
+        );
+        wait.blockers.clear();
+        assert!(
+            wait.to_string()
+                .ends_with("; no conflicting lock is held now"),
+            "{wait}"
         );
     }
 }
