@@ -357,7 +357,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     }
 
     // Row 1: an ordinary image-bearing insert, staged with `enumout`'s
-    // spelling — exactly what real CDC/`pgoutput` decoding produces.
+    // spelling — exactly what a capture trigger images.
     stage_image(&client, "1", r#"{"grp":"medium","amount":"10"}"#).await;
     // Row 2: a bare recompute trigger — no image at all — forcing a live
     // refetch that decodes `grp` via `row_as_text_jsonb_sql`'s `<col>::text`

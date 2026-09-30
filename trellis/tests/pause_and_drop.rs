@@ -5,7 +5,7 @@
 //! [`trellis::Trellis`] facade (ADR-0012: the sibling crates and these suites
 //! reach the engine the way a user does, not through internals), and is
 //! verified against Postgres directly — reading `transform_definitions`,
-//! `information_schema`, the quarantine tables and `pg_publication_tables`
+//! `information_schema`, the quarantine tables and the installed capture
 //! with a raw connection rather than re-asking the engine what it thinks it
 //! did.
 //!
@@ -39,11 +39,8 @@
 //! - the target's own `column_*` quarantine bookkeeping goes with it; the
 //!   shared, source-keyed poison band does not
 //!   (`dropping_takes_target_owned_quarantine_rows_and_leaves_the_poison_band`)
-//! - the publication shrinks by reconciliation, and only once nothing
-//!   derives from a source any longer
-//!   (`dropping_shrinks_the_publication_to_what_still_derives`), and that
-//!   same reconcile still *grows* it correctly
-//!   (`dropping_reconciles_a_publication_that_still_has_to_grow`)
+//! - a drop leaves the source's capture to the staging worker's reconcile
+//!   (`dropping_leaves_capture_to_the_staging_worker`)
 //! - "chains off the target" includes reading it through a relationship, not
 //!   only `FROM <target>`
 //!   (`dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationship`)
@@ -1182,9 +1179,6 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     let db = cluster.create_isolated_database().await;
     let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 40).await;
-    raw.batch_execute("create publication trellis_pub")
-        .await
-        .expect("create publication");
 
     let trellis = define_only(db.dsn()).await;
     // A plain 1-1 transform's discharge enumerates a durable chunk queue
@@ -1271,9 +1265,6 @@ async fn a_chunk_finishing_after_the_pause_does_not_unpause_the_definition() {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 40).await;
-    raw.batch_execute("create publication trellis_pub")
-        .await
-        .expect("create publication");
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1366,9 +1357,6 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
     // A sibling definition's queue, which resuming `order_doubles` must not
     // touch.
     seed_source(&raw, "items", 10).await;
-    raw.batch_execute("create publication trellis_pub")
-        .await
-        .expect("create publication");
 
     let trellis = define_only(db.dsn()).await;
     trellis
@@ -1456,29 +1444,38 @@ async fn resuming_discards_the_paused_definitions_unclaimed_chunks() {
 }
 
 // ---------------------------------------------------------------------
-// Publication
+// Capture
 // ---------------------------------------------------------------------
 
 /// ADR-0014, "The publication shrinks by reconciliation", as ADR-0016 amends
-/// it (issue #427): a drop only removes catalog rows and never touches the
-/// publication, so the process applying it needs no publication privileges.
-/// The staging worker's next reconcile pass shrinks the publication from the
-/// catalog; `client::reconcile_tests` covers that pass directly.
+/// it (issue #427) and #622 C5 restates it for trigger capture: a drop only
+/// removes catalog rows and never touches the source's capture triggers, so
+/// the process applying it needs no privilege on the source. The staging
+/// worker's next reconcile pass uninstalls them from the catalog;
+/// `client::reconcile_tests` covers that pass directly.
 #[tokio::test]
-async fn dropping_leaves_the_publication_to_the_staging_worker() {
+async fn dropping_leaves_capture_to_the_staging_worker() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 4).await;
-    raw.batch_execute("create publication trellis_pub for table trellis.orders")
-        .await
-        .expect("create a publication covering the source");
 
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g SELECT sum(a) AS total")
         .await
         .expect("define");
+    let desired = trellis::defs::publication_tables(&db.pool)
+        .await
+        .expect("the tables to capture");
+    trellis::capture::reconcile::reconcile(
+        &mut raw,
+        DEFAULT_SCHEMA,
+        &desired,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("capture the source");
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
         .await
@@ -1488,15 +1485,13 @@ async fn dropping_leaves_the_publication_to_the_staging_worker() {
         .await
         .expect("drop the source's only reader");
 
-    assert_eq!(
-        count(
-            &raw,
-            "select count(*) from pg_publication_tables \
-             where pubname = 'trellis_pub' and tablename = 'orders'"
-        )
-        .await,
-        1,
-        "the drop leaves the publication alone; the staging worker's reconcile removes `orders`"
+    let installed = trellis::capture::reconcile::installed_tables(&raw, DEFAULT_SCHEMA)
+        .await
+        .expect("read the installed capture");
+    assert!(
+        installed.contains(&format!("{DEFAULT_SCHEMA}.orders")),
+        "the drop leaves the capture alone; the staging worker's reconcile removes it: \
+         {installed:?}"
     );
 }
 
@@ -1513,7 +1508,7 @@ async fn dropping_leaves_the_publication_to_the_staging_worker() {
 /// Dropping anyway used to succeed, leaving the reader deriving from a
 /// vanished table — and because the surviving `relationship` edge keeps the
 /// target's `schema_nodes` row alive, `all_source_tables` kept naming the
-/// dropped table, so every later `reconcile_publication` (including the
+/// dropped table, so every later publication reconcile (including the
 /// running client's own periodic one) failed `42P01`.
 #[tokio::test]
 async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationship() {
@@ -1603,9 +1598,9 @@ async fn dropping_is_refused_by_a_live_dependent_that_reads_through_a_relationsh
 /// declaration, and `drop_relationship` reaps them — so a relationship that
 /// outlives its to-side keeps the dropped target's `schema_nodes` row alive
 /// with nothing left to explain it. `all_source_tables` then keeps naming a
-/// table that no longer exists and every later `reconcile_publication`,
-/// including the running client's own periodic one, fails `42P01`: a
-/// fleet-wide intake wedge, reachable with zero readers in the picture.
+/// table that no longer exists and every later reconcile pass, including
+/// the running client's own periodic one, fails `42P01`: a fleet-wide
+/// capture wedge, reachable with zero readers in the picture.
 ///
 /// Retirement order is therefore relationship-then-target, and the refusal
 /// names the relationship by its qualified `schema.from_table.name` address —

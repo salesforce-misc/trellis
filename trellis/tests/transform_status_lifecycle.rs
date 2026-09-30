@@ -8,14 +8,10 @@
 //! Two scenarios, each exercising a real fence/marker rather than a
 //! shortcut:
 //!
-//! - A fresh transform whose source table's `pending_backfill` marker
-//!   (`intake::publication`) is pinned by a concurrent straggler
-//!   transaction sits in `waiting_to_backfill` until that transaction
-//!   commits and the marker's `xmin` fence settles, then reaches `live` —
-//!   mirroring `intake_robustness.rs`'s own
-//!   `table_add_backfills_existing_rows_once_the_fence_settles_and_retries_safely`
-//!   straggler pattern for the fence mechanics, plus asserting the status
-//!   column this issue wires up.
+//! - A fresh transform whose source table's `pending_backfill` marker is
+//!   pinned by a concurrent straggler transaction sits in
+//!   `waiting_to_backfill` until that transaction commits and the marker's
+//!   `xmin` fence settles, then reaches `live`.
 //! - `quarantine::resume_transform` drops an (manually) `quarantined`
 //!   definition back to `waiting_to_backfill` and re-parks a catch-up
 //!   marker, which the same `run_pending_backfills` discharge carries
@@ -42,11 +38,6 @@
 //! pre-resume `poison` rows are (deliberately) still there, while a full
 //! fresh threshold's worth of new evictions must.
 //!
-//! Two more (issue #417) cover a fresh install's slot creation: a row
-//! committed while the slot is being created still reaches the target (#393),
-//! and a definition that defers while the slot is being created still goes
-//! live (#323).
-//!
 //! The last (issue #407) checks that a source whose backfill keeps failing
 //! shows its retry state through `Trellis::status` until the cause is fixed.
 
@@ -63,7 +54,6 @@ use trellis::defs::{
 use trellis::intake::publication;
 use trellis::staging::apply;
 use trellis::staging::quarantine;
-use trellis::staging::session::ProducerSession;
 use trellis::staging::{has_pending, retire_drained_segments};
 
 async fn connect_raw(dsn: &str) -> Client {
@@ -266,6 +256,14 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
     }
 }
 
+/// One staging-worker reconcile pass (capture, markers, discharge), with no
+/// time to wait for an unsettled fence.
+async fn reconcile_pass(pool: &trellis::Pool, raw: &mut Client) {
+    trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA, "wake", Duration::ZERO)
+        .await
+        .expect("reconcile pass");
+}
+
 async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
     // `transform_definitions.target_table` is persisted fully-qualified
     // (issue #73) — every definition this test file installs lands in
@@ -395,12 +393,12 @@ async fn evict_keys_for_real(
         .expect("retire drained segments");
 }
 
-/// A fresh transform whose source table's publication-join fence is pinned
-/// by a concurrent straggler transaction sits in `waiting_to_backfill` for
-/// as long as that straggler is open — never silently `live` or
-/// `backfilling` while its rows are genuinely unpopulated — then reaches
-/// `backfilling`/`live` once the straggler commits and
-/// `run_pending_backfills` discharges the marker, with the target correctly
+/// A fresh transform whose registration marker's fence is pinned by a
+/// concurrent straggler transaction sits in `waiting_to_backfill` for as
+/// long as that straggler is open — never silently `live` or `backfilling`
+/// while its rows are genuinely unpopulated — then reaches
+/// `backfilling`/`live` once the straggler commits and the staging worker's
+/// reconcile pass discharges the marker, with the target correctly
 /// populated from every pre-existing source row.
 #[tokio::test]
 async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
@@ -410,27 +408,19 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
 
     raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 25) g; \
-         create publication test_pub;",
+         insert into s (id, a) select g, g from generate_series(1, 25) g",
     )
     .await
-    .expect("seed source table and publication");
+    .expect("seed source table");
 
-    // A straggler holds an xid open before the table joins the publication,
-    // so the marker `reconcile_publication` leaves must name it as
-    // in-flight — same pattern as
-    // `intake_robustness.rs`'s `table_add_backfills_existing_rows_once_the_fence_settles_and_retries_safely`.
+    // A straggler holds an xid open before the table is captured, so the
+    // marker the reconcile pass parks must name it as in-flight.
     let straggler = OpenTransaction::begin(db.dsn()).await;
     straggler.execute("select txid_current()").await;
 
-    publication::reconcile_publication(&mut raw, "test_pub", &[format!("{DEFAULT_SCHEMA}.s")])
-        .await
-        .expect("reconcile adds s and leaves an unsettled pending_backfill marker");
-
-    // The definition is created *while the marker is still unsettled* — the
-    // scenario issue #55 closed. Registration always leaves the definition
-    // `waiting_to_backfill` now (ADR-0016); what this pins is that the
-    // discharge doesn't build it until the straggler has ended.
+    // Registration always leaves the definition `waiting_to_backfill`
+    // (ADR-0016); what this pins is that the discharge doesn't build it
+    // until the straggler has ended.
     let cols = numeric(&["a"]);
     let def = install_definition(
         &db.pool,
@@ -476,17 +466,16 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         "a deferred definition must not enqueue chunk work it can't safely run yet"
     );
 
-    // A second run_pending_backfills pass while the straggler is still open
-    // must leave the definition exactly where it was — no flicker, no
-    // partial progress.
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills (unsettled)");
+    // A reconcile pass while the straggler is still open installs the
+    // capture and parks the marker, and must leave the definition exactly
+    // where it was — no flicker, no partial progress.
+    reconcile_pass(&db.pool, &mut raw).await;
+    let markers: i64 = raw
+        .query_one("select count(*) from pending_backfill", &[])
+        .await
+        .expect("count markers")
+        .get(0);
+    assert_eq!(markers, 1, "the pass parked the marker and left it unsettled");
     assert_eq!(
         status_of(&raw, "t").await,
         TransformStatus::WaitingToBackfill,
@@ -496,16 +485,9 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
     // The straggler settles.
     straggler.commit().await;
 
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills (settled)");
+    reconcile_pass(&db.pool, &mut raw).await;
 
-    // `run_pending_backfills` only *dispatches* the build (for this plain
+    // The pass only *dispatches* the build (for this plain
     // 1-1 definition, its chunks); running the chunks is what actually
     // populates the target and takes the definition `live`.
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -529,77 +511,6 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         mismatches, 0,
         "the deferred backfill must populate every pre-existing source row correctly"
     );
-}
-
-/// Issue #312: when the settled marker's enumeration has to wait for intake
-/// and gives up, the definition stays `waiting_to_backfill`. Left in
-/// `backfilling`, the next pass (which only dispatches `waiting_to_backfill`
-/// definitions) would never flip it to `live`. A doubling alias chain too
-/// large for the direct build to inline, so it's `Unsupported` there and
-/// built by the ring (which waits for intake).
-#[tokio::test]
-async fn a_deferred_enumeration_returns_its_definition_to_waiting_to_backfill() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric); \
-         alter table s replica identity full; \
-         insert into s (id, a) select g, g from generate_series(1, 5) g; \
-         create publication test_pub;",
-    )
-    .await
-    .expect("seed source table and publication");
-
-    let straggler = OpenTransaction::begin(db.dsn()).await;
-    straggler.execute("select txid_current()").await;
-    publication::reconcile_publication(&mut raw, "test_pub", &[format!("{DEFAULT_SCHEMA}.s")])
-        .await
-        .expect("reconcile leaves an unsettled marker");
-    let chain: Vec<String> = std::iter::once("a + a AS f0".to_string())
-        .chain((1..=17).map(|k| format!("f{} + f{} AS f{k}", k - 1, k - 1)))
-        .collect();
-    install_definition(
-        &db.pool,
-        &format!("TRANSFORM t FROM s SELECT {}", chain.join(", ")),
-        &numeric(&["id", "a"]),
-        "public",
-    )
-    .await
-    .expect("install_definition defers");
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::WaitingToBackfill
-    );
-    straggler.commit().await;
-
-    // The fence has settled, but intake is behind the enumeration's
-    // snapshot, so the enumeration defers.
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::new(),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("run_pending_backfills (intake behind)");
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::WaitingToBackfill,
-        "a deferred enumeration must not leave its definition in backfilling"
-    );
-
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("run_pending_backfills (intake caught up)");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
 }
 
 /// Whole-transform quarantine resume (ADR-0003's coarser fuse tier):
@@ -1109,306 +1020,6 @@ async fn both_backfill_mechanisms_still_reach_live_with_no_unsettled_marker() {
     assert_eq!(status_of(&raw, "agg_t").await, TransformStatus::Live);
 }
 
-/// Polls until some other backend is blocked on a transaction lock inside
-/// `pg_create_logical_replication_slot`: slot creation waiting out a
-/// transaction that was open when it started. A state to reach, not a
-/// convergence: the tests below hold that transaction open until this
-/// returns.
-async fn wait_until_slot_creation_blocks(client: &Client) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let blocked: bool = client
-            .query_one(
-                "select exists (select 1 from pg_stat_activity \
-                 where pid <> pg_backend_pid() and wait_event_type = 'Lock' \
-                 and query like '%pg_create_logical_replication_slot%')",
-                &[],
-            )
-            .await
-            .expect("read pg_stat_activity")
-            .get(0);
-        if blocked {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "slot creation never blocked on the open transaction"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Runs fresh-install slot setup for `table` on its own producer session.
-async fn create_slot(dsn: &str, slot: &str, table: &str) {
-    let mut session = ProducerSession::connect(dsn, DEFAULT_SCHEMA)
-        .await
-        .expect("connect producer session");
-    publication::create_slot_and_park_markers(&mut session, slot, &[table.to_string()])
-        .await
-        .expect("create the slot");
-}
-
-/// Issue #393, fixed by #417: a transaction open when a fresh install starts
-/// creating its slot, and committed while slot creation waits for it, lands
-/// before the slot's consistent point, so the slot never streams it. Setup
-/// used to read every table at a snapshot taken before that wait, so it
-/// missed the row too, and only a leftover join marker could repair it. `s`
-/// here is already published, so it had no such marker and the row was lost.
-/// Setup now reads nothing and parks a marker on every table, and the
-/// discharge's read, taken after the slot exists, sees the row.
-#[tokio::test]
-async fn a_row_committed_during_fresh_slot_creation_reaches_the_target() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-    let source = format!("{DEFAULT_SCHEMA}.s");
-
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) values (1, 1); \
-         create publication test_pub for table s;",
-    )
-    .await
-    .expect("seed an already-published source table");
-    install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
-        "public",
-    )
-    .await
-    .expect("install_definition");
-    // Build it and discharge its go-live catch-up, so no marker is left over
-    // to re-read `s` by accident.
-    drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the go-live catch-up");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
-
-    let writer = OpenTransaction::begin(db.dsn()).await;
-    writer
-        .execute(&format!("insert into {source} (id, a) values (2, 2)"))
-        .await;
-    tokio::join!(create_slot(db.dsn(), "gap_slot", &source), async {
-        wait_until_slot_creation_blocks(&raw).await;
-        writer.commit().await;
-    });
-
-    // The commit is before the consistent point: the slot carries no insert.
-    let streamed_inserts: i64 = raw
-        .query_one(
-            "select count(*) from pg_logical_slot_peek_binary_changes( \
-                 'gap_slot', null, null, 'proto_version', '1', 'publication_names', 'test_pub') \
-             where get_byte(data, 0) = ascii('I')",
-            &[],
-        )
-        .await
-        .expect("peek the slot")
-        .get(0);
-    assert_eq!(
-        streamed_inserts, 0,
-        "the writer must commit before the consistent point for this to test #393's gap"
-    );
-
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge setup's marker");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    let x: Option<String> = raw
-        .query_opt("select x::text from t where id = 2", &[])
-        .await
-        .expect("read t")
-        .map(|row| row.get(0));
-    assert_eq!(
-        x,
-        Some("4".to_string()),
-        "a row committed during slot creation must reach the target"
-    );
-
-    raw.execute("select pg_drop_replication_slot('gap_slot')", &[])
-        .await
-        .expect("drop the slot");
-}
-
-/// #393's gap for a delete, on a definition already `live` when a fresh slot
-/// is created (the catalog outlived its old slot). A delete committed during
-/// slot creation is neither streamed nor reachable by a re-read, which only
-/// enumerates the keys the source still has. Setup's marker is a go-live
-/// catch-up for the table's applying readers: it moves `t` to `catching_up`,
-/// and its discharge sweeps the row no source row backs before flipping `t`
-/// back `live`.
-#[tokio::test]
-async fn a_delete_committed_during_fresh_slot_creation_reaches_a_live_target() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-    let source = format!("{DEFAULT_SCHEMA}.s");
-
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) values (1, 1), (2, 2); \
-         create publication test_pub for table s;",
-    )
-    .await
-    .expect("seed an already-published source table");
-    install_definition(
-        &db.pool,
-        "TRANSFORM t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
-        "public",
-    )
-    .await
-    .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the go-live catch-up");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
-
-    let writer = OpenTransaction::begin(db.dsn()).await;
-    writer
-        .execute(&format!("delete from {source} where id = 2"))
-        .await;
-    tokio::join!(create_slot(db.dsn(), "gap_slot", &source), async {
-        wait_until_slot_creation_blocks(&raw).await;
-        writer.commit().await;
-    });
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::CatchingUp,
-        "a live definition may be missing commits from before the new slot's consistent \
-         point, so it isn't in its steady state until setup's catch-up has run"
-    );
-
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge setup's marker");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    let ids: Vec<i64> = raw
-        .query("select id from t order by id", &[])
-        .await
-        .expect("read t")
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(
-        ids,
-        vec![1],
-        "a row deleted during slot creation must leave the target"
-    );
-    assert_eq!(status_of(&raw, "t").await, TransformStatus::Live);
-
-    raw.execute("select pg_drop_replication_slot('gap_slot')", &[])
-        .await
-        .expect("drop the slot");
-}
-
-/// Issue #323's second concern, checked for #417: a definition registered
-/// while a fresh install's slot creation waits (its source's join marker is
-/// unsettled) must still go live. Setup parks its own marker on the table after slot
-/// creation, merging into the join marker, and nothing discharges markers
-/// during setup, so the deferred definition's marker is always there for the
-/// discharge to promote it.
-#[tokio::test]
-async fn a_definition_deferred_during_fresh_slot_creation_goes_live() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
-    let source = format!("{DEFAULT_SCHEMA}.s");
-
-    raw.batch_execute(
-        "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 3) g; \
-         create publication test_pub;",
-    )
-    .await
-    .expect("seed source table and publication");
-
-    // Open before the join, so the join marker's fence is unsettled and slot
-    // creation has to wait for it.
-    let writer = OpenTransaction::begin(db.dsn()).await;
-    writer
-        .execute(&format!("insert into {source} (id, a) values (4, 4)"))
-        .await;
-    publication::reconcile_publication(&mut raw, "test_pub", std::slice::from_ref(&source))
-        .await
-        .expect("reconcile adds s with an unsettled marker");
-
-    let (_, def) = tokio::join!(create_slot(db.dsn(), "defer_slot", &source), async {
-        wait_until_slot_creation_blocks(&raw).await;
-        let def = install_definition(
-            &db.pool,
-            "TRANSFORM t FROM s SELECT a + a AS x",
-            &numeric(&["a"]),
-            "public",
-        )
-        .await
-        .expect("install_definition while the slot is being created");
-        writer.commit().await;
-        def
-    });
-    assert_eq!(
-        def.status,
-        TransformStatus::WaitingToBackfill,
-        "registered behind an unsettled marker, the definition must defer"
-    );
-
-    publication::run_pending_backfills(
-        &mut raw,
-        "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the marker");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-
-    assert_eq!(
-        status_of(&raw, "t").await,
-        TransformStatus::Live,
-        "a definition deferred during slot creation must not be stranded"
-    );
-    let mismatches: i64 = raw
-        .query_one(
-            "select count(*) from s left join t on t.id = s.id \
-             where t.id is null or t.x is distinct from s.a + s.a",
-            &[],
-        )
-        .await
-        .expect("compare s and t")
-        .get(0);
-    assert_eq!(mismatches, 0, "every source row, the writer's included");
-
-    raw.execute("select pg_drop_replication_slot('defer_slot')", &[])
-        .await
-        .expect("drop the slot");
-}
-
 /// Every definition's [`trellis::DefinitionSummary::backfill_failure`], in
 /// `Trellis::definitions`' order.
 async fn backfill_failures_listed(
@@ -1497,12 +1108,9 @@ async fn a_failing_backfill_shows_through_status_until_it_goes_through() {
     // backoff out: a new park resets the marker's retry state, so the table
     // is due at once and `status` stops reporting the old failure while the
     // marker is still there.
-    raw.batch_execute(
-        "alter table public.widgets add primary key (id); \
-         create publication trellis_pub for table public.widgets",
-    )
-    .await
-    .expect("restore the primary key and publish the source");
+    raw.batch_execute("alter table public.widgets add primary key (id)")
+        .await
+        .expect("restore the primary key");
     trellis
         .request_backfill("widgets")
         .await

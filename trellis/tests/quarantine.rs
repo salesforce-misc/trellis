@@ -261,14 +261,6 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    client
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ('slot1', $1)",
-            &[&PgLsn::from(1000u64)],
-        )
-        .await
-        .expect("seed replication_progress");
-
     seed_order_totals(&db, &client).await;
     client
         .execute(

@@ -6,7 +6,8 @@
 //! owning instance reaches its own readers of that target through the
 //! in-transaction downstream `Recompute` (`staging::apply` step 4), never
 //! through CDC. A *different* instance has no such path: before this fix it
-//! accepted the definition and added the target to its own publication.
+//! accepted the definition and added the target to its own publication (now
+//! its capture).
 //! Postgres then refused every one of the owning instance's updates to its
 //! own target (`cannot update table ... because it does not have a replica
 //! identity and publishes updates`), or, under `REPLICA IDENTITY FULL`, the
@@ -25,12 +26,10 @@ use trellis::defs::{
     CatalogError, RelationshipSide, ValueType, create_relationship, install_definition,
     publication_tables,
 };
-use trellis::intake::publication::reconcile_publication;
 use trellis::integer::IntWidth;
 use trellis::{Config, Pool, migrate};
 
 const INSTANCE_B: &str = "instance_b";
-const B_PUBLICATION: &str = "instance_b_pub";
 
 async fn connect_raw(dsn: &str, schema: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -94,34 +93,37 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
         .await
         .expect("migrate instance B");
     let b = connect_raw(db.dsn(), INSTANCE_B).await;
-    b.batch_execute(&format!("create publication {B_PUBLICATION}"))
-        .await
-        .expect("create instance B's publication");
     (pool_b, b)
 }
 
-/// Reconciles instance B's publication to the tables its catalog says to
-/// publish, exactly as B's maintenance loop would
-/// (`client::reconcile_source_tables`, via `defs::publication_tables`).
+/// Brings instance B's capture to the tables its catalog says to capture,
+/// exactly as B's maintenance loop would (`client::reconcile_source_tables`,
+/// via `defs::publication_tables`).
 async fn reconcile_b(pool_b: &Pool, b: &mut Client) -> Vec<String> {
     let desired = publication_tables(pool_b)
         .await
         .expect("instance B's source tables");
-    reconcile_publication(b, B_PUBLICATION, &desired)
-        .await
-        .expect("reconcile instance B's publication");
+    let outcome = trellis::capture::reconcile::reconcile(
+        b,
+        INSTANCE_B,
+        &desired,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("reconcile instance B's capture");
+    assert!(
+        outcome.failed.is_empty() && outcome.waiting.is_empty(),
+        "{outcome:?}"
+    );
     desired
 }
 
-async fn b_publishes(b: &Client, table: &str) -> bool {
-    b.query_one(
-        "select exists(select 1 from pg_publication_tables \
-         where pubname = $1 and schemaname = 'public' and tablename = $2)",
-        &[&B_PUBLICATION, &table],
-    )
-    .await
-    .expect("read instance B's publication")
-    .get(0)
+/// Whether instance B has capture installed on `public.<table>`.
+async fn b_captures(b: &Client, table: &str) -> bool {
+    trellis::capture::reconcile::installed_tables(b, INSTANCE_B)
+        .await
+        .expect("read instance B's capture")
+        .contains(&format!("public.{table}"))
 }
 
 async fn table_exists(client: &Client, qualified: &str) -> bool {
@@ -178,7 +180,7 @@ async fn a_one_to_one_over_another_instances_aggregate_target_is_rejected() {
         !desired.contains(&"public.sku_totals".to_string()),
         "instance B must not count instance A's aggregate target as a source: {desired:?}"
     );
-    assert!(!b_publishes(&b, "sku_totals").await);
+    assert!(!b_captures(&b, "sku_totals").await);
     assert_rejected_as_unkeyed(result);
     assert!(
         !table_exists(&b, "public.sku_copy").await,
@@ -209,7 +211,7 @@ async fn an_aggregate_over_another_instances_aggregate_target_is_rejected() {
     assert_rejected_as_unkeyed(result);
 
     reconcile_b(&pool_b, &mut b).await;
-    assert!(!b_publishes(&b, "sku_totals").await);
+    assert!(!b_captures(&b, "sku_totals").await);
     assert!(!table_exists(&b, "public.sku_rollup").await);
 }
 
@@ -245,8 +247,8 @@ async fn the_owning_instance_can_still_chain_off_its_own_aggregate_target() {
 }
 
 /// A 1-1 target has a real primary key, so another instance can still read it
-/// over CDC (issue #312's cross-instance hop), and it still joins that
-/// instance's publication.
+/// over CDC (issue #312's cross-instance hop), and that instance still
+/// captures it.
 #[tokio::test]
 async fn another_instances_one_to_one_target_is_still_accepted() {
     let cluster = TestCluster::start();
@@ -274,10 +276,10 @@ async fn another_instances_one_to_one_target_is_still_accepted() {
     .expect("instance B reads instance A's 1-1 target");
 
     reconcile_b(&pool_b, &mut b).await;
-    assert!(b_publishes(&b, "sales_copy").await);
+    assert!(b_captures(&b, "sales_copy").await);
 }
 
-/// Issue #375: a relationship endpoint reaches instance B's publication through
+/// Issue #375: a relationship endpoint reaches instance B's capture through
 /// `all_source_tables`' relationship walk, not as a definition's source, so it
 /// must pass the same keying rule. Instance A's aggregate target fails it
 /// whichever side of the relationship it is on; a plain table without a
@@ -386,7 +388,7 @@ async fn a_relationship_endpoint_intake_cant_key_is_rejected() {
     .await
     .expect("instance B reads through the relationship");
     let desired = reconcile_b(&pool_b, &mut b).await;
-    assert!(b_publishes(&b, "stores_copy").await, "{desired:?}");
+    assert!(b_captures(&b, "stores_copy").await, "{desired:?}");
 }
 
 /// The rule is about the table, not its owner, so a plain source table the

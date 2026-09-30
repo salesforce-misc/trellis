@@ -94,14 +94,10 @@ fn totals_def() -> TransformDef {
 
 /// Creates `orders` plus `totals`'s definition and target table. `orders`
 /// keeps Postgres's default replica identity (its primary key) rather than
-/// `REPLICA IDENTITY FULL`: this scalar sum never needs an old image (a
-/// delete only needs the key, which the primary-key-only default identity
-/// already sends) — setting `FULL` would mark *every* column as a key
-/// column in pgoutput's `Relation` message, and `intake::extract_key`
-/// joins every `is_key` column, so the row's "key" would become every
-/// column's value concatenated rather than just its primary key. Returns
-/// the primary key column intake's caller needs for both the target DDL
-/// and the oracle recompute.
+/// `REPLICA IDENTITY FULL`: this scalar sum never needs an old image, and
+/// capture keys a row by its primary key whatever the identity. Returns the
+/// primary key column the caller needs for both the target DDL and the
+/// oracle recompute.
 async fn setup_source_and_target(
     pool: &Pool,
     raw: &Client,
@@ -394,11 +390,11 @@ fn comments_calc_def() -> TransformDef {
 /// `defs::create_definition`, mirroring what `defctl add` does under the
 /// hood — against a source table that was **not** in
 /// the catalog when `Client::start` ran must still get
-/// published and backfilled while that same client keeps running, with no
-/// restart. Before the fix, `reconcile_publication`/`run_pending_backfills`
-/// only ever ran once, from `setup_staging`, so `comments` would never join
-/// the publication and `comments_calc` would stay empty for as long as this
-/// client kept running.
+/// captured and backfilled while that same client keeps running, with no
+/// restart. Before the fix, the reconcile pass and `run_pending_backfills`
+/// only ever ran once, from `setup_staging`, so `comments` would never be
+/// captured and `comments_calc` would stay empty for as long as this client
+/// kept running.
 #[tokio::test]
 async fn a_transform_registered_against_a_new_source_table_backfills_without_a_client_restart() {
     let cluster = TestCluster::start();

@@ -245,8 +245,8 @@ async fn change_id_records_intra_transaction_append_order() {
 
     let mut client = connect_raw(db.dsn()).await;
     let txn = client.transaction().await.expect("begin");
-    // One call, one transaction: exactly how intake stages one source txn's
-    // buffered changes (see `trellis::intake::stage_and_advance`).
+    // One call, one transaction: one source transaction's changes staged
+    // together.
     append::append(&txn, &[insert, update])
         .await
         .expect("append insert then update in one txn");

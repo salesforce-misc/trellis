@@ -379,7 +379,7 @@ async fn an_enum_to_side_enrichment_column_keeps_its_own_type() {
 /// The database is an *isolated* (already-migrated) one, so `DEFAULT_SCHEMA`
 /// exists and a wrongly-resolved client would start up perfectly happily.
 /// What gives the bug away is which ring the write actually flows through:
-/// the configured instance's own `replication_progress`/ring never see it,
+/// the configured instance's own ring never sees it,
 /// so `await_converged` — which asks that instance's own predicate — cannot
 /// return `Ok`, and the target row never appears.
 #[tokio::test]
@@ -642,18 +642,6 @@ async fn a_staging_connection_starts_with_no_definitions_registered() {
     assert!(
         captured.is_empty(),
         "nothing is registered, so nothing is captured"
-    );
-    let slots: i64 = client
-        .query_one(
-            "select count(*) from pg_replication_slots where database = current_database()",
-            &[],
-        )
-        .await
-        .expect("read replication slots")
-        .get(0);
-    assert_eq!(
-        slots, 0,
-        "trigger capture creates no replication slot (#622)"
     );
     drop(client);
 

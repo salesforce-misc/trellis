@@ -417,19 +417,6 @@ async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantin
         )
         .await
         .expect("create source table");
-    // `converged_through`'s condition 1 fails closed on a missing
-    // `replication_progress` row (see that function's own doc comment) —
-    // unrelated to this test's actual NULL-key scenario, but needed so the
-    // final convergence check below reflects condition 4 (the poison band)
-    // rather than this unrelated always-false floor.
-    client
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ('slot1', $1)",
-            &[&PgLsn::from(1000u64)],
-        )
-        .await
-        .expect("seed replication_progress");
-
     // `setup` installs the definition and creates the target table; its
     // return value (needed by `read_oracle`'s NULL-unsafe `order_id::text`
     // key) isn't usable here since this test's whole point is a NULL
@@ -573,9 +560,8 @@ async fn a_null_grouping_key_flows_through_the_live_delta_path_without_quarantin
     // Issue #128's liveness half: `converge::converged_through`'s condition 4
     // deliberately blocks on any live `poison_held` row (by design, for a
     // *genuine* poison case — see that function's own doc comment). With no
-    // NULL-key row ever quarantined in the first place, a token the seeded
-    // `replication_progress` row has already confirmed must converge once
-    // every staged change has drained — the same scenario that used to hang
+    // NULL-key row ever quarantined in the first place, a token must
+    // converge once every staged change has drained — the same scenario that used to hang
     // the generative suite's `quiesce` past its 30s timeout.
     let converged = converge::converged_through(&client, PgLsn::from(1u64))
         .await

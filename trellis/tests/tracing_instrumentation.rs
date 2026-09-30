@@ -1,5 +1,5 @@
 //! Integration tests for issue #56 (epic #49): the `tracing` spans/events
-//! added along the propagation path (source intake, `staging::apply::compute`,
+//! added along the propagation path (`staging::apply::compute`,
 //! `staging::apply::apply_target`/`apply_and_mark_drained`/`drain_once`,
 //! quarantine trips, backfill status transitions) actually fire, with the
 //! field conventions ADR-0009 decision 3 calls for.
@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
-use pgwire_replication::{Lsn, ReplicationEvent};
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
 use tokio_postgres::{Client, NoTls};
@@ -35,7 +34,6 @@ use tracing_subscriber::registry::LookupSpan;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
-use trellis::intake::{self, publication, spill};
 use trellis::staging::apply;
 use trellis::staging::{FoldedChange, IsolationOutcome, StagedWatermark, isolate_and_evict};
 
@@ -97,7 +95,7 @@ impl Captured {
 /// (`tracing`'s "Display" field wrapper) formats through `record_debug`
 /// with a `Debug` impl that forwards to the original `Display` impl, so a
 /// `%`-recorded string field (every string field this crate's own spans/
-/// events use — see `src/staging/apply.rs`/`src/intake/mod.rs`) comes
+/// events use — see `src/staging/apply.rs`) comes
 /// through here unquoted, exactly as it displays.
 struct FieldVisitor(HashMap<String, String>);
 
@@ -232,95 +230,6 @@ async fn insert_cdc_row(
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
-
-/// Issue #56's source-intake span: `Intake::commit_transaction`'s
-/// `intake.commit_transaction` span, driven through a real `Intake` against
-/// a real replication slot (mirroring `intake_robustness.rs`'s
-/// `keepalive_watermark_advance_is_guarded_on_every_axis`) — no XLogData is
-/// fed in, so the transaction commits with zero buffered changes, which is
-/// enough to prove the span fires with the right `slot`/`changes` fields;
-/// this module's own doc comment explains why threading a real `pgoutput`
-/// byte payload through by hand isn't needed to make that point.
-#[tokio::test]
-async fn intake_commit_transaction_span_records_slot_and_change_count() {
-    let (_guard, captured) = install_capture();
-
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    let setup = connect_raw(db.dsn()).await;
-    setup
-        .batch_execute(
-            "create table widgets (id bigint primary key, payload text not null);
-             create publication intake_pub for table widgets;",
-        )
-        .await
-        .expect("create source table and publication");
-    setup
-        .query_one(
-            "select slot_name from pg_create_logical_replication_slot('intake_slot', 'pgoutput')",
-            &[],
-        )
-        .await
-        .expect("create replication slot");
-    setup
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) \
-             select slot_name, confirmed_flush_lsn from pg_replication_slots \
-             where slot_name = $1 and database = current_database()",
-            &[&"intake_slot"],
-        )
-        .await
-        .expect("seed replication_progress");
-
-    let config = intake::IntakeConfig {
-        dsn: db.dsn().to_string(),
-        schema: DEFAULT_SCHEMA.to_string(),
-        host: db.socket_dir().display().to_string(),
-        port: db.port(),
-        user: "postgres".to_string(),
-        password: String::new(),
-        database: db.name().to_string(),
-        slot: "intake_slot".to_string(),
-        publication: "intake_pub".to_string(),
-        wake_channel: "wake".to_string(),
-        spill_threshold: spill::DEFAULT_SPILL_THRESHOLD,
-        hard_cap: spill::DEFAULT_HARD_CAP,
-        group_commit: None,
-    };
-    let mut consumer = intake::Intake::connect(&config, StagedWatermark::new(), db.pool.clone())
-        .await
-        .expect("connect intake");
-
-    consumer
-        .handle_event(ReplicationEvent::Begin {
-            final_lsn: Lsn::from(1_000),
-            xid: 42,
-            commit_time_micros: 0,
-        })
-        .await
-        .expect("handle Begin");
-    consumer
-        .handle_event(ReplicationEvent::Commit {
-            lsn: Lsn::from(900),
-            end_lsn: Lsn::from(1_000),
-            commit_time_micros: 0,
-        })
-        .await
-        .expect("handle Commit");
-
-    let span = captured.span_named("intake.commit_transaction");
-    assert_eq!(
-        span.fields.get("slot").map(String::as_str),
-        Some("intake_slot")
-    );
-    assert_eq!(span.fields.get("end_lsn").map(String::as_str), Some("1000"));
-    assert_eq!(
-        span.fields.get("changes").map(String::as_str),
-        Some("0"),
-        "no XLogData was fed in, so this transaction's own change count is 0: {span:#?}"
-    );
-}
 
 /// Issue #56's apply-phase span tree: `staging.drain_once` parents
 /// `staging.compute` and `staging.apply_and_mark_drained`, the latter
@@ -684,8 +593,8 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
 }
 
 /// Issue #56's backfill status transition events (#55's lifecycle):
-/// `waiting_to_backfill` -> `backfilling` from
-/// `intake::publication::run_pending_backfills`'s discharge dispatching a
+/// `waiting_to_backfill` -> `backfilling` from the staging worker's
+/// reconcile pass (`trellis::client::reconcile_pass`) dispatching a
 /// plain 1-1 definition's chunks (ADR-0016), then `backfilling` ->
 /// `catching_up` from its last chunk finishing and `catching_up` -> `live`
 /// from its go-live catch-up's discharge (issue #476) — mirrors `transform_status_lifecycle.rs`'s
@@ -701,18 +610,13 @@ async fn backfill_status_transitions_emit_info_events() {
 
     raw.batch_execute(
         "create table s (id bigint primary key, a numeric); \
-         insert into s (id, a) select g, g from generate_series(1, 5) g; \
-         create publication test_pub;",
+         insert into s (id, a) select g, g from generate_series(1, 5) g",
     )
     .await
-    .expect("seed source table and publication");
+    .expect("seed source table");
 
     let straggler = OpenTransaction::begin(db.dsn()).await;
     straggler.execute("select txid_current()").await;
-
-    publication::reconcile_publication(&mut raw, "test_pub", &[format!("{DEFAULT_SCHEMA}.s")])
-        .await
-        .expect("reconcile adds s and leaves an unsettled pending_backfill marker");
 
     let cols = numeric_columns(&["a"]);
     let def = install_definition(
@@ -727,18 +631,19 @@ async fn backfill_status_transitions_emit_info_events() {
 
     straggler.commit().await;
 
-    // Only install the capture around the settled pass: the unsettled pass
-    // above is `publication::reconcile_publication`/`install_definition`,
-    // neither of which is `run_pending_backfills` — nothing to capture yet.
+    // Only install the tracing capture around the settled pass:
+    // `install_definition` above only registers, so there is nothing to
+    // capture yet.
     let (_guard, captured) = install_capture();
-    publication::run_pending_backfills(
+    trellis::client::reconcile_pass(
         &mut raw,
+        &db.pool,
+        DEFAULT_SCHEMA,
         "wake",
-        &trellis::staging::StagedWatermark::saturated(),
-        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(5),
     )
     .await
-    .expect("run_pending_backfills (settled)");
+    .expect("reconcile pass (settled)");
     trellis::intake::publication::settle_registrations(&db.pool).await;
 
     let events = captured.events();

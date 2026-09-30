@@ -1,5 +1,5 @@
 //! Issue #677's review: an `UPDATE` that leaves an out-of-line TOASTed
-//! column unchanged, through real intake.
+//! column unchanged, through capture.
 //!
 //! `pgoutput` doesn't resend such a column in the new tuple. Before intake
 //! filled it in from the old tuple, the new image simply lacked it, so:

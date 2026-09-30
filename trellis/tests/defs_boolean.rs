@@ -14,8 +14,8 @@
 //! of the previous four type-family issues had reason to find:
 //!
 //! 1. **`boolean` has two independent, disagreeing output paths**, and nothing
-//!    about the value's own equality is at issue. `boolout` (what CDC/
-//!    `pgoutput` decodes and what a raw fetch renders) spells a boolean
+//!    about the value's own equality is at issue. `boolout` (what a capture
+//!    trigger images and what a raw fetch renders) spells a boolean
 //!    `'t'`/`'f'`. `<col>::text` does **not** call `boolout` — Postgres ships
 //!    a second, dedicated `pg_cast` row (`pg_catalog.text(boolean)`) that
 //!    overrides the cast to spell it `'true'`/`'false'` instead. Every other
@@ -540,7 +540,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
     }
 
     // Row 1: an ordinary image-bearing insert, staged with the literal
-    // spelling real CDC/`pgoutput` decoding produces — `boolout`'s `'t'`,
+    // spelling a capture trigger images — `boolout`'s `'t'`,
     // not the SQL cast's `'true'`.
     stage_image(&client, "seg_0", "1", r#"{"grp":"t","amount":"10"}"#).await;
     // Row 2: a bare recompute trigger — no image at all — forcing

@@ -117,21 +117,13 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Creates `source` from `source_ddl`, defines `transform` over it (still
 /// empty, so the definition goes live immediately), then for each `(key,
 /// image)` pair inserts the source row and stages the matching CDC insert
-/// by hand, the same text-valued JSON image intake would stage for it
-/// (`intake::tuple_to_json`). The ring is then drained through the engine's
-/// real apply path, so every target value is one the engine itself computed
-/// and wrote.
+/// by hand, the same text-valued JSON image a capture trigger would stage
+/// for it. The ring is then drained through the engine's real apply path, so
+/// every target value is one the engine itself computed and wrote.
 ///
-/// What this skips is the live `Client`: CDC intake and its
-/// `replication_progress` advance. That advance is what made these tests
-/// slow: before issue #452, on a quiet stream `confirmed_lsn` only reached a
-/// fresh `pg_current_wal_lsn()` token on intake's keepalive-driven persist,
-/// paced at 10s, so every await cost about 10s. Here the progress row is
-/// seeded directly, as
-/// `quarantine.rs`/`apply_aggregate.rs` seed theirs, at the highest
-/// possible LSN: intake has confirmed everything, and whether the target is
-/// caught up rests on the ring alone. `self_check`'s own convergence await
-/// still runs its real predicate; it just finds nothing pending.
+/// What this skips is the live `Client`, so whether the target is caught up
+/// rests on the ring alone. `self_check`'s own convergence await still runs
+/// its real predicate; it just finds nothing pending.
 async fn converged_fixture(
     db: &TestDatabase,
     source_ddl: &str,
@@ -195,14 +187,6 @@ async fn converged_fixture(
         .unwrap_or_else(|e| panic!("stage cdc {key}: {e}"));
     }
     drain_to_quiescence(&db.pool, &mut raw).await;
-
-    raw.execute(
-        "insert into replication_progress (slot_name, confirmed_lsn) \
-         values ('self_check_test', 'FFFFFFFF/FFFFFFFF')",
-        &[],
-    )
-    .await
-    .expect("seed replication_progress");
 
     (trellis, raw)
 }
@@ -439,7 +423,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
         .expect("define");
     definer.shutdown().await.expect("shutdown definer");
 
-    // Staging only: CDC intake + ring maintenance, but zero drain workers —
+    // Staging only: capture + ring maintenance, but zero drain workers —
     // nothing will ever apply this row.
     let running = Trellis::connect(
         Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),

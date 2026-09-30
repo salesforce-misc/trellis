@@ -661,8 +661,8 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     }
 
     // Row 1: an ordinary image-bearing insert, staged with `inet_out`'s
-    // host-elided spelling — exactly what real CDC/`pgoutput` decoding
-    // produces for a bare host address.
+    // host-elided spelling — exactly what a capture trigger images for a
+    // bare host address.
     stage_image(
         &client,
         "seg_0",

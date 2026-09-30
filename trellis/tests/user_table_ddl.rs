@@ -2,14 +2,13 @@
 //! ADR-0002 I6), and never waits for a lock inside a transaction for longer
 //! than its `lock_timeout` (I7).
 //!
-//! Each attempt runs under a per-attempt `lock_timeout` and
+//! Each attempt runs under a per-attempt `lock_timeout`
+//! (`trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT`) and
 //! [`trellis::locks::DdlRetry`] retries it, one attempt per interval, until it
-//! lands: `trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT` for DDL writers queue
-//! behind, `trellis::locks::share_update_exclusive_ddl_timeout` for ALTER
-//! PUBLICATION, which they don't. The tests hold a lock the DDL needs for a
-//! few seconds, write to the table throughout, and check the writers' latency
-//! and the DDL's transactions against the timeout, never by waiting for
-//! anything to converge (#297).
+//! lands. The tests hold a lock the DDL needs for a few seconds, write to the
+//! table throughout, and check the writers' latency and the DDL's
+//! transactions against the timeout, never by waiting for anything to
+//! converge (#297).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,11 +16,7 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::intake::publication;
-use trellis::locks::{
-    DdlRetry, USER_TABLE_DDL_LOCK_TIMEOUT, read_share_update_exclusive_ddl_timeout,
-    set_local_lock_timeout,
-};
+use trellis::locks::{DdlRetry, USER_TABLE_DDL_LOCK_TIMEOUT, set_local_lock_timeout};
 
 /// How long the `CREATE TRIGGER` test holds the lock the DDL needs.
 const HOLD: Duration = Duration::from_secs(2);
@@ -43,14 +38,6 @@ async fn connect(dsn: &str) -> Client {
     client
 }
 
-async fn backend_pid(client: &Client) -> i32 {
-    client
-        .query_one("select pg_backend_pid()", &[])
-        .await
-        .expect("pid")
-        .get(0)
-}
-
 /// Inserts into `public.t` one row at a time until `stop`, and returns the
 /// longest any one insert took.
 fn spawn_writer(client: Client, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<Duration> {
@@ -69,129 +56,6 @@ fn spawn_writer(client: Client, stop: Arc<AtomicBool>) -> tokio::task::JoinHandl
         }
         longest
     })
-}
-
-/// For `hold`, the transactions of every backend waiting for a lock except
-/// `except`, and the longest any of them had been open.
-async fn watch_lock_waiters(observer: &Client, except: &[i32], hold: Duration) -> (usize, f64) {
-    let started = Instant::now();
-    let mut transactions = std::collections::HashSet::new();
-    let mut longest = 0f64;
-    while started.elapsed() < hold {
-        for row in observer
-            .query(
-                "select pid, xact_start::text, \
-                        extract(epoch from clock_timestamp() - xact_start)::float8 \
-                 from pg_stat_activity \
-                 where wait_event_type = 'Lock' and pid <> all($1) \
-                   and datname = current_database()",
-                &[&except],
-            )
-            .await
-            .expect("read pg_stat_activity")
-        {
-            let (pid, xact_start, open): (i32, String, f64) = (row.get(0), row.get(1), row.get(2));
-            transactions.insert((pid, xact_start));
-            longest = longest.max(open);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    (transactions.len(), longest)
-}
-
-/// A join (`ALTER PUBLICATION ... ADD TABLE`) while something holds a lock
-/// that conflicts with it: `SHARE UPDATE EXCLUSIVE`, as a manual `VACUUM`,
-/// an `ANALYZE`, a `CREATE INDEX CONCURRENTLY` or an autovacuum does.
-///
-/// Each attempt waits past `deadlock_timeout`, which is when Postgres cancels
-/// a blocking autovacuum (this holder is a plain session, so nothing is
-/// cancelled here), and writers still never wait on it, since `SHARE UPDATE
-/// EXCLUSIVE` doesn't queue them. Each of its transactions still ends within
-/// its timeout instead of holding a snapshot for the whole hold, and it
-/// lands once the lock is gone.
-#[tokio::test]
-async fn a_join_retries_a_locked_table_in_bounded_transactions() {
-    let cluster = testkit::TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let observer = connect(db.dsn()).await;
-    observer
-        .batch_execute("create table public.t (id bigint primary key); create publication test_pub")
-        .await
-        .expect("create table and publication");
-    let deadlock_timeout: String = observer
-        .query_one(
-            "select setting from pg_settings where name = 'deadlock_timeout'",
-            &[],
-        )
-        .await
-        .expect("show deadlock_timeout")
-        .get(0);
-    let deadlock_timeout = Duration::from_millis(deadlock_timeout.parse().expect("ms"));
-    let attempt = read_share_update_exclusive_ddl_timeout(&observer)
-        .await
-        .expect("attempt timeout");
-    // Long enough for at least two attempts and the interval between them.
-    let hold = attempt * 2 + Duration::from_secs(1);
-
-    let holder = connect(db.dsn()).await;
-    holder
-        .batch_execute("begin; lock table public.t in share update exclusive mode")
-        .await
-        .expect("hold the table");
-    let writer = connect(db.dsn()).await;
-    let except = vec![backend_pid(&holder).await, backend_pid(&writer).await];
-    let stop = Arc::new(AtomicBool::new(false));
-    let writing = spawn_writer(writer, stop.clone());
-
-    let mut joiner = connect(db.dsn()).await;
-    let join = tokio::spawn(async move {
-        publication::reconcile_publication(&mut joiner, "test_pub", &["public.t".to_string()]).await
-    });
-
-    let (transactions, longest) = watch_lock_waiters(&observer, &except, hold).await;
-    assert!(
-        !join.is_finished(),
-        "the join waits while the table is held"
-    );
-    stop.store(true, Ordering::Relaxed);
-    let writer_longest = writing.await.expect("writer");
-
-    assert!(
-        transactions >= 2,
-        "the join must give up and retry in a fresh transaction, saw {transactions}"
-    );
-    assert!(
-        longest < (attempt + SLACK).as_secs_f64(),
-        "a join transaction waited {longest:.3}s for its lock, its timeout is {attempt:?}"
-    );
-    assert!(
-        longest > deadlock_timeout.as_secs_f64(),
-        "a join attempt must outwait deadlock_timeout ({deadlock_timeout:?}), so the deadlock \
-         check can cancel a blocking autovacuum; the longest waited {longest:.3}s"
-    );
-    // A writer queued behind a join waiting out a whole attempt would take
-    // about `attempt`.
-    assert!(
-        writer_longest < USER_TABLE_DDL_LOCK_TIMEOUT + SLACK,
-        "a writer waited {writer_longest:?}"
-    );
-
-    holder.batch_execute("commit").await.expect("release");
-    tokio::time::timeout(Duration::from_secs(10), join)
-        .await
-        .expect("the join lands once the table is free")
-        .expect("join task")
-        .expect("join");
-    let published: i64 = observer
-        .query_one(
-            "select count(*) from pg_publication_tables \
-             where pubname = 'test_pub' and schemaname = 'public' and tablename = 't'",
-            &[],
-        )
-        .await
-        .expect("read publication")
-        .get(0);
-    assert_eq!(published, 1);
 }
 
 /// The loop #622's `CREATE TRIGGER` runs in, in #565 E7's shape: an open

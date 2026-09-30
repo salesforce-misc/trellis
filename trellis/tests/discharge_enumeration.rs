@@ -22,6 +22,23 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
+/// Installs `tables`' capture (one capture reconcile pass), which parks a
+/// join marker for each.
+async fn capture(client: &mut Client, tables: &[String]) {
+    let outcome = trellis::capture::reconcile::reconcile(
+        client,
+        DEFAULT_SCHEMA,
+        tables,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("capture pass");
+    assert!(
+        outcome.failed.is_empty() && outcome.waiting.is_empty(),
+        "{outcome:?}"
+    );
+}
+
 /// Recompute rows staged into the fresh install's active segment (`seg_0`) for
 /// `src_table` — the enumeration's signature.
 async fn recompute_count(client: &Client, src_table: &str) -> i64 {
@@ -65,8 +82,7 @@ async fn a_table_with_a_reader_is_enumerated() {
 
     client
         .batch_execute(
-            "create table widgets (id bigint primary key); \
-             create publication test_pub;",
+            "create table widgets (id bigint primary key)",
         )
         .await
         .expect("create source");
@@ -77,9 +93,7 @@ async fn a_table_with_a_reader_is_enumerated() {
         .expect("seed source");
 
     let table = format!("{DEFAULT_SCHEMA}.widgets");
-    publication::reconcile_publication(&mut client, "test_pub", std::slice::from_ref(&table))
-        .await
-        .expect("reconcile adds widgets");
+    capture(&mut client, std::slice::from_ref(&table)).await;
     publication::run_pending_backfills(
         &mut client,
         "wake",
@@ -167,8 +181,7 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
              create table public.posts (id integer primary key, author_id integer, words integer); \
              alter table public.posts replica identity full; \
              insert into public.authors (id, name) values (1, 'a'), (2, 'b'); \
-             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5); \
-             create publication test_pub;",
+             insert into public.posts (id, author_id, words) values (100, 1, 10), (101, 2, 5)",
         )
         .await
         .expect("seed authors + posts");
@@ -194,9 +207,7 @@ async fn a_table_read_only_through_a_relationship_is_still_enumerated() {
         .await
         .expect("write posts after the build");
 
-    publication::reconcile_publication(&mut client, "test_pub", &["public.posts".to_string()])
-        .await
-        .expect("reconcile adds public.posts");
+    capture(&mut client, &["public.posts".to_string()]).await;
     publication::run_pending_backfills(
         &mut client,
         "wake",

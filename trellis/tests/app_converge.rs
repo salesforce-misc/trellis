@@ -46,16 +46,6 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn seed_progress(client: &Client, slot: &str, confirmed_lsn: PgLsn) {
-    client
-        .execute(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ($1, $2)",
-            &[&slot, &confirmed_lsn],
-        )
-        .await
-        .expect("seed replication_progress");
-}
-
 /// Inserts a bare recompute row directly into `seg_0` (the fresh, always-
 /// active slot on an untouched ring) with an explicit `origin_lsn` —
 /// `trellis/tests/converge.rs`'s own `insert_with_origin`, reproduced here
@@ -126,13 +116,9 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
 ///
 /// No live `Client` (issue #301). This used to run a staging-only pipeline
 /// and start a drain-capable one after a 400ms delay, asserting
-/// `await_converged` took at least that long. That shape rests on real CDC
-/// intake advancing `replication_progress` past the token, which on a quiet
-/// stream waits on intake's 10s-paced keepalive persist (see
-/// `Trellis::await_converged`'s doc comment), all under a fixed 30s budget.
-/// Here the CDC insert is staged by hand, the same text-valued image intake
-/// stages (NULL `origin_lsn`, as intake leaves it, so it gates every token),
-/// and intake's confirmed position is seeded at the token. The ordering is
+/// `await_converged` took at least that long, all under a fixed 30s budget.
+/// Here the insert is staged by hand with a text-valued image and a NULL
+/// `origin_lsn`, so it gates every token. The ordering is
 /// then controlled rather than timed: nothing drains the row until the test
 /// itself does, so a return during the window before that is a false
 /// `converged`, however slow the box is.
@@ -193,7 +179,6 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
     // commit has returned. Intake has confirmed through it; only the ring
     // stands between the token and convergence.
     let token = trellis.watermark_token().await.expect("watermark_token");
-    seed_progress(&raw, "slot1", token).await;
     // Sealed but not drained, as a staging-only pipeline would leave it.
     let sealed = seal_active_segment(&mut raw).await;
 
@@ -258,7 +243,6 @@ async fn await_converged_times_out_with_a_named_staging_error() {
     // Condition 1 (replication progress) satisfied exactly at `token`;
     // conditions 2/3 never will be — a pending row in the active slot,
     // deliberately never sealed or drained.
-    seed_progress(&raw, "slot1", token).await;
     insert_pending_row(&raw, "k1", PgLsn::from(0)).await;
 
     let timeout = Duration::from_millis(80);
@@ -311,7 +295,6 @@ async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable(
     let token = trellis.watermark_token().await.expect("watermark_token");
     let raw = connect_raw(db.dsn()).await;
     // Converged but for the lock: progress at the token, nothing pending.
-    seed_progress(&raw, "slot1", token).await;
     raw.batch_execute("begin; lock table poison_held in access exclusive mode")
         .await
         .expect("lock poison_held");
@@ -338,12 +321,6 @@ async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable(
 
     raw.batch_execute("rollback").await.expect("release lock");
     let token = trellis.watermark_token().await.expect("watermark_token");
-    raw.execute(
-        "update replication_progress set confirmed_lsn = $1",
-        &[&token],
-    )
-    .await
-    .expect("advance progress");
     trellis
         .await_converged(token, Duration::from_secs(5))
         .await
@@ -379,7 +356,6 @@ fn blocking_trellis_watermark_token_and_await_converged_round_trip() {
         BlockingTrellis::connect(config, TrellisOptions::default()).expect("connect (sync)");
 
     let token = trellis.watermark_token().expect("watermark_token (sync)");
-    setup_runtime.block_on(seed_progress(&raw, "slot1", token));
 
     // Nothing is pending anywhere on a fresh ring with a satisfied progress
     // row — this must converge immediately, well inside a generous timeout.

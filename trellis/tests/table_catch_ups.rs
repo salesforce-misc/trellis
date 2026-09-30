@@ -20,15 +20,14 @@
 //! the marker, and drives the discharge and the drain directly.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, create_relationship, install_definition};
-use trellis::intake::{publication, slot_loss};
-use trellis::staging::session::ProducerSession;
+use trellis::intake::publication;
 use trellis::staging::{CdcOp, StagedChange, StagedWatermark, apply, seal};
 use trellis::staging::{has_pending, retire_drained_segments};
 use trellis::{Config, Trellis, TrellisOptions};
@@ -95,6 +94,33 @@ async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
         not_live, 0,
         "every definition is live before the test starts"
     );
+}
+
+/// One capture reconcile pass over `tables` (every other table's capture is
+/// uninstalled), which parks a join marker for each table it installs.
+async fn capture(client: &mut Client, tables: &[&str]) {
+    let desired: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+    let outcome = trellis::capture::reconcile::reconcile(
+        client,
+        DEFAULT_SCHEMA,
+        &desired,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("capture pass");
+    assert!(
+        outcome.failed.is_empty() && outcome.waiting.is_empty(),
+        "{outcome:?}"
+    );
+}
+
+/// Drops `table`'s capture, as an operator dropping its triggers would.
+async fn uninstall(client: &mut Client, table: &str) {
+    trellis::capture::install::uninstall(client, DEFAULT_SCHEMA, table, None)
+        .await
+        .expect("uninstall capture")
+        .done()
+        .expect("nothing holds the table");
 }
 
 /// One discharge pass over every settled marker, then a drain of what it
@@ -171,11 +197,10 @@ async fn seed_sales(client: &Client) {
             "create table public.sales (id integer primary key, sku text, amount integer); \
              alter table public.sales replica identity full; \
              insert into public.sales values (1, 'a', 5), (2, 'a', 7), (3, 'b', 2), \
-                                             (4, 'a', 1000); \
-             create publication trellis_pub for table public.sales",
+                                             (4, 'a', 1000)",
         )
         .await
-        .expect("create, seed and publish sales");
+        .expect("create and seed sales");
 }
 
 /// A 1-1 target row whose source row was deleted with no CDC reaching the
@@ -284,7 +309,7 @@ async fn a_requested_backfill_sweeps_a_stale_aggregate_group() {
     assert_eq!(totals, vec![("a".to_string(), "12".to_string())]);
 }
 
-/// Seeds `customers` (the to-side) and `orders`, publishes both, declares
+/// Seeds `customers` (the to-side) and `orders`, declares
 /// the to-one `customer` relationship, registers `order_names` (which reads
 /// `customer.name` through it) and brings it `live`. Returns the define-only
 /// `Trellis` it registered through.
@@ -300,11 +325,10 @@ async fn live_relationship_consumer(
              alter table public.customers replica identity full; \
              alter table public.orders replica identity full; \
              insert into public.customers values (1, 'ann'), (2, 'bob'); \
-             insert into public.orders values (10, 1), (11, 2), (12, 1); \
-             create publication trellis_pub for table public.customers, public.orders",
+             insert into public.orders values (10, 1), (11, 2), (12, 1)",
         )
         .await
-        .expect("create, seed and publish customers and orders");
+        .expect("create and seed customers and orders");
     create_relationship(
         pool,
         "RELATIONSHIP customer FROM orders.customer_id TO customers.id",
@@ -371,295 +395,11 @@ async fn a_requested_backfill_of_a_to_side_catches_up_its_relationship_consumer(
     assert_eq!(order_names(&client).await, renamed());
 }
 
-/// #393's case for a to-side: the catalog outlived its slot, and a change
-/// before the new slot's consistent point is neither streamed nor in the
-/// to-side's projection. Setup's marker catches the consumer up as a
-/// requested re-backfill does.
+/// A table whose capture an operator dropped while a definition applied from
+/// it is captured again at the next reconcile. Its readers missed everything
+/// written meanwhile, so the install's join marker is their catch-up.
 #[tokio::test]
-async fn a_fresh_slot_catches_up_a_to_sides_relationship_consumer() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
-
-    client
-        .batch_execute("update public.customers set name = 'ann2' where id = 1")
-        .await
-        .expect("rename a customer before the slot exists");
-    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("connect producer session");
-    publication::create_slot_and_park_markers(
-        &mut session,
-        "table_catch_ups_slot",
-        &["public.customers".to_string(), "public.orders".to_string()],
-    )
-    .await
-    .expect("create the slot");
-    assert_eq!(
-        status_of(&client, "public.order_names").await,
-        "catching_up"
-    );
-
-    discharge_markers(&db.pool, &mut client).await;
-
-    assert_eq!(status_of(&client, "public.order_names").await, "live");
-    assert_eq!(order_names(&client).await, renamed());
-    client
-        .execute(
-            "select pg_drop_replication_slot('table_catch_ups_slot')",
-            &[],
-        )
-        .await
-        .expect("drop the slot");
-}
-
-fn orders_update(lsn: PgLsn, id: i32, old_customer: i32, new_customer: i32) -> StagedChange {
-    let image = |customer: i32| format!(r#"{{"id":"{id}","customer_id":"{customer}"}}"#);
-    StagedChange::Cdc {
-        src_table: "public.orders".to_string(),
-        key: id.to_string(),
-        op: CdcOp::Update,
-        lsn: Some(lsn),
-        old_image: Some(image(old_customer)),
-        new_image: Some(image(new_customer)),
-        origin_lsn: None,
-        src_changed: None,
-        hop_gen: 0,
-        group_key: None,
-    }
-}
-
-/// Issue #533: a to-side change lost with the slot never reached the
-/// to-side's projection. A 1-1 consumer of a to-one lookup is built by the
-/// ring, whose `Recompute`s re-derive each row through the projection
-/// (`defs::backfill::collect_agg_leaves`), so without a
-/// refresh the resumed consumer comes back `live` with the old name, and a
-/// later from-side change reads it again. The recovery re-reads each
-/// published to-side as a catch-up that refreshes its projections, so both
-/// read the renamed customer.
-#[tokio::test]
-async fn a_slot_loss_refreshes_a_to_sides_projection_for_its_resumed_consumer() {
-    const LOST: &str = "table_catch_ups_lost_slot";
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
-
-    client
-        .batch_execute(&format!(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
-             update public.customers set name = 'ann2' where id = 1"
-        ))
-        .await
-        .expect("lose the slot, and rename a customer it never delivered");
-    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("connect producer session");
-    let recovery = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "trellis_pub")
-        .await
-        .expect("recover from the lost slot")
-        .expect("a slot that doesn't exist is lost");
-    assert_eq!(recovery.paused, vec!["order_names"]);
-    discharge_markers(&db.pool, &mut client).await;
-
-    trellis
-        .apply("RESUME TRANSFORM order_names")
-        .await
-        .expect("resume the consumer");
-    bring_live(&db.pool, &mut client).await;
-    assert_eq!(order_names(&client).await, renamed());
-
-    // Order 11 moves to customer 1: its row is re-derived through the
-    // projection, not by a read of `customers`.
-    commit_and_stage(
-        &mut client,
-        "update public.orders set customer_id = 1 where id = 11",
-        |lsn| orders_update(lsn, 11, 2, 1),
-    )
-    .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
-    assert_eq!(
-        order_names(&client).await,
-        vec![
-            (10, Some("ann2".to_string())),
-            (11, Some("ann2".to_string())),
-            (12, Some("ann2".to_string())),
-        ],
-        "the from-side change reads the rename the lost slot never delivered"
-    );
-
-    drop(session);
-    client
-        .execute("select pg_drop_replication_slot($1)", &[&LOST])
-        .await
-        .expect("drop the recreated slot");
-}
-
-/// Issue #533: the to-side refresh commits with the new slot's start. A
-/// recovery that dies after creating the slot but before that commit (here,
-/// a park that fails) leaves the old position, behind the new slot's, so the
-/// next startup takes the slot for lost again, pauses nothing new, and
-/// parks the refresh then.
-#[tokio::test]
-async fn a_slot_loss_recovery_cut_short_parks_its_refresh_on_the_redo() {
-    const LOST: &str = "table_catch_ups_lost_slot_redo";
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
-
-    client
-        .batch_execute(&format!(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
-             update public.customers set name = 'ann2' where id = 1; \
-             create function fail_park() returns trigger language plpgsql as \
-               $$ begin raise exception 'the recovery dies before its commit'; end $$; \
-             create trigger fail_park before insert on pending_backfill \
-               for each row execute function fail_park()"
-        ))
-        .await
-        .expect("lose the slot, rename a customer, and make the park fail");
-    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("connect producer session");
-    let err = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "trellis_pub")
-        .await
-        .expect_err("the park fails the recovery's last transaction");
-    assert!(
-        format!("{err:?}").contains("the recovery dies before its commit"),
-        "{err:?}"
-    );
-    session.release().await.expect("release the producer lock");
-    let confirmed: PgLsn = client
-        .query_one(
-            "select confirmed_lsn from replication_progress where slot_name = $1",
-            &[&LOST],
-        )
-        .await
-        .expect("read the confirmed position")
-        .get(0);
-    assert_eq!(
-        confirmed,
-        PgLsn::from(0x10),
-        "the new start never committed"
-    );
-    client
-        .batch_execute("drop trigger fail_park on pending_backfill")
-        .await
-        .expect("let the park through");
-
-    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("reconnect the producer session");
-    let redo = slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "trellis_pub")
-        .await
-        .expect("redo the recovery")
-        .expect("the uncommitted slot looks recreated under the same name");
-    assert!(redo.paused.is_empty(), "the first pass already paused it");
-    assert_eq!(redo.already_frozen, vec!["order_names"]);
-    discharge_markers(&db.pool, &mut client).await;
-
-    trellis
-        .apply("RESUME TRANSFORM order_names")
-        .await
-        .expect("resume the consumer");
-    bring_live(&db.pool, &mut client).await;
-    assert_eq!(order_names(&client).await, renamed());
-
-    drop(session);
-    client
-        .execute("select pg_drop_replication_slot($1)", &[&LOST])
-        .await
-        .expect("drop the recreated slot");
-}
-
-/// Issue #533: the recovery's refresh of a to-side failed and is backing
-/// off (issue #407) when the consumer is resumed, so the consumer's marker
-/// discharges first and its ring build re-derives every row through the
-/// stale projection (and flips it `live`, the limitation ADR-0016's "A
-/// re-read table's readers" names). The refresh's retry re-reads the to-side
-/// with the consumer applying, and that re-read re-derives it from the
-/// refreshed projection.
-#[tokio::test]
-async fn a_slot_loss_refresh_that_backs_off_still_reaches_a_consumer_resumed_meanwhile() {
-    const LOST: &str = "table_catch_ups_lost_slot_backoff";
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    let trellis = live_relationship_consumer(db.dsn(), &db.pool, &mut client).await;
-
-    client
-        .batch_execute(&format!(
-            "insert into replication_progress (slot_name, confirmed_lsn) values ('{LOST}', '0/10'); \
-             update public.customers set name = 'ann2' where id = 1"
-        ))
-        .await
-        .expect("lose the slot, and rename a customer it never delivered");
-    let mut session = ProducerSession::connect(db.dsn(), DEFAULT_SCHEMA)
-        .await
-        .expect("connect producer session");
-    slot_loss::pause_if_slot_lost(&mut session, &db.pool, LOST, "trellis_pub")
-        .await
-        .expect("recover from the lost slot")
-        .expect("a slot that doesn't exist is lost");
-    let backing_off = client
-        .execute(
-            "update pending_backfill set attempts = 1, \
-               next_attempt_at = now() + interval '1 hour' \
-             where table_name = 'public.customers' and refresh_projections",
-            &[],
-        )
-        .await
-        .expect("back the refresh off");
-    assert_eq!(backing_off, 1, "the recovery parked a refresh on customers");
-
-    trellis
-        .apply("RESUME TRANSFORM order_names")
-        .await
-        .expect("resume the consumer");
-    publication::run_pending_backfills(
-        &mut client,
-        WAKE,
-        &StagedWatermark::saturated(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("discharge the consumer's marker");
-    drain_to_quiescence(&db.pool, &mut client).await;
-    let pending: Vec<String> = client
-        .query("select table_name from pending_backfill", &[])
-        .await
-        .expect("read the markers")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(
-        pending,
-        vec!["public.customers"],
-        "the consumer built while the refresh was still backing off"
-    );
-
-    client
-        .execute("update pending_backfill set next_attempt_at = now()", &[])
-        .await
-        .expect("make the refresh due");
-    discharge_markers(&db.pool, &mut client).await;
-    assert_eq!(order_names(&client).await, renamed());
-    assert_eq!(status_of(&client, "public.order_names").await, "live");
-
-    drop(session);
-    client
-        .execute("select pg_drop_replication_slot($1)", &[&LOST])
-        .await
-        .expect("drop the recreated slot");
-}
-
-/// A table an operator dropped from the publication while a definition
-/// applied from it rejoins at the next reconcile. Its readers missed
-/// everything written meanwhile, so the join marker is their catch-up.
-#[tokio::test]
-async fn a_table_rejoining_the_publication_catches_up_its_readers() {
+async fn a_table_whose_capture_is_reinstalled_catches_up_its_readers() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -673,17 +413,15 @@ async fn a_table_rejoining_the_publication_catches_up_its_readers() {
     .await
     .expect("install the 1-1");
     bring_live(&db.pool, &mut client).await;
+    capture(&mut client, &["public.sales"]).await;
+    discharge_markers(&db.pool, &mut client).await;
 
+    uninstall(&mut client, "public.sales").await;
     client
-        .batch_execute(
-            "alter publication trellis_pub drop table public.sales; \
-             delete from public.sales where id = 4",
-        )
+        .batch_execute("delete from public.sales where id = 4")
         .await
-        .expect("unpublish sales, then delete a row");
-    publication::reconcile_publication(&mut client, "trellis_pub", &["public.sales".to_string()])
-        .await
-        .expect("reconcile the publication");
+        .expect("delete a row while sales isn't captured");
+    capture(&mut client, &["public.sales"]).await;
     assert_eq!(status_of(&client, "public.sales_copy").await, "catching_up");
 
     discharge_markers(&db.pool, &mut client).await;
@@ -738,11 +476,12 @@ async fn projected_name(client: &Client, id: i32) -> Option<Option<String>> {
         .map(|r| r.get(0))
 }
 
-/// Issue #531: a rename streamed but not yet drained when a later rename is
-/// lost (the table is out of the publication) is older than what the
-/// rejoin's refresh writes into the projection. It drains after the refresh
-/// and must not put its image back: the refresh stamped the relationship, so
-/// a record at or below the stamp writes the projection from the live row.
+/// Issue #531: a rename staged but not yet drained when a later rename is
+/// lost (the table isn't captured) is older than what the rejoin's refresh
+/// writes into the projection, and must not put its image back. Under
+/// trigger capture the install's join marker is gated on the table's
+/// pending ring rows (#622 C3), so the refresh waits for the older rename to
+/// drain rather than relying on the relationship's stamp.
 #[tokio::test]
 async fn pending_older_to_side_cdc_does_not_undo_a_rejoins_projection_refresh() {
     let cluster = TestCluster::start();
@@ -757,19 +496,34 @@ async fn pending_older_to_side_cdc_does_not_undo_a_rejoins_projection_refresh() 
     )
     .await;
     client
-        .batch_execute(
-            "alter publication trellis_pub drop table public.customers; \
-             update public.customers set name = 'ann2' where id = 1",
-        )
+        .batch_execute("update public.customers set name = 'ann2' where id = 1")
         .await
-        .expect("unpublish customers, then rename a customer");
-    publication::reconcile_publication(
+        .expect("rename a customer while customers isn't captured");
+    capture(&mut client, &["public.customers", "public.orders"]).await;
+    publication::run_pending_backfills(
         &mut client,
-        "trellis_pub",
-        &["public.customers".to_string(), "public.orders".to_string()],
+        WAKE,
+        &StagedWatermark::saturated(),
+        Duration::ZERO,
     )
     .await
-    .expect("reconcile the publication");
+    .expect("run_pending_backfills");
+    let gated: Vec<String> = client
+        .query(
+            "select table_name from pending_backfill where capture_gate_lsn is not null",
+            &[],
+        )
+        .await
+        .expect("read gated markers")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        gated,
+        ["public.customers"],
+        "the join marker waits for the older rename still in the ring"
+    );
+    drain_to_quiescence(&db.pool, &mut client).await;
     discharge_markers(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.order_names").await, "live");
