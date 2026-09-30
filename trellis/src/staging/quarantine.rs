@@ -2152,7 +2152,9 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 ///
 /// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
 /// isn't currently paused — resuming a live column is caller error, not a
-/// silent no-op.
+/// silent no-op — and with [`ApplyError::ColumnAwaitingCapture`] if it is
+/// an `ALTER TRANSFORM` field still awaiting its capture widen (#687). A
+/// dependent in that state reached through the cascade stays paused too.
 ///
 /// Errors with [`ApplyError::DefinitionNotLive`] — with no side effects at
 /// all, checked before any of this function's deletes run — if `transform`
@@ -2181,18 +2183,29 @@ pub async fn resume_column(
 ) -> Result<Vec<(String, String)>, ApplyError> {
     {
         let client = pool.get().await?;
-        let exists = client
+        let awaiting_capture: Option<bool> = client
             .query_opt(
-                "select 1 from column_status where transform_table = $1 and column_name = $2",
+                "select awaiting_capture from column_status \
+                 where transform_table = $1 and column_name = $2",
                 &[&transform, &column],
             )
             .await?
-            .is_some();
-        if !exists {
-            return Err(ApplyError::ColumnNotPaused {
-                transform: transform.to_string(),
-                column: column.to_string(),
-            });
+            .map(|row| row.get(0));
+        match awaiting_capture {
+            None => {
+                return Err(ApplyError::ColumnNotPaused {
+                    transform: transform.to_string(),
+                    column: column.to_string(),
+                });
+            }
+            // #687: only the widened capture's catch-up may unpause it.
+            Some(true) => {
+                return Err(ApplyError::ColumnAwaitingCapture {
+                    transform: transform.to_string(),
+                    column: column.to_string(),
+                });
+            }
+            Some(false) => {}
         }
 
         // Gate before any mutation: resuming is all-or-nothing, so a
@@ -2287,7 +2300,7 @@ pub async fn resume_column(
             let downstream_column: String = row.get(1);
             let status = txn
                 .query_opt(
-                    "select local_fuse from column_status \
+                    "select local_fuse, awaiting_capture from column_status \
                      where transform_table = $1 and column_name = $2",
                     &[&downstream_transform, &downstream_column],
                 )
@@ -2297,8 +2310,10 @@ pub async fn resume_column(
                 // within one resume walk, but tolerate it rather than panic).
                 continue;
             };
-            let local_fuse: bool = status.get(0);
-            if local_fuse {
+            let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
+            // #687: a field awaiting its capture widen stays paused; with
+            // this cascade gone, its catch-up's discharge unpauses it.
+            if local_fuse || awaiting_capture {
                 continue;
             }
             let remaining: i64 = txn

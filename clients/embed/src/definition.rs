@@ -9,11 +9,14 @@
 //! the source columns but no creation time, and [`DefinitionSummary`] (what
 //! `definitions()` lists) has the creation time but no source columns.
 //! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
-//! backfill failure's retry time in epoch microseconds.
+//! backfill failure's retry time, its capture wait's times and its capture
+//! failure's detection time in epoch microseconds.
 
 use std::collections::BTreeMap;
 
-use trellis::{BackfillFailure, Definition, DefinitionStatus, DefinitionSummary};
+use trellis::{
+    BackfillFailure, CaptureFailure, CaptureWait, Definition, DefinitionStatus, DefinitionSummary,
+};
 
 use crate::{epoch_micros, transform_status};
 
@@ -95,6 +98,43 @@ pub struct PlainDefinitionStatus {
     /// Set while the definition's source table's backfill keeps failing to
     /// discharge; see [`DefinitionStatus::backfill_failure`].
     pub backfill_failure: Option<PlainBackfillFailure>,
+    /// Set while the definition's capture waits on a table lock; see
+    /// [`DefinitionStatus::capture_wait`].
+    pub capture_wait: Option<PlainCaptureWait>,
+    /// Set while capture of a table the definition reads is broken; see
+    /// [`DefinitionStatus::capture_failure`].
+    pub capture_failure: Option<PlainCaptureFailure>,
+}
+
+/// A [`CaptureWait`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainCaptureWait {
+    /// The fully-qualified `schema.table` whose lock the capture waits for.
+    pub table: String,
+    /// `install`, `widen` or `uninstall`.
+    pub operation: String,
+    /// The lock mode it asks for, as `pg_locks` spells it.
+    pub lock_mode: String,
+    /// When the staging worker first found the table locked, as
+    /// [`crate::epoch_micros`].
+    pub waiting_since_micros: i64,
+    /// When it last read who holds the lock, as [`crate::epoch_micros`].
+    pub observed_at_micros: i64,
+    /// One line per session holding or queued for a conflicting lock.
+    pub blockers: Vec<String>,
+}
+
+/// A [`CaptureFailure`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainCaptureFailure {
+    /// The fully-qualified `schema.table` whose capture is broken.
+    pub source_table: String,
+    /// The columns the failure is about; empty when it isn't about one.
+    pub columns: Vec<String>,
+    /// A sentence naming the cause.
+    pub error: String,
+    /// When it was first found, as [`crate::epoch_micros`].
+    pub detected_at_micros: i64,
 }
 
 /// A [`BackfillFailure`] flattened to plain data.
@@ -118,6 +158,35 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .backfill_failure
                 .as_ref()
                 .map(PlainBackfillFailure::from),
+            capture_wait: status.capture_wait.as_ref().map(PlainCaptureWait::from),
+            capture_failure: status
+                .capture_failure
+                .as_ref()
+                .map(PlainCaptureFailure::from),
+        }
+    }
+}
+
+impl From<&CaptureWait> for PlainCaptureWait {
+    fn from(wait: &CaptureWait) -> Self {
+        PlainCaptureWait {
+            table: wait.table.clone(),
+            operation: wait.operation.clone(),
+            lock_mode: wait.lock_mode.clone(),
+            waiting_since_micros: epoch_micros(wait.waiting_since),
+            observed_at_micros: epoch_micros(wait.observed_at),
+            blockers: wait.blockers.clone(),
+        }
+    }
+}
+
+impl From<&CaptureFailure> for PlainCaptureFailure {
+    fn from(failure: &CaptureFailure) -> Self {
+        PlainCaptureFailure {
+            source_table: failure.source_table.clone(),
+            columns: failure.columns.clone(),
+            error: failure.error.clone(),
+            detected_at_micros: epoch_micros(failure.detected_at),
         }
     }
 }
@@ -256,6 +325,8 @@ mod tests {
             PlainDefinitionStatus {
                 status: "live",
                 backfill_failure: None,
+                capture_wait: None,
+                capture_failure: None,
             }
         );
     }
@@ -284,7 +355,55 @@ mod tests {
                     last_error: "permission denied for table orders".to_string(),
                     next_attempt_at_micros: 1_727_222_400_654_321,
                 }),
+                capture_wait: None,
+                capture_failure: None,
             }
+        );
+    }
+
+    #[test]
+    fn a_capture_wait_and_failure_cross_with_their_times_in_microseconds() {
+        let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
+        let status = DefinitionStatus {
+            status: TransformStatus::CatchingUp,
+            backfill_failure: None,
+            capture_wait: Some(CaptureWait {
+                table: "public.orders".to_string(),
+                operation: "widen".to_string(),
+                lock_mode: "ShareRowExclusiveLock".to_string(),
+                waiting_since: at(1_727_222_400_000_001),
+                observed_at: at(1_727_222_400_000_002),
+                blockers: vec!["pid 42 (client backend) holds RowExclusiveLock".to_string()],
+            }),
+            capture_failure: Some(CaptureFailure {
+                source_table: "public.lines".to_string(),
+                columns: vec!["qty".to_string()],
+                error: "capture of public.lines needs column \"qty\"".to_string(),
+                detected_at: at(1_727_222_400_000_003),
+            }),
+        };
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(
+            plain.capture_wait,
+            Some(PlainCaptureWait {
+                table: "public.orders".to_string(),
+                operation: "widen".to_string(),
+                lock_mode: "ShareRowExclusiveLock".to_string(),
+                waiting_since_micros: 1_727_222_400_000_001,
+                observed_at_micros: 1_727_222_400_000_002,
+                blockers: vec!["pid 42 (client backend) holds RowExclusiveLock".to_string()],
+            })
+        );
+        assert_eq!(
+            plain.capture_failure,
+            Some(PlainCaptureFailure {
+                source_table: "public.lines".to_string(),
+                columns: vec!["qty".to_string()],
+                error: "capture of public.lines needs column \"qty\"".to_string(),
+                detected_at_micros: 1_727_222_400_000_003,
+            })
         );
     }
 }

@@ -889,6 +889,64 @@ async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
     );
 }
 
+/// A primary key redefined without a rename, its old column still there
+/// (#687). The installed functions go on imaging the old key, so no write
+/// marks the change, and without a check the capture pass would regenerate
+/// them keyed by the new one, silently. The pass pauses every reader
+/// instead, with the old and new key on its status, and leaves the functions
+/// for the next pass. A row the old functions staged then drains without
+/// reaching a paused reader, and no write fails.
+///
+/// (A drain that runs before the pass still meets that row while its
+/// readers are live, and fails on its key: #703.)
+#[tokio::test]
+async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute(
+        "alter table public.u drop constraint u_pkey, add primary key (id, g); \
+         update public.u set b = b + 1 where id = 1;",
+    )
+    .await
+    .expect("redefine the key, and write");
+
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    for target in ["ta", "tb", "tc", "tsum"] {
+        let reported = trellis.status(target).await.expect("status").expect(target);
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let failure = reported.capture_failure.expect("the reason is reported");
+        assert_eq!(failure.source_table, "public.u");
+        assert_eq!(failure.columns, vec!["id".to_string()]);
+        assert!(
+            failure.error.contains("primary key") && failure.error.contains("\"g\""),
+            "{failure:?}"
+        );
+    }
+    assert_eq!(
+        captured(&raw, "public.u").await.0,
+        vec!["id".to_string()],
+        "the pass that pauses leaves the functions for the next one"
+    );
+
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    app.batch_execute("insert into public.u values (5, 1, 5, 50, 500, 0)")
+        .await
+        .expect("no write fails");
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let outcome = capture_pass(&mut raw, &db.pool).await;
+    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    assert_eq!(
+        captured(&raw, "public.u").await.0,
+        vec!["id".to_string(), "g".to_string()],
+        "with every reader paused, the next pass keys capture by the new key"
+    );
+}
+
 /// Resuming a definition while the column it reads is still missing: the
 /// next capture pass pauses it again, with the reason on its status, rather
 /// than leaving it waiting to backfill and the table's capture failing every

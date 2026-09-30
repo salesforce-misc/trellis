@@ -166,8 +166,9 @@ pub(crate) async fn pause_transform(
 }
 
 /// Pauses definition `id` because a capture function found `columns` of
-/// `source_table` renamed or dropped (#622 C6), and records why in
-/// `capture_failures`. The record is what `Trellis::status` reports as
+/// `source_table` renamed or dropped (#622 C6), or the capture pass found
+/// its primary key redefined (#687), and records why in `capture_failures`:
+/// `error` is the sentence `Trellis::status` reports. The record is what `Trellis::status` reports as
 /// `capture_failure`, and what makes capture stop imaging for the
 /// definition (`capture::columns`). Runs in the caller's transaction, which
 /// the drain commits before it computes anything that could apply to it.
@@ -181,12 +182,13 @@ pub(crate) async fn pause_for_capture_failure(
     id: i64,
     source_table: &str,
     columns: &[String],
+    error: &str,
 ) -> Result<bool, CatalogError> {
     txn.execute(
-        "insert into capture_failures (transform_id, source_table, columns) \
-         select id, $2, $3 from transform_definitions where id = $1 \
+        "insert into capture_failures (transform_id, source_table, columns, error) \
+         select id, $2, $3, $4 from transform_definitions where id = $1 \
          on conflict (transform_id) do nothing",
-        &[&id, &source_table, &columns],
+        &[&id, &source_table, &columns, &error],
     )
     .await?;
     let paused = txn

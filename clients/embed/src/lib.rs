@@ -63,7 +63,8 @@ pub use config::PlainConfig;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
-    PlainBackfillFailure, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
+    PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainDefinition,
+    PlainDefinitionStatus, PlainDefinitionSummary,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use log::{

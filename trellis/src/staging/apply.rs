@@ -193,6 +193,15 @@ pub enum ApplyError {
     /// resume until the definition's build has finished closes the window
     /// instead of racing it.
     DefinitionNotLive { transform: String },
+    /// [`super::quarantine::resume_column`] was asked to resume an `ALTER
+    /// TRANSFORM` field that is paused until its source's capture images the
+    /// column it reads (`column_status.awaiting_capture`, #687). Unpausing it
+    /// before then would let a row the narrower capture function staged,
+    /// which lacks that column, reach it and fail with `MissingColumn`. The
+    /// field's catch-up marker unpauses it once the widened capture lands;
+    /// the definition's `capture_wait` or `capture_failure` status says what
+    /// holds that up.
+    ColumnAwaitingCapture { transform: String, column: String },
     /// A failure from [`crate::intake::markers`]'s backfill-marker
     /// machinery (issue #55: [`super::quarantine::resume_transform`]
     /// re-parking a catch-up marker, or clearing/qualifying its source
@@ -260,7 +269,9 @@ impl ApplyError {
             // blocks this request" rather than "the request itself is
             // malformed" (-> Validation) or "nothing by that name exists"
             // (-> NotFound).
-            ApplyError::DefinitionNotLive { .. } => ErrorCode::Conflict,
+            ApplyError::DefinitionNotLive { .. } | ApplyError::ColumnAwaitingCapture { .. } => {
+                ErrorCode::Conflict
+            }
             ApplyError::Intake(err) => err.code(),
             ApplyError::TransformNotFound { .. } => ErrorCode::NotFound,
             ApplyError::TransformNotPaused { .. } => ErrorCode::Conflict,
@@ -315,6 +326,13 @@ impl fmt::Display for ApplyError {
                 "'{transform}' is not currently live (it may still be backfilling); resuming a \
                  paused column requires its definition to be live first"
             ),
+            ApplyError::ColumnAwaitingCapture { transform, column } => write!(
+                f,
+                "'{transform}.{column}' awaits the capture of its source's new column and \
+                 unpauses on its own once the capture images it (the definition's status says \
+                 what holds that up); RESUME it then only if it was also paused for another \
+                 reason"
+            ),
             ApplyError::Intake(err) => write!(f, "backfill marker error: {err}"),
             ApplyError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
@@ -354,6 +372,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::SourceTableDropped { .. }
             | ApplyError::ColumnNotPaused { .. }
             | ApplyError::DefinitionNotLive { .. }
+            | ApplyError::ColumnAwaitingCapture { .. }
             | ApplyError::TransformNotFound { .. }
             | ApplyError::TransformNotPaused { .. }
             | ApplyError::ReverseTriggerNotResolvable { .. } => None,

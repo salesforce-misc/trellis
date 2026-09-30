@@ -634,12 +634,32 @@ fn uniqueish_id() -> String {
 /// A table whose capture can't be installed yet (a lock held on it, a
 /// missing primary key) doesn't fail the start: the pass logs it, and every
 /// maintenance pass tries again.
+///
+/// A pass that fails as a whole releases the singleton before this returns
+/// (#687), as the maintenance loop does when it stops. Dropping the session
+/// would free it only once the server noticed the closed connection, so a
+/// client restarted at once could fail with `ProducerAlreadyRunning`.
 async fn setup_staging(
     dsn: &str,
     config: &Config,
     pool: &Pool,
 ) -> Result<ProducerSession, ClientError> {
     let mut session = ProducerSession::connect(dsn, config.schema()).await?;
+    match first_capture_pass(&mut session, config, pool).await {
+        Ok(()) => Ok(session),
+        Err(err) => {
+            release_singleton(Some(session)).await;
+            Err(err)
+        }
+    }
+}
+
+/// [`setup_staging`]'s capture pass, on the session holding the singleton.
+async fn first_capture_pass(
+    session: &mut ProducerSession,
+    config: &Config,
+    pool: &Pool,
+) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome =
@@ -647,7 +667,7 @@ async fn setup_staging(
             .await
             .map_err(capture_pass_error)?;
     intake::markers::park_ready_registration_markers(session.client(), &outcome.ready).await?;
-    Ok(session)
+    Ok(())
 }
 
 /// The [`ClientError`] for a capture pass that couldn't run at all. Only
@@ -2918,6 +2938,47 @@ mod reconcile_tests {
             Installed::Absent => false,
             partial => panic!("a pass leaves no partial install: {partial:?}"),
         }
+    }
+
+    /// A `setup_staging` whose first capture pass fails releases the
+    /// staging-worker singleton before it returns (#687), so a restart right
+    /// after doesn't fail with `ProducerAlreadyRunning`. Here the pass can't
+    /// read the catalog: the schema has no Trellis tables.
+    ///
+    /// Dropping the session isn't enough: its connection task only closes the
+    /// connection once the runtime polls it, and the server only lets the
+    /// lock go once it sees that. So the second session is taken on another
+    /// thread while this (current-thread) runtime is blocked, which keeps a
+    /// merely dropped session holding the lock and makes the test
+    /// deterministic.
+    #[tokio::test]
+    async fn a_failed_setup_releases_the_singleton_before_returning() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let schema = "no_trellis_here";
+        let config = Config::with_schema(db.dsn(), schema).expect("valid config");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let err = setup_staging(db.dsn(), &config, &pool)
+            .await
+            .expect_err("the pass can't read a catalog that isn't there");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        let dsn = db.dsn().to_string();
+        let retaken = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    ProducerSession::connect(&dsn, schema)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                })
+        })
+        .join()
+        .expect("the retake thread");
+        assert_eq!(retaken, Ok(()), "the failed setup still held the singleton");
     }
 
     async fn marker_count(raw: &tokio_postgres::Client) -> i64 {

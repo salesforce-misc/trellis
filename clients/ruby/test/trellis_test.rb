@@ -29,7 +29,8 @@ class TrellisTest < Minitest::Test
     assert_equal({ "id" => "integer", "price" => "integer" }, definition.source_columns)
 
     status = await_status("widget_prices")
-    assert_equal Trellis::Status.new(status: :live, backfill_failure: nil), status
+    assert_equal Trellis::Status.new(status: :live, backfill_failure: nil, capture_wait: nil,
+                                     capture_failure: nil), status
 
     # The backfill carried the existing row across.
     assert_equal [[1, 5]], rows(pg)

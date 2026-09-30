@@ -26,13 +26,40 @@ class ValuesTest < Minitest::Test
     status = Trellis::Status.from_native(
       status: :waiting_to_backfill,
       backfill_failure: { source_table: "public.orders", attempts: 3,
-                          last_error: "permission denied", next_attempt_at_micros: MICROS }
+                          last_error: "permission denied", next_attempt_at_micros: MICROS },
+      capture_wait: nil, capture_failure: nil
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
       backfill_failure: Trellis::BackfillFailure.new(
         source_table: "public.orders", attempts: 3, last_error: "permission denied",
         next_attempt_at: Trellis::EpochMicros.to_time(MICROS)
+      ),
+      capture_wait: nil,
+      capture_failure: nil
+    ), status
+  end
+
+  def test_a_capture_wait_and_failure_become_values_with_times
+    status = Trellis::Status.from_native(
+      status: :catching_up, backfill_failure: nil,
+      capture_wait: { table: "public.orders", operation: "widen",
+                      lock_mode: "ShareRowExclusiveLock", waiting_since_micros: MICROS,
+                      observed_at_micros: MICROS + 1, blockers: ["pid 42 holds RowExclusiveLock"] },
+      capture_failure: { source_table: "public.lines", columns: ["qty"],
+                         error: "column \"qty\" was dropped", detected_at_micros: MICROS }
+    )
+    assert_equal Trellis::Status.new(
+      status: :catching_up, backfill_failure: nil,
+      capture_wait: Trellis::CaptureWait.new(
+        table: "public.orders", operation: "widen", lock_mode: "ShareRowExclusiveLock",
+        waiting_since: Trellis::EpochMicros.to_time(MICROS),
+        observed_at: Trellis::EpochMicros.to_time(MICROS + 1),
+        blockers: ["pid 42 holds RowExclusiveLock"]
+      ),
+      capture_failure: Trellis::CaptureFailure.new(
+        source_table: "public.lines", columns: ["qty"], error: "column \"qty\" was dropped",
+        detected_at: Trellis::EpochMicros.to_time(MICROS)
       )
     ), status
   end

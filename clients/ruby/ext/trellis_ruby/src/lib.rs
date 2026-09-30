@@ -53,13 +53,13 @@ use magnus::{
 };
 use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisError, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainConfig,
-    PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark,
-    encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
+    PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary,
+    PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship,
+    PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES,
+    decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
+    relationship_cardinality_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -720,11 +720,56 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .backfill_failure
         .map(|failure| backfill_failure_hash(ruby, failure))
         .transpose()?;
+    let wait = status
+        .capture_wait
+        .map(|wait| capture_wait_hash(ruby, wait))
+        .transpose()?;
+    let capture_failure = status
+        .capture_failure
+        .map(|failure| capture_failure_hash(ruby, failure))
+        .transpose()?;
     record(
         ruby,
         [
             ("status", word_symbol(ruby, status.status).as_value()),
             ("backfill_failure", ruby.into_value(failure)),
+            ("capture_wait", ruby.into_value(wait)),
+            ("capture_failure", ruby.into_value(capture_failure)),
+        ],
+    )
+}
+
+fn capture_wait_hash(ruby: &Ruby, wait: PlainCaptureWait) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("table", ruby.into_value(wait.table)),
+            ("operation", ruby.into_value(wait.operation)),
+            ("lock_mode", ruby.into_value(wait.lock_mode)),
+            (
+                "waiting_since_micros",
+                ruby.into_value(wait.waiting_since_micros),
+            ),
+            (
+                "observed_at_micros",
+                ruby.into_value(wait.observed_at_micros),
+            ),
+            ("blockers", ruby.into_value(wait.blockers)),
+        ],
+    )
+}
+
+fn capture_failure_hash(ruby: &Ruby, failure: PlainCaptureFailure) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("source_table", ruby.into_value(failure.source_table)),
+            ("columns", ruby.into_value(failure.columns)),
+            ("error", ruby.into_value(failure.error)),
+            (
+                "detected_at_micros",
+                ruby.into_value(failure.detected_at_micros),
+            ),
         ],
     )
 }

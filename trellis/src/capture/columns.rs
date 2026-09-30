@@ -250,6 +250,41 @@ pub async fn load_catalog(
     })
 }
 
+/// `table`'s live columns by name, with their attribute numbers, and its
+/// primary key's columns in key order (empty when it has none). Both
+/// [`capture_spec`] and the reconcile pass's schema-change check
+/// (`staging::schema_change::pause_readers_of_missing`) read the key here,
+/// so they can't disagree about it.
+pub(crate) async fn live_columns(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<(HashMap<String, i16>, Vec<String>), CaptureError> {
+    let rows = client
+        .query(
+            "select a.attname::text, a.attnum, \
+                    pg_catalog.array_position(i.indkey, a.attnum) \
+             from pg_catalog.pg_attribute a \
+             left join pg_catalog.pg_index i \
+               on i.indrelid = a.attrelid and i.indisprimary \
+              and a.attnum = any(i.indkey) \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attnum > 0 and not a.attisdropped",
+            &[&crate::defs::ddl::regclass_arg(table)],
+        )
+        .await?;
+    let mut attnums: HashMap<String, i16> = HashMap::with_capacity(rows.len());
+    let mut key: Vec<(i32, String)> = Vec::new();
+    for row in rows {
+        let name: String = row.get(0);
+        if let Some(position) = row.get::<_, Option<i32>>(2) {
+            key.push((position, name.clone()));
+        }
+        attnums.insert(name, row.get(1));
+    }
+    key.sort();
+    Ok((attnums, key.into_iter().map(|(_, name)| name).collect()))
+}
+
 /// The [`CaptureSpec`] for `table` (an unquoted `schema.table` identity):
 /// its primary key plus [`read_columns`], checked against the table's live
 /// columns.
@@ -277,30 +312,7 @@ pub async fn capture_spec(
             table: table.to_string(),
         });
     }
-    let rows = client
-        .query(
-            "select a.attname::text, a.attnum, \
-                    pg_catalog.array_position(i.indkey, a.attnum) \
-             from pg_catalog.pg_attribute a \
-             left join pg_catalog.pg_index i \
-               on i.indrelid = a.attrelid and i.indisprimary \
-              and a.attnum = any(i.indkey) \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 and not a.attisdropped",
-            &[&regclass],
-        )
-        .await?;
-    let mut attnums: HashMap<String, i16> = HashMap::with_capacity(rows.len());
-    let mut key: Vec<(i32, String)> = Vec::new();
-    for row in rows {
-        let name: String = row.get(0);
-        if let Some(position) = row.get::<_, Option<i32>>(2) {
-            key.push((position, name.clone()));
-        }
-        attnums.insert(name, row.get(1));
-    }
-    key.sort();
-    let key: Vec<String> = key.into_iter().map(|(_, name)| name).collect();
+    let (attnums, key) = live_columns(client, table).await?;
     if key.is_empty() {
         return Err(CaptureError::NoPrimaryKey {
             table: table.to_string(),

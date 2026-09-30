@@ -598,7 +598,10 @@ impl Trellis {
                         pb.last_error as backfill_last_error, \
                         pb.next_attempt_at as backfill_next_attempt_at, \
                         cf.source_table as capture_table, cf.columns as capture_columns, \
-                        cf.detected_at as capture_detected_at \
+                        cf.error as capture_error, cf.detected_at as capture_detected_at, \
+                        exists (select 1 from column_status cs \
+                                where cs.transform_table = $1 and cs.awaiting_capture) \
+                          as awaiting_capture \
                  from transform_definitions d \
                  left join pending_backfill pb \
                    on pb.table_name = d.source_table and pb.last_error is not null \
@@ -608,36 +611,39 @@ impl Trellis {
             )
             .await?;
         let mut status = None;
-        let mut capture_wait = None;
+        let mut holdup = (None, None);
         if let Some(row) = &row {
             let status_text: String = row.get(0);
             let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                 panic!("transform_definitions.status held unrecognized value '{status_text}'")
             });
             status = Some(reported_status(&*txn, row.get(1), stored).await?);
-            if stored == TransformStatus::WaitingToBackfill {
-                capture_wait = self.capture_wait(&*txn, row.get(2)).await?;
+            // #687: an edit whose new field awaits a widen is stuck on
+            // capture as much as a registration is.
+            if stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture") {
+                holdup = self.capture_holdup(&*txn, row.get(2)).await?;
             }
         }
         txn.commit().await?;
+        let (capture_wait, stalled) = holdup;
         Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
             status,
             backfill_failure: backfill_failure(&row),
             capture_wait,
-            capture_failure: capture_failure(&row),
+            capture_failure: capture_failure(&row).or(stalled),
         }))
     }
 
-    /// The capture lock wait, if any, holding up a `waiting_to_backfill`
-    /// definition sourced from `source_table` (issue #622 C5): the latest
-    /// [`crate::capture::install::LockWait`] this process's staging worker
-    /// recorded for the source, or for the to-side of a relationship declared
-    /// on it. Only a staging worker running in this process is seen.
-    async fn capture_wait(
+    /// What holds up the capture a definition sourced from `source_table`
+    /// waits on (issue #622 C5, #687): the latest lock wait, then the latest
+    /// other failure, that this process's staging worker recorded for the
+    /// source, or for the to-side of a relationship declared on it. Only a
+    /// staging worker running in this process is seen.
+    async fn capture_holdup(
         &self,
         client: &impl tokio_postgres::GenericClient,
         source_table: &str,
-    ) -> Result<Option<CaptureWait>, TrellisError> {
+    ) -> Result<(Option<CaptureWait>, Option<CaptureFailure>), TrellisError> {
         let schema = self.config.schema();
         let database: String = client
             .query_one("select pg_catalog.current_database()::text", &[])
@@ -655,10 +661,21 @@ impl Trellis {
                 .into_iter()
                 .map(|row| row.get::<_, String>(0)),
         );
-        Ok(tables
+        use crate::capture::reconcile;
+        let wait = tables
             .iter()
-            .find_map(|table| crate::capture::reconcile::lock_wait(&database, schema, table))
-            .map(|wait| CaptureWait::from(&wait)))
+            .find_map(|table| reconcile::lock_wait(&database, schema, table))
+            .map(|wait| CaptureWait::from(&wait));
+        let failure = tables
+            .iter()
+            .find_map(|table| reconcile::failure(&database, schema, table))
+            .map(|failure| CaptureFailure {
+                source_table: failure.table,
+                columns: failure.columns,
+                error: failure.error,
+                detected_at: failure.since,
+            });
+        Ok((wait, failure))
     }
 
     /// Every registered relationship declaration, oldest first.
@@ -1392,26 +1409,17 @@ fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
 }
 
 /// The [`CaptureFailure`] in a row of [`Trellis::status`]'s query:
-/// `capture_failures`' `source_table`, `columns` and `detected_at`, selected
-/// as `capture_table`, `capture_columns` and `capture_detected_at` from a
-/// left join on the definition's id.
+/// `capture_failures`' `source_table`, `columns`, `error` and
+/// `detected_at`, selected as `capture_table`, `capture_columns`,
+/// `capture_error` and `capture_detected_at` from a left join on the
+/// definition's id.
 fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
     row.get::<_, Option<String>>("capture_table")
-        .map(|source_table| {
-            let columns: Vec<String> = row.get("capture_columns");
-            let named: Vec<String> = columns.iter().map(|c| format!("{c:?}")).collect();
-            let error = format!(
-                "column {} of {source_table}, which this definition reads, was renamed or \
-                 dropped; its capture now leaves it out. Restore the column and resume the \
-                 definition to rebuild it, or drop the definition",
-                named.join(", ")
-            );
-            CaptureFailure {
-                source_table,
-                columns,
-                error,
-                detected_at: row.get("capture_detected_at"),
-            }
+        .map(|source_table| CaptureFailure {
+            source_table,
+            columns: row.get("capture_columns"),
+            error: row.get("capture_error"),
+            detected_at: row.get("capture_detected_at"),
         })
 }
 
@@ -1432,41 +1440,56 @@ pub struct DefinitionStatus {
     /// named in [`BackfillFailure::last_error`], not on the discharge's turn.
     /// It clears once the discharge succeeds or the table is parked again.
     pub backfill_failure: Option<BackfillFailure>,
-    /// Set while the definition is `waiting_to_backfill` because the staging
-    /// worker can't yet take the lock it needs to install or widen the
-    /// capture triggers on its source, or on the to-side of a relationship
-    /// declared on it (issue #622). In memory only: reported when the
-    /// staging worker runs in this process.
+    /// Set while the definition waits on capture, because the staging worker
+    /// can't yet take the lock it needs to install or widen the capture
+    /// triggers on its source, or on the to-side of a relationship declared
+    /// on it (issue #622). It clears on its own once the lock holder lets
+    /// go. A definition waits on capture while it is `waiting_to_backfill`,
+    /// or while an `ALTER TRANSFORM` field it gained is paused until the
+    /// capture images the column it reads (it is `catching_up` then, #687).
+    /// In memory only: reported when the staging worker runs in this
+    /// process.
     pub capture_wait: Option<CaptureWait>,
-    /// Set while the definition is paused because a column it reads was
-    /// renamed or dropped on a captured table (issue #622 C6). The
-    /// application's writes to that table go on succeeding; the capture
-    /// trigger marks the change and the drain pauses every definition that
-    /// reads the column, while the other definitions on the table keep
-    /// applying. Cleared by resuming the definition, which rebuilds it.
+    /// Set while capture of a table the definition reads is broken, and
+    /// only fixing the cause gets the definition going again. Either:
+    ///
+    /// - a schema change paused it (issue #622 C6): a column it reads was
+    ///   renamed or dropped, or its source's primary key was redefined
+    ///   (#687). The application's writes go on succeeding, and the other
+    ///   definitions on the table keep applying. Recorded in the catalog
+    ///   and cleared by resuming the definition, which rebuilds it;
+    /// - or, while it waits on capture as for `capture_wait`, the staging
+    ///   worker's install or widen fails for a reason other than a lock (no
+    ///   primary key, a statement that fails, #687). Every pass retries it,
+    ///   and it clears once one succeeds. In memory only, like
+    ///   `capture_wait`.
     pub capture_failure: Option<CaptureFailure>,
 }
 
-/// Why a definition was paused by a schema change (issue #622 C6).
+/// Why capture of a table a definition reads is broken (issue #622 C6,
+/// #687); see [`DefinitionStatus::capture_failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFailure {
-    /// The qualified captured table whose column went.
+    /// The qualified captured table.
     pub source_table: String,
-    /// The missing columns the definition reads. When a primary-key column
-    /// went, every missing column of the table.
+    /// The columns the failure is about: the renamed or dropped ones the
+    /// definition reads (every missing column of the table when a
+    /// primary-key column went), the old key columns when the key was
+    /// redefined, or the missing column an install names. Empty for a
+    /// failure that isn't about a column.
     pub columns: Vec<String>,
-    /// A sentence naming the table and columns, and what to do.
+    /// A sentence naming the cause and, for a pause, what to do.
     pub error: String,
-    /// When the drain met the first capture that lacked the column.
+    /// When the drain or the staging worker first found it.
     pub detected_at: SystemTime,
 }
 
-/// What a `waiting_to_backfill` definition's capture is waiting on (issue
-/// #622 C5): the staging worker's install or widen of the capture triggers
-/// on a table the definition reads couldn't take the table's lock, because
-/// another session holds or is queued for a conflicting one. Nothing
-/// cancels that session (an autovacuum included), so the definition waits
-/// until it lets go; this names it.
+/// What a definition's capture is waiting on (issue #622 C5): the staging
+/// worker's install or widen of the capture triggers on a table the
+/// definition reads couldn't take the table's lock, because another session
+/// holds or is queued for a conflicting one. Nothing cancels that session
+/// (an autovacuum included), so the definition waits until it lets go; this
+/// names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureWait {
     /// The qualified table whose lock the capture operation waits for.

@@ -45,13 +45,13 @@ use std::time::Duration;
 use rustler::{Atom, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, SelfCheckScope, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure, PlainConfig,
-    PlainDefinition, PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainError,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainRelationship, PlainRelationshipSummary,
-    PlainSamplePage, PlainSelfCheckReport, SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark,
-    encode_watermark, quarantine_state_names, relationship_cardinality_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
+    PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainDefinition, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainDivergence, PlainError, PlainPoisonEntry, PlainQuarantineEntry,
+    PlainRelationship, PlainRelationshipSummary, PlainSamplePage, PlainSelfCheckReport,
+    SELF_CHECK_OUTCOMES, decode_cursor, decode_watermark, encode_watermark, quarantine_state_names,
+    relationship_cardinality_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -155,6 +155,50 @@ struct DefinitionTerm {
 struct StatusTerm {
     status: Atom,
     backfill_failure: Option<BackfillFailureTerm>,
+    capture_wait: Option<CaptureWaitTerm>,
+    capture_failure: Option<CaptureFailureTerm>,
+}
+
+#[derive(NifMap)]
+struct CaptureWaitTerm {
+    table: String,
+    operation: String,
+    lock_mode: String,
+    waiting_since_micros: i64,
+    observed_at_micros: i64,
+    blockers: Vec<String>,
+}
+
+impl From<PlainCaptureWait> for CaptureWaitTerm {
+    fn from(wait: PlainCaptureWait) -> Self {
+        CaptureWaitTerm {
+            table: wait.table,
+            operation: wait.operation,
+            lock_mode: wait.lock_mode,
+            waiting_since_micros: wait.waiting_since_micros,
+            observed_at_micros: wait.observed_at_micros,
+            blockers: wait.blockers,
+        }
+    }
+}
+
+#[derive(NifMap)]
+struct CaptureFailureTerm {
+    source_table: String,
+    columns: Vec<String>,
+    error: String,
+    detected_at_micros: i64,
+}
+
+impl From<PlainCaptureFailure> for CaptureFailureTerm {
+    fn from(failure: PlainCaptureFailure) -> Self {
+        CaptureFailureTerm {
+            source_table: failure.source_table,
+            columns: failure.columns,
+            error: failure.error,
+            detected_at_micros: failure.detected_at_micros,
+        }
+    }
 }
 
 #[derive(NifMap)]
@@ -703,6 +747,8 @@ fn status(
     Ok(Some(StatusTerm {
         status: word_atom(env, status.status)?,
         backfill_failure: status.backfill_failure.map(BackfillFailureTerm::from),
+        capture_wait: status.capture_wait.map(CaptureWaitTerm::from),
+        capture_failure: status.capture_failure.map(CaptureFailureTerm::from),
     }))
 }
 

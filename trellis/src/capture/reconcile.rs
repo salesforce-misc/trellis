@@ -26,6 +26,8 @@
 //! makes that table [`Progress::Waiting`], and the next pass tries it again.
 //! Its [`LockWait`] report is kept in memory ([`lock_wait`]), where
 //! [`crate::Trellis::status`] reports it on each definition it keeps waiting.
+//! So is the error of a table whose capture fails for another reason (no
+//! primary key, a failed statement: [`failure`], #687).
 //!
 //! # Which definitions a discharge may dispatch
 //!
@@ -61,7 +63,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use tokio_postgres::{Client, GenericClient};
 
@@ -127,11 +129,11 @@ pub async fn reconcile(
         {
             Ok(false) => {}
             Ok(true) => {
-                forget_lock_wait(instance, table);
+                // Neither waiting nor failing: the next pass decides afresh.
+                forget_holdup(instance, table);
                 continue;
             }
             Err(err) => {
-                forget_lock_wait(instance, table);
                 outcome.failed.push((table.clone(), err));
                 continue;
             }
@@ -139,8 +141,6 @@ pub async fn reconcile(
         let spec = match capture_spec(&*client, &snapshot.catalog, table).await {
             Ok(spec) => spec,
             Err(err) => {
-                // No longer waiting for a lock, whatever it did last pass.
-                forget_lock_wait(instance, table);
                 outcome.failed.push((table.clone(), err));
                 continue;
             }
@@ -150,7 +150,7 @@ pub async fn reconcile(
                 if action != CaptureAction::Unchanged {
                     tracing::info!(table = %table, action = ?action, "capture reconciled");
                 }
-                forget_wait(instance, table);
+                forget(instance, table);
                 outcome.captured.insert(table.clone());
             }
             Ok(Progress::Waiting(wait)) => {
@@ -161,7 +161,6 @@ pub async fn reconcile(
                 outcome.waiting.push(wait);
             }
             Err(err) => {
-                forget_lock_wait(instance, table);
                 outcome.failed.push((table.clone(), err));
             }
         }
@@ -174,7 +173,7 @@ pub async fn reconcile(
                 if removed {
                     tracing::info!(table = %table, "capture uninstalled: nothing reads the table");
                 }
-                forget_wait(instance, table);
+                forget(instance, table);
             }
             Ok(Progress::Waiting(wait)) => {
                 let wait = remember_wait(instance, *wait);
@@ -184,7 +183,6 @@ pub async fn reconcile(
                 outcome.waiting.push(wait);
             }
             Err(err) => {
-                forget_lock_wait(instance, table);
                 outcome.failed.push((table.clone(), err));
             }
         }
@@ -192,9 +190,11 @@ pub async fn reconcile(
 
     // A table that is neither read nor installed any more can't be waited on.
     let known: HashSet<&String> = desired.iter().chain(installed.iter()).collect();
-    forget_waits_except(instance, &known);
+    forget_holdups_except(instance, &known);
 
     for (table, err) in &outcome.failed {
+        // No longer waiting for a lock, whatever it did last pass.
+        remember_failure(instance, table, err);
         let text = err.to_string();
         report(instance, table, &text, || {
             tracing::warn!(table = %table, error = %err, "capture of a source table failed; retrying next pass");
@@ -352,39 +352,98 @@ pub async fn installed_tables(
 }
 
 // ---------------------------------------------------------------------
-// The latest lock wait per table, in memory
+// What holds each table's capture back, in memory
 // ---------------------------------------------------------------------
 
-/// The latest [`LockWait`] of each table whose capture operation is still
-/// waiting, keyed by instance (database and schema) and table. In memory only (#622 plan
-/// Q9: it describes other sessions, so nothing can re-derive it, and it
-/// stays out of the schema): a staging worker in another process reports
-/// its waits in its own log only.
-static LOCK_WAITS: Mutex<Option<HashMap<(String, String), LockWait>>> = Mutex::new(None);
+/// What the staging worker's last pass in this process found holding a
+/// table's capture back: a lock it is still waiting for, or another failure.
+/// A table is never both; each pass's outcome replaces the last.
+#[derive(Debug, Clone)]
+enum Holdup {
+    Waiting(LockWait),
+    Failed(Failure),
+}
 
-fn with_waits<T>(f: impl FnOnce(&mut HashMap<(String, String), LockWait>) -> T) -> T {
-    let mut guard = LOCK_WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+/// A table whose capture couldn't be installed, widened, narrowed or
+/// uninstalled for a reason other than its lock (#687): no primary key, a
+/// missing column, a statement that failed (the Trellis role no longer a
+/// member of the ring's owner, say). Every pass retries it; nothing but a
+/// fix of the cause makes it land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The qualified table.
+    pub table: String,
+    /// The pass's error.
+    pub error: String,
+    /// The column the error names, if it is a missing one.
+    pub columns: Vec<String>,
+    /// When a pass first failed with this error.
+    pub since: SystemTime,
+}
+
+/// The latest [`Holdup`] of each table whose capture isn't current, keyed
+/// by instance (database and schema) and table. In memory only (#622 plan
+/// Q9: a wait describes other sessions, so nothing can re-derive it, and it
+/// stays out of the schema; a failure is re-derived by the next pass): a
+/// staging worker in another process reports them in its own log only.
+static HOLDUPS: Mutex<Option<HashMap<(String, String), Holdup>>> = Mutex::new(None);
+
+fn with_holdups<T>(f: impl FnOnce(&mut HashMap<(String, String), Holdup>) -> T) -> T {
+    let mut guard = HOLDUPS.lock().unwrap_or_else(PoisonError::into_inner);
     f(guard.get_or_insert_with(HashMap::new))
 }
 
 /// Records `wait`, keeping the first pass's `waiting_since` while the same
 /// operation keeps waiting, and returns what it recorded.
 fn remember_wait(instance: &str, mut wait: LockWait) -> LockWait {
-    with_waits(|waits| {
+    with_holdups(|holdups| {
         let key = (instance.to_string(), wait.table.clone());
-        if let Some(previous) = waits.get(&key)
+        if let Some(Holdup::Waiting(previous)) = holdups.get(&key)
             && previous.operation == wait.operation
         {
             wait.waiting_since = wait.waiting_since.min(previous.waiting_since);
         }
-        waits.insert(key, wait.clone());
+        holdups.insert(key, Holdup::Waiting(wait.clone()));
         wait
     })
 }
 
-fn forget_wait(instance: &str, table: &str) {
-    with_waits(|waits| waits.remove(&(instance.to_string(), table.to_string())));
+/// Records `table`'s failure, replacing any wait, and keeping the first
+/// pass's `since` while it keeps failing with the same error.
+fn remember_failure(instance: &str, table: &str, err: &CaptureError) {
+    let error = err.to_string();
+    let columns = match err {
+        CaptureError::MissingColumn { column, .. } => vec![column.clone()],
+        _ => Vec::new(),
+    };
+    with_holdups(|holdups| {
+        let key = (instance.to_string(), table.to_string());
+        let since = match holdups.get(&key) {
+            Some(Holdup::Failed(previous)) if previous.error == error => previous.since,
+            _ => SystemTime::now(),
+        };
+        holdups.insert(
+            key,
+            Holdup::Failed(Failure {
+                table: table.to_string(),
+                error,
+                columns,
+                since,
+            }),
+        );
+    });
+}
+
+/// Forgets `table`'s holdup and what [`report`] last logged for it: its
+/// capture landed.
+fn forget(instance: &str, table: &str) {
+    forget_holdup(instance, table);
     with_reports(|reports| reports.remove(&(instance.to_string(), table.to_string())));
+}
+
+/// Forgets `table`'s holdup only, keeping what [`report`] last logged for it.
+fn forget_holdup(instance: &str, table: &str) {
+    with_holdups(|holdups| holdups.remove(&(instance.to_string(), table.to_string())));
 }
 
 /// How often [`report`] repeats a table's unchanged wait or failure at its
@@ -424,24 +483,17 @@ fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
     }
 }
 
-/// Forgets `table`'s lock wait only, keeping what [`report`] last logged for
-/// it: a table that failed for another reason is no longer waiting for a
-/// lock, but its failure is still rate-limited.
-fn forget_lock_wait(instance: &str, table: &str) {
-    with_waits(|waits| waits.remove(&(instance.to_string(), table.to_string())));
-}
-
-/// Forgets every wait and report of the instance with schema `schema` in
+/// Forgets every holdup and report of the instance with schema `schema` in
 /// database `database`: its staging worker in this process stopped, so
 /// nothing here keeps them current any more.
 pub fn forget_instance(database: &str, schema: &str) {
     let instance = instance_key(database, schema);
-    with_waits(|waits| waits.retain(|(i, _), _| *i != instance));
+    with_holdups(|holdups| holdups.retain(|(i, _), _| *i != instance));
     with_reports(|reports| reports.retain(|(i, _), _| *i != instance));
 }
 
-fn forget_waits_except(instance: &str, known: &HashSet<&String>) {
-    with_waits(|waits| waits.retain(|(i, table), _| i != instance || known.contains(table)));
+fn forget_holdups_except(instance: &str, known: &HashSet<&String>) {
+    with_holdups(|holdups| holdups.retain(|(i, table), _| i != instance || known.contains(table)));
     with_reports(|reports| reports.retain(|(i, table), _| i != instance || known.contains(table)));
 }
 
@@ -451,7 +503,22 @@ fn forget_waits_except(instance: &str, known: &HashSet<&String>) {
 /// this process.
 pub fn lock_wait(database: &str, schema: &str, table: &str) -> Option<LockWait> {
     let key = (instance_key(database, schema), table.to_string());
-    with_waits(|waits| waits.get(&key).cloned())
+    with_holdups(|holdups| match holdups.get(&key) {
+        Some(Holdup::Waiting(wait)) => Some(wait.clone()),
+        _ => None,
+    })
+}
+
+/// The latest failure of `table`'s capture in the instance with schema
+/// `schema` in database `database`, if the staging worker's last pass in
+/// this process couldn't bring it current for a reason other than its lock
+/// (#687).
+pub fn failure(database: &str, schema: &str, table: &str) -> Option<Failure> {
+    let key = (instance_key(database, schema), table.to_string());
+    with_holdups(|holdups| match holdups.get(&key) {
+        Some(Holdup::Failed(failure)) => Some(failure.clone()),
+        _ => None,
+    })
 }
 
 /// The registry's key for one instance: its database and schema. Two
@@ -510,6 +577,26 @@ mod tests {
         assert_eq!(lock_wait(stopped, "s", "public.t"), None);
         assert!(lock_wait(other, "s", "public.t").is_some());
         forget_instance(other, "s");
+    }
+
+    #[test]
+    fn a_failure_replaces_a_wait_and_keeps_its_first_detection() {
+        // A name no other test uses: the registry is process-global.
+        let db = "db_failure_replaces_wait";
+        let instance = instance_key(db, "s");
+        remember_wait(&instance, wait_on("public.t"));
+        let err = || CaptureError::NoPrimaryKey {
+            table: "public.t".to_string(),
+        };
+        remember_failure(&instance, "public.t", &err());
+        assert_eq!(lock_wait(db, "s", "public.t"), None);
+        let first = failure(db, "s", "public.t").expect("the failure");
+        assert!(first.error.contains("no primary key"), "{first:?}");
+        remember_failure(&instance, "public.t", &err());
+        assert_eq!(failure(db, "s", "public.t"), Some(first));
+        remember_wait(&instance, wait_on("public.t"));
+        assert_eq!(failure(db, "s", "public.t"), None, "a wait replaces it");
+        forget_instance(db, "s");
     }
 
     #[test]

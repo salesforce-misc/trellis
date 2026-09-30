@@ -48,11 +48,24 @@ use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
 use crate::pool::Pool;
 
-/// What one table's markers in a drain's segments say is missing.
+/// What one table's markers in a drain's segments say is missing, or what
+/// the capture pass found changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Missing {
     columns: BTreeSet<String>,
     key_missing: bool,
+    /// The installed capture's key and the table's primary key now, when the
+    /// key was redefined with its old columns still there (#687). Only the
+    /// capture pass sees this: the functions keep imaging the old key
+    /// columns, so no write marks it.
+    key_changed: Option<(Vec<String>, Vec<String>)>,
+}
+
+impl Missing {
+    /// Whether every definition on the table must pause.
+    fn whole_table(&self) -> bool {
+        self.key_missing || self.key_changed.is_some()
+    }
 }
 
 /// Pauses every definition a `schema_changed` marker in `seg_seqs` names a
@@ -101,7 +114,7 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     let catalog = load_catalog(&**client, pool.schema()).await?;
     let txn = client.transaction().await?;
     for (table, missing) in &by_table {
-        let readers = readers_of(&catalog, table, &missing.columns, missing.key_missing);
+        let readers = readers_of(&catalog, table, &missing.columns, missing.whole_table());
         if readers.is_empty() {
             tracing::info!(
                 table = %table,
@@ -126,30 +139,62 @@ async fn pause(
     readers: &[i64],
 ) -> Result<(), CatalogError> {
     for &id in readers {
-        // The columns this definition reads, or every missing one when it
-        // pauses only because the key went.
-        let mut columns: Vec<String> = missing
-            .columns
-            .iter()
-            .filter(|c| {
-                readers_of(catalog, table, &BTreeSet::from([(*c).clone()]), false).contains(&id)
-            })
-            .cloned()
-            .collect();
-        if columns.is_empty() {
-            columns = missing.columns.iter().cloned().collect();
-        }
-        if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns).await? {
-            tracing::warn!(
-                transform_id = id,
-                table = %table,
-                columns = ?columns,
-                "definition paused: a column it reads was renamed or dropped; \
-                 resume it to rebuild once the column is back, or drop it"
-            );
+        let (columns, error) = match &missing.key_changed {
+            Some((old, new)) => (old.clone(), key_changed_error(table, old, new)),
+            None => {
+                // The columns this definition reads, or every missing one
+                // when it pauses only because the key went.
+                let mut columns: Vec<String> = missing
+                    .columns
+                    .iter()
+                    .filter(|c| {
+                        readers_of(catalog, table, &BTreeSet::from([(*c).clone()]), false)
+                            .contains(&id)
+                    })
+                    .cloned()
+                    .collect();
+                if columns.is_empty() {
+                    columns = missing.columns.iter().cloned().collect();
+                }
+                let error = missing_columns_error(table, &columns);
+                (columns, error)
+            }
+        };
+        if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns, &error)
+            .await?
+        {
+            tracing::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }
     Ok(())
+}
+
+/// The `capture_failure` sentence for a definition paused because `columns`
+/// of `table` it reads were renamed or dropped.
+fn missing_columns_error(table: &str, columns: &[String]) -> String {
+    format!(
+        "column {} of {table}, which this definition reads, was renamed or dropped; its \
+         capture now leaves it out. Restore the column and resume the definition to rebuild \
+         it, or drop the definition",
+        quoted_list(columns)
+    )
+}
+
+/// The `capture_failure` sentence for a definition paused because `table`'s
+/// primary key changed from `old` to `new` (#687).
+fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
+    format!(
+        "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
+         are keyed by the old one. Restore the key and resume the definition to rebuild it, \
+         or drop the definition and define it again",
+        quoted_list(old),
+        quoted_list(new)
+    )
+}
+
+fn quoted_list(columns: &[String]) -> String {
+    let quoted: Vec<String> = columns.iter().map(|c| format!("{c:?}")).collect();
+    quoted.join(", ")
 }
 
 /// The staging worker's capture pass's side of a schema change: pauses,
@@ -176,6 +221,12 @@ async fn pause(
 ///   can't change for anyone, and the definition waits for its backfill with
 ///   nothing on its status.
 ///
+/// It also pauses every definition on the table when its primary key was
+/// redefined while the old key columns stayed (#687): the installed
+/// functions still image them, so no write marks the change, and
+/// `capture_spec` would widen capture to the new key. The drain would then
+/// apply rows keyed by columns the definitions' targets aren't keyed by.
+///
 /// Pausing before a marker does is sound: a pause only ever drops the
 /// definition's share, and its resume is the rebuild either way.
 pub(crate) async fn pause_readers_of_missing(
@@ -184,41 +235,34 @@ pub(crate) async fn pause_readers_of_missing(
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
-    let present: BTreeSet<String> = client
-        .query(
-            "select a.attname::text from pg_catalog.pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 and not a.attisdropped",
-            &[&crate::defs::ddl::regclass_arg(table)],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    if present.is_empty() {
+    let (attnums, key) = crate::capture::columns::live_columns(&*client, table).await?;
+    if attnums.is_empty() {
         // No such table (or no columns): `capture_spec` reports it.
         return Ok(false);
     }
+    let present = |c: &String| attnums.contains_key(c);
     let mut missing = Missing::default();
     if let Installed::Complete { spec, .. } = installed(&*client, schema, table).await? {
-        missing.key_missing = spec.key().iter().any(|c| !present.contains(c));
-        missing.columns.extend(
-            spec.columns()
-                .iter()
-                .filter(|c| !present.contains(*c))
-                .cloned(),
-        );
+        missing.key_missing = !spec.key().iter().all(present);
+        // A table with no primary key now fails `capture_spec`, and the
+        // pass reports that; the installed functions keep imaging it.
+        if !missing.key_missing && !key.is_empty() && spec.key() != key.as_slice() {
+            missing.key_changed = Some((spec.key().to_vec(), key));
+        }
+        missing
+            .columns
+            .extend(spec.columns().iter().filter(|c| !present(c)).cloned());
     }
     missing.columns.extend(
         read_columns(catalog, table)
             .columns
             .into_iter()
-            .filter(|c| !present.contains(c)),
+            .filter(|c| !present(c)),
     );
-    if missing.columns.is_empty() && !missing.key_missing {
+    if missing.columns.is_empty() && !missing.whole_table() {
         return Ok(false);
     }
-    let readers: Vec<i64> = readers_of(catalog, table, &missing.columns, missing.key_missing)
+    let readers: Vec<i64> = readers_of(catalog, table, &missing.columns, missing.whole_table())
         .into_iter()
         .filter(|id| {
             catalog

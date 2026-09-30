@@ -85,7 +85,8 @@ Trellis.define("TRANSFORM widget_prices FROM widgets SELECT price AS price")
 # => #<data Trellis::Definition id=1, target_table="public.widget_prices", ...,
 #    status=:waiting_to_backfill, source_columns={"id"=>"integer", "price"=>"integer"}>
 Trellis.status("widget_prices")
-# => #<data Trellis::Status status=:live, backfill_failure=nil>, once backfilled
+# => #<data Trellis::Status status=:live, backfill_failure=nil, capture_wait=nil,
+#    capture_failure=nil>, once backfilled
 
 # A column that keeps failing is paused, not fatal: find it, see why, fix
 # the data, resume it.

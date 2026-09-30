@@ -117,8 +117,12 @@ So:
   needs a brief table lock. The worker tries it for at most 50 ms at a time, so
   your writers never queue behind it for longer, and retries every reconcile
   pass while a long transaction or an autovacuum holds the table. Meanwhile the
-  transform stays `waiting_to_backfill`, and `status()` reports what it waits
-  on (`capture_wait`, in Rust).
+  transform stays `waiting_to_backfill` (or, after an `ALTER TRANSFORM` that
+  reads a new source column, `catching_up` with the new field paused), and
+  `status()` reports what it waits on (`capture_wait`). An install that fails
+  for another reason, such as a source that lost its primary key, is on
+  `capture_failure` instead, and is retried every pass until you fix the
+  cause. Both are reported only by the process running the staging worker.
 
 ```rust
 // A web process: define transforms, never drains anything.
@@ -534,7 +538,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 | `catching_up` | Built and maintained, but may still be missing changes made while it was building. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
-| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis after a column it reads was renamed or dropped (`capture_failure`, in Rust). | Stop and report it. |
+| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis after a column it reads was renamed or dropped, or its source's primary key was redefined (`capture_failure`). | Stop and report it. |
 
 The lifecycle behind these words is in
 [transforms — Status](transforms.md#status) and
@@ -560,10 +564,10 @@ Three things a poll needs to handle:
 * **Renaming or dropping a source column never fails your writes.** The
   capture trigger notices the column is gone, and Trellis pauses every
   transform that reads it, with the table and column on the status's
-  `capture_failure` (in Rust). Transforms on the same table that don't read
-  the column keep running. Put the column back (or redefine the transform)
-  and `RESUME TRANSFORM <target>` rebuilds it; renaming a primary-key column
-  pauses every transform on the table.
+  `capture_failure`. Transforms on the same table that don't read the column
+  keep running. Put the column back (or redefine the transform) and `RESUME
+  TRANSFORM <target>` rebuilds it; renaming a primary-key column, or
+  redefining the primary key, pauses every transform on the table.
 * **`quarantined` can come before `live`.** The fuse can trip once apply
   maintains a transform, which starts at `catching_up`, so a transform can
   go from `catching_up` to `quarantined` without ever reporting `live`. Its

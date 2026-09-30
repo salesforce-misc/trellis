@@ -47,17 +47,56 @@ module Trellis
     end
   end
 
-  # A definition's status, as Trellis.status returns it. backfill_failure is
-  # nil unless its source table's backfill keeps failing.
+  # A definition's status, as Trellis.status returns it.
   #
   # status is one of :waiting_to_backfill, :backfilling, :catching_up,
   # :live, :quarantined or :paused. A newly defined transform starts
   # :waiting_to_backfill and reaches :live once some process in the fleet
   # runs the staging worker and drain threads (see Trellis.connect).
-  Status = Data.define(:status, :backfill_failure) do
+  #
+  # The other fields say what the definition is stuck on, and are nil when
+  # nothing holds it up:
+  # - backfill_failure: its source table's backfill keeps failing.
+  # - capture_wait: installing or widening capture on a table it reads waits
+  #   for a lock another session holds. It clears once that session lets go.
+  # - capture_failure: capture of a table it reads is broken. A schema change
+  #   paused it (resume it once fixed), or installing capture keeps failing
+  #   (it clears once the cause is fixed).
+  # capture_wait, and a capture_failure that isn't a pause, are only seen in
+  # the process running the staging worker.
+  Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
-      new(status: hash[:status], backfill_failure: failure && BackfillFailure.from_native(failure))
+      wait = hash[:capture_wait]
+      capture_failure = hash[:capture_failure]
+      new(status: hash[:status],
+          backfill_failure: failure && BackfillFailure.from_native(failure),
+          capture_wait: wait && CaptureWait.from_native(wait),
+          capture_failure: capture_failure && CaptureFailure.from_native(capture_failure))
+    end
+  end
+
+  # What a definition's capture waits on: the staging worker's install,
+  # widen or uninstall (operation, a String) of the capture triggers on
+  # table needs lock_mode, and another session holds or is queued for a
+  # conflicting lock. blockers has one line per such session. waiting_since
+  # and observed_at are Times.
+  CaptureWait = Data.define(:table, :operation, :lock_mode, :waiting_since, :observed_at,
+                            :blockers) do
+    def self.from_native(hash)
+      new(**hash.except(:waiting_since_micros, :observed_at_micros),
+          waiting_since: EpochMicros.to_time(hash.fetch(:waiting_since_micros)),
+          observed_at: EpochMicros.to_time(hash.fetch(:observed_at_micros)))
+    end
+  end
+
+  # Why capture of source_table is broken: error is a sentence naming the
+  # cause, columns the columns it is about (empty when it isn't about a
+  # column), and detected_at (a Time) when it was first found.
+  CaptureFailure = Data.define(:source_table, :columns, :error, :detected_at) do
+    def self.from_native(hash)
+      new(**hash.except(:detected_at_micros),
+          detected_at: EpochMicros.to_time(hash.fetch(:detected_at_micros)))
     end
   end
 

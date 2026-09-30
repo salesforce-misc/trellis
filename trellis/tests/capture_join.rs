@@ -1075,3 +1075,233 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     assert_eq!(wrong, 0, "the target equals the source");
     assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
 }
+
+/// Claims, runs and finishes every pending backfill chunk: the hand-driven
+/// stand-in for a drain worker's build half (as in `capture_schema_change.rs`).
+async fn run_backfill_chunks(pool: &trellis::Pool) {
+    use trellis::defs::chunk_queue;
+    const CLAIMED_BY: &str = "capture_join_backfill";
+    loop {
+        let client = pool.get().await.expect("acquire connection");
+        let claimed = chunk_queue::claim_chunks(&**client, CLAIMED_BY, 1000)
+            .await
+            .expect("claim_chunks");
+        drop(client);
+        if claimed.is_empty() {
+            return;
+        }
+        for chunk in &claimed {
+            chunk_queue::run_claimed_chunk(
+                pool,
+                chunk,
+                CLAIMED_BY,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("run_claimed_chunk");
+            chunk_queue::finish_chunk(pool, chunk, CLAIMED_BY)
+                .await
+                .expect("finish_chunk");
+        }
+    }
+}
+
+/// Alternates staging-worker passes, chunk runs and drains until `target`
+/// is live: a bounded number of explicit steps, not a timed wait.
+async fn bring_live(raw: &mut Client, pool: &trellis::Pool, target: &str) {
+    for _ in 0..8 {
+        full_pass(raw, pool).await;
+        run_backfill_chunks(pool).await;
+        drain_to_quiescence(pool, raw).await;
+        if status(raw, target).await == TransformStatus::Live {
+            return;
+        }
+    }
+    panic!("{target} did not go live within 8 pass/drain rounds");
+}
+
+/// `tu` over `public.u (id, a, b)`, live and reading `a` only, then an
+/// `ALTER TRANSFORM tu ADD b AS b2` whose widen of `u`'s capture waits on
+/// the returned open writer through one staging-worker pass, so `b2` stays
+/// paused awaiting capture and `tu` is catching up. Stepped by hand.
+async fn edit_held_by_a_writer(
+    dsn: &str,
+    raw: &mut Client,
+    pool: &trellis::Pool,
+) -> (Trellis, Client) {
+    raw.batch_execute(
+        "create table public.u (id int primary key, a int, b int); \
+         insert into public.u select g, g, 10 * g from generate_series(1, 3) g;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+    bring_live(raw, pool, "tu").await;
+
+    let holder = hold_table(dsn, "public.u").await;
+    trellis
+        .apply("ALTER TRANSFORM tu ADD b AS b2")
+        .await
+        .expect("alter: apply never waits on the table");
+    full_pass(raw, pool).await;
+    assert_eq!(
+        captured_columns(raw, "public.u").await,
+        Some(vec!["a".to_string(), "id".to_string()]),
+        "the widen waits out the open writer"
+    );
+    assert!(b2_awaits_capture(raw).await);
+    assert_eq!(status(raw, "tu").await, TransformStatus::CatchingUp);
+    (trellis, holder)
+}
+
+/// An edited definition whose new field waits for a widen that can't take
+/// its table's lock reports the wait, as a waiting registration does (#687,
+/// the user's Q5 decision): it is `catching_up`, not `waiting_to_backfill`,
+/// but it is stuck on the same thing. The wait goes once the widen lands.
+#[tokio::test]
+async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, holder) = edit_held_by_a_writer(db.dsn(), &mut raw, &db.pool).await;
+    let holder_pid = backend_pid(&holder).await;
+
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
+    assert_eq!(reported.status, TransformStatus::CatchingUp);
+    let wait = reported
+        .capture_wait
+        .expect("the edited definition's status names what it waits on");
+    assert_eq!(wait.table, "public.u");
+    assert_eq!(wait.operation, "widen");
+    assert!(
+        wait.blockers
+            .iter()
+            .any(|line| line.contains(&format!("pid {holder_pid}"))),
+        "{wait:?}"
+    );
+    assert_eq!(reported.capture_failure, None);
+
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+    full_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
+    assert_eq!(
+        reported.capture_wait, None,
+        "a landed widen clears the wait"
+    );
+}
+
+/// An operator `RESUME` of a field that awaits its capture widen is refused
+/// and leaves it paused (#687). Unpausing it early would let the rows the
+/// old capture function staged, which lack the field's column, reach it and
+/// fail with `MissingColumn`. The catch-up marker's discharge unpauses it
+/// once the widened capture images the column, as it does without a resume.
+#[tokio::test]
+async fn resuming_a_field_awaiting_its_widen_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, holder) = edit_held_by_a_writer(db.dsn(), &mut raw, &db.pool).await;
+
+    let err = trellis
+        .apply("RESUME TRANSFORM tu.b2")
+        .await
+        .expect_err("a field awaiting capture can't be resumed");
+    assert_eq!(err.code(), trellis::ErrorCode::Conflict, "{err}");
+    assert!(err.to_string().contains("awaits"), "{err}");
+    assert!(b2_awaits_capture(&raw).await, "b2 stays paused");
+
+    // A write the old capture body images without `b` drains with b2 still
+    // paused, so it can't fail on the missing column.
+    raw.batch_execute("update public.u set b = 100 where id = 1")
+        .await
+        .expect("write");
+    let mut ring = connect(db.dsn()).await;
+    drain_to_quiescence(&db.pool, &mut ring).await;
+
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+    bring_live(&mut raw, &db.pool, "tu").await;
+    let (poisoned, failed, wrong, paused): (i64, i64, i64, i64) = {
+        let row = raw
+            .query_one(
+                "select (select count(*) from poison), \
+                        (select count(*) from column_failures), \
+                        (select count(*) from public.tu t join public.u s using (id) \
+                         where t.b2 is distinct from s.b or t.a is distinct from s.a), \
+                        (select count(*) from column_status)",
+                &[],
+            )
+            .await
+            .expect("read the outcome");
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    };
+    assert_eq!((poisoned, failed), (0, 0), "no row met the old images");
+    assert_eq!(wrong, 0, "the target equals the source");
+    assert_eq!(
+        paused, 0,
+        "the discharge unpaused b2 once capture covered it"
+    );
+}
+
+/// A capture install that fails for a reason other than a lock is reported
+/// on the waiting definition's status (#687): here the source lost its
+/// primary key after the definition registered. Without this the definition
+/// sat in `waiting_to_backfill` with nothing but a warning in the staging
+/// worker's log. The report goes once the install lands.
+#[tokio::test]
+async fn an_install_failure_is_reported_on_the_waiting_definition() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.u (id int primary key, a int)")
+        .await
+        .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tu FROM public.u SELECT a AS a")
+        .await
+        .expect("define");
+    raw.batch_execute("alter table public.u drop constraint u_pkey")
+        .await
+        .expect("drop the primary key");
+
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
+    assert_eq!(reported.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(reported.capture_wait, None);
+    let failure = reported
+        .capture_failure
+        .expect("the waiting definition's status names why its capture fails");
+    assert_eq!(failure.source_table, "public.u");
+    assert!(failure.error.contains("no primary key"), "{failure:?}");
+
+    // A second failing pass keeps the first detection time.
+    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let again = trellis
+        .status("tu")
+        .await
+        .expect("status")
+        .expect("tu")
+        .capture_failure
+        .expect("still failing");
+    assert_eq!(again.detected_at, failure.detected_at);
+
+    raw.batch_execute("alter table public.u add primary key (id)")
+        .await
+        .expect("restore the primary key");
+    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    assert!(outcome.failed.is_empty(), "{outcome:?}");
+    let reported = trellis.status("tu").await.expect("status").expect("tu");
+    assert_eq!(reported.capture_failure, None, "a landed install clears it");
+}
