@@ -150,5 +150,4 @@ async fn an_aggregate_over_a_hop_follows_a_row_that_moves_groups_and_then_leaves
         groups(&[("9", "2")]),
         "a group every row left, by moving or by deletion, must be removed"
     );
-
 }

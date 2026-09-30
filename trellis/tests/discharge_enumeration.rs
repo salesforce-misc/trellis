@@ -81,9 +81,7 @@ async fn a_table_with_a_reader_is_enumerated() {
     let mut client = connect_raw(db.dsn()).await;
 
     client
-        .batch_execute(
-            "create table widgets (id bigint primary key)",
-        )
+        .batch_execute("create table widgets (id bigint primary key)")
         .await
         .expect("create source");
     register_reader(&db).await;

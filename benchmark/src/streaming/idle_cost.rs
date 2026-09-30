@@ -113,9 +113,9 @@ impl IdleCostResult {
     }
 }
 
-/// Starts a real streaming client against a fresh cluster with a published but
+/// Starts a real streaming client against a fresh cluster with a captured but
 /// never-written-to source table — so there is genuinely zero source traffic —
-/// waits `warmup` for start-of-day work (publication reconcile, first
+/// waits `warmup` for start-of-day work (capture reconcile, first
 /// maintenance tick, drainer registration) to finish so it doesn't pollute the
 /// steady-state reading, then samples across a `duration`-long idle window.
 ///

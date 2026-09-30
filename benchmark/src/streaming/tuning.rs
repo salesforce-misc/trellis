@@ -7,8 +7,8 @@
 //!
 //! ## Extension point (epic #269)
 //!
-//! Later children of #269 add engine options of their own (a seal mode, an
-//! intake group-commit config). Wiring one up is meant to be three edits and
+//! Later children of #269 add engine options of their own (a seal mode,
+//! say). Wiring one up is meant to be three edits and
 //! no new plumbing:
 //!
 //! 1. add the field to [`EngineTuning`] (with its stock value in
@@ -61,15 +61,10 @@ pub struct EngineTuning {
     pub poll_interval: Duration,
     /// The seal cadence ([`ClientOptions::maintenance_interval`]).
     pub maintenance_interval: Duration,
-    /// How often the publication/backfill reconcile pass runs
+    /// How often the capture/backfill reconcile pass runs
     /// ([`ClientOptions::reconcile_interval`]) — see
     /// [`STOCK_RECONCILE_INTERVAL`] for why this is a knob at all.
     pub reconcile_interval: Duration,
-    /// Intake's group-commit batching bounds
-    /// ([`ClientOptions::group_commit`], issue #274). `Some` (matching
-    /// `ClientOptions::default()`) is stock `main`'s shipped, default-on
-    /// behavior; `None` measures the un-grouped escape hatch instead.
-    pub group_commit: Option<trellis::GroupCommitConfig>,
     /// The most folded records one drain batch holds
     /// ([`ClientOptions::drain_batch_cap`], issue #620). A small value forces
     /// paging on a scenario whose segments would otherwise drain whole.
@@ -90,7 +85,6 @@ impl Default for EngineTuning {
             poll_interval: STOCK_POLL_INTERVAL,
             maintenance_interval: STOCK_MAINTENANCE_INTERVAL,
             reconcile_interval: STOCK_RECONCILE_INTERVAL,
-            group_commit: Some(trellis::GroupCommitConfig::default()),
             drain_batch_cap: trellis::ClientOptions::default().drain_batch_cap,
         }
     }
@@ -100,10 +94,10 @@ impl EngineTuning {
     /// The multi-hop latency ladder's defaults: stock in every field.
     ///
     /// The ladder used to run with an hour-long reconcile interval, so the
-    /// reconcile pass never fired and intermediate hop tables never joined
-    /// the CDC publication, where each of their writes was staged twice
-    /// (once by apply's in-transaction `Recompute`, again by CDC decoding).
-    /// #315 keeps every definition's target out of the publication, so that
+    /// reconcile pass never fired and intermediate hop tables were never
+    /// captured, where each of their writes would have been staged twice
+    /// (once by apply's in-transaction `Recompute`, again by capture). #315
+    /// keeps every definition's target out of the captured set, so that
     /// reason is gone (#471). And the reconcile pass is what parks a newly
     /// registered hop's backfill marker, so an hour-long interval kept every
     /// hop after the first `waiting_to_backfill` for an hour.
@@ -112,7 +106,7 @@ impl EngineTuning {
     }
 
     /// This tuning as [`ClientOptions`], for a staging-worker client. The
-    /// worker publishes whatever the registered definitions read (issue
+    /// worker captures whatever the registered definitions read (issue
     /// #427), so there is no table list to pass.
     pub fn client_options(&self) -> ClientOptions {
         ClientOptions {
@@ -121,7 +115,6 @@ impl EngineTuning {
             poll_interval: self.poll_interval,
             maintenance_interval: self.maintenance_interval,
             reconcile_interval: self.reconcile_interval,
-            group_commit: self.group_commit,
             drain_batch_cap: self.drain_batch_cap,
             ..Default::default()
         }

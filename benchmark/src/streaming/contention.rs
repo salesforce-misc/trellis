@@ -16,9 +16,9 @@
 //!   database, and one waiting on a lock would say nothing about Trellis. A
 //!   backend running the generator's `INSERT INTO public.<source>` is
 //!   counted apart ([`Role::Generator`]); every other client backend in the
-//!   database — drain workers, intake's staging writes, the maintenance tick
-//!   — is the engine. Intake's replication stream is a `walsender`, not a
-//!   client backend, so the server-side WAL decoding it drives isn't sampled.
+//!   database — drain workers and the maintenance tick — is the engine. The
+//!   capture triggers run inside the generator's own backends, so their ring
+//!   writes count as the generator's.
 //! * **Row locks vs everything else.** Two drain workers applying
 //!   overlapping aggregate groups serialize on the target rows' tuple locks,
 //!   which Postgres reports as a `Lock` wait on `transactionid` (waiting for

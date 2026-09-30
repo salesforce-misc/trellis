@@ -159,37 +159,6 @@ pub async fn wait_for_chain_live(raw: &RawClient, chain: &Chain, timeout: Durati
     }
 }
 
-/// Polls until no `pending_backfill` marker is left, or panics at `deadline`.
-///
-/// For a scenario whose transform never goes live, so [`wait_for_live`] has
-/// nothing to wait for: [`crate::streaming::write_tax`]'s `slot` variant runs
-/// no drain threads, so its transform's build never runs. Its source's join marker is
-/// still discharged by the staging worker, and waiting for that while the
-/// source is empty keeps the discharge out of the measurement window. A
-/// scenario that waits for `live` needs no such wait: a definition reports
-/// `live` only once its go-live catch-up has been discharged (#476), and
-/// nothing parks another marker until the source changes.
-pub async fn wait_for_markers_discharged(raw: &RawClient, deadline: Instant) {
-    loop {
-        let pending: Vec<String> = raw
-            .query("select table_name from pending_backfill", &[])
-            .await
-            .expect("read pending_backfill")
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
-        if pending.is_empty() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "backfill markers for {pending:?} never discharged in time (is the staging \
-             worker running?)"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// Polls until `predicate_sql` (a `select 1 ... ` returning at most one row)
 /// matches, or panics at `deadline` with `what` in the message.
 async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline: Instant) {
@@ -205,7 +174,7 @@ async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline
         assert!(
             Instant::now() < deadline,
             "{what} never landed in time — the pipeline isn't flowing end to end \
-             (check publication membership and transform status before trusting any \
+             (check capture and transform status before trusting any \
              measurement from this run)"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -232,10 +201,10 @@ async fn wait_for_counted(transform: &str, baseline: u64, what: &str, deadline: 
 }
 
 /// Sends one reserved-id row ([`WARM_UP_ID`]) through the whole chain and
-/// waits for it to reach the terminal hop — proving CDC intake -> ring ->
+/// waits for it to reach the terminal hop — proving capture -> ring ->
 /// seal -> claim -> fold -> apply is actually flowing (in particular that
-/// every intermediate hop has joined the publication via the periodic
-/// `reconcile_source_tables` pass) before a measurement window opens — and
+/// the periodic `reconcile_source_tables` pass has installed the root's
+/// capture) before a measurement window opens — and
 /// for the terminal hop's apply counter to include it
 /// ([`wait_for_counted`]).
 pub async fn warm_up(raw: &RawClient, chain: &Chain, timeout: Duration) {

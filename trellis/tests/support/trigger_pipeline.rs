@@ -76,7 +76,9 @@ async fn dump_ring(raw: &Client) -> String {
         let seq: i64 = seg.get(0);
         let ring_slot: i16 = seg.get(1);
         let state: String = seg.get(2);
-        out.push_str(&format!("  seg_seq={seq} ring_slot={ring_slot} state={state}\n"));
+        out.push_str(&format!(
+            "  seg_seq={seq} ring_slot={ring_slot} state={state}\n"
+        ));
         let rows = raw
             .query(
                 &format!(
@@ -147,7 +149,10 @@ impl Pipeline {
             .await
             .expect("read the installed capture");
         let expected: BTreeSet<String> = expected_captured.iter().map(|t| t.to_string()).collect();
-        assert_eq!(installed, expected, "the pass captures exactly those tables");
+        assert_eq!(
+            installed, expected,
+            "the pass captures exactly those tables"
+        );
         let mut pipeline = Self {
             raw,
             db,

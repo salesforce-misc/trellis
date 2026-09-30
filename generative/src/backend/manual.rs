@@ -833,7 +833,8 @@ impl ManualBackend {
     /// source data; [`Backend::quiesce`] waits for them to finish.
     pub async fn resume_all(&self) -> Result<(), ManualBackendError> {
         let facade =
-            trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default()).await?;
+            trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
+                .await?;
         for def in &self.defs {
             facade
                 .apply(&format!("RESUME TRANSFORM {}", def.target))
@@ -1238,7 +1239,8 @@ impl super::ConcurrentBackend for ManualBackend {
         }
         if self.operator.is_none() {
             self.operator = Some(
-                trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default()).await?,
+                trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
+                    .await?,
             );
         }
         let operator = self.operator.as_ref().expect("connected just above");

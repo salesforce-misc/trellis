@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn an_event_crosses_as_its_level_target_message_and_fields() {
         let bridge = with_bridge("trace", || {
-            tracing::warn!(slot = "trellis_slot", restarts = 3, "intake stopped");
+            tracing::warn!(table = "public.orders", attempts = 3, "capture waiting");
             tracing::error!("bare");
             tracing::info!(answer = 42);
             tracing::trace!(target: "custom::target", "fine detail");
@@ -352,7 +352,7 @@ mod tests {
                 PlainLogRecord {
                     level: "warn",
                     target: module.clone(),
-                    message: "intake stopped slot=\"trellis_slot\" restarts=3".into(),
+                    message: "capture waiting table=\"public.orders\" attempts=3".into(),
                 },
                 PlainLogRecord {
                     level: "error",

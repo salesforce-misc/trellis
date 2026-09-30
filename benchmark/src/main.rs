@@ -23,8 +23,8 @@
 //!
 //! The scenarios above time the direct, ring-bypassing backfill build. The
 //! streaming ones (see [`streaming`], issue #270) instead drive the real
-//! product path through a live [`trellis::Client`] — CDC intake -> ring append
-//! -> seal -> claim -> fold -> apply — and are epic #269's validation battery:
+//! product path through a live [`trellis::Client`] — trigger capture into the
+//! ring -> seal -> claim -> fold -> apply — and are epic #269's validation battery:
 //!
 //! ```text
 //! # V-LAT: the T1 depth ladder, and one depth alone
@@ -96,17 +96,13 @@
 //!   saying whether that was everything.
 //!
 //! All the engine scenarios accept `--application-threads`, `--poll-interval-ms`,
-//! `--maintenance-interval-ms`, `--reconcile-interval-ms` and
-//! `--group-commit <max_rows>,<max_delay_ms>|off` (issue #274; the last
-//! defaults to stock `ClientOptions::default()`'s shipped-on group-commit,
-//! `off` measures the un-grouped escape hatch), and `--drain-batch-cap`
+//! `--maintenance-interval-ms`, `--reconcile-interval-ms` and `--drain-batch-cap`
 //! (issue #620: the most folded records one drain batch holds; a small value
 //! forces paging, and `TRELLIS_BENCH_LOG=trellis::staging::apply=info` logs
 //! each paged drain's page count) —
 //! [`streaming::tuning::EngineTuning`], which is also where a later child of
 //! #269 adds a knob of its own. `write-tax` and `capture-ceiling` take
-//! none of them: nothing drains in either, and their `slot` variant runs a
-//! stock client with no application threads.
+//! none of them: they run no client, and nothing drains in either.
 //! Each prints one JSON line per measurement
 //! point, cross-checks `trellis_changes_applied_total` against the rows its
 //! generator committed, and runs an independent SQL oracle over the terminal

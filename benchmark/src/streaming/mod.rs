@@ -5,8 +5,8 @@
 //! Unlike [`crate::scenario`]/[`crate::scenario_relationship`], which time
 //! [`trellis::dev::defs::backfill_definition`] — the direct, ring-bypassing
 //! set-based build (ADR-0007) — everything here drives the real,
-//! product-facing streaming path: a live [`trellis::Client`] doing CDC
-//! intake -> ring append -> seal -> claim -> fold -> apply, fed by a
+//! product-facing streaming path: a live [`trellis::Client`] doing trigger
+//! capture into the ring -> seal -> claim -> fold -> apply, fed by a
 //! controlled-rate load generator, measured through the Prometheus
 //! histograms that already exist
 //! ([`trellis::Metrics::render_prometheus`]). No new instrumentation: issue

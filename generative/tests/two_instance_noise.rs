@@ -200,10 +200,9 @@ async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instanc
         .await
         .expect("migrate instance schema");
 
-    let backend =
-        ManualBackend::connect_with_instance(db.dsn(), &schema, &target_schema, 1, None)
-            .await
-            .expect("connect instance backend");
+    let backend = ManualBackend::connect_with_instance(db.dsn(), &schema, &target_schema, 1, None)
+        .await
+        .expect("connect instance backend");
 
     Instance {
         backend,

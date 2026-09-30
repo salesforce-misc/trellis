@@ -475,7 +475,10 @@ async fn a_fresh_transform_waits_on_the_xmin_fence_then_reaches_live() {
         .await
         .expect("count markers")
         .get(0);
-    assert_eq!(markers, 1, "the pass parked the marker and left it unsettled");
+    assert_eq!(
+        markers, 1,
+        "the pass parked the marker and left it unsettled"
+    );
     assert_eq!(
         status_of(&raw, "t").await,
         TransformStatus::WaitingToBackfill,

@@ -16,9 +16,7 @@ use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     db_admin_plan_for, trivial_program,
 };
-use generative::model::{
-    DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
-};
+use generative::model::{DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode};
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;

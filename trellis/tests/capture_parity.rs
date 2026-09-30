@@ -386,18 +386,14 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     // The application role has no privilege on Trellis's schema: the
     // `SECURITY DEFINER` functions write the ring for it.
     raw.batch_execute(&format!(
-            "do $$ begin create role {APP_ROLE}; \
+        "do $$ begin create role {APP_ROLE}; \
              exception when duplicate_object then null; end $$; \
              grant usage on schema public to {APP_ROLE}; \
              grant all on all tables in schema public to {APP_ROLE}"
-        ))
-        .await
-        .expect("create the application role");
-    let mut writer = connect(
-        db.dsn(),
-        &format!("set role {APP_ROLE}; {HOSTILE}"),
-    )
-    .await;
+    ))
+    .await
+    .expect("create the application role");
+    let mut writer = connect(db.dsn(), &format!("set role {APP_ROLE}; {HOSTILE}")).await;
     let usage: bool = writer
         .query_one(
             "select has_schema_privilege($1, 'usage')",

@@ -14,12 +14,9 @@
 //!   btree, or ADR-0002 A7's comparator, an expression index on
 //!   `regexp_count(val::text, '[13579]')`. They put the capture numbers next to
 //!   costs application engineers already accept.
-//! - `slot`: the path before #622 C5. A `trellis::Client` with the staging
-//!   worker and no application threads, so the walsender and intake staged
-//!   every row and nothing drained. The client stopped running intake in C5,
-//!   so this variant no longer works and isn't in [`DEFAULT_VARIANTS`]; C7
-//!   deletes it. C4's baseline (`local_docs/bench/622-baseline.md`) holds its
-//!   numbers.
+//! - The logical-replication path before #622 C5 (`slot`) is gone with
+//!   intake (C7). C4's baseline (`local_docs/bench/622-baseline.md`) holds
+//!   its numbers.
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
 //!   from the catalog the way the staging worker's reconcile does.
@@ -46,10 +43,8 @@
 //!
 //! What a cell reports, besides rows/s: per-transaction commit latency p50 and
 //! p99; Postgres CPU per row (every postgres process, reaped backends
-//! included, less the harness's own sampling and probe backends) and, for
-//! `slot`, the Trellis engine's in-process CPU; WAL bytes per row (for
-//! `slot`, including the ring WAL intake writes while catching up); the top
-//! wait events of active client backends, sampled every 10 ms; the storage
+//! included, less the harness's own sampling and probe backends); WAL bytes
+//! per row; the top wait events of active client backends, sampled every 10 ms; the storage
 //! and the settings that decide durability.
 //!
 //! **The subtransaction effect** is measured three ways, on every cell:
@@ -85,12 +80,11 @@ use bytes::Bytes;
 use futures_util::SinkExt;
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::ClientOptions;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::dev::capture::CaptureSpec;
 
 use crate::scenario::connect_raw;
-use crate::streaming::chain::{install_chain_hops, wait_for_markers_discharged};
+use crate::streaming::chain::install_chain_hops;
 use crate::streaming::disk_tier::{self, LatencyHistogram, json_escape, json_ms};
 use crate::streaming::idle_cost::{wal_bytes_since, wal_lsn};
 
@@ -99,10 +93,6 @@ pub const SOURCE_TABLE: &str = "wt_src";
 /// Where writer `w`'s ids start. Each writer inserts into its own band, so
 /// the snapshot probe can read one writer's newest rows with one index range.
 const WRITER_BAND: i64 = 1_000_000_000_000;
-
-/// How long a `slot` cell's client may take to publish the table and
-/// discharge its capture marker before the window opens.
-const SLOT_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the sampler reads `pg_stat_activity`, as E1 did.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
@@ -124,11 +114,10 @@ pub enum Variant {
     None,
     Btree,
     RegexIndex,
-    Slot,
     Trigger,
 }
 
-/// Every variant but `slot` (see the module doc).
+/// Every variant.
 pub const DEFAULT_VARIANTS: [Variant; 4] = [
     Variant::None,
     Variant::Btree,
@@ -137,20 +126,13 @@ pub const DEFAULT_VARIANTS: [Variant; 4] = [
 ];
 
 impl Variant {
-    pub const ALL: [Variant; 5] = [
-        Variant::None,
-        Variant::Btree,
-        Variant::RegexIndex,
-        Variant::Slot,
-        Variant::Trigger,
-    ];
+    pub const ALL: [Variant; 4] = DEFAULT_VARIANTS;
 
     pub fn name(self) -> &'static str {
         match self {
             Variant::None => "none",
             Variant::Btree => "btree",
             Variant::RegexIndex => "regex-index",
-            Variant::Slot => "slot",
             Variant::Trigger => "trigger",
         }
     }
@@ -166,14 +148,10 @@ impl Variant {
             })
     }
 
-    /// Writes ring rows inside the writer's transaction.
-    fn is_trigger(self) -> bool {
-        self == Variant::Trigger
-    }
-
-    /// Captures at all, so the ring must end up holding every row.
+    /// Captures, writing ring rows inside the writer's transaction, so the
+    /// ring must end up holding every row.
     fn captures(self) -> bool {
-        self.is_trigger() || self == Variant::Slot
+        self == Variant::Trigger
     }
 }
 
@@ -348,10 +326,6 @@ pub struct CellOptions {
     pub copy_rows: u64,
     /// Overrides every shape's [`Shape::default_rows`].
     pub rows: Option<u64>,
-    /// How long a `slot` cell waits, after the writers stop, for intake to
-    /// stage the catch-up sentinel, which it stages after every row the
-    /// writers committed.
-    pub slot_catch_up: Duration,
     pub probe: ProbeMode,
 }
 
@@ -361,7 +335,6 @@ impl Default for CellOptions {
             max_window: Duration::from_secs(30),
             copy_rows: 1_000_000,
             rows: None,
-            slot_catch_up: Duration::from_secs(180),
             probe: ProbeMode::Orm,
         }
     }
@@ -469,28 +442,6 @@ fn pg_cpu(postmaster: u32) -> f64 {
     total
 }
 
-/// The CPU of this process's Trellis engine threads: the client's own thread
-/// and its runtime's workers, which keep tokio's default names
-/// (`tokio-rt-worker`, `tokio-runtime-worker` in older releases). The
-/// benchmark's own runtime names its threads `bench-writer`
-/// ([`crate::streaming::cli`]), so they are not counted.
-fn engine_cpu() -> f64 {
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-        return 0.0;
-    };
-    tasks
-        .filter_map(Result::ok)
-        .filter_map(|task| {
-            let tid = task.file_name().into_string().ok()?;
-            let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).ok()?;
-            let comm = comm.trim();
-            (comm.starts_with("trellis-") || comm.starts_with("tokio-"))
-                .then(|| proc_cpu(&format!("self/task/{tid}"), false))
-                .flatten()
-        })
-        .sum()
-}
-
 /// Every physical ring table (`seg_0..`), read from `pg_tables` rather than
 /// hardcoding the ring size, a private staging constant.
 async fn ring_tables(raw: &RawClient) -> Vec<String> {
@@ -520,27 +471,6 @@ pub async fn total_ring_rows(raw: &RawClient) -> i64 {
         .await
         .expect("count ring rows")
         .get(0)
-}
-
-async fn wal_insert_lsn(raw: &RawClient) -> String {
-    raw.query_one("select pg_current_wal_insert_lsn()::text", &[])
-        .await
-        .expect("read pg_current_wal_insert_lsn")
-        .get(0)
-}
-
-/// A statement whose one boolean says whether any ring row's `origin_lsn`
-/// is past `$1` (text), reading each `seg_N`'s `origin_lsn` index.
-async fn newest_ring_origin_sql(raw: &RawClient) -> String {
-    let tables = ring_tables(raw).await;
-    let newest: Vec<String> = tables
-        .iter()
-        .map(|t| format!("(select max(origin_lsn) from {DEFAULT_SCHEMA}.{t})"))
-        .collect();
-    format!(
-        "select coalesce(greatest({}) > $1::text::pg_lsn, false)",
-        newest.join(", ")
-    )
 }
 
 /// `pg_stat_slru`'s `pg_subtrans` counters: hits, reads, zeroed pages. The
@@ -902,8 +832,7 @@ pub struct CellResult {
     /// `rows_per_sec` over the same repetition's head control, when there is one.
     pub share_of_control: Option<f64>,
     pub pg_cpu_us_per_row: f64,
-    pub engine_cpu_us_per_row: f64,
-    /// `pg_cpu_us_per_row + engine_cpu_us_per_row` less the head control's.
+    /// `pg_cpu_us_per_row` less the head control's.
     pub extra_cpu_us_per_row: Option<f64>,
     pub commit_p50_ms: Option<f64>,
     pub commit_p99_ms: Option<f64>,
@@ -917,11 +846,8 @@ pub struct CellResult {
     probe_p50_ms: Option<f64>,
     probe_p99_ms: Option<f64>,
     /// Rows/s reaching the ring: the writers' rate for a trigger (the ring
-    /// row commits with the source row), intake's staged rate over the
-    /// window plus its catch-up for `slot`, `None` without capture.
+    /// row commits with the source row), `None` without capture.
     pub capture_rows_per_sec: Option<f64>,
-    slot_catch_up_secs: Option<f64>,
-    slot_caught_up: Option<bool>,
     pub ring_rows: i64,
     /// The ring holds exactly the rows written (no capture: none).
     pub ring_ok: bool,
@@ -930,10 +856,6 @@ pub struct CellResult {
 fn opt_f(v: Option<f64>, decimals: usize) -> String {
     v.map(|x| format!("{x:.decimals$}"))
         .unwrap_or_else(|| "null".into())
-}
-
-fn opt_b(v: Option<bool>) -> String {
-    v.map(|b| b.to_string()).unwrap_or_else(|| "null".into())
 }
 
 impl CellResult {
@@ -949,12 +871,12 @@ impl CellResult {
              \"rows_per_txn\":{},\"statements_per_txn\":{},\"hold_xmin\":{},\"rep\":{},\
              \"position\":\"{}\",{},\"rows\":{},\"txns\":{},\"secs\":{:.3},\
              \"rows_per_sec\":{:.1},\"share_of_control\":{},\"pg_cpu_us_per_row\":{:.3},\
-             \"engine_cpu_us_per_row\":{:.3},\"extra_cpu_us_per_row\":{},\
+             \"extra_cpu_us_per_row\":{},\
              \"commit_p50_ms\":{},\"commit_p99_ms\":{},\"wal_bytes_per_row\":{:.1},{},\
              \"top_waits\":{{{}}},\"subxact_overflow_share\":{},\"max_subxact_count\":{},\
              \"subtrans_slru_hits\":{},\"subtrans_slru_reads\":{},\"subtrans_slru_zeroed\":{},\
              \"probe_qps\":{},\"probe_p50_ms\":{},\"probe_p99_ms\":{},\
-             \"capture_rows_per_sec\":{},\"slot_catch_up_secs\":{},\"slot_caught_up\":{},\
+             \"capture_rows_per_sec\":{},\
              \"ring_rows\":{},\"ring_ok\":{}}}",
             self.scenario,
             self.cell.variant.name(),
@@ -972,7 +894,6 @@ impl CellResult {
             self.rows_per_sec,
             opt_f(self.share_of_control, 4),
             self.pg_cpu_us_per_row,
-            self.engine_cpu_us_per_row,
             opt_f(self.extra_cpu_us_per_row, 3),
             json_ms(self.commit_p50_ms),
             json_ms(self.commit_p99_ms),
@@ -988,8 +909,6 @@ impl CellResult {
             json_ms(self.probe_p50_ms),
             json_ms(self.probe_p99_ms),
             opt_f(self.capture_rows_per_sec, 1),
-            opt_f(self.slot_catch_up_secs, 2),
-            opt_b(self.slot_caught_up),
             self.ring_rows,
             self.ring_ok,
         )
@@ -1028,15 +947,6 @@ impl CellResult {
     }
 }
 
-/// The rows/s `slot` staged over `span` (the writers' window plus the
-/// catch-up), from the ring's count once the catch-up ended. The sentinel is
-/// staged last, so it is in the count only when intake caught up; a cell that
-/// hit the cap reports what intake staged, not what the writers offered.
-pub fn slot_staged_rows_per_sec(ring_rows: i64, caught_up: bool, span: f64) -> f64 {
-    let staged = if caught_up { ring_rows - 1 } else { ring_rows };
-    staged.max(0) as f64 / span
-}
-
 /// The head control's numbers a cell is compared with.
 #[derive(Debug, Clone, Copy)]
 pub struct Control {
@@ -1059,22 +969,16 @@ pub fn against_control(
     }
 }
 
-/// Sets `variant` up on a fresh database: an index, the capture triggers, or
-/// a running client. Returns the client for `slot`.
-async fn set_up_variant(
-    variant: Variant,
-    db: &testkit::TestDatabase,
-    raw: &mut RawClient,
-) -> Option<trellis::Client> {
+/// Sets `variant` up on a fresh database: an index or the capture triggers.
+async fn set_up_variant(variant: Variant, raw: &mut RawClient) {
     match variant {
-        Variant::None => None,
+        Variant::None => {}
         Variant::Btree => {
             raw.batch_execute(&format!(
                 "create index wt_val_idx on public.{SOURCE_TABLE} (val)"
             ))
             .await
             .expect("create the btree index");
-            None
         }
         Variant::RegexIndex => {
             raw.batch_execute(&format!(
@@ -1083,38 +987,6 @@ async fn set_up_variant(
             ))
             .await
             .expect("create the expression index");
-            None
-        }
-        Variant::Slot => {
-            let client = trellis::Client::start(
-                db.dsn(),
-                ClientOptions {
-                    staging_worker: true,
-                    application_threads: 0,
-                    ..Default::default()
-                },
-            )
-            .expect("client start");
-            let deadline = Instant::now() + SLOT_SETUP_TIMEOUT;
-            wait_for_markers_discharged(raw, deadline).await;
-            loop {
-                let active: i64 = raw
-                    .query_one(
-                        "select count(*) from pg_replication_slots where active",
-                        &[],
-                    )
-                    .await
-                    .expect("read pg_replication_slots")
-                    .get(0);
-                if active > 0 {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "the slot never became active");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            // As E1: let intake settle past its startup work.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            Some(client)
         }
         Variant::Trigger => {
             let table = format!("public.{SOURCE_TABLE}");
@@ -1132,7 +1004,6 @@ async fn set_up_variant(
                     .expect("nothing else holds the benchmark's source table"),
                 "a fresh table's install changes something"
             );
-            None
         }
     }
 }
@@ -1156,7 +1027,7 @@ pub async fn run_cell(
     .expect("create the source table");
     // The same catalog for every variant: one transform reading `val`.
     install_chain_hops(&db.pool, SOURCE_TABLE, 1).await;
-    let client = set_up_variant(variant, &db, &mut raw).await;
+    set_up_variant(variant, &mut raw).await;
 
     let rows_target = opts
         .rows
@@ -1222,7 +1093,6 @@ pub async fn run_cell(
     let lsn_before = wal_lsn(&raw).await;
     let harness_before = harness_cpu();
     let pg_before = pg_cpu(postmaster);
-    let engine_before = engine_cpu();
 
     let stop = Arc::new(AtomicBool::new(false));
     let sampling = tokio::spawn(sample_until(
@@ -1260,49 +1130,10 @@ pub async fn run_cell(
     }
     let disk = disk_tier::since(&raw, &disk_before).await;
 
-    // `slot`: wait for intake to stage everything the writers committed, so
-    // its CPU and the ring's WAL are counted. A sentinel row committed after
-    // the writers finish is staged after all of theirs (intake stages in
-    // commit order), and nothing else commits after `sentinel_from`, so the
-    // ring's newest `origin_lsn` (the commit position, read through the
-    // `origin_lsn` indexes) passing it means the ring holds every row.
-    let (slot_catch_up_secs, slot_caught_up) = if client.is_some() {
-        let t = Instant::now();
-        let sentinel_from = wal_insert_lsn(&raw).await;
-        raw.batch_execute(&format!(
-            "insert into public.{SOURCE_TABLE} (id, val) values (0, 0)"
-        ))
-        .await
-        .expect("insert the catch-up sentinel");
-        let newest = newest_ring_origin_sql(&raw).await;
-        let deadline = t + opts.slot_catch_up;
-        let caught_up = loop {
-            let staged: bool = raw
-                .query_one(&newest, &[&sentinel_from])
-                .await
-                .expect("read the ring's newest origin_lsn")
-                .get(0);
-            if staged {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        (Some(t.elapsed().as_secs_f64()), Some(caught_up))
-    } else {
-        (None, None)
-    };
-
     let pg_after = pg_cpu(postmaster);
-    let engine_after = engine_cpu();
     let harness_after = harness_cpu();
     let wal_bytes = wal_bytes_since(&raw, &lsn_before).await;
     let subtrans_after = subtrans_slru(&raw).await;
-    if let Some(client) = client {
-        client.shutdown().await.expect("client shutdown");
-    }
     let ring_rows = total_ring_rows(&raw).await;
 
     let rows = writes.rows.max(1) as f64;
@@ -1310,30 +1141,17 @@ pub async fn run_cell(
     let rows_per_sec = writes.rows as f64 / secs;
     let pg_cpu_us_per_row =
         ((pg_after - pg_before) - (harness_after - harness_before)).max(0.0) / rows * 1e6;
-    let engine_cpu_us_per_row = (engine_after - engine_before) / rows * 1e6;
     let (share_of_control, extra_cpu_us_per_row) =
         if variant == Variant::None && cell.position == Position::Head {
             (None, None)
         } else {
-            against_control(
-                control,
-                rows_per_sec,
-                pg_cpu_us_per_row + engine_cpu_us_per_row,
-            )
+            against_control(control, rows_per_sec, pg_cpu_us_per_row)
         };
-    let capture_rows_per_sec = if variant.is_trigger() {
-        Some(rows_per_sec)
-    } else if variant == Variant::Slot {
-        slot_catch_up_secs
-            .map(|c| slot_staged_rows_per_sec(ring_rows, slot_caught_up == Some(true), secs + c))
+    let capture_rows_per_sec = variant.captures().then_some(rows_per_sec);
+    let expected_ring = if variant.captures() {
+        writes.rows as i64
     } else {
-        None
-    };
-    let expected_ring = match variant {
-        // The catch-up sentinel is staged too.
-        Variant::Slot => writes.rows as i64 + 1,
-        v if v.captures() => writes.rows as i64,
-        _ => 0,
+        0
     };
 
     CellResult {
@@ -1346,7 +1164,6 @@ pub async fn run_cell(
         rows_per_sec,
         share_of_control,
         pg_cpu_us_per_row,
-        engine_cpu_us_per_row,
         extra_cpu_us_per_row,
         commit_p50_ms: writes.latency.quantile_ms(0.5),
         commit_p99_ms: writes.latency.quantile_ms(0.99),
@@ -1366,8 +1183,6 @@ pub async fn run_cell(
         probe_p50_ms: probe.as_ref().and_then(|p| p.latency.quantile_ms(0.5)),
         probe_p99_ms: probe.as_ref().and_then(|p| p.latency.quantile_ms(0.99)),
         capture_rows_per_sec,
-        slot_catch_up_secs,
-        slot_caught_up,
         ring_rows,
         ring_ok: ring_rows == expected_ring,
     }
@@ -1406,7 +1221,7 @@ pub async fn run_matrix(
         if cell.position == Position::Head {
             control = Some(Control {
                 rows_per_sec: result.rows_per_sec,
-                cpu_us_per_row: result.pg_cpu_us_per_row + result.engine_cpu_us_per_row,
+                cpu_us_per_row: result.pg_cpu_us_per_row,
             });
         }
         println!("{}", result.to_json());
@@ -1541,7 +1356,7 @@ mod tests {
     fn the_schedule_brackets_each_shape_with_the_control_and_rotates_the_rest() {
         let variants = [
             Variant::None,
-            Variant::Slot,
+            Variant::RegexIndex,
             Variant::Trigger,
             Variant::Btree,
         ];
@@ -1557,11 +1372,11 @@ mod tests {
         };
         assert_eq!(
             names(0, shapes[0]),
-            ["none", "slot", "trigger", "btree", "none"]
+            ["none", "regex-index", "trigger", "btree", "none"]
         );
         assert_eq!(
             names(1, shapes[0]),
-            ["none", "trigger", "btree", "slot", "none"]
+            ["none", "trigger", "btree", "regex-index", "none"]
         );
         // Repetitions are the outer loop.
         assert!(cells[..10].iter().all(|c| c.rep == 0));
@@ -1587,15 +1402,6 @@ mod tests {
         assert_eq!(share, Some(0.5));
         assert_eq!(extra, Some(16.5));
         assert_eq!(against_control(None, 1.0, 1.0), (None, None));
-    }
-
-    #[test]
-    fn slot_reports_what_it_staged_not_what_was_offered() {
-        // Caught up: every row plus the sentinel.
-        assert_eq!(slot_staged_rows_per_sec(1_001, true, 10.0), 100.0);
-        // Hit the cap with none of a big COPY staged (#565 E1's 10M-row case).
-        assert_eq!(slot_staged_rows_per_sec(0, false, 180.0), 0.0);
-        assert_eq!(slot_staged_rows_per_sec(500, false, 5.0), 100.0);
     }
 
     #[test]

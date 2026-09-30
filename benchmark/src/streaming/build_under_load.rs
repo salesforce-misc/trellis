@@ -714,14 +714,13 @@ async fn dump_mismatches(raw: &RawClient, terminal: &str) {
 }
 
 /// Whether the engine reports nothing pending through `token` (a WAL position
-/// taken after every writer's last commit): intake has confirmed past it, no
-/// ring slot holds an unapplied row at or below it (a phase-gap straggler in
+/// taken after every writer's last commit): no ring slot holds an unapplied row at or below it (a phase-gap straggler in
 /// a drained segment's slot included) and nothing is parked in
 /// `poison_held`. This is the engine's own one-statement, one-snapshot
 /// predicate (`converged_through`), used only to decide when the full-source
 /// oracle is worth running, never as the verdict. A hand-rolled ring probe
-/// can't answer it: it would miss commits intake hasn't staged yet, a
-/// straggler and a parked row, and its per-slot queries race a seal.
+/// can't answer it: it would miss a straggler and a parked row, and its
+/// per-slot queries race a seal.
 async fn engine_converged(raw: &RawClient, token: trellis::PgLsn) -> bool {
     trellis::dev::staging::converged_through(raw, token)
         .await
@@ -895,14 +894,10 @@ pub async fn run(cfg: BuildUnderLoad, tuning: &EngineTuning) -> BuildUnderLoadRe
     let achieved_write_rate = writes.total() as f64 / writer_secs;
 
     // Every writer has returned, so each of its statements has committed:
-    // a position read now bounds all of them from above. One zero-budget
-    // `await_converged` checks once and, if intake hasn't confirmed this far,
-    // asks it to (a logical message), so the poll below isn't left waiting
-    // on a ~10s keepalive once the source has gone quiet.
+    // a position read now bounds all of them from above.
     let token = trellis::dev::staging::watermark_token(&raw)
         .await
         .expect("read the writers' stop position");
-    let _ = trellis::dev::staging::await_converged(&raw, token, Duration::ZERO).await;
 
     // Converged: the definition is live, the engine reports nothing pending
     // through `token`, and the target equals the oracle. The first two are

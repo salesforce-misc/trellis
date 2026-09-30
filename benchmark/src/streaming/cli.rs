@@ -106,7 +106,7 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
-/// `--reconcile-interval-ms`, `--group-commit`, `--drain-batch-cap`). Postgres settings for a disk
+/// `--reconcile-interval-ms`, `--drain-batch-cap`). Postgres settings for a disk
 /// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
 /// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
@@ -215,44 +215,10 @@ fn tuning(args: &[String], default: EngineTuning) -> EngineTuning {
             .unwrap_or(default.maintenance_interval),
         reconcile_interval: millis(args, "--reconcile-interval-ms")
             .unwrap_or(default.reconcile_interval),
-        group_commit: group_commit(args, default.group_commit),
         drain_batch_cap: number(args, "--drain-batch-cap")
             .map(|v| v as usize)
             .unwrap_or(default.drain_batch_cap),
     }
-}
-
-/// Parses `--group-commit <max_rows>,<max_delay_ms>` (issue #274) or
-/// `--group-commit off`, falling back to `default` (whatever the scenario's
-/// own `EngineTuning` default is — `EngineTuning::default()`'s is
-/// `ClientOptions::default()`'s own shipped-on group-commit config) when the
-/// flag is absent. `off` measures the ungrouped escape hatch directly
-/// against the same scenario for an A/B comparison.
-fn group_commit(
-    args: &[String],
-    default: Option<trellis::GroupCommitConfig>,
-) -> Option<trellis::GroupCommitConfig> {
-    let Some(raw) = flag(args, "--group-commit") else {
-        return default;
-    };
-    if raw.eq_ignore_ascii_case("off") {
-        return None;
-    }
-    let (max_rows, max_delay_ms) = raw.split_once(',').unwrap_or_else(|| {
-        panic!("--group-commit value {raw:?} must be \"<max_rows>,<max_delay_ms>\" or \"off\"")
-    });
-    Some(trellis::GroupCommitConfig {
-        max_rows: max_rows
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("--group-commit max_rows {max_rows:?}: {e}")),
-        max_delay: Duration::from_millis(
-            max_delay_ms
-                .trim()
-                .parse()
-                .unwrap_or_else(|e| panic!("--group-commit max_delay_ms {max_delay_ms:?}: {e}")),
-        ),
-    })
 }
 
 fn throughput_tuning(args: &[String]) -> EngineTuning {
@@ -282,8 +248,8 @@ fn reps(args: &[String]) -> usize {
 }
 
 /// The flags every `write-tax`/`capture-ceiling` cell shares, over
-/// [`CellOptions::default`]: `--max-secs`, `--rows`, `--copy-rows`,
-/// `--slot-catch-up-secs` and `--snapshot-probe off|orm|all`.
+/// [`CellOptions::default`]: `--max-secs`, `--rows`, `--copy-rows` and
+/// `--snapshot-probe off|orm|all`.
 fn cell_options(args: &[String]) -> CellOptions {
     let default = CellOptions::default();
     CellOptions {
@@ -292,17 +258,14 @@ fn cell_options(args: &[String]) -> CellOptions {
             .map(|v| v as u64)
             .unwrap_or(default.copy_rows),
         rows: number(args, "--rows").map(|v| v as u64).or(default.rows),
-        slot_catch_up: secs(args, "--slot-catch-up-secs").unwrap_or(default.slot_catch_up),
         probe: flag(args, "--snapshot-probe")
             .map(ProbeMode::parse)
             .unwrap_or(default.probe),
     }
 }
 
-/// The runtime `write-tax` and `capture-ceiling` run their writers on. Its
-/// threads are named `bench-writer`, so a `slot` cell can tell the Trellis
-/// engine's threads (tokio's default names) from the load's when it counts
-/// the engine's CPU.
+/// The runtime `write-tax` and `capture-ceiling` run their writers on, its
+/// threads named `bench-writer`.
 fn writer_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -794,40 +757,6 @@ mod tests {
         assert_eq!(t.maintenance_interval, STOCK_MAINTENANCE_INTERVAL);
         assert_eq!(t.reconcile_interval, STOCK_RECONCILE_INTERVAL);
         assert_eq!(t.application_threads, 4);
-        // Issue #274: absent `--group-commit`, tuning inherits the scenario's
-        // own default rather than silently forcing a value — `EngineTuning::default()`'s
-        // is stock `ClientOptions::default()`'s shipped-on group-commit.
-        assert!(t.group_commit.is_some());
-    }
-
-    #[test]
-    fn group_commit_flag_parses_rows_and_delay_or_falls_back_to_the_default() {
-        let default = Some(trellis::GroupCommitConfig {
-            max_rows: 1000,
-            max_delay: Duration::from_millis(5),
-        });
-        assert_eq!(
-            group_commit(&argv(&["transaction-shape"]), default).map(|c| c.max_rows),
-            Some(1000),
-            "absent flag keeps the caller's default"
-        );
-
-        let overridden = group_commit(
-            &argv(&["transaction-shape", "--group-commit", "50,10"]),
-            default,
-        )
-        .expect("explicit config parses to Some");
-        assert_eq!(overridden.max_rows, 50);
-        assert_eq!(overridden.max_delay, Duration::from_millis(10));
-
-        assert_eq!(
-            group_commit(
-                &argv(&["transaction-shape", "--group-commit", "off"]),
-                default
-            ),
-            None,
-            "\"off\" measures the ungrouped escape hatch"
-        );
     }
 
     #[test]
@@ -1262,8 +1191,6 @@ mod tests {
             "5000",
             "--copy-rows",
             "10000000",
-            "--slot-catch-up-secs",
-            "60",
             "--snapshot-probe",
             "all",
             "--reps",
@@ -1275,7 +1202,6 @@ mod tests {
         assert_eq!(opts.max_window, Duration::from_secs(10));
         assert_eq!(opts.rows, Some(5000));
         assert_eq!(opts.copy_rows, 10_000_000);
-        assert_eq!(opts.slot_catch_up, Duration::from_secs(60));
         assert_eq!(opts.probe, ProbeMode::All);
         assert_eq!(reps(&args), 1);
         assert_eq!(
