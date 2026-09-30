@@ -9807,6 +9807,11 @@ async fn drain_segments(
         return Ok(None);
     }
 
+    // #622 C6: a `schema_changed` marker pauses the definitions that read a
+    // missing column before this drain computes anything they could apply.
+    let held_seqs: Vec<i64> = held.iter().map(|share| share.seg_seq).collect();
+    super::schema_change::pause_readers(pool, &held_seqs).await?;
+
     let estimated: i64 = held.iter().map(|share| share.estimated_rows).sum();
     if !held.iter().any(|share| share.has_cursor) && estimated <= cap as i64 {
         let per_segment = {

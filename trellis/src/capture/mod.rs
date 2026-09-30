@@ -81,8 +81,10 @@ pub enum CaptureError {
     /// The table doesn't exist.
     UnknownTable { table: String },
     /// A column some reader needs, or a key column the spec names, isn't a
-    /// column of the table. A renamed or dropped read column lands here until
-    /// C6 handles schema changes.
+    /// column of the table. A renamed or dropped column lands here while a
+    /// definition that isn't paused still reads it; the capture function
+    /// marks it on the next write and the drain pauses that definition (C6,
+    /// `staging::schema_change`).
     MissingColumn { table: String, column: String },
     /// A table name that isn't a `schema.table` identity with exactly one
     /// separating `.` (see `intake::publication::qualify`).

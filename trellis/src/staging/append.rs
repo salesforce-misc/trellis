@@ -79,6 +79,14 @@ impl CdcOp {
 /// fixed, greppable literal, which is judged not worth it here.
 pub const TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-truncate-sentinel";
 
+/// The ring key of a capture function's `schema_changed` marker (#622 C6):
+/// a row a capture trigger writes, in place of or ahead of its images, when a
+/// column it images has been renamed or dropped. Key-less like
+/// [`TRUNCATE_SENTINEL_KEY`], and with the same collision caveat. Its
+/// `new_image` says which columns went missing
+/// (`capture::sql::SCHEMA_CHANGED_OP`'s doc has the shape).
+pub const SCHEMA_CHANGED_SENTINEL_KEY: &str = "\u{1f}trellis-schema-changed";
+
 /// One raw change to append into the active ring segment.
 ///
 /// `old_image`/`new_image` are raw JSON text (serialized by the caller):

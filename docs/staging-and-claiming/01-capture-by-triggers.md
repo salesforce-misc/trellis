@@ -142,6 +142,59 @@ a watermark token already has its rows in the ring when the token is read.
 The read-your-writes predicate ([07](07-convergence-and-await.md)) needs no
 "intake has staged past the token" condition, and a waiter writes nothing.
 
+## A renamed or dropped column (#622 C6)
+
+A function's inserts name every column it images, so once one of them is
+renamed or dropped they no longer plan, and without a guard every write to
+the table would fail. Instead, the insert, update and delete functions count
+their columns first, in one `pg_attribute` probe that rides in the
+empty-statement guard's query (`present := case when exists (select 1 from
+<transition table>) then (select count(*) from pg_attribute …) else -1
+end`). PL/pgSQL plans a statement only when it first runs it, so on a miss
+the stale inserts are never planned. The check is per statement, and sound,
+because `ALTER TABLE … RENAME` and `DROP COLUMN` take `ACCESS EXCLUSIVE`: no
+captured statement runs across one. It costs about 3.4–5 µs per single-row
+statement and nothing measurable past a few rows per statement (#622 C4's
+`trigger+column-check-guard`). There is no `EXCEPTION` block, so no
+subtransaction.
+
+On a miss the function:
+
+1. appends a `schema_changed` marker for the table (key
+   `\x1ftrellis-schema-changed`, `new_image` `{"missing": [...],
+   "key_missing": bool}`);
+2. if the primary key is intact, images the statement's rows over the
+   columns that are left, with the same `SELECT` as the static insert built at
+   run time and run with `EXECUTE` (PL/pgSQL registers the transition tables
+   for the whole trigger call, so dynamic SQL reads them). If a key column is
+   gone, it writes the marker only.
+
+The seal records whether a segment's fenced window holds a marker
+(`segments.has_schema_change`). A drain that claims such a segment reads its
+markers over the whole window, every bucket, before it folds anything
+(`staging::schema_change`), and pauses every definition that reads a
+missing column (`capture::columns::readers_of`; with `key_missing`, every
+definition that reads the table), recording why in `capture_failures`. That
+commits before the drain's compute picks the definitions to apply, so no
+page of the segment, on any worker, applies a partial image to a paused
+definition, on the ledger path or any other. A marker and the partial images
+after it come from one trigger call, so every segment with such a row has
+its marker. The fold leaves markers out.
+
+`Trellis::status` reports the pause as `DefinitionStatus::capture_failure`
+(the table, the columns, a message, and when it was found). While the
+record exists, capture doesn't count the definition's columns, so the next
+reconcile pass narrows the functions to what the other readers need and the
+markers stop; a column only an unused relationship or a projection still
+names is left out the same way. `RESUME TRANSFORM` deletes the record and
+rebuilds: once the column is back, the pass widens capture again under the
+join fence before the rebuild is dispatched. If it is still missing, the
+pass reports the table's capture as failed and the definition stays
+`waiting_to_backfill`.
+
+Regenerating from an event trigger, inside the DDL's own transaction, is not
+built (#622 plan Q2(b)).
+
 ## Known limitation: nested writes to the same key (#680)
 
 Suppose an application `AFTER ROW` trigger, or a self-referencing cascade,

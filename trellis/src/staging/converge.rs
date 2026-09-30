@@ -292,8 +292,9 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// segment isn't `drained`, or while it is a phase-gap straggler its
 /// segment's fence can't see. Condition 2's active-slot arm is subsumed here,
 /// since the active segment is never `drained`. A row of unknown origin
-/// (`NULL`) is conservatively old. `recompute` and `truncate` rows carry no
-/// image a reader could miss a column of, so they don't hold the gate.
+/// (`NULL`) is conservatively old. `recompute`, `truncate` and
+/// `schema_changed` rows carry no image a reader could miss a column of, so
+/// they don't hold the gate.
 ///
 /// A deferred relationship reverse (`rel_reverse_deferred`) carries its
 /// to-side's images under a synthetic `src_table`, so one whose relationship's
@@ -308,7 +309,7 @@ pub async fn table_changes_pending_through(
     table: &str,
     gate: PgLsn,
 ) -> Result<bool, StagingError> {
-    const IMAGED: &str = "op not in ('recompute', 'truncate')";
+    const IMAGED: &str = "op not in ('recompute', 'truncate', 'schema_changed')";
     let arms = per_ring_table(" union all ", |slot, ring| {
         format!(
             "select 1 from {ring} r \

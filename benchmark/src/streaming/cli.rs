@@ -1269,7 +1269,7 @@ mod tests {
             "--reps",
             "1",
             "--variants",
-            "none,trigger+exception",
+            "none,trigger",
         ]);
         let opts = cell_options(&args);
         assert_eq!(opts.max_window, Duration::from_secs(10));
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(reps(&args), 1);
         assert_eq!(
             variants(&args, &Variant::ALL),
-            [Variant::None, Variant::TriggerException]
+            [Variant::None, Variant::Trigger]
         );
         assert_eq!(
             variants(

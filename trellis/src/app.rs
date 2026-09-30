@@ -596,10 +596,13 @@ impl Trellis {
                 "select d.status, d.id, d.source_table, \
                         pb.table_name as backfill_table, pb.attempts as backfill_attempts, \
                         pb.last_error as backfill_last_error, \
-                        pb.next_attempt_at as backfill_next_attempt_at \
+                        pb.next_attempt_at as backfill_next_attempt_at, \
+                        cf.source_table as capture_table, cf.columns as capture_columns, \
+                        cf.detected_at as capture_detected_at \
                  from transform_definitions d \
                  left join pending_backfill pb \
                    on pb.table_name = d.source_table and pb.last_error is not null \
+                 left join capture_failures cf on cf.transform_id = d.id \
                  where split_part(d.target_table, '.', 2) = $1",
                 &[&target_table],
             )
@@ -621,6 +624,7 @@ impl Trellis {
             status,
             backfill_failure: backfill_failure(&row),
             capture_wait,
+            capture_failure: capture_failure(&row),
         }))
     }
 
@@ -1385,6 +1389,30 @@ fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
         })
 }
 
+/// The [`CaptureFailure`] in a row of [`Trellis::status`]'s query:
+/// `capture_failures`' `source_table`, `columns` and `detected_at`, selected
+/// as `capture_table`, `capture_columns` and `capture_detected_at` from a
+/// left join on the definition's id.
+fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
+    row.get::<_, Option<String>>("capture_table")
+        .map(|source_table| {
+            let columns: Vec<String> = row.get("capture_columns");
+            let named: Vec<String> = columns.iter().map(|c| format!("{c:?}")).collect();
+            let error = format!(
+                "column {} of {source_table}, which this definition reads, was renamed or \
+                 dropped; its capture now leaves it out. Restore the column and resume the \
+                 definition to rebuild it, or drop the definition",
+                named.join(", ")
+            );
+            CaptureFailure {
+                source_table,
+                columns,
+                error,
+                detected_at: row.get("capture_detected_at"),
+            }
+        })
+}
+
 /// One registered transform definition's status, as [`Trellis::status`]
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1408,6 +1436,27 @@ pub struct DefinitionStatus {
     /// declared on it (issue #622). In memory only: reported when the
     /// staging worker runs in this process.
     pub capture_wait: Option<CaptureWait>,
+    /// Set while the definition is paused because a column it reads was
+    /// renamed or dropped on a captured table (issue #622 C6). The
+    /// application's writes to that table go on succeeding; the capture
+    /// trigger marks the change and the drain pauses every definition that
+    /// reads the column, while the other definitions on the table keep
+    /// applying. Cleared by resuming the definition, which rebuilds it.
+    pub capture_failure: Option<CaptureFailure>,
+}
+
+/// Why a definition was paused by a schema change (issue #622 C6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureFailure {
+    /// The qualified captured table whose column went.
+    pub source_table: String,
+    /// The missing columns the definition reads. When a primary-key column
+    /// went, every missing column of the table.
+    pub columns: Vec<String>,
+    /// A sentence naming the table and columns, and what to do.
+    pub error: String,
+    /// When the drain met the first capture that lacked the column.
+    pub detected_at: SystemTime,
 }
 
 /// What a `waiting_to_backfill` definition's capture is waiting on (issue

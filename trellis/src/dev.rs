@@ -91,15 +91,12 @@ pub mod staging {
 /// Trigger capture (#622), for `benchmark`'s `write-tax` and
 /// `capture-ceiling` (#622 C4): the write-path benchmark installs the capture
 /// triggers through the real installer, with nothing draining, before C5
-/// wires the installer into the staging worker. It also replaces the
-/// installed functions with benchmark-only variants built from
-/// [`capture::function_ddl`]'s text, to measure what open question Q2's
-/// schema-change guards would cost.
+/// wires the installer into the staging worker.
 pub mod capture {
     pub use crate::capture::CaptureError;
     pub use crate::capture::columns::{capture_spec, load_catalog};
     pub use crate::capture::install::install;
-    pub use crate::capture::sql::{CaptureEvent, CaptureSpec, function_ddl};
+    pub use crate::capture::sql::CaptureSpec;
 }
 
 /// Test-only pause points inside a drain page's transaction (#623 D1), for

@@ -745,6 +745,12 @@ For the debate on #618; each has a recommendation where one exists.
    function be regenerated only from an event trigger and a rename without
    one be a documented outage of that definition (never of the application)?
    How do the audit and the rebuild pick the marker up?
+   *Resolved in #622 C6:* neither. The function counts its columns in the
+   empty-statement guard's query (no subtransaction) and on a miss writes the
+   marker, then images the columns left through `EXECUTE`. The drain pauses
+   the definitions that read a missing column before applying anything
+   later, and reconcile narrows the functions. See
+   [capture by triggers](../staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column-622-c6).
 10. **Truncate under xid order** (#598) and cascading truncates on targets
     that are captured tables.
 

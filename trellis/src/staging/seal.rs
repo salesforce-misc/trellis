@@ -330,7 +330,8 @@ pub async fn seal_phase2(
         "with batch as ({window}), \
          decided as ( \
              select count(*) as row_count, \
-                    coalesce(bool_or(op = 'truncate'), false) as has_truncate \
+                    coalesce(bool_or(op = 'truncate'), false) as has_truncate, \
+                    coalesce(bool_or(op = 'schema_changed'), false) as has_schema_change \
              from batch \
          ), \
          published as ( \
@@ -338,6 +339,7 @@ pub async fn seal_phase2(
                 set fence_snapshot = $1::text::pg_snapshot, \
                     row_count = d.row_count, \
                     has_truncate = d.has_truncate, \
+                    has_schema_change = d.has_schema_change, \
                     bucket_count = (case \
                         when d.has_truncate then 1 \
                         when d.row_count >= {MIN_ROWS_TO_SPLIT} then {SEG_BUCKETS} \

@@ -248,6 +248,7 @@ mod tests {
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
+            capture_failure: None,
         };
 
         assert_eq!(
@@ -270,6 +271,7 @@ mod tests {
                 next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
             }),
             capture_wait: None,
+            capture_failure: None,
         };
 
         assert_eq!(

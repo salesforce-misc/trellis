@@ -525,7 +525,7 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 | `catching_up` | Built and maintained, but may still be missing changes made while it was building. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
-| `paused` | Frozen by a `PAUSE TRANSFORM` (or by Trellis, after the replication slot was lost). | Stop and report it. |
+| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis after a column it reads was renamed or dropped (`capture_failure`, in Rust). | Stop and report it. |
 
 The lifecycle behind these words is in
 [transforms — Status](transforms.md#status) and
@@ -548,6 +548,13 @@ Three things a poll needs to handle:
   chunks, and a chunk that fails (a field that overflows its type on some
   row, say) is retried as it stands: the transform stays `backfilling`,
   `backfill_failure` stays empty, and only your deadline notices.
+* **Renaming or dropping a source column never fails your writes.** The
+  capture trigger notices the column is gone, and Trellis pauses every
+  transform that reads it, with the table and column on the status's
+  `capture_failure` (in Rust). Transforms on the same table that don't read
+  the column keep running. Put the column back (or redefine the transform)
+  and `RESUME TRANSFORM <target>` rebuilds it; renaming a primary-key column
+  pauses every transform on the table.
 * **`quarantined` can come before `live`.** The fuse can trip once apply
   maintains a transform, which starts at `catching_up`, so a transform can
   go from `catching_up` to `quarantined` without ever reporting `live`. Its

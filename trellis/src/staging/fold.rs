@@ -651,6 +651,10 @@ fn fold_sql(
     // deletes), filtered to insert-shaped and delete-shaped rows so an
     // update, the common row, never feeds them.
     //
+    // #622 C6: a `schema_changed` marker is no change to any key. The drain
+    // acts on it before the fold (`staging::schema_change`), so `filtered`
+    // leaves it out and no folded change ever carries its key.
+    //
     // Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is
     // the key's final state within the window, whatever precedes it. So the
     // post-image arg-extreme (`last`) ranks image-bearing rows *and* every
@@ -675,6 +679,7 @@ fn fold_sql(
          filtered as ( \
              select * from fenced f \
              where route % ${bucket_count_idx}::bigint = any(${buckets_idx}::bigint[]) {range} \
+               and f.op <> 'schema_changed' \
                and not exists ( \
                    select 1 from truncates t \
                    where t.src_table = f.src_table \

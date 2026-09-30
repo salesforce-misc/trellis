@@ -22,6 +22,9 @@
 //!   mark-drained per page), the version fence, and downstream propagation.
 //! - [`page`] is where an oversized share's pages come from (issue #620):
 //!   the page-source interface and the `drain_cursor` read-back.
+//! - [`schema_change`] is the drain's barrier for a capture function's
+//!   `schema_changed` marker (#622 C6): it pauses the definitions that read
+//!   a renamed or dropped column before anything later applies to them.
 //! - [`retire`] is stage 06's retirement half (issue #13/#58): freeing a
 //!   `drained` segment's ring slot once nobody can still need it.
 //! - [`quarantine`] is stage 06's other half (issue #16): isolate, evict,
@@ -64,6 +67,7 @@ pub mod liveness;
 pub(crate) mod page;
 pub mod quarantine;
 pub mod retire;
+pub(crate) mod schema_change;
 pub mod seal;
 pub mod self_check;
 pub mod session;
@@ -122,7 +126,10 @@ pub use seal::{seal_phase1, seal_phase2};
 // Reached only by this crate's own `tests/*.rs`, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
-pub use append::{RING_SIZE, TRUNCATE_SENTINEL_KEY, active_ring_slot, ring_slot_is_free};
+pub use append::{
+    RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY, active_ring_slot,
+    ring_slot_is_free,
+};
 #[cfg(any(test, feature = "internals"))]
 pub use apply::next_claimable_segment;
 #[cfg(any(test, feature = "internals"))]

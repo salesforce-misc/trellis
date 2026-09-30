@@ -3290,25 +3290,35 @@ pub(crate) async fn relationships_from_table_in(
     rows.iter().map(relationship_from_row).collect()
 }
 
-/// Issue #622 (C2): every registered definition, as its qualified
-/// `source_table` and parsed text, plus every relationship. This is the whole
+/// Issue #622 (C2): every registered definition, as its id, qualified
+/// `source_table`, parsed text and whether a `schema_changed` marker paused
+/// it (C6, `capture_failures`), plus every relationship. This is the whole
 /// input `crate::capture::columns` needs to decide which columns a table's
 /// capture trigger images.
 ///
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
 /// paused or quarantined reader still needs its columns when it resumes.
+#[allow(clippy::type_complexity)]
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
-) -> Result<(Vec<(String, TransformDef)>, Vec<RelationshipDefinition>), CatalogError> {
+) -> Result<
+    (
+        Vec<(i64, String, TransformDef, bool)>,
+        Vec<RelationshipDefinition>,
+    ),
+    CatalogError,
+> {
     let definitions = client
         .query(
-            "select source_table, definition_text from transform_definitions order by id",
+            "select d.id, d.source_table, d.definition_text, \
+                    exists (select 1 from capture_failures f where f.transform_id = d.id) \
+             from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
-        .map(|row| Ok((row.get(0), parse(row.get(1))?)))
+        .map(|row| Ok((row.get(0), row.get(1), parse(row.get(2))?, row.get(3))))
         .collect::<Result<Vec<_>, CatalogError>>()?;
     let relationships = client
         .query(

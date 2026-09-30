@@ -2486,6 +2486,15 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
         &[&id],
     )
     .await?;
+    // #622 C6: likewise a transform paused by a schema change. Its columns
+    // count for capture again from here, so the next reconcile widens the
+    // source's capture to them (or reports the column still missing) before
+    // the discharge may dispatch the rebuild.
+    txn.execute(
+        "delete from capture_failures where transform_id = $1",
+        &[&id],
+    )
+    .await?;
 
     txn.commit().await?;
     tracing::info!(

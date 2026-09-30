@@ -35,6 +35,10 @@
 //! - **It skips a statement that changed nothing.** An `UPDATE … WHERE false`
 //!   still fires a statement trigger. Returning early keeps it from
 //!   assigning an xid it doesn't need.
+//! - **It never fails the statement over a renamed or dropped column** (#622
+//!   C6). The same guard query counts the columns the function images; on a
+//!   miss it writes a [`SCHEMA_CHANGED_OP`] marker and images what's left
+//!   (see [`function_body`]).
 //! - **It stamps `lsn = origin_lsn = pg_current_wal_insert_lsn()`** and
 //!   `src_changed = clock_timestamp()`, both read once per statement.
 //!
@@ -54,9 +58,16 @@ use std::collections::BTreeSet;
 
 use crate::defs::ddl::composite_key_escape_sql;
 use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, quote_ident};
-use crate::staging::append::{RING_SIZE, TRUNCATE_SENTINEL_KEY};
+use crate::staging::append::{RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY};
 
 use super::CaptureError;
+
+/// The ring `op` of the marker a capture function writes when a column it
+/// images has been renamed or dropped (#622 C6), keyed by
+/// [`SCHEMA_CHANGED_SENTINEL_KEY`]. Its `new_image` is `{"missing": [<column
+/// names, sorted>], "key_missing": <bool>}`, and it has no `old_image` or
+/// `group_key`.
+pub const SCHEMA_CHANGED_OP: &str = "schema_changed";
 
 /// The transition-table names the insert, update and delete triggers
 /// declare with `REFERENCING`.
@@ -455,33 +466,64 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// get that column's value as its `lsn`. `#variable_conflict use_variable`
 /// pins the resolution to the variables. Every column reference in the body
 /// is qualified by its alias, so nothing needs the other resolution.
+///
+/// # A renamed or dropped column never fails the write (#622 C6)
+///
+/// The static ring inserts name every imaged column. Once one of them is
+/// renamed or dropped, planning them fails, and with them the application's
+/// statement. So the insert, update and delete functions first count, in
+/// one `pg_attribute` probe, how many of their imaged columns the table
+/// still has. The probe rides in the empty-statement guard's query, which
+/// the function runs anyway (#622 plan Q2(c); C4's
+/// `trigger+column-check-guard` measured it at +3.4–5 µs per single-row
+/// statement). On a miss the function takes [`schema_changed_branch`]
+/// instead of the static inserts. PL/pgSQL plans a statement only when it
+/// first runs it, so the stale inserts are never planned.
+///
+/// The check is sound per statement because `ALTER TABLE … RENAME` and `DROP
+/// COLUMN` take `ACCESS EXCLUSIVE`: no captured statement runs across one,
+/// and a statement after one in the same transaction probes the new catalog.
+/// The truncate function images nothing, so it has no probe.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let mirror = text_expr(&format!(
         "{}.{}",
         quote_ident(schema),
         quote_ident("ring_slot_mirror")
     ));
+    let rows = match event {
+        CaptureEvent::Insert | CaptureEvent::Update => Some(NEW_ROWS),
+        CaptureEvent::Delete => Some(OLD_ROWS),
+        CaptureEvent::Truncate => None,
+    };
     let mut body = String::from(
         "#variable_conflict use_variable\n\
-         declare\n    slot smallint;\n    l pg_lsn;\n    ts timestamptz;\nbegin\n",
+         declare\n    slot smallint;\n    l pg_lsn;\n    ts timestamptz;\n",
     );
-    match event {
-        CaptureEvent::Insert | CaptureEvent::Update => body.push_str(&format!(
-            "    if not exists (select 1 from {NEW_ROWS}) then\n        return null;\n    end if;\n"
-        )),
-        CaptureEvent::Delete => body.push_str(&format!(
-            "    if not exists (select 1 from {OLD_ROWS}) then\n        return null;\n    end if;\n"
-        )),
-        CaptureEvent::Truncate => {}
+    if rows.is_some() {
+        body.push_str("    present bigint;\n    have text[];\n");
+    }
+    body.push_str("begin\n");
+    if let Some(rows) = rows {
+        body.push_str(&format!(
+            "    -- #622 C6: how many imaged columns the table still has, or -1 for a\n    \
+             -- statement that changed nothing.\n    \
+             present := case when exists (select 1 from {rows})\n        \
+             then {} else -1 end;\n    \
+             if present < 0 then\n        return null;\n    end if;\n",
+            column_probe("count(*)", &spec.columns),
+        ));
     }
     body.push_str(&format!(
         "    -- #597: the xid is assigned in the same expression that reads the mirror.\n    \
          slot := case when pg_current_xact_id() is not null\n        \
          then pg_sequence_last_value(({mirror})::regclass)::smallint end;\n    \
          l := pg_current_wal_insert_lsn();\n    \
-         ts := clock_timestamp();\n    \
-         case slot\n"
+         ts := clock_timestamp();\n"
     ));
+    if rows.is_some() {
+        body.push_str(&schema_changed_branch(schema, spec, event));
+    }
+    body.push_str("    case slot\n");
     for slot in 0..RING_SIZE {
         let ring = format!(
             "{}.{}",
@@ -490,7 +532,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
         );
         body.push_str(&format!(
             "    when {slot} then\n        insert into {ring} ({RING_COLUMNS})\n{};\n",
-            ring_select(spec, event)
+            ring_select(spec, event, Render::Static)
         ));
     }
     body.push_str(
@@ -500,23 +542,208 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     body
 }
 
+/// A subquery over the table's live columns (`tg_relid`) named in `columns`,
+/// selecting `select`: `count(*)` for the guard's probe, or the names.
+fn column_probe(select: &str, columns: &[String]) -> String {
+    let names: Vec<String> = columns.iter().map(|c| text_expr(c)).collect();
+    format!(
+        "(select {select} from pg_catalog.pg_attribute a\n            \
+         where a.attrelid = tg_relid and a.attnum > 0 and not a.attisdropped\n              \
+         and a.attname = any (array[{}]::name[]))",
+        names.join(", ")
+    )
+}
+
+/// The miss path of [`function_body`]'s column probe (#622 C6), taken when
+/// some column the function images is gone. It never fails the statement:
+///
+/// 1. It appends one [`SCHEMA_CHANGED_OP`] marker for the table, whose
+///    `new_image` names the missing columns. The drain pauses every
+///    definition that reads one of them before it applies anything later
+///    (`staging::schema_change`), and the staging worker's reconcile then
+///    regenerates the functions over the columns the remaining readers need.
+/// 2. If every key column is still there, it images the statement's rows over
+///    the columns that are left, with the same shape as the static inserts
+///    but built at run time and run with `EXECUTE`. PL/pgSQL registers the
+///    transition tables for the whole trigger call, so dynamic SQL reads
+///    them too. Definitions that don't read a missing column keep applying.
+///    If a key column is gone, it writes the marker only: every row would be
+///    keyed wrongly, and every definition on the table pauses.
+///
+/// Neither statement is in an `EXCEPTION` block, so the path takes no
+/// subtransaction (#622 plan Q2).
+fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
+    let all: Vec<String> = spec.columns.iter().map(|c| text_expr(c)).collect();
+    let key: Vec<String> = spec.key.iter().map(|c| text_expr(c)).collect();
+    let schema_lit = text_expr(&quote_ident(schema));
+    let ring = format!("{schema_lit} || '.' || pg_catalog.quote_ident('seg_' || slot)");
+    let key_present = format!("array[{}]::text[] <@ have", key.join(", "));
+    let marker = format!(
+        "pg_catalog.jsonb_build_object('missing', pg_catalog.to_jsonb((\
+         select coalesce(pg_catalog.array_agg(m.c order by m.c), '{{}}') \
+         from pg_catalog.unnest(array[{}]::text[]) as m(c) where m.c <> all (have))), \
+         'key_missing', not ({key_present}))",
+        all.join(", ")
+    );
+    let marker_sql = format!(
+        "insert into %s ({RING_COLUMNS}) \
+         values ($1, $2, '{SCHEMA_CHANGED_OP}', $3, null, $4, $3, $5, null)"
+    );
+
+    // The static select, with the column-dependent parts as `format()`
+    // arguments (see [`Render::Dynamic`]). Every `%` the select holds, such
+    // as `format('%s', …)`'s, is doubled first.
+    let template = format!(
+        "insert into {} ({RING_COLUMNS}) {}",
+        placeholder(1),
+        ring_select(spec, event, Render::Dynamic)
+    )
+    .replace('\n', " ")
+    .replace('%', "%%");
+    let template = (1..=5).fold(template, |t, n| {
+        t.replace(&placeholder(n), &format!("%{n}$s"))
+    });
+
+    // `alias`'s fragment per column, `render`ed, joined by `sep` over the
+    // columns the table still has.
+    let fragments =
+        |alias: &str, render: fn(&str, &str) -> String, columns: &[String], sep: &str| {
+            let rows: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("({i}, {}, {})", text_expr(c), text_expr(&render(alias, c))))
+                .collect();
+            format!(
+                "(select pg_catalog.string_agg(f.frag, {} order by f.i) \
+             from (values {}) as f(i, c, frag) where f.c = any (have))",
+                text_expr(sep),
+                rows.join(", ")
+            )
+        };
+    // Only the event's own transition tables have arguments; the others are
+    // `null`, which `format()` never reads.
+    let reads = |alias: &str| match event {
+        CaptureEvent::Insert => alias == "n",
+        CaptureEvent::Delete => alias == "o",
+        CaptureEvent::Update => true,
+        CaptureEvent::Truncate => false,
+    };
+    let image_arg = |alias: &str| {
+        if !reads(alias) {
+            return "null".to_string();
+        }
+        fragments(alias, image_pair, &spec.columns, " || ")
+    };
+    let group_arg = |alias: &str| {
+        if !reads(alias) || spec.group_key.is_empty() {
+            return "null".to_string();
+        }
+        format!(
+            "'array[' || coalesce({}, '') || ']::text[]'",
+            fragments(alias, value_text, &spec.group_key, ", ")
+        )
+    };
+    format!(
+        "    if present <> {count} then\n        \
+         -- #622 C6: an imaged column was renamed or dropped.\n        \
+         have := array{names};\n        \
+         execute pg_catalog.format({marker_sql}, {ring})\n            \
+         using {src}, {marker_key}, l, {marker}, ts;\n        \
+         if not ({key_present}) then\n            return null;\n        end if;\n        \
+         execute pg_catalog.format({template},\n                {ring},\n                \
+         {img_o},\n                {img_n},\n                {gk_o},\n                {gk_n})\n            \
+         using l, ts;\n        \
+         return null;\n    end if;\n",
+        count = spec.columns.len(),
+        names = column_probe("a.attname::text", &spec.columns),
+        marker_sql = text_expr(&marker_sql),
+        src = text_expr(&spec.table),
+        marker_key = text_expr(SCHEMA_CHANGED_SENTINEL_KEY),
+        template = text_expr(&template),
+        img_o = image_arg("o"),
+        img_n = image_arg("n"),
+        gk_o = group_arg("o"),
+        gk_n = group_arg("n"),
+    )
+}
+
+/// A token [`Render::Dynamic`] leaves where [`schema_changed_branch`] puts
+/// `format()` argument `n`. A NUL can't occur in an identifier or in the
+/// generated SQL, so it can't collide.
+fn placeholder(n: usize) -> String {
+    format!("\u{0}{n}\u{0}")
+}
+
+/// `alias`'s `column` as a one-pair image: [`image_expr`]'s pair, alone.
+fn image_pair(alias: &str, column: &str) -> String {
+    format!(
+        "jsonb_build_object({}, {})",
+        text_expr(column),
+        value_text(alias, column)
+    )
+}
+
+/// How [`ring_select`] renders the parts that depend on which columns the
+/// table has, and the statement's `lsn` and change time.
+#[derive(Clone, Copy)]
+enum Render {
+    /// The static inserts: every spec column named, and `l` and `ts` the
+    /// function's variables.
+    Static,
+    /// [`schema_changed_branch`]'s template: [`placeholder`]s for the old
+    /// image (2), new image (3), old group-key array (4) and new group-key
+    /// array (5), and `$1`/`$2` for `l` and `ts`.
+    Dynamic,
+}
+
+impl Render {
+    fn lsn(self) -> &'static str {
+        match self {
+            Render::Static => "l",
+            Render::Dynamic => "$1",
+        }
+    }
+
+    fn ts(self) -> &'static str {
+        match self {
+            Render::Static => "ts",
+            Render::Dynamic => "$2",
+        }
+    }
+
+    fn image(self, spec: &CaptureSpec, alias: &str) -> String {
+        match self {
+            Render::Static => image_expr(spec, alias),
+            Render::Dynamic => placeholder(if alias == "o" { 2 } else { 3 }),
+        }
+    }
+
+    fn group_array(self, spec: &CaptureSpec, alias: &str) -> String {
+        match self {
+            Render::Static => group_key_array(spec, alias),
+            Render::Dynamic => placeholder(if alias == "o" { 4 } else { 5 }),
+        }
+    }
+}
+
 /// The rows a capture insert writes: a `SELECT` over the event's transition
 /// tables (a `VALUES` row for truncate), in [`RING_COLUMNS`] order.
-fn ring_select(spec: &CaptureSpec, event: CaptureEvent) -> String {
+fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) -> String {
     let src = text_expr(&spec.table);
+    let (l, ts) = (render.lsn(), render.ts());
     let indent = "        ";
     match event {
         CaptureEvent::Insert => format!(
-            "{indent}select {src}, {}, 'insert', l, null, {}, l, ts, {}\n{indent}from {NEW_ROWS} n",
+            "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, {}\n{indent}from {NEW_ROWS} n",
             key_expr(spec, "n"),
-            image_expr(spec, "n"),
-            group_key_expr(spec, &["n"]),
+            render.image(spec, "n"),
+            group_key_expr(spec, &["n"], render),
         ),
         CaptureEvent::Delete => format!(
-            "{indent}select {src}, {}, 'delete', l, {}, null, l, ts, {}\n{indent}from {OLD_ROWS} o",
+            "{indent}select {src}, {}, 'delete', {l}, {}, null, {l}, {ts}, {}\n{indent}from {OLD_ROWS} o",
             key_expr(spec, "o"),
-            image_expr(spec, "o"),
-            group_key_expr(spec, &["o"]),
+            render.image(spec, "o"),
+            group_key_expr(spec, &["o"], render),
         ),
         // A statement trigger sees the update's old and new rows as two sets
         // with no pairing, so they are paired on the key text. A row whose
@@ -529,12 +756,12 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent) -> String {
                 let group = if spec.group_key.is_empty() {
                     String::new()
                 } else {
-                    format!(", {} as gk", group_key_array(spec, alias))
+                    format!(", {} as gk", render.group_array(spec, alias))
                 };
                 format!(
                     "(select {} as k, {} as img{group} from {rows} {alias})",
                     key_expr(spec, alias),
-                    image_expr(spec, alias),
+                    render.image(spec, alias),
                 )
             };
             let group = if spec.group_key.is_empty() {
@@ -546,14 +773,14 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent) -> String {
                 "{indent}select {src}, coalesce(n.k, o.k),\n{indent}    \
                  case when n.k is null then 'delete' when o.k is null then 'insert' \
                  else 'update' end,\n{indent}    \
-                 l, o.img, n.img, l, ts, {group}\n{indent}from {} o\n{indent}full join {} n \
+                 {l}, o.img, n.img, {l}, {ts}, {group}\n{indent}from {} o\n{indent}full join {} n \
                  on o.k = n.k collate \"C\"",
                 side("o", OLD_ROWS),
                 side("n", NEW_ROWS),
             )
         }
         CaptureEvent::Truncate => format!(
-            "{indent}values ({src}, {}, 'truncate', l, null, null, l, ts, null)",
+            "{indent}values ({src}, {}, 'truncate', {l}, null, null, {l}, {ts}, null)",
             text_expr(TRUNCATE_SENTINEL_KEY)
         ),
     }
@@ -624,11 +851,14 @@ fn group_key_array(spec: &CaptureSpec, alias: &str) -> String {
 /// The ring's `group_key` for rows drawn from `aliases` (old before new):
 /// `intake::touched_group_key`'s union of every non-null group-key value, in
 /// first-seen order, or `NULL` when there are none.
-fn group_key_expr(spec: &CaptureSpec, aliases: &[&str]) -> String {
+fn group_key_expr(spec: &CaptureSpec, aliases: &[&str], render: Render) -> String {
     if spec.group_key.is_empty() {
         return "null::text[]".to_string();
     }
-    let arrays: Vec<String> = aliases.iter().map(|a| group_key_array(spec, a)).collect();
+    let arrays: Vec<String> = aliases
+        .iter()
+        .map(|a| render.group_array(spec, a))
+        .collect();
     distinct_non_null(&arrays.join(" || "))
 }
 
@@ -866,11 +1096,26 @@ mod tests {
                     "slot {slot} unqualified in\n{sql}"
                 );
             }
+            // The schema-changed branch's two dynamic inserts name the ring
+            // as `%s`/`%1$s`, the quoted schema plus the slot's table.
+            let dynamic = if event == CaptureEvent::Truncate {
+                0
+            } else {
+                2
+            };
             assert_eq!(
                 sql.matches("insert into ").count(),
-                RING_SIZE as usize,
+                RING_SIZE as usize + dynamic,
                 "one insert per ring slot, all qualified:\n{sql}"
             );
+            if dynamic > 0 {
+                assert_eq!(
+                    sql.matches("'\"trellis\"' || '.' || pg_catalog.quote_ident('seg_' || slot)")
+                        .count(),
+                    2,
+                    "{sql}"
+                );
+            }
             assert!(
                 sql.contains(
                     "pg_sequence_last_value(('\"trellis\".\"ring_slot_mirror\"')::regclass)"
@@ -901,11 +1146,66 @@ mod tests {
         ] {
             let sql = ddl(&spec(), event);
             let guard = sql
-                .find(&format!("if not exists (select 1 from {rows}) then"))
+                .find(&format!(
+                    "present := case when exists (select 1 from {rows})\n        then "
+                ))
                 .unwrap_or_else(|| panic!("no empty-statement guard in\n{sql}"));
-            assert!(guard < sql.find("pg_current_xact_id").unwrap());
+            let exit = sql
+                .find("    if present < 0 then\n        return null;\n    end if;\n")
+                .expect("the guard returns");
+            assert!(guard < exit && exit < sql.find("pg_current_xact_id").unwrap());
         }
-        assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("if not exists"));
+        assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("present"));
+    }
+
+    /// #622 C6: the guard's query counts the imaged columns the table still
+    /// has, and a miss takes the schema-changed branch before any static
+    /// insert: the marker first, then (only with the key intact) the images
+    /// over the columns left, by `EXECUTE`, with no `EXCEPTION` block.
+    #[test]
+    fn a_missing_column_takes_the_marker_branch_before_the_static_inserts() {
+        for (event, rows) in [
+            (CaptureEvent::Insert, NEW_ROWS),
+            (CaptureEvent::Update, NEW_ROWS),
+            (CaptureEvent::Delete, OLD_ROWS),
+        ] {
+            let sql = ddl(&spec(), event);
+            let at = |needle: &str| {
+                sql.find(needle)
+                    .unwrap_or_else(|| panic!("no {needle:?} in\n{sql}"))
+            };
+            let probe = at(&format!(
+                "present := case when exists (select 1 from {rows})\n        \
+                 then (select count(*) from pg_catalog.pg_attribute a\n            \
+                 where a.attrelid = tg_relid and a.attnum > 0 and not a.attisdropped\n              \
+                 and a.attname = any (array['amount', 'customer_id', 'id']::name[])) \
+                 else -1 end;"
+            ));
+            let miss = at("    if present <> 3 then\n");
+            let marker = at("''schema_changed''");
+            let key_check =
+                at("if not (array['id']::text[] <@ have) then\n            return null;");
+            let images = at("execute pg_catalog.format('insert into %1$s (");
+            let statics = at("    case slot\n");
+            assert!(
+                probe < miss
+                    && miss < marker
+                    && marker < key_check
+                    && key_check < images
+                    && images < statics,
+                "{sql}"
+            );
+            assert!(at("pg_current_xact_id") < miss, "the xid comes first");
+            assert_eq!(
+                sql.matches("exception").count(),
+                sql.matches("raise exception").count(),
+                "no EXCEPTION block, so no subtransaction:\n{sql}"
+            );
+            // The dynamic template keeps the static select's `format('%s', …)`
+            // as a literal `%%s` for `format()` to pass through.
+            assert!(sql.contains("format(''%%s'', "), "{sql}");
+            assert!(!sql[images..statics].contains(", l, ts"), "{sql}");
+        }
     }
 
     #[test]

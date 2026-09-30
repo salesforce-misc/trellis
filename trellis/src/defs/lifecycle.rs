@@ -165,6 +165,45 @@ pub(crate) async fn pause_transform(
     Ok(PauseOutcome::Paused)
 }
 
+/// Pauses definition `id` because a capture function found `columns` of
+/// `source_table` renamed or dropped (#622 C6), and records why in
+/// `capture_failures`. The record is what `Trellis::status` reports as
+/// `capture_failure`, and what makes capture stop imaging for the
+/// definition (`capture::columns`). Runs in the caller's transaction, which
+/// the drain commits before it computes anything that could apply to it.
+///
+/// A definition already frozen keeps its status (a quarantined one stays
+/// quarantined) but still gets the record, since its resume is the same
+/// rebuild. An existing record is kept, so the first detection stands.
+/// Returns whether this call paused it.
+pub(crate) async fn pause_for_capture_failure(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    columns: &[String],
+) -> Result<bool, CatalogError> {
+    txn.execute(
+        "insert into capture_failures (transform_id, source_table, columns) \
+         select id, $2, $3 from transform_definitions where id = $1 \
+         on conflict (transform_id) do nothing",
+        &[&id, &source_table, &columns],
+    )
+    .await?;
+    let paused = txn
+        .execute(
+            "update transform_definitions set status = $2 \
+             where id = $1 and status = any($3)",
+            &[
+                &id,
+                &TransformStatus::Paused.as_str(),
+                &TransformStatus::dispatchable(),
+            ],
+        )
+        .await?
+        == 1;
+    Ok(paused)
+}
+
 /// Removes `target`'s definition — ADR-0014's terminal reap.
 ///
 /// **Only ever acts on a frozen definition.** There is no direct live-to-gone

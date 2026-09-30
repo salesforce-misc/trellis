@@ -23,15 +23,11 @@
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
 //!   from the catalog the way the staging worker's reconcile does.
-//! - `trigger+exception` and `trigger+column-check`: open question Q2's two
-//!   candidate guards against a renamed or dropped read column, as
-//!   benchmark-only rewrites of the installed functions
-//!   ([`exception_variant`], [`column_check_variant`]).
-//!   `trigger+column-check-guard` runs the same check per statement inside
-//!   the empty-statement guard's query ([`column_check_guard_variant`]), and
-//!   `trigger+column-check-txn` runs it once per transaction
-//!   ([`column_check_per_txn_variant`]). None is product code; C6 builds
-//!   whichever Q2 picks.
+//!   Since #622 C6 every insert, update and delete function counts its
+//!   columns in the empty-statement guard's query (Q2(c)), so this is C4's
+//!   `trigger+column-check-guard`. C4's benchmark-only Q2 variants
+//!   (`trigger+exception`, `trigger+column-check`, `-guard`, `-txn`) went
+//!   with the decision; the baseline holds their numbers.
 //!
 //! Shapes ([`Shape::parse`]):
 //!
@@ -91,7 +87,7 @@ use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
 use trellis::ClientOptions;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::dev::capture::{CaptureEvent, CaptureSpec};
+use trellis::dev::capture::CaptureSpec;
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::{install_chain_hops, wait_for_markers_discharged};
@@ -130,35 +126,23 @@ pub enum Variant {
     RegexIndex,
     Slot,
     Trigger,
-    TriggerException,
-    TriggerColumnCheck,
-    TriggerColumnCheckGuard,
-    TriggerColumnCheckPerTxn,
 }
 
 /// Every variant but `slot` (see the module doc).
-pub const DEFAULT_VARIANTS: [Variant; 8] = [
+pub const DEFAULT_VARIANTS: [Variant; 4] = [
     Variant::None,
     Variant::Btree,
     Variant::RegexIndex,
     Variant::Trigger,
-    Variant::TriggerException,
-    Variant::TriggerColumnCheck,
-    Variant::TriggerColumnCheckGuard,
-    Variant::TriggerColumnCheckPerTxn,
 ];
 
 impl Variant {
-    pub const ALL: [Variant; 9] = [
+    pub const ALL: [Variant; 5] = [
         Variant::None,
         Variant::Btree,
         Variant::RegexIndex,
         Variant::Slot,
         Variant::Trigger,
-        Variant::TriggerException,
-        Variant::TriggerColumnCheck,
-        Variant::TriggerColumnCheckGuard,
-        Variant::TriggerColumnCheckPerTxn,
     ];
 
     pub fn name(self) -> &'static str {
@@ -168,10 +152,6 @@ impl Variant {
             Variant::RegexIndex => "regex-index",
             Variant::Slot => "slot",
             Variant::Trigger => "trigger",
-            Variant::TriggerException => "trigger+exception",
-            Variant::TriggerColumnCheck => "trigger+column-check",
-            Variant::TriggerColumnCheckGuard => "trigger+column-check-guard",
-            Variant::TriggerColumnCheckPerTxn => "trigger+column-check-txn",
         }
     }
 
@@ -188,14 +168,7 @@ impl Variant {
 
     /// Writes ring rows inside the writer's transaction.
     fn is_trigger(self) -> bool {
-        matches!(
-            self,
-            Variant::Trigger
-                | Variant::TriggerException
-                | Variant::TriggerColumnCheck
-                | Variant::TriggerColumnCheckGuard
-                | Variant::TriggerColumnCheckPerTxn
-        )
+        self == Variant::Trigger
     }
 
     /// Captures at all, so the ring must end up holding every row.
@@ -456,166 +429,6 @@ pub fn schedule(variants: &[Variant], shapes: &[Shape], reps: usize) -> Vec<Cell
         }
     }
     cells
-}
-
-// --- Q2's benchmark-only variants -------------------------------------------
-
-/// The events a write-tax cell fires. Truncate's function is left as
-/// installed: nothing truncates.
-const REWRITTEN_EVENTS: [CaptureEvent; 3] = [
-    CaptureEvent::Insert,
-    CaptureEvent::Update,
-    CaptureEvent::Delete,
-];
-
-fn replace_once(ddl: &str, from: &str, to: &str) -> String {
-    assert_eq!(
-        ddl.matches(from).count(),
-        1,
-        "the capture function no longer has exactly one {from:?}; update the write-tax rewrite"
-    );
-    ddl.replacen(from, to, 1)
-}
-
-/// Q2(a): the capture wrapped in a `BEGIN … EXCEPTION` block, so a failed
-/// capture never fails the application's statement. Entering the block
-/// starts a subtransaction, and the ring insert inside it gives that
-/// subtransaction its own xid: one subxid per captured statement.
-///
-/// The empty-statement check stays outside the block, as a real
-/// implementation would keep it.
-pub fn exception_variant(ddl: &str) -> String {
-    let ddl = replace_once(ddl, "    -- #597:", "    begin\n    -- #597:");
-    replace_once(
-        &ddl,
-        "    end case;\n    return null;\nend;\n",
-        "    end case;\n    exception when others then\n        \
-         raise warning 'trellis capture skipped: %', sqlerrm;\n    end;\n    return null;\nend;\n",
-    )
-}
-
-/// The `pg_attribute` probe Q2(c) runs: how many of `columns` `tg_relid`
-/// still has.
-fn column_probe(columns: &[String]) -> String {
-    let names: Vec<String> = columns
-        .iter()
-        .map(|c| format!("'{}'", c.replace('\'', "''")))
-        .collect();
-    format!(
-        "(select count(*) from pg_catalog.pg_attribute a\n          \
-         where a.attrelid = tg_relid and a.attnum > 0 and not a.attisdropped\n            \
-         and a.attname = any (array[{}]::name[]))",
-        names.join(", ")
-    )
-}
-
-/// The mirror-read statement's span in `ddl`: `slot := <case>;`, and the
-/// case expression.
-fn mirror_read(ddl: &str) -> (usize, usize, String) {
-    let start = ddl
-        .find("    slot := case when")
-        .expect("the capture function assigns slot from the mirror read");
-    let end = start
-        + ddl[start..]
-            .find(" end;\n")
-            .expect("the mirror read ends its case")
-        + " end;\n".len();
-    let expr = ddl[start + "    slot := ".len()..end - ";\n".len()].to_string();
-    (start, end, expr)
-}
-
-fn declare_present(ddl: &str) -> String {
-    replace_once(
-        ddl,
-        "    ts timestamptz;\nbegin\n",
-        "    ts timestamptz;\n    present bigint;\nbegin\n",
-    )
-}
-
-/// Q2(c): one `pg_attribute` probe for the capture columns, folded into the
-/// statement that reads the mirror (so #597's single expression still
-/// assigns the xid and reads the slot). On a miss the function returns
-/// without capturing; C6 would stage a `schema_changed` marker there. The
-/// benchmark never takes that branch, so it measures only the probe.
-///
-/// Folding the probe in turns the mirror read from a PL/pgSQL simple
-/// expression, which skips the executor, into a query.
-pub fn column_check_variant(ddl: &str, columns: &[String]) -> String {
-    let (start, end, expr) = mirror_read(ddl);
-    let replacement = format!(
-        "    select {expr},\n        {}\n      \
-         into slot, present;\n    \
-         if present <> {} then\n        \
-         return null;\n    end if;\n",
-        column_probe(columns),
-        columns.len(),
-    );
-    declare_present(&format!("{}{replacement}{}", &ddl[..start], &ddl[end..]))
-}
-
-/// The empty-statement guard's span in `ddl`: `if not exists (select 1
-/// from <transition table>) then return null; end if;`, and the table.
-fn empty_guard(ddl: &str) -> (usize, usize, String) {
-    const OPEN: &str = "    if not exists (select 1 from ";
-    const CLOSE: &str = "    end if;\n";
-    assert_eq!(
-        ddl.matches(OPEN).count(),
-        1,
-        "the capture function no longer has exactly one {OPEN:?}; update the write-tax rewrite"
-    );
-    let start = ddl.find(OPEN).expect("counted above");
-    let table_end = start
-        + ddl[start..]
-            .find(") then\n        return null;\n")
-            .expect("the empty guard returns null");
-    let table = ddl[start + OPEN.len()..table_end].to_string();
-    let end = table_end + ddl[table_end..].find(CLOSE).expect("the guard ends") + CLOSE.len();
-    (start, end, table)
-}
-
-/// Q2(c), with the `pg_attribute` probe riding in the empty-statement
-/// guard's query instead of the mirror read's. The guard is already a query
-/// (its `EXISTS` subquery keeps it off PL/pgSQL's simple-expression path),
-/// so the probe adds a subplan to a query the function runs anyway, and the
-/// mirror read stays a simple expression. An empty statement skips the
-/// probe; a miss returns without capturing, as in [`column_check_variant`].
-pub fn column_check_guard_variant(ddl: &str, columns: &[String]) -> String {
-    let (start, end, table) = empty_guard(ddl);
-    let guard = format!(
-        "    present := case when exists (select 1 from {table})\n        \
-         then {} else -1 end;\n    \
-         if present < 0 then\n        return null;\n    end if;\n    \
-         if present <> {} then\n        return null;\n    end if;\n",
-        column_probe(columns),
-        columns.len(),
-    );
-    declare_present(&format!("{}{guard}{}", &ddl[..start], &ddl[end..]))
-}
-
-/// Q2(c), checked once per transaction: the same probe, run only when a
-/// transaction-local setting keyed by the table doesn't say this transaction
-/// already checked it. The mirror read stays a simple expression.
-///
-/// Sound only because `RENAME`/`DROP COLUMN` take `ACCESS EXCLUSIVE`, which
-/// waits for every transaction already holding the table's `ROW EXCLUSIVE`.
-/// Once a transaction has written the table, only that transaction can change
-/// its columns before it commits. A transaction that writes, renames a read
-/// column and writes again would reach the stale images and fail, where
-/// [`column_check_variant`] wouldn't.
-pub fn column_check_per_txn_variant(ddl: &str, columns: &[String]) -> String {
-    let (_, end, _) = mirror_read(ddl);
-    let check = format!(
-        "    if pg_catalog.current_setting('trellis.capture_checked_' || tg_relid, true)\n        \
-         is distinct from 'on' then\n        \
-         select {} into present;\n        \
-         if present <> {} then\n            \
-         return null;\n        end if;\n        \
-         perform pg_catalog.set_config('trellis.capture_checked_' || tg_relid, 'on', true);\n    \
-         end if;\n",
-        column_probe(columns),
-        columns.len(),
-    );
-    declare_present(&format!("{}{check}{}", &ddl[..end], &ddl[end..]))
 }
 
 // --- Measurement helpers ----------------------------------------------------
@@ -1303,11 +1116,7 @@ async fn set_up_variant(
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some(client)
         }
-        Variant::Trigger
-        | Variant::TriggerException
-        | Variant::TriggerColumnCheck
-        | Variant::TriggerColumnCheckGuard
-        | Variant::TriggerColumnCheckPerTxn => {
+        Variant::Trigger => {
             let table = format!("public.{SOURCE_TABLE}");
             let catalog = trellis::dev::capture::load_catalog(&*raw, DEFAULT_SCHEMA)
                 .await
@@ -1323,24 +1132,6 @@ async fn set_up_variant(
                     .expect("nothing else holds the benchmark's source table"),
                 "a fresh table's install changes something"
             );
-            for event in REWRITTEN_EVENTS {
-                let ddl = trellis::dev::capture::function_ddl(DEFAULT_SCHEMA, &spec, event)
-                    .expect("generate the capture function");
-                let replaced = match variant {
-                    Variant::TriggerException => exception_variant(&ddl),
-                    Variant::TriggerColumnCheck => column_check_variant(&ddl, spec.columns()),
-                    Variant::TriggerColumnCheckGuard => {
-                        column_check_guard_variant(&ddl, spec.columns())
-                    }
-                    Variant::TriggerColumnCheckPerTxn => {
-                        column_check_per_txn_variant(&ddl, spec.columns())
-                    }
-                    _ => continue,
-                };
-                raw.batch_execute(&replaced).await.unwrap_or_else(|e| {
-                    panic!("replace the {} function: {e}\n{replaced}", event.as_str())
-                });
-            }
             None
         }
     }
@@ -1683,21 +1474,6 @@ pub fn summary(results: &[CellResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trellis::dev::capture::function_ddl;
-
-    fn spec() -> CaptureSpec {
-        CaptureSpec::new(
-            "public.wt_src",
-            vec!["id".to_string()],
-            vec!["id".to_string(), "val".to_string()],
-            Vec::new(),
-        )
-        .expect("valid spec")
-    }
-
-    fn ddl(event: CaptureEvent) -> String {
-        function_ddl("trellis", &spec(), event).expect("ddl")
-    }
 
     #[test]
     fn shapes_parse_and_label_round_trip() {
@@ -1842,115 +1618,5 @@ mod tests {
         s.samples = 4;
         s.overflowed = 1;
         assert_eq!(s.overflow_share(), Some(0.25));
-    }
-
-    #[test]
-    fn the_exception_variant_wraps_the_capture_after_the_empty_check() {
-        let before = ddl(CaptureEvent::Insert);
-        let after = exception_variant(&before);
-        let check = after.find("if not exists").expect("empty check");
-        let block = after.find("    begin\n    -- #597:").expect("inner block");
-        let handler = after.find("exception when others then").expect("handler");
-        assert!(check < block && block < handler);
-        assert!(after.contains("    end;\n    return null;\nend;\n"));
-        // Everything else is untouched.
-        assert!(after.contains("security definer"));
-        assert_eq!(
-            after.matches("insert into").count(),
-            before.matches("insert into").count()
-        );
-    }
-
-    #[test]
-    fn the_column_check_variant_probes_pg_attribute_in_the_mirror_statement() {
-        let before = ddl(CaptureEvent::Update);
-        let after = column_check_variant(&before, spec().columns());
-        assert!(!after.contains("slot := case"), "{after}");
-        let select = after
-            .find("    select case when pg_current_xact_id()")
-            .expect("select");
-        let probe = after.find("pg_catalog.pg_attribute a").expect("probe");
-        let into = after.find("into slot, present;").expect("into");
-        assert!(select < probe && probe < into, "{after}");
-        assert!(after.contains("array['id', 'val']::name[]"), "{after}");
-        assert!(after.contains("if present <> 2 then"), "{after}");
-        assert!(after.contains("    present bigint;\nbegin\n"), "{after}");
-        assert!(
-            !after.contains("exception when"),
-            "no subtransaction: {after}"
-        );
-    }
-
-    #[test]
-    fn the_guard_check_probes_in_the_empty_statement_query() {
-        for (event, table) in [
-            (CaptureEvent::Insert, "trellis_new"),
-            (CaptureEvent::Update, "trellis_new"),
-            (CaptureEvent::Delete, "trellis_old"),
-        ] {
-            let before = ddl(event);
-            let after = column_check_guard_variant(&before, spec().columns());
-            assert!(!after.contains("if not exists"), "{after}");
-            let guard = after
-                .find(&format!(
-                    "    present := case when exists (select 1 from {table})"
-                ))
-                .expect("guard");
-            let probe = after.find("pg_catalog.pg_attribute a").expect("probe");
-            let empty = after.find("if present < 0 then").expect("empty return");
-            let miss = after.find("if present <> 2 then").expect("miss return");
-            let read = after
-                .find("    slot := case when")
-                .expect("the mirror read stays a simple expression");
-            assert!(
-                guard < probe && probe < empty && empty < miss && miss < read,
-                "{after}"
-            );
-            assert_eq!(after.matches("pg_catalog.pg_attribute").count(), 1);
-            assert!(after.contains("    present bigint;\nbegin\n"), "{after}");
-            assert!(!after.contains("exception when"), "{after}");
-        }
-    }
-
-    #[test]
-    fn the_per_transaction_check_keeps_the_mirror_read_a_simple_expression() {
-        let before = ddl(CaptureEvent::Insert);
-        let after = column_check_per_txn_variant(&before, spec().columns());
-        let read = after
-            .find("    slot := case when")
-            .expect("mirror read kept");
-        let check = after
-            .find("current_setting('trellis.capture_checked_' || tg_relid, true)")
-            .expect("per-transaction guard");
-        let probe = after.find("pg_catalog.pg_attribute a").expect("probe");
-        let mark = after
-            .find("set_config('trellis.capture_checked_' || tg_relid, 'on', true)")
-            .expect("marks the transaction checked");
-        let capture = after.find("    case slot\n").expect("capture");
-        assert!(
-            read < check && check < probe && probe < mark && mark < capture,
-            "{after}"
-        );
-        assert!(after.contains("if present <> 2 then"), "{after}");
-        assert!(
-            !after.contains("exception when"),
-            "no subtransaction: {after}"
-        );
-    }
-
-    #[test]
-    fn every_rewritten_event_has_the_text_the_rewrites_expect() {
-        for event in REWRITTEN_EVENTS {
-            exception_variant(&ddl(event));
-            column_check_variant(&ddl(event), spec().columns());
-            column_check_guard_variant(&ddl(event), spec().columns());
-            column_check_per_txn_variant(&ddl(event), spec().columns());
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "update the write-tax rewrite")]
-    fn a_rewrite_that_no_longer_matches_fails_loudly() {
-        exception_variant("create function f() returns trigger as $$ begin end $$");
     }
 }
