@@ -860,3 +860,212 @@ async fn a_from_side_target_of_two_relationships_unions_both_join_keys() {
         "{staged:?}"
     );
 }
+
+/// Every `AVG` column (the visible mean and its hidden running sum and
+/// count) of `src_table`'s rows in the active segment, per op, as
+/// `(op, region, old mean/sum/count, new mean/sum/count)` text.
+async fn staged_avg_images(raw: &Client, src_table: &str) -> Vec<Vec<Option<String>>> {
+    let slot: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment_pointer")
+        .get(0);
+    let mut out: Vec<Vec<Option<String>>> = raw
+        .query(
+            &format!(
+                "select op, coalesce(old_image, new_image) ->> 'region', \
+                        old_image ->> 'mean', old_image ->> '__mean_sum', \
+                        old_image ->> '__mean_count', \
+                        new_image ->> 'mean', new_image ->> '__mean_sum', \
+                        new_image ->> '__mean_count' \
+                 from seg_{slot} where src_table = $1"
+            ),
+            &[&src_table],
+        )
+        .await
+        .expect("read the ring")
+        .into_iter()
+        .map(|row| {
+            let op: String = row.get(0);
+            std::iter::once(Some(op))
+                .chain((1..8).map(|i| row.get::<_, Option<String>>(i)))
+                .collect()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// #623 D3b: an `AVG` target on the ledger that is a relationship's to-side
+/// stages its groups' prior images from the upsert's result minus the page's
+/// increments. Those values are not just a group locator here: an aggregate
+/// reading the target through the relationship applies each parent change
+/// as a reverse delta, new mean minus old mean, so a wrong prior mean drifts
+/// it (the offset proves the reader took a delta, not a re-derive). Covers a
+/// changed group, a grown one, and one deleted with its last member.
+#[tokio::test]
+async fn an_avg_target_endpoints_prior_images_carry_its_old_means() {
+    let (_cluster, db, mut raw) = setup().await;
+    raw.batch_execute(
+        "create table public.sales (id integer primary key, region integer, amount integer); \
+         insert into public.sales values (1, 1, 10), (2, 1, 20), (3, 2, 5); \
+         create table public.stores (id integer primary key, region integer, kind text); \
+         insert into public.stores values (100, 1, 'a'), (101, 2, 'a'), (102, 1, 'b'); \
+         alter table public.sales replica identity full; \
+         alter table public.stores replica identity full",
+    )
+    .await
+    .expect("create sources");
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.region_avgs FROM public.sales GROUP BY region \
+         SELECT AVG(amount) AS mean",
+        &int_columns(&["id", "region", "amount"]),
+        "public",
+    )
+    .await
+    .expect("install region_avgs");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    create_relationship(
+        &db.pool,
+        "RELATIONSHIP avgs FROM stores.region TO region_avgs.region",
+    )
+    .await
+    .expect("a relationship whose to-side is an AVG target");
+    let mut store_columns = int_columns(&["id", "region"]);
+    store_columns.insert("kind".to_string(), ValueType::Text);
+    install_definition(
+        &db.pool,
+        "TRANSFORM public.kind_means FROM public.stores GROUP BY kind \
+         SELECT SUM(avgs.mean) AS total",
+        &store_columns,
+        "public",
+    )
+    .await
+    .expect("install kind_means");
+    trellis::intake::publication::settle_registrations(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let totals = "select kind, trim_scale(total)::text from public.kind_means";
+    assert_eq!(
+        rows(&raw, totals).await,
+        BTreeMap::from([
+            ("a".to_string(), "20".to_string()),
+            ("b".to_string(), "15".to_string()),
+        ]),
+    );
+    raw.execute("update public.kind_means set total = total + 1000", &[])
+        .await
+        .expect("offset every group");
+
+    // Region 1's mean 15 -> 30, region 2's 5 -> 6.5.
+    raw.batch_execute(
+        "update public.sales set amount = 50 where id = 2; \
+         insert into public.sales values (4, 2, 8)",
+    )
+    .await
+    .expect("write the source");
+    stage_source_update(
+        &mut raw,
+        "public.sales",
+        "2",
+        r#"{"id":"2","region":"1","amount":"20"}"#,
+        r#"{"id":"2","region":"1","amount":"50"}"#,
+    )
+    .await;
+    stage_source_insert(
+        &mut raw,
+        "public.sales",
+        "4",
+        r#"{"id":"4","region":"2","amount":"8"}"#,
+    )
+    .await;
+    drain_round(&db.pool, &mut raw).await;
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        staged_avg_images(&raw, "public.region_avgs").await,
+        vec![
+            vec![
+                s("update"),
+                s("1"),
+                s("15.0000000000000000"),
+                s("30"),
+                s("2"),
+                s("30.0000000000000000"),
+                s("60"),
+                s("2"),
+            ],
+            vec![
+                s("update"),
+                s("2"),
+                s("5.0000000000000000"),
+                s("5"),
+                s("1"),
+                s("6.5000000000000000"),
+                s("13"),
+                s("2"),
+            ],
+        ],
+    );
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, totals).await,
+        BTreeMap::from([
+            ("a".to_string(), "1036.5".to_string()),
+            ("b".to_string(), "1030".to_string()),
+        ]),
+        "each store took its region's new mean minus its old one"
+    );
+
+    // Region 2 loses both members: its row is deleted, and its prior image
+    // is the mean the readers last saw.
+    raw.execute("delete from public.sales where region = 2", &[])
+        .await
+        .expect("delete region 2");
+    for (key, amount) in [("3", "5"), ("4", "8")] {
+        let txn = raw.transaction().await.expect("begin");
+        append(
+            &txn,
+            &[StagedChange::Cdc {
+                src_table: "public.sales".to_string(),
+                key: key.to_string(),
+                op: CdcOp::Delete,
+                lsn: Some(testkit::wal_insert_lsn(&txn).await),
+                old_image: Some(format!(
+                    r#"{{"id":"{key}","region":"2","amount":"{amount}"}}"#
+                )),
+                new_image: None,
+                origin_lsn: None,
+                src_changed: None,
+                hop_gen: 0,
+                group_key: None,
+            }],
+        )
+        .await
+        .expect("stage the delete");
+        txn.commit().await.expect("commit");
+    }
+    drain_round(&db.pool, &mut raw).await;
+    assert_eq!(
+        staged_avg_images(&raw, "public.region_avgs").await,
+        vec![vec![
+            s("delete"),
+            s("2"),
+            s("6.5000000000000000"),
+            s("13"),
+            s("2"),
+            None,
+            None,
+            None,
+        ]],
+    );
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, totals).await,
+        BTreeMap::from([
+            ("a".to_string(), "1030".to_string()),
+            ("b".to_string(), "1030".to_string()),
+        ]),
+        "store 101 lost region 2's mean as a delta"
+    );
+}
