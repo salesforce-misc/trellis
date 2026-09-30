@@ -1077,7 +1077,9 @@ async fn the_partial_images_keep_odd_identifiers() {
 /// `spare` is read by no one else, so capture can never image them. `tb`'s
 /// own edit then parks a catch-up on the same table. The discharge must not
 /// wait on the paused `ta`'s columns, so `tb` catches up and goes live
-/// while `ta` stays paused.
+/// while `ta` stays paused. `ta`'s status names only its capture failure,
+/// not a capture wait on the table. Once the column is back, resuming `ta`
+/// releases `spare2` and rebuilds it over every write made meanwhile.
 #[tokio::test]
 async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch_up() {
     let cluster = TestCluster::start();
@@ -1118,10 +1120,58 @@ async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch
         rows(&raw, "select id::text, b::text from public.u order by id").await,
         "tb's new field caught up"
     );
+    // A lock wait on the table's capture, as a pass records one, is not
+    // what the paused `ta` waits on, though its `spare2` still awaits
+    // capture: only the resume its capture failure asks for gets it going.
+    raw.batch_execute(
+        "insert into capture_holdups \
+             (table_name, since, operation, lock_mode, observed_at, blockers) \
+         values ('public.u', now(), 'widen', 'ShareRowExclusiveLock', now(), '{}')",
+    )
+    .await
+    .expect("record a lock wait");
     let reported = trellis.status("ta").await.expect("status").expect("ta");
     assert_eq!(reported.status, TransformStatus::Paused);
+    assert_eq!(reported.capture_wait, None, "{reported:?}");
     assert_eq!(
         reported.capture_failure.expect("the reason").columns,
         vec!["a".to_string()]
     );
+    raw.batch_execute("delete from capture_holdups")
+        .await
+        .expect("clear the lock wait");
+
+    // Once the column is back, resuming `ta` counts it again: the widen
+    // images `a` and `spare`, `spare2` is released, and the rebuild covers
+    // every write made while `ta` was left out.
+    raw.batch_execute(
+        "alter table public.u rename column a2 to a; \
+         update public.u set a = a + 5, spare = id * 7",
+    )
+    .await
+    .expect("rename back and write");
+    trellis.apply("RESUME TRANSFORM ta").await.expect("resume");
+    bring_live(&mut raw, &db.pool, &["ta", "tb"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, a::text, spare2::text from public.ta order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, a::text, spare::text from public.u order by id"
+        )
+        .await,
+        "the resumed ta rebuilt with its edited field"
+    );
+    let left: i64 = raw
+        .query_one(
+            "select count(*) from column_status where transform_table = 'ta'",
+            &[],
+        )
+        .await
+        .expect("read column_status")
+        .get(0);
+    assert_eq!(left, 0, "spare2 no longer waits");
 }

@@ -619,8 +619,14 @@ impl Trellis {
             });
             status = Some(reported_status(&*txn, row.get(1), stored).await?);
             // #687: an edit whose new field awaits a widen is stuck on
-            // capture as much as a registration is.
-            if stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture") {
+            // capture as much as a registration is. Not one a schema change
+            // paused (#705): capture stops widening for it, and its field
+            // waits for the resume its `capture_failure` asks for, not on
+            // the table's lock or install failure.
+            let capture_failed = row.get::<_, Option<String>>("capture_table").is_some();
+            if !capture_failed
+                && (stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture"))
+            {
                 holdup = self.capture_holdup(&*txn, row.get(2)).await?;
             }
         }
@@ -1450,7 +1456,8 @@ pub struct DefinitionStatus {
     /// go. A definition waits on capture while it is `waiting_to_backfill`,
     /// or while an `ALTER TRANSFORM` field it gained is paused until the
     /// capture images the column it reads (it is `catching_up` then, #687).
-    /// The staging worker's latest pass records it in the catalog
+    /// One a schema change paused doesn't: it waits for the resume its
+    /// `capture_failure` asks for (#705). The staging worker's latest pass records it in the catalog
     /// (`capture_holdups`), so every process reports it, wherever the worker
     /// runs.
     pub capture_wait: Option<CaptureWait>,
